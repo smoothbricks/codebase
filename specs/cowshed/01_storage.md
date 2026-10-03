@@ -262,6 +262,14 @@ existing grace and then uses `hdiutil detach -force`; every other error remains 
 fallback. `hdiutil info -plist` remains the one host view that maps an image's path to its devices
 (`diskutil image info` reports none).
 
+DiskImages2 can return a newly attached blank whole device before `hdiutil info` publishes its image entry. Creation
+reobserves only that absence within the existing attachment-settle bound while holding the host lease. A positive exact
+image-to-single-device mapping is still required before formatting; an observed conflicting mapping fails immediately,
+and exhausted or unreadable inventory leaves both the attachment and backing file intact for diagnosis. No mutation is
+retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
+state from an APFS volume: it rechecks the exact mapping under the lease and releases only that owned device without
+deleting the backing file first.
+
 Mounted-image release first uses `/sbin/umount <verified-volume-device>`, the kernel's unmount interface. Merely
 changing general eject to `hdiutil detach` did not remove the hosted mounted-volume delay: that command still spent
 10.694 s in the next release run. The native host reads kernel mount facts, then holds the host lease and a fresh raw

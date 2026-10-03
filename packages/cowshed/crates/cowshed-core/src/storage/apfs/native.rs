@@ -19,7 +19,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent,
-    MacOsApfsBackend, MountAccess,
+    MacOsApfsBackend, MountAccess, RecoveredImageAttachment,
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
@@ -1411,8 +1411,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        match self.backend.existing_attachment(image)? {
-            Some(attachment) => self.detach_attachment(&attachment, intent),
+        match self.backend.recovered_image_attachment(image)? {
+            Some(RecoveredImageAttachment::Apfs(attachment)) => {
+                self.detach_attachment(&attachment, intent)
+            }
+            Some(RecoveredImageAttachment::Unformatted {
+                image,
+                whole_device,
+            }) => self
+                .backend
+                .detach_unformatted_image(&image, &whole_device, intent)
+                .map_err(Into::into),
             None => Ok(()),
         }
     }

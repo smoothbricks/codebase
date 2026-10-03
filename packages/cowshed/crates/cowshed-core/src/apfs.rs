@@ -508,6 +508,15 @@ impl AttachedImage {
     }
 }
 
+/// The exact image mapping may be a just-created whole device or a formatted APFS attachment.
+pub(crate) enum RecoveredImageAttachment {
+    Unformatted {
+        image: PathBuf,
+        whole_device: String,
+    },
+    Apfs(AttachedImage),
+}
+
 #[derive(Debug)]
 pub enum CloneFileError {
     InvalidImagePath {
@@ -963,6 +972,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         image: &Path,
     ) -> Result<BTreeSet<String>, ApfsError> {
+        Ok(self.attachment_inventory(image)?.devices)
+    }
+
+    fn attachment_inventory(&self, image: &Path) -> Result<AttachmentInventory, ApfsError> {
         let image = attachment_inventory_path(image)?;
         // Tahoe's `diskutil image info --plist` does not expose attachment devices. The
         // read-only hdiutil inventory is the observed authoritative image-path -> system-entities
@@ -971,7 +984,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             "inventory attached disk images",
             CommandRequest::new(HDIUTIL, ["info", "-plist"]),
         )?;
-        parse_attachment_inventory(&image, &output.stdout)
+        parse_hdiutil_images(&image, &output.stdout)
     }
 
     fn cleanup_new_attachments(
@@ -1136,13 +1149,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 ),
             ));
         }
-        let held = self.attached_whole_devices(path)?;
-        if !held.contains(&whole_device) {
-            return Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} no longer owns {whole_device} (holds {held:?}); refusing to format a foreign device",
-                path.display()
-            )));
-        }
+        self.settle_attached_device(path, &whole_device)?;
         let format = CommandRequest::new(
             NEWFS_APFS,
             [
@@ -1206,20 +1213,51 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         image: &Path,
     ) -> Result<Option<AttachedImage>, ApfsError> {
+        match self.recovered_image_attachment(image)? {
+            None => Ok(None),
+            Some(RecoveredImageAttachment::Apfs(attachment)) => Ok(Some(attachment)),
+            Some(RecoveredImageAttachment::Unformatted { image, .. }) => {
+                Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "{} is still unformatted; an APFS volume is required",
+                    image.display(),
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn recovered_image_attachment(
+        &self,
+        image: &Path,
+    ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
         validate_image_path(image)?;
         let image = attachment_inventory_path(image)?;
         let output = self.run_checked(
             "inventory attached disk images",
             CommandRequest::new(HDIUTIL, ["info", "-plist"]),
         )?;
-        Ok(parse_existing_attachment(&image, &output.stdout)?.map(
-            |(whole_device, volume_device)| AttachedImage {
-                image,
-                whole_device,
-                volume_device,
-                pin: std::sync::Mutex::new(None),
-            },
-        ))
+        parse_existing_attachment(&image, &output.stdout)
+    }
+
+    pub(crate) fn detach_unformatted_image(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsError> {
+        let _lease = self.host_device_lease(image)?;
+        match self.recovered_image_attachment(image)? {
+            None => Ok(()),
+            Some(RecoveredImageAttachment::Unformatted {
+                whole_device: current,
+                ..
+            }) if current == whole_device => {
+                self.detach_image_device_unlocked(image, whole_device, intent)
+            }
+            Some(_) => Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} no longer has the observed unformatted attachment {whole_device}; retaining the image",
+                image.display(),
+            ))),
+        }
     }
 
     /// Attach `image` without mounting it, answering the volume and container the attach itself
@@ -1334,6 +1372,36 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.detach_device_checked(whole_device, intent)?;
         self.settle_detached_device(whole_device);
         Ok(())
+    }
+
+    /// DiskImages2 may finish attaching before hdiutil publishes the exact image mapping.
+    /// Reobserve only absence under the caller's host lease; a conflicting mapping fails at once.
+    /// Formatting never proceeds without positive ownership proof. Exhaustion leaves the image
+    /// and attachment intact, since an unpublished attachment is not authority to remove either.
+    fn settle_attached_device(&self, image: &Path, whole_device: &str) -> Result<(), ApfsError> {
+        let mut waited = Duration::ZERO;
+        loop {
+            let inventory = self.attachment_inventory(image)?;
+            if inventory.matched {
+                return if inventory.devices.len() == 1 && inventory.devices.contains(whole_device) {
+                    Ok(())
+                } else {
+                    Err(ApfsError::InvalidAttachmentInventory(format!(
+                        "{} no longer owns {whole_device} (holds {:?}); refusing to format a foreign device",
+                        image.display(),
+                        inventory.devices,
+                    )))
+                };
+            }
+            if waited >= self.settle.total {
+                return Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "{} attach of {whole_device} was not published in hdiutil after {waited:?}; retaining the image and attachment",
+                    image.display(),
+                )));
+            }
+            self.sleeper.sleep(self.settle.poll);
+            waited = waited.saturating_add(self.settle.poll);
+        }
     }
 
     /// Bounded, logged confirmation that a detached whole device left the attachment
@@ -1851,14 +1919,10 @@ fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
     })
 }
 
-fn parse_attachment_inventory(image: &Path, bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
-    Ok(parse_hdiutil_images(image, bytes)?.devices)
-}
-
 fn parse_existing_attachment(
     image: &Path,
     bytes: &[u8],
-) -> Result<Option<(String, String)>, ApfsError> {
+) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
     let expected = image.to_str().ok_or_else(|| {
         ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
     })?;
@@ -1889,8 +1953,29 @@ fn parse_existing_attachment(
                     "matching image has no system-entities array".into(),
                 )
             })?;
-        let found = attached_apfs_volume(&collect_attachment_entities(entities)?)
-            .map_err(ApfsError::InvalidAttachmentInventory)?;
+        let entities = collect_attachment_entities(entities)?;
+        let found = match entities.as_slice() {
+            [(device, hint)]
+                if device_depth(device) == 0
+                    && is_kernel_device_path(device)
+                    && (hint.is_empty() || hint == "GUID_partition_scheme") =>
+            {
+                RecoveredImageAttachment::Unformatted {
+                    image: image.to_owned(),
+                    whole_device: device.clone(),
+                }
+            }
+            _ => {
+                let (whole_device, volume_device) = attached_apfs_volume(&entities)
+                    .map_err(ApfsError::InvalidAttachmentInventory)?;
+                RecoveredImageAttachment::Apfs(AttachedImage {
+                    image: image.to_owned(),
+                    whole_device,
+                    volume_device,
+                    pin: std::sync::Mutex::new(None),
+                })
+            }
+        };
         if attachment.replace(found).is_some() {
             return Err(ApfsError::InvalidAttachmentInventory(
                 "matching image has multiple inventory entries".into(),
@@ -3175,6 +3260,174 @@ mod tests {
     }
 
     #[test]
+    fn recovered_unformatted_media_is_released_without_deleting_its_backing_file() {
+        let image = temp_path("unformatted-release", IMAGE_EXTENSION);
+        fs::write(&image, b"unformatted").unwrap();
+        let backend = graced_backend([
+            holding(&image, "/dev/disk8"),
+            holding(&image, "/dev/disk8"),
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
+        backend
+            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
+            .unwrap();
+        assert_eq!(fs::read(&image).unwrap(), b"unformatted");
+        assert!(
+            backend.runner().requests().iter().any(|request| {
+                request.program == Path::new(HDIUTIL) && argv(request) == ["detach", "/dev/disk8"]
+            }),
+            "positive fresh image ownership permits only its own device release"
+        );
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn changed_unformatted_media_mapping_never_releases_another_device() {
+        let image = temp_path("unformatted-changed-map", IMAGE_EXTENSION);
+        fs::write(&image, b"unformatted").unwrap();
+        let backend = graced_backend([holding(&image, "/dev/disk9")]);
+        let error = backend
+            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
+            .unwrap_err();
+        assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
+        assert_eq!(fs::read(&image).unwrap(), b"unformatted");
+        assert!(
+            !backend
+                .runner()
+                .requests()
+                .iter()
+                .any(|request| { request.args.first().is_some_and(|arg| arg == "detach") }),
+            "a cached device name is not ownership evidence"
+        );
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn delayed_blank_attachment_publication_gates_format_on_positive_ownership() {
+        let stem = temp_path("asif-delayed-publication", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        fs::write(&image, b"created").unwrap();
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            holding(&image, "/dev/disk8"),
+            CommandOutput::failure(70, "format reached"),
+            holding(&image, "/dev/disk8"),
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: capacity("5g"),
+                volume_name: "main".into(),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "format ASIF APFS volume",
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(70),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+        assert!(
+            !image.exists(),
+            "proven owned format failure permits cleanup"
+        );
+    }
+
+    #[test]
+    fn conflicting_blank_attachment_mapping_never_formats_or_removes_the_image() {
+        let stem = temp_path("asif-foreign-publication", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        fs::write(&image, b"created").unwrap();
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            holding(&image, "/dev/disk9"),
+        ]);
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: capacity("5g"),
+                volume_name: "main".into(),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+        assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
+        assert_eq!(fs::read(&image).unwrap(), b"created");
+        assert!(
+            backend.sleeper.waits().is_empty(),
+            "conflict is not announcement lag"
+        );
+        assert!(
+            !backend.runner().requests().iter().any(|request| {
+                request.program == Path::new(NEWFS_APFS)
+                    || request.args.first().is_some_and(|arg| arg == "detach")
+            }),
+            "an observed foreign mapping authorizes no mutation"
+        );
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn unpublished_blank_attachment_exhaustion_preserves_unproven_media() {
+        let stem = temp_path("asif-unpublished-attachment", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        fs::write(&image, b"created").unwrap();
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: capacity("5g"),
+                volume_name: "main".into(),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::InvalidAttachmentInventory(message) if message.contains("not published")
+        ));
+        assert_eq!(fs::read(&image).unwrap(), b"created");
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+        assert!(
+            !backend.runner().requests().iter().any(|request| {
+                request.program == Path::new(NEWFS_APFS)
+                    || request.args.first().is_some_and(|arg| arg == "detach")
+            }),
+            "absence is not permission to format, eject or remove a backing file"
+        );
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
     fn failed_newfs_detaches_and_removes_staged_asif() {
         let stem = temp_path("asif-newfs-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
@@ -3970,7 +4223,7 @@ mod tests {
         ];
         for plist in malformed {
             assert!(matches!(
-                parse_attachment_inventory(Path::new("/tmp/cowshed-target.asif"), plist),
+                parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist),
                 Err(ApfsError::InvalidAttachmentInventory(_))
             ));
         }
