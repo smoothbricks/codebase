@@ -1,6 +1,5 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
@@ -14,7 +13,9 @@ import {
   countedCargo,
   expectCargoMetadataError,
   expectGraphRefusal,
+  guardEvent,
   rejectionOf,
+  waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
@@ -23,12 +24,15 @@ import { createNodesV2 } from './index.js';
 
 /*
  * What Cargo resolution costs, measured by the one number that matters: how many `cargo metadata`
- * children were actually started. A `cargo` ahead of the real one on PATH logs each child's life
- * (`__tests__/counted-cargo.ts`); no assertion here reads a clock.
+ * children were actually started. A `cargo` ahead of the real one on PATH reports each child's life
+ * to the fixture as it happens (`__tests__/counted-cargo.ts`); no assertion here reads a clock, and
+ * nothing here waits for one: every wait advances on a child's report, a process's output or exit,
+ * or a sharer joining an in-flight resolution. Only the outer hang guards keep time, and they report
+ * what was still open instead of advancing anything.
  *
- * The file depends on nothing the resolution cache adds, so it runs against a tree without the
- * cache and fails there on the counts. `readCargoResolve`, the project graph and the hash command
- * are reached through what every version of them exports; `CargoMetadataError` is looked up by name.
+ * These regressions exercise the content-keyed cache through `readCargoResolve`, project-graph
+ * inference and the hash command. Join readiness comes from the resolution's diagnostics channel;
+ * child counts and process-lifetime evidence come from the fixture's control connections.
  *
  * Every fixture is a temporary directory of its own, with its own Nx workspace-data directory (where
  * the cache is kept), deleted with the fixture.
@@ -54,18 +58,7 @@ async function touch(root: string, path: string): Promise<void> {
   await utimes(file, later, later);
 }
 
-/**
- * Polls real processes: a child's first output and its reaping by init are
- * signals no promise in this process exposes, so no fake clock can stand in.
- */
-async function eventually(condition: () => boolean | Promise<boolean>, what: string): Promise<void> {
-  for (let attempt = 0; attempt < 3000; attempt++) {
-    if (await condition()) return;
-    await Bun.sleep(10);
-  }
-  throw new Error(`timed out waiting for ${what}`);
-}
-
+/** Whether `pid` names a process right now: one syscall, never a wait. */
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -74,6 +67,93 @@ function alive(pid: number): boolean {
     if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return false;
     throw error;
   }
+}
+
+/** How a subprocess ended, with everything it printed. */
+interface Ended {
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * A subprocess whose stdout and stderr are read from the moment it starts, so a full pipe never
+ * stalls it and every failure message can say what it printed.
+ */
+interface Drained {
+  readonly pid: number;
+  kill(signal: NodeJS.Signals): void;
+  /** Settles when stdout has printed `line` as a whole line; rejects if stdout ends first. */
+  printed(line: string): Promise<void>;
+  /** Settles once the process has exited and both of its streams have ended. */
+  readonly ended: Promise<Ended>;
+  /** The command, whether it is still running, and what it has printed so far. */
+  describe(): string;
+}
+
+async function drain(stream: ReadableStream<Uint8Array>, append: (text: string) => void): Promise<void> {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+    append(decoder.decode(chunk.value, { stream: true }));
+  }
+  append(decoder.decode());
+}
+
+function spawnDrained(command: readonly string[], cwd: string, environment: Readonly<Record<string, string>>): Drained {
+  const proc = Bun.spawn([...command], {
+    cwd,
+    env: { ...process.env, ...environment },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  let stdout = '';
+  let stderr = '';
+  let stdoutEnded = false;
+  const waiting = new Set<{ readonly line: string; resolve(): void; reject(error: Error): void }>();
+  const describe = (): string => {
+    const state =
+      proc.signalCode !== null
+        ? `killed by ${proc.signalCode}`
+        : proc.exitCode !== null
+          ? `exited ${proc.exitCode}`
+          : 'running';
+    return `${command.join(' ')} (pid ${proc.pid}, ${state})\nstdout: ${JSON.stringify(stdout)}\nstderr: ${JSON.stringify(stderr)}`;
+  };
+  const notify = (): void => {
+    const lines = new Set(stdout.split('\n').slice(0, -1));
+    for (const waiter of waiting) {
+      if (lines.has(waiter.line)) waiter.resolve();
+      else if (stdoutEnded) waiter.reject(new Error(`stdout ended before printing ${waiter.line}: ${describe()}`));
+      else continue;
+      waiting.delete(waiter);
+    }
+  };
+  const out = drain(proc.stdout, (text) => {
+    stdout += text;
+    notify();
+  }).finally(() => {
+    stdoutEnded = true;
+    notify();
+  });
+  const err = drain(proc.stderr, (text) => {
+    stderr += text;
+  });
+  return {
+    pid: proc.pid,
+    kill: (signal) => proc.kill(signal),
+    printed: (line) =>
+      new Promise<void>((resolve, reject) => {
+        waiting.add({ line, resolve, reject });
+        notify();
+      }),
+    ended: Promise.all([out, err, proc.exited]).then(
+      (): Ended => ({ exitCode: proc.exitCode, signalCode: proc.signalCode, stdout, stderr }),
+    ),
+    describe,
+  };
 }
 
 function summarize(resolved: CargoResolve) {
@@ -132,21 +212,19 @@ function metadataNamed(root: string, name: string) {
   };
 }
 
-/** A process that has never resolved anything: it announces it is about to ask, asks, and reports the answer. */
+/** A process that has never resolved anything: it says on stdout that it is about to ask, asks, and prints the answer. */
 const RESOLVE_WORKER = [
-  "import { writeFileSync } from 'node:fs';",
   `import { readCargoResolve } from ${JSON.stringify(sourceModule)};`,
-  'const [manifest, cwd, output] = process.argv.slice(2);',
-  "writeFileSync(output + '.ready', '');",
+  'const [manifest, cwd] = process.argv.slice(2);',
+  "process.stdout.write('ready\\n');",
   'const resolved = await readCargoResolve(manifest, cwd);',
-  'writeFileSync(',
-  '  output,',
+  'process.stdout.write(',
   '  JSON.stringify({',
   '    root: resolved.root,',
   '    members: [...resolved.members],',
   '    local: resolved.local,',
   '    edges: resolved.edges === null ? null : [...resolved.edges],',
-  '  }),',
+  "  }) + '\\n',",
   ');',
   '',
 ].join('\n');
@@ -196,35 +274,54 @@ async function withCannedWorkspace(body: (fixture: CannedWorkspace) => Promise<v
   }
 }
 
-/** `readCargoResolve` in a fresh process: a second Nx worker, or the next `nx` run. */
+/**
+ * `readCargoResolve` in a fresh process: a second Nx worker, or the next `nx` run. `ready` settles when
+ * the process has said it is about to ask; `result` is the answer it printed once it exited cleanly.
+ * Both are held to the fixture's hang guard, which reports what the process printed.
+ */
 function freshResolver({ root, workspace, manifest, environment }: CannedWorkspace, name: string) {
-  const output = join(root, `${name}.json`);
-  const child = Bun.spawn([process.execPath, join(root, 'resolve-worker.ts'), manifest, workspace, output], {
-    cwd: workspace,
-    env: { ...process.env, ...environment },
-    stdout: 'ignore',
-    stderr: 'pipe',
-  });
-  const result = (async (): Promise<unknown> => {
-    const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-    expect(exitCode, stderr).toBe(0);
-    const resolved: unknown = JSON.parse(await readFile(output, 'utf8'));
-    return resolved;
-  })();
-  return { ready: () => existsSync(`${output}.ready`), result };
+  const worker = spawnDrained(
+    [process.execPath, join(root, 'resolve-worker.ts'), manifest, workspace],
+    workspace,
+    environment,
+  );
+  const result = guardEvent(worker.ended, `fresh resolver ${name} to exit`, () => worker.describe()).then(
+    (ended): unknown => {
+      expect(ended.exitCode, worker.describe()).toBe(0);
+      const [announced, ...rest] = ended.stdout.trimEnd().split('\n');
+      expect(announced, worker.describe()).toBe('ready');
+      const answer = rest.at(-1);
+      if (answer === undefined) throw new Error(`fresh resolver ${name} printed no answer: ${worker.describe()}`);
+      const resolved: unknown = JSON.parse(answer);
+      return resolved;
+    },
+  );
+  return {
+    ready: () =>
+      guardEvent(worker.printed('ready'), `fresh resolver ${name} to say it is about to ask`, () => worker.describe()),
+    result,
+  };
 }
 
 it('concurrent resolutions of one Cargo workspace share one cargo child, and an unchanged workspace never runs Cargo again', async () => {
   await withCannedWorkspace(async ({ cargo, answer, members, workspace, manifest }) => {
     await answer('before');
-    // The child holds its answer for half a second after it read the workspace,
-    // so every call below arrives while it is pending.
-    await cargo.holdFor(0.5);
-    const results = await Promise.all(Array.from({ length: 16 }, () => readCargoResolve(manifest, workspace)));
+    // The child holds its answer, after it read the workspace, until each of the other fifteen calls
+    // has joined its flight, so every call below arrives while it is pending.
+    await cargo.beforeAnswer.close();
+    const joins = waitForCargoJoins(manifest, 15);
+    let results: CargoResolve[];
+    try {
+      const calls = Promise.all(Array.from({ length: 16 }, () => readCargoResolve(manifest, workspace)));
+      await joins.joined;
+      await cargo.beforeAnswer.open();
+      results = await calls;
+    } finally {
+      joins.dispose();
+    }
     expect(await spawned(cargo)).toBe(1);
     expect(new Set(results).size).toBe(1);
     for (const result of results) expect([...result.members]).toEqual(['before']);
-    await cargo.holdFor(0);
 
     // Nothing Cargo's answer depends on has changed, so Cargo, which would
     // answer differently now, is not asked.
@@ -243,10 +340,20 @@ it('concurrent resolutions of one Cargo workspace share one cargo child, and an 
 it("a failed resolution rejects every sharer with a CargoMetadataError carrying Cargo's stderr, and is not kept for the next call", async () => {
   await withCannedWorkspace(async ({ cargo, answer, members, workspace, manifest }) => {
     await cargo.failWith('fake cargo: resolution failed\n');
-    await cargo.holdFor(0.3);
-    const failures = await Promise.all(
-      [readCargoResolve(manifest, workspace), readCargoResolve(manifest, workspace)].map(rejectionOf),
-    );
+    // The child that fails holds its refusal until the second call has joined its flight.
+    await cargo.beforeAnswer.close();
+    const joins = waitForCargoJoins(manifest, 1);
+    let failures: unknown[];
+    try {
+      const refused = Promise.all(
+        [readCargoResolve(manifest, workspace), readCargoResolve(manifest, workspace)].map(rejectionOf),
+      );
+      await joins.joined;
+      await cargo.beforeAnswer.open();
+      failures = await refused;
+    } finally {
+      joins.dispose();
+    }
     for (const failure of failures) {
       expect(expectCargoMetadataError(failure, manifest).message).toContain('fake cargo: resolution failed');
     }
@@ -416,7 +523,7 @@ it('a discovered manifest outside the workspace, edited while the first resoluti
     await answer('before');
     await cargo.beforeAnswer.close();
     const first = readCargoResolve(manifest, workspace);
-    await eventually(async () => (await cargo.runs()).read === 1, 'the first cargo child to read the workspace');
+    await cargo.waitForRuns((runs) => runs.read === 1, 'the first cargo child to read the workspace');
     await appendFile(join(root, 'external/Cargo.toml'), '# edited\n');
     await answer('after');
     await cargo.beforeAnswer.open();
@@ -437,7 +544,7 @@ it('an edit made while Cargo resolves is answered by a resolution that follows t
     await answer('before');
     await cargo.beforeAnswer.close();
     const early = Array.from({ length: 4 }, () => readCargoResolve(manifest, workspace));
-    await eventually(async () => (await cargo.runs()).read === 1, 'the first cargo child to read the workspace');
+    await cargo.waitForRuns((runs) => runs.read === 1, 'the first cargo child to read the workspace');
 
     // That child holds the answer for the workspace as it was.
     await appendFile(manifest, '# edited\n');
@@ -464,7 +571,7 @@ it('an answer Cargo read after an edit is never kept for the workspace as it was
     await answer('before');
     await cargo.beforeRead.close();
     const first = readCargoResolve(manifest, workspace);
-    await eventually(async () => (await spawned(cargo)) === 1, 'the cargo child to start');
+    await cargo.waitForRuns((runs) => runs.spawned === 1, 'the cargo child to start');
 
     // The call has taken the workspace as it is; Cargo reads it only after the edit.
     await writeFile(manifest, `${original}# edited\n`);
@@ -512,13 +619,12 @@ it('fresh processes that ask at once for a workspace nobody has resolved share o
   await withCannedWorkspace(async (fixture) => {
     const { cargo, answer } = fixture;
     await answer('cold');
-    // The child that starts first is held until every process is about to ask,
-    // and kept for half a second after it has read, so the rest are waiting on it.
-    await cargo.holdFor(0.5);
+    // The child that starts first is held before it reads the workspace until every process has
+    // said, on its stdout, that it is about to ask: they ask while that child resolves.
     await cargo.beforeRead.close();
     const resolvers = Array.from({ length: 4 }, (_, index) => freshResolver(fixture, `process-${index}`));
-    await eventually(() => resolvers.every((resolver) => resolver.ready()), 'every process to be about to ask');
-    await eventually(async () => (await spawned(cargo)) >= 1, 'a cargo child to start');
+    await Promise.all(resolvers.map((resolver) => resolver.ready()));
+    await cargo.waitForRuns((runs) => runs.spawned >= 1, 'a cargo child to start');
     await cargo.beforeRead.open();
 
     const results = await Promise.all(resolvers.map((resolver) => resolver.result));
@@ -544,20 +650,15 @@ it('a worker that exits on SIGTERM while Cargo resolves leaves no cargo child be
         '',
       ].join('\n'),
     );
-    const proc = Bun.spawn([process.execPath, worker], {
-      cwd: workspace,
-      env: { ...process.env, ...environment },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    await eventually(async () => (await spawned(cargo)) === 1, 'the cargo child');
-    const [pid] = (await cargo.runs()).pids;
+    const proc = spawnDrained([process.execPath, worker], workspace, environment);
+    const [pid] = (await cargo.waitForRuns((runs) => runs.spawned === 1, 'the cargo child')).pids;
     if (pid === undefined) throw new Error('the cargo child has no pid');
     expect(alive(pid)).toBe(true);
     proc.kill('SIGTERM');
-    expect(await proc.exited).toBe(0);
-    // Reparented on its parent's exit, a killed child lingers until reaped.
-    await eventually(() => !alive(pid), `cargo child ${pid} to die`);
+    const ended = await guardEvent(proc.ended, 'the worker to exit on SIGTERM', () => proc.describe());
+    expect(ended.exitCode, proc.describe()).toBe(0);
+    // The child's end is the end of its connection to the fixture, killed before it answered.
+    await cargo.waitForDisconnects([pid]);
   });
 }, 20_000);
 
@@ -586,25 +687,25 @@ it("a worker that exits with callers waiting on two resolutions leaves none of C
         '',
       ].join('\n'),
     );
-    const proc = Bun.spawn([process.execPath, worker, manifest, workspace, otherManifest, otherWorkspace], {
-      cwd: workspace,
-      env: { ...process.env, ...environment },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const proc = spawnDrained(
+      [process.execPath, worker, manifest, workspace, otherManifest, otherWorkspace],
+      workspace,
+      environment,
+    );
     // Sixteen callers, two workspaces: two children, each holding an answer and a process of its own.
-    await eventually(async () => {
-      const runs = await cargo.runs();
-      return runs.read === 2 && runs.grandchildren.length === 2;
-    }, 'both cargo children to hold an answer');
-    const runs = await cargo.runs();
+    const runs = await cargo.waitForRuns(
+      (held) => held.read === 2 && held.grandchildren.length === 2,
+      'both cargo children to hold an answer',
+    );
     expect(runs.spawned).toBe(2);
     const running = [...runs.pids, ...runs.grandchildren];
     for (const pid of running) expect(alive(pid)).toBe(true);
 
     proc.kill('SIGTERM');
-    expect(await proc.exited).toBe(0);
-    await eventually(() => running.every((pid) => !alive(pid)), 'cargo and what it left behind to die');
+    const ended = await guardEvent(proc.ended, 'the worker to exit on SIGTERM', () => proc.describe());
+    expect(ended.exitCode, proc.describe()).toBe(0);
+    // Every child and what it left behind is killed: each one's connection ends without a normal end.
+    await cargo.waitForDisconnects(running);
 
     // Nothing the dead worker held, a lock or a half-written answer, is in the next process's way.
     await cargo.leaveGrandchildren(false);
@@ -619,30 +720,26 @@ it("a worker that exits with callers waiting on two resolutions leaves none of C
 }, 60_000);
 
 // A standalone `smoo-nx-cargo-hash` has no handler of its own, so a signal would end it on the spot,
-// before any exit hook could take the Cargo it started along.
+// before any exit hook could take the Cargo it started along. The module forwards the signal to
+// Cargo's process group and then raises it again, so the command still ends by that signal.
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
   it(`a standalone smoo-nx-cargo-hash ended by ${signal} takes its cargo child and what the child left behind with it`, async () => {
     await withCannedWorkspace(async ({ workspace, cargo, answer, environment }) => {
       await answer('before');
       await cargo.leaveGrandchildren(true);
       await cargo.beforeAnswer.close();
-      const proc = Bun.spawn([process.execPath, cliModule, 'Cargo.toml'], {
-        cwd: workspace,
-        env: { ...process.env, ...environment },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      await eventually(async () => {
-        const runs = await cargo.runs();
-        return runs.read === 1 && runs.grandchildren.length === 1;
-      }, 'the cargo child to hold an answer');
-      const runs = await cargo.runs();
+      const proc = spawnDrained([process.execPath, cliModule, 'Cargo.toml'], workspace, environment);
+      const runs = await cargo.waitForRuns(
+        (held) => held.read === 1 && held.grandchildren.length === 1,
+        'the cargo child to hold an answer',
+      );
       const running = [...runs.pids, ...runs.grandchildren];
       for (const pid of running) expect(alive(pid)).toBe(true);
 
       proc.kill(signal);
-      await proc.exited;
-      await eventually(() => running.every((pid) => !alive(pid)), 'cargo and what it left behind to die');
+      const ended = await guardEvent(proc.ended, `smoo-nx-cargo-hash to end by ${signal}`, () => proc.describe());
+      expect(ended.signalCode, proc.describe()).toBe(signal);
+      await cargo.waitForDisconnects(running);
     });
   }, 30_000);
 }

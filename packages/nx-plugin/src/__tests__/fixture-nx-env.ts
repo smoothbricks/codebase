@@ -1,5 +1,7 @@
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { existsSync, watch } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { guardEvent } from './counted-cargo.js';
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
 const DAEMON_STOP_TIMEOUT_MS = 10_000;
@@ -49,25 +51,71 @@ export function fixtureNxEnv(workspace: string): Record<string, string> {
 export async function stopFixtureNxDaemon(workspace: string): Promise<void> {
   const record = join(workspace, '.nx/workspace-data/d/server-process.json');
   if (!existsSync(record)) return;
-  const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'daemon', '--stop'], {
-    cwd: workspace,
-    env: fixtureNxEnv(workspace),
-    stdout: 'pipe',
-    stderr: 'pipe',
+  // Subscribe before sending the stop request: an unlink is an event, not a delay to guess.
+  const subscription = watch(dirname(record));
+  const retirement = new Promise<Error | null>((resolve) => {
+    subscription.on('change', () => {
+      if (!existsSync(record)) resolve(null);
+    });
+    subscription.once('error', resolve);
+    if (!existsSync(record)) resolve(null);
   });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  if (exitCode !== 0) {
-    throw new Error(`nx daemon --stop failed for fixture ${workspace} with exit code ${exitCode}\n${stdout}${stderr}`);
-  }
-  const deadline = Date.now() + DAEMON_STOP_TIMEOUT_MS;
-  while (existsSync(record)) {
-    if (Date.now() > deadline) {
-      throw new Error(`Nx daemon of ${workspace} still recorded ${DAEMON_STOP_TIMEOUT_MS}ms after nx daemon --stop`);
+  let stdout = '';
+  let stderr = '';
+  try {
+    const child = spawn('bun', [join(repositoryRoot, 'node_modules/.bin/nx'), 'daemon', '--stop'], {
+      cwd: workspace,
+      env: fixtureNxEnv(workspace),
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.setEncoding('utf8').on('data', (text: string) => {
+      stdout += text;
+    });
+    child.stderr.setEncoding('utf8').on('data', (text: string) => {
+      stderr += text;
+    });
+    let spawnFailure: Error | null = null;
+    child.once('error', (error) => {
+      spawnFailure = error;
+    });
+    const ended = new Promise<number | null>((resolve) => {
+      child.once('close', (code) => resolve(code));
+    });
+    const describe = () =>
+      `fixture ${workspace}; stop pid ${child.pid ?? 'not started'}, exit ${child.exitCode ?? 'pending'}, ` +
+      `signal ${child.signalCode ?? 'none'}; daemon record ${existsSync(record) ? 'present' : 'removed'}\n${stdout}${stderr}`;
+    let exitCode: number | null;
+    try {
+      exitCode = await guardEvent(ended, 'nx daemon --stop to exit', describe);
+    } catch (error) {
+      if (child.pid !== undefined) {
+        try {
+          process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
+        } catch (killError) {
+          if (!(killError instanceof Error && 'code' in killError && killError.code === 'ESRCH')) {
+            throw new AggregateError(
+              [error, killError],
+              `could not stop the fixture's failed Nx command\n${describe()}`,
+            );
+          }
+        }
+      }
+      await ended;
+      throw error;
     }
-    await Bun.sleep(50);
+    if (spawnFailure !== null || exitCode !== 0) {
+      throw new Error(`nx daemon --stop failed with exit code ${exitCode}\n${describe()}`, { cause: spawnFailure });
+    }
+    const error = await guardEvent(
+      retirement,
+      'Nx daemon record to retire',
+      describe,
+      undefined,
+      DAEMON_STOP_TIMEOUT_MS,
+    );
+    if (error !== null) throw error;
+  } finally {
+    subscription.close();
   }
 }

@@ -1,5 +1,6 @@
 import { type ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { channel } from 'node:diagnostics_channel';
 import { constants, realpathSync, statSync } from 'node:fs';
 import {
   access,
@@ -21,6 +22,8 @@ import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 
 const { FileLock, IS_WASM, WorkspaceContext } = native;
+
+const cargoResolveEvents = channel('@smoothbricks/nx-plugin:cargo-resolve');
 
 /** The fields of `cargo metadata --format-version 1` this module reads. */
 interface CargoMetadata {
@@ -480,6 +483,7 @@ export async function readCargoResolve(
       const pending = state.pending;
       if (pending !== undefined) {
         if (joined === 3) break;
+        if (cargoResolveEvents.hasSubscribers) cargoResolveEvents.publish({ phase: 'join', manifest });
         try {
           await pending.promise;
         } catch (error) {

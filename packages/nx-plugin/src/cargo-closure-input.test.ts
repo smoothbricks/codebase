@@ -9,9 +9,12 @@ import { Watcher } from 'nx/src/native/index.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import {
   aggregateOf,
+  type CountedCargo,
   countedCargo,
   expectGraphRefusal,
+  guardEvent,
   rejectionOf,
+  waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
@@ -222,9 +225,6 @@ const LEAF_LINK = '[dependencies]\nunrelated={path="../unrelated"}\n';
 const crateFiles = (crates: string) =>
   `{workspaceRoot}/crates/${crates}/**/{*.rs,Cargo.toml,.cargo/config,.cargo/config.toml}`;
 
-/** Long enough that every caller of a pending resolution arrives before its child settles, even on a loaded host. */
-const HOLD_SECONDS = 1.5;
-
 /** One project-graph computation over the fixture: the plugin's `createNodes`, as Nx runs it for each recomputation. */
 function graphComputation(workspace: string) {
   const [, infer] = createNodesV2;
@@ -260,36 +260,35 @@ function leafControls(workspace: string, edit: (path: string, text: string) => P
   };
 }
 
-/**
- * Poll `condition` until it holds. The condition is another process's log:
- * a child Cargo names no event to await, so a fake clock cannot stand in for it.
- */
-async function until(condition: () => Promise<boolean>, what: string): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  while (!(await condition())) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await Bun.sleep(20);
-  }
-}
-
 it('shares one Cargo child among overlapping graph computations, and an unchanged workspace never asks Cargo again', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-overlap-')));
+  let fixtureCargo: CountedCargo | undefined;
   try {
     const { workspace, edit } = await closureFixture(root);
     const { linkLeaf, relock } = leafControls(workspace, edit);
     const cargo = await countedCargo(root);
+    fixtureCargo = cargo;
     const graph = graphComputation(workspace);
     resetWorkspaceContext();
     await withEnvironment(cargo.environment, async () => {
       // Watcher events start computations while earlier ones still run: here sixteen at once, over a
       // workspace nobody has resolved, each Cargo child holding its answer so that a child per
       // computation would certainly overlap. One child answers all of them.
-      await cargo.holdFor(HOLD_SECONDS);
-      const overlapping = await Promise.all(Array.from({ length: 16 }, graph));
+      await cargo.beforeAnswer.close();
+      const joins = waitForCargoJoins(join(workspace, 'Cargo.toml'), 15);
+      let overlapping: CreateNodesResultV2[];
+      try {
+        const computations = Array.from({ length: 16 }, graph);
+        await cargo.waitForRuns((runs) => runs.read === 1, 'the shared Cargo answer');
+        await joins.joined;
+        await cargo.beforeAnswer.open();
+        overlapping = await Promise.all(computations);
+      } finally {
+        joins.dispose();
+      }
       const overlapped = await cargo.runs();
       expect(overlapped.spawned).toBe(1);
       expect(overlapped.peak).toBe(1);
-      await cargo.holdFor(0);
 
       const baseline = byFile(await graph());
       for (const computed of overlapping) expect(byFile(computed)).toEqual(baseline);
@@ -311,16 +310,19 @@ it('shares one Cargo child among overlapping graph computations, and an unchange
       expect(settled.peak).toBe(1);
     });
   } finally {
+    await fixtureCargo?.release();
     await rm(root, { recursive: true, force: true });
   }
 }, 120_000);
 
 it('refuses with a typed error what Cargo refuses, and follows an edit made while a child holds its answer with a resolution after it', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-pending-')));
+  let fixtureCargo: CountedCargo | undefined;
   try {
     const { workspace, edit } = await closureFixture(root);
     const { linkLeaf, relock } = leafControls(workspace, edit);
     const cargo = await countedCargo(root);
+    fixtureCargo = cargo;
     const graph = graphComputation(workspace);
     const baselineLock = await readFile(join(workspace, 'Cargo.lock'), 'utf8');
     resetWorkspaceContext();
@@ -341,12 +343,12 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
       // A computation that asks while a child holds its answer waits for that child. One that asks
       // after an edit made since the child read the workspace does not take that answer for the edited
       // workspace's: a resolution follows the first, never beside it.
-      await cargo.holdFor(HOLD_SECONDS);
+      await cargo.beforeAnswer.close();
       await linkLeaf(false);
       await writeFile(join(workspace, 'Cargo.lock'), baselineLock);
       const before = await cargo.runs();
       const early = graph();
-      await until(async () => (await cargo.runs()).read > before.read, 'the running Cargo child to read the workspace');
+      await cargo.waitForRuns((runs) => runs.read > before.read, 'the running Cargo child to read the workspace');
       // Use content the successful cache has never seen; restoring the repaired
       // content would correctly reuse that entry after discarding the held answer.
       await edit(
@@ -354,7 +356,14 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
         (LEAF_MANIFEST + LEAF_LINK).replace('version="0.1.0"', 'version="0.2.0"'),
       );
       relock();
+      const joins = waitForCargoJoins(join(workspace, 'Cargo.toml'), 1);
       const late = graph();
+      try {
+        await joins.joined;
+      } finally {
+        joins.dispose();
+      }
+      await cargo.beforeAnswer.open();
       expect(byFile(await late)).toEqual(repaired);
       // The early computation began before the edit: it saw the workspace on either side of it.
       expect([baseline, repaired]).toContainEqual(byFile(await early));
@@ -363,11 +372,11 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
       expect(shared.peak).toBe(1);
 
       // Nothing is pending once both have settled, and nothing has changed since.
-      await cargo.holdFor(0);
       expect(byFile(await graph())).toEqual(repaired);
       expect((await cargo.runs()).spawned).toBe(shared.spawned);
     });
   } finally {
+    await fixtureCargo?.release();
     await rm(root, { recursive: true, force: true });
   }
 }, 120_000);
@@ -403,14 +412,15 @@ const SOURCE_FILE = 'src/lib.rs';
  * a supervisor's pid file) beside a source file that changes every round. This is
  * the watcher Nx's daemon subscribes to the workspace with: it recomputes the
  * project graph for each batch of events it reports, with no filter of its
- * own. The writes continue for a few rounds after the source file is first
- * reported, so runtime state that is going to be reported has had its chance.
+ * own. Each round advances on its unique source file's native callback, not
+ * on a guessed subscription or debounce delay.
  */
 async function watchedPaths(nxignore: string): Promise<string[]> {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-watch-')));
   const reported = new Set<string>();
   const failures: string[] = [];
   let watcher: Watcher | undefined;
+  let pending: { path: string; resolve(): void; reject(error: Error): void } | undefined;
   try {
     execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
     await writeFile(join(root, '.nxignore'), nxignore);
@@ -418,25 +428,36 @@ async function watchedPaths(nxignore: string): Promise<string[]> {
     await mkdir(join(root, '.cowshed/cache/nx/workspace-data/d'), { recursive: true });
     await mkdir(join(root, '.cowshed/run'), { recursive: true });
     watcher = new Watcher(root);
+    // Native watch() registers the filesystem subscription synchronously.
     watcher.watch((error, events) => {
-      if (error !== null) failures.push(error);
-      for (const event of events) reported.add(event.path);
+      if (error !== null) {
+        failures.push(error);
+        pending?.reject(new Error(error));
+      }
+      for (const event of events) {
+        reported.add(event.path);
+        if (event.path === pending?.path) {
+          pending.resolve();
+          pending = undefined;
+        }
+      }
     });
-    const deadline = Date.now() + 30_000;
-    for (let round = 0, settling = 5; settling > 0; round += 1) {
-      if (Date.now() > deadline) throw new Error(`the watcher reported nothing of ${SOURCE_FILE} in 30s`);
-      await appendFile(join(root, '.cowshed/cache/nx/workspace-data/d/daemon.log'), `round ${round}\n`);
-      await mkdir(join(root, '.cowshed/job', String(round)), { recursive: true });
-      await writeFile(join(root, '.cowshed/job', String(round), 'stdout.log'), `round ${round}\n`);
-      await writeFile(join(root, '.cowshed/run/supervisor.pid'), `${round}\n`);
-      await writeFile(join(root, SOURCE_FILE), `pub fn round() -> u8 { ${round % 200} }\n`);
-      // The watcher announces nothing when its subscription is live, and
-      // writes made before it are never reported: the round repeats on the
-      // platform clock until the source file is seen.
-      await Bun.sleep(100);
-      // What the debounce still holds, without waiting for it.
+    for (let round = 0; round < 5; round += 1) {
+      const source = round === 0 ? SOURCE_FILE : `src/round-${round}.rs`;
+      const observed = new Promise<void>((resolve, reject) => {
+        pending = { path: source, resolve, reject };
+      });
+      const writes = (async () => {
+        await appendFile(join(root, '.cowshed/cache/nx/workspace-data/d/daemon.log'), `round ${round}\n`);
+        await mkdir(join(root, '.cowshed/job', String(round)), { recursive: true });
+        await writeFile(join(root, '.cowshed/job', String(round), 'stdout.log'), `round ${round}\n`);
+        await writeFile(join(root, '.cowshed/run/supervisor.pid'), `${round}\n`);
+        await writeFile(join(root, source), `pub fn round() -> u8 { ${round} }\n`);
+      })();
+      await guardEvent(Promise.all([observed, writes]), `native watcher callback for ${source}`, () =>
+        JSON.stringify({ pending: pending?.path, reported: [...reported], failures }),
+      );
       for (const event of watcher.forceFlushPending()) reported.add(event.path);
-      if (reported.has(SOURCE_FILE)) settling -= 1;
     }
     expect(failures).toEqual([]);
     return [...reported].sort();

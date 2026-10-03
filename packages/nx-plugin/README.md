@@ -132,6 +132,11 @@ kills the whole process group, including wrapper descendants. Standalone callers
 signals to their owned groups. An uncatchable `SIGKILL` cannot run an exit hook; the kernel still releases its file
 lock.
 
+The `@smoothbricks/nx-plugin:cargo-resolve` diagnostics channel reports `{ phase: "join", manifest }` when a caller
+joins an existing flight. With no subscribers, inference neither allocates nor publishes an event. The cache regressions
+use this readiness signal and Cargo control-channel events to prove concurrency and child teardown without sleep-based
+timing assumptions; their outer hang guards report still-open test spans and process/gate state.
+
 Keep workspace-owned runtime state outside Nx's source index. In a cowshed workspace, the root `.nxignore` must include
 `.cowshed/`: Nx's watcher reads the root ignore files, not Git's `.git/info/exclude`. Watching the daemon's own log,
 plugin sockets or job records turns each graph computation into another file event and another graph computation.
