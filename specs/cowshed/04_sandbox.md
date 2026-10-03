@@ -344,7 +344,10 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle, and the store-wide readers refuse
   any two live blocks that share a port. It is allocated at new/fork (adopt, for main), preserved across restore, never
   inherited by a fork, and omitted on Linux. Linux records no synthetic port alias; its per-workspace Unix gateway
-  socket and private loopback namespace are runtime topology, not grant authority.
+  socket and private loopback namespace are runtime topology, not grant authority. Unpublished allocations claim every
+  initial-size 64-port grid cell they touch, even when a legacy 16-port block grows into an upper-half 32-port block.
+  Cell claims and newly owned kernel listeners stay held through the authoritative inventory re-read and durable grant
+  publication.
 - **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
   block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
   least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the

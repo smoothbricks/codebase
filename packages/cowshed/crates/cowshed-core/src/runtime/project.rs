@@ -2003,7 +2003,8 @@ async fn reserve_port_grant_replacement(
     };
     // Own every covered initial-size grid cell before publication: a smaller allocator
     // cannot claim a block in the middle of a larger allocation.
-    for base in (block.base()..block.base() + block.size())
+    let claim_base = block.base() - block.base() % crate::metadata::NEW_PORT_BLOCK_SIZE;
+    for base in (claim_base..block.base() + block.size())
         .step_by(usize::from(crate::metadata::NEW_PORT_BLOCK_SIZE))
     {
         let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
@@ -15791,6 +15792,47 @@ mod port_reservation_tests {
             assert_eq!(grants.retained_port_blocks, [second]);
         }
         grants.validate(Platform::Macos).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_growth_claims_the_containing_initial_size_grid_cell() {
+        let root = root("legacy-growth-claim");
+        let (inventory, _) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let mut initial = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("find a free initial-size grid cell");
+        let grid_base = initial.grants.port_block.unwrap().base();
+        let target = PortBlock::new(grid_base + 32, 32).unwrap();
+        let mut owned =
+            GrantSet::closed_baseline(Some(PortBlock::new(grid_base + 48, 16).unwrap())).unwrap();
+        owned
+            .retained_port_blocks
+            .push(PortBlock::new(grid_base + 32, 16).unwrap());
+        owned.validate(Platform::Macos).unwrap();
+        // Keep legacy services bound through growth without an unbound handoff.
+        let old_listeners = initial
+            .listeners
+            .drain(..)
+            .filter(|listener| listener.local_addr().unwrap().port() >= target.base())
+            .collect::<Vec<_>>();
+        drop(initial);
+        let grown = reserve_grown_port_grants(&inventory, &staging, &owned, 32)
+            .await
+            .expect("grow a legacy 16-port block into its containing 32-port block");
+        assert_eq!(grown.grants.port_block, Some(target));
+        let probe = claim_port_block(&staging, grid_base).unwrap();
+        let common_cell_claimed = probe.is_none();
+        if let Some(marker) = probe {
+            std::fs::remove_file(marker).unwrap();
+        }
+        drop(grown);
+        drop(old_listeners);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            common_cell_claimed,
+            "legacy growth must fence the same 64-port grid cell as a new allocator"
+        );
     }
 
     #[tokio::test]
