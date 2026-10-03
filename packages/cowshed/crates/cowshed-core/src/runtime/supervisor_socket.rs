@@ -495,7 +495,7 @@ pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapsh
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
-    listener: UnixListener,
+    pub(super) listener: UnixListener,
     _lease: std::fs::File,
     path: PathBuf,
     device: u64,

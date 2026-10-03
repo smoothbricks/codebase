@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use super::supervisor::WorkspaceAuthoritySnapshot;
@@ -692,10 +692,13 @@ pub async fn stop_other_build(socket: &Path) -> Result<u32> {
     Ok(pid)
 }
 
-/// Serve ensures on `listener` for as long as the daemon runs.
-pub async fn serve(listener: UnixListener, manager: Arc<SupervisorManager>) -> Result<()> {
+/// Serve ensures while holding the manager's bound socket and exclusive listener lease.
+pub async fn serve(
+    socket: supervisor_socket::BoundSocket,
+    manager: Arc<SupervisorManager>,
+) -> Result<()> {
     loop {
-        let (stream, _) = listener.accept().await.map_err(|error| {
+        let (stream, _) = socket.listener.accept().await.map_err(|error| {
             CowshedError::environment_missing(
                 format!("the supervisor manager stopped accepting: {error}"),
                 "restart the gateway with `cowshed gateway start`",
@@ -795,6 +798,7 @@ pub async fn ensure(
 mod tests {
     use std::io::Read as _;
     use std::os::fd::IntoRawFd as _;
+    use tokio::net::UnixListener;
 
     use super::*;
 
