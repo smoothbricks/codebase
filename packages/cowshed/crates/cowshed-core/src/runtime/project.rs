@@ -12753,6 +12753,13 @@ mod retired_recovery_tests {
         fn attached_disk_images(&self) -> std::io::Result<Vec<crate::apfs::AttachedDiskImage>> {
             panic!("reclaiming a detached retired image read the kernel disk-image inventory");
         }
+        fn grow_image(
+            &self,
+            image: &Path,
+            _: crate::metadata::ImageCapacity,
+        ) -> std::io::Result<()> {
+            panic!("reclaiming a detached retired image grew an image: {image:?}");
+        }
     }
 
     /// `doctor` opens the project to inspect it. Its open must leave a retired image where it is

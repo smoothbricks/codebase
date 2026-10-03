@@ -4060,10 +4060,11 @@ where
             .mounts()?
             .into_iter()
             .any(|mount| mount.mount_point == mount_point);
-        // `diskutil image resize` grows only an image nothing holds; an attached one is answered
-        // with a bare `Resource busy`. Releasing the workspace's mount releases the attachment
-        // behind it, but an attachment with nothing mounted at the workspace's mount point is not
-        // that mount's to release, so it is refused here, before anything is detached.
+        // An image grows only while nothing holds it: an attachment keeps its file under an
+        // exclusive lock, and the grow refuses it as `EWOULDBLOCK`. Releasing the workspace's
+        // mount releases the attachment behind it, but an attachment with nothing mounted at the
+        // workspace's mount point is not that mount's to release, so it is refused here, before
+        // anything is detached.
         if !was_mounted && let Some(device) = self.attached_device(image)? {
             return Err(attached_without_mount(
                 image,
@@ -4089,8 +4090,12 @@ where
         }
 
         self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
-        // A refused resize leaves the image an image — untouched, or grown — so a workspace that
-        // was mounted goes back on its mount rather than staying detached over the failure.
+        // Growth is two owned steps: the detached image's header grows first, then its container
+        // grows through a verified attachment. A refused header grow leaves the image untouched,
+        // so a workspace that was mounted goes back on its mount rather than staying detached
+        // over the failure. A process killed between the steps leaves the image grown under its
+        // old container: nothing is lost, the same capacity is then refused as not growing, and
+        // any larger resize grows both.
         if let Err(primary) = self.backend.resize_image(image, capacity) {
             let primary = ApfsStorageError::from(primary);
             return Err(if was_mounted {

@@ -154,6 +154,20 @@ pub trait CommandRunner {
     /// release that never happened and lost a mounted workspace's identity on restart. The
     /// kernel's matching snapshot is taken under the registry's own consistency check.
     fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>>;
+    /// Grow a detached ASIF image's virtual disk to `capacity` by rewriting the one header field
+    /// that records it, and nothing else.
+    ///
+    /// `diskutil image resize` grows the same field, but on an image whose APFS container spans
+    /// the whole device (no partition map, so `--image-only` is refused) it also attaches the
+    /// image itself to grow the filesystem, then detaches it: an attachment no image lease,
+    /// ownership proof or raw pin covers, which reported `ENOENT` after completing while other
+    /// resizes ran. Growing the header here leaves the container to cowshed's own verified
+    /// attachment ([`ApfsBackend::grow_container`]). Measured on macOS 26: a successful
+    /// `--image-only` resize changes exactly the header's sector count, and an image grown that
+    /// way attaches at the new size and its container grows to fill it.
+    ///
+    /// Recording runners script or refuse it explicitly; production never falls back to diskutil.
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()>;
 }
 
 /// The bound every spawned disk child (attach/detach, inventory, mount) answers inside.
@@ -273,6 +287,140 @@ impl CommandRunner for SystemCommandRunner {
                 "attached disk images are read from the macOS I/O Registry",
             ))
         }
+    }
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            asif::grow(image, capacity)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (image, capacity);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ASIF images exist only on macOS",
+            ))
+        }
+    }
+}
+
+/// ASIF version-1 header growth: the fields a grow reads are all big-endian (huven/asif-format,
+/// "ASIF binary specification", header version 1; Apple publishes no layout) — the `shdw` magic
+/// at 0x00, the version at 0x04, the header length at 0x08, the virtual disk's 512-byte sector
+/// count at 0x30 and the largest sector count the image accepts at 0x38. Directories and tables
+/// are sized from the maximum, never from the current count, so growing within the maximum
+/// changes nothing but the count — measured: Apple's own `--image-only` grow changes exactly those
+/// eight bytes.
+#[cfg(target_os = "macos")]
+mod asif {
+    use crate::metadata::ImageCapacity;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    use std::path::Path;
+
+    pub(super) const MAGIC: [u8; 4] = *b"shdw";
+    pub(super) const MAGIC_AT: u64 = 0x00;
+    pub(super) const VERSION: u32 = 1;
+    pub(super) const VERSION_AT: u64 = 0x04;
+    pub(super) const HEADER_LENGTH: u32 = 0x200;
+    pub(super) const HEADER_LENGTH_AT: u64 = 0x08;
+    pub(super) const SECTOR_COUNT_AT: u64 = 0x30;
+    pub(super) const MAX_SECTOR_COUNT_AT: u64 = 0x38;
+    const SECTOR_BYTES: u64 = 512;
+    /// `diskutil image resize` rounds every size to this block; a grow never asks for less.
+    const GROW_BLOCK: u64 = 4096;
+
+    /// The header fields a grow decides from, as read from the image.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct Header {
+        pub(super) magic: [u8; 4],
+        pub(super) version: u32,
+        pub(super) length: u32,
+        pub(super) sector_count: u64,
+        pub(super) max_sector_count: u64,
+    }
+
+    impl Header {
+        /// Positional reads of exactly the fields used; a short file is `UnexpectedEof`.
+        pub(super) fn read(file: &File) -> io::Result<Self> {
+            fn field<const N: usize>(file: &File, at: u64) -> io::Result<[u8; N]> {
+                let mut bytes = [0; N];
+                file.read_exact_at(&mut bytes, at)?;
+                Ok(bytes)
+            }
+            Ok(Self {
+                magic: field(file, MAGIC_AT)?,
+                version: u32::from_be_bytes(field(file, VERSION_AT)?),
+                length: u32::from_be_bytes(field(file, HEADER_LENGTH_AT)?),
+                sector_count: u64::from_be_bytes(field(file, SECTOR_COUNT_AT)?),
+                max_sector_count: u64::from_be_bytes(field(file, MAX_SECTOR_COUNT_AT)?),
+            })
+        }
+
+        /// The sector count growing this image to `capacity` writes, or why it is refused: an
+        /// unrecognized header, a size off the 4 KiB grid, one that does not grow, or one past
+        /// the image's own maximum. Pure; nothing is written unless this answers.
+        pub(super) fn grown_sector_count(&self, capacity: ImageCapacity) -> io::Result<u64> {
+            if self.magic != MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "not an ASIF image: the header has no `shdw` magic",
+                ));
+            }
+            if self.version != VERSION || self.length != HEADER_LENGTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unrecognized ASIF header: version {}, length {:#x}; expected \
+                         {VERSION}, {HEADER_LENGTH:#x}",
+                        self.version, self.length
+                    ),
+                ));
+            }
+            let bytes = capacity.bytes();
+            if !bytes.is_multiple_of(GROW_BLOCK) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{capacity} is not a whole number of {GROW_BLOCK}-byte blocks"),
+                ));
+            }
+            let requested = bytes / SECTOR_BYTES;
+            if requested <= self.sector_count || requested > self.max_sector_count {
+                let size =
+                    |sectors: u64| ImageCapacity::from_bytes(sectors.saturating_mul(SECTOR_BYTES));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{capacity} must exceed the image's {} and stay within its {} maximum",
+                        size(self.sector_count),
+                        size(self.max_sector_count)
+                    ),
+                ));
+            }
+            Ok(requested)
+        }
+    }
+
+    /// Rewrite a detached image's eight-byte sector count in place, and nothing else.
+    ///
+    /// The image driver holds an attached image's file under an exclusive lock (01_storage.md: a
+    /// second `O_SHLOCK`/`O_EXLOCK` open fails with `EAGAIN`), so the non-blocking `O_EXLOCK`
+    /// open is the detached precondition itself: any attachment — cowshed's, one another tool
+    /// made, another user's — refuses it with `EWOULDBLOCK` instead of being raced, and holding
+    /// the lock keeps every attach out until the write is durable. The power-loss flush comes
+    /// before the descriptor closes: the container grows on top of this size once the image is
+    /// attached again, and a lost count beneath a grown container would describe a smaller disk
+    /// than the filesystem on it.
+    pub(super) fn grow(image: &Path, capacity: ImageCapacity) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(image)?;
+        let grown = Header::read(&file)?.grown_sector_count(capacity)?;
+        file.write_all_at(&grown.to_be_bytes(), SECTOR_COUNT_AT)?;
+        crate::fsio::Durability::PowerLoss.sync_file(&file)
     }
 }
 
@@ -1054,7 +1202,8 @@ pub trait ApfsBackend {
     fn delete_image(&self, image: &Path) -> Result<(), ApfsError>;
     /// The capacity a detached image currently holds, read from its own resize limits.
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
-    /// Grow a detached image, and the partition and container inside it, to `capacity`.
+    /// Grow a detached image's virtual disk to `capacity`. Only the image grows: the container
+    /// inside it grows afterwards through an owned, verified attachment ([`Self::grow_container`]).
     fn resize_image(&self, image: &Path, capacity: ImageCapacity) -> Result<(), ApfsError>;
     /// Grow the APFS container an attachment exposes until it spans the whole image.
     fn grow_container(&self, attachment: &AttachedImage) -> Result<(), ApfsError>;
@@ -1916,17 +2065,16 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
 
     fn resize_image(&self, image: &Path, capacity: ImageCapacity) -> Result<(), ApfsError> {
         validate_image_path(image)?;
-        let request = CommandRequest::new(
-            DISKUTIL,
-            [
-                OsString::from("image"),
-                OsString::from("resize"),
-                OsString::from("--size"),
-                OsString::from(capacity_argument(capacity)),
-                image.as_os_str().to_owned(),
-            ],
-        );
-        self.run_checked("resize image", request).map(|_| ())
+        let _lease = self.image_lease(image)?;
+        timed_apfs_step(apfs_step_leg(image), "grow-image", || {
+            self.runner
+                .grow_image(image, capacity)
+                .map_err(|source| ApfsError::FileOperation {
+                    operation: "grow ASIF image",
+                    path: image.to_owned(),
+                    source,
+                })
+        })
     }
 
     fn grow_container(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
@@ -2899,6 +3047,7 @@ mod tests {
     enum Reply {
         Command(CommandOutput),
         Inventory(io::Result<Vec<AttachedDiskImage>>),
+        Grow(io::Result<()>),
     }
 
     /// One thing the backend asked the host, in order.
@@ -2906,6 +3055,7 @@ mod tests {
     enum Seen {
         Command(CommandRequest),
         Inventory,
+        Grow(PathBuf, ImageCapacity),
     }
 
     impl Seen {
@@ -2913,6 +3063,7 @@ mod tests {
             match self {
                 Self::Command(request) => request,
                 Self::Inventory => panic!("expected a command, saw the kernel inventory read"),
+                Self::Grow(image, _) => panic!("expected a command, saw {} grow", image.display()),
             }
         }
     }
@@ -2922,7 +3073,7 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 Seen::Command(request) => Some(request.clone()),
-                Seen::Inventory => None,
+                Seen::Inventory | Seen::Grow(..) => None,
             })
             .collect()
     }
@@ -2974,6 +3125,12 @@ mod tests {
             match self.next_reply(Seen::Inventory) {
                 Reply::Inventory(images) => images,
                 other => panic!("test scripted {other:?} where the kernel inventory was read"),
+            }
+        }
+        fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
+            match self.next_reply(Seen::Grow(image.to_owned(), capacity)) {
+                Reply::Grow(result) => result,
+                other => panic!("test scripted {other:?} where {} grew", image.display()),
             }
         }
     }
@@ -3199,6 +3356,9 @@ mod tests {
                     )
                 })
                 .collect())
+        }
+        fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
+            panic!("creation never grows an image: {}", image.display());
         }
     }
 
@@ -4601,6 +4761,37 @@ mod tests {
         finish_real_image_test(result, cleanup);
     }
 
+    /// A real attachment holds its image file exclusively, so growing it is refused outright and
+    /// nothing is written; once detached, the grow lands and Apple's own limits report it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_grow_refuses_an_attached_image_and_lands_once_detached() {
+        let stem = temp_path("real-asif-grow", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let mut cleanup = RealImageCleanup::new(&backend, image);
+        let result = (|| -> Result<(), ApfsError> {
+            let created =
+                backend.create_staged_image(&lease_test_image(stem, "cowshed-asif-grow"))?;
+            let attachment = cleanup.track(backend.attach_verified(&created)?);
+            let refused = SystemCommandRunner
+                .grow_image(&created, capacity("128m"))
+                .expect_err("an attached image's file is held exclusively");
+            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
+            assert!(matches!(
+                backend.resize_image(&created, capacity("128m")),
+                Err(ApfsError::FileOperation { operation: "grow ASIF image", source, .. })
+                    if source.kind() == io::ErrorKind::WouldBlock
+            ));
+            backend.detach(attachment, DetachIntent::Release)?;
+            assert_eq!(backend.image_capacity(&created)?, capacity("64m"));
+            backend.resize_image(&created, capacity("128m"))?;
+            assert_eq!(backend.image_capacity(&created)?, capacity("128m"));
+            Ok(())
+        })();
+        finish_real_image_test(result, cleanup);
+    }
+
     /// One identity's lease excludes every other holder of that identity — another descriptor
     /// in this very process included — while other identities stay free, a contended holder is
     /// handed the lease only after its release, and a wait that outlives its bound fails naming
@@ -5217,27 +5408,25 @@ mod tests {
       <key>min</key><integer>20971520</integer>
     </dict></plist>"#;
 
+    /// Limits are still diskutil's to report, but growing spawns nothing: the image's own header
+    /// is grown through the runner seam, never by `diskutil image resize`, whose content resize
+    /// attaches the image outside every ownership check.
     #[test]
-    fn asif_resize_uses_the_diskutil_image_verbs_for_both_limits_and_growth() {
+    fn asif_limits_come_from_diskutil_and_growth_spawns_no_disk_command() {
         let image = Path::new("/tmp/cowshed-resize/main.asif");
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             ok(ASIF_RESIZE_LIMITS_PLIST),
-            ok([]),
+            Reply::Grow(Ok(())),
         ]));
 
         assert_eq!(backend.image_capacity(image).unwrap(), capacity("100g"));
         backend.resize_image(image, capacity("200g")).unwrap();
 
-        let requests = backend.runner().requests();
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].command().program, Path::new(DISKUTIL));
         assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.program.as_path())
-                .collect::<Vec<_>>(),
-            [Path::new(DISKUTIL), Path::new(DISKUTIL)]
-        );
-        assert_eq!(
-            argv(&requests[0]),
+            argv(steps[0].command()),
             [
                 "image",
                 "resize",
@@ -5245,16 +5434,190 @@ mod tests {
                 "/tmp/cowshed-resize/main.asif"
             ]
         );
-        assert_eq!(
-            argv(&requests[1]),
-            [
-                "image",
-                "resize",
-                "--size",
-                "214748364800",
-                "/tmp/cowshed-resize/main.asif"
-            ]
+        assert_eq!(steps[1], Seen::Grow(image.to_owned(), capacity("200g")));
+    }
+
+    /// A refused grow is the operation's failure, typed and naming the image, never a success.
+    #[test]
+    fn a_refused_grow_is_a_typed_failure_naming_the_image() {
+        let image = Path::new("/tmp/cowshed-resize/main.asif");
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([Reply::Grow(Err(
+            io::Error::from_raw_os_error(libc::EWOULDBLOCK),
+        ))]));
+
+        let error = backend
+            .resize_image(image, capacity("200g"))
+            .expect_err("an attached image cannot grow");
+        assert!(
+            matches!(
+                &error,
+                ApfsError::FileOperation { operation: "grow ASIF image", path, source }
+                    if path == image && source.kind() == io::ErrorKind::WouldBlock
+            ),
+            "{error}"
         );
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    /// A version-1 header as the measured images carry it: 1 GiB of 512-byte sectors, the
+    /// 4 PiB maximum, and recognizable bytes in every field a grow must leave alone.
+    #[cfg(target_os = "macos")]
+    fn synthetic_asif(label: &str) -> (PathBuf, Vec<u8>) {
+        let mut bytes: Vec<u8> = (0..=250_u8).cycle().take(4096).collect();
+        bytes[0..4].copy_from_slice(b"shdw");
+        bytes[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&0x200_u32.to_be_bytes());
+        bytes[0x30..0x38].copy_from_slice(&0x0020_0000_u64.to_be_bytes());
+        bytes[0x38..0x40].copy_from_slice(&0x0800_0000_0000_u64.to_be_bytes());
+        let path = temp_path(label, IMAGE_EXTENSION);
+        fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn asif_grow_rewrites_only_the_eight_byte_sector_count() {
+        let (image, before) = synthetic_asif("grow-sector-count");
+        SystemCommandRunner
+            .grow_image(&image, capacity("2g"))
+            .expect("a valid header grows");
+        let after = fs::read(&image).unwrap();
+        assert_eq!(after.len(), before.len());
+        let changed: Vec<usize> = (0..after.len())
+            .filter(|&index| after[index] != before[index])
+            .collect();
+        assert!(
+            changed.iter().all(|index| (0x30..0x38).contains(index)),
+            "{changed:?}"
+        );
+        assert_eq!(after[0x30..0x38], 0x0040_0000_u64.to_be_bytes());
+        fs::remove_file(image).unwrap();
+    }
+
+    /// Every refusal is decided before the write: the file is byte-for-byte what it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn asif_grow_refusals_leave_every_byte_unchanged() {
+        type Mutation = fn(&mut Vec<u8>);
+        let cases: [(&str, Mutation, ImageCapacity, io::ErrorKind); 8] = [
+            (
+                "magic",
+                |bytes| bytes[0] = b'x',
+                capacity("2g"),
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                "version",
+                |bytes| bytes[4..8].copy_from_slice(&2_u32.to_be_bytes()),
+                capacity("2g"),
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                "length",
+                |bytes| bytes[8..12].copy_from_slice(&0x400_u32.to_be_bytes()),
+                capacity("2g"),
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                "short",
+                |bytes| bytes.truncate(0x34),
+                capacity("2g"),
+                io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                "unaligned",
+                |_| {},
+                ImageCapacity::from_bytes(2 * ImageCapacity::GIBIBYTE + 512),
+                io::ErrorKind::InvalidInput,
+            ),
+            ("equal", |_| {}, capacity("1g"), io::ErrorKind::InvalidInput),
+            (
+                "shrink",
+                |_| {},
+                capacity("512m"),
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                "past-maximum",
+                |bytes| bytes[0x38..0x40].copy_from_slice(&0x0030_0000_u64.to_be_bytes()),
+                capacity("2g"),
+                io::ErrorKind::InvalidInput,
+            ),
+        ];
+        for (label, mutate, requested, kind) in cases {
+            let (image, mut bytes) = synthetic_asif(&format!("grow-refused-{label}"));
+            mutate(&mut bytes);
+            fs::write(&image, &bytes).unwrap();
+            let error = SystemCommandRunner
+                .grow_image(&image, requested)
+                .expect_err(label);
+            assert_eq!(error.kind(), kind, "{label}: {error}");
+            assert_eq!(fs::read(&image).unwrap(), bytes, "{label} wrote");
+            fs::remove_file(image).unwrap();
+        }
+    }
+
+    /// The image driver holds an attached image's file under an exclusive lock; another
+    /// exclusive holder stands in for it here, and the grow refuses without writing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn asif_grow_refuses_a_file_another_descriptor_holds_exclusively() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (image, before) = synthetic_asif("grow-exclusive");
+        let holder = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK)
+            .open(&image)
+            .unwrap();
+        let error = SystemCommandRunner
+            .grow_image(&image, capacity("2g"))
+            .expect_err("a held image cannot grow");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        drop(holder);
+        assert_eq!(fs::read(&image).unwrap(), before);
+        fs::remove_file(image).unwrap();
+    }
+
+    /// Growth happens under the image's own production lease, so no cooperating attach,
+    /// format or detach of the same image can interleave with the header write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resize_image_grows_while_holding_the_image_lease() {
+        struct LeaseProbe {
+            held_while_growing: std::cell::Cell<bool>,
+        }
+        impl CommandRunner for LeaseProbe {
+            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+                panic!("growing spawned {request:?}");
+            }
+            fn image_lease(&self, identity: &Path) -> io::Result<Option<File>> {
+                SystemCommandRunner.image_lease(identity)
+            }
+            fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>> {
+                panic!("growing pinned {}", device.display());
+            }
+            fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+                panic!("growing read the attachment inventory");
+            }
+            fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
+                let identity = attachment_inventory_path(image).expect("identity");
+                let probe = open_image_lease(&image_lease_path(&identity)?)?;
+                let contended = lock_file(&probe, libc::LOCK_EX | libc::LOCK_NB)
+                    .err()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+                self.held_while_growing.set(contended);
+                Ok(())
+            }
+        }
+
+        let image = attachment_inventory_path(&temp_path("grow-leased", IMAGE_EXTENSION)).unwrap();
+        let backend = MacOsApfsBackend::new(LeaseProbe {
+            held_while_growing: std::cell::Cell::new(false),
+        });
+        backend.resize_image(&image, capacity("2g")).unwrap();
+        assert!(backend.runner().held_while_growing.get());
+        fs::remove_file(image_lease_path(&image).unwrap()).unwrap();
     }
 
     #[test]

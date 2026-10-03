@@ -39,6 +39,16 @@ impl CommandRunner for StubRunner {
     fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_core::apfs::AttachedDiskImage>> {
         Ok(Vec::new())
     }
+    fn grow_image(
+        &self,
+        image: &std::path::Path,
+        _: cowshed_core::metadata::ImageCapacity,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("the deletion-log stub grows no image: {}", image.display()),
+        ))
+    }
 }
 
 struct Fixture {

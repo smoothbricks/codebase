@@ -171,6 +171,17 @@ every clone automatically). Main and sessions use identical wiring; only the san
   before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next
   `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
   (the gateway keeps them mounted), so no path rewrites main on its own.
+- **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open proves no image driver
+  holds the file and excludes attachment until the write is durable. Validate the ASIF v1 `shdw` header, version 1,
+  length `0x200`, 4 KiB alignment, and a strictly larger capacity within the header's maximum sector count (`0x38`);
+  rewrite only the eight-byte big-endian 512-byte sector count at `0x30`, then power-loss flush before closing.
+  Directories and chunk tables are sized from the maximum, not the current count
+  ([format specification](https://github.com/huven/asif-format)); Apple publishes no layout.
+  `diskutil image resize --plist` only reads limits. Its content resize secretly attaches the image outside cowshed's
+  ownership check and pin, and concurrent resizes were observed exiting `ENOENT` after completing. Cowshed instead
+  attaches and verifies its own image, grows the container with `diskutil apfs resizeContainer`, and checks kernel
+  capacity. A crash between the header and container growth leaves a larger image around the old container:
+  equal-capacity resize is refused, while a larger resize completes both steps, as in the previous two-phase path.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
@@ -228,6 +239,8 @@ round by round.
 | Work per `new` for case sensitivity                                      | none                                                                              | none                                                                     | none                                                             |
 | Largest capacity (documented / reverse-engineered)                       | just under 4 PiB                                                                  | just under 4 PiB                                                         | 128 PB (`man hdiutil`)                                           |
 | Host dies mid-write (docs)                                               | allocation directory is versioned and switched atomically                         | allocation directory is versioned and switched atomically                | power loss during `compact` can damage the image (`man hdiutil`) |
+
+The detached-grow timings above measured Apple's content resize, before the native header-growth cutover.
 
 ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
 (<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
@@ -298,26 +311,25 @@ Disk device names are reusable, not image identities. Each image has its own pri
 single-link file, opened without following symlinks, in a 0700 directory this user owns. The identity is the absolute
 path produced by `attachment_inventory_path`, matched against the kernel's `DiskImageURL` backing-file path; the lease
 hashes that same normalized identity, never a separately resolved alias. An alias with another identity fails closed.
-Every cooperating create, attach,
-format, `fsck_apfs`, mount, unmount, recovery and detach of one image holds that image's lease, so independent processes
-serialize on one image while operations on different images overlap. There is no host-wide device lock. A cooperating
-process acts on a device only after the inventory positively maps the identity to it under the lease (or while a raw pin
-holds it), and a device is freed only by a detach the same lease covers, so no same-user cowshed process recycles it
-inside the critical section. A contended lease is awaited on a helper thread that hands the locked descriptor back when
-the holder releases it, bounded by the 120 s disk-child deadline; expiry names the lease file, the image and the
-holder's recorded pid. The lease does **not** constrain another user's disk tools or a manual eject during the two
-mutations that cannot run raw-pinned, `newfs_apfs` and `hdiutil detach`, because a read-only raw pin makes both fail
-with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the
-attachment inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns
-that raw descriptor across the `attach_verified` → `mount` method boundary. It is released after `mount_apfs` finishes,
-before intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
-descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
-descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
-recycling its device name. If the image lost the reported device before the descriptor could be pinned, cowshed performs
-at most one fresh attachment, and only when inventory shows no remaining attachment for that image. A conflicting or
-unreadable mapping fails closed, without running fsck on the reported device. No live-fsck option authorizes touching a
-foreign mounted container. Blank-image formatting keeps its image-to-whole-device check under the image's lease; its
-exclusive formatter cannot share a raw-device descriptor with another opener.
+Every cooperating create, attach, format, `fsck_apfs`, mount, unmount, recovery and detach of one image holds that
+image's lease, so independent processes serialize on one image while operations on different images overlap. There is no
+host-wide device lock. A cooperating process acts on a device only after the inventory positively maps the identity to
+it under the lease (or while a raw pin holds it), and a device is freed only by a detach the same lease covers, so no
+same-user cowshed process recycles it inside the critical section. A contended lease is awaited on a helper thread that
+hands the locked descriptor back when the holder releases it, bounded by the 120 s disk-child deadline; expiry names the
+lease file, the image and the holder's recorded pid. The lease does **not** constrain another user's disk tools or a
+manual eject during the two mutations that cannot run raw-pinned, `newfs_apfs` and `hdiutil detach`, because a read-only
+raw pin makes both fail with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only,
+then verifies that the attachment inventory maps **both** its whole container and its volume to the exact image. A
+verified attachment owns that raw descriptor across the `attach_verified` → `mount` method boundary. It is released
+after `mount_apfs` finishes, before intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer,
+which cannot run with a raw descriptor open. Independent device ejects during container resize after pin release are not
+covered. While held, the descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from
+releasing the image and recycling its device name. If the image lost the reported device before the descriptor could be
+pinned, cowshed performs at most one fresh attachment, and only when inventory shows no remaining attachment for that
+image. A conflicting or unreadable mapping fails closed, without running fsck on the reported device. No live-fsck
+option authorizes touching a foreign mounted container. Blank-image formatting keeps its image-to-whole-device check
+under the image's lease; its exclusive formatter cannot share a raw-device descriptor with another opener.
 
 For every mounted attachment:
 

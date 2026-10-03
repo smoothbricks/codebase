@@ -172,6 +172,12 @@ impl CommandRunner for RecordingRunner {
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         Ok(self.inventory.images())
     }
+    fn grow_image(&self, image: &Path, _: ImageCapacity) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("the recording runner grows no image: {}", image.display()),
+        ))
+    }
 }
 /// Fails the first kernel disk-image inventory read, then reports nothing attached.
 ///
@@ -198,6 +204,15 @@ impl CommandRunner for UnreadableFirstInventoryRunner {
             ));
         }
         Ok(Vec::new())
+    }
+    fn grow_image(&self, image: &Path, _: ImageCapacity) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "the GC inventory double grows no image: {}",
+                image.display()
+            ),
+        ))
     }
 }
 
@@ -2437,6 +2452,10 @@ impl CommandRunner for EjectAtFsck {
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         SystemCommandRunner.attached_disk_images()
     }
+
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
+        SystemCommandRunner.grow_image(image, capacity)
+    }
 }
 
 #[test]
@@ -2604,6 +2623,10 @@ impl CommandRunner for EjectAfterAttach {
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         SystemCommandRunner.attached_disk_images()
+    }
+
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
+        SystemCommandRunner.grow_image(image, capacity)
     }
 }
 
@@ -5175,9 +5198,9 @@ fn resize_refuses_an_image_still_attached_with_nothing_mounted_before_touching_i
     );
 }
 
-/// Lets `diskutil image resize` really run, against an image file nothing may write: the
-/// user-immutable flag goes on immediately before the resize and comes off as soon as it
-/// returns. diskutil really refuses, and the image is really unchanged.
+/// Lets the image's header growth really run, against an image file nothing may write: the
+/// user-immutable flag goes on immediately before the grow and comes off as soon as it returns.
+/// The open really refuses, and the image is really unchanged.
 struct ImmutableDuringResize {
     image: PathBuf,
     resized: AtomicUsize,
@@ -5198,22 +5221,18 @@ fn set_file_flags(path: &Path, flags: u32) {
 
 impl CommandRunner for ImmutableDuringResize {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        SystemCommandRunner.run(request)
+    }
+
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
         use std::os::macos::fs::MetadataExt as _;
-        let grows = request.program == Path::new("/usr/sbin/diskutil")
-            && request
-                .args
-                .iter()
-                .take(3)
-                .eq(["image", "resize", "--size"]);
-        if !grows {
-            return SystemCommandRunner.run(request);
-        }
+        assert_eq!(image, self.image, "only the fixture image grows");
         let flags = std::fs::metadata(&self.image).expect("image").st_flags();
         set_file_flags(&self.image, flags | libc::UF_IMMUTABLE);
-        let output = SystemCommandRunner.run(request);
+        let grown = SystemCommandRunner.grow_image(image, capacity);
         set_file_flags(&self.image, flags);
         self.resized.fetch_add(1, Ordering::SeqCst);
-        output
+        grown
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -5255,15 +5274,16 @@ fn real_apfs_a_refused_resize_leaves_the_image_ungrown_and_puts_the_workspace_ba
     assert!(
         matches!(
             &error,
-            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
-                if *operation == "resize image"
+            ApfsStorageError::Apfs(ApfsError::FileOperation { operation, source, .. })
+                if *operation == "grow ASIF image"
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
         ),
         "unexpected failure: {error}"
     );
     assert_eq!(
         host.backend().runner().resized.load(Ordering::SeqCst),
         1,
-        "diskutil really ran the refused resize"
+        "the refused grow really ran against the immutable file"
     );
     let after = kernel_attachments(&image);
     assert!(
