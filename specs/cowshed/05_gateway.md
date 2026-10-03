@@ -53,15 +53,10 @@ Every data-plane request additionally carries exactly `Proxy-Authorization: Bear
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
 workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy
 client may present it as `Proxy-Authorization: Basic` with the token as password (what curl, libcurl, reqwest and Go
-send for proxy-URL userinfo). One alternate header exists: on the local mirror routes — origin-form `/npm/`, `/cargo/`
-and `/go/` requests to the workspace's own endpoint — a registry client's own `Authorization` (`Bearer <token>`, which
-bun sends as its registry token, or `Basic` with the token as password) carries the same token, because a registry
-client cannot be told to send `Proxy-Authorization` to its registry. Go's module fetcher sends credentials only over
-HTTPS and so never reaches `/go/` (03_caches.md). An absolute-form or tunnelled request's `Authorization` is the
-client's own and authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it
-strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes,
-rejects malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token
-is 401.
+send for proxy-URL userinfo). No other header carries it: a request's `Authorization` is the client's own and
+authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips
+`Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects
+malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
@@ -80,12 +75,15 @@ covered under "Availability and offline behavior".
 
 Three tiers, never mixed:
 
-- **Public registry mirrors are baseline broker policy.** Anonymous public npm, crates.io, `proxy.golang.org`, and the
-  public checksum database are available with zero grants. Baseline does not include scoped registries, private module
-  namespaces, alternate credentialed registries, or any request that would attach a credential.
+- **Public npm reads are anonymous by default.** Every workspace's derived policy includes an intercepted
+  `registry.npmjs.org:443` read grant, including fresh workspaces with no project-standing grants. An explicit grant
+  matching that host and port replaces the default, including a matching wildcard or opaque grant. Eligible package
+  requests use the verified mirror cache without credentials. No HTTP port, alternate registry, private namespace, or
+  registry write is implicitly admitted. crates.io, `proxy.golang.org`, and the public checksum database remain
+  explicitly granted hosts, intercepted and opaque respectively, never mirrored.
 - **Admitted private/credentialed registry routes.** A private upstream would be usable only when a trusted admission
-  for the project's stable `repo_id` named the exact registry origin and package/module scope. The trusted project
-  policy has no admission field, so no workspace holds a mirror route beyond the public baselines; repository config
+  for the project's stable `repo_id` named the exact registry origin and package scope. The trusted project policy has
+  no admission field, so no workspace holds a registry route beyond the anonymous public baseline; repository config
   cannot admit one either. The gateway rejects an unadmitted route before credential lookup.
 - **Granted hosts.** `cowshed grant <ws> --egress <host>` defaults to `mode: "intercept"`, which admits `GET` and `HEAD`
   on the whole origin plus `POST` to a path ending in `/git-upload-pack` — git's smart-HTTP fetch, a read git can only
@@ -97,38 +95,44 @@ Three tiers, never mixed:
 
 ## Endpoints (data plane, per-workspace endpoint)
 
-The HTTP URL base is `http://127.0.0.1:<portBlock.base>` on macOS and exactly `http://127.0.0.1:7644` on Linux. Thus
-Bun/npm uses `<base>/npm`, a client configured for it uses `sparse+<base>/cargo/` (workspace cargo reaches crates.io
-through intercepted egress, 03_caches.md), and generic `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase equivalents) use
-`<base>`. Go uses none of them: it fetches from `proxy.golang.org` through an opaque tunnel (03_caches.md), because it
-sends no credential to plain HTTP. On Linux the trusted connector carries these byte streams to the mounted Unix socket;
-clients never speak HTTP over Unix sockets. Endpoint selection and the token still authenticate every request.
+The HTTP URL base is `http://127.0.0.1:<portBlock.base>` on macOS and exactly `http://127.0.0.1:7644` on Linux. No
+workspace client is configured for a mirror route: bun (its repository's registry), cargo and Go reach their public
+registries through the generic `HTTP_PROXY`/`HTTPS_PROXY` variables (and lowercase equivalents) on `<base>`
+(03_caches.md) — intercepted for npm and crates.io, an opaque tunnel for Go, which sends no credential to plain HTTP. On
+Linux the trusted connector carries these byte streams to the mounted Unix socket; clients never speak HTTP over Unix
+sockets. Endpoint selection and the token still authenticate every request.
 
-### `/npm/*` — npm registry mirror
+### npm registry mirror — eligible requests to an admitted registry
 
-Speaks packument and tarball protocols. Anonymous `registry.npmjs.org` is baseline. Scoped or private origins require a
-trusted project-policy admission binding an exact origin to allowed package scopes; only then may the gateway select the
-matching credential. Metadata TTL is 5 minutes. Tarballs are content-addressed by their declared integrity digest,
-verified while filling and again on every cache read, and committed by atomic rename. The declared digest is the
-`cowshed-integrity` a rewritten packument puts on the tarball URL; a tarball URL without one (a lockfile install builds
-it without reading the packument) takes the `dist.integrity` and `dist.size` the package's packument publishes for the
-version whose `dist.tarball` is that exact path, fetched through the same metadata path. A version the packument does
-not publish with a SHA-512 or SHA-256 integrity is refused, never served unverified.
+A read-only package request that an egress grant admits is served through the mirror; nothing else is. Eligible requests
+carry no `Authorization` and no query, and have the exact shape of a packument (`/<name>` or `/@scope%2fname`, asked for
+as `application/json` or `application/vnd.npm.install-v1+json`) or a tarball (`/<name>/-/<file>.tgz`). Full and compact
+packuments have distinct representation cache identities; either index can verify later tarballs without another
+metadata fetch. Admin/version endpoints, queries, unsupported/ambiguous Accept, and credentialed requests remain
+generic. Anonymous `registry.npmjs.org` is the baseline. Scoped or private origins require a trusted project-policy
+admission binding an exact origin to allowed package scopes; only then may the gateway select the matching credential,
+and only the longest admitted prefix on that exact origin decides — a scope never crosses origins, and a private origin
+has no public baseline behind it. Metadata TTL is 5 minutes. A packument is streamed to the client byte for byte — the
+gateway rewrites no tarball URL, buffers none of it, and caps its size nowhere — while the same chunks fill the cache. A
+streaming recognizer reads them in that one pass and records, for every `versions.*.dist`, the `dist.integrity` and
+`dist.size` of the same-origin tarball path that object names — one path and digest per version, never the document; an
+ambiguous document (a duplicate `versions`, `dist`, `tarball`, `integrity` or `size` key, or two expectations for one
+path) is refused. Tarballs are content-addressed by that published digest, verified while filling and again on every
+cache read, and committed by atomic rename. A tarball request — a lockfile install builds its URL without reading the
+packument — takes its expectation from the index of its package's packument, fetched through the same metadata path,
+instead of parsing it again. A version the packument does not publish with a SHA-512 or SHA-256 integrity is refused,
+never served unverified.
 
-### `/cargo/` — cargo sparse registry mirror
+### Cargo and Go — not mirrored
 
-Serves `config.json`, sparse index files, and crate downloads. crates.io is anonymous baseline; alternate or
-credentialed registries require exact-origin and crate-scope admission. Workspaces do not route cargo through it: every
-sandbox builds with one literal `CARGO_HOME` whose registry is shared host-wide (03_caches.md), so cargo reaches
-crates.io through intercepted egress (`index.crates.io`, `static.crates.io`) and the route serves clients configured for
-it explicitly.
-
-### `/go/` — Go module proxy mirror
-
-Implements the GOPROXY protocol and public checksum-database pass-through. `proxy.golang.org` and the public checksum
-database are anonymous baseline. Private module prefixes and alternate proxies require trusted project-policy admission
-for the exact origin and module prefix; there is no `,direct` VCS fallback. Immutable `.zip` and `.mod` responses are
-digest-validated and metadata uses the 5-minute TTL.
+crates.io and the Go module proxy are ordinary granted hosts: cargo reaches `index.crates.io` and `static.crates.io`
+through intercepted egress, Go reaches `proxy.golang.org` and `sum.golang.org` through opaque tunnels. Neither is served
+from the mirror cache or rewritten, and neither could be a mirror client. Every sandbox builds with one literal
+`CARGO_HOME` whose registry is shared host-wide (03_caches.md), cargo names that registry by its index URL (a
+per-workspace endpoint would split it), and cargo has no client-side setting for the `dl` of a registry. `cmd/go` sends
+credentials only over HTTPS, so it cannot authenticate to a plain-HTTP endpoint. The clients verify what they download
+themselves: cargo checks every crate against the index's own `cksum`, and Go checks `.mod` and `.zip` against `go.sum`
+or the checksum database and verifies the database's signed tree.
 
 ### `/sim/` — personal-session simulator broker (posture B)
 
@@ -160,9 +164,12 @@ The engine is `hyper` + `rustls` + `rcgen` + `tokio`:
 - Leaves are minted in process and cached, not listeners. The leaf LRU is capped at 256 entries per workspace and 4096
   globally; entries expire after 24 hours and are usable only when hostname, workspace CA fingerprint, validity window,
   and at least 5 minutes of remaining lifetime all match. Rotation of a workspace CA drops that workspace's entries.
-- Limits are 32 active requests/tunnels and 64 queued requests per workspace, 256 active and 512 queued globally, and 8
-  active upstream connections per workspace+origin. Queue overflow returns 429 without reading a body. Each direction
-  gets a 1 MiB bounded streaming buffer; producers pause when it fills, and cancellation closes both legs.
+- Limits are 32 active HTTP/opaque requests and 64 queued admissions per workspace, 256 active HTTP/opaque requests and
+  512 queued admissions globally, and 8 active upstream connections per workspace+origin. Intercepted CONNECT transports
+  use a separate bounded pool (32 per workspace, 256 globally), not their contained requests' slots or upstream-origin
+  slots; lifetime audit leases, rotation, cancellation, and drain cover both pools. Active status is their combined
+  count. Queue overflow returns 429 without reading a body. Each direction gets a 1 MiB bounded streaming buffer;
+  producers pause when it fills, and cancellation closes both legs.
 - Timeouts are 10 s for request headers, 5 s for TCP connect, 10 s for each TLS handshake, 60 s to upstream response
   headers, 120 s idle between body bytes, 15 min total for ordinary requests, and 60 min total for opaque tunnels or
   explicitly detected streaming responses. Timeouts close both legs and emit a classified audit event.

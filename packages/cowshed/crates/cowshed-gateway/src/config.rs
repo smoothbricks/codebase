@@ -58,6 +58,11 @@ impl ControlTcpConfig {
     }
 }
 
+/// Admission limits. Active permits are drawn from two orthogonal pools: intercepted CONNECT
+/// tunnels, which terminate TLS locally and open no upstream connection, and requests (plain and
+/// tunnelled HTTP requests, and opaque CONNECTs). `workspace_active` and `global_active` bound
+/// each pool separately, so at most twice those permits are active in total; `origin_active`
+/// bounds requests only, since a tunnel never holds an upstream origin connection.
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayLimits {
     pub max_sessions: usize,
@@ -100,7 +105,10 @@ impl GatewayLimits {
         if fields.into_iter().any(|value| value == 0) {
             return Err(ConfigError::ZeroLimit);
         }
+        // Each active permit reserves a completion slot and both pools may be full, so the
+        // completion channel needs `2 * global_active` permits.
         if self.max_sessions > 4096
+            || self.global_active > tokio::sync::Semaphore::MAX_PERMITS / 2
             || self.workspace_active > self.global_active
             || self.workspace_queued > self.global_queued
             || self.leaf_cache_workspace > self.leaf_cache_global

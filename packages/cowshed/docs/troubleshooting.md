@@ -95,9 +95,8 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
 - **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
   macOS block base. Run `cowshed attach`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
   wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses
-  `http://127.0.0.1:7644/{npm,cargo,go}` and the same base, with the token as userinfo
-  (`http://cowshed:<token>@127.0.0.1:7644`), in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms). Detach and restore
-  intentionally drain old connections; retry only after the new attachment is admitted.
+  `http://cowshed:<token>@127.0.0.1:7644` in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms), the token as userinfo.
+  Detach and restore intentionally drain old connections; retry only after the new attachment is admitted.
 - **407 versus 403**: 407 means the endpoint/credential pair did not authenticate — most often proxy variables that lost
   their userinfo, or stale pre-restore wiring. A client without the credential gets one 407 with
   `Proxy-Authenticate: Basic realm="cowshed"` and stops; cargo instead reads a bare tunnel failure as a spurious network

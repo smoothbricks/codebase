@@ -1,35 +1,26 @@
-use std::{collections::HashMap, fmt, time::SystemTime};
+use std::{cmp::Ordering, collections::HashMap, fmt, time::SystemTime};
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
-use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
-use cowshed_gateway_types::{CanonicalTarget, MirrorProtocol, decode_percent, normalize_path};
+use cowshed_gateway_types::{CanonicalTarget, MirrorProtocol, decode_percent};
 
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
-        ObjectDigest, ObjectExpectation, hex_decode, unix_ms,
+        NpmExpectationLookup, ObjectExpectation, unix_ms,
     },
     interfaces::UpstreamHealth,
 };
 
 const MAX_REDIRECTS: u8 = 5;
-const MAX_LOCATION_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Bounded metadata body size: 5.24x the largest abbreviated npm packument measured
-/// in October 2026 (next, 25,607,776 bytes). JSON DOM parsing and rewriting allocate
-/// additional memory beyond this input bound.
-pub const MAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
-/// What npm clients send for a packument; the mirror asks for the same representation.
-const NPM_PACKUMENT_ACCEPT: &str =
-    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 const HEALTH_COMMAND_CAPACITY: usize = 64;
 
 pub type MirrorBody = BoxBody<Bytes, CacheBodyError>;
@@ -64,6 +55,9 @@ pub struct MirrorRequest {
     pub cache_scope: MirrorCacheScope,
     pub credentialed: bool,
     pub redirects_remaining: u8,
+    /// The packument representation this request names: `Some` exactly for an npm packument.
+    /// `headers` only carry what is sent upstream; the cache identity comes from here.
+    representation: Option<PackumentRepresentation>,
 }
 
 impl MirrorRequest {
@@ -94,6 +88,17 @@ impl MirrorRequest {
             HeaderValue::from_static("identity"),
         );
         let metadata = classify(protocol, &upstream_path, expected)?;
+        let representation = match (protocol, metadata.kind) {
+            (MirrorProtocol::Npm, MirrorResourceKind::Metadata) => {
+                let representation = PackumentRepresentation::requested(&headers)?;
+                headers.insert(
+                    header::ACCEPT,
+                    HeaderValue::from_static(representation.upstream_accept()),
+                );
+                Some(representation)
+            }
+            _ => None,
+        };
         if metadata
             .expected
             .is_some_and(|expected| expected.length > MAX_OBJECT_BYTES)
@@ -109,6 +114,7 @@ impl MirrorRequest {
             metadata,
             cache_scope,
             credentialed,
+            representation,
             redirects_remaining: MAX_REDIRECTS,
         })
     }
@@ -143,19 +149,46 @@ impl MirrorRequest {
         Ok(request)
     }
 
-    fn cache_key(&self) -> Result<CacheKey, CacheError> {
-        let namespace = match &self.cache_scope {
+    fn cache_namespace(&self) -> CacheNamespace {
+        match &self.cache_scope {
             MirrorCacheScope::Anonymous => CacheNamespace::Anonymous,
             MirrorCacheScope::Project(repo_id) => CacheNamespace::Project {
                 repo_id: repo_id.clone(),
             },
+        }
+    }
+
+    fn cache_key(&self) -> Result<CacheKey, CacheError> {
+        let (protocol, path) = match self.representation {
+            Some(representation) if !self.upstream_path.contains('?') => (
+                representation.cache_protocol(),
+                npm_packument_path(&self.metadata.identity),
+            ),
+            Some(representation) => (representation.cache_protocol(), self.upstream_path.clone()),
+            None => (self.protocol.as_str(), self.upstream_path.clone()),
         };
         CacheKey::new(
-            namespace,
-            self.protocol.as_str(),
+            self.cache_namespace(),
+            protocol,
             self.target.origin(),
-            self.upstream_path.clone(),
+            path,
             self.metadata.expected.map(|expected| expected.digest),
+        )
+    }
+
+    /// Key of this package's query-free packument in one representation. Every spelling of the
+    /// name (`/@scope/pkg`, `/@scope%2Fpkg`) is the same resource; each representation is its own
+    /// entry in the request's namespace and origin.
+    fn packument_key(
+        &self,
+        representation: PackumentRepresentation,
+    ) -> Result<CacheKey, CacheError> {
+        CacheKey::new(
+            self.cache_namespace(),
+            representation.cache_protocol(),
+            self.target.origin(),
+            npm_packument_path(&self.metadata.identity),
+            None,
         )
     }
 }
@@ -271,11 +304,9 @@ impl MirrorService {
         self.execute_expected(request, health, upstream).await
     }
 
-    /// A tarball URL a client builds from its lockfile carries no `cowshed-integrity`. The
-    /// expectation is the `dist.integrity` (and `dist.size`) the registry publishes for the
-    /// version whose `dist.tarball` is exactly this path, read from the package's packument
-    /// through the same cached metadata path clients use. No such version means there is nothing
-    /// to verify the bytes against, so the tarball stays refused.
+    /// Published integrity is indexed once, as the unchanged packument fills the cache. The index
+    /// attached to either cached representation of the package supplies it; only when neither
+    /// exists does a lockfile-driven tarball fetch fill the canonical install-v1 packument.
     async fn published_npm_expectation<U>(
         &self,
         tarball: &MirrorRequest,
@@ -285,39 +316,103 @@ impl MirrorService {
     where
         U: MirrorUpstream + ?Sized,
     {
-        let mut headers = tarball.headers.clone();
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static(NPM_PACKUMENT_ACCEPT),
-        );
-        let packument = MirrorRequest::new(
-            MirrorProtocol::Npm,
-            tarball.target.clone(),
-            Method::GET,
-            npm_packument_path(&tarball.metadata.identity),
-            headers,
-            tarball.cache_scope.clone(),
-            tarball.credentialed,
-            None,
-        )?;
-        let MirrorOutcome::Response(response) =
-            self.execute_expected(packument, health, upstream).await?
-        else {
-            return Err(MirrorError::MissingIntegrity);
-        };
-        if response.response.status() != StatusCode::OK {
-            return Err(MirrorError::MissingIntegrity);
-        }
-        let (_, bytes) = collect_metadata(response.response, &tarball.metadata.identity).await?;
         let path = tarball
             .upstream_path
             .split_once('?')
             .map_or(tarball.upstream_path.as_str(), |(path, _)| path);
-        let expected = published_tarball_expectation(&tarball.target, path, &bytes)?;
+        let path = decode_percent(path, |_| false).map_err(|_| MirrorError::InvalidProtocolPath)?;
+        let allow_stale = health == UpstreamHealth::Offline;
+        let published = match self
+            .cached_npm_expectation(tarball, &path, allow_stale)
+            .await?
+        {
+            NpmExpectationLookup::Published(expected) => expected,
+            NpmExpectationLookup::MissingPackument => {
+                // What a tarball request accepts says nothing about a packument: ask for the
+                // canonical install-v1 document, exactly as an installing client would.
+                let mut headers = tarball.headers.clone();
+                headers.insert(
+                    header::ACCEPT,
+                    HeaderValue::from_static(PackumentRepresentation::InstallV1.upstream_accept()),
+                );
+                let packument = MirrorRequest::new(
+                    MirrorProtocol::Npm,
+                    tarball.target.clone(),
+                    Method::GET,
+                    npm_packument_path(&tarball.metadata.identity),
+                    headers,
+                    tarball.cache_scope.clone(),
+                    tarball.credentialed,
+                    None,
+                )?;
+                let MirrorOutcome::Response(response) =
+                    self.execute_expected(packument, health, upstream).await?
+                else {
+                    return Err(MirrorError::MissingIntegrity);
+                };
+                if response.response.status() != StatusCode::OK {
+                    return Err(MirrorError::MissingIntegrity);
+                }
+                // Only the leader must drive the upstream stream to publish the index.
+                // Coalesced waiters and a 304 reuse an already-published index, not its body.
+                if response.cache_status == MirrorCacheStatus::Filled {
+                    let mut body = response.response.into_body();
+                    while let Some(frame) = body.frame().await {
+                        frame.map_err(MirrorError::Upstream)?;
+                    }
+                }
+                match self
+                    .cached_npm_expectation(tarball, &path, allow_stale)
+                    .await?
+                {
+                    NpmExpectationLookup::Published(expected) => expected,
+                    NpmExpectationLookup::MissingPackument => None,
+                }
+            }
+        };
+        let expected = published.ok_or(MirrorError::MissingIntegrity)?;
         if expected.length > MAX_OBJECT_BYTES {
             return Err(MirrorError::ObjectTooLarge);
         }
         Ok(expected)
+    }
+
+    /// Looks the tarball path up in the index attached to each cached representation of its
+    /// package; neither packument is opened. A fresh index that does not publish the path refuses
+    /// it without a refetch, and so does a pair that publish different integrity for it.
+    async fn cached_npm_expectation(
+        &self,
+        tarball: &MirrorRequest,
+        path: &str,
+        allow_stale: bool,
+    ) -> Result<NpmExpectationLookup, MirrorError> {
+        let install_v1 = self
+            .cache
+            .npm_expectation(
+                &tarball.packument_key(PackumentRepresentation::InstallV1)?,
+                path,
+                allow_stale,
+            )
+            .await?;
+        let full = self
+            .cache
+            .npm_expectation(
+                &tarball.packument_key(PackumentRepresentation::Full)?,
+                path,
+                allow_stale,
+            )
+            .await?;
+        Ok(match (install_v1, full) {
+            (NpmExpectationLookup::MissingPackument, other)
+            | (other, NpmExpectationLookup::MissingPackument) => other,
+            (
+                NpmExpectationLookup::Published(Some(install_v1)),
+                NpmExpectationLookup::Published(Some(full)),
+            ) => NpmExpectationLookup::Published((install_v1 == full).then_some(full)),
+            (NpmExpectationLookup::Published(first), NpmExpectationLookup::Published(second)) => {
+                NpmExpectationLookup::Published(first.or(second))
+            }
+        })
     }
 
     async fn execute_expected<U>(
@@ -377,7 +472,7 @@ impl MirrorService {
                     if let Some(previous) = &previous {
                         add_conditionals(&mut fetch.headers, previous);
                     }
-                    let mut response = self
+                    let response = self
                         .fetch_observed(&request.target, fetch, upstream)
                         .await?;
                     if response.status() == StatusCode::NOT_MODIFIED {
@@ -395,12 +490,6 @@ impl MirrorService {
                     if response.status().is_redirection() {
                         permit.bypass().await?;
                         return redirect_outcome(&request, &response);
-                    }
-                    if response.status() == StatusCode::OK
-                        && request.metadata.kind == MirrorResourceKind::Metadata
-                        && cacheable(&request, &response)
-                    {
-                        response = rewrite_metadata_response(&request, response).await?;
                     }
                     validate_representation(&response)?;
                     if response.status() != StatusCode::OK || !cacheable(&request, &response) {
@@ -432,12 +521,26 @@ impl MirrorService {
                         expected: request.metadata.expected,
                         stored_unix_ms: unix_ms(SystemTime::now())
                             .map_err(|_| MirrorError::Clock)?,
+                        npm_tarballs: None,
+                        npm_index_bytes: 0,
                     };
-                    let body = self
+                    let mut body = self
                         .cache
                         .start_fill(permit, cached, max_bytes, body)
-                        .await?
-                        .boxed();
+                        .await?;
+                    if request.representation.is_some()
+                        && parts
+                            .headers
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| {
+                                value.starts_with("application/json")
+                                    || value.starts_with("application/vnd.npm.install-v1+json")
+                            })
+                    {
+                        body = body.with_npm_index(request.target.clone());
+                    }
+                    let body = body.boxed();
                     return Ok(MirrorOutcome::Response(MirrorResponse {
                         response: Response::from_parts(parts, body),
                         cache_status: MirrorCacheStatus::Filled,
@@ -560,286 +663,143 @@ fn response_from_hit(
     }
 }
 
-async fn collect_metadata(
-    response: Response<MirrorBody>,
-    package: &str,
-) -> Result<(http::response::Parts, Vec<u8>), MirrorError> {
-    if let Some(size_bytes) = response_content_length_optional(&response)?
-        && size_bytes > MAX_METADATA_BYTES
-    {
-        return Err(MirrorError::MetadataTooLarge {
-            package: package.to_owned(),
-            size_bytes,
-        });
-    }
-    let (parts, mut body) = response.into_parts();
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| {
-            if matches!(
-                error.downcast_ref::<CacheError>(),
-                Some(CacheError::ObjectTooLarge)
-            ) {
-                MirrorError::MetadataTooLarge {
-                    package: package.to_owned(),
-                    size_bytes: MAX_METADATA_BYTES + 1,
-                }
-            } else {
-                MirrorError::Upstream(error)
-            }
-        })?;
-        if let Ok(data) = frame.into_data() {
-            let size_bytes =
-                u64::try_from(bytes.len().saturating_add(data.len())).unwrap_or(u64::MAX);
-            if size_bytes > MAX_METADATA_BYTES {
-                return Err(MirrorError::MetadataTooLarge {
-                    package: package.to_owned(),
-                    size_bytes,
-                });
-            }
-            bytes.extend_from_slice(&data);
-        }
-    }
-    Ok((parts, bytes))
-}
-
 /// The path npm clients request a package's packument at: `/@scope%2fname` or `/name`.
 fn npm_packument_path(identity: &str) -> String {
     format!("/{}", identity.replacen('/', "%2f", 1))
 }
 
-/// The expectation of the version whose `dist.tarball` is `path` on `target`, in either form the
-/// mirror serves a packument: as the registry publishes it (an absolute URL) or as
-/// `rewrite_npm_packument` rewrites it (`/npm{path}?…`, which keeps `dist.integrity`).
-fn published_tarball_expectation(
-    target: &CanonicalTarget,
-    path: &str,
-    packument: &[u8],
-) -> Result<ObjectExpectation, MirrorError> {
-    let document: Value =
-        serde_json::from_slice(packument).map_err(|_| MirrorError::InvalidMetadata)?;
-    let versions = document
-        .get("versions")
-        .and_then(Value::as_object)
-        .ok_or(MirrorError::InvalidMetadata)?;
-    let dist = versions
-        .values()
-        .filter_map(|version| version.get("dist"))
-        .find(|dist| {
-            dist.get("tarball")
-                .and_then(Value::as_str)
-                .is_some_and(|tarball| match Url::parse(tarball) {
-                    Ok(url) => {
-                        url.path() == path
-                            && CanonicalTarget::from_url(&url).is_ok_and(|origin| origin == *target)
-                    }
-                    Err(_) => {
-                        tarball
-                            .strip_prefix("/npm")
-                            .map(|local| local.split_once('?').map_or(local, |(local, _)| local))
-                            == Some(path)
-                    }
-                })
-        })
-        .ok_or(MirrorError::MissingIntegrity)?;
-    let digest = dist
-        .get("integrity")
-        .and_then(Value::as_str)
-        .and_then(parse_sri)
-        .ok_or(MirrorError::MissingIntegrity)?;
-    Ok(ObjectExpectation {
-        length: dist.get("size").and_then(Value::as_u64).unwrap_or(0),
-        digest,
-    })
-}
-async fn rewrite_metadata_response(
-    request: &MirrorRequest,
-    response: Response<MirrorBody>,
-) -> Result<Response<MirrorBody>, MirrorError> {
-    if request.protocol == MirrorProtocol::Npm
-        && !response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/json"))
-    {
-        return Ok(response);
+pub(crate) fn npm_resource_kind(path: &str) -> Option<MirrorResourceKind> {
+    if path.contains('?') || validate_mirror_path(path).is_err() {
+        return None;
     }
-    let (mut parts, bytes) = collect_metadata(response, &request.metadata.identity).await?;
-    let rewritten = match request.protocol {
-        MirrorProtocol::Npm => rewrite_npm_packument(request, &bytes)?,
-        MirrorProtocol::Cargo if request.upstream_path == "/config.json" => {
-            rewrite_cargo_config(&bytes)?
+    classify_npm(path).ok().map(|(kind, _)| kind)
+}
+
+/// The two logical npm packument representations. Each is its own upstream request, its own cache
+/// entry, and is served as the registry's own bytes and headers; neither is derived from the
+/// other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackumentRepresentation {
+    /// `application/vnd.npm.install-v1+json`: the abbreviated document `npm install` reads.
+    InstallV1,
+    /// `application/json`: the full packument (`fullMetadata`, `npm view`).
+    Full,
+}
+
+impl PackumentRepresentation {
+    /// A request without `Accept` is a trusted recovery caller and wants the install document;
+    /// one with `Accept` must select a single representation.
+    fn requested(headers: &HeaderMap) -> Result<Self, MirrorError> {
+        if !headers.contains_key(header::ACCEPT) {
+            return Ok(Self::InstallV1);
         }
-        MirrorProtocol::Cargo => {
-            validate_cargo_index(&bytes)?;
-            bytes
+        Self::select(headers).ok_or(MirrorError::UnsupportedMetadataAccept)
+    }
+
+    /// The canonical media type naming this representation.
+    const fn media(self) -> &'static str {
+        match self {
+            Self::InstallV1 => "application/vnd.npm.install-v1+json",
+            Self::Full => "application/json",
         }
-        MirrorProtocol::Go => {
-            validate_go_metadata(&request.upstream_path, &bytes)?;
-            bytes
+    }
+
+    /// The `Accept` the mirror sends upstream: what npm itself sends for this representation.
+    /// It always selects the same representation again, so redirect hops keep it.
+    const fn upstream_accept(self) -> &'static str {
+        match self {
+            Self::InstallV1 => {
+                "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*"
+            }
+            Self::Full => "application/json",
+        }
+    }
+
+    /// The install document keeps the protocol name it was always cached under.
+    const fn cache_protocol(self) -> &'static str {
+        match self {
+            Self::InstallV1 => MirrorProtocol::Npm.as_str(),
+            Self::Full => "npm-json",
+        }
+    }
+
+    /// The one representation an `Accept` header selects: the supported media type with the
+    /// strictly highest quality, not outranked by a wildcard. Absent, unknown ranges or
+    /// parameters, `q=0`, and ties select nothing.
+    fn select(headers: &HeaderMap) -> Option<Self> {
+        let (mut install_v1, mut full, mut wildcard) = (0_u16, 0_u16, 0_u16);
+        for value in headers.get_all(header::ACCEPT) {
+            let ranges = value
+                .to_str()
+                .ok()?
+                .split(',')
+                .map(str::trim)
+                .filter(|range| !range.is_empty());
+            for range in ranges {
+                let (media, quality) = accept_range(range)?;
+                let slot = if media.eq_ignore_ascii_case(Self::InstallV1.media()) {
+                    &mut install_v1
+                } else if media.eq_ignore_ascii_case(Self::Full.media()) {
+                    &mut full
+                } else if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
+                    &mut wildcard
+                } else if quality == 0 {
+                    continue;
+                } else {
+                    return None;
+                };
+                *slot = (*slot).max(quality);
+            }
+        }
+        let (selected, quality) = match install_v1.cmp(&full) {
+            Ordering::Greater => (Self::InstallV1, install_v1),
+            Ordering::Less => (Self::Full, full),
+            Ordering::Equal => return None,
+        };
+        (quality >= wildcard).then_some(selected)
+    }
+}
+
+/// The canonical media type of the one packument representation `headers` unambiguously select.
+/// `None` keeps the request off the packument cache.
+pub(crate) fn npm_metadata_accept(headers: &HeaderMap) -> Option<&'static str> {
+    PackumentRepresentation::select(headers).map(PackumentRepresentation::media)
+}
+
+/// One `Accept` media range and its quality in thousandths. Only a bare `q` parameter is
+/// understood; any other parameter makes the range unsupported.
+fn accept_range(range: &str) -> Option<(&str, u16)> {
+    let mut parts = range.split(';');
+    let media = parts.next()?.trim();
+    let quality = match parts.next() {
+        None => 1000,
+        Some(parameter) => {
+            let (name, value) = parameter.trim().split_once('=')?;
+            if !name.eq_ignore_ascii_case("q") || parts.next().is_some() {
+                return None;
+            }
+            parse_quality(value)?
         }
     };
-    parts.headers.remove(header::ETAG);
-    parts.headers.remove(header::LAST_MODIFIED);
-    parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&rewritten.len().to_string())
-            .map_err(|_| MirrorError::InvalidContentLength)?,
-    );
-    Ok(Response::from_parts(
-        parts,
-        http_body_util::Full::new(Bytes::from(rewritten))
-            .map_err(|never| -> CacheBodyError { match never {} })
-            .boxed(),
-    ))
+    Some((media, quality))
 }
 
-fn rewrite_npm_packument(request: &MirrorRequest, bytes: &[u8]) -> Result<Vec<u8>, MirrorError> {
-    let mut document: Value =
-        serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
-    let versions = document
-        .get_mut("versions")
-        .and_then(Value::as_object_mut)
-        .ok_or(MirrorError::InvalidMetadata)?;
-    for version in versions.values_mut() {
-        let dist = version
-            .get_mut("dist")
-            .and_then(Value::as_object_mut)
-            .ok_or(MirrorError::InvalidMetadata)?;
-        let tarball = dist
-            .get("tarball")
-            .and_then(Value::as_str)
-            .ok_or(MirrorError::InvalidMetadata)?;
-        let tarball_url = Url::parse(tarball).map_err(|_| MirrorError::InvalidMetadata)?;
-        let target =
-            CanonicalTarget::from_url(&tarball_url).map_err(|_| MirrorError::InvalidMetadata)?;
-        if target != request.target {
-            return Err(MirrorError::UnsafeMetadataOrigin);
-        }
-        let integrity = dist
-            .get("integrity")
-            .and_then(Value::as_str)
-            .ok_or(MirrorError::MissingIntegrity)?;
-        parse_sri(integrity).ok_or(MirrorError::MissingIntegrity)?;
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("cowshed-integrity", integrity);
-        if let Some(length) = dist.get("size").and_then(Value::as_u64) {
-            query.append_pair("cowshed-length", &length.to_string());
-        }
-        let query = query.finish();
-        let local = format!("/npm{}?{query}", tarball_url.path());
-        dist.insert("tarball".to_owned(), Value::String(local));
+/// RFC 9110 `qvalue` in thousandths: `0[.ddd]` or `1[.000]`.
+fn parse_quality(value: &str) -> Option<u16> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
     }
-    serde_json::to_vec(&document).map_err(|_| MirrorError::InvalidMetadata)
-}
-
-fn rewrite_cargo_config(bytes: &[u8]) -> Result<Vec<u8>, MirrorError> {
-    let mut document: Value =
-        serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
-    let object = document
-        .as_object_mut()
-        .ok_or(MirrorError::InvalidMetadata)?;
-    object.insert(
-        "dl".to_owned(),
-        Value::String(
-            "/cargo/crates/{crate}/{version}/download?cowshed-integrity=sha256-{sha256-checksum}"
-                .to_owned(),
-        ),
-    );
-    object.remove("api");
-    serde_json::to_vec(&document).map_err(|_| MirrorError::InvalidMetadata)
-}
-
-fn validate_cargo_index(bytes: &[u8]) -> Result<(), MirrorError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
-    let mut entries = 0usize;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let entry: Value = serde_json::from_str(line).map_err(|_| MirrorError::InvalidMetadata)?;
-        let object = entry.as_object().ok_or(MirrorError::InvalidMetadata)?;
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or(MirrorError::InvalidMetadata)?;
-        let version = object
-            .get("vers")
-            .and_then(Value::as_str)
-            .ok_or(MirrorError::InvalidMetadata)?;
-        let checksum = object
-            .get("cksum")
-            .and_then(Value::as_str)
-            .ok_or(MirrorError::MissingIntegrity)?;
-        if name.is_empty() || version.is_empty() || hex_decode::<32>(checksum).is_err() {
-            return Err(MirrorError::InvalidMetadata);
-        }
-        entries += 1;
+    let thousandths = fraction
+        .bytes()
+        .zip([100_u16, 10, 1])
+        .map(|(digit, scale)| u16::from(digit - b'0') * scale)
+        .sum::<u16>();
+    match whole {
+        "0" => Some(thousandths),
+        "1" if thousandths == 0 => Some(1000),
+        _ => None,
     }
-    if entries == 0 {
-        return Err(MirrorError::InvalidMetadata);
-    }
-    Ok(())
-}
-
-fn validate_go_metadata(path: &str, bytes: &[u8]) -> Result<(), MirrorError> {
-    if path.starts_with("/tile/") || path == "/latest" {
-        return Ok(());
-    }
-    let text = std::str::from_utf8(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
-    if path.starts_with("/lookup/") {
-        let has_checksum = text.lines().any(|line| {
-            line.split_once(" h1:").is_some_and(|(_, encoded)| {
-                STANDARD
-                    .decode(encoded.trim())
-                    .is_ok_and(|digest| digest.len() == 32)
-            })
-        });
-        return has_checksum
-            .then_some(())
-            .ok_or(MirrorError::MissingIntegrity);
-    }
-    if path.ends_with("/@v/list") {
-        return text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .all(|line| line.starts_with('v') && !line.contains(char::is_whitespace))
-            .then_some(())
-            .ok_or(MirrorError::InvalidMetadata);
-    }
-    if path.ends_with(".info") {
-        let info: Value =
-            serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
-        let object = info.as_object().ok_or(MirrorError::InvalidMetadata)?;
-        return (object.get("Version").and_then(Value::as_str).is_some()
-            && object.get("Time").and_then(Value::as_str).is_some())
-        .then_some(())
-        .ok_or(MirrorError::InvalidMetadata);
-    }
-    if path.ends_with(".mod") {
-        return text
-            .lines()
-            .map(str::trim)
-            .any(|line| line.starts_with("module "))
-            .then_some(())
-            .ok_or(MirrorError::InvalidMetadata);
-    }
-    Err(MirrorError::InvalidMetadata)
-}
-
-fn parse_sri(value: &str) -> Option<ObjectDigest> {
-    let mut sha256 = None;
-    for token in value.split_ascii_whitespace() {
-        let (algorithm, encoded) = token.split_once('-')?;
-        let decoded = STANDARD
-            .decode(encoded.split_once('?').map_or(encoded, |(hash, _)| hash))
-            .ok()?;
-        match algorithm {
-            "sha512" => return decoded.try_into().ok().map(ObjectDigest::Sha512),
-            "sha256" => sha256 = decoded.try_into().ok().map(ObjectDigest::Sha256),
-            _ => {}
-        }
-    }
-    sha256
 }
 
 fn response_content_length(response: &Response<MirrorBody>) -> Result<u64, MirrorError> {
@@ -901,21 +861,14 @@ fn response_limit(
         }
         return Ok(expected.length);
     }
-    if let Some(size_bytes) = header_length
-        && size_bytes > MAX_METADATA_BYTES
-    {
-        return Err(MirrorError::MetadataTooLarge {
-            package: request.metadata.identity.clone(),
-            size_bytes,
-        });
-    }
-    Ok(MAX_METADATA_BYTES)
+    Ok(header_length.unwrap_or(u64::MAX))
 }
 
 fn cacheable(request: &MirrorRequest, response: &Response<MirrorBody>) -> bool {
     if response.headers().contains_key(header::SET_COOKIE) {
         return false;
     }
+    // `Vary: accept` is safe only because each packument representation is its own cache entry.
     let unsupported_vary = response
         .headers()
         .get_all(header::VARY)
@@ -923,7 +876,10 @@ fn cacheable(request: &MirrorRequest, response: &Response<MirrorBody>) -> bool {
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .map(str::trim)
-        .any(|name| !name.eq_ignore_ascii_case("accept-encoding"));
+        .any(|name| {
+            !name.eq_ignore_ascii_case("accept-encoding")
+                && !(request.representation.is_some() && name.eq_ignore_ascii_case("accept"))
+        });
     if unsupported_vary {
         return false;
     }
@@ -1026,157 +982,54 @@ fn classify(
     let path = path_and_query
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path);
-    validate_mirror_path(path, protocol)?;
-    let (kind, identity) = match protocol {
-        MirrorProtocol::Npm => classify_npm(path)?,
-        MirrorProtocol::Cargo => classify_cargo(path)?,
-        MirrorProtocol::Go => classify_go(path)?,
-    };
-    let encoded = parse_protocol_expectation(path_and_query)?;
-    let expected = match (supplied, encoded) {
-        (Some(left), Some(right)) if left != right => return Err(MirrorError::IntegrityConflict),
-        (Some(expected), _) | (_, Some(expected)) => Some(expected),
-        (None, None) => None,
-    };
+    if protocol != MirrorProtocol::Npm {
+        return Err(MirrorError::InvalidProtocolPath);
+    }
+    validate_mirror_path(path)?;
+    let (kind, identity) = classify_npm(path)?;
     Ok(MirrorProtocolMetadata {
         kind,
         identity,
-        expected,
+        expected: supplied,
     })
-}
-
-fn parse_protocol_expectation(
-    path_and_query: &str,
-) -> Result<Option<ObjectExpectation>, MirrorError> {
-    let Some((_, query)) = path_and_query.split_once('?') else {
-        return Ok(None);
-    };
-    let mut integrity = None;
-    let mut length = 0;
-    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        match name.as_ref() {
-            "cowshed-integrity" if integrity.is_none() => integrity = Some(value.into_owned()),
-            "cowshed-length" => {
-                length = value
-                    .parse::<u64>()
-                    .map_err(|_| MirrorError::InvalidContentLength)?;
-            }
-            _ => {}
-        }
-    }
-    let Some(integrity) = integrity else {
-        return Ok(None);
-    };
-    let digest = integrity
-        .strip_prefix("sha256-")
-        .and_then(|hex| hex_decode::<32>(hex).ok())
-        .map(ObjectDigest::Sha256)
-        .or_else(|| parse_sri(&integrity))
-        .ok_or(MirrorError::MissingIntegrity)?;
-    Ok(Some(ObjectExpectation { length, digest }))
 }
 
 fn classify_npm(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> {
     let relative = path
         .strip_prefix('/')
         .ok_or(MirrorError::InvalidProtocolPath)?;
-    if relative.is_empty() {
-        return Err(MirrorError::InvalidProtocolPath);
-    }
-    let lower = relative.to_ascii_lowercase();
-    let tarball = lower.ends_with(".tgz") && lower.contains("/-/");
-    let package_path = relative.split("/-/").next().unwrap_or(relative);
+    let (package, artifact) = match relative.split_once("/-/") {
+        Some((package, artifact)) => (package, Some(artifact)),
+        None => (relative, None),
+    };
     let decoded =
-        decode_percent(package_path, |_| false).map_err(|_| MirrorError::InvalidProtocolPath)?;
-    let identity = if decoded.starts_with('@') {
-        let mut parts = decoded.split('/');
-        let scope = parts.next().ok_or(MirrorError::InvalidProtocolPath)?;
-        let package = parts.next().ok_or(MirrorError::InvalidProtocolPath)?;
-        if parts.next().is_some() || scope.len() < 2 || package.is_empty() {
+        decode_percent(package, |_| false).map_err(|_| MirrorError::InvalidProtocolPath)?;
+    let mut segments = decoded.split('/');
+    let first = segments.next().ok_or(MirrorError::InvalidProtocolPath)?;
+    if first.is_empty() {
+        return Err(MirrorError::InvalidProtocolPath);
+    }
+    if first.starts_with('@') {
+        if first.len() < 2 || segments.next().is_none_or(str::is_empty) || segments.next().is_some()
+        {
             return Err(MirrorError::InvalidProtocolPath);
         }
-        format!("{scope}/{package}")
-    } else {
-        let package = decoded
-            .split('/')
-            .next()
-            .ok_or(MirrorError::InvalidProtocolPath)?;
-        if package.is_empty() {
-            return Err(MirrorError::InvalidProtocolPath);
-        }
-        package.to_owned()
-    };
-    Ok((
-        if tarball {
+    } else if segments.next().is_some() {
+        return Err(MirrorError::InvalidProtocolPath);
+    }
+    let kind = match artifact {
+        Some(artifact) if artifact.ends_with(".tgz") && !artifact.contains('/') => {
             MirrorResourceKind::Immutable
-        } else {
-            MirrorResourceKind::Metadata
-        },
-        identity,
-    ))
-}
-
-fn classify_cargo(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> {
-    if path == "/config.json" {
-        return Ok((MirrorResourceKind::Metadata, "config.json".to_owned()));
-    }
-    let segments = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() >= 5
-        && segments[0] == "api"
-        && segments[1] == "v1"
-        && segments[2] == "crates"
-        && segments.last() == Some(&"download")
-    {
-        return Ok((MirrorResourceKind::Immutable, segments[3].to_owned()));
-    }
-    if segments.len() >= 3 && segments[0] == "crates" && path.ends_with(".crate") {
-        return Ok((MirrorResourceKind::Immutable, segments[1].to_owned()));
-    }
-    let crate_name = segments.last().ok_or(MirrorError::InvalidProtocolPath)?;
-    if crate_name.is_empty() {
-        return Err(MirrorError::InvalidProtocolPath);
-    }
-    Ok((MirrorResourceKind::Metadata, (*crate_name).to_owned()))
-}
-
-fn classify_go(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> {
-    let relative = path
-        .strip_prefix('/')
-        .ok_or(MirrorError::InvalidProtocolPath)?;
-    if relative.starts_with("lookup/")
-        || relative.starts_with("tile/")
-        || relative == "latest"
-        || relative.starts_with("sumdb/")
-    {
-        return Ok((MirrorResourceKind::Metadata, relative.to_owned()));
-    }
-    let (module, resource) = relative
-        .split_once("/@v/")
-        .ok_or(MirrorError::InvalidProtocolPath)?;
-    if module.is_empty() || resource.is_empty() {
-        return Err(MirrorError::InvalidProtocolPath);
-    }
-    let kind = if resource.ends_with(".zip") {
-        MirrorResourceKind::Immutable
-    } else if resource == "list" || resource.ends_with(".info") || resource.ends_with(".mod") {
-        MirrorResourceKind::Metadata
-    } else {
-        return Err(MirrorError::InvalidProtocolPath);
+        }
+        Some(_) => return Err(MirrorError::InvalidProtocolPath),
+        None => MirrorResourceKind::Metadata,
     };
-    Ok((kind, module.to_owned()))
+    Ok((kind, decoded))
 }
 
-fn validate_mirror_path(path: &str, protocol: MirrorProtocol) -> Result<(), MirrorError> {
+pub(crate) fn validate_mirror_path(path: &str) -> Result<(), MirrorError> {
     if path.len() > MAX_LOCATION_BYTES || !path.starts_with('/') {
         return Err(MirrorError::InvalidProtocolPath);
-    }
-    if protocol != MirrorProtocol::Npm {
-        normalize_path(path).map_err(|_| MirrorError::InvalidProtocolPath)?;
-        return Ok(());
     }
     if path.contains('\\') || path.contains('\0') || path.contains("//") {
         return Err(MirrorError::InvalidProtocolPath);
@@ -1228,25 +1081,12 @@ pub enum MirrorError {
     MissingIntegrity,
     #[error("mirror object exceeds the 2 GiB maximum")]
     ObjectTooLarge,
-    #[error(
-        "mirror metadata for {package} is at least {size_bytes} bytes; limit is {} bytes",
-        MAX_METADATA_BYTES
-    )]
-    MetadataTooLarge {
-        package: String,
-        /// Declared length or a lower bound from the observed stream prefix.
-        size_bytes: u64,
-    },
-    #[error("mirror metadata is malformed")]
-    InvalidMetadata,
-    #[error("mirror metadata points at an unadmitted origin")]
-    UnsafeMetadataOrigin,
-    #[error("mirror protocol integrity metadata conflicts")]
-    IntegrityConflict,
     #[error("mirror upstream ignored canonical identity encoding")]
     UnsupportedEncoding,
     #[error("mirror protocol path is invalid")]
     InvalidProtocolPath,
+    #[error("mirror npm metadata Accept does not select exactly one packument representation")]
+    UnsupportedMetadataAccept,
     #[error("mirror cache miss while upstream is offline")]
     OfflineMiss,
     #[error("mirror upstream failed: {0}")]
@@ -1325,29 +1165,109 @@ mod tests {
         assert!(mirror_response.is_empty());
     }
 
-    #[test]
-    fn sha256_sri_and_cargo_hex_use_their_own_decoders() {
-        let digest = [7; 32];
-        let sri = format!("sha256-{}", STANDARD.encode(digest));
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("cowshed-integrity", &sri)
-            .finish();
-        let parsed = parse_protocol_expectation(&format!("/package?{query}"))
-            .expect("valid expectation")
-            .expect("integrity present");
-        assert_eq!(parsed.digest, ObjectDigest::Sha256(digest));
+    fn accepting<'a>(ranges: impl IntoIterator<Item = &'a str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for range in ranges {
+            headers.append(
+                header::ACCEPT,
+                HeaderValue::from_str(range).expect("accept fixture"),
+            );
+        }
+        headers
+    }
 
-        let cargo_hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let cargo = format!("sha256-{cargo_hex}");
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("cowshed-integrity", &cargo)
-            .finish();
-        let parsed = parse_protocol_expectation(&format!("/crate?{query}"))
-            .expect("valid expectation")
-            .expect("integrity present");
-        assert_eq!(parsed.digest, ObjectDigest::Sha256(digest));
+    #[test]
+    fn accept_selects_only_one_unambiguous_packument_representation() {
+        const INSTALL_V1: &str = "application/vnd.npm.install-v1+json";
+        for accept in [
+            "application/json",
+            "Application/JSON",
+            "application/json, */*",
+            "application/json; q=0.9",
+            "application/json,",
+            "application/json, application/vnd.npm.install-v1+json; q=0.5",
+            "application/vnd.npm.install-v1+json;q=0, application/json",
+            "application/json, text/html;q=0",
+        ] {
+            assert_eq!(
+                npm_metadata_accept(&accepting([accept])),
+                Some("application/json"),
+                "{accept}"
+            );
+        }
+        for accept in [
+            "application/vnd.npm.install-v1+json",
+            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
+            "application/vnd.npm.install-v1+json;q=1.000",
+            "application/vnd.npm.install-v1+json, application/json;q=0.5",
+            "application/vnd.npm.install-v1+json;q=0.001, application/json;q=0.",
+        ] {
+            assert_eq!(
+                npm_metadata_accept(&accepting([accept])),
+                Some(INSTALL_V1),
+                "{accept}"
+            );
+        }
+        for accept in [
+            "",
+            "*/*",
+            "application/*",
+            "text/plain",
+            "application/json, text/html",
+            "application/json, application/vnd.npm.install-v1+json",
+            "application/json;q=0",
+            "application/json;q=0, application/vnd.npm.install-v1+json;q=0",
+            "application/json;q=0.5, */*",
+            "application/json;q=1.5",
+            "application/json;q=1.001",
+            "application/json;q=0.1234",
+            "application/json;q=",
+            "application/json;q=x",
+            "application/json;q = 1",
+            "application/json;charset=utf-8",
+            "application/json;q=1;ext=1",
+            "application/json;q=1;q=1",
+        ] {
+            assert_eq!(
+                npm_metadata_accept(&accepting([accept])),
+                None,
+                "{accept:?}"
+            );
+        }
+        assert_eq!(npm_metadata_accept(&HeaderMap::new()), None);
+        assert_eq!(
+            npm_metadata_accept(&accepting(["application/json", "*/*"])),
+            Some("application/json"),
+            "ranges split over header lines are one list"
+        );
+        assert_eq!(
+            npm_metadata_accept(&accepting(["application/json", INSTALL_V1])),
+            None
+        );
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            header::ACCEPT,
+            HeaderValue::from_bytes(b"application/json, \xff").expect("opaque bytes"),
+        );
+        assert_eq!(npm_metadata_accept(&opaque), None);
+    }
+
+    #[test]
+    fn the_accept_sent_upstream_selects_its_own_representation_again() {
+        for representation in [
+            PackumentRepresentation::InstallV1,
+            PackumentRepresentation::Full,
+        ] {
+            let headers = accepting([representation.upstream_accept()]);
+            assert_eq!(
+                PackumentRepresentation::select(&headers),
+                Some(representation)
+            );
+            assert_eq!(npm_metadata_accept(&headers), Some(representation.media()));
+        }
+        assert_ne!(
+            PackumentRepresentation::InstallV1.cache_protocol(),
+            PackumentRepresentation::Full.cache_protocol()
+        );
     }
 }

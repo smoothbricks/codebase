@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cowshed_gateway_types::{
-    EgressGrant, GatewayStatus, MirrorProtocol, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
-    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    CanonicalHost, EgressGrant, GatewayStatus, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
+    WorkspaceSession, WorkspaceToken,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -198,10 +198,15 @@ pub fn stable_workspace_id(
     format!("{prefix}w{}", hex_lower(&digest[..16]))
 }
 
+/// Explicit egress grants plus anonymous public npm reads on HTTPS port 443.
+///
+/// This is the package-registry baseline every workspace gets, including a fresh workspace
+/// with no standing grants. An explicit rule matching that host and port replaces the default,
+/// including an opaque rule. Private registries still require their own grants and admission.
 pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
     let mut policy = WorkspacePolicy {
         grants: Vec::new(),
-        mirrors: baseline_mirror_routes(),
+        mirrors: Vec::new(),
     };
     for rule in &grants.egress {
         for &port in rule.effective_ports() {
@@ -218,6 +223,17 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
             policy.grants.push(grant);
         }
     }
+    let npm_host = CanonicalHost::parse("registry.npmjs.org").expect("fixed npm registry host");
+    if !policy
+        .grants
+        .iter()
+        .any(|grant| grant.port == 443 && grant.host.matches(&npm_host))
+    {
+        policy.grants.push(
+            EgressGrant::intercept("registry.npmjs.org", 443)
+                .expect("fixed public npm registry grant"),
+        );
+    }
     policy.validate().map_err(|error| {
         CowshedError::integrity(
             format!("gateway policy is invalid: {error}"),
@@ -225,23 +241,6 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
         )
     })?;
     Ok(policy)
-}
-
-fn baseline_mirror_routes() -> Vec<MirrorRoute> {
-    [
-        MirrorProtocol::Npm,
-        MirrorProtocol::Cargo,
-        MirrorProtocol::Go,
-    ]
-    .into_iter()
-    .map(|protocol| MirrorRoute {
-        local_prefix: protocol.local_prefix().to_owned(),
-        upstream_origin: protocol.baseline_origin().to_owned(),
-        protocol,
-        admitted_prefixes: vec!["/".to_owned()],
-        credentialed: true,
-    })
-    .collect()
 }
 
 pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {

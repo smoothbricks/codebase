@@ -40,11 +40,13 @@ removes the connector/socket before releasing the netns; attach creates exactly 
 
 Five jobs:
 
-1. **Registry mirrors.** `/npm`, `/cargo/`, and `/go/` serve anonymous public npm, crates.io, the public Go proxy, and
-   checksum database as zero-grant baseline policy. Private/scoped/credentialed registries and module namespaces work
-   only when trusted policy for the current `repo_id` admits their exact origin and package/module prefix. Repository
-   config may request or further restrict a route, but cannot admit itself. Artifacts are digest-checked and cached
-   once.
+1. **Registry mirror (npm).** A read-only package request to an admitted npm registry uses the verified artifact cache.
+   Every workspace gets an anonymous `registry.npmjs.org:443` intercept-read default; an explicit matching grant
+   replaces it, including an opaque grant. Private, scoped, or credentialed registries require trusted policy for the
+   current `repo_id` admitting their exact origin and package prefix. Repository config cannot admit itself. Tarballs
+   are digest-checked and cached once. Exact packuments requested as full JSON or install-v1 JSON have separate
+   representation caches; admin and version endpoints, queries, or requests carrying `Authorization` remain generic.
+   Cargo and Go are not mirrored: crates.io is intercepted egress and the Go module proxy an opaque tunnel.
 2. **Repo mirrors.** Mirror fetch is a coordinator-only control-plane action, bound to the current project and its
    trusted repository admission. A sandbox token cannot invoke it; admission or a mirror for one project grants nothing
    to another. Fetches use gateway-owned config and credentials, and resulting bare mirrors are sandbox-readable but
@@ -63,32 +65,29 @@ Five jobs:
 Every decision is auditable in Arrow telemetry under `/private/cowshed/store/telemetry/gateway/`
 ([telemetry.md](telemetry.md)).
 
-### Registry metadata limits
+### Registry metadata streams
 
-Metadata the gateway buffers is bounded at 128 MiB, including packuments fetched to recover a lockfile tarball's
-published integrity. The limit applies before buffering or parsing; JSON parsing and tarball-URL rewriting allocate
-additional memory. A buffered stream without `Content-Length` is stopped as soon as it crosses the bound. Uncacheable
-client metadata responses pass through without buffering; this parser bound does not limit those streamed responses.
+npm install metadata has no whole-document buffer or byte cap. Original response bytes, status, and headers (including
+ETag and Content-Length) stream to the client while the same chunks fill the cache. The JSON scanner retains bounded
+parser state and relevant tokens, version-key hashes for duplicate detection, and a tarball-path-to-integrity-and-size
+index. Memory grows with version/index cardinality, not ignored document bytes; it never constructs a JSON DOM. Later
+tarball requests look up that index rather than opening or parsing the packument again. If a lockfile install requests a
+tarball before its packument is cached, the gateway fills and indexes that packument once. Missing published integrity
+is a typed refusal, not an unverified download.
 
-The limit is a power of two with more than four times the largest abbreviated npm packument measured on 2026-10-03.
-Measurements used `Accept: application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*` and
-`Accept-Encoding: identity` against `https://registry.npmjs.org`:
+Full `application/json` packuments (including npm installs and `npm view`) and compact
+`application/vnd.npm.install-v1+json` packuments retain their own representations, response headers, and cache
+identities. Either representation's published index can verify a tarball; the gateway does not fetch a second packument
+just because the install client requested full metadata.
 
-| Package       | Metadata bytes |
-| ------------- | -------------: |
-| `typescript`  |      8,714,866 |
-| `@types/node` |      2,332,109 |
-| `next`        |     25,607,776 |
-| `aws-sdk`     |      3,771,153 |
-| `wrangler`    |     16,297,094 |
+The index is persisted as a checksummed appendix to the cache entry, after the unchanged metadata bytes. Cache format
+version 3 discards version 2 entries once on upgrade, so the first install after upgrading is cold. Malformed JSON or
+unsafe, ambiguous integrity metadata aborts the stream and publishes neither cache entry nor index. Unsupported
+integrity algorithms are not indexed. The gateway never rewrites tarball URLs or adds integrity query parameters. Stream
+timeouts remain: 120 s idle between body bytes and 15 minutes in total for an ordinary request.
 
-The 134,217,728-byte cap gives the largest measured body 5.24 times headroom while retaining a finite upstream bound.
-Oversized buffered metadata returns HTTP 502 with JSON `code: "mirror-metadata-too-large"`, the package in `package`,
-its size in `sizeBytes`, the bound in `limitBytes`, and a readable `error`. `sizeBytes` is the declared `Content-Length`
-when available, or a lower bound from the observed stream prefix; the gateway does not drain an oversized upstream to
-determine its final length. The audit classification is also `mirror-metadata-too-large`. Cacheable client metadata
-streamed only into a cache fill can exceed its bound after HTTP 200 headers have already been sent when no
-`Content-Length` was declared; those streams abort rather than replacing the response status.
+Clients use the ordinary `HTTP_PROXY`/`HTTPS_PROXY` and gateway CA wiring. TLS clients that omit ALPN use HTTP/1.1;
+clients negotiating HTTP/2 or HTTP/1.1 use that protocol. No local `/npm`, `/cargo`, or `/go` registry endpoint remains.
 
 ## Start at login (launchd)
 
@@ -179,25 +178,26 @@ followed. Credential rotation is observed on next use; nothing inside a workspac
 
 ## Client wiring (files, not hand-written env)
 
-Wiring is written at adopt/new/fork and revalidated by `attach`. `portBlock` is optional and macOS-only. The exact
-registry URLs are:
+Wiring is written at adopt/new/fork and revalidated by `attach`. `portBlock` is optional and macOS-only. Every client
+reaches the gateway at one URL:
 
 | Client                | macOS                                           | Linux                                   |
 | --------------------- | ----------------------------------------------- | --------------------------------------- |
-| Bun/npm               | `http://127.0.0.1:<block-base>/npm`             | `http://127.0.0.1:7644/npm`             |
-| Cargo sparse source   | `sparse+http://127.0.0.1:<block-base>/cargo/`   | `sparse+http://127.0.0.1:7644/cargo/`   |
-| Go `GOPROXY`          | `http://127.0.0.1:<block-base>/go`              | `http://127.0.0.1:7644/go`              |
 | Generic HTTP(S) proxy | `http://cowshed:<token>@127.0.0.1:<block-base>` | `http://cowshed:<token>@127.0.0.1:7644` |
 
-`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms use the generic base. Linux clients do **not** speak HTTP over
-the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured.
+`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms use that base. No client is pointed at a registry mirror route.
+Bun reads its registry from the repository's own configuration, cargo has no registry configuration, and both reach
+their public registries as intercepted hosts that trust the workspace CA; the gateway mirrors an eligible npm request in
+flight. Go's `GOENV` file names `proxy.golang.org` and `sum.golang.org`, reached through opaque tunnels, because
+`cmd/go` sends credentials only over HTTPS and never trusts the workspace CA on macOS. Linux clients do **not** speak
+HTTP over the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured.
 
-Per-protocol clients load the token from mode-0600 configuration and send it only in `Proxy-Authorization`. The generic
-proxy variables are the exception, and they must be: a generic proxy client has no cowshed configuration file and no way
-to add a header, so the token rides as userinfo and the client turns it into `Proxy-Authorization: Basic` itself. That
-exports no authority into the sandbox that `COWSHED_WORKSPACE_TOKEN` does not already give it, and the token still
-authenticates against nothing but that workspace's own endpoint. The compatibility listener provides reachability, not
-identity or authority: endpoint/socket selection plus the token still authenticate, and gateway policy still authorizes.
+No wiring file carries the token. The proxy variables carry it as userinfo, which the client turns into
+`Proxy-Authorization: Basic` itself: a generic proxy client has no cowshed configuration file and no way to add a
+header. That exports no authority into the sandbox that `COWSHED_WORKSPACE_TOKEN` does not already give it, and the
+token still authenticates against nothing but that workspace's own endpoint. The compatibility listener provides
+reachability, not identity or authority: endpoint/socket selection plus the token still authenticate, and gateway policy
+still authorizes.
 
 The workspace's public CA certificate is installed as a server trust anchor for supported tool families. Its private key
 never enters a mount. macOS-native TLS clients that ignore configured anchors must fail or use an explicitly granted
@@ -221,16 +221,21 @@ built-in, trusted-policy, or repository-added deny.
 
 Network decisions are checked in order:
 
-1. Anonymous public registry baseline.
-2. Trusted project admission for private/scoped/credentialed registry routes and coordinator-only repo mirrors.
-3. Workspace egress grants for all other destinations; intercepted by default, or opaque when granted so.
+1. Workspace egress grants: public npm HTTPS reads have an anonymous default grant; other destinations need explicit
+   grants. An explicit matching registry grant overrides the default, including an opaque grant.
+2. Registry mirror resolution for an admitted intercepted npm request: the public registry anonymously, and a private,
+   scoped, or credentialed registry only under trusted project admission.
+3. Coordinator-only repo mirrors, bound to trusted repository admission.
 
 ## Gateway safety limits
 
 Defaults are deliberately bounded: 32 active and 64 queued requests per workspace, 256 active and 512 queued globally,
-and 8 upstream connections per workspace+origin. Each stream direction buffers at most 1 MiB and applies backpressure;
-queue overflow returns 429. Header/read, connect, TLS, upstream-header, and idle timeouts are 10 s, 5 s, 10 s, 60 s, and
-120 s; ordinary requests stop at 15 minutes and opaque or detected streaming connections at 60 minutes.
+and 8 upstream HTTP/opaque connections per workspace+origin. Intercepted CONNECTs are downstream TLS transports, with a
+separate bounded pool of 32 per workspace and 256 globally; they do not occupy their contained HTTP requests' slots.
+Both pools retain lifetime audits and participate in drain/rotation. Status reports their combined active count. Each
+stream direction buffers at most 1 MiB and applies backpressure; queue overflow returns 429. Header/read, connect, TLS,
+upstream-header, and idle timeouts are 10 s, 5 s, 10 s, 60 s, and 120 s; ordinary requests stop at 15 minutes and opaque
+or detected streaming connections at 60 minutes.
 
 Requests are limited to an 8 KiB target, 100 headers, 16 KiB per field, 64 KiB total headers, and a 64 MiB generic body.
 Mirror artifacts may stream to 2 GiB only with declared length and digest. Ambiguous HTTP framing is rejected: no

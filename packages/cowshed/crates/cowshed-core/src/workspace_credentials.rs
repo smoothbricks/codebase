@@ -131,10 +131,7 @@ pub fn mint_workspace_credentials(
     publish_minted_client_wiring(
         &credential_directory,
         workspace_mount,
-        &token,
         certificate_pem.as_bytes(),
-        platform,
-        port_block,
     )?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
@@ -280,26 +277,16 @@ fn credential_subject(
     )
 }
 
-/// The package-manager and trust wiring a minted workspace starts with, in its private
-/// environment (`.cowshed/`), as the child will see it under the canonical mount. Every exec
-/// republishes it; minting it here means a new, adopted, or forked workspace never exists without
-/// it.
+/// The Go and trust wiring a minted workspace starts with, in its private environment
+/// (`.cowshed/`), as the child will see it under the canonical mount. Every exec republishes it;
+/// minting it here means a new, adopted, or forked workspace never exists without it. It carries
+/// no endpoint and no token, so it needs neither the platform nor the port block, which
+/// `publish_workspace_environment` has already validated.
 fn publish_minted_client_wiring(
     credential_directory: &Path,
     workspace_mount: &Path,
-    token: &str,
     workspace_ca: &[u8],
-    platform: Platform,
-    port_block: Option<PortBlock>,
 ) -> Result<(), WorkspaceCredentialError> {
-    let Some(gateway_http) = crate::workspace_clients::gateway_http(platform, port_block) else {
-        return Err(WorkspaceCredentialError::Environment(
-            WorkspaceEnvironmentError::InvalidPortWiring {
-                platform,
-                port_block,
-            },
-        ));
-    };
     let system_bundle = crate::workspace_clients::system_trust_bundle().map_err(|source| {
         io_failure(
             "reading the platform trust bundle",
@@ -322,8 +309,6 @@ fn publish_minted_client_wiring(
     crate::workspace_clients::publish_client_wiring(
         &root,
         &crate::workspace_clients::ClientWiring {
-            gateway_http: &gateway_http,
-            token,
             workspace_ca: Some(workspace_ca),
             system_bundle: &system_bundle,
             environment: &workspace_mount.join(CREDENTIAL_DIRECTORY),
@@ -331,7 +316,7 @@ fn publish_minted_client_wiring(
     )
     .map_err(|source| {
         io_failure(
-            "publishing package-manager wiring",
+            "publishing Go and trust wiring",
             credential_directory,
             source,
         )

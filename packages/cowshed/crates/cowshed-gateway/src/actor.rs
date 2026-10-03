@@ -18,12 +18,12 @@ use tokio::{
 use cowshed_gateway_types::{
     CanonicalHost, CanonicalTarget, ConfigError, EgressMode, GatewayStatus, MirrorProtocol,
     PolicyDenial, SessionStatus, TargetScheme, WorkspaceEndpoint, WorkspacePolicy,
-    WorkspaceSession, WorkspaceToken, mirror_scope_matches, normalize_path,
+    WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
     cache::{Cache, CacheError},
-    config::{ControlTcpConfig, GatewayConfig},
+    config::{ControlTcpConfig, GatewayConfig, GatewayLimits},
     control::ControlError,
     interfaces::{
         AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError, CredentialError,
@@ -238,7 +238,8 @@ impl Gateway {
         config.validate()?;
         let mirror_service =
             MirrorService::new(Cache::open(config.mirror_cache.cache_config()).await?);
-        let (completions, completion_receiver) = mpsc::channel(config.limits.global_active);
+        let (completions, completion_receiver) =
+            mpsc::channel(active_permit_capacity(&config.limits));
         let (cancellations, cancellation_receiver) = mpsc::channel(config.limits.global_queued);
         let (commands, receiver) = mpsc::channel(config.command_capacity.get());
         let handle = GatewayHandle { commands };
@@ -442,13 +443,7 @@ pub(crate) enum Authentication {
 #[derive(Clone, Debug)]
 pub(crate) enum RequestTarget {
     Generic(CanonicalTarget),
-    LocalMirror,
     LocalSim,
-    MirrorRedirect {
-        protocol: MirrorProtocol,
-        target: CanonicalTarget,
-        upstream_path: String,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +453,7 @@ pub(crate) struct RequestIntent {
     pub path: String,
     pub audit_kind: AuditKind,
     pub trace_id: Option<String>,
+    pub npm_mirror: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +538,18 @@ impl AdmissionSeed {
             tracestate: None,
             trace_classification: None,
             completion: Some(completion),
+        }
+    }
+
+    /// The pool this admission is charged to. Only an intercepted CONNECT is a tunnel: it
+    /// terminates TLS locally and opens no upstream connection of its own. An opaque CONNECT
+    /// is the upstream TCP connection, so it is origin-limited work like any request.
+    fn class(&self) -> PermitClass {
+        match self.mode {
+            EgressMode::Intercept if self.method == Method::CONNECT => PermitClass::InterceptTunnel,
+            EgressMode::Intercept | EgressMode::Opaque => PermitClass::Request {
+                origin: self.target.origin(),
+            },
         }
     }
 }
@@ -684,9 +692,83 @@ struct Pending {
     cancellation: Option<JoinHandle<()>>,
 }
 
+/// Which bounded active pool a permit is charged to.
+///
+/// An intercepted CONNECT is a downstream TLS transport: every HTTP request it carries is
+/// admitted separately as a [`PermitClass::Request`]. Charging the tunnel to the origin pool its
+/// own inner requests need would let `origin_active` live tunnels starve every inner request
+/// until the client gives up. Tunnels therefore draw from their own pool, bounded by the same
+/// workspace and global limits, and never hold an origin slot; only requests carry one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PermitClass {
+    InterceptTunnel,
+    Request { origin: String },
+}
+
+/// Active permits per pool. Each pool is bounded independently by `workspace_active` and
+/// `global_active`, so the active total is at most twice either limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveCounts {
+    tunnels: usize,
+    requests: usize,
+}
+
+impl ActiveCounts {
+    fn of(self, class: &PermitClass) -> usize {
+        match class {
+            PermitClass::InterceptTunnel => self.tunnels,
+            PermitClass::Request { .. } => self.requests,
+        }
+    }
+
+    fn slot(&mut self, class: &PermitClass) -> &mut usize {
+        match class {
+            PermitClass::InterceptTunnel => &mut self.tunnels,
+            PermitClass::Request { .. } => &mut self.requests,
+        }
+    }
+
+    fn charge(&mut self, class: &PermitClass) {
+        *self.slot(class) += 1;
+    }
+
+    fn release(&mut self, class: &PermitClass) {
+        let slot = self.slot(class);
+        *slot = slot.saturating_sub(1);
+    }
+
+    fn total(self) -> usize {
+        self.tunnels + self.requests
+    }
+}
+
+/// Every active permit owns one reserved completion slot until the actor receives its
+/// completion, so the channel holds both pools' global bounds.
+/// [`GatewayLimits::validate`] keeps this product within the channel's permit range.
+fn active_permit_capacity(limits: &GatewayLimits) -> usize {
+    limits.global_active * 2
+}
+
+/// Whether one more permit of `class` fits its pool. `origin_active` is consulted only for
+/// requests, the sole class holding an upstream origin slot.
+fn pool_admits(
+    limits: &GatewayLimits,
+    session: ActiveCounts,
+    global: ActiveCounts,
+    class: &PermitClass,
+    origin_active: impl FnOnce(&str) -> usize,
+) -> bool {
+    session.of(class) < limits.workspace_active
+        && global.of(class) < limits.global_active
+        && match class {
+            PermitClass::InterceptTunnel => true,
+            PermitClass::Request { origin } => origin_active(origin) < limits.origin_active,
+        }
+}
+
 struct PermitState {
     workspace_id: String,
-    origin: String,
+    class: PermitClass,
     generation: u64,
 }
 
@@ -699,7 +781,7 @@ struct SessionState {
     policy: WorkspacePolicy,
     signer: CaSigner,
     generation: u64,
-    active: usize,
+    active: ActiveCounts,
     queued: usize,
     accept_stop: watch::Sender<bool>,
     connection_stop: watch::Sender<bool>,
@@ -753,7 +835,7 @@ struct Actor {
     permits: HashMap<u64, PermitState>,
     origins: HashMap<(String, String), usize>,
     queue: VecDeque<Pending>,
-    global_active: usize,
+    global_active: ActiveCounts,
     global_queued: usize,
     next_generation: u64,
     next_permit: u64,
@@ -807,7 +889,7 @@ impl Actor {
             permits: HashMap::new(),
             origins: HashMap::new(),
             queue: VecDeque::new(),
-            global_active: 0,
+            global_active: ActiveCounts::default(),
             global_queued: 0,
             next_generation: 1,
             next_permit: 1,
@@ -1018,7 +1100,7 @@ impl Actor {
                 policy: session.policy,
                 signer,
                 generation,
-                active: 0,
+                active: ActiveCounts::default(),
                 queued: 0,
                 accept_stop,
                 connection_stop,
@@ -1185,9 +1267,9 @@ impl Actor {
                 return;
             }
         };
-        let origin = seed.target.origin();
-        if self.can_activate(&workspace_id, &origin) {
-            let admission = self.activate(seed);
+        let class = seed.class();
+        if self.can_activate(&workspace_id, &class) {
+            let admission = self.activate(seed, class);
             let _ = reply.send(Ok(admission));
             return;
         }
@@ -1241,24 +1323,27 @@ impl Actor {
         });
     }
 
-    fn can_activate(&self, workspace_id: &str, origin: &str) -> bool {
+    fn can_activate(&self, workspace_id: &str, class: &PermitClass) -> bool {
         let Some(session) = self.sessions.get(workspace_id) else {
             return false;
         };
-        session.active < self.config.limits.workspace_active
-            && self.global_active < self.config.limits.global_active
-            && self
-                .origins
-                .get(&(workspace_id.to_owned(), origin.to_owned()))
-                .copied()
-                .unwrap_or(0)
-                < self.config.limits.origin_active
+        pool_admits(
+            &self.config.limits,
+            session.active,
+            self.global_active,
+            class,
+            |origin| {
+                self.origins
+                    .get(&(workspace_id.to_owned(), origin.to_owned()))
+                    .copied()
+                    .unwrap_or(0)
+            },
+        )
     }
 
-    fn activate(&mut self, seed: AdmissionSeed) -> Admission {
+    fn activate(&mut self, seed: AdmissionSeed, class: PermitClass) -> Admission {
         let permit_id = self.next_permit;
         self.next_permit = self.next_permit.wrapping_add(1).max(1);
-        let origin = seed.target.origin();
         let workspace_id = seed.workspace_id.clone();
         let cancelled =
             pending_audit_draft(&seed, AuditStatus::Cancelled, None, Some("request-dropped"));
@@ -1266,20 +1351,22 @@ impl Actor {
             .completions
             .clone()
             .try_reserve_owned()
-            .expect("completion capacity equals the active permit limit");
-        self.global_active += 1;
+            .expect("completion capacity covers both active pools' global bounds");
+        self.global_active.charge(&class);
         if let Some(session) = self.sessions.get_mut(&workspace_id) {
-            session.active += 1;
+            session.active.charge(&class);
         }
-        *self
-            .origins
-            .entry((workspace_id.clone(), origin.clone()))
-            .or_default() += 1;
+        if let PermitClass::Request { origin } = &class {
+            *self
+                .origins
+                .entry((workspace_id.clone(), origin.clone()))
+                .or_default() += 1;
+        }
         self.permits.insert(
             permit_id,
             PermitState {
                 workspace_id,
-                origin,
+                class,
                 generation: seed.generation,
             },
         );
@@ -1293,17 +1380,19 @@ impl Actor {
         let Some(permit) = self.permits.remove(&permit_id) else {
             return;
         };
-        self.global_active = self.global_active.saturating_sub(1);
+        self.global_active.release(&permit.class);
         if let Some(session) = self.sessions.get_mut(&permit.workspace_id)
             && session.generation == permit.generation
         {
-            session.active = session.active.saturating_sub(1);
+            session.active.release(&permit.class);
         }
-        let origin_key = (permit.workspace_id, permit.origin);
-        if let Some(active) = self.origins.get_mut(&origin_key) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.origins.remove(&origin_key);
+        if let PermitClass::Request { origin } = permit.class {
+            let origin_key = (permit.workspace_id, origin);
+            if let Some(active) = self.origins.get_mut(&origin_key) {
+                *active = active.saturating_sub(1);
+                if *active == 0 {
+                    self.origins.remove(&origin_key);
+                }
             }
         }
         self.promote();
@@ -1329,15 +1418,15 @@ impl Actor {
                 }
                 continue;
             }
-            let origin = pending.seed.target.origin();
-            if self.can_activate(&workspace_id, &origin) {
+            let class = pending.seed.class();
+            if self.can_activate(&workspace_id, &class) {
                 if let Some(timer) = pending.timer.take() {
                     timer.abort();
                 }
                 if let Some(cancellation) = pending.cancellation.take() {
                     cancellation.abort();
                 }
-                let admission = self.activate(pending.seed);
+                let admission = self.activate(pending.seed, class);
                 let _ = pending.reply.send(Ok(admission));
                 inspected = 0;
             } else {
@@ -1569,7 +1658,7 @@ impl Actor {
                 workspace_id: workspace_id.clone(),
                 revision: session.revision,
                 endpoint: session.endpoint_label.clone(),
-                active: session.active,
+                active: session.active.total(),
                 queued: session.queued,
             })
             .collect();
@@ -1583,7 +1672,7 @@ impl Actor {
             }),
             executable_sha256: self.config.executable_sha256.clone(),
             sessions,
-            active: self.global_active,
+            active: self.global_active.total(),
             queued: self.global_queued,
         }
     }
@@ -1618,7 +1707,7 @@ impl Actor {
     }
 
     async fn finish_drain(&mut self) -> Result<bool, GatewayError> {
-        if !self.draining || self.global_active != 0 {
+        if !self.draining || self.global_active.total() != 0 {
             return Ok(false);
         }
         let sessions = std::mem::take(&mut self.sessions);
@@ -1650,7 +1739,7 @@ impl Actor {
         }
         self.permits.clear();
         self.origins.clear();
-        self.global_active = 0;
+        self.global_active = ActiveCounts::default();
         self.global_queued = 0;
         self.audit.flush().await?;
         if let Some(error) = self.audit_failure.take() {
@@ -1667,50 +1756,6 @@ fn build_seed(
 ) -> Result<AdmissionSeed, (&'static str, Option<String>)> {
     let (target, mode, protocol, credential_allowed, private_network_authorized, upstream_path) =
         match &intent.target {
-            RequestTarget::LocalMirror => {
-                let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
-                    "mirror route is not admitted",
-                    Some("trusted project policy must admit this registry scope".to_owned()),
-                ))?;
-                (
-                    resolved.target,
-                    EgressMode::Intercept,
-                    Some(resolved.protocol),
-                    resolved.credentialed,
-                    false,
-                    resolved.path,
-                )
-            }
-            RequestTarget::MirrorRedirect {
-                protocol,
-                target,
-                upstream_path,
-            } => {
-                let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
-                    "mirror redirect is no longer admitted",
-                    Some("trusted project policy changed during redirect".to_owned()),
-                ))?;
-                let normalized = normalize_path(
-                    upstream_path
-                        .split_once('?')
-                        .map_or(upstream_path.as_str(), |(path, _)| path),
-                )
-                .map_err(|_| ("mirror redirect path is ambiguous", None))?;
-                if resolved.protocol != *protocol
-                    || resolved.target != *target
-                    || !mirror_scope_matches(&normalized, &resolved.admitted_prefix)
-                {
-                    return Err(("mirror redirect escaped its admitted origin or scope", None));
-                }
-                (
-                    target.clone(),
-                    EgressMode::Intercept,
-                    Some(*protocol),
-                    resolved.credentialed,
-                    false,
-                    upstream_path.clone(),
-                )
-            }
             RequestTarget::Generic(target) => {
                 let grant = session
                     .policy
@@ -1721,11 +1766,19 @@ fn build_seed(
                             ("destination is not granted", Some(hint))
                         }
                     })?;
+                let npm = if grant.mode == EgressMode::Intercept && intent.npm_mirror {
+                    session.policy.resolve_npm_registry(target, &intent.path)
+                } else {
+                    None
+                };
                 (
                     target.clone(),
                     grant.mode,
-                    None,
-                    grant.mode == EgressMode::Intercept,
+                    npm.as_ref().map(|_| MirrorProtocol::Npm),
+                    npm.as_ref()
+                        .map_or(grant.mode == EgressMode::Intercept, |route| {
+                            route.credentialed
+                        }),
                     grant.host.is_exact(),
                     intent.path.clone(),
                 )
@@ -1759,7 +1812,12 @@ fn build_seed(
         protocol,
         credential_allowed,
         private_network_authorized,
-        audit_kind: intent.audit_kind,
+        audit_kind: match protocol {
+            Some(MirrorProtocol::Npm) => AuditKind::Npm,
+            Some(MirrorProtocol::Cargo) => AuditKind::Cargo,
+            Some(MirrorProtocol::Go) => AuditKind::Go,
+            None => intent.audit_kind,
+        },
         method: intent.method.clone(),
         request_path: intent.path.clone(),
         upstream_path,
@@ -1806,8 +1864,7 @@ fn denial_draft(
 ) -> AuditDraft {
     let host = match &intent.target {
         RequestTarget::Generic(target) => Some(target.authority()),
-        RequestTarget::MirrorRedirect { target, .. } => Some(target.authority()),
-        RequestTarget::LocalMirror | RequestTarget::LocalSim => None,
+        RequestTarget::LocalSim => None,
     };
     AuditDraft {
         workspace_id: workspace_id.to_owned(),
@@ -2135,4 +2192,166 @@ pub enum GatewayError {
     Stopped,
     #[error("gateway task failed: {0}")]
     Task(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(method: Method, mode: EgressMode) -> AdmissionSeed {
+        AdmissionSeed {
+            workspace_id: "workspace".to_owned(),
+            repo_id: "repo".to_owned(),
+            revision: 1,
+            endpoint: "endpoint".to_owned(),
+            generation: 1,
+            target: CanonicalTarget {
+                scheme: TargetScheme::Https,
+                host: CanonicalHost::Dns("registry.example.test".to_owned()),
+                port: 443,
+            },
+            mode,
+            protocol: None,
+            credential_allowed: false,
+            private_network_authorized: false,
+            audit_kind: AuditKind::Connect,
+            method,
+            request_path: "/".to_owned(),
+            upstream_path: "/".to_owned(),
+            trace_id: None,
+        }
+    }
+
+    /// Charges `class` the way `Actor::activate` does, after checking it fits.
+    fn admit(
+        limits: &GatewayLimits,
+        session: &mut ActiveCounts,
+        global: &mut ActiveCounts,
+        origin_active: &mut usize,
+        class: &PermitClass,
+    ) -> bool {
+        if !pool_admits(limits, *session, *global, class, |_| *origin_active) {
+            return false;
+        }
+        session.charge(class);
+        global.charge(class);
+        if let PermitClass::Request { .. } = class {
+            *origin_active += 1;
+        }
+        true
+    }
+
+    #[test]
+    fn only_intercepted_connect_is_a_tunnel() {
+        let origin = seed(Method::GET, EgressMode::Intercept).target.origin();
+        assert_eq!(
+            seed(Method::CONNECT, EgressMode::Intercept).class(),
+            PermitClass::InterceptTunnel
+        );
+        assert_eq!(
+            seed(Method::CONNECT, EgressMode::Opaque).class(),
+            PermitClass::Request {
+                origin: origin.clone()
+            }
+        );
+        assert_eq!(
+            seed(Method::GET, EgressMode::Intercept).class(),
+            PermitClass::Request { origin }
+        );
+    }
+
+    #[test]
+    fn origin_limit_of_intercept_tunnels_leaves_inner_requests_admissible() {
+        let limits = GatewayLimits::default();
+        let tunnel = seed(Method::CONNECT, EgressMode::Intercept).class();
+        let request = seed(Method::GET, EgressMode::Intercept).class();
+        let (mut session, mut global, mut origin_active) =
+            (ActiveCounts::default(), ActiveCounts::default(), 0_usize);
+        for _ in 0..limits.origin_active {
+            assert!(admit(
+                &limits,
+                &mut session,
+                &mut global,
+                &mut origin_active,
+                &tunnel
+            ));
+        }
+        assert_eq!(origin_active, 0, "tunnels never hold an origin slot");
+        for _ in 0..limits.origin_active {
+            assert!(admit(
+                &limits,
+                &mut session,
+                &mut global,
+                &mut origin_active,
+                &request
+            ));
+        }
+        assert!(
+            !admit(
+                &limits,
+                &mut session,
+                &mut global,
+                &mut origin_active,
+                &request
+            ),
+            "requests stay origin-limited"
+        );
+        assert_eq!(session.total(), limits.origin_active * 2);
+    }
+
+    #[test]
+    fn single_active_limit_admits_one_tunnel_and_its_inner_request() {
+        let limits = GatewayLimits {
+            workspace_active: 1,
+            global_active: 1,
+            origin_active: 1,
+            ..GatewayLimits::default()
+        };
+        let tunnel = seed(Method::CONNECT, EgressMode::Intercept).class();
+        let request = seed(Method::GET, EgressMode::Intercept).class();
+        let opaque = seed(Method::CONNECT, EgressMode::Opaque).class();
+        let (mut session, mut global, mut origin_active) =
+            (ActiveCounts::default(), ActiveCounts::default(), 0_usize);
+        assert!(admit(
+            &limits,
+            &mut session,
+            &mut global,
+            &mut origin_active,
+            &tunnel
+        ));
+        assert!(!pool_admits(&limits, session, global, &tunnel, |_| 0));
+        assert!(admit(
+            &limits,
+            &mut session,
+            &mut global,
+            &mut origin_active,
+            &request
+        ));
+        assert!(!pool_admits(&limits, session, global, &request, |_| 0));
+        assert!(!pool_admits(&limits, session, global, &opaque, |_| {
+            origin_active
+        }));
+        session.release(&request);
+        global.release(&request);
+        origin_active -= 1;
+        assert!(pool_admits(&limits, session, global, &request, |_| {
+            origin_active
+        }));
+        assert!(!pool_admits(&limits, session, global, &tunnel, |_| 0));
+    }
+
+    #[test]
+    fn completion_capacity_covers_both_full_pools() {
+        let limits = GatewayLimits::default();
+        let full = ActiveCounts {
+            tunnels: limits.global_active,
+            requests: limits.global_active,
+        };
+        assert_eq!(active_permit_capacity(&limits), full.total());
+        let oversized = GatewayLimits {
+            global_active: tokio::sync::Semaphore::MAX_PERMITS / 2 + 1,
+            ..limits
+        };
+        assert!(oversized.validate().is_err());
+    }
 }

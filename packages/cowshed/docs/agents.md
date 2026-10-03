@@ -149,12 +149,12 @@ terminal state after process-group termination and pipe drain, never silent trun
 ## Sandbox etiquette: start closed, earn grants
 
 Every workspace starts closed: writes limited to its own volume, designated cache subtrees, and temp; network limited to
-your own gateway listener (whose registry mirrors — npm, crates.io — are baseline policy, warm and credentialed, so
-builds and installs work out of the box with zero grants). Third-party repositories arrive by `git clone` over an
-intercepted egress grant for their host, which admits fetch and refuses push. Need a dev server? Bind it to a port from
-`$COWSHED_PORT_BASE + 1` up — each workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base
-(`$COWSHED_PORT_BASE`), reachable from the host browser container-style and guaranteed not to collide with sibling
-workspaces.
+your own gateway listener. Public npm HTTPS reads are admitted anonymously by the built-in package-registry default;
+other destinations need egress grants. npm installs use the gateway's verified artifact cache. Third-party repositories
+arrive by `git clone` over an intercepted egress grant for their host, which admits fetch and refuses push. Need a dev
+server? Bind it to a port from `$COWSHED_PORT_BASE + 1` up — each workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE`
+ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from the host browser container-style and guaranteed not
+to collide with sibling workspaces.
 
 **Exit code 6 is not an error to retry — it is a request to negotiate.** When cowshed reports 6 it has authoritative
 evidence of the denial (egress denials always — the gateway logged the decision; filesystem denials when the kernel
@@ -197,9 +197,9 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 
 - No writes to `$HOME`, no reading `~/.ssh`, `~/.aws`, keychains, or other projects — closed means closed, and
   `cowshed grant` is the only door.
-- No direct internet. The gateway's mirrors make registry traffic invisible to you; arbitrary hosts need an egress
-  grant. Credentials are injected upstream by the gateway — there are no tokens inside the workspace to find, and no
-  `.env` files.
+- No direct internet. Public npm HTTPS reads have an anonymous default grant; every other destination needs an egress
+  grant. Explicit matching registry grants override the default, including opaque grants. Credentials are injected
+  upstream by the gateway — there are no registry tokens inside the workspace to find, and no `.env` files.
 - No pushing. Your repo's own remote is the local `main`; git can fetch from a host you hold an egress grant for, but
   the gateway refuses every push, and pushing to origin/GitHub is the coordinator's job, host-side.
 - No reaching the human's simulator. iOS test loops run on **dev-side headless simulators** (`--preset simulator`;

@@ -277,13 +277,13 @@ Covered flows:
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
 - **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,
   under the dedicated controller-owned identity/cgroup, bound only to IPv4 `127.0.0.1:7644`. Run real Bun/npm install,
-  Cargo sparse-registry fetch, Go module download, and a generic HTTP/HTTPS proxy client against
-  `http://127.0.0.1:7644/{npm,cargo,go}` and the proxy variables; assert byte identity through the connector, gateway
-  endpoint+token authentication, mirror behavior, and no direct fallback. None of these clients may use a Unix-socket
-  transport. Run two workspaces with the same address/port and prove neither can reach the other's connector or socket.
-  Detach must stop admission, drain connections, kill the connector cgroup, unlink the socket, and leave 7644 unbound;
-  attach must create exactly one fresh connector before exec admission. Restore must drain old connections and make the
-  old connector/socket/token unusable before publishing the new incarnation.
+  Cargo registry fetch, Go module download, and a generic HTTP/HTTPS proxy client through the proxy variables on
+  `http://127.0.0.1:7644`; assert byte identity through the connector, gateway endpoint+token authentication, mirror
+  behavior, and no direct fallback. None of these clients may use a Unix-socket transport. Run two workspaces with the
+  same address/port and prove neither can reach the other's connector or socket. Detach must stop admission, drain
+  connections, kill the connector cgroup, unlink the socket, and leave 7644 unbound; attach must create exactly one
+  fresh connector before exec admission. Restore must drain old connections and make the old connector/socket/token
+  unusable before publishing the new incarnation.
 - gateway interception (05_gateway.md): an intercepted host serves a workspace-CA leaf the in-image anchor trusts,
   injects the Keychain credential, and records a **request-granular** audit line; an `--opaque` host tunnels without
   injection; the **upstream-health gate** fails a dead upstream fast with a classifiable error (not a per-request

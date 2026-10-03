@@ -3,7 +3,7 @@ use super::*;
 use bytes::Bytes;
 use cowshed_gateway::{
     ControlError, ControlFailureCode, CredentialProtocol, GatewayControlClient, GatewayLimits,
-    MirrorProtocol, MirrorRoute,
+    MirrorRoute,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body::{Body, Frame, SizeHint};
@@ -997,8 +997,117 @@ async fn endpoint_identity_precedes_token_authentication() {
 }
 
 #[tokio::test]
-async fn local_mirror_route_rewrites_only_the_admitted_scope() {
+async fn eight_intercept_tunnels_do_not_starve_their_own_registry_requests() {
+    let (upstream_port, mut captured, _upstream) = http_fixture(8, None).await;
+    let endpoint = free_endpoint();
+    let mut config = test_config();
+    config.limits.workspace_active = 8;
+    config.limits.global_active = 8;
+    config.limits.origin_active = 8;
+    let (audit_tx, mut audit_rx) = mpsc::channel(64);
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let (installed, token, certificate) = session(
+        "concurrent-registry",
+        "owner/concurrent-registry",
+        block_endpoint(endpoint),
+        9,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("registry.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install concurrent session");
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate).expect("trust workspace CA");
+    let client = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut tunnels = Vec::new();
+    // Establish every CONNECT before sending a GET: the old single permit pool deadlocked here.
+    for _ in 0..8 {
+        let mut stream = TcpStream::connect(endpoint)
+            .await
+            .expect("connect registry proxy");
+        stream.write_all(format!(
+            "CONNECT registry.test:{upstream_port} HTTP/1.1\r\nHost: registry.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+        ).as_bytes()).await.expect("write registry CONNECT");
+        let head = timeout(Duration::from_secs(2), read_response_head(&mut stream))
+            .await
+            .expect("bounded CONNECT admission");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        tunnels.push(
+            TlsConnector::from(Arc::clone(&client))
+                .connect(
+                    ServerName::try_from("registry.test").expect("registry name"),
+                    stream,
+                )
+                .await
+                .expect("intercepted registry TLS"),
+        );
+    }
+    let mut requests = tokio::task::JoinSet::new();
+    for (index, mut tls) in tunnels.into_iter().enumerate() {
+        requests.spawn(async move {
+            tls.write_all(format!(
+                "GET /allowed/{index} HTTP/1.1\r\nHost: registry.test:{upstream_port}\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.expect("write inner registry request");
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.expect("read inner registry response");
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        });
+    }
+    timeout(Duration::from_secs(2), async {
+        while let Some(result) = requests.join_next().await {
+            result.expect("inner registry request finishes without client retry");
+        }
+    })
+    .await
+    .expect("inner requests never wait for the containing CONNECT to close");
+    for _ in 0..8 {
+        assert!(
+            captured
+                .recv()
+                .await
+                .expect("captured inner GET")
+                .starts_with("GET /allowed/")
+        );
+    }
+    gateway.drain().await.expect("drain both capacity classes");
+    let mut completed_tunnels = 0;
+    let mut completed_requests = 0;
+    while let Ok(event) = audit_rx.try_recv() {
+        if event.status == AuditStatus::Completed {
+            match event.kind {
+                AuditKind::Connect => completed_tunnels += 1,
+                AuditKind::Intercept => completed_requests += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(completed_tunnels, 8);
+    assert_eq!(completed_requests, 8);
+}
+
+#[tokio::test]
+async fn native_registry_requests_use_one_admitted_proxy_path_and_cache() {
     let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
+    let (audit_tx, mut audit_rx) = mpsc::channel(32);
     let endpoint = free_endpoint();
     let gateway = gateway(
         test_config(),
@@ -1007,22 +1116,23 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
             health: UpstreamHealth::Healthy,
             observed: None,
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let policy = WorkspacePolicy {
-        grants: Vec::new(),
-        mirrors: vec![MirrorRoute {
-            local_prefix: "/npm/".to_owned(),
-            upstream_origin: format!("https://mirror.test:{upstream_port}"),
-            protocol: MirrorProtocol::Npm,
-            admitted_prefixes: vec!["/allowed".to_owned(), "/@scope/".to_owned()],
-            credentialed: false,
-        }],
+        grants: vec![grant("mirror.test", upstream_port)],
+        mirrors: vec![
+            MirrorRoute::new(
+                &format!("https://mirror.test:{upstream_port}"),
+                vec!["/allowed".to_owned(), "/@scope/".to_owned()],
+                false,
+            )
+            .expect("registry route"),
+        ],
     };
-    let (session, token, _) = session(
-        "mirror",
-        "owner/repo-mirror",
+    let (installed, token, _) = session(
+        "registry",
+        "owner/repo-registry",
         block_endpoint(endpoint),
         9,
         1,
@@ -1030,221 +1140,188 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     );
     gateway
         .handle()
-        .install(session)
+        .install(installed)
         .await
-        .expect("install mirror session");
-    let request = format!(
-        "GET /npm/allowed/pkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
-    let response = proxy_request(endpoint, request).await;
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let forwarded = captured.recv().await.expect("captured mirror request");
-    assert!(
-        forwarded.starts_with("GET /allowed/pkg HTTP/1.1"),
-        "{forwarded}"
-    );
-
-    let scoped = format!(
-        "GET /npm/@scope%2fpkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
-    let response = proxy_request(endpoint, scoped).await;
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let forwarded = captured.recv().await.expect("captured scoped npm request");
-    assert!(
-        forwarded.starts_with("GET /@scope%2fpkg HTTP/1.1"),
-        "{forwarded}"
-    );
-
-    let public_baseline = format!(
-        "GET /npm/private/pkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
-    let response = proxy_request(endpoint, public_baseline).await;
-    assert!(
-        response.starts_with("HTTP/1.1 502"),
-        "unmatched private scope must fall through to the fixed public baseline: {response}"
-    );
-    gateway.drain().await.expect("drain gateway");
-}
-
-/// A packument over the mirror's metadata bound reaches the registry client as a typed failure
-/// naming the package and its size, not as an opaque mirror-service 502. The upstream declares
-/// its length and then never sends a byte: the refusal comes from the declared length alone, so
-/// a hostile registry cannot make the gateway buffer the body it is refusing.
-#[tokio::test]
-async fn oversized_mirror_metadata_reaches_the_client_as_a_typed_failure() {
-    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind oversized packument fixture");
-    let upstream_port = upstream.local_addr().expect("fixture address").port();
-    let declared = cowshed_gateway::MAX_METADATA_BYTES + 1;
-    let (captured, mut forwarded) = mpsc::channel(1);
-    let release = Arc::new(Notify::new());
-    let held = release.clone();
-    let _upstream = tokio::spawn(async move {
-        let (mut stream, _) = upstream.accept().await.expect("accept packument request");
-        captured
-            .send(read_headers(&mut stream).await)
-            .await
-            .expect("capture packument request");
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write packument headers");
-        held.notified().await;
-    });
-    let endpoint = free_endpoint();
-    let gateway = gateway(
-        test_config(),
-        Arc::new(NoCredentials),
-        Arc::new(LocalConnector {
-            health: UpstreamHealth::Healthy,
-            observed: None,
-        }),
-        Arc::new(DiscardAudit),
-    )
-    .await;
-    let policy = WorkspacePolicy {
-        grants: Vec::new(),
-        mirrors: vec![MirrorRoute {
-            local_prefix: "/npm/".to_owned(),
-            upstream_origin: format!("https://mirror.test:{upstream_port}"),
-            protocol: MirrorProtocol::Npm,
-            admitted_prefixes: vec!["/".to_owned()],
-            credentialed: false,
-        }],
-    };
-    let (session, token, _) = session(
-        "oversized",
-        "owner/repo-oversized",
-        block_endpoint(endpoint),
-        13,
-        1,
-        policy,
-    );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install mirror session");
-
-    let response = proxy_request(
-        endpoint,
-        format!(
-            "GET /npm/@huge%2fpkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-        ),
-    )
-    .await;
-    release.notify_one();
-    let forwarded = forwarded.recv().await.expect("captured packument request");
-    assert!(
-        forwarded.starts_with("GET /@huge%2fpkg HTTP/1.1"),
-        "{forwarded}"
-    );
-    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-    let (_, body) = response
-        .split_once("\r\n\r\n")
-        .expect("response has a body");
-    let problem: serde_json::Value = serde_json::from_str(body).expect("typed JSON failure");
-    assert_eq!(problem["code"], "mirror-metadata-too-large", "{problem}");
-    assert_eq!(problem["package"], "@huge/pkg", "{problem}");
-    assert_eq!(problem["sizeBytes"], declared, "{problem}");
-    assert_eq!(
-        problem["limitBytes"],
-        cowshed_gateway::MAX_METADATA_BYTES,
-        "{problem}"
-    );
-    gateway.drain().await.expect("drain gateway");
-}
-
-/// A registry client talks to its registry, not to a proxy, so it can only send the token in its
-/// own `Authorization` header: bun as `Bearer` (bunfig `token`), Go as `Basic` (netrc). On the
-/// local mirror routes that header carries the workspace token; it is still one exact token,
-/// another workspace's is refused, and it never reaches the upstream. Anywhere else —
-/// absolute-form proxying — `Authorization` is the client's own and authenticates nothing here.
-#[tokio::test]
-async fn a_registry_clients_authorization_header_authenticates_only_the_mirror_routes() {
-    let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
-    let endpoint = free_endpoint();
-    let gateway = gateway(
-        test_config(),
-        Arc::new(NoCredentials),
-        Arc::new(LocalConnector {
-            health: UpstreamHealth::Healthy,
-            observed: None,
-        }),
-        Arc::new(DiscardAudit),
-    )
-    .await;
-    let policy = WorkspacePolicy {
-        grants: vec![grant("isolated.test", upstream_port)],
-        mirrors: vec![MirrorRoute {
-            local_prefix: "/npm/".to_owned(),
-            upstream_origin: format!("https://mirror.test:{upstream_port}"),
-            protocol: MirrorProtocol::Npm,
-            admitted_prefixes: vec!["/".to_owned()],
-            credentialed: false,
-        }],
-    };
-    let (session, token, _) = session(
-        "registry-client",
-        "owner/repo-registry",
-        block_endpoint(endpoint),
-        11,
-        1,
-        policy,
-    );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
-
-    // Each credential form fetches its own package: the mirror caches a packument it filled, so a
-    // repeated path would be served without reaching the upstream this asserts on.
-    for (authorization, package) in [
-        (format!("Bearer {token}"), "left-pad"),
-        (basic_credential("cowshed", &token), "right-pad"),
-    ] {
+        .expect("install registry session");
+    for path in ["/allowed", "/@scope%2fpkg"] {
         let request = format!(
-            "GET /npm/{package} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+            "GET https://mirror.test:{upstream_port}{path} HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nAccept: application/vnd.npm.install-v1+json\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
         );
-        let response = proxy_request(endpoint, request).await;
+        let response = proxy_request(endpoint, request.clone()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let forwarded = captured.recv().await.expect("captured registry request");
         assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "{authorization}: {response}"
-        );
-        let forwarded = timeout(Duration::from_secs(10), captured.recv())
-            .await
-            .expect("the mirror fill reaches the upstream")
-            .expect("captured mirror request");
-        assert!(
-            forwarded.starts_with(&format!("GET /{package} HTTP/1.1")),
+            forwarded.starts_with(&format!("GET {path} HTTP/1.1")),
             "{forwarded}"
         );
         assert!(
-            !forwarded.to_ascii_lowercase().contains("authorization"),
-            "the workspace token reached the upstream: {forwarded}"
+            !forwarded.contains(&token),
+            "workspace proxy token reached registry"
+        );
+        let warm = proxy_request(endpoint, request).await;
+        assert!(warm.starts_with("HTTP/1.1 200"), "{warm}");
+    }
+    for path in [
+        "/npm/allowed",
+        "/cargo/config.json",
+        "/go/example.com/@v/list",
+    ] {
+        let response = proxy_request(endpoint, format!(
+            "GET {path} HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )).await;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "retired reverse endpoint is not served: {response}"
         );
     }
-
-    let forged = format!(
-        "GET /npm/left-pad HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        "B".repeat(43)
-    );
-    let response = proxy_request(endpoint, forged).await;
-    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
-
-    let proxied = format!(
-        "GET http://isolated.test:{upstream_port}/allowed HTTP/1.1\r\nHost: isolated.test:{upstream_port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
-    let response = proxy_request(endpoint, proxied).await;
-    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
     gateway.drain().await.expect("drain gateway");
+    let mut filled = 0;
+    let mut hit = 0;
+    while let Ok(event) = audit_rx.try_recv() {
+        if event.kind == AuditKind::Npm {
+            match event.mirror_cache_status {
+                Some(MirrorCacheStatus::Filled) => filled += 1,
+                Some(MirrorCacheStatus::Hit) => hit += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(filled, 2);
+    assert_eq!(hit, 2);
+}
+
+#[tokio::test]
+async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_mismatch() {
+    use sha2::{Digest as _, Sha512};
+
+    let expected = b"published tarball bytes";
+    let tampered = b"tampered! tarball bytes";
+    assert_eq!(expected.len(), tampered.len());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind registry fixture");
+    let upstream_port = listener.local_addr().expect("registry address").port();
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "versions": {"1.0.0": {"dist": {
+            "tarball": format!("https://mirror.test:{upstream_port}/pkg/-/pkg-1.0.0.tgz"),
+            "integrity": format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(expected))),
+            "size": expected.len()
+        }}}
+    })).expect("published packument");
+    let (paths_tx, mut paths_rx) = mpsc::channel(2);
+    let upstream = tokio::spawn(async move {
+        for (path, content_type, bytes) in [
+            (
+                "/pkg",
+                "application/vnd.npm.install-v1+json",
+                packument.as_slice(),
+            ),
+            (
+                "/pkg/-/pkg-1.0.0.tgz",
+                "application/octet-stream",
+                tampered.as_slice(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.expect("accept registry request");
+            let request = read_headers(&mut stream).await;
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1")),
+                "{request}"
+            );
+            paths_tx.send(path).await.expect("record registry path");
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            ).as_bytes()).await.expect("write registry headers");
+            stream.write_all(bytes).await.expect("write registry body");
+        }
+    });
+    let (audit_tx, mut audit_rx) = mpsc::channel(16);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: vec![grant("mirror.test", upstream_port)],
+        mirrors: vec![
+            MirrorRoute::new(
+                &format!("https://mirror.test:{upstream_port}"),
+                vec!["/pkg".to_owned()],
+                false,
+            )
+            .expect("registry route"),
+        ],
+    };
+    let (installed, token, certificate) = session(
+        "tampered-registry",
+        "owner/tampered-registry",
+        block_endpoint(endpoint),
+        9,
+        1,
+        policy,
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install registry session");
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect proxy");
+    stream.write_all(format!(
+        "CONNECT mirror.test:{upstream_port} HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+    ).as_bytes()).await.expect("write CONNECT");
+    assert!(
+        read_response_head(&mut stream)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate).expect("trust workspace CA");
+    // Node's native registry client omits ALPN; the standard HTTP/1.1 fallback must work.
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut tls = TlsConnector::from(Arc::new(client))
+        .connect(
+            ServerName::try_from("mirror.test").expect("registry name"),
+            stream,
+        )
+        .await
+        .expect("intercept client TLS");
+    tls.write_all(format!(
+        "GET /pkg/-/pkg-1.0.0.tgz HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nConnection: close\r\n\r\n"
+    ).as_bytes()).await.expect("request frozen-install tarball");
+    let mut received = Vec::new();
+    let _closed_stream = timeout(Duration::from_secs(3), tls.read_to_end(&mut received))
+        .await
+        .expect("failed integrity closes stream without waiting for client timeout");
+    assert!(
+        !received
+            .windows(tampered.len())
+            .any(|bytes| bytes == tampered),
+        "complete tampered content must never reach the client: {received:?}"
+    );
+    assert_eq!(paths_rx.recv().await, Some("/pkg"));
+    assert_eq!(paths_rx.recv().await, Some("/pkg/-/pkg-1.0.0.tgz"));
+    upstream.await.expect("registry fixture completes");
+    gateway.drain().await.expect("drain gateway");
+    let mut integrity_failure = false;
+    while let Ok(event) = audit_rx.try_recv() {
+        if event.kind == AuditKind::Npm && event.path.as_deref() == Some("/pkg/-/pkg-1.0.0.tgz") {
+            assert_eq!(event.status, AuditStatus::Failed);
+            integrity_failure = true;
+        }
+    }
+    assert!(
+        integrity_failure,
+        "tampered intercepted download is auditable"
+    );
 }
 
 #[tokio::test]
@@ -2834,19 +2911,19 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
 }
 
 #[tokio::test]
-async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
-    let calls = Arc::new(AtomicUsize::new(0));
+async fn missing_downstream_alpn_serves_http1_for_registry_clients() {
+    let (port, mut captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
     let gateway = gateway(
         test_config(),
         Arc::new(NoCredentials),
-        Arc::new(CountingFailConnector {
-            calls: Arc::clone(&calls),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
         }),
         Arc::new(DiscardAudit),
     )
     .await;
-    let port = 443;
     let (installed, token, ca_certificate) = session(
         "no-downstream-alpn",
         "owner/repo-no-downstream-alpn",
@@ -2886,35 +2963,24 @@ async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
         .await
         .expect("TLS handshake without ALPN");
     assert_eq!(tls.get_ref().1.alpn_protocol(), None);
-    let _ = tls
-        .write_all(
-            format!(
-                "GET /allowed HTTP/1.1\r\nHost: downstream.test:{port}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+    tls.write_all(
+        format!(
+            "GET /allowed HTTP/1.1\r\nHost: downstream.test:{port}\r\nConnection: close\r\n\r\n"
         )
-        .await;
+        .as_bytes(),
+    )
+    .await
+    .expect("write HTTP/1.1 without ALPN");
     let mut response = Vec::new();
-    let result = timeout(Duration::from_secs(1), tls.read_to_end(&mut response))
+    timeout(Duration::from_secs(2), tls.read_to_end(&mut response))
         .await
-        .expect("gateway closes missing-ALPN transport");
+        .expect("HTTP/1.1 response deadline")
+        .expect("read HTTP/1.1 response");
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+    let forwarded = captured.recv().await.expect("captured HTTP/1.1 request");
     assert!(
-        result.is_ok()
-            || matches!(
-                &result,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    )
-            ),
-        "unexpected missing-ALPN close result: {result:?}"
-    );
-    assert!(response.is_empty(), "gateway silently selected HTTP/1.1");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "upstream connector ran despite rejected downstream ALPN"
+        forwarded.starts_with("GET /allowed HTTP/1.1"),
+        "{forwarded}"
     );
     gateway
         .drain()

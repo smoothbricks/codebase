@@ -1559,10 +1559,11 @@ pub(super) async fn sandbox_environment(
              being added, so an intercepted HTTPS origin may fail to verify"
         );
     }
-    // Registry clients find the gateway's mirror routes, and one-file TLS clients find a bundle
-    // that trusts the workspace CA, in the private environment (crate::workspace_clients) —
-    // republished before every spawn so a rotated token or a moved endpoint is never served
-    // stale. The mirror files need only the endpoint and the token; the bundle needs the CA.
+    // Go's env file and one-file TLS clients' trust bundle live in the private environment
+    // (crate::workspace_clients), republished before every spawn so a moved environment is never
+    // served stale. Neither names a gateway endpoint or carries the token: the Go file names the
+    // public module proxy and the bundle needs only the CA. Registry clients — bun included —
+    // reach their registries through the proxy variables above, with no mirror route.
     let anchor = sandbox
         .workspace_mount
         .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
@@ -1588,13 +1589,9 @@ pub(super) async fn sandbox_environment(
         })?,
         None => Vec::new(),
     };
-    let gateway_base = format!("http://127.0.0.1:{port_base}");
-    let token = workspace_token.encode();
     crate::workspace_clients::publish_client_wiring(
         &environment,
         &crate::workspace_clients::ClientWiring {
-            gateway_http: &gateway_base,
-            token: &token,
             workspace_ca: workspace_ca.as_deref(),
             system_bundle: &system_bundle,
             environment: environment_root,
@@ -4716,17 +4713,20 @@ mod workspace_toolchain_tests {
         root
     }
 
-    /// A child finds every package manager's route to the gateway, and every one-file TLS client
-    /// finds a bundle that trusts both the platform roots and the workspace CA — from the files
-    /// and variables the host prepared before the spawn, with no tracked file touched.
+    /// A child's Go toolchain finds the public module proxy, and every one-file TLS client finds
+    /// a bundle that trusts both the platform roots and the workspace CA — from the files and
+    /// variables the host prepared before the spawn, with no tracked file touched. No registry
+    /// client is wired to a gateway route and the workspace token reaches the child only through
+    /// its proxy variables: the bunfig and netrc an earlier wiring left, token and all, are gone.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn a_child_finds_its_mirror_clients_and_a_trust_bundle_with_the_workspace_ca() {
+    async fn a_child_finds_go_and_a_trust_bundle_and_no_retired_registry_wiring() {
         let root = scratch("clients");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
         std::fs::create_dir_all(root.join("home")).expect("home");
-        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        let token = format!("{}A", "canary".repeat(7));
+        std::fs::write(mount.join(".cowshed/token"), &token).expect("token");
         std::fs::write(
             mount.join(".cowshed/ca.pem"),
             b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
@@ -4739,6 +4739,14 @@ mod workspace_toolchain_tests {
             "machine 127.0.0.1\nlogin cowshed\npassword stale\n",
         )
         .expect("stale netrc");
+        // The wiring before this one left bun's global bunfig in the private config: the
+        // loopback mirror registry and the workspace token.
+        std::fs::create_dir_all(mount.join(".cowshed/config")).expect("private config");
+        std::fs::write(
+            mount.join(".cowshed/config/.bunfig.toml"),
+            "[install]\nregistry = { url = \"http://127.0.0.1:49104/npm/\", token = \"stale-token\" }\n",
+        )
+        .expect("stale bunfig");
         let mut sandbox = sandbox_at(&mount);
         sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
         let mut env = BTreeMap::new();
@@ -4811,13 +4819,43 @@ mod workspace_toolchain_tests {
         );
 
         let private = mount.join(".cowshed");
-        let token = "A".repeat(43);
-        assert_eq!(
-            std::fs::read_to_string(private.join("config/.bunfig.toml")).expect("bunfig"),
-            format!(
-                "[install]\nregistry = {{ url = \"http://127.0.0.1:49104/npm/\", token = \"{token}\" }}\n"
-            )
+        fn tree_contains(directory: &Path, needle: &str) -> bool {
+            std::fs::read_dir(directory)
+                .expect("private directory")
+                .any(|entry| {
+                    let path = entry.expect("directory entry").path();
+                    let kind = std::fs::symlink_metadata(&path).expect("entry metadata");
+                    if kind.is_dir() {
+                        tree_contains(&path, needle)
+                    } else if kind.is_file() {
+                        String::from_utf8_lossy(&std::fs::read(&path).expect("file bytes"))
+                            .contains(needle)
+                    } else {
+                        false
+                    }
+                })
+        }
+        assert!(
+            std::fs::symlink_metadata(private.join("config/.bunfig.toml")).is_err(),
+            "the bunfig a previous wiring left, mirror registry and token alike, is gone"
         );
+        for directory in ["config", "cache", "home"] {
+            for needle in ["stale-token", token.as_str()] {
+                assert!(
+                    !tree_contains(&private.join(directory), needle),
+                    "no file under {directory} carries a workspace token"
+                );
+            }
+        }
+        // The token's one channel to a registry client is its proxy userinfo: bun, cargo and Go
+        // reach their public registries through the gateway's proxy endpoint.
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(
+                vars.get(name).map(String::as_str),
+                Some(format!("http://cowshed:{token}@127.0.0.1:49104").as_str()),
+                "{name}"
+            );
+        }
         assert_eq!(
             vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
             Some(private.join("config"))

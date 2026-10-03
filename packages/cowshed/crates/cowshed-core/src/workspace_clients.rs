@@ -1,29 +1,29 @@
-//! Client wiring for a workspace's package managers and TLS clients, written into the
-//! workspace's private environment (`.cowshed/{home,config,cache}`, never a tracked file).
+//! Client wiring for a workspace's Go toolchain and TLS clients, written into the workspace's
+//! private environment (`.cowshed/{home,config,cache}`, never a tracked file).
 //!
-//! Every sandboxed process reaches the network through the workspace gateway: bun through its npm
-//! mirror route (`<GATEWAY_HTTP>/npm`), everything else through the proxy, where a granted host's
-//! TLS is terminated with a leaf the workspace CA signed. Two things make that work for tools
+//! Every sandboxed process reaches the network through the workspace gateway's proxy endpoint
+//! (the `HTTP_PROXY`/`HTTPS_PROXY` variables), where a granted host's TLS is terminated with a
+//! leaf the workspace CA signed, or tunnelled opaquely. No registry client is pointed at a
+//! gateway mirror route: bun, cargo and Go reach their public registries through that endpoint,
+//! and the proxy variables carry the workspace token. Two things make that work for tools
 //! cowshed does not configure by argument:
 //!
-//! - **The mirror client** — bun — finds its registry and the workspace token in its global
-//!   bunfig in the private environment, and sends the token in its own `Authorization` header,
-//!   never in a URL. Go is not a mirror client: `cmd/go` sends credentials only over HTTPS, so
-//!   its `GOENV` file points it at the public module proxy, reached through an opaque tunnel.
+//! - **Go** has no directory-scoped config, so its `GOENV` file names the public module proxy
+//!   and checksum database, reached through opaque tunnels: `cmd/go` sends credentials only
+//!   over HTTPS, and on macOS it verifies TLS with the platform verifier, so it never trusts the
+//!   workspace CA.
 //! - **TLS clients** that read one CA file — git, cargo, nix, uv and OpenSSL — get a combined
 //!   trust bundle: the platform's roots (for opaque tunnels, which present the real upstream
 //!   certificate) followed by the workspace CA (for intercepted hosts).
 //!
-//! Written when the workspace is minted and rewritten before every exec, so an endpoint that
-//! moved or a token that rotated is never served stale. Writes are idempotent: an unchanged
-//! file is left as it is.
+//! Written when the workspace is minted and rewritten before every exec, so a moved environment
+//! is never served stale. Writes are idempotent: an unchanged file is left as it is.
 
 use std::ffi::CStr;
 use std::io;
 use std::path::Path;
 
 use crate::fsio::AnchoredDirectory;
-use crate::metadata::{Platform, PortBlock};
 
 /// The combined trust bundle, at the root of the private environment.
 pub const TRUST_BUNDLE_NAME: &CStr = c"ca-bundle.pem";
@@ -50,31 +50,12 @@ pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/cert.pem";
 #[cfg(not(target_os = "macos"))]
 pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
-/// The workspace's gateway base URL: its port-block base on macOS, the namespace-local
-/// connector on Linux (05_gateway.md).
-pub fn gateway_http(platform: Platform, port_block: Option<PortBlock>) -> Option<String> {
-    match (platform, port_block) {
-        (Platform::Macos, Some(block)) => Some(format!("http://127.0.0.1:{}", block.base())),
-        (Platform::Linux, None) => Some("http://127.0.0.1:7644".to_owned()),
-        _ => None,
-    }
-}
-
-/// bun's global config: the npm mirror as the default registry, authenticated with the token.
-///
-/// Measured on bun 1.4.2: bun reads `$XDG_CONFIG_HOME/.bunfig.toml` when `XDG_CONFIG_HOME` is set
-/// (and `$HOME/.bunfig.toml` only when it is not), and reads it alongside a repository's own
-/// `bunfig.toml`; the token is sent as `Authorization: Bearer`.
-pub fn bunfig(gateway_http: &str, token: &str) -> String {
-    format!("[install]\nregistry = {{ url = \"{gateway_http}/npm/\", token = \"{token}\" }}\n")
-}
-
 /// Go's env file (`go env -w` format), reached through `GOENV` (03_caches.md).
 ///
-/// The public module proxy, not the gateway's loopback mirror: `cmd/go` attaches credentials —
+/// The public module proxy, not a plain-HTTP gateway route: `cmd/go` attaches credentials —
 /// netrc, `GOAUTH`, URL userinfo — only to HTTPS URLs, so no Go client can present the workspace
-/// token to a plain-HTTP route. It names no endpoint and carries no token, so a host process that
-/// loads the workspace's `.envrc` reads the same file and fetches directly.
+/// token to one. It names no endpoint and carries no token, so a host process that loads the
+/// workspace's `.envrc` reads the same file and fetches directly.
 pub fn go_env(environment: &Path) -> String {
     let go = environment.join("cache/go");
     format!(
@@ -104,8 +85,6 @@ pub fn trust_bundle(system: &[u8], workspace_ca: &[u8]) -> Vec<u8> {
 
 /// Everything the wiring is derived from.
 pub struct ClientWiring<'a> {
-    pub gateway_http: &'a str,
-    pub token: &'a str,
     /// The workspace CA certificate; no bundle is published without one.
     pub workspace_ca: Option<&'a [u8]>,
     pub system_bundle: &'a [u8],
@@ -119,13 +98,15 @@ pub(crate) fn publish_client_wiring(
     root: &AnchoredDirectory,
     wiring: &ClientWiring<'_>,
 ) -> io::Result<()> {
-    root.child(c"config")?.publish_file(
-        c".bunfig.toml",
-        bunfig(wiring.gateway_http, wiring.token).as_bytes(),
-    )?;
     root.child(c"cache")?
         .child(c"go")?
         .publish_file(c"env", go_env(wiring.environment).as_bytes())?;
+    // An earlier wiring published bun's global bunfig here: the loopback mirror registry and the
+    // workspace token. Bun reads `$XDG_CONFIG_HOME/.bunfig.toml`, so a stale copy would keep
+    // sending every install to the retired route and leave the token on disk. Removed as the
+    // entry itself, never a link target; bun resolves its registry from the repository's own
+    // configuration and reaches it through the proxy variables.
+    root.child(c"config")?.remove_file(c".bunfig.toml")?;
     // The netrc an earlier wiring published for Go carried the workspace token, and no Go client
     // ever sent it; nothing else reads it but clients that would hand it to any loopback server.
     root.child(c"home")?.remove_file(c".netrc")?;
@@ -148,29 +129,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bun_carries_the_token_outside_any_url_and_go_names_the_public_proxy() {
-        let gateway = "http://127.0.0.1:40960";
-        assert_eq!(
-            bunfig(gateway, "tok"),
-            "[install]\nregistry = { url = \"http://127.0.0.1:40960/npm/\", token = \"tok\" }\n"
-        );
+    fn go_names_the_public_proxy_and_no_gateway_endpoint_or_token() {
         let go = go_env(Path::new("/w/.cowshed"));
         assert!(go.contains("GOPROXY=https://proxy.golang.org\n"));
         assert!(!go.contains("direct"));
         assert!(!go.contains("127.0.0.1"));
+        assert!(!go.to_ascii_lowercase().contains("token"));
         assert!(go.contains("GOMODCACHE=/private/cowshed/caches/go/mod\n"));
         assert!(go.contains("GOPATH=/w/.cowshed/cache/go/path\n"));
         assert!(go.contains("GOBIN=/w/.cowshed/cache/go/bin\n"));
         assert!(go.contains("GOTOOLCHAIN=local\n"));
-        assert_eq!(
-            gateway_http(Platform::Macos, Some(PortBlock::new(40_960, 16).unwrap())).as_deref(),
-            Some(gateway)
-        );
-        assert_eq!(
-            gateway_http(Platform::Linux, None).as_deref(),
-            Some("http://127.0.0.1:7644")
-        );
-        assert_eq!(gateway_http(Platform::Macos, None), None);
     }
 
     #[test]
@@ -187,54 +155,55 @@ mod tests {
         let root = std::fs::canonicalize(&root).unwrap();
         let anchored = AnchoredDirectory::create(&root).unwrap();
         let wiring = ClientWiring {
-            gateway_http: "http://127.0.0.1:40960",
-            token: "tok",
             workspace_ca: Some(b"CA\n"),
             system_bundle: b"ROOTS\n",
             environment: &root,
         };
         publish_client_wiring(&anchored, &wiring).unwrap();
         let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
-        assert!(read("config/.bunfig.toml").contains("/npm/"));
         assert!(read("cache/go/env").contains("GOPROXY=https://proxy.golang.org\n"));
         assert!(!root.join("home/.netrc").exists());
+        assert!(!root.join("config/.bunfig.toml").exists());
         assert_eq!(read("ca-bundle.pem"), "ROOTS\nCA\n");
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(root.join("config/.bunfig.toml"))
+            let mode = std::fs::metadata(root.join("cache/go/env"))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 
-        // Unchanged wiring leaves the file itself in place; a rotated token rewrites it.
+        // Unchanged wiring leaves the file itself in place; a moved environment rewrites it.
         let inode = |path: &str| {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(root.join(path)).unwrap().ino()
         };
-        let before = inode("config/.bunfig.toml");
+        let before = inode("cache/go/env");
         publish_client_wiring(&anchored, &wiring).unwrap();
-        assert_eq!(inode("config/.bunfig.toml"), before);
+        assert_eq!(inode("cache/go/env"), before);
+        let moved = root.join("moved");
         publish_client_wiring(
             &anchored,
             &ClientWiring {
-                token: "rotated",
+                environment: &moved,
                 ..wiring
             },
         )
         .unwrap();
-        assert!(read("config/.bunfig.toml").contains("token = \"rotated\""));
+        assert!(
+            read("cache/go/env").contains(&format!("GOPATH={}/cache/go/path\n", moved.display()))
+        );
 
         // A child that planted a link where a file belongs cannot redirect the host's write.
         let outside = root.join("outside");
         std::fs::write(&outside, b"untouched").unwrap();
-        std::fs::remove_file(root.join("config/.bunfig.toml")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("config/.bunfig.toml")).unwrap();
+        std::fs::remove_file(root.join("cache/go/env")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("cache/go/env")).unwrap();
         publish_client_wiring(&anchored, &wiring).unwrap();
         assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
         assert!(
-            !std::fs::symlink_metadata(root.join("config/.bunfig.toml"))
+            !std::fs::symlink_metadata(root.join("cache/go/env"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
@@ -245,6 +214,56 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("home/.netrc")).unwrap();
         publish_client_wiring(&anchored, &wiring).unwrap();
         assert!(std::fs::symlink_metadata(root.join("home/.netrc")).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The bunfig an earlier wiring published carried the workspace token and the loopback mirror
+    /// registry, and bun reads it from `XDG_CONFIG_HOME`: a stale copy would keep sending every
+    /// install to the retired route. Publication removes it — or a link planted in its place — as
+    /// the entry itself, never what the link points at, and nothing in the private environment
+    /// keeps the token.
+    #[test]
+    fn publication_removes_the_retired_bunfig_and_leaves_no_token_on_disk() {
+        fn leaked(directory: &Path, needle: &str) -> bool {
+            std::fs::read_dir(directory).unwrap().any(|entry| {
+                let path = entry.unwrap().path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    leaked(&path, needle)
+                } else if metadata.is_file() {
+                    String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(needle)
+                } else {
+                    false
+                }
+            })
+        }
+
+        let root = std::env::temp_dir().join(format!("client-wiring-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let anchored = AnchoredDirectory::create(&root).unwrap();
+        let wiring = ClientWiring {
+            workspace_ca: Some(b"CA\n"),
+            system_bundle: b"ROOTS\n",
+            environment: &root,
+        };
+        let bunfig = root.join("config/.bunfig.toml");
+        std::fs::write(
+            &bunfig,
+            "[install]\nregistry = { url = \"http://127.0.0.1:40960/npm/\", token = \"stale-token\" }\n",
+        )
+        .unwrap();
+        assert!(leaked(&root, "stale-token"));
+        publish_client_wiring(&anchored, &wiring).unwrap();
+        assert!(std::fs::symlink_metadata(&bunfig).is_err());
+        assert!(!leaked(&root, "stale-token"));
+
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &bunfig).unwrap();
+        publish_client_wiring(&anchored, &wiring).unwrap();
+        assert!(std::fs::symlink_metadata(&bunfig).is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
         std::fs::remove_dir_all(&root).unwrap();
     }

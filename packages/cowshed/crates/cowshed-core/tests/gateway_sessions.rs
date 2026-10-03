@@ -13,8 +13,8 @@ use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnat
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{
-    EgressMode as GatewayEgressMode, GatewayStatus, SessionStatus, WorkspaceCa, WorkspaceEndpoint,
-    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    CanonicalTarget, EgressMode as GatewayEgressMode, GatewayStatus, SessionStatus, TargetScheme,
+    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -656,14 +656,14 @@ fn grant_policy_maps_default_ports_and_modes() {
         ..GrantSet::default()
     };
     let policy = policy_from_grants(&grants).expect("policy maps");
-    assert_eq!(policy.grants.len(), 3);
+    assert_eq!(policy.grants.len(), 4);
     assert_eq!(
         policy
             .grants
             .iter()
             .map(|grant| grant.port)
             .collect::<Vec<_>>(),
-        vec![443, 80, 8443]
+        vec![443, 80, 8443, 443]
     );
     assert_eq!(
         policy
@@ -674,8 +674,76 @@ fn grant_policy_maps_default_ports_and_modes() {
         vec![
             GatewayEgressMode::Intercept,
             GatewayEgressMode::Intercept,
-            GatewayEgressMode::Opaque
+            GatewayEgressMode::Opaque,
+            GatewayEgressMode::Intercept
         ]
     );
-    assert_eq!(policy.mirrors.len(), 3);
+    assert!(
+        policy.mirrors.is_empty(),
+        "no mirror route is configured: the public registry is the gateway's own baseline"
+    );
+}
+
+#[test]
+fn fresh_workspaces_have_anonymous_public_npm_reads_without_probe_grants() {
+    let policy = policy_from_grants(&GrantSet::default()).expect("default policy");
+    let target = CanonicalTarget::from_authority("registry.npmjs.org:443", TargetScheme::Https)
+        .expect("public registry");
+    let grant = policy
+        .authorize(
+            &target,
+            &"GET".parse().expect("read method"),
+            "/@scope%2fpkg",
+        )
+        .expect("default npm read");
+    assert_eq!(grant.mode, GatewayEgressMode::Intercept);
+    assert!(
+        !policy
+            .resolve_npm_registry(&target, "/@scope%2fpkg")
+            .expect("public npm route")
+            .credentialed
+    );
+    assert!(
+        policy
+            .authorize(&target, &"PUT".parse().expect("write method"), "/pkg")
+            .is_err()
+    );
+    let other_port =
+        CanonicalTarget::from_authority("registry.npmjs.org:8443", TargetScheme::Https)
+            .expect("other port");
+    assert!(
+        policy
+            .authorize(&other_port, &"CONNECT".parse().expect("tunnel method"), "/")
+            .is_err()
+    );
+}
+
+#[test]
+fn explicit_registry_rules_replace_the_package_default_including_wildcards() {
+    for host in ["registry.npmjs.org", "*.npmjs.org"] {
+        let policy = policy_from_grants(&GrantSet {
+            egress: vec![EgressRule {
+                host: host.to_owned(),
+                ports: vec![443],
+                mode: EgressMode::Opaque,
+            }],
+            ..GrantSet::default()
+        })
+        .expect("explicit registry policy");
+        assert_eq!(policy.grants.len(), 1);
+        let target = CanonicalTarget::from_authority("registry.npmjs.org:443", TargetScheme::Https)
+            .expect("public registry");
+        assert_eq!(
+            policy
+                .authorize(&target, &"CONNECT".parse().expect("tunnel method"), "/")
+                .expect("explicit tunnel")
+                .mode,
+            GatewayEgressMode::Opaque
+        );
+        assert!(
+            policy
+                .authorize(&target, &"GET".parse().expect("read method"), "/pkg")
+                .is_err()
+        );
+    }
 }

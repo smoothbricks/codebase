@@ -96,12 +96,13 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   read-at-build, layer 3; go's sum/ziphash verification + 0444 entries make it the strongest-postured shared cache);
   `GOPATH`/`GOBIN` in-image (`go install` binaries are the `~/.cargo/bin` hazard); `GOTOOLCHAIN=local` (toolchain is
   nix/devenv-pinned; `auto` contradicts the declarative env — deliberate opt-in lands downloads in GOMODCACHE, on the
-  caches volume). Wired by an in-image `GOENV` file at `.cowshed/cache/go/env` carrying the per-workspace
-  `GOPROXY=http://127.0.0.1:<base>/go` (no `,direct`), reached via the `GOENV` export riding `.envrc`/direnv — Go has no
-  directory-scoped config, so this is a second load-bearing export beside the token candidate. New gateway endpoint:
-  `/go` GOPROXY mirror with sumdb passthrough and private-module credential injection (workspace git reaches a forge
-  only through a grant, fetch-only, so the proxy IS the private-module path). `~/go` is deny-listed as a
-  misconfiguration tripwire (04_sandbox.md). Specs: 03_caches.md, 04_sandbox.md, 05_gateway.md.
+  caches volume). Wired by an in-image `GOENV` file at `.cowshed/cache/go/env` carrying
+  `GOPROXY=https://proxy.golang.org` and `GOSUMDB=sum.golang.org` (no `,direct`), reached via the `GOENV` export riding
+  `.envrc`/direnv — Go has no directory-scoped config, so this is a second load-bearing export beside the token
+  candidate. Go is not a gateway mirror client: `cmd/go` sends credentials only over HTTPS, so both hosts are reached
+  through the proxy variables as opaque tunnels under project-standing grants (workspace git reaches a forge only
+  through a grant, fetch-only, so the proxy IS the private-module path). `~/go` is deny-listed as a misconfiguration
+  tripwire (04_sandbox.md). Specs: 03_caches.md, 04_sandbox.md, 05_gateway.md.
 - **iOS/Xcode topology (posture B)**: Xcode has no remote mode and Simulator.app cannot attach cross-uid, so the
   **personal-session simulator is an artifact host** (human inspection, fed by the one-way drop dir
   `<shared-drop-root>/<owner>/<repo>/`, using the separately validated components of the primary `repo_id`, via
@@ -275,12 +276,11 @@ Open experiments (fold into Phase 1 as tests, don't block on them):
 - **Go wiring verification** (03/04/05, empirical baseline: devenv-provided go 1.26.3, defaults `GOPATH=~/go` with a 1.1
   GB modcache already grown, `GOENV=~/Library/Application Support/go/env`): (i) `GOENV` coverage across all go
   invocations — including editor-spawned gopls (direnv integration) and unwrapped spawns — and whether any file-based
-  mechanism could kill the export (none known: go has no directory-scoped config); (ii) per-exec `GOPROXY` env override
-  taking precedence over the `GOENV` file (decides tier-2 go attribution, 13_telemetry.md); (iii) Go-on-macOS platform
-  verifier: confirm `crypto/x509` ignores `SSL_CERT_FILE` on darwin so Go-built clients of intercepted hosts need
-  `--opaque` (04_sandbox.md gap table; moot for module traffic on the plain-HTTP `/go` mirror); (iv) cite/verify the
-  GOMODCACHE concurrent-sharing guarantee across many workspaces + main (0444 entries, internal locking) and confirm
-  GOFLAGS `-modcacherw` projects don't break the model.
+  mechanism could kill the export (none known: go has no directory-scoped config); (ii) Go-on-macOS platform verifier:
+  confirm `crypto/x509` ignores `SSL_CERT_FILE` on darwin so Go-built clients of intercepted hosts need `--opaque`
+  (04_sandbox.md gap table; why module traffic is an opaque tunnel); (iii) cite/verify the GOMODCACHE concurrent-sharing
+  guarantee across many workspaces + main (0444 entries, internal locking) and confirm GOFLAGS `-modcacherw` projects
+  don't break the model.
 - **iOS/simulator verification** (14_nix.md, 05_gateway.md `/sim/`): (i) simulator reliability without an Aqua session —
   CI folklore says XCUITest/`simctl` workloads want a live GUI session for the executing uid; confirm what actually
   degrades over pure SSH and whether a persistent background dev session fixes it; (ii) Expo CLI resolves `xcrun` via
@@ -304,9 +304,6 @@ Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold i
   over an intercepted host? If not, Bun is a documented interception gap (04_sandbox.md trust-anchor table).
 - **macOS-native-TLS tool inventory** — enumerate the Security.framework-backed tools (Swift/Xcode, some system
   utilities) that ignore env anchors and therefore need `--opaque` for an intercepted host (04_sandbox.md gaps).
-- **`BUN_CONFIG_REGISTRY` per-job trace URL** — env-vs-bunfig precedence, subcommand coverage (bun#617), and the
-  npmrc-overrides-bunfig bug (bun#20593): decides whether tier-2 exact `bun install` attribution is reliable
-  (13_telemetry.md).
 - **Audit flush-durability window** — measure the one-batch crash window under the decision-boundary/short-timer flush
   policy; confirm no audit-relevant event class needs a per-event flush (13_telemetry.md).
 - **lmao TRACEPARENT adoption** — verify that the TS/Rust tracer adopts `TRACEPARENT` at init and stamps outbound

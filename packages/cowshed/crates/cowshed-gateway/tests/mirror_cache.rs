@@ -16,10 +16,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use cowshed_gateway::{
     Cache, CacheBodyError, CacheConfig, CacheError, CanonicalTarget, ConfigError, GatewayConfig,
-    MAX_METADATA_BYTES, MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus,
-    MirrorError, MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest,
-    MirrorResourceKind, MirrorRoute, MirrorService, MirrorUpstream, ObjectDigest,
-    ObjectExpectation, TargetScheme, UpstreamHealth, WorkspacePolicy,
+    MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError,
+    MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind,
+    MirrorRoute, MirrorService, MirrorUpstream, ObjectDigest, ObjectExpectation, TargetScheme,
+    UpstreamHealth, WorkspacePolicy,
 };
 use http::{HeaderMap, Method, Response, StatusCode, header};
 use http_body::{Body, Frame};
@@ -49,8 +49,8 @@ impl TestRoot {
     fn cache_config(&self) -> CacheConfig {
         CacheConfig {
             root: self.0.clone(),
-            high_water_bytes: 1024 * 1024,
-            low_water_bytes: 512 * 1024,
+            high_water_bytes: 512 * 1024 * 1024,
+            low_water_bytes: 256 * 1024 * 1024,
             metadata_ttl: Duration::from_secs(300),
             fill_wait_timeout: Duration::from_secs(1),
         }
@@ -118,11 +118,14 @@ impl MirrorUpstream for FailingUpstream {
     }
 }
 
-struct OversizedMetadataBody {
-    sent: u64,
+struct LargePackumentBody {
+    prefix: Option<Bytes>,
+    padding: u64,
+    complete: bool,
+    polls: Arc<AtomicUsize>,
 }
 
-impl Body for OversizedMetadataBody {
+impl Body for LargePackumentBody {
     type Data = Bytes;
     type Error = CacheBodyError;
 
@@ -130,17 +133,22 @@ impl Body for OversizedMetadataBody {
         mut self: Pin<&mut Self>,
         _context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, CacheBodyError>>> {
-        assert!(
-            self.sent <= MAX_METADATA_BYTES,
-            "oversized stream was drained"
-        );
-        let bytes = if self.sent == MAX_METADATA_BYTES {
-            Bytes::from_static(b" ")
-        } else {
-            Bytes::from_static(&[b' '; 1024 * 1024])
-        };
-        self.sent += u64::try_from(bytes.len()).expect("frame length fits u64");
-        Poll::Ready(Some(Ok(Frame::data(bytes))))
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        if let Some(prefix) = self.prefix.take() {
+            return Poll::Ready(Some(Ok(Frame::data(prefix))));
+        }
+        if self.padding > 0 {
+            const CHUNK: &[u8] = &[b' '; 64 * 1024];
+            let length = usize::try_from(self.padding.min(CHUNK.len() as u64))
+                .expect("chunk length fits usize");
+            self.padding -= length as u64;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&CHUNK[..length])))));
+        }
+        if !self.complete {
+            self.complete = true;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"\"}")))));
+        }
+        Poll::Ready(None)
     }
 }
 
@@ -168,8 +176,8 @@ fn declared_digest_response(bytes: &[u8]) -> Response<MirrorBody> {
         .expect("fixture response")
 }
 
-/// A packument as registry.npmjs.org answers it: `Vary: accept`, so the mirror serves it as
-/// published, neither cached nor rewritten.
+/// The registry's install representation varies by Accept. Each representation is its own cache
+/// entry, so `Vary: accept` never conflates it with the full packument.
 fn registry_packument_response(bytes: &[u8]) -> Response<MirrorBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -178,6 +186,104 @@ fn registry_packument_response(bytes: &[u8]) -> Response<MirrorBody> {
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(body(Bytes::copy_from_slice(bytes)))
         .expect("registry packument response")
+}
+
+/// What an npm client sends for `fullMetadata`, and for an install.
+const FULL_ACCEPT: &str = "application/json";
+const INSTALL_V1_ACCEPT: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+
+/// A registry's packument in one representation; content type and ETag tell them apart.
+fn representation_response(content_type: &str, etag: &str, bytes: &[u8]) -> Response<MirrorBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ETAG, etag)
+        .header(header::VARY, "accept-encoding, accept")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(body(Bytes::copy_from_slice(bytes)))
+        .expect("representation response")
+}
+
+fn full_response(bytes: &[u8]) -> Response<MirrorBody> {
+    representation_response("application/json", "\"full\"", bytes)
+}
+
+fn install_response(bytes: &[u8]) -> Response<MirrorBody> {
+    representation_response("application/vnd.npm.install-v1+json", "\"install\"", bytes)
+}
+
+/// `@scope/pkg@1.0.0` publishing `tarball`'s integrity. The full document adds fields only the
+/// full representation carries, so the two representations never share bytes.
+fn published(tarball: &[u8], full: bool) -> Vec<u8> {
+    let mut document = serde_json::json!({
+        "name": "@scope/pkg",
+        "versions": {"1.0.0": {"dist": {
+            "tarball": "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz",
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(tarball))),
+            "size": tarball.len()
+        }}}
+    });
+    if full {
+        document["dist-tags"] = serde_json::json!({"latest": "1.0.0"});
+        document["readme"] = serde_json::json!("only the full packument carries a readme");
+    }
+    serde_json::to_vec(&document).expect("encode packument")
+}
+
+fn accepting(
+    target: CanonicalTarget,
+    path: &str,
+    scope: MirrorCacheScope,
+    credentialed: bool,
+    accept: &str,
+) -> MirrorRequest {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT, accept.parse().expect("accept header"));
+    MirrorRequest::new(
+        MirrorProtocol::Npm,
+        target,
+        Method::GET,
+        path.to_owned(),
+        headers,
+        scope,
+        credentialed,
+        None,
+    )
+    .expect("valid fixture mirror request")
+}
+
+/// An anonymous packument request to the public registry.
+fn packument(path: &str, accept: &str) -> MirrorRequest {
+    accepting(
+        target("registry.npmjs.org"),
+        path,
+        MirrorCacheScope::Anonymous,
+        false,
+        accept,
+    )
+}
+
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
+    headers
+        .get(name)
+        .expect("fixture header")
+        .to_str()
+        .expect("visible header")
+}
+
+async fn collect_response(outcome: MirrorOutcome) -> (MirrorCacheStatus, HeaderMap, Bytes) {
+    let MirrorOutcome::Response(response) = outcome else {
+        panic!("expected mirror response");
+    };
+    let status = response.cache_status;
+    let (parts, body) = response.response.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .expect("collect mirror response")
+        .to_bytes();
+    (status, parts.headers, bytes)
 }
 
 fn metadata_response(bytes: &[u8], etag: &str) -> Response<MirrorBody> {
@@ -333,6 +439,65 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
     assert!(!object.exists(), "corruption must delete the cache entry");
 }
 
+#[tokio::test]
+async fn same_length_cached_tarball_corruption_withholds_the_last_chunk() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let artifact = b"verified cached tarball";
+    let request = request(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        "/pkg/-/pkg-1.0.0.tgz",
+        MirrorCacheScope::Anonymous,
+        false,
+        Some(expectation(artifact)),
+    );
+    let upstream = QueueUpstream::new([ok_response(artifact)]);
+    collect(
+        service
+            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("fill verified tarball"),
+    )
+    .await;
+    let object = std::fs::read_dir(root.path())
+        .expect("list cache")
+        .map(|entry| entry.expect("cache entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("obj-"))
+        })
+        .expect("cached tarball");
+    let mut file = StdOpenOptions::new()
+        .write(true)
+        .open(&object)
+        .expect("open corruption fixture");
+    file.seek(SeekFrom::Start(64 * 1024))
+        .expect("seek unchanged body geometry");
+    file.write_all(b"!")
+        .expect("change one cached byte without changing length");
+    file.sync_all().expect("sync corrupted byte");
+    drop(file);
+    let offline = QueueUpstream::new([]);
+    let MirrorOutcome::Response(response) = service
+        .execute(request, UpstreamHealth::Offline, &offline)
+        .await
+        .expect("headers admitted before streaming integrity verification")
+    else {
+        panic!("expected cached response");
+    };
+    let mut body = response.response.into_body();
+    let error = body
+        .frame()
+        .await
+        .expect("reader verifies final chunk")
+        .expect_err("same-length digest corruption cannot emit the complete tarball");
+    assert!(error.to_string().contains("digest"), "{error}");
+    assert_eq!(offline.call_count(), 0);
+}
+
 /// An HTTP client reads a response to its declared `Content-Length` and closes; it never polls
 /// for the end of a body it has already received. The fill must publish on the strength of the
 /// declared length, not on a final poll the client never makes, or every fetch refills.
@@ -390,9 +555,9 @@ async fn immutable_digest_mismatch_never_publishes() {
     let service = open_service(&root).await;
     let expected = expectation(b"right bytes");
     let request = request(
-        MirrorProtocol::Cargo,
-        target("static.crates.io"),
-        "/crates/demo/demo-1.0.0.crate",
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        "/demo/-/demo-1.0.0.tgz",
         MirrorCacheScope::Anonymous,
         false,
         Some(expected),
@@ -502,54 +667,97 @@ async fn metadata_over_the_old_cap_supplies_tarball_integrity() {
 }
 
 #[tokio::test]
-async fn metadata_over_the_new_cap_is_a_typed_package_failure() {
-    for (declared_length, cacheable) in [(true, false), (false, false), (false, true)] {
-        let root = TestRoot::new();
-        let service = open_service(&root).await;
-        let request = request(
-            MirrorProtocol::Npm,
-            target("registry.npmjs.org"),
-            "/@huge/pkg/-/pkg-1.0.0.tgz",
-            MirrorCacheScope::Anonymous,
-            false,
-            None,
-        );
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/vnd.npm.install-v1+json");
-        if !cacheable {
-            response = response.header(header::VARY, "accept-encoding, accept");
-        }
-        let upstream_body = if declared_length {
-            response = response.header(header::CONTENT_LENGTH, MAX_METADATA_BYTES + 1);
-            body(Bytes::new())
-        } else {
-            OversizedMetadataBody { sent: 0 }.boxed()
-        };
-        let upstream = QueueUpstream::new([response
-            .body(upstream_body)
-            .expect("oversized metadata response")]);
-        let error = service
-            .execute(request, UpstreamHealth::Healthy, &upstream)
-            .await
-            .expect_err("oversized metadata must fail before fetching a tarball");
-        assert!(error.to_string().contains("@huge/pkg"));
-        assert!(
-            error
-                .to_string()
-                .contains(&(MAX_METADATA_BYTES + 1).to_string())
-        );
-        let MirrorError::MetadataTooLarge {
-            package,
-            size_bytes,
-        } = error
-        else {
-            panic!("expected typed metadata size failure");
-        };
-        assert_eq!(package, "@huge/pkg");
-        assert_eq!(size_bytes, MAX_METADATA_BYTES + 1);
-        assert_eq!(upstream.call_count(), 1);
+async fn packument_larger_than_128_mib_streams_and_indexes_without_buffering() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let artifact = b"verified large-packument tarball";
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "versions": {"1.0.0": {"dist": {
+            "tarball": "https://registry.npmjs.org/huge/-/huge-1.0.0.tgz",
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(artifact))),
+            "size": artifact.len()
+        }}}
+    }))
+    .expect("packument prefix");
+    let mut prefix = encoded;
+    prefix.pop();
+    prefix.extend_from_slice(b",\"padding\":\"");
+    let prefix_length = prefix.len() as u64;
+    let padding = 129 * 1024 * 1024;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let upstream_body = LargePackumentBody {
+        prefix: Some(Bytes::from(prefix)),
+        padding,
+        complete: false,
+        polls: polls.clone(),
     }
+    .boxed();
+    let upstream = QueueUpstream::new([Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.npm.install-v1+json")
+        .header(header::VARY, "accept")
+        .body(upstream_body)
+        .expect("large stream")]);
+    let MirrorOutcome::Response(response) = service
+        .execute(
+            request(
+                MirrorProtocol::Npm,
+                target("registry.npmjs.org"),
+                "/huge",
+                MirrorCacheScope::Anonymous,
+                false,
+                None,
+            ),
+            UpstreamHealth::Healthy,
+            &upstream,
+        )
+        .await
+        .expect("start streaming packument")
+    else {
+        panic!("expected streamed packument");
+    };
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "headers arrive before reading metadata"
+    );
+    let mut body = response.response.into_body();
+    let mut total = 0u64;
+    while let Some(frame) = body.frame().await {
+        if let Ok(bytes) = frame.expect("stream large packument").into_data() {
+            total += bytes.len() as u64;
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "gateway never emits a buffered packument"
+            );
+        }
+    }
+    assert_eq!(total, prefix_length + padding + 2);
+    let artifact_upstream = QueueUpstream::new([ok_response(artifact)]);
+    let (_, bytes) = collect(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/huge/-/huge-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &artifact_upstream,
+            )
+            .await
+            .expect("indexed integrity"),
+    )
+    .await;
+    assert_eq!(bytes.as_ref(), artifact);
+    assert_eq!(
+        artifact_upstream.call_count(),
+        1,
+        "tarball uses index, never fetches metadata again"
+    );
 }
 
 #[tokio::test]
@@ -869,7 +1077,7 @@ async fn startup_removes_crash_temps_and_rejects_symlink_roots() {
 }
 
 #[test]
-fn npm_cargo_go_fixtures_have_exact_protocol_metadata() {
+fn npm_fixtures_have_exact_protocol_metadata() {
     let npm = request(
         MirrorProtocol::Npm,
         target("registry.npmjs.org"),
@@ -880,85 +1088,47 @@ fn npm_cargo_go_fixtures_have_exact_protocol_metadata() {
     );
     assert_eq!(npm.metadata.identity, "@scope/pkg");
     assert_eq!(npm.metadata.kind, MirrorResourceKind::Metadata);
-
-    let crate_bytes = b"crate";
-    let cargo = request(
-        MirrorProtocol::Cargo,
-        target("static.crates.io"),
-        "/crates/serde/serde-1.0.0.crate",
-        MirrorCacheScope::Anonymous,
-        false,
-        Some(expectation(crate_bytes)),
-    );
-    assert_eq!(cargo.metadata.identity, "serde");
-    assert_eq!(cargo.metadata.kind, MirrorResourceKind::Immutable);
-
-    let zip = b"module zip";
-    let go = request(
-        MirrorProtocol::Go,
-        target("proxy.golang.org"),
-        "/golang.org/x/text/@v/v0.3.0.zip",
-        MirrorCacheScope::Anonymous,
-        false,
-        Some(expectation(zip)),
-    );
-    assert_eq!(go.metadata.identity, "golang.org/x/text");
-    assert_eq!(go.metadata.kind, MirrorResourceKind::Immutable);
-
-    let sumdb = request(
-        MirrorProtocol::Go,
-        target("sum.golang.org"),
-        "/sumdb/sum.golang.org/supported",
-        MirrorCacheScope::Anonymous,
-        false,
-        None,
-    );
-    assert_eq!(sumdb.metadata.kind, MirrorResourceKind::Metadata);
 }
 
 #[test]
-fn policy_rewrite_is_typed_exact_and_scope_bound() {
+fn native_registry_policy_is_typed_exact_and_scope_bound() {
     let policy = WorkspacePolicy {
         grants: Vec::new(),
-        mirrors: vec![MirrorRoute {
-            local_prefix: "/npm/".to_owned(),
-            upstream_origin: "https://registry.npmjs.org:443".to_owned(),
-            protocol: MirrorProtocol::Npm,
-            admitted_prefixes: vec![
-                "/react".to_owned(),
-                "/react/-/".to_owned(),
-                "/@scope/".to_owned(),
-            ],
-            credentialed: false,
-        }],
+        mirrors: vec![
+            MirrorRoute::new(
+                "https://registry.npmjs.org:443",
+                vec![
+                    "/react".to_owned(),
+                    "/react/-/".to_owned(),
+                    "/@scope/".to_owned(),
+                ],
+                false,
+            )
+            .expect("valid npm route"),
+        ],
     };
     policy.validate().expect("valid typed route");
     let resolved = policy
-        .resolve_mirror("/npm/react/-/react-1.0.0.tgz")
+        .resolve_npm_registry(&target("registry.npmjs.org"), "/react/-/react-1.0.0.tgz")
         .expect("admitted route");
     assert_eq!(resolved.target, target("registry.npmjs.org"));
     assert_eq!(resolved.path, "/react/-/react-1.0.0.tgz");
     assert_eq!(resolved.protocol, MirrorProtocol::Npm);
     assert_eq!(resolved.admitted_prefix, "/react/-/");
     let baseline = policy
-        .resolve_mirror("/npm/lodash")
+        .resolve_npm_registry(&target("registry.npmjs.org"), "/lodash")
         .expect("unmatched private scope falls through to public baseline");
     assert_eq!(baseline.target, target("registry.npmjs.org"));
     assert_eq!(baseline.admitted_prefix, "/");
     let scoped = policy
-        .resolve_mirror("/npm/@scope%2fpkg")
+        .resolve_npm_registry(&target("registry.npmjs.org"), "/@scope%2fpkg")
         .expect("encoded npm scope is admitted without weakening generic paths");
     assert_eq!(scoped.path, "/@scope%2fpkg");
     assert_eq!(scoped.admitted_prefix, "/@scope/");
 
-    let wrong = MirrorRoute {
-        local_prefix: "/registry/".to_owned(),
-        upstream_origin: "https://registry.npmjs.org:443".to_owned(),
-        protocol: MirrorProtocol::Npm,
-        admitted_prefixes: vec!["/".to_owned()],
-        credentialed: false,
-    };
-    assert!(wrong.validate().is_err());
+    assert!(
+        MirrorRoute::new("http://registry.npmjs.org:80", vec!["/".to_owned()], false,).is_err()
+    );
 }
 
 #[test]
@@ -966,99 +1136,56 @@ fn disjoint_private_scopes_coexist_without_shadowing_public_baselines() {
     let policy = WorkspacePolicy {
         grants: Vec::new(),
         mirrors: vec![
-            MirrorRoute {
-                local_prefix: "/npm/".to_owned(),
-                upstream_origin: "https://npm.company.test:443".to_owned(),
-                protocol: MirrorProtocol::Npm,
-                admitted_prefixes: vec!["/@company/".to_owned()],
-                credentialed: true,
-            },
-            MirrorRoute {
-                local_prefix: "/npm/".to_owned(),
-                upstream_origin: "https://npm.other.test:443".to_owned(),
-                protocol: MirrorProtocol::Npm,
-                admitted_prefixes: vec!["/@other/".to_owned()],
-                credentialed: true,
-            },
-            MirrorRoute {
-                local_prefix: "/cargo/".to_owned(),
-                upstream_origin: "https://cargo.company.test:443".to_owned(),
-                protocol: MirrorProtocol::Cargo,
-                admitted_prefixes: vec!["/privatecrate".to_owned()],
-                credentialed: true,
-            },
-            MirrorRoute {
-                local_prefix: "/go/".to_owned(),
-                upstream_origin: "https://go.company.test:443".to_owned(),
-                protocol: MirrorProtocol::Go,
-                admitted_prefixes: vec!["/company.example/".to_owned()],
-                credentialed: true,
-            },
+            MirrorRoute::new(
+                "https://npm.company.test:443",
+                vec!["/@company/".to_owned()],
+                true,
+            )
+            .expect("company npm route"),
+            MirrorRoute::new(
+                "https://npm.other.test:443",
+                vec!["/@other/".to_owned()],
+                true,
+            )
+            .expect("other npm route"),
         ],
     };
     policy.validate().expect("disjoint private scopes");
 
     assert_eq!(
         policy
-            .resolve_mirror("/npm/react")
+            .resolve_npm_registry(&target("registry.npmjs.org"), "/react")
             .expect("public npm baseline")
             .target,
         target("registry.npmjs.org")
     );
     assert_eq!(
         policy
-            .resolve_mirror("/npm/@company%2fpkg")
+            .resolve_npm_registry(&target("npm.company.test"), "/@company%2fpkg")
             .expect("company npm scope")
             .target,
         target("npm.company.test")
     );
     assert_eq!(
         policy
-            .resolve_mirror("/npm/@other%2fpkg")
+            .resolve_npm_registry(&target("npm.other.test"), "/@other%2fpkg")
             .expect("other npm scope")
             .target,
         target("npm.other.test")
     );
-    assert_eq!(
-        policy
-            .resolve_mirror("/cargo/se/rd/serde")
-            .expect("public Cargo baseline")
-            .target,
-        target("index.crates.io")
-    );
-    assert_eq!(
-        policy
-            .resolve_mirror("/cargo/privatecrate")
-            .expect("private Cargo scope")
-            .target,
-        target("cargo.company.test")
-    );
-    assert_eq!(
-        policy
-            .resolve_mirror("/go/golang.org/x/text/@v/list")
-            .expect("public Go baseline")
-            .target,
-        target("proxy.golang.org")
-    );
-    assert_eq!(
-        policy
-            .resolve_mirror("/go/company.example/mod/@v/list")
-            .expect("private Go scope")
-            .target,
-        target("go.company.test")
-    );
 
     let mut overlapping = policy.clone();
-    overlapping.mirrors.push(MirrorRoute {
-        local_prefix: "/npm/".to_owned(),
-        upstream_origin: "https://shadow.company.test:443".to_owned(),
-        protocol: MirrorProtocol::Npm,
-        admitted_prefixes: vec!["/@company/pkg".to_owned()],
-        credentialed: true,
-    });
+    overlapping.mirrors.push(
+        MirrorRoute::new(
+            "https://npm.company.test:443",
+            vec!["/@company/pkg".to_owned()],
+            true,
+        )
+        .expect("overlapping npm route"),
+    );
     assert!(matches!(
         overlapping.validate(),
-        Err(cowshed_gateway::PolicyError::DuplicateMirrorPrefix)
+        Err(cowshed_gateway::PolicyError::OverlappingMirrorScope)
     ));
 }
 
@@ -1171,32 +1298,34 @@ async fn redirect_is_bounded_same_origin_typed_and_never_followed() {
 }
 
 #[test]
-fn zero_grant_policy_resolves_only_fixed_public_protocol_origins() {
+fn native_registry_baseline_is_only_the_exact_public_npm_origin() {
     let policy = WorkspacePolicy::default();
     let npm = policy
-        .resolve_mirror("/npm/@scope%2fpkg")
+        .resolve_npm_registry(&target("registry.npmjs.org"), "/@scope%2fpkg")
         .expect("baseline npm packument");
     assert_eq!(npm.target, target("registry.npmjs.org"));
     assert_eq!(npm.path, "/@scope%2fpkg");
     assert!(!npm.credentialed);
 
-    let cargo = policy
-        .resolve_mirror(
-            "/cargo/crates/demo/1.2.3/download?cowshed-integrity=sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .expect("baseline Cargo download");
-    assert_eq!(cargo.target, target("static.crates.io"));
-    assert!(cargo.path.starts_with("/crates/demo/demo-1.2.3.crate?"));
-
-    let go = policy
-        .resolve_mirror("/go/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0")
-        .expect("baseline Go checksum lookup");
-    assert_eq!(go.target, target("sum.golang.org"));
-    assert_eq!(go.path, "/lookup/example.com/mod@v1.0.0");
+    assert!(
+        policy
+            .resolve_npm_registry(&target("npm.other.test"), "/@scope%2fpkg")
+            .is_none()
+    );
+    assert!(
+        policy
+            .resolve_npm_registry(&target("index.crates.io"), "/config.json")
+            .is_none()
+    );
+    assert!(
+        policy
+            .resolve_npm_registry(&target("proxy.golang.org"), "/example.com/@v/list")
+            .is_none()
+    );
 }
 
 #[tokio::test]
-async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
+async fn npm_packument_passes_through_and_index_verifies_tarball() {
     let root = TestRoot::new();
     let service = open_service(&root).await;
     let tarball = b"real npm tarball bytes";
@@ -1215,7 +1344,7 @@ async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
     });
     let encoded = serde_json::to_vec(&packument).expect("encode packument");
     let metadata = QueueUpstream::new([json_response(&encoded)]);
-    let (_, rewritten) = collect(
+    let (_, streamed) = collect(
         service
             .execute(
                 request(
@@ -1230,19 +1359,11 @@ async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
                 &metadata,
             )
             .await
-            .expect("rewrite packument"),
+            .expect("stream packument"),
     )
     .await;
-    let document: serde_json::Value =
-        serde_json::from_slice(&rewritten).expect("rewritten packument JSON");
-    let local = document["versions"]["1.2.3"]["dist"]["tarball"]
-        .as_str()
-        .expect("local tarball URL");
-    assert!(local.starts_with("/npm/@scope/pkg/-/pkg-1.2.3.tgz?"));
-    assert!(local.contains("cowshed-integrity=sha512-"));
-    assert!(local.contains("cowshed-length="));
-
-    let artifact_path = local.strip_prefix("/npm").expect("npm local prefix");
+    assert_eq!(streamed.as_ref(), encoded, "packument bytes are unchanged");
+    let artifact_path = "/@scope/pkg/-/pkg-1.2.3.tgz";
     let artifact = QueueUpstream::new([ok_response(tarball)]);
     let (_, bytes) = collect(
         service
@@ -1268,7 +1389,7 @@ async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
     let mut tampered = tarball.to_vec();
     tampered[0] ^= 1;
     let mismatch = QueueUpstream::new([ok_response(&tampered)]);
-    let MirrorOutcome::Response(response) = service
+    let error = service
         .execute(
             request(
                 MirrorProtocol::Npm,
@@ -1282,21 +1403,13 @@ async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
             &mismatch,
         )
         .await
-        .expect("start sha512 mismatch stream")
-    else {
-        panic!("expected streaming mismatch response");
-    };
-    assert!(
-        response.response.into_body().collect().await.is_err(),
-        "sha512 mismatch must abort before publication"
-    );
+        .expect_err("unpublished tarball is refused");
+    assert!(matches!(error, MirrorError::MissingIntegrity));
+    assert_eq!(mismatch.call_count(), 0);
 }
 
-/// A lockfile install never reads the packument: bun builds `/@scope/name/-/name-ver.tgz` itself
-/// and asks for it with no `cowshed-integrity`. The mirror takes the integrity the registry
-/// publishes for exactly that tarball from the package's packument — fetched through the same
-/// cached metadata path — and verifies the fill against it, so the answer is the verified bytes
-/// rather than a refusal, and bytes that do not match are still never served.
+/// Lockfile installs can fetch a tarball before reading metadata. The first request fills
+/// and indexes the packument; later requests use only its attached published expectations.
 #[tokio::test]
 async fn a_lockfile_tarball_is_verified_against_the_integrity_its_packument_publishes() {
     let root = TestRoot::new();
@@ -1402,8 +1515,7 @@ async fn a_lockfile_tarball_is_verified_against_the_integrity_its_packument_publ
     ));
     assert_eq!(unknown.call_count(), 0);
 
-    // The registry's own packument (`Vary: accept`) is served as published, neither cached nor
-    // rewritten: the integrity comes from its absolute `dist.tarball` entry.
+    // The registry's Vary: accept representation is cached and indexed without changing bytes.
     let registry_root = TestRoot::new();
     let registry_service = open_service(&registry_root).await;
     let registry = QueueUpstream::new([
@@ -1430,130 +1542,6 @@ async fn a_lockfile_tarball_is_verified_against_the_integrity_its_packument_publ
     .await;
     assert_eq!(status, MirrorCacheStatus::Filled);
     assert_eq!(bytes.as_ref(), tarball);
-}
-
-#[tokio::test]
-async fn cargo_config_rewrites_download_template_to_content_addressed_local_route() {
-    let root = TestRoot::new();
-    let service = open_service(&root).await;
-    let upstream = QueueUpstream::new([json_response(
-        br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#,
-    )]);
-    let (_, bytes) = collect(
-        service
-            .execute(
-                request(
-                    MirrorProtocol::Cargo,
-                    target("index.crates.io"),
-                    "/config.json",
-                    MirrorCacheScope::Anonymous,
-                    false,
-                    None,
-                ),
-                UpstreamHealth::Healthy,
-                &upstream,
-            )
-            .await
-            .expect("rewrite Cargo sparse config"),
-    )
-    .await;
-    let document: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("rewritten config JSON");
-    assert_eq!(
-        document["dl"],
-        "/cargo/crates/{crate}/{version}/download?cowshed-integrity=sha256-{sha256-checksum}"
-    );
-    assert!(document.get("api").is_none());
-}
-
-#[tokio::test]
-async fn cargo_sparse_and_go_metadata_rules_reject_unverified_entries() {
-    let root = TestRoot::new();
-    let service = open_service(&root).await;
-    let checksum = "11".repeat(32);
-    let sparse = format!(
-        "{{\"name\":\"demo\",\"vers\":\"1.0.0\",\"cksum\":\"{checksum}\",\"deps\":[],\"features\":{{}},\"yanked\":false}}\n"
-    );
-    let cargo = QueueUpstream::new([ok_response(sparse.as_bytes())]);
-    let (status, _) = collect(
-        service
-            .execute(
-                request(
-                    MirrorProtocol::Cargo,
-                    target("index.crates.io"),
-                    "/de/mo/demo",
-                    MirrorCacheScope::Anonymous,
-                    false,
-                    None,
-                ),
-                UpstreamHealth::Healthy,
-                &cargo,
-            )
-            .await
-            .expect("validate Cargo sparse entry"),
-    )
-    .await;
-    assert_eq!(status, MirrorCacheStatus::Filled);
-
-    let invalid = QueueUpstream::new([ok_response(
-        br#"{"name":"demo","vers":"1.0.1","cksum":"not-a-checksum"}"#,
-    )]);
-    assert!(matches!(
-        service
-            .execute(
-                request(
-                    MirrorProtocol::Cargo,
-                    target("index.crates.io"),
-                    "/de/mo/demo-invalid",
-                    MirrorCacheScope::Anonymous,
-                    false,
-                    None,
-                ),
-                UpstreamHealth::Healthy,
-                &invalid,
-            )
-            .await,
-        Err(MirrorError::InvalidMetadata)
-    ));
-
-    let go_list = QueueUpstream::new([ok_response(b"v1.0.0\nv1.1.0\n")]);
-    collect(
-        service
-            .execute(
-                request(
-                    MirrorProtocol::Go,
-                    target("proxy.golang.org"),
-                    "/example.com/mod/@v/list",
-                    MirrorCacheScope::Anonymous,
-                    false,
-                    None,
-                ),
-                UpstreamHealth::Healthy,
-                &go_list,
-            )
-            .await
-            .expect("validate Go version list"),
-    )
-    .await;
-
-    let bad_sumdb = QueueUpstream::new([ok_response(b"123\nexample.com/mod v1.0.0 bad\n")]);
-    assert!(matches!(
-        service
-            .execute(
-                request(
-                    MirrorProtocol::Go,
-                    target("sum.golang.org"),
-                    "/lookup/example.com/mod@v1.0.0",
-                    MirrorCacheScope::Anonymous,
-                    false,
-                    None,
-                ),
-                UpstreamHealth::Healthy,
-                &bad_sumdb,
-            )
-            .await,
-        Err(MirrorError::MissingIntegrity)
-    ));
 }
 
 #[tokio::test]
@@ -1752,4 +1740,664 @@ fn git_helper_executable_must_be_private_and_owner_executable() {
     production_layout(&root, git_helper(root.join("git-helper"), 0o700))
         .validate_host_cache_layout()
         .expect("a private, owner-executable helper is accepted");
+}
+
+#[tokio::test]
+async fn persisted_tarball_index_is_used_without_opening_or_reparsing_packument() {
+    use std::io::{Seek as _, Write as _};
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let artifact = b"persisted verified tarball";
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "versions": {"1.0.0": {"dist": {
+            "tarball": "https://registry.npmjs.org/@scope/demo/-/demo-1.0.0.tgz",
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(artifact))),
+            "size": artifact.len()
+        }}}
+    }))
+    .expect("encode packument");
+    let metadata = QueueUpstream::new([registry_packument_response(&packument)]);
+    let (_, bytes) = collect(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope%2fdemo",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &metadata,
+            )
+            .await
+            .expect("fill metadata"),
+    )
+    .await;
+    assert_eq!(bytes.as_ref(), packument);
+    let object = std::fs::read_dir(root.path())
+        .expect("cache files")
+        .map(|entry| entry.expect("cache entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("obj-"))
+        })
+        .expect("published metadata object");
+    let mut file = StdOpenOptions::new()
+        .write(true)
+        .open(object)
+        .expect("open sealed fixture");
+    file.seek(std::io::SeekFrom::Start(64 * 1024))
+        .expect("seek packument body");
+    file.write_all(&vec![b'!'; packument.len()])
+        .expect("replace body with invalid JSON");
+    file.sync_all().expect("sync fixture");
+    drop(file);
+    drop(service);
+    let reopened = open_service(&root).await;
+    let upstream = QueueUpstream::new([ok_response(artifact)]);
+    let (_, bytes) = collect(
+        reopened
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope%2Fdemo/-/demo-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("persisted index supplies expectation"),
+    )
+    .await;
+    assert_eq!(bytes.as_ref(), artifact);
+    assert_eq!(upstream.call_count(), 1, "only the tarball is fetched");
+    assert!(matches!(
+        reopened
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/demo/-/demo-unknown.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None
+                ),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await,
+        Err(MirrorError::MissingIntegrity)
+    ));
+    assert_eq!(
+        upstream.call_count(),
+        1,
+        "unpublished path does not refetch metadata"
+    );
+}
+
+#[tokio::test]
+async fn project_packument_index_does_not_supply_anonymous_tarball_integrity() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let artifact = b"private tarball";
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "versions": {"1.0.0": {"dist": {
+            "tarball": "https://registry.npmjs.org/private/-/private-1.0.0.tgz",
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(artifact))),
+            "size": artifact.len()
+        }}}
+    }))
+    .expect("encode packument");
+    let upstream = QueueUpstream::new([registry_packument_response(&packument)]);
+    collect(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/private",
+                    MirrorCacheScope::Project("owner/private".to_owned()),
+                    true,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("fill private metadata"),
+    )
+    .await;
+    assert!(matches!(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/private/-/private-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None
+                ),
+                UpstreamHealth::Offline,
+                &upstream,
+            )
+            .await,
+        Err(MirrorError::OfflineMiss)
+    ));
+    assert_eq!(upstream.call_count(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_lockfile_misses_fetch_and_index_the_packument_once() {
+    let root = TestRoot::new();
+    let service = Arc::new(open_service(&root).await);
+    let artifact = b"one verified coalesced tarball";
+    let path = "/coalesced/-/coalesced-1.0.0.tgz";
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "versions": {"1.0.0": {"dist": {
+            "tarball": format!("https://registry.npmjs.org{path}"),
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(artifact))),
+            "size": artifact.len()
+        }}}
+    }))
+    .expect("coalesced packument");
+    let upstream = Arc::new(QueueUpstream::new([
+        registry_packument_response(&packument),
+        ok_response(artifact),
+    ]));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let service = Arc::clone(&service);
+        let upstream = Arc::clone(&upstream);
+        tasks.spawn(async move {
+            collect(
+                service
+                    .execute(
+                        request(
+                            MirrorProtocol::Npm,
+                            target("registry.npmjs.org"),
+                            path,
+                            MirrorCacheScope::Anonymous,
+                            false,
+                            None,
+                        ),
+                        UpstreamHealth::Healthy,
+                        upstream.as_ref(),
+                    )
+                    .await
+                    .expect("shared metadata index"),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        let (_, bytes) = result.expect("join concurrent tarball");
+        assert_eq!(bytes.as_ref(), artifact);
+    }
+    assert_eq!(
+        upstream.call_count(),
+        2,
+        "one packument and one artifact fill"
+    );
+    assert_eq!(upstream.requests()[0].path, "/coalesced");
+    assert_eq!(upstream.requests()[1].path, path);
+}
+
+#[tokio::test]
+async fn full_and_install_packuments_are_distinct_byte_exact_cache_entries() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"representation tarball";
+    let full = published(tarball, true);
+    let install = published(tarball, false);
+    assert_ne!(full, install);
+    let upstream = QueueUpstream::new([full_response(&full), install_response(&install)]);
+
+    let (status, headers, bytes) = collect_response(
+        service
+            .execute(
+                packument("/@scope%2fpkg", FULL_ACCEPT),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("fill the full packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), full);
+    assert_eq!(header_str(&headers, header::ETAG), "\"full\"");
+    // Same package, same namespace and origin: still a separate entry, not a hit.
+    let (status, headers, bytes) = collect_response(
+        service
+            .execute(
+                packument("/@scope/pkg", INSTALL_V1_ACCEPT),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("fill the install packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), install);
+    assert_eq!(header_str(&headers, header::ETAG), "\"install\"");
+    let sent = upstream.requests();
+    assert_eq!(header_str(&sent[0].headers, header::ACCEPT), FULL_ACCEPT);
+    assert_eq!(
+        header_str(&sent[1].headers, header::ACCEPT),
+        INSTALL_V1_ACCEPT
+    );
+
+    // Each representation now hits through every spelling of the name, with its own bytes and
+    // headers; `Vary: accept` is stored and still never mixes them up.
+    for (path, accept, expected, content_type, etag) in [
+        (
+            "/@scope%2Fpkg",
+            FULL_ACCEPT,
+            &full,
+            "application/json",
+            "\"full\"",
+        ),
+        (
+            "/@scope/pkg",
+            "application/vnd.npm.install-v1+json",
+            &install,
+            "application/vnd.npm.install-v1+json",
+            "\"install\"",
+        ),
+        (
+            "/@scope%2fpkg",
+            INSTALL_V1_ACCEPT,
+            &install,
+            "application/vnd.npm.install-v1+json",
+            "\"install\"",
+        ),
+        (
+            "/@scope/pkg",
+            "application/json, */*",
+            &full,
+            "application/json",
+            "\"full\"",
+        ),
+    ] {
+        let (status, headers, bytes) = collect_response(
+            service
+                .execute(packument(path, accept), UpstreamHealth::Healthy, &upstream)
+                .await
+                .expect("cached representation"),
+        )
+        .await;
+        assert_eq!(status, MirrorCacheStatus::Hit, "{path} {accept}");
+        assert_eq!(bytes.as_ref(), expected.as_slice(), "{path} {accept}");
+        assert_eq!(header_str(&headers, header::CONTENT_TYPE), content_type);
+        assert_eq!(header_str(&headers, header::ETAG), etag);
+        assert_eq!(
+            header_str(&headers, header::VARY),
+            "accept-encoding, accept"
+        );
+    }
+    assert_eq!(upstream.call_count(), 2, "hits never reach the registry");
+
+    // Another private scope or another origin never shares the full packument.
+    let isolated = QueueUpstream::new([full_response(&full), full_response(&full)]);
+    for isolated_request in [
+        accepting(
+            target("registry.npmjs.org"),
+            "/@scope%2fpkg",
+            MirrorCacheScope::Project("owner/private".to_owned()),
+            true,
+            FULL_ACCEPT,
+        ),
+        accepting(
+            target("registry.example.test"),
+            "/@scope%2fpkg",
+            MirrorCacheScope::Anonymous,
+            false,
+            FULL_ACCEPT,
+        ),
+    ] {
+        let (status, _, bytes) = collect_response(
+            service
+                .execute(isolated_request, UpstreamHealth::Healthy, &isolated)
+                .await
+                .expect("fill the isolated full packument"),
+        )
+        .await;
+        assert_eq!(status, MirrorCacheStatus::Filled);
+        assert_eq!(bytes.as_ref(), full);
+    }
+    assert_eq!(isolated.call_count(), 2);
+    let (status, _, _) = collect_response(
+        service
+            .execute(
+                accepting(
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg",
+                    MirrorCacheScope::Project("owner/private".to_owned()),
+                    true,
+                    FULL_ACCEPT,
+                ),
+                UpstreamHealth::Healthy,
+                &isolated,
+            )
+            .await
+            .expect("private full packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(isolated.call_count(), 2);
+}
+
+#[tokio::test]
+async fn a_tarball_reuses_the_index_of_a_cached_full_packument_without_a_metadata_fetch() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"tarball verified by the full packument";
+    let full = published(tarball, true);
+    let metadata = QueueUpstream::new([full_response(&full)]);
+    collect_response(
+        service
+            .execute(
+                packument("/@scope%2fpkg", FULL_ACCEPT),
+                UpstreamHealth::Healthy,
+                &metadata,
+            )
+            .await
+            .expect("fill the full packument"),
+    )
+    .await;
+
+    let artifact = QueueUpstream::new([ok_response(tarball)]);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &artifact,
+            )
+            .await
+            .expect("the full packument's index verifies the tarball"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), tarball);
+    assert_eq!(
+        artifact
+            .requests()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/@scope/pkg/-/pkg-1.0.0.tgz"],
+        "no packument is fetched for a tarball the full index publishes"
+    );
+
+    let unpublished = QueueUpstream::new([]);
+    assert!(matches!(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-9.9.9.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &unpublished,
+            )
+            .await,
+        Err(MirrorError::MissingIntegrity)
+    ));
+    assert_eq!(unpublished.call_count(), 0);
+
+    // No install packument was invented from the full one: that request is still a miss.
+    let install = published(tarball, false);
+    let compact = QueueUpstream::new([install_response(&install)]);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(
+                packument("/@scope%2fpkg", INSTALL_V1_ACCEPT),
+                UpstreamHealth::Healthy,
+                &compact,
+            )
+            .await
+            .expect("fill the install packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), install);
+}
+
+#[tokio::test]
+async fn a_tarball_fetches_the_canonical_install_packument_whatever_it_accepts() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"tarball whose accept names no packument";
+    let install = published(tarball, false);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT, "*/*".parse().expect("accept header"));
+    let lockfile_tarball = MirrorRequest::new(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        Method::GET,
+        "/@scope/pkg/-/pkg-1.0.0.tgz".to_owned(),
+        headers,
+        MirrorCacheScope::Anonymous,
+        false,
+        None,
+    )
+    .expect("a tarball request negotiates no representation");
+    let upstream = QueueUpstream::new([install_response(&install), ok_response(tarball)]);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(lockfile_tarball, UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("a lockfile tarball is served"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), tarball);
+    let sent = upstream.requests();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].path, "/@scope%2fpkg");
+    assert_eq!(
+        header_str(&sent[0].headers, header::ACCEPT),
+        INSTALL_V1_ACCEPT
+    );
+    assert_eq!(sent[1].path, "/@scope/pkg/-/pkg-1.0.0.tgz");
+
+    // The fetched packument is the install entry an installing client now hits.
+    let silent = QueueUpstream::new([]);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(
+                packument("/@scope%2fpkg", INSTALL_V1_ACCEPT),
+                UpstreamHealth::Healthy,
+                &silent,
+            )
+            .await
+            .expect("cached install packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(bytes.as_ref(), install);
+    assert_eq!(silent.call_count(), 0);
+}
+
+#[tokio::test]
+async fn representations_that_publish_different_integrity_refuse_the_tarball() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let install_tarball = b"tarball the install packument publishes";
+    let full_tarball = b"tarball the full packument publishes";
+    let install = published(install_tarball, false);
+    let full = published(full_tarball, true);
+    for (accept, response) in [
+        (INSTALL_V1_ACCEPT, install_response(&install)),
+        (FULL_ACCEPT, full_response(&full)),
+    ] {
+        collect_response(
+            service
+                .execute(
+                    packument("/@scope%2fpkg", accept),
+                    UpstreamHealth::Healthy,
+                    &QueueUpstream::new([response]),
+                )
+                .await
+                .expect("fill representation"),
+        )
+        .await;
+    }
+    let upstream = QueueUpstream::new([ok_response(install_tarball)]);
+    assert!(matches!(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await,
+        Err(MirrorError::MissingIntegrity)
+    ));
+    assert_eq!(upstream.call_count(), 0);
+}
+
+#[test]
+fn a_packument_request_selects_one_representation_or_defaults_to_the_install_document() {
+    for accept in [
+        "*/*",
+        "text/plain",
+        "application/json, application/vnd.npm.install-v1+json",
+        "application/json;q=0",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, accept.parse().expect("accept header"));
+        assert!(
+            matches!(
+                MirrorRequest::new(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    Method::GET,
+                    "/pkg".to_owned(),
+                    headers.clone(),
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                Err(MirrorError::UnsupportedMetadataAccept)
+            ),
+            "{accept}"
+        );
+        // A tarball negotiates no representation, so its Accept is never a refusal.
+        MirrorRequest::new(
+            MirrorProtocol::Npm,
+            target("registry.npmjs.org"),
+            Method::GET,
+            "/pkg/-/pkg-1.0.0.tgz".to_owned(),
+            headers,
+            MirrorCacheScope::Anonymous,
+            false,
+            None,
+        )
+        .expect("tarball request");
+    }
+    let default = request(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        "/pkg",
+        MirrorCacheScope::Anonymous,
+        false,
+        None,
+    );
+    assert_eq!(
+        header_str(&default.headers, header::ACCEPT),
+        INSTALL_V1_ACCEPT,
+        "trusted callers without Accept get the install document"
+    );
+    for (accept, upstream_accept) in [
+        (FULL_ACCEPT, FULL_ACCEPT),
+        ("application/vnd.npm.install-v1+json", INSTALL_V1_ACCEPT),
+        (INSTALL_V1_ACCEPT, INSTALL_V1_ACCEPT),
+    ] {
+        assert_eq!(
+            header_str(&packument("/pkg", accept).headers, header::ACCEPT),
+            upstream_accept
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_hop_keeps_the_full_representation_and_its_cache_identity() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"redirected tarball";
+    let full = published(tarball, true);
+    let redirected = Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, "/@scope%2fpkg")
+        .body(body(Bytes::new()))
+        .expect("redirect response");
+    let MirrorOutcome::Redirect(redirect) = service
+        .execute(
+            packument("/@scope/pkg", FULL_ACCEPT),
+            UpstreamHealth::Healthy,
+            &QueueUpstream::new([redirected]),
+        )
+        .await
+        .expect("typed redirect")
+    else {
+        panic!("expected redirect outcome");
+    };
+    assert_eq!(
+        header_str(&redirect.request.headers, header::ACCEPT),
+        FULL_ACCEPT
+    );
+    let hop = MirrorRequest::from_redirect(redirect.request, MirrorCacheScope::Anonymous, false)
+        .expect("re-admitted redirect request");
+    let upstream = QueueUpstream::new([full_response(&full)]);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(hop, UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("fill through the redirect hop"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), full);
+    let (status, _, bytes) = collect_response(
+        service
+            .execute(
+                packument("/@scope/pkg", FULL_ACCEPT),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("the hop filled the full entry"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(bytes.as_ref(), full);
+    assert_eq!(upstream.call_count(), 1);
 }

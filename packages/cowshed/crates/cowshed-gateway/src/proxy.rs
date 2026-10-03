@@ -34,7 +34,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use cowshed_gateway_types::{
-    CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, raw_path_admissible,
+    CanonicalHost, CanonicalTarget, EgressMode, TargetScheme, raw_path_admissible,
 };
 
 use crate::{
@@ -50,8 +50,8 @@ use crate::{
         UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
     },
     mirror::{
-        MAX_METADATA_BYTES, MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError,
-        MirrorFetchRequest, MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
+        MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
+        MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
     },
     repo_mirror::RepoMirrorHandle,
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRequest},
@@ -216,30 +216,20 @@ async fn handle_request(
             .await);
         }
     };
-    // A registry client speaks to its registry, not to a proxy: bun sends its configured token as
-    // `Authorization: Bearer`, Go's netrc as `Authorization: Basic`, and neither can be told to
-    // send `Proxy-Authorization` to a registry. On the local mirror routes — origin-form requests
-    // to this workspace's own endpoint — that header carries the same single token. Nowhere else:
-    // an absolute-form or tunnelled request's `Authorization` belongs to the client's upstream.
-    let authentication = match (authentication, &target) {
-        (Authentication::Bearer(None), RequestTarget::LocalMirror) => {
-            Authentication::Bearer(presented_token(request.headers(), header::AUTHORIZATION))
-        }
-        (authentication, _) => authentication,
-    };
-    let (path, trace_id) = extract_mirror_trace(&path, audit_kind).unwrap_or((path, None));
     let intent = RequestIntent {
         target,
         method: request.method().clone(),
         path: path.clone(),
         audit_kind,
-        trace_id,
+        trace_id: None,
+        npm_mirror: eligible_npm_mirror(&request, &path),
     };
     let mut admission = match admit(&context, authentication, intent).await {
         Ok(admission) => admission,
         Err(error) => return Ok(problem(error.status, error.message, error.hint.as_deref())),
     };
     apply_trace_context(request.headers(), &mut admission);
+    let audit_kind = admission.audit_kind;
     if let Some(fixed) = fixed_target
         && admission.target != fixed
     {
@@ -885,7 +875,6 @@ async fn handle_mirror_request(
             }
             Ok(MirrorOutcome::Redirect(redirect)) => {
                 let generation = admission.generation;
-                let request_path = admission.request_path.clone();
                 let trace_id = admission.trace_id.clone();
                 let parent_span_id = Some(admission.span_id);
                 let trace_flags = admission.trace_flags;
@@ -905,15 +894,12 @@ async fn handle_mirror_request(
                 )
                 .await;
                 let intent = RequestIntent {
-                    target: RequestTarget::MirrorRedirect {
-                        protocol,
-                        target,
-                        upstream_path,
-                    },
+                    target: RequestTarget::Generic(target),
                     method: redirected.method.clone(),
-                    path: request_path,
+                    path: upstream_path,
                     audit_kind,
                     trace_id,
+                    npm_mirror: true,
                 };
                 admission =
                     match admit(&context, Authentication::Generation(generation), intent).await {
@@ -956,34 +942,6 @@ async fn mirror_failure(
     error: MirrorError,
     audit_kind: AuditKind,
 ) -> Response<ResponseBody> {
-    if let MirrorError::MetadataTooLarge {
-        package,
-        size_bytes,
-    } = &error
-    {
-        let status = StatusCode::BAD_GATEWAY;
-        complete_now(
-            context,
-            admission,
-            AuditStatus::Failed,
-            Some(status),
-            Some("mirror-metadata-too-large"),
-            0,
-            audit_kind,
-        )
-        .await;
-        return json_problem(
-            status,
-            serde_json::json!({
-                "code": "mirror-metadata-too-large",
-                "error": error.to_string(),
-                "package": package,
-                "sizeBytes": size_bytes,
-                "limitBytes": MAX_METADATA_BYTES,
-                "grantHint": null,
-            }),
-        );
-    }
     let (status, audit_status, classification, message) = match &error {
         MirrorError::OfflineMiss => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1000,6 +958,7 @@ async fn mirror_failure(
         MirrorError::MissingIntegrity
         | MirrorError::ObjectTooLarge
         | MirrorError::InvalidProtocolPath
+        | MirrorError::UnsupportedMetadataAccept
         | MirrorError::UnscopedCredential => (
             StatusCode::BAD_REQUEST,
             AuditStatus::Denied,
@@ -1196,6 +1155,7 @@ async fn handle_connect(
         path: "/".to_owned(),
         audit_kind: AuditKind::Connect,
         trace_id: None,
+        npm_mirror: false,
     };
     let mut admission = match admit(&context, authentication, intent).await {
         Ok(admission) => admission,
@@ -1743,8 +1703,8 @@ fn spawn_intercept(
             }
             let negotiated = match tls.get_ref().1.alpn_protocol() {
                 Some(ALPN_H2) => NegotiatedTransport::Http2,
-                Some(ALPN_HTTP_1_1) => NegotiatedTransport::Http1,
-                Some(_) | None => {
+                Some(ALPN_HTTP_1_1) | None => NegotiatedTransport::Http1,
+                Some(_) => {
                     complete_now(
                         &context,
                         admission,
@@ -2179,6 +2139,23 @@ fn apply_trace_context(headers: &HeaderMap, admission: &mut Admission) {
     }
 }
 
+fn eligible_npm_mirror<B>(request: &Request<B>, path: &str) -> bool {
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return false;
+    }
+    if request.headers().contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    match crate::mirror::npm_resource_kind(path) {
+        Some(crate::mirror::MirrorResourceKind::Immutable) => true,
+        Some(crate::mirror::MirrorResourceKind::Metadata) => {
+            request.headers().contains_key(header::ACCEPT)
+                && crate::mirror::npm_metadata_accept(request.headers()).is_some()
+        }
+        None => false,
+    }
+}
+
 fn request_target(
     request: &Request<Incoming>,
     fixed: Option<&CanonicalTarget>,
@@ -2237,46 +2214,15 @@ fn request_target(
         return Ok((RequestTarget::Generic(target), path, AuditKind::Http));
     }
     if let Some(kind) = local_kind {
-        let target = if kind == AuditKind::Sim {
-            RequestTarget::LocalSim
-        } else {
-            RequestTarget::LocalMirror
-        };
-        return Ok((target, path, kind));
+        return Ok((RequestTarget::LocalSim, path, kind));
     }
     Err(RequestError::bad(
         "generic proxy requests require absolute-form URI",
     ))
 }
-fn extract_mirror_trace(path: &str, kind: AuditKind) -> Option<(String, Option<String>)> {
-    let protocol = match kind {
-        AuditKind::Npm => "npm",
-        AuditKind::Go => "go",
-        _ => return None,
-    };
-    let prefix = format!("/{protocol}/t/");
-    let remainder = path.strip_prefix(&prefix)?;
-    let (traceparent, suffix) = remainder.split_once('/')?;
-    let (trace_id, _, _) = parse_traceparent(traceparent)?;
-    Some((format!("/{protocol}/{suffix}"), Some(trace_id)))
-}
 
 fn local_request_kind(path: &str) -> Option<AuditKind> {
-    if path == "/sim" {
-        return Some(AuditKind::Sim);
-    }
-    let protocol = [
-        MirrorProtocol::Npm,
-        MirrorProtocol::Cargo,
-        MirrorProtocol::Go,
-    ]
-    .into_iter()
-    .find(|protocol| protocol.matches_local_path(path))?;
-    Some(match protocol {
-        MirrorProtocol::Npm => AuditKind::Npm,
-        MirrorProtocol::Cargo => AuditKind::Cargo,
-        MirrorProtocol::Go => AuditKind::Go,
-    })
+    (path == "/sim").then_some(AuditKind::Sim)
 }
 
 /// Display length of `uri` without allocating. Matches `http::Uri`'s `fmt`
@@ -3202,35 +3148,62 @@ mod tests {
     }
 
     #[test]
-    fn npm_and_go_trace_paths_are_stripped_and_adopted() {
-        let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
-        let (npm_path, npm_trace) = extract_mirror_trace(
-            &format!("/npm/t/{traceparent}/@scope%2fpkg"),
-            AuditKind::Npm,
-        )
-        .expect("npm trace prefix");
-        assert_eq!(npm_path, "/npm/@scope%2fpkg");
-        assert_eq!(
-            npm_trace.as_deref(),
-            Some("0123456789abcdef0123456789abcdef")
+    fn npm_mirror_admits_exact_json_packuments_and_plain_tarballs() {
+        let install = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .header(header::ACCEPT, "application/vnd.npm.install-v1+json")
+                .body(())
+                .expect("fixture request")
+        };
+        for path in [
+            "/react",
+            "/@scope%2fpkg",
+            "/@scope/pkg",
+            "/react/-/react-1.0.0.tgz",
+        ] {
+            assert!(eligible_npm_mirror(&install(path), path), "{path}");
+        }
+        for path in [
+            "/react/latest",
+            "/react/18.2.0",
+            "/react?write=true",
+            "/react?audit=true",
+            "/-/whoami",
+            "/-/npm/v1/security/advisories",
+        ] {
+            assert!(!eligible_npm_mirror(&install(path), path), "{path}");
+        }
+        let view = Request::builder()
+            .uri("/react")
+            .header(header::ACCEPT, "application/json")
+            .body(())
+            .expect("full metadata request");
+        assert!(eligible_npm_mirror(&view, "/react"));
+        for accept in [
+            "*/*",
+            "text/plain",
+            "application/json, application/vnd.npm.install-v1+json",
+            "application/json;q=0",
+        ] {
+            let ambiguous = Request::builder()
+                .uri("/react")
+                .header(header::ACCEPT, accept)
+                .body(())
+                .expect("unsupported metadata representation");
+            assert!(!eligible_npm_mirror(&ambiguous, "/react"), "{accept}");
+        }
+        let mut authenticated = install("/react");
+        authenticated.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer private"),
         );
-
-        let (go_path, go_trace) = extract_mirror_trace(
-            &format!("/go/t/{traceparent}/example.com/mod/@v/list"),
-            AuditKind::Go,
-        )
-        .expect("Go trace prefix");
-        assert_eq!(go_path, "/go/example.com/mod/@v/list");
-        assert_eq!(go_trace, npm_trace);
-        assert!(extract_mirror_trace("/npm/t/invalid/react", AuditKind::Npm).is_none());
-
-        let version1 = "01-0123456789abcdef0123456789abcdef-0123456789abcdef-01-extra";
-        let (npm_v1_path, npm_v1_trace) =
-            extract_mirror_trace(&format!("/npm/t/{version1}/react"), AuditKind::Npm)
-                .expect("version-1 extra-field path uses the header grammar");
-        assert_eq!(npm_v1_path, "/npm/react");
-        assert_eq!(npm_v1_trace, npm_trace);
+        assert!(!eligible_npm_mirror(&authenticated, "/react"));
+        let mut write = install("/react");
+        *write.method_mut() = Method::PUT;
+        assert!(!eligible_npm_mirror(&write, "/react"));
     }
+
     #[test]
     fn generic_w3c_context_is_strictly_parsed_and_canonically_serialized() {
         let mut headers = HeaderMap::new();

@@ -48,7 +48,7 @@ Propagation across cowshed's own boundaries:
 
 **lmao TRACEPARENT convention** (a verification item until the TS/Rust tracer ships it, kickoff): a tracer adopts
 `TRACEPARENT` at init and stamps outbound `fetch`/HTTP requests with it. This is what upgrades a first-party tool's
-traffic from tier-3 to tier-1 attribution (below).
+traffic from tier-2 to tier-1 attribution (below).
 
 ## Span taxonomy
 
@@ -76,20 +76,14 @@ Under interception (05_gateway.md), most granted traffic is request-visible, so 
 1. **Cooperative lmao clients** on the plain-HTTP mirror endpoints or sending `traceparent` on an intercepted host:
    **exact span parentage** — the gateway adopts the inbound context. The in-image `xcrun` wrapper (03_caches.md) is
    first-party code, so `/sim/` broker calls (05_gateway.md) are tier-1 by construction.
-2. **`bun install`** — a per-job registry URL segment `http://127.0.0.1:<base>/npm/t/<traceparent>` injected via
-   `BUN_CONFIG_REGISTRY` (verification items: env-vs-bunfig precedence, subcommand coverage — bun#617 — and the
-   npmrc-overrides-bunfig bug bun#20593). The gateway strips the `/t/…` segment for **exact job attribution** of an
-   otherwise-uncooperative native client. **`go`** is the same shape: a real `GOPROXY` env var takes precedence over the
-   `GOENV` file (verification item, kickoff), so the supervisor can inject a per-job
-   `GOPROXY=http://127.0.0.1:<base>/go/t/<traceparent>` for exact go-fetch attribution. cargo has no per-invocation
-   source-replacement env, so cargo mirror traffic falls to tier 3.
-3. **Everything else** — an intercepted host whose client sent no `traceparent`, an `--opaque` tunnel, cargo — is
-   **workspace-exact** (port identity) and **job-attributed at query time** by an interval join (request timestamp
-   within a job's start/end, same workspace incarnation) over two controller-owned tables. The resulting gateway span
-   links the matching `job_id` to its standard lmao trace/thread/span identity; exact when a workspace's jobs don't
-   overlap, heuristic when they do.
+2. **Everything else** — an intercepted host whose client sent no `traceparent`, an `--opaque` tunnel, and the native
+   package managers (bun, cargo, Go): none takes a per-job registry URL, because none is wired to a mirror route that
+   could carry a `/t/<traceparent>` segment — is **workspace-exact** (port identity) and **job-attributed at query
+   time** by an interval join (request timestamp within a job's start/end, same workspace incarnation) over two
+   controller-owned tables. The resulting gateway span links the matching `job_id` to its standard lmao
+   trace/thread/span identity; exact when a workspace's jobs don't overlap, heuristic when they do.
 
-Interception makes tier 3 richer than a tunnel would: an intercepted request is workspace-exact **with request-level
+Interception makes tier 2 richer than a tunnel would: an intercepted request is workspace-exact **with request-level
 detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is silent.
 
 ## Storage: one authority tier, one audit trail, one Arrow substrate
@@ -347,7 +341,7 @@ as its own spans.
 
 - **Real distributions.** Every attach/clonefile/fsck ever run is the dataset; the n=20 benchmark problem dissolves.
 - **Query-time correlation** links the numeric `job_id` to standard lmao trace/thread/span identity and replaces runtime
-  ID-plumbing through uncooperative tools (the tier-3 interval join, lineage walks, "what could this workspace reach at
+  ID-plumbing through uncooperative tools (the tier-2 interval join, lineage walks, "what could this workspace reach at
   time T vs what it tried").
 - **Fleet questions, zero infra** — egress-denial hot spots, mirror hit rates, image-growth trajectories, grant churn,
   per-task cost — as queries over local files.

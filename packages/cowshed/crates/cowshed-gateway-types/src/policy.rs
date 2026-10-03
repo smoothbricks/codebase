@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt, net::IpAddr, str::FromStr};
+use std::{collections::BTreeSet, fmt, net::IpAddr, str::FromStr, sync::LazyLock};
 
 use http::{Method, uri::Authority};
 use serde::{Deserialize, Serialize};
@@ -306,42 +306,6 @@ pub enum MirrorProtocol {
 }
 
 impl MirrorProtocol {
-    pub const fn local_prefix(self) -> &'static str {
-        match self {
-            Self::Npm => "/npm/",
-            Self::Cargo => "/cargo/",
-            Self::Go => "/go/",
-        }
-    }
-
-    pub fn matches_local_path(self, path: &str) -> bool {
-        let prefix = self.local_prefix();
-        path == &prefix[..prefix.len() - 1] || path.starts_with(prefix)
-    }
-
-    pub const fn baseline_origin(self) -> &'static str {
-        match self {
-            Self::Npm => "https://registry.npmjs.org:443",
-            Self::Cargo => "https://index.crates.io:443",
-            Self::Go => "https://proxy.golang.org:443",
-        }
-    }
-
-    pub const fn artifact_origin(self) -> &'static str {
-        match self {
-            Self::Npm => "https://registry.npmjs.org:443",
-            Self::Cargo => "https://static.crates.io:443",
-            Self::Go => "https://proxy.golang.org:443",
-        }
-    }
-
-    pub const fn checksum_origin(self) -> Option<&'static str> {
-        match self {
-            Self::Go => Some("https://sum.golang.org:443"),
-            Self::Npm | Self::Cargo => None,
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Npm => "npm",
@@ -353,30 +317,41 @@ impl MirrorProtocol {
 
 #[derive(Clone, Debug)]
 pub struct MirrorRoute {
-    pub local_prefix: String,
-    pub upstream_origin: String,
-    pub protocol: MirrorProtocol,
+    target: CanonicalTarget,
     pub admitted_prefixes: Vec<String>,
     pub credentialed: bool,
 }
 
 impl MirrorRoute {
-    pub fn validate(&self) -> Result<(), PolicyError> {
-        if !self.local_prefix.starts_with('/') || !self.local_prefix.ends_with('/') {
-            return Err(PolicyError::InvalidMirrorPrefix);
-        }
-        if self.local_prefix != self.protocol.local_prefix() {
-            return Err(PolicyError::MirrorProtocolPrefixMismatch);
-        }
-        let url = Url::parse(&self.upstream_origin).map_err(|_| PolicyError::InvalidOrigin)?;
+    pub fn new(
+        origin: &str,
+        admitted_prefixes: Vec<String>,
+        credentialed: bool,
+    ) -> Result<Self, PolicyError> {
+        let url = Url::parse(origin).map_err(|_| PolicyError::InvalidOrigin)?;
         if url.scheme() != "https"
             || url.path() != "/"
             || url.query().is_some()
             || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
         {
             return Err(PolicyError::InvalidOrigin);
         }
-        CanonicalTarget::from_url(&url)?;
+        let route = Self {
+            target: CanonicalTarget::from_url(&url)?,
+            admitted_prefixes,
+            credentialed,
+        };
+        route.validate()?;
+        Ok(route)
+    }
+
+    pub fn target(&self) -> &CanonicalTarget {
+        &self.target
+    }
+
+    pub fn validate(&self) -> Result<(), PolicyError> {
         if self.admitted_prefixes.is_empty() {
             return Err(PolicyError::EmptyAdmission);
         }
@@ -401,28 +376,18 @@ impl WorkspacePolicy {
         for route in &self.mirrors {
             route.validate()?;
         }
-        let scopes = self
-            .mirrors
-            .iter()
-            .enumerate()
-            .flat_map(|(route_index, route)| {
-                route
-                    .admitted_prefixes
-                    .iter()
-                    .map(move |prefix| (route_index, &route.local_prefix, prefix))
-            })
-            .collect::<Vec<_>>();
-        for (index, (left_route, left_local, left_scope)) in scopes.iter().enumerate() {
-            if scopes[index + 1..]
-                .iter()
-                .any(|(right_route, right_local, right_scope)| {
-                    left_route != right_route
-                        && left_local == right_local
-                        && (mirror_scope_matches(left_scope, right_scope)
-                            || mirror_scope_matches(right_scope, left_scope))
-                })
-            {
-                return Err(PolicyError::DuplicateMirrorPrefix);
+        for (index, left) in self.mirrors.iter().enumerate() {
+            for right in &self.mirrors[index + 1..] {
+                if left.target == right.target
+                    && left.admitted_prefixes.iter().any(|left_scope| {
+                        right.admitted_prefixes.iter().any(|right_scope| {
+                            mirror_scope_matches(left_scope, right_scope)
+                                || mirror_scope_matches(right_scope, left_scope)
+                        })
+                    })
+                {
+                    return Err(PolicyError::OverlappingMirrorScope);
+                }
             }
         }
         Ok(())
@@ -459,38 +424,56 @@ impl WorkspacePolicy {
         })
     }
 
-    pub fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirrorRoute> {
+    /// Resolves one request a native npm client sent straight to `target` against the trusted
+    /// routes. `path` is the request path and query exactly as received, with no mirror prefix.
+    ///
+    /// A configured route claims the request only when its upstream origin is exactly `target`
+    /// and one of its admitted prefixes covers the path on label boundaries; the longest such
+    /// prefix decides, and that route's own `credentialed` flag travels with the answer. A
+    /// private scope therefore never admits another origin's paths, and another origin's scope
+    /// never admits this one's. When no configured route claims it, `target` being exactly the
+    /// public registry makes it an anonymous read from the root; every other destination is no
+    /// mirror at all (`None`), left to the generic egress grants. The path keeps npm's reading:
+    /// an escaped `/` inside a segment (`@scope%2fname`) decodes only for the admission
+    /// decision, and the resolved path is the received bytes, which is what goes upstream.
+    pub fn resolve_npm_registry(
+        &self,
+        target: &CanonicalTarget,
+        path: &str,
+    ) -> Option<ResolvedMirrorRoute> {
+        let admission_path = npm_admission_path(path).ok()?;
         let configured = self
             .mirrors
             .iter()
+            .filter(|route| &route.target == target)
             .filter_map(|route| {
-                let suffix =
-                    path.strip_prefix(&route.local_prefix[..route.local_prefix.len() - 1])?;
-                let (normalized, admission_path) =
-                    normalize_mirror_suffix(route.protocol, suffix).ok()?;
                 let admitted_prefix = route
                     .admitted_prefixes
                     .iter()
                     .filter(|prefix| mirror_scope_matches(&admission_path, prefix))
-                    .max_by_key(|prefix| prefix.len())?
-                    .clone();
-                Some((route, normalized, admitted_prefix))
+                    .max_by_key(|prefix| prefix.len())?;
+                Some((route, admitted_prefix))
             })
-            .max_by_key(|(_, _, admitted_prefix)| admitted_prefix.len());
-        if let Some((route, normalized, admitted_prefix)) = configured {
-            let base = Url::parse(&route.upstream_origin).ok()?;
-            let url = base.join(normalized.trim_start_matches('/')).ok()?;
-            return Some(ResolvedMirrorRoute {
-                target: CanonicalTarget::from_url(&url).ok()?,
-                path: normalized,
-                protocol: route.protocol,
-                credentialed: route.credentialed,
-                admitted_prefix,
-            });
-        }
-        resolve_baseline_mirror(path)
+            .max_by_key(|(_, admitted_prefix)| admitted_prefix.len());
+        let (credentialed, admitted_prefix) = match configured {
+            Some((route, admitted_prefix)) => (route.credentialed, admitted_prefix.clone()),
+            None if NPM_BASELINE.as_ref() == Some(target) => (false, "/".to_owned()),
+            None => return None,
+        };
+        Some(ResolvedMirrorRoute {
+            target: target.clone(),
+            path: path.to_owned(),
+            protocol: MirrorProtocol::Npm,
+            credentialed,
+            admitted_prefix,
+        })
     }
 }
+
+/// The public npm registry, readable anonymously by every workspace.
+static NPM_BASELINE: LazyLock<Option<CanonicalTarget>> = LazyLock::new(|| {
+    CanonicalTarget::from_url(&Url::parse("https://registry.npmjs.org:443").ok()?).ok()
+});
 
 /// Whether an admitted prefix covers a normalized path, on label boundaries only.
 ///
@@ -504,62 +487,6 @@ pub fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
             .is_some_and(|suffix| prefix.ends_with('/') || suffix.starts_with('/'))
 }
 
-fn resolve_baseline_mirror(path: &str) -> Option<ResolvedMirrorRoute> {
-    let (protocol, suffix) = [
-        MirrorProtocol::Npm,
-        MirrorProtocol::Cargo,
-        MirrorProtocol::Go,
-    ]
-    .into_iter()
-    .find_map(|protocol| {
-        path.strip_prefix(protocol.local_prefix())
-            .map(|suffix| (protocol, suffix))
-    })?;
-    let local_suffix = format!("/{suffix}");
-    let (mut upstream_path, _) = normalize_mirror_suffix(protocol, &local_suffix).ok()?;
-    let origin = match protocol {
-        MirrorProtocol::Npm => protocol.baseline_origin(),
-        MirrorProtocol::Cargo if upstream_path.starts_with("/crates/") => {
-            let (route_path, query) = upstream_path
-                .split_once('?')
-                .map_or((upstream_path.as_str(), None), |(path, query)| {
-                    (path, Some(query))
-                });
-            let segments = route_path
-                .trim_start_matches('/')
-                .split('/')
-                .collect::<Vec<_>>();
-            if segments.len() != 4 || segments[0] != "crates" || segments[3] != "download" {
-                return None;
-            }
-            let suffix = query.map_or(String::new(), |query| format!("?{query}"));
-            upstream_path = format!(
-                "/crates/{name}/{name}-{version}.crate{suffix}",
-                name = segments[1],
-                version = segments[2]
-            );
-            protocol.artifact_origin()
-        }
-        MirrorProtocol::Cargo => protocol.baseline_origin(),
-        MirrorProtocol::Go if upstream_path.starts_with("/sumdb/sum.golang.org/") => {
-            upstream_path = upstream_path
-                .strip_prefix("/sumdb/sum.golang.org")
-                .unwrap_or("/")
-                .to_owned();
-            protocol.checksum_origin()?
-        }
-        MirrorProtocol::Go => protocol.baseline_origin(),
-    };
-    let target = CanonicalTarget::from_url(&Url::parse(origin).ok()?).ok()?;
-    Some(ResolvedMirrorRoute {
-        target,
-        path: upstream_path,
-        protocol,
-        credentialed: false,
-        admitted_prefix: "/".to_owned(),
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedMirrorRoute {
     pub target: CanonicalTarget,
@@ -569,19 +496,14 @@ pub struct ResolvedMirrorRoute {
     pub admitted_prefix: String,
 }
 
-fn normalize_mirror_suffix(
-    protocol: MirrorProtocol,
-    path_and_query: &str,
-) -> Result<(String, String), PolicyError> {
-    if protocol != MirrorProtocol::Npm {
-        let normalized = normalize_path(path_and_query)?;
-        return Ok((normalized.clone(), normalized));
-    }
+/// The path an npm admission prefix is compared against: strict structure, an escaped `/` inside
+/// a segment decoded, an empty segment refused.
+fn npm_admission_path(path_and_query: &str) -> Result<String, PolicyError> {
     let admission_path = decode_encoded_slashes(path_and_query)?;
     if admission_path.contains("//") {
         return Err(PolicyError::InvalidPath);
     }
-    Ok((path_and_query.to_owned(), admission_path))
+    Ok(admission_path)
 }
 
 pub const MAX_PATH_BYTES: usize = 8192;
@@ -731,14 +653,10 @@ pub enum PolicyError {
     InvalidMethod,
     #[error("path is ambiguous or unsafe")]
     InvalidPath,
-    #[error("mirror local prefixes must start and end with slash")]
-    InvalidMirrorPrefix,
-    #[error("mirror route prefix must be the frozen endpoint for its protocol")]
-    MirrorProtocolPrefixMismatch,
     #[error("mirror origins must be exact HTTPS origins")]
     InvalidOrigin,
-    #[error("mirror local prefixes must be unique")]
-    DuplicateMirrorPrefix,
+    #[error("npm mirror scopes must not overlap on the same origin")]
+    OverlappingMirrorScope,
 }
 
 #[cfg(test)]
@@ -956,6 +874,215 @@ mod tests {
             hint,
             "cowshed grant --project-wide --egress elsewhere.test:443 (every workspace of this project) \
              or cowshed grant <ws> --egress elsewhere.test:443 (this workspace)"
+        );
+    }
+
+    fn https(host: &str) -> CanonicalTarget {
+        CanonicalTarget::from_authority(&format!("{host}:443"), TargetScheme::Https)
+            .expect("fixture target")
+    }
+
+    fn npm_route(origin_host: &str, prefixes: &[&str], credentialed: bool) -> MirrorRoute {
+        MirrorRoute::new(
+            &format!("https://{origin_host}:443"),
+            prefixes.iter().map(|prefix| (*prefix).to_owned()).collect(),
+            credentialed,
+        )
+        .expect("fixture npm origin")
+    }
+
+    #[test]
+    fn a_direct_npm_request_resolves_by_exact_origin_and_longest_admitted_prefix() {
+        let policy = WorkspacePolicy {
+            grants: Vec::new(),
+            mirrors: vec![npm_route(
+                "registry.npmjs.org",
+                &["/react", "/react/-/", "/@scope/"],
+                false,
+            )],
+        };
+        policy.validate().expect("valid typed route");
+        let registry = https("registry.npmjs.org");
+
+        let tarball = policy
+            .resolve_npm_registry(&registry, "/react/-/react-1.0.0.tgz")
+            .expect("admitted route");
+        assert_eq!(tarball.target, registry);
+        assert_eq!(tarball.path, "/react/-/react-1.0.0.tgz");
+        assert_eq!(tarball.protocol, MirrorProtocol::Npm);
+        assert_eq!(tarball.admitted_prefix, "/react/-/");
+
+        // The escaped slash decides admission only; the bytes forwarded upstream are the ones
+        // the client sent.
+        let scoped = policy
+            .resolve_npm_registry(&registry, "/@scope%2fpkg?write=true")
+            .expect("encoded npm scope is admitted without weakening generic paths");
+        assert_eq!(scoped.path, "/@scope%2fpkg?write=true");
+        assert_eq!(scoped.admitted_prefix, "/@scope/");
+    }
+
+    #[test]
+    fn the_public_registry_is_read_anonymously_and_only_when_it_is_the_destination() {
+        let policy = WorkspacePolicy {
+            grants: Vec::new(),
+            mirrors: vec![npm_route("registry.npmjs.org", &["/@scope/"], true)],
+        };
+        policy.validate().expect("valid typed route");
+        let registry = https("registry.npmjs.org");
+
+        // A path outside every configured prefix falls through to the anonymous baseline, and
+        // the configured route's credential decision stays inside its own scope.
+        let public = policy
+            .resolve_npm_registry(&registry, "/lodash")
+            .expect("public baseline");
+        assert!(!public.credentialed);
+        assert_eq!(public.admitted_prefix, "/");
+        let private = policy
+            .resolve_npm_registry(&registry, "/@scope%2fpkg")
+            .expect("configured scope");
+        assert!(private.credentialed);
+        assert_eq!(private.admitted_prefix, "/@scope/");
+
+        // With no configured route at all the public registry is still readable.
+        let public = WorkspacePolicy::default()
+            .resolve_npm_registry(&registry, "/lodash")
+            .expect("baseline needs no route");
+        assert!(!public.credentialed);
+
+        // Any other destination — host, port or scheme — is no mirror: generic grants decide it.
+        assert!(
+            policy
+                .resolve_npm_registry(&https("registry.example.test"), "/lodash")
+                .is_none()
+        );
+        let other_port =
+            CanonicalTarget::from_authority("registry.npmjs.org:8443", TargetScheme::Https)
+                .expect("fixture target");
+        assert!(
+            policy
+                .resolve_npm_registry(&other_port, "/lodash")
+                .is_none()
+        );
+        let plain = CanonicalTarget::from_authority("registry.npmjs.org:80", TargetScheme::Http)
+            .expect("fixture target");
+        assert!(policy.resolve_npm_registry(&plain, "/lodash").is_none());
+    }
+
+    #[test]
+    fn disjoint_private_scopes_resolve_only_on_their_own_origin() {
+        let policy = WorkspacePolicy {
+            grants: Vec::new(),
+            mirrors: vec![
+                npm_route("npm.company.test", &["/@company/"], true),
+                npm_route("npm.other.test", &["/@other/"], true),
+            ],
+        };
+        policy.validate().expect("disjoint private scopes");
+        let company = policy
+            .resolve_npm_registry(&https("npm.company.test"), "/@company%2fpkg")
+            .expect("company scope on its own origin");
+        assert_eq!(company.target, https("npm.company.test"));
+        assert!(company.credentialed);
+        assert_eq!(company.admitted_prefix, "/@company/");
+        let other = policy
+            .resolve_npm_registry(&https("npm.other.test"), "/@other%2fpkg")
+            .expect("other scope on its own origin");
+        assert_eq!(other.target, https("npm.other.test"));
+
+        // A scope never crosses origins, and a private origin has no public baseline behind it.
+        for (host, path) in [
+            ("npm.other.test", "/@company%2fpkg"),
+            ("npm.company.test", "/@other%2fpkg"),
+            ("npm.company.test", "/react"),
+            ("npm.company.test", "/@companyx%2fpkg"),
+            ("cargo.company.test", "/@company%2fpkg"),
+        ] {
+            assert!(
+                policy.resolve_npm_registry(&https(host), path).is_none(),
+                "{host}{path}"
+            );
+        }
+        assert_eq!(
+            policy
+                .resolve_npm_registry(&https("registry.npmjs.org"), "/react")
+                .expect("public baseline")
+                .target,
+            https("registry.npmjs.org")
+        );
+
+        // Two routes may not claim overlapping scopes on the same origin.
+        let mut overlapping = policy.clone();
+        overlapping
+            .mirrors
+            .push(npm_route("npm.company.test", &["/@company/pkg"], true));
+        assert!(matches!(
+            overlapping.validate(),
+            Err(PolicyError::OverlappingMirrorScope)
+        ));
+    }
+
+    #[test]
+    fn mirror_origins_are_canonical_once_and_aliases_cannot_claim_one_scope() {
+        let left = MirrorRoute::new(
+            "https://registry.npmjs.org",
+            vec!["/@scope/".to_owned()],
+            false,
+        )
+        .expect("implicit HTTPS port");
+        let right = MirrorRoute::new(
+            "https://REGISTRY.npmjs.org:443/",
+            vec!["/@scope/pkg".to_owned()],
+            true,
+        )
+        .expect("explicit HTTPS port and DNS case");
+        assert_eq!(left.target(), right.target());
+        assert!(matches!(
+            WorkspacePolicy {
+                grants: Vec::new(),
+                mirrors: vec![left, right]
+            }
+            .validate(),
+            Err(PolicyError::OverlappingMirrorScope)
+        ));
+        for origin in [
+            "http://registry.npmjs.org",
+            "https://user@registry.npmjs.org",
+            "https://registry.npmjs.org/pkg",
+            "https://registry.npmjs.org?query",
+            "https://registry.npmjs.org#fragment",
+        ] {
+            assert!(
+                MirrorRoute::new(origin, vec!["/".to_owned()], false).is_err(),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_npm_paths_resolve_to_nothing_even_on_the_public_registry() {
+        let policy = WorkspacePolicy::default();
+        let registry = https("registry.npmjs.org");
+        for path in [
+            "/..%2fother",
+            "/@scope%2f..%2fx",
+            "//react",
+            "/a%2f%2fb",
+            "/a%5cb",
+            "/a%00b",
+            "/@scope%252fpkg",
+            "/@scope%2",
+            "/re\\act",
+            "react",
+        ] {
+            assert!(
+                policy.resolve_npm_registry(&registry, path).is_none(),
+                "{path}"
+            );
+        }
+        assert!(
+            policy
+                .resolve_npm_registry(&registry, "/@scope%2fpkg")
+                .is_some()
         );
     }
 }

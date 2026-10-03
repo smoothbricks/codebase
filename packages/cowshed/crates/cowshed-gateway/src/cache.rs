@@ -8,7 +8,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::npm_index::{NpmIndexScanner, NpmTarballIndex};
 use bytes::Bytes;
+use cowshed_gateway_types::CanonicalTarget;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,7 @@ use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf, SeekFrom},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf, SeekFrom},
     sync::{mpsc, oneshot},
 };
 use uuid::Uuid;
@@ -25,7 +27,7 @@ pub const DEFAULT_HIGH_WATER_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_LOW_WATER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_FILL_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const CACHE_VERSION: u8 = 2;
+const CACHE_VERSION: u8 = 3;
 const HEADER_REGION: u64 = 64 * 1024;
 const MAX_HEADER_BYTES: usize = HEADER_REGION as usize - 4;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -169,10 +171,39 @@ impl ObjectDigest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl Serialize for ObjectDigest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.algorithm(), self.as_bytes()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let (algorithm, bytes): (String, Vec<u8>) = Deserialize::deserialize(deserializer)?;
+        match algorithm.as_str() {
+            "sha256" => bytes
+                .try_into()
+                .map(Self::Sha256)
+                .map_err(|_| D::Error::custom("invalid sha256 length")),
+            "sha512" => bytes
+                .try_into()
+                .map(Self::Sha512)
+                .map_err(|_| D::Error::custom("invalid sha512 length")),
+            _ => Err(D::Error::custom("unsupported object digest")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectExpectation {
     pub length: u64,
     pub digest: ObjectDigest,
+}
+
+pub(crate) enum NpmExpectationLookup {
+    MissingPackument,
+    Published(Option<ObjectExpectation>),
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +214,8 @@ pub struct CachedResponse {
     pub content_sha256: [u8; 32],
     pub expected: Option<ObjectExpectation>,
     pub stored_unix_ms: u64,
+    pub(crate) npm_tarballs: Option<Arc<NpmTarballIndex>>,
+    pub(crate) npm_index_bytes: u64,
 }
 
 impl CachedResponse {
@@ -245,6 +278,25 @@ impl Cache {
         receiver.await.map_err(|_| CacheError::ActorStopped)?
     }
 
+    pub(crate) async fn npm_expectation(
+        &self,
+        key: &CacheKey,
+        path: &str,
+        allow_stale: bool,
+    ) -> Result<NpmExpectationLookup, CacheError> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::NpmExpectation {
+                digest: key.digest(),
+                path: path.to_owned(),
+                allow_stale,
+                reply,
+            })
+            .await
+            .map_err(|_| CacheError::ActorStopped)?;
+        receiver.await.map_err(|_| CacheError::ActorStopped)?
+    }
+
     pub async fn retry_after_wait(&self, wait: CacheWait) -> Result<(), CacheError> {
         tokio::time::timeout(self.config.fill_wait_timeout, wait.receiver)
             .await
@@ -256,12 +308,25 @@ impl Cache {
         match open_and_validate(&candidate.path, &candidate.response).await {
             Ok(file) => {
                 let content_length = candidate.response.content_length;
+                let verification =
+                    candidate
+                        .response
+                        .expected
+                        .map(|expected| match expected.digest {
+                            ObjectDigest::Sha256(digest) => {
+                                ReadDigest::Sha256(Sha256::new(), digest)
+                            }
+                            ObjectDigest::Sha512(digest) => {
+                                ReadDigest::Sha512(Sha512::new(), digest)
+                            }
+                        });
                 Ok(CacheHit {
                     response: candidate.response,
                     body: CacheReadBody {
                         file,
                         remaining: content_length,
                         buffer: vec![0; STREAM_CHUNK_BYTES],
+                        verification,
                         commands: self.commands.clone(),
                         digest: candidate.digest,
                         generation: candidate.generation,
@@ -322,6 +387,7 @@ impl Cache {
         Ok(CacheFillBody {
             declared: source.size_hint().exact(),
             source,
+            scanner: None,
             writer: Some(writer),
             pending: None,
             pending_offset: 0,
@@ -449,10 +515,38 @@ impl Drop for FillPermit {
     }
 }
 
+enum ReadDigest {
+    Sha256(Sha256, [u8; 32]),
+    Sha512(Sha512, [u8; 64]),
+}
+
+impl ReadDigest {
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha256(digest, _) => digest.update(bytes),
+            Self::Sha512(digest, _) => digest.update(bytes),
+        }
+    }
+
+    fn matches(self) -> bool {
+        match self {
+            Self::Sha256(digest, expected) => {
+                let actual: [u8; 32] = digest.finalize().into();
+                actual == expected
+            }
+            Self::Sha512(digest, expected) => {
+                let actual: [u8; 64] = digest.finalize().into();
+                actual == expected
+            }
+        }
+    }
+}
+
 pub struct CacheReadBody {
     file: File,
     remaining: u64,
     buffer: Vec<u8>,
+    verification: Option<ReadDigest>,
     commands: mpsc::Sender<Command>,
     digest: [u8; 32],
     generation: u64,
@@ -468,6 +562,26 @@ impl CacheReadBody {
         let command = Command::Release {
             digest: self.digest,
             generation: self.generation,
+        };
+        match self.commands.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let _ = commands.send(command).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    fn corrupt(&mut self) {
+        self.release();
+        let (reply, _receiver) = oneshot::channel();
+        let command = Command::Corrupt {
+            digest: self.digest,
+            generation: self.generation,
+            reply,
         };
         match self.commands.try_send(command) {
             Ok(()) => {}
@@ -511,12 +625,25 @@ impl Body for CacheReadBody {
                 Poll::Ready(Some(Err(Box::new(error))))
             }
             Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
-                this.release();
+                this.remaining = 0;
+                this.corrupt();
                 Poll::Ready(Some(Err("cache object truncated after validation".into())))
             }
             Poll::Ready(Ok(())) => {
                 let length = read_buf.filled().len();
                 this.remaining -= length as u64;
+                if let Some(verification) = &mut this.verification {
+                    verification.update(read_buf.filled());
+                }
+                if this.remaining == 0
+                    && this
+                        .verification
+                        .take()
+                        .is_some_and(|verification| !verification.matches())
+                {
+                    this.corrupt();
+                    return Poll::Ready(Some(Err(Box::new(CacheError::DigestMismatch))));
+                }
                 let bytes = Bytes::copy_from_slice(read_buf.filled());
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
@@ -539,6 +666,7 @@ impl Body for CacheReadBody {
 /// that waited for that poll would be dropped with the body, so every fetch would refill.
 pub struct CacheFillBody<B> {
     source: B,
+    scanner: Option<NpmIndexScanner>,
     /// The upstream body's exact length, when it declares one (`Content-Length`).
     declared: Option<u64>,
     writer: Option<File>,
@@ -556,14 +684,22 @@ pub struct CacheFillBody<B> {
 
 enum FillState {
     Streaming,
-    /// Publication, spawned so it completes whether or not the client is still reading; a client
-    /// that is gets its verdict as the end of the body.
-    Finalizing(tokio::task::JoinHandle<Result<(), CacheError>>),
+    /// Hold the last declared chunk until integrity verification and publication finish:
+    /// an HTTP client can stop after Content-Length without polling the body again.
+    Finalizing {
+        publication: tokio::task::JoinHandle<Result<(), CacheError>>,
+        last: Option<Bytes>,
+    },
     Done,
 }
 
 impl<B> CacheFillBody<B> {
-    fn begin_finalizing(&mut self) {
+    pub(crate) fn with_npm_index(mut self, target: CanonicalTarget) -> Self {
+        self.scanner = Some(NpmIndexScanner::new(target));
+        self
+    }
+
+    fn begin_finalizing(&mut self, last: Option<Bytes>) {
         let writer = self.writer.take().expect("writer exists while streaming");
         let permit = self.permit.take().expect("permit exists while streaming");
         let mut response = self
@@ -571,6 +707,7 @@ impl<B> CacheFillBody<B> {
             .take()
             .expect("response exists while streaming");
         let temp_path = self.temp_path.take().expect("temporary path exists");
+        let index = self.scanner.take().map(NpmIndexScanner::finish).transpose();
         response.content_length = self.bytes;
         response.content_sha256 = self.digest.clone().finalize().into();
         let content_sha512 = self
@@ -578,10 +715,14 @@ impl<B> CacheFillBody<B> {
             .take()
             .map(|digest| <[u8; 64]>::from(digest.finalize()));
         let cleanup = TempCleanup(temp_path.clone());
-        self.state = FillState::Finalizing(tokio::spawn(async move {
-            let _cleanup = cleanup;
-            finalize_fill(writer, temp_path, response, content_sha512, permit).await
-        }));
+        self.state = FillState::Finalizing {
+            publication: tokio::spawn(async move {
+                let _cleanup = cleanup;
+                response.npm_tarballs = index?.map(Arc::new);
+                finalize_fill(writer, temp_path, response, content_sha512, permit).await
+            }),
+            last,
+        };
     }
 }
 
@@ -601,11 +742,13 @@ where
         loop {
             match &mut self.state {
                 FillState::Done => return Poll::Ready(None),
-                FillState::Finalizing(publication) => match Pin::new(publication).poll(cx) {
+                FillState::Finalizing { publication, last } => match Pin::new(publication).poll(cx)
+                {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(Ok(()))) => {
+                        let last = last.take();
                         self.state = FillState::Done;
-                        return Poll::Ready(None);
+                        return Poll::Ready(last.map(|bytes| Ok(Frame::data(bytes))));
                     }
                     Poll::Ready(Ok(Err(error))) => {
                         self.state = FillState::Done;
@@ -653,13 +796,20 @@ where
                             continue;
                         }
                         self.pending_offset = 0;
+                        if let Some(scanner) = &mut self.scanner
+                            && let Err(error) = scanner.push(&pending)
+                        {
+                            self.state = FillState::Done;
+                            return Poll::Ready(Some(Err(Box::new(error))));
+                        }
                         self.digest.update(&pending);
                         if let Some(digest) = &mut self.expected_sha512 {
                             digest.update(&pending);
                         }
                         self.bytes = self.bytes.saturating_add(pending.len() as u64);
                         if self.declared == Some(self.bytes) {
-                            self.begin_finalizing();
+                            self.begin_finalizing(Some(pending));
+                            continue;
                         }
                         return Poll::Ready(Some(Ok(Frame::data(pending))));
                     }
@@ -679,7 +829,7 @@ where
                     }
                     Err(frame) => return Poll::Ready(Some(Ok(frame))),
                 },
-                Poll::Ready(None) => self.begin_finalizing(),
+                Poll::Ready(None) => self.begin_finalizing(None),
             }
         }
     }
@@ -715,9 +865,9 @@ impl Drop for TempCleanup {
 }
 
 async fn finalize_fill(
-    mut writer: File,
+    writer: File,
     temp_path: PathBuf,
-    response: CachedResponse,
+    mut response: CachedResponse,
     content_sha512: Option<[u8; 64]>,
     mut permit: FillPermit,
 ) -> Result<(), CacheError> {
@@ -735,21 +885,41 @@ async fn finalize_fill(
         permit.completed = true;
         return Err(CacheError::DigestMismatch);
     }
-    let disk = DiskRecord::from_response(permit.digest, permit.generation, &response)?;
-    let encoded = serde_json::to_vec(&disk).map_err(CacheError::MetadataEncode)?;
-    if encoded.len() > MAX_HEADER_BYTES {
-        let _ = fs::remove_file(&temp_path).await;
-        permit.finish_without_commit().await?;
-        permit.completed = true;
-        return Err(CacheError::MetadataTooLarge);
-    }
-    writer.seek(SeekFrom::Start(0)).await?;
-    writer
-        .write_all(&(encoded.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(&encoded).await?;
-    writer.sync_all().await?;
-    drop(writer);
+    let digest = permit.digest;
+    let generation = permit.generation;
+    let mut writer = writer.into_std().await;
+    response = tokio::task::spawn_blocking(move || {
+        use std::io::{Seek as _, Write as _};
+        let mut index_sha256 = None;
+        if let Some(index) = &response.npm_tarballs {
+            let mut index_writer = HashingWriter {
+                inner: std::io::BufWriter::new(writer),
+                digest: Sha256::new(),
+                bytes: 0,
+            };
+            serde_json::to_writer(&mut index_writer, index.as_ref())
+                .map_err(CacheError::MetadataEncode)?;
+            index_writer.flush()?;
+            response.npm_index_bytes = index_writer.bytes;
+            index_sha256 = Some(<[u8; 32]>::from(index_writer.digest.finalize()));
+            writer = index_writer
+                .inner
+                .into_inner()
+                .map_err(|error| CacheError::Io(error.into_error()))?;
+        }
+        let disk = DiskRecord::from_response(digest, generation, &response, index_sha256)?;
+        let encoded = serde_json::to_vec(&disk).map_err(CacheError::MetadataEncode)?;
+        if encoded.len() > MAX_HEADER_BYTES {
+            return Err(CacheError::MetadataTooLarge);
+        }
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(&(encoded.len() as u32).to_be_bytes())?;
+        writer.write_all(&encoded)?;
+        writer.sync_all()?;
+        Ok(response)
+    })
+    .await
+    .map_err(|error| CacheError::Io(io::Error::other(error)))??;
 
     let final_path = permit.commands_path(&temp_path)?;
     fs::rename(&temp_path, &final_path).await?;
@@ -833,6 +1003,12 @@ enum Command {
         generation: u64,
         refreshed_unix_ms: u64,
         reply: oneshot::Sender<Result<CacheCandidate, CacheError>>,
+    },
+    NpmExpectation {
+        digest: [u8; 32],
+        path: String,
+        allow_stale: bool,
+        reply: oneshot::Sender<Result<NpmExpectationLookup, CacheError>>,
     },
 }
 
@@ -972,6 +1148,32 @@ impl CacheActor {
                         .map(|_| ())
                         .map_err(|error| error.for_waiter());
                     self.finish_fill(digest, generation, notification);
+                    let _ = reply.send(result);
+                }
+                Command::NpmExpectation {
+                    digest,
+                    path,
+                    allow_stale,
+                    reply,
+                } => {
+                    let result = unix_ms(SystemTime::now()).map(|now| {
+                        let Some(entry) = self.entries.get_mut(&digest) else {
+                            return NpmExpectationLookup::MissingPackument;
+                        };
+                        let age = Duration::from_millis(
+                            now.saturating_sub(entry.response.stored_unix_ms),
+                        );
+                        if !allow_stale && age > self.config.metadata_ttl {
+                            return NpmExpectationLookup::MissingPackument;
+                        }
+                        let Some(index) = &entry.response.npm_tarballs else {
+                            return NpmExpectationLookup::MissingPackument;
+                        };
+                        let expected = index.get(&path).copied();
+                        entry.last_access = self.next_access;
+                        self.next_access = self.next_access.saturating_add(1);
+                        NpmExpectationLookup::Published(expected)
+                    });
                     let _ = reply.send(result);
                 }
             }
@@ -1221,6 +1423,8 @@ struct DiskRecord {
     headers: Vec<(String, String)>,
     content_length: u64,
     content_sha256: String,
+    npm_index_bytes: u64,
+    npm_index_sha256: Option<String>,
     expected_length: Option<u64>,
     expected_algorithm: Option<String>,
     expected_digest: Option<String>,
@@ -1232,6 +1436,7 @@ impl DiskRecord {
         digest: [u8; 32],
         generation: u64,
         response: &CachedResponse,
+        index_sha256: Option<[u8; 32]>,
     ) -> Result<Self, CacheError> {
         let mut headers = Vec::with_capacity(response.headers.len());
         for (name, value) in &response.headers {
@@ -1249,6 +1454,8 @@ impl DiskRecord {
             headers,
             content_length: response.content_length,
             content_sha256: hex_encode(&response.content_sha256),
+            npm_index_bytes: response.npm_index_bytes,
+            npm_index_sha256: index_sha256.map(|digest| hex_encode(&digest)),
             expected_length: response.expected.map(|expected| expected.length),
             expected_algorithm: response
                 .expected
@@ -1260,8 +1467,18 @@ impl DiskRecord {
         })
     }
 
-    fn into_entry(self, path: PathBuf, stored_bytes: u64) -> Result<([u8; 32], Entry), CacheError> {
-        if self.version != CACHE_VERSION || stored_bytes < HEADER_REGION {
+    fn into_entry(
+        self,
+        path: PathBuf,
+        stored_bytes: u64,
+        npm_tarballs: Option<Arc<NpmTarballIndex>>,
+    ) -> Result<([u8; 32], Entry), CacheError> {
+        if self.version != CACHE_VERSION
+            || HEADER_REGION
+                .checked_add(self.content_length)
+                .and_then(|length| length.checked_add(self.npm_index_bytes))
+                != Some(stored_bytes)
+        {
             return Err(CacheError::InvalidMetadata);
         }
 
@@ -1306,6 +1523,8 @@ impl DiskRecord {
                     content_sha256,
                     expected,
                     stored_unix_ms: self.stored_unix_ms,
+                    npm_tarballs,
+                    npm_index_bytes: self.npm_index_bytes,
                 },
                 stored_bytes,
                 active_readers: 0,
@@ -1380,13 +1599,25 @@ async fn load_entries(root: &Path) -> Result<HashMap<[u8; 32], Entry>, CacheErro
             remove_generated_file(&path).await?;
             continue;
         }
-        match read_disk_record(&path).await.and_then(|record| {
-            let expected_name = final_name(&hex_decode_32(&record.key_sha256)?);
-            if name != expected_name {
-                return Err(CacheError::InvalidMetadata);
-            }
-            record.into_entry(path.clone(), metadata.len())
-        }) {
+        let loaded_record = match read_disk_record(&path).await {
+            Ok(record) if record.version == CACHE_VERSION => read_npm_index(
+                &path,
+                record.content_length,
+                record.npm_index_bytes,
+                record.npm_index_sha256.as_deref(),
+            )
+            .await
+            .and_then(|index| {
+                let expected_name = final_name(&hex_decode_32(&record.key_sha256)?);
+                if name != expected_name {
+                    return Err(CacheError::InvalidMetadata);
+                }
+                record.into_entry(path.clone(), metadata.len(), index)
+            }),
+            Ok(_) => Err(CacheError::InvalidMetadata),
+            Err(error) => Err(error),
+        };
+        match loaded_record {
             Ok((digest, value)) => {
                 loaded.insert(digest, value);
             }
@@ -1416,6 +1647,7 @@ async fn open_and_validate(path: &Path, response: &CachedResponse) -> Result<Fil
     let metadata = file.metadata().await?;
     let expected_file_len = HEADER_REGION
         .checked_add(response.content_length)
+        .and_then(|length| length.checked_add(response.npm_index_bytes))
         .ok_or(CacheError::InvalidMetadata)?;
     if metadata.len() != expected_file_len {
         return Err(CacheError::DigestMismatch);
@@ -1520,9 +1752,90 @@ pub(crate) fn unix_ms(time: SystemTime) -> Result<u64, CacheError> {
     u64::try_from(duration.as_millis()).map_err(|_| CacheError::InvalidMetadata)
 }
 
+struct HashingWriter<W> {
+    inner: W,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<W: io::Write> io::Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("cache index length overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct HashingReader<R> {
+    inner: R,
+    digest: Sha256,
+}
+
+impl<R: io::Read> io::Read for HashingReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(bytes)?;
+        self.digest.update(&bytes[..read]);
+        Ok(read)
+    }
+}
+
+async fn read_npm_index(
+    path: &Path,
+    body_length: u64,
+    index_length: u64,
+    expected_digest: Option<&str>,
+) -> Result<Option<Arc<NpmTarballIndex>>, CacheError> {
+    if index_length == 0 {
+        return if expected_digest.is_none() {
+            Ok(None)
+        } else {
+            Err(CacheError::InvalidMetadata)
+        };
+    }
+    let expected = hex_decode_32(expected_digest.ok_or(CacheError::InvalidMetadata)?)?;
+    let mut file = open_existing_nofollow(path).await?;
+    let offset = HEADER_REGION
+        .checked_add(body_length)
+        .ok_or(CacheError::InvalidMetadata)?;
+    if file.metadata().await?.len()
+        != offset
+            .checked_add(index_length)
+            .ok_or(CacheError::InvalidMetadata)?
+    {
+        return Err(CacheError::InvalidMetadata);
+    }
+    file.seek(SeekFrom::Start(offset)).await?;
+    let file = file.into_std().await;
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(HashingReader {
+            inner: file.take(index_length),
+            digest: Sha256::new(),
+        });
+        let index: NpmTarballIndex =
+            serde_json::from_reader(&mut reader).map_err(|_| CacheError::InvalidMetadata)?;
+        let digest: [u8; 32] = reader.into_inner().digest.finalize().into();
+        if digest != expected {
+            return Err(CacheError::DigestMismatch);
+        }
+        Ok(Some(Arc::new(index)))
+    })
+    .await
+    .map_err(|error| CacheError::Io(io::Error::other(error)))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
     async fn sealed_open_validates_geometry_without_rehashing_body() {
@@ -1542,6 +1855,8 @@ mod tests {
             content_sha256: Sha256::digest(b"original").into(),
             expected: None,
             stored_unix_ms: 0,
+            npm_tarballs: None,
+            npm_index_bytes: 0,
         };
         let mut opened = open_and_validate(&path, &response)
             .await
@@ -1569,6 +1884,8 @@ mod tests {
             content_sha256: Sha256::digest([]).into(),
             expected: None,
             stored_unix_ms: 0,
+            npm_tarballs: None,
+            npm_index_bytes: 0,
         };
         let entries = HashMap::from([(
             digest,

@@ -80,21 +80,21 @@ HTTP proxy variables, which are emitted by the workspace environment wiring beca
 them there; they contain the endpoint URL, whose userinfo is the workspace token (below).
 
 - **Private-environment config files**, written when the workspace is minted (adopt/new/fork, and rekey/restore's fresh
-  token) and republished before every exec, so a rotated token or a moved endpoint is never served stale. They live in
-  the workspace's private environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`,
-  `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only
-  exec gets the same files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>`
-  on macOS and exactly `http://127.0.0.1:7644` on Linux. The Linux address is served by the trusted connector inside
-  that workspace's private netns; package clients do not speak Unix sockets. No Linux `portBlock` or synthetic base
-  exists.
-  - **bun: the global bunfig** at `$XDG_CONFIG_HOME/.bunfig.toml`:
-    `[install] registry = { url = "<GATEWAY_HTTP>/npm/", token = "<workspace token>" }`. **Measured (bun 1.4.2): bun
-    reads `$XDG_CONFIG_HOME/.bunfig.toml` whenever `XDG_CONFIG_HOME` is set, and `$HOME/.bunfig.toml` only when it is
-    not; it reads that global file alongside the repository's own `bunfig.toml`, which still wins for any key it sets;
-    and it sends the token as `Authorization: Bearer`**, which the gateway accepts on its mirror routes (05_gateway.md).
-    Neither bunfig names a cache directory: bun's global install cache is the shared link-target cache every checkout
-    reaches through the host's literal path (host-level relocation below), and an `[install.cache] dir` inside the
-    checkout would write each checkout's own path into its `node_modules/.bun` links.
+  CA) and republished before every exec, so a moved environment is never served stale. They live in the workspace's
+  private environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`, `XDG_CONFIG_HOME`
+  and `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only exec gets the
+  same files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>` on macOS and
+  exactly `http://127.0.0.1:7644` on Linux. The Linux address is served by the trusted connector inside that workspace's
+  private netns; package clients do not speak Unix sockets. No Linux `portBlock` or synthetic base exists.
+  - **bun: no registry configuration at all.** Bun reads its registry from the repository's own configuration
+    (`bunfig.toml`, `.npmrc`; the public registry by default) and reaches it like every other client: through the proxy
+    variables (below), trusting the workspace CA through `NODE_EXTRA_CA_CERTS` (04_sandbox.md). Public npm HTTPS reads
+    have an anonymous default grant (05_gateway.md "Egress modes"). No `$XDG_CONFIG_HOME/.bunfig.toml` is written: it
+    would put the workspace token and a loopback registry URL in a file, and an earlier wiring did — so every publish
+    removes that entry itself, never a link target. No bunfig names a cache directory either: bun's global install cache
+    is the shared link-target cache every checkout reaches through the host's literal path (host-level relocation
+    below), and an `[install.cache] dir` inside the checkout would write each checkout's own path into its
+    `node_modules/.bun` links.
   - **cargo: no registry configuration at all.** Every sandbox builds with one literal `CARGO_HOME` — the host's
     `~/.cargo`, whose `registry` and `git` are relocated to the caches volume (below) — because cargo fingerprints a
     registry or git dependency by its absolute source path under `CARGO_HOME`: the same crate reached through another
@@ -265,8 +265,8 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       (04_sandbox.md);
     - the caller's `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `COLORTERM` and `DEVELOPER_DIR`, passed through.
 
-    The workspace token needs no registry export on top: bun takes it from the private bunfig's registry `token`, and
-    the gateway reads it from bun's own `Authorization` header on the mirror routes (05_gateway.md). The cargo `[env]`
+    No registry client receives the workspace token from a file: it travels only as proxy userinfo and as
+    `COWSHED_WORKSPACE_TOKEN`, and no file under the private `home`, `config` or `cache` carries it. The cargo `[env]`
     guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
 
 ### The sccache daemon
@@ -315,11 +315,14 @@ table is advisory metadata, not a gate.
 
 ## New-package flow
 
-1. A workspace's `bun install` (or cargo, or `go mod download`) asks the gateway mirror — on the workspace's own
-   data-plane port (05_gateway.md) — for a package it lacks. Registry endpoints are **baseline broker policy**: a closed
-   workspace installs with zero grants; the port+token still identify and audit every request.
-2. The gateway fetches it upstream once (credentials injected), stores it content-addressed on the caches volume, and
-   serves it — over loopback, so no WAN duplication across workspaces.
+1. A workspace's `bun install` (or cargo, or `go mod download`) asks its registry — through the gateway's proxy endpoint
+   on the workspace's own data-plane port (05_gateway.md) — for a package it lacks. Every registry host needs an egress
+   grant (a project's standing grants name the registries its builds use); the port+token still identify and audit every
+   request.
+2. For npm, the gateway serves an eligible package request through its verified cache: it fetches the tarball upstream
+   once (credentials injected where trusted policy admits them), stores it content-addressed on the caches volume, and
+   serves it over loopback, so no WAN duplication across workspaces. Cargo and Go fetch from their registries as
+   intercepted and opaque egress; the shared cargo registry and `GOMODCACHE` below are their deduplication.
 3. bun extracts into the shared global cache and links `node_modules/.bun` to the extracted package; cargo extracts into
    the shared registry, and go extracts into the shared `GOMODCACHE` (0444 entries, internally locked, built for exactly
    this cross-consumer sharing), where every workspace and main read them thereafter.

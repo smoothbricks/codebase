@@ -12,6 +12,7 @@ mod config;
 mod control;
 mod interfaces;
 mod mirror;
+mod npm_index;
 mod platform;
 mod proxy;
 mod repo_mirror;
@@ -45,9 +46,9 @@ pub use interfaces::{
     UpstreamConnector, UpstreamHealth, UpstreamPurpose,
 };
 pub use mirror::{
-    MAX_METADATA_BYTES, MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError,
-    MirrorFetchRequest, MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest,
-    MirrorResourceKind, MirrorResponse, MirrorService, MirrorUpstream,
+    MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
+    MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,
+    MirrorResponse, MirrorService, MirrorUpstream,
 };
 #[cfg(target_os = "macos")]
 pub use platform::KeychainCredentialProvider;

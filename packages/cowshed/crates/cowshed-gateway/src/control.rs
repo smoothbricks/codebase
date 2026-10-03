@@ -17,7 +17,7 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
-    EgressGrant, EgressMode, GatewayStatus, HostPattern, MirrorProtocol, MirrorRoute, WorkspaceCa,
+    EgressGrant, EgressMode, GatewayStatus, HostPattern, MirrorRoute, WorkspaceCa,
     WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
@@ -502,7 +502,11 @@ impl PolicyWire {
                 .iter()
                 .map(GrantWire::to_grant)
                 .collect::<Result<_, _>>()?,
-            mirrors: self.mirrors.iter().map(MirrorWire::to_route).collect(),
+            mirrors: self
+                .mirrors
+                .iter()
+                .map(MirrorWire::to_route)
+                .collect::<Result<_, _>>()?,
         };
         policy
             .validate()
@@ -554,9 +558,7 @@ impl GrantWire {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MirrorWire {
-    local_prefix: String,
     upstream_origin: String,
-    protocol: MirrorProtocol,
     admitted_prefixes: Vec<String>,
     credentialed: bool,
 }
@@ -564,9 +566,7 @@ struct MirrorWire {
 impl From<&MirrorRoute> for MirrorWire {
     fn from(route: &MirrorRoute) -> Self {
         Self {
-            local_prefix: route.local_prefix.clone(),
-            upstream_origin: route.upstream_origin.clone(),
-            protocol: route.protocol,
+            upstream_origin: route.target().origin(),
             admitted_prefixes: route.admitted_prefixes.clone(),
             credentialed: route.credentialed,
         }
@@ -574,14 +574,13 @@ impl From<&MirrorRoute> for MirrorWire {
 }
 
 impl MirrorWire {
-    fn to_route(&self) -> MirrorRoute {
-        MirrorRoute {
-            local_prefix: self.local_prefix.clone(),
-            upstream_origin: self.upstream_origin.clone(),
-            protocol: self.protocol,
-            admitted_prefixes: self.admitted_prefixes.clone(),
-            credentialed: self.credentialed,
-        }
+    fn to_route(&self) -> Result<MirrorRoute, ControlError> {
+        MirrorRoute::new(
+            &self.upstream_origin,
+            self.admitted_prefixes.clone(),
+            self.credentialed,
+        )
+        .map_err(|error| ControlError::InvalidSession(error.to_string()))
     }
 }
 

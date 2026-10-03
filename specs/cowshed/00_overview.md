@@ -66,7 +66,7 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
         /private/cowshed/store/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
-        <owner>/<repo>/main.asif ─ clonefile ─►                   npm/cargo mirror · per-workspace CA interception
+        <owner>/<repo>/main.asif ─ clonefile ─►                   npm mirror · per-workspace CA interception
         <owner>/<repo>/sessions/<ws>.asif                         repo-mirror verb · Arrow audit (13)
         <owner>/<repo>/sessions/<ws>.asif.grants.json                   │
                     │                                                ▼
