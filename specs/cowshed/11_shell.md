@@ -185,9 +185,13 @@ the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and w
 serving process creates `<store>/run` mode `0700`, so no other user reaches a socket in it, binds the socket there and
 sets it `0600`, and verifies each connecting peer's uid before reading a byte. A persistent no-follow file lease at
 `<digest>.sock.lock` serializes binders and stale-socket replacement. The bound listener and lease are one owned value,
-held throughout serving or a workspace mutation. A connected peer is never displaced unless its non-reusable kernel
-identity positively proves it no longer runs; unknown inspection or hello outcomes retain its socket and ledger.
-Retirement releases the listener and lease **before** acknowledging success, and removes only its own socket inode.
+held throughout serving or a workspace mutation. Stream refusal is not absence: a live Darwin listener can refuse when
+its backlog is full. Recovery probes the exact filesystem socket with a datagram connection; wrong-type or connected
+means a socket remains attached to that vnode, including one inherited after its creator exited. Only proven unattached
+socket instances may be replaced. New listeners bind privately and publish with atomic exclusive rename or exchange; the
+displaced private instance is checked again before deletion, and ambiguous/live replacements are restored or kept with a
+typed error. Cleanup likewise moves and verifies its own live inode without unlinking another public instance.
+Retirement releases the listener and lease **before** acknowledging success.
 
 Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
 stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
@@ -530,6 +534,13 @@ its longest job. A lifecycle verb stops admission with `drain` and identifies th
 connection's kernel peer credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only
 through that non-reusable identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process
 that reused the pid. A host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
+
+The owner exit watch is registered before sending `drain` or a termination signal. On macOS, registration is followed by
+an actual kernel pid-version match, never a guessed numeric-pid or signal-zero probe; on Linux the watch duplicates the
+already pinned peer pidfd. A watch registered after the process starts exiting may fail while its descriptors are still
+open, so that failure is not death proof. Termination waits on the pre-established watch within the existing grace, then
+retains the exclusive replacement listener continuously through the caller's mutation. A listener inherited by another
+live process remains attached and is refused even after its original creator dies.
 
 Once the supervisor exits, the verb reconciles its group ledger as above and unlinks the socket unless something serves
 it again; unresolved group evidence is retained. The jobs' records remain unterminated until the next supervisor seals

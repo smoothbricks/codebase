@@ -289,6 +289,21 @@ pub enum Writer {
     Any,
 }
 
+impl Writer {
+    fn wrote(self, ledger: &Ledger) -> bool {
+        match self {
+            Self::Process(pid) => pid == ledger.supervisor,
+            Self::Any => true,
+        }
+    }
+}
+
+/// Whether the ledger at `path` that `writer` wrote names a group [`end_recorded`] would end.
+/// A supervisor that retired in order left none.
+pub fn names_groups(path: &Path, writer: Writer) -> io::Result<bool> {
+    Ok(read(path)?.is_some_and(|ledger| writer.wrote(&ledger) && !ledger.groups.is_empty()))
+}
+
 /// What ending a ledger's groups did.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Ended {
@@ -306,9 +321,7 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
     let Some(mut ledger) = read(path)? else {
         return Ok(Ended::default());
     };
-    if let Writer::Process(pid) = writer
-        && pid != ledger.supervisor
-    {
+    if !writer.wrote(&ledger) {
         return Ok(Ended::default());
     }
     let (signalled, unresolved) = end_groups(&ledger.groups, grace)?;
@@ -636,7 +649,8 @@ struct AuditToken {
 unsafe extern "C" {
     /// Signals the process the token's pid and pid version name, if it still runs. Returns
     /// the error number itself, not -1 (measured: `ESRCH` for a stale version, an exited and a
-    /// reaped process; `EPERM` where the sandbox denies signalling).
+    /// reaped process; `EPERM` where the sandbox denies signalling; `EINVAL` for signal 0, so it
+    /// cannot probe whether a process runs).
     fn proc_signal_with_audittoken(token: *mut AuditToken, signal: libc::c_int) -> libc::c_int;
 }
 
@@ -645,35 +659,10 @@ unsafe extern "C" {
 fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
     let mut members = Vec::new();
     for pid in group_pids(pgid)? {
-        let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqueId>::zeroed();
-        let size = libc::c_int::try_from(std::mem::size_of::<BsdInfoWithUniqueId>())
-            .map_err(io::Error::other)?;
-        // SAFETY: `info` is writable storage of exactly `size` bytes.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDT_BSDINFOWITHUNIQID,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
+        // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
+        let Some(info) = running_info(pid)? else {
+            continue;
         };
-        if written != size {
-            if written <= 0 {
-                let error = io::Error::last_os_error();
-                // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(error);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("proc_pidinfo returned {written} bytes, expected {size}"),
-            ));
-        }
-        // SAFETY: proc_pidinfo filled all `size` bytes.
-        let info = unsafe { info.assume_init() };
         // One call read both, so the group is this very process's: one the id now names a
         // newer process for would have answered with that process's version.
         if i32::try_from(info.bsd.pbi_pgid).ok() == Some(pgid) {
@@ -684,6 +673,40 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
         }
     }
     Ok(members)
+}
+
+/// The BSD record and pid version of the process `pid` names now, read in one call; `None` once
+/// it has exited, reaped or not.
+#[cfg(target_os = "macos")]
+fn running_info(pid: i32) -> io::Result<Option<BsdInfoWithUniqueId>> {
+    let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqueId>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<BsdInfoWithUniqueId>())
+        .map_err(io::Error::other)?;
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_BSDINFOWITHUNIQID,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("proc_pidinfo returned {written} bytes, expected {size}"),
+        ));
+    }
+    // SAFETY: proc_pidinfo filled all `size` bytes.
+    Ok(Some(unsafe { info.assume_init() }))
 }
 
 #[cfg(target_os = "macos")]
@@ -735,6 +758,147 @@ impl Process {
                 ),
             )),
         }
+    }
+
+    /// Watch for this process's exit, from now. A watch registered by pid once the process has
+    /// begun to exit is refused (`ESRCH`) while its descriptors may still be open, and one made
+    /// after it is gone could name another process: so it must be watched while it runs. The
+    /// pid's running process read after the registration carries this process's pid version,
+    /// which no other process is given: it ran throughout, and the watch names it.
+    pub(super) fn watch_exit(&self) -> io::Result<ExitWatch> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        // SAFETY: kqueue takes nothing and returns a new descriptor.
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor this function alone owns.
+        let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+        let change = libc::kevent {
+            ident: usize::try_from(self.pid).map_err(io::Error::other)?,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one change read from live memory, no event list, on a live queue. With no room
+        // for events a failed registration is the call's own error.
+        let registered = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if registered != 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "process {} cannot be watched to its exit, which may have begun: {error}",
+                    self.pid
+                ),
+            ));
+        }
+        match running_info(self.pid)? {
+            Some(info) if info.unique.id_version.cast_unsigned() == self.version => {
+                Ok(ExitWatch(queue))
+            }
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "process {} exited before it could be watched; its pid names another",
+                    self.pid
+                ),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("process {} exited before it could be watched", self.pid),
+            )),
+        }
+    }
+}
+
+/// A process's exit, watched from a moment it ran (`Process::watch_exit`). The kernel reports
+/// it only once the process has released what it held, every descriptor included (measured on
+/// Darwin: a listener it alone held is detached from its socket file by NOTE_EXIT; Linux makes
+/// a pidfd readable in `exit_notify`, after `exit_files` and the deferred closes it queued).
+pub struct ExitWatch(std::os::fd::OwnedFd);
+
+impl ExitWatch {
+    /// Block until the process has exited.
+    pub(super) fn wait(&self) -> io::Result<()> {
+        self.exited(None).map(|_| ())
+    }
+
+    /// Block until the process has exited or `within` passes; whether it exited.
+    pub(super) fn within(&self, within: Duration) -> io::Result<bool> {
+        self.exited(Some(within))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ExitWatch {
+    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let timeout = within
+            .map(|within| {
+                Ok::<_, io::Error>(libc::timespec {
+                    tv_sec: libc::time_t::try_from(within.as_secs()).map_err(io::Error::other)?,
+                    tv_nsec: libc::c_long::from(within.subsec_nanos()),
+                })
+            })
+            .transpose()?;
+        // SAFETY: `event` is plain data the call may write; the queue and timeout are live.
+        let (returned, event) = unsafe {
+            let mut event = std::mem::zeroed::<libc::kevent>();
+            let returned = libc::kevent(
+                self.0.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                timeout
+                    .as_ref()
+                    .map_or(std::ptr::null(), std::ptr::from_ref),
+            );
+            (returned, event)
+        };
+        match returned {
+            ..0 => Err(io::Error::last_os_error()),
+            0 => Ok(false),
+            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
+                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
+            _ => Ok(true),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExitWatch {
+    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let timeout = within.map_or(-1, |within| {
+            i32::try_from(within.as_millis()).unwrap_or(i32::MAX)
+        });
+        let mut exited = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd entry.
+        let waited = unsafe { libc::poll(&mut exited, 1, timeout) };
+        if waited < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(waited > 0)
     }
 }
 
@@ -927,6 +1091,11 @@ impl Process {
         }
         Err(error)
     }
+
+    /// Watch for this process's exit: its pidfd names it alone, whenever it is polled.
+    pub(super) fn watch_exit(&self) -> io::Result<ExitWatch> {
+        self.handle.try_clone().map(ExitWatch)
+    }
 }
 
 /// The leader's start time, or confirmed absence. An unreadable process is never absent.
@@ -1030,7 +1199,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use super::{GroupLeader, Writer, end_recorded, ledger_path, record, take_lost};
+    use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, record, take_lost};
 
     fn leader(pid: u32) -> GroupLeader {
         GroupLeader::observe(pid).expect("observe a live test group leader")
@@ -1163,6 +1332,27 @@ mod tests {
         let _ = job.wait();
     }
 
+    /// A supervisor that retired in order left a ledger naming no group: its watcher has nothing
+    /// to recover. One that left a group does, and only its own watcher, or a holder of the
+    /// workspace's socket, may act on it.
+    #[test]
+    fn only_a_ledger_naming_the_watched_supervisor_s_groups_needs_recovery() {
+        let ledger = scratch();
+        let own = Writer::Process(std::process::id());
+        assert!(!names_groups(&ledger, Writer::Any).unwrap(), "no ledger");
+        record(&ledger, &[], &[]).unwrap();
+        assert!(!names_groups(&ledger, own).unwrap(), "retired in order");
+
+        let mut job = job_group();
+        record(&ledger, &[(4, leader(job.id()))], &[]).unwrap();
+        assert!(names_groups(&ledger, own).unwrap());
+        assert!(names_groups(&ledger, Writer::Any).unwrap());
+        assert!(!names_groups(&ledger, Writer::Process(std::process::id() + 1)).unwrap());
+
+        end_recorded(&ledger, own, Duration::from_millis(100)).unwrap();
+        let _ = job.wait();
+    }
+
     /// A ledger rewrite carries the identity a group's leader had when the job started. Here
     /// the job's pid now names another live group leader -- what a pid reuse looks like from the
     /// ledger -- and recording it again must not adopt that stranger as the job's group, nor may
@@ -1201,13 +1391,36 @@ mod tests {
         let _ = stranger.wait();
     }
 
+    /// A job-shaped process tree whose leader has finished starting: an exec gives a process a
+    /// new pid version, and macOS's `/bin/sh` execs the shell it selects (measured: about 2ms
+    /// after the spawn returns). Its leader announces itself only after that last exec, so the
+    /// identity read once this returns is the one it keeps.
+    #[cfg(target_os = "macos")]
+    fn started_job_group() -> std::process::Child {
+        use std::io::BufRead as _;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 300 & echo READY; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a job group");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("its stdout"))
+            .read_line(&mut ready)
+            .expect("the leader announces itself");
+        assert_eq!(ready.trim(), "READY");
+        child
+    }
+
     /// A process is signalled only through the identity it was read with: the pid and that pid's
     /// version. The same pid under any other version -- the shape a reused pid takes -- is never
     /// reached, and neither is the process once it has exited and been reaped.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_signal_reaches_only_the_process_its_identity_names() {
-        let mut job = job_group();
+        let mut job = started_job_group();
         let pgid = i32::try_from(job.id()).unwrap();
         let members = super::members_of(pgid).unwrap();
         let leader = members
@@ -1228,6 +1441,33 @@ mod tests {
         assert!(
             !leader.signal(libc::SIGKILL).unwrap(),
             "a reaped process was signalled"
+        );
+        // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+
+    /// A process's exit is watched only while it runs: a watch made once it exited -- here, after
+    /// it was reaped, when its pid could already name another process -- is refused, never taken
+    /// as its exit. One made while it ran sees it exit, and not before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exit_is_watched_only_from_while_the_process_ran() {
+        let mut job = started_job_group();
+        let pgid = i32::try_from(job.id()).unwrap();
+        let members = super::members_of(pgid).unwrap();
+        let leader = members
+            .iter()
+            .find(|member| member.pid() == pgid)
+            .expect("the running leader holds its group id");
+        let exit = leader.watch_exit().expect("a running process is watched");
+        assert!(!exit.within(Duration::from_millis(50)).unwrap());
+
+        assert!(leader.signal(libc::SIGTERM).unwrap());
+        assert!(exit.within(Duration::from_secs(5)).unwrap());
+        job.wait().unwrap();
+        assert!(
+            leader.watch_exit().is_err(),
+            "a reaped process's exit was watched"
         );
         // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };

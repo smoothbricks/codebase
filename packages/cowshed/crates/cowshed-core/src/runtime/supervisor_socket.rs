@@ -490,16 +490,17 @@ type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
 pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
-/// its substrate. The persistent file lease serializes stale-socket replacement between binders;
-/// keeping the listener alive prevents admission by a replacement supervisor.
+/// its substrate. The persistent file lease serializes the binders that take it; keeping the
+/// listener open keeps a socket attached to the file, so no binder of any build replaces it.
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
     pub(super) listener: UnixListener,
     _lease: std::fs::File,
+    /// Where its socket file is: the workspace's socket path once published, a private name
+    /// before.
     path: PathBuf,
-    device: u64,
-    inode: u64,
+    instance: Instance,
 }
 
 impl BoundSocket {
@@ -510,44 +511,196 @@ impl BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt as _;
-        match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.dev() == self.device && metadata.ino() == self.inode => {
-                if let Err(error) = std::fs::remove_file(&self.path)
-                    && error.kind() != io::ErrorKind::NotFound
-                {
+        // The listener is still open here: its file stays attached and its inode cannot be given
+        // to another file, so a file at the path with this identity is this socket's.
+        match Instance::at(&self.path) {
+            Ok(Some(instance)) if instance == self.instance => {}
+            Ok(_) => return,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: cannot inspect retired supervisor socket {}: {error}",
+                    self.path.display()
+                );
+                return;
+            }
+        }
+        // Inspecting the path and then unlinking it could remove a file that replaced this one
+        // between the two. Whatever is at the path moves, in one rename, to a name only this
+        // socket's identity gives, and is removed only if it is this socket's file.
+        let released = self.instance.private_name(&self.path, "gone");
+        match rename(&self.path, &released, Rename::Exclusive) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: cannot remove retired supervisor socket {}: {error}",
+                    self.path.display()
+                );
+                return;
+            }
+        }
+        match Instance::at(&released) {
+            Ok(Some(instance)) if instance == self.instance => {
+                if let Err(error) = std::fs::remove_file(&released) {
                     eprintln!(
                         "cowshed: cannot remove retired supervisor socket {}: {error}",
-                        self.path.display()
+                        released.display()
                     );
                 }
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
-                "cowshed: cannot inspect retired supervisor socket {}: {error}",
-                self.path.display()
-            ),
+            // Another file replaced this socket between the inspection and the move.
+            _ => {
+                if let Err(error) = rename(&released, &self.path, Rename::Exclusive) {
+                    eprintln!(
+                        "cowshed: a socket that replaced retired supervisor socket {} is kept at \
+                         {}; move it back yourself: {error}",
+                        self.path.display(),
+                        released.display()
+                    );
+                }
+            }
         }
     }
 }
 
+/// One socket file. A bind always creates a new file, and no other file is given an inode while
+/// the file holding it exists, so no two existing files share an identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Instance {
+    device: u64,
+    inode: u64,
+}
+
+impl Instance {
+    /// The socket file at `path`, read without following a symlink; `None` when nothing is
+    /// there. Anything else there is no supervisor's socket, and an error.
+    fn at(path: &Path) -> io::Result<Option<Self>> {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => Ok(Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a socket", path.display()),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A name beside `path` that no other file's identity gives while this file exists; as long
+    /// as the socket path's name, so it fits wherever that does.
+    fn private_name(self, path: &Path, role: &str) -> PathBuf {
+        path.with_file_name(format!("{:016x}{:016x}.{role}", self.device, self.inode))
+    }
+}
+
+/// What holds the file at a socket path, as far as the kernel shows.
+#[derive(Debug)]
+enum Occupant {
+    /// Nothing is there.
+    Absent,
+    /// A socket file no socket is attached to: nothing will accept on it again.
+    Stopped,
+    /// A socket file a socket is still attached to, whoever holds it.
+    Live,
+}
+
+/// Whether a socket is still attached to the socket file at `path`. Neither a stream connection
+/// nor its listener's process says so. Measured on Darwin, a live listener whose queue is full
+/// refuses a stream connection, as does a socket that is bound and not listening; a listener
+/// still accepts after the process that created it exited, from a child that inherited it, and
+/// the kernel's peer identity names that exited creator. A datagram connection is refused only
+/// when no socket at all is attached to the file -- every descriptor of it closed, in every
+/// process -- and otherwise fails as the wrong type or, to a datagram socket, is made: Darwin's
+/// `unp_connect` and Linux's `unix_find_bsd` find the attached socket before they compare types,
+/// and neither looks at a queue. Measured on Darwin, a killed listener's file is detached by the
+/// time its NOTE_EXIT is delivered. No bind attaches a socket to a file that already exists, so
+/// a file found detached stays detached. Any other answer is an error, never stopped.
+fn occupant(path: &Path) -> io::Result<Occupant> {
+    if Instance::at(path)?.is_none() {
+        return Ok(Occupant::Absent);
+    }
+    match std::os::unix::net::UnixDatagram::unbound()?.connect(path) {
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(Occupant::Stopped),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Occupant::Absent),
+        Err(error) if error.raw_os_error() == Some(libc::EPROTOTYPE) => Ok(Occupant::Live),
+        Ok(()) => Ok(Occupant::Live),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Rename {
+    /// Fail with `AlreadyExists` rather than replace a file at the destination.
+    Exclusive,
+    /// Exchange the two files, both of which must exist.
+    Swap,
+}
+
+/// Rename `from` to `to` in one step the kernel performs whole: Darwin's `renamex_np`, Linux's
+/// `renameat2`.
+fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let native = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    };
+    let (from, to) = (native(from)?, native(to)?);
+    #[cfg(target_os = "macos")]
+    let renamed = {
+        let flags = match how {
+            Rename::Exclusive => libc::RENAME_EXCL,
+            Rename::Swap => libc::RENAME_SWAP,
+        };
+        // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
+        unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) }
+    };
+    #[cfg(target_os = "linux")]
+    let renamed = {
+        let flags = match how {
+            Rename::Exclusive => libc::RENAME_NOREPLACE,
+            Rename::Swap => libc::RENAME_EXCHANGE,
+        };
+        // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
+        unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                flags,
+            )
+        }
+    };
+    if renamed == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("cannot {what} {}: {error}", path.display()),
+        "check the cowshed runtime directory",
+    )
+}
+
 /// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
-/// A socket file already at `path` is replaced only when nothing answers on it.
+/// A socket file already at `path` is replaced only once the kernel shows nothing will accept on
+/// it again, and is never removed by its name: see `publish`.
 pub async fn bind(path: &Path) -> Result<BoundSocket> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let directory = path.parent().ok_or_else(|| {
         CowshedError::internal(format!(
             "supervisor socket {} has no parent",
             path.display()
         ))
     })?;
-    let io = |what: &str, error: io::Error| {
-        CowshedError::environment_missing(
-            format!("cannot {what} {}: {error}", path.display()),
-            "check the cowshed runtime directory",
-        )
-    };
+    let io = |what: &str, error: io::Error| socket_error(path, what, error);
     std::fs::create_dir_all(directory).map_err(|error| io("create the directory of", error))?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| io("restrict the directory of", error))?;
@@ -576,50 +729,181 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
             return Err(io("lock the socket lease of", error));
         }
     }
-    match UnixStream::connect(path).await {
-        Ok(stream) => {
-            // NOTE_EXIT can precede the exiting process's final descriptor close. A connection
-            // alone therefore is not a live owner; only its non-reusable kernel identity can
-            // prove it no longer runs. Inspection/refusal errors never authorize replacement.
-            let owner = super::job_groups::Process::of_socket_peer(&stream)
-                .map_err(|error| io("identify the connected owner of", error))?;
-            if owner
-                .signal(0)
-                .map_err(|error| io("verify the connected owner of", error))?
-            {
+    // A binder of a build without the lease can hold the socket while the lease is free.
+    let replacing =
+        match occupant(path).map_err(|error| io("inspect the current server of", error))? {
+            Occupant::Absent => false,
+            Occupant::Stopped => true,
+            Occupant::Live => {
                 return Err(CowshedError::conflict(
                     format!("a workspace supervisor already serves {}", path.display()),
                     "stop that supervisor first",
                 ));
             }
-            std::fs::remove_file(path).map_err(|error| io("remove the stopped owner's", error))?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                // The previous server can unlink its socket after our failed connect but before
-                // removal. The next bind still owns the result; this is not a missing directory.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io("remove the stale", error)),
+        };
+    // Bound and restricted under a name of its own, then published at `path` in one rename: no
+    // client reaches it with a wider mode. The process umask is not narrowed around the bind:
+    // it is process-wide, and another thread's files created meanwhile would get it.
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| {
+        io(
+            "name the new socket of",
+            io::Error::other(error.to_string()),
+        )
+    })?;
+    let fresh = directory.join(format!("{:032x}.bind", u128::from_ne_bytes(random)));
+    let listener = UnixListener::bind(&fresh).map_err(|error| io("bind", error))?;
+    let instance = match Instance::at(&fresh) {
+        Ok(Some(instance)) => instance,
+        outcome => {
+            // Nobody else knows the random name, so whatever is there is this listener's file.
+            if let Err(error) = std::fs::remove_file(&fresh)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "cowshed: cannot remove unpublished supervisor socket {}: {error}",
+                    fresh.display()
+                );
             }
+            return Err(io(
+                "identify the new socket of",
+                outcome.err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "the new socket vanished")
+                }),
+            ));
         }
-        Err(error) => return Err(io("inspect the current server of", error)),
-    }
-    let listener = UnixListener::bind(path).map_err(|error| io("bind", error))?;
-    // The directory already admits only this user; the socket's own mode says the same. The
-    // process umask is not narrowed around the bind: it is process-wide, and another thread's
-    // files created meanwhile would get it.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| io("restrict", error))?;
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| io("identify", error))?;
-    Ok(BoundSocket {
+    };
+    let socket = BoundSocket {
         listener,
         _lease: lease,
-        path: path.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
+        path: fresh,
+        instance,
+    };
+    std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| io("restrict", error))?;
+    publish(socket, path, replacing)
+}
+
+/// Put `socket`, bound under its private name, at `path`. When `replacing`, `path` held a socket
+/// file found stopped, and the two are exchanged in one rename: `path` is never empty, and every
+/// client reaches the one or the other. What comes back under the private name is whatever
+/// `path` held at that instant, which need no longer be the file inspected, so it is proven
+/// stopped again there -- a name nobody else uses -- before it is removed. Anything else is put
+/// back, and kept.
+fn publish(mut socket: BoundSocket, path: &Path, replacing: bool) -> Result<BoundSocket> {
+    if replacing {
+        match rename(&socket.path, path, Rename::Swap) {
+            Ok(()) => {
+                let displaced = std::mem::replace(&mut socket.path, path.to_owned());
+                return settle_displaced(socket, displaced, path);
+            }
+            // Removed since it was inspected: `path` is empty, and taken as such.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(socket_error(path, "replace the stopped socket at", error));
+            }
+        }
+    }
+    match rename(&socket.path, path, Rename::Exclusive) {
+        Ok(()) => {
+            socket.path = path.to_owned();
+            Ok(socket)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(CowshedError::conflict(
+            format!(
+                "another process bound {} while this one was binding it",
+                path.display()
+            ),
+            "stop that process first",
+        )),
+        Err(error) => Err(socket_error(path, "publish", error)),
+    }
+}
+
+/// `socket` is published at `path`; `displaced` is the private name of what it replaced there.
+fn settle_displaced(
+    mut socket: BoundSocket,
+    displaced: PathBuf,
+    path: &Path,
+) -> Result<BoundSocket> {
+    let refusal = match occupant(&displaced) {
+        Ok(Occupant::Stopped) => {
+            if let Err(error) = std::fs::remove_file(&displaced) {
+                eprintln!(
+                    "cowshed: cannot remove stopped supervisor socket {}, replaced at {}: {error}",
+                    displaced.display(),
+                    path.display()
+                );
+            }
+            return Ok(socket);
+        }
+        Ok(Occupant::Absent) => return Ok(socket),
+        Ok(Occupant::Live) => CowshedError::conflict(
+            format!(
+                "a live socket replaced the stopped one at {} while it was being recovered; it \
+                 was put back",
+                path.display()
+            ),
+            "stop that supervisor first",
+        ),
+        Err(error) => socket_error(
+            path,
+            "prove stopped, so it was put back, the socket that replaced the stopped one at",
+            error,
+        ),
+    };
+    // A socket replaced the stopped one after it was inspected: exchanging again puts it back.
+    // While this socket's listener is open no other file has its identity, so finding it under
+    // the private name afterwards proves the exchange put back exactly what it displaced.
+    match rename(&displaced, path, Rename::Swap) {
+        Ok(()) => match Instance::at(&displaced) {
+            Ok(Some(instance)) if instance == socket.instance => {
+                socket.path = displaced;
+                Err(refusal)
+            }
+            // A third file took `path` from this socket meanwhile, and came back instead.
+            // Exchanging once more returns it to `path` and the displaced one to the private name.
+            _ => {
+                let reason = match rename(&displaced, path, Rename::Swap) {
+                    Ok(()) => "another socket took the path from this one meanwhile".to_owned(),
+                    Err(error) => format!(
+                        "another socket took the path from this one meanwhile, and could not be \
+                         returned to it: {error}"
+                    ),
+                };
+                Err(kept(path, &displaced, &reason, &refusal))
+            }
+        },
+        // This socket left `path` meanwhile: the displaced one moves back alone, onto nothing.
+        // `path` then holds a file that is not this socket's, which its release leaves alone.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match rename(&displaced, path, Rename::Exclusive) {
+                Ok(()) => Err(refusal),
+                Err(error) => Err(kept(path, &displaced, &error.to_string(), &refusal)),
+            }
+        }
+        Err(error) => Err(kept(path, &displaced, &error.to_string(), &refusal)),
+    }
+}
+
+/// A socket displaced from `path` could not be put back: it is kept, as is whatever holds `path`.
+fn kept(path: &Path, displaced: &Path, reason: &str, refusal: &CowshedError) -> CowshedError {
+    CowshedError::integrity(
+        format!(
+            "a socket that replaced the stopped one at {} could not be put back ({reason}); a \
+             socket is kept at {}, and nothing was removed. {}",
+            path.display(),
+            displaced.display(),
+            refusal.message
+        ),
+        format!(
+            "stop the processes serving {} and {}, then move the one that belongs back to {} \
+             yourself",
+            path.display(),
+            displaced.display(),
+            path.display()
+        ),
+    )
 }
 
 /// Serve `supervisor` on `socket`, one call per connection, until a `retire` call has
@@ -1087,19 +1371,29 @@ pub async fn hello(path: &Path) -> Result<Hello> {
     })
 }
 
-/// Absence is only an absent or connection-refused socket. A live peer's unknown response,
-/// malformed protocol, or bounded hello timeout is an error, never proof it stopped.
+/// Absence is only no socket file, or a refused connection to one no socket is attached to any
+/// more (see `occupant`). A refusal while a socket is still attached -- a full queue, or a
+/// holder that does not accept -- a live peer's unknown response, malformed protocol, or bounded
+/// hello timeout is an error, never proof it stopped.
 pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
     tokio::time::timeout(HELLO_BOUND, async {
         let mut stream = match UnixStream::connect(path).await {
             Ok(stream) => stream,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Ok(None);
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                return match occupant(path) {
+                    Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
+                    Ok(Occupant::Live) => Err(CowshedError::environment_missing(
+                        format!(
+                            "the workspace supervisor socket {} refuses connections while a \
+                             socket is still attached to it: its queue is full, or its holder \
+                             does not accept",
+                            path.display()
+                        ),
+                        "retry once the operation holding it finishes; cowshed doctor --json",
+                    )),
+                    Err(error) => Err(unavailable(path, &error)),
+                };
             }
             Err(error) => return Err(unavailable(path, &error)),
         };
@@ -1164,6 +1458,9 @@ pub async fn acknowledge_commitments(path: &Path, through: u64) -> Result<()> {
 /// names only that process.
 pub struct Drained {
     pub process: super::job_groups::Process,
+    /// Its exit, watched from before it was asked to drain: a supervisor with no running job
+    /// retires at once, and an exit that began before a watch could not be awaited to its end.
+    pub exit: super::job_groups::ExitWatch,
 }
 
 impl Drained {
@@ -1187,6 +1484,15 @@ pub async fn drain(path: &Path) -> Result<Drained> {
             "use a host with kernel peer identities; retain the supervisor and its ledger",
         )
     })?;
+    let exit = process.watch_exit().map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot watch the supervisor at {} to its exit: {error}",
+                path.display()
+            ),
+            "retry once it has exited; its jobs and ledger are retained",
+        )
+    })?;
     let (value, _) = exchange_on(&mut stream, path, &Request::Drain, Bytes::new()).await?;
     let answered: u32 = decode(value)?;
     if i32::try_from(answered).ok() != Some(process.pid()) {
@@ -1197,7 +1503,7 @@ pub async fn drain(path: &Path) -> Result<Drained> {
             process.pid()
         )));
     }
-    Ok(Drained { process })
+    Ok(Drained { process, exit })
 }
 
 /// Ask the supervisor at `path` to serve under its workspace's current grants; the authority
@@ -1610,6 +1916,315 @@ mod socket_ownership_tests {
         );
         drop(socket);
         assert_eq!(hello_if_present(&path).await.unwrap(), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// The names in the directory of `path`, sorted.
+    fn entries(path: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `listener` takes a new connection made to `path`.
+    async fn accepts(listener: &UnixListener, path: &Path) {
+        let client = UnixStream::connect(path).await.unwrap();
+        listener.accept().await.unwrap();
+        drop(client);
+    }
+
+    /// A stream connection a socket refuses while it is still attached to its file -- here, bound
+    /// by a binder without the lease and not listening -- is neither absence nor stale: the
+    /// socket and its file are kept.
+    #[tokio::test]
+    async fn a_refusing_socket_still_attached_is_kept_not_absent() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = tokio::net::UnixSocket::new_stream().unwrap();
+        held.bind(&path).unwrap();
+        let before = inode(&path);
+        assert_eq!(
+            UnixStream::connect(&path).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+
+        let error = hello_if_present(&path)
+            .await
+            .expect_err("a refusal by an attached socket is not absence");
+        assert_eq!(error.code, crate::ErrorCode::EnvironmentMissing);
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(inode(&path), before);
+        let listener = held.listen(8).unwrap();
+        accepts(&listener, &path).await;
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Darwin refuses a stream connection to a live listener whose queue is full, as it does
+    /// one to a socket nothing listens on. A live supervisor of a build without the lease, so
+    /// saturated, keeps its socket.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_saturated_live_listener_is_kept_not_absent() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let socket = tokio::net::UnixSocket::new_stream().unwrap();
+        socket.bind(&path).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let before = inode(&path);
+        let mut queued = Vec::new();
+        let refused = loop {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => break error,
+            }
+            assert!(queued.len() < 64, "the queue never filled");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+
+        let error = hello_if_present(&path)
+            .await
+            .expect_err("a saturated live listener is not absent");
+        assert_eq!(error.code, crate::ErrorCode::EnvironmentMissing);
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(inode(&path), before);
+        for _ in &queued {
+            listener.accept().await.unwrap();
+        }
+        drop(queued);
+        accepts(&listener, &path).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A socket a binder without the lease left when it stopped -- every descriptor of it
+    /// closed -- is absent to hello, and the next bind replaces it.
+    #[tokio::test]
+    async fn a_stopped_socket_of_a_binder_without_the_lease_is_replaced() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(UnixListener::bind(&path).unwrap());
+        let stopped = inode(&path);
+
+        assert_eq!(hello_if_present(&path).await.unwrap(), None);
+        let socket = bind(&path).await.unwrap();
+        assert_ne!(inode(&path), stopped);
+        accepts(&socket.listener, &path).await;
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        drop(socket);
+        assert_eq!(entries(&path), ["s.sock.lock"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Names the socket [`holds_a_bound_socket_until_killed`] binds.
+    const BOUND_SOCKET: &str = "COWSHED_TEST_BOUND_SOCKET";
+
+    /// Not a test: the owner process [`a_killed_owner_is_recovered_from`] kills.
+    #[test]
+    #[ignore = "helper process of a_killed_owner_is_recovered_from"]
+    fn holds_a_bound_socket_until_killed() {
+        let Some(path) = std::env::var_os(BOUND_SOCKET) else {
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let _socket = bind(Path::new(&path)).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+    }
+
+    /// An owner killed while it holds the lease and serves the socket leaves both: the lease
+    /// ends with it, its socket is absent to hello, and the next bind replaces it.
+    #[tokio::test]
+    async fn a_killed_owner_is_recovered_from() {
+        let path = path();
+        let mut owner = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::supervisor_socket::socket_ownership_tests::holds_a_bound_socket_until_killed",
+                "--ignored",
+            ])
+            .env(BOUND_SOCKET, &path)
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Published last, once the owner holds the lease.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Instance::at(&path).ok().flatten().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner never bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let killed = inode(&path);
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+
+        owner.kill().await.unwrap();
+
+        assert_eq!(hello_if_present(&path).await.unwrap(), None);
+        let socket = bind(&path).await.unwrap();
+        assert_ne!(inode(&path), killed);
+        accepts(&socket.listener, &path).await;
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        drop(socket);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A live socket that took the path after it was found stopped comes back from the exchange
+    /// under the private name, is proven live there, and is exchanged back: never removed.
+    #[tokio::test]
+    async fn a_live_socket_found_in_the_exchange_is_put_back() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let foreign = UnixListener::bind(&path).unwrap();
+        let before = inode(&path);
+        let ours = bind(&path.with_file_name("ours.sock")).await.unwrap();
+
+        let error = publish(ours, &path, true).expect_err("a live socket is never replaced");
+
+        assert_eq!(error.code, crate::ErrorCode::Conflict);
+        assert_eq!(inode(&path), before);
+        accepts(&foreign, &path).await;
+        assert_eq!(entries(&path), ["ours.sock.lock", "s.sock"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Names the socket [`binds_and_hands_its_listener_to_a_child`] binds.
+    const INHERITED_SOCKET: &str = "COWSHED_TEST_INHERITED_SOCKET";
+
+    /// Not a test: a binder without the lease, for
+    /// [`a_listener_a_child_inherited_is_kept_after_its_creator_exits`]. It binds and listens,
+    /// starts a child that inherits the listener and runs until its standard input ends, and
+    /// exits.
+    #[test]
+    #[ignore = "helper process of a_listener_a_child_inherited_is_kept_after_its_creator_exits"]
+    fn binds_and_hands_its_listener_to_a_child() {
+        use std::os::fd::AsRawFd as _;
+        let Some(path) = std::env::var_os(INHERITED_SOCKET) else {
+            return;
+        };
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        // SAFETY: F_SETFD on a descriptor this process holds open changes only its own flag.
+        assert_eq!(
+            unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        // `cat` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+    }
+
+    /// A listener stays live while any process holds it, whatever became of the process that
+    /// created it -- the one a connection's peer identity names. Its socket is kept until the last
+    /// holder closes it, and only then replaced.
+    #[tokio::test]
+    async fn a_listener_a_child_inherited_is_kept_after_its_creator_exits() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut creator = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::supervisor_socket::socket_ownership_tests::binds_and_hands_its_listener_to_a_child",
+                "--ignored",
+            ])
+            .env(INHERITED_SOCKET, &path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // The child that inherited the listener reads this until it is dropped.
+        let holder_input = creator.stdin.take().unwrap();
+        assert!(creator.wait().await.unwrap().success());
+        let held = inode(&path);
+        drop(
+            UnixStream::connect(&path)
+                .await
+                .expect("the inherited listener queues"),
+        );
+
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(inode(&path), held);
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+
+        drop(holder_input);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(occupant(&path), Ok(Occupant::Stopped)) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never closed the listener"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hello_if_present(&path).await.unwrap(), None);
+        let socket = bind(&path).await.unwrap();
+        assert_ne!(inode(&path), held);
+        accepts(&socket.listener, &path).await;
+        drop(socket);
+        assert_eq!(entries(&path), ["s.sock.lock"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A bound socket released after another file took its path leaves that file where it is.
+    #[tokio::test]
+    async fn release_leaves_a_file_that_replaced_the_socket() {
+        let path = path();
+        let socket = bind(&path).await.unwrap();
+        std::fs::rename(&path, path.with_file_name("moved.sock")).unwrap();
+        let foreign = UnixListener::bind(&path).unwrap();
+        let before = inode(&path);
+
+        drop(socket);
+
+        assert_eq!(inode(&path), before);
+        accepts(&foreign, &path).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Something at the socket path that is no socket is never taken as stopped or absent.
+    #[tokio::test]
+    async fn a_file_that_is_no_socket_is_kept() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a socket").unwrap();
+
+        hello_if_present(&path)
+            .await
+            .expect_err("a file that is no socket is not absence");
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::EnvironmentMissing
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

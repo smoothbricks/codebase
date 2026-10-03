@@ -3722,7 +3722,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
-        let _stopped = self.stop_supervisor(&main_name()).await?;
+        let stopped = self.stop_supervisor(&main_name()).await?;
         self.substrate
             .unmount(&current.derived.workspace)
             .await
@@ -3743,13 +3743,26 @@ impl NativeProjectRuntimeHost {
         .await
         .map_err(|error| CowshedError::internal(format!("checkout rename task failed: {error}")))?;
         if let Err(error) = renamed {
-            // Nothing moved; put main back exactly where the caller found it.
-            let _ = self
+            // Nothing moved. Restore the mount while fenced, then release our own listener
+            // before restarting main; ensuring under that listener could only refuse or hang.
+            let restored = self
                 .substrate
                 .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
-                .await;
-            let _ = self.ensure_supervisor(&main_name()).await;
-            return Err(error);
+                .await
+                .map_err(native_storage_error);
+            drop(stopped);
+            let rollback = match restored {
+                Ok(_) => self.ensure_supervisor(&main_name()).await.map(|_| ()),
+                Err(rollback) => Err(rollback),
+            };
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(CowshedError::new(
+                    error.code,
+                    format!("{}; restoring main also failed: {rollback}", error.message),
+                    error.hint,
+                )),
+            };
         }
         Ok(())
     }
@@ -5395,11 +5408,14 @@ impl NativeProjectRuntimeHost {
                 )),
                 Ok(None) => None,
                 Err(error) if error.code == ErrorCode::Conflict => {
-                    let pid = super::supervisor_manager::stop_other_build(&socket).await?;
+                    let stopped = super::supervisor_manager::stop_other_build(&socket).await?;
                     eprintln!(
-                        "cowshed: stopped workspace {name}'s supervisor (pid {pid}) of another cowshed build"
+                        "cowshed: stopped workspace {name}'s supervisor (pid {}) of another cowshed build",
+                        stopped.pid
                     );
-                    None
+                    self.forget_served(name).await?;
+                    self.sessions.retain(|(workspace, _), _| workspace != name);
+                    return Ok(stopped.socket);
                 }
                 Err(error) => return Err(error),
             },
