@@ -1411,16 +1411,24 @@ pub(super) async fn sandbox_environment(
     // directory or a private HOME path longer than Unix sockets permit.
     // Its O_NOFOLLOW admission requires a real leaf below the short alias.
     own("NX_SOCKET_DIR", runtime_link.join("nx").as_os_str());
-    // A sandboxed Nx runs without a daemon. A client finds the daemon through the record the
-    // daemon writes into the checkout's workspace-data directory, which names its socket (the
-    // socket directory decides nothing), and host shells use the same checkout: a daemon started
-    // here would become their daemon, computing their project graph and running their runtime
-    // inputs inside this sandbox with the host client's environment. Moving the record means
-    // moving the workspace-data directory, which holds the task database that indexes the
-    // checkout's Nx cache, and a sandbox with a database of its own never hits what the host or
-    // main cached. Without a daemon both boundaries share one cache; a hit is copied back (with
-    // its timestamps) rather than left in place.
-    own("NX_DAEMON", OsStr::new("false"));
+    // Nx's own defaults decide whether its daemon runs, so a caller's NX_DAEMON never reaches
+    // the child. What has to be the sandbox's instead is where that daemon is found. A client
+    // connects only to the socket named by `d/server-process.json` in Nx's workspace-data
+    // directory, and a client that cannot reach that socket starts a daemon of its own, which
+    // overwrites the record and so retires the daemon it replaced. Left in the checkout, the
+    // record is shared with every host shell there: a sandboxed client cannot reach a host
+    // daemon's socket, replaces it, and host clients then send their whole environment to a
+    // daemon inside this sandbox. The workspace-data directory is therefore the sandbox's, in
+    // its private environment, and so is the cache: once either directory is configured Nx puts
+    // its task database in the workspace-data directory, and that database indexes exactly one
+    // cache directory. Both are scoped like the runtime link, per workspace and mode.
+    let nx_state = private_cache.join("nx");
+    own(
+        "NX_WORKSPACE_DATA_DIRECTORY",
+        nx_state.join("workspace-data").as_os_str(),
+    );
+    own("NX_CACHE_DIRECTORY", nx_state.join("cache").as_os_str());
+    withheld.push("NX_DAEMON");
     own(GO_ENV, private_cache.join("go/env").as_os_str());
     // Rust routes through sccache in every workspace of a host that pinned one. Cargo's
     // `-C metadata` is path-independent for workspace members (cargo >= 1.97, measured), and the

@@ -2,12 +2,15 @@
 //!
 //! A workspace is materialized by cloning one image, so a build daemon's private directory
 //! arrives byte-identical — including the file that says *where that daemon is*. Nx writes
-//! `.nx/workspace-data/d/server-process.json` naming the pid and socket of the server that owns
-//! the workspace it was started in; a clone that carries it points every `nx` invocation in the
-//! new tree at the daemon still serving the old one, which then answers about a workspace root
-//! that is not the caller's. The failure surfaces as a workspace mismatch rather than as
-//! anything that names the copied file, and the same directory is where that daemon's log
-//! accumulates: 563MB of it in one repository measured here, cloned into every workspace.
+//! `server-process.json` naming the pid and socket of the server that owns the workspace it was
+//! started in — under `.nx/workspace-data/d` for a host shell, and under the private
+//! environment's `.cowshed/cache/nx/workspace-data/d` for a read-write sandboxed job. A clone
+//! that carries it points every `nx` invocation in the new tree at the daemon still serving the
+//! old one: a host client is answered about a workspace root that is not the caller's, and a
+//! sandboxed client, refused the other workspace's socket, runs its command without a daemon
+//! under a permission warning while the daemon it starts replaces the record. Neither names the
+//! copied file, and the same directory is where that daemon's log accumulates: 563MB of it in
+//! one repository measured here, cloned into every workspace.
 //!
 //! This is the same class of repair as an inherited Git remote or an escaping symlink
 //! ([`crate::inherited_links`]) and it runs in the same place, at mint, where nothing in the
@@ -31,7 +34,8 @@ use crate::error::{CowshedError, Result};
 /// One entry per daemon that rendezvouses through a file in the tree. Anything a fresh daemon
 /// regenerates from the tree belongs here; anything that would have to be recomputed from
 /// sources does not.
-const INHERITED_DAEMON_STATE: &[&str] = &[".nx/workspace-data/d"];
+const INHERITED_DAEMON_STATE: &[&str] =
+    &[".nx/workspace-data/d", ".cowshed/cache/nx/workspace-data/d"];
 
 /// Discard every inherited daemon rendezvous directory in `tree_root`.
 ///
@@ -166,6 +170,16 @@ mod tests {
         fs::write(root.join(".nx/cache/1234/terminalOutput"), b"cached").expect("cached output");
         fs::create_dir_all(root.join("packages/app/src")).expect("source directory");
         fs::write(root.join("packages/app/src/main.ts"), b"export {};").expect("source file");
+        let sandboxed = root.join(".cowshed/cache/nx");
+        fs::create_dir_all(sandboxed.join("workspace-data/d")).expect("sandbox daemon directory");
+        fs::write(
+            sandboxed.join("workspace-data/d/server-process.json"),
+            b"{\"processId\":4343}",
+        )
+        .expect("sandbox server process");
+        fs::create_dir_all(sandboxed.join("cache/5678")).expect("sandbox task cache");
+        fs::write(sandboxed.join("cache/5678/terminalOutput"), b"cached")
+            .expect("sandbox cached output");
     }
 
     /// The daemon directory goes and nothing else does. The neighbours are the assertion that
@@ -178,14 +192,17 @@ mod tests {
 
         discard(&root).expect("discard inherited daemon state");
 
-        assert!(
-            !root.join(".nx/workspace-data/d").exists(),
-            "the daemon rendezvous directory must be gone"
-        );
+        for gone in [".nx/workspace-data/d", ".cowshed/cache/nx/workspace-data/d"] {
+            assert!(
+                !root.join(gone).exists(),
+                "the daemon rendezvous directory {gone} must be gone"
+            );
+        }
         for kept in [
             ".nx/workspace-data/file-map.json",
             ".nx/workspace-data/project-graph.db",
             ".nx/cache/1234/terminalOutput",
+            ".cowshed/cache/nx/cache/5678/terminalOutput",
             "packages/app/src/main.ts",
         ] {
             assert!(root.join(kept).exists(), "{kept} must survive the mint");
