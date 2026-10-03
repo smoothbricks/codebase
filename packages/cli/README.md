@@ -451,6 +451,9 @@ Every install smoo runs keeps such a link: shell entry's install, a CI runner's 
 exactly those back afterwards. A link whose target no longer exists is removed with a warning, and that install puts the
 lockfile's version in its place. To unlink, remove the link: the next install puts the lockfile's version there.
 
+Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
+removing captured links; an unreadable checkout is not a deleted checkout.
+
 While such links exist, every shell entry and every install smoo runs prints one line naming them, such as
 `linked to local checkouts: @smoothbricks/lmao -> ~/src/smoothbricks/packages/lmao (12 links)`. Entries that install
 nothing print it too, because devenv's direnv integration hides the output of the run that installs.

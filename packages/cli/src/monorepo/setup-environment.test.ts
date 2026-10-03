@@ -713,6 +713,30 @@ describe('what shell entry keeps linked', () => {
       });
     });
 
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+      'retains developer links when their target metadata is denied',
+      async () => {
+        await withDeveloperLinks(async ({ root, texts }) => {
+          const blocked = join(dirname(root), 'blocked-provider');
+          const provider = join(blocked, 'package');
+          await mkdir(provider, { recursive: true });
+          await linkEntry(root, APP_LIB, provider);
+          const before = texts();
+          await chmod(blocked, 0);
+          try {
+            await expect(
+              keepDeveloperLinks(root, async () => {
+                await Bun.$`bun install --no-summary`.cwd(root).quiet();
+              }),
+            ).rejects.toHaveProperty('code', 'EACCES');
+            expect(texts()).toEqual(before);
+          } finally {
+            await chmod(blocked, 0o700);
+          }
+        });
+      },
+    );
+
     it('puts every link back, the named packages included, when the install fails after relinking', async () => {
       await withDeveloperLinks(async ({ root, original, texts }) => {
         const provider = join(dirname(root), 'provider');

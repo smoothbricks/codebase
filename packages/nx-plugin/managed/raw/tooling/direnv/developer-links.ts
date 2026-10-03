@@ -52,6 +52,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   symlinkSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -148,7 +149,7 @@ function findDeveloperLinks(root: string): DeveloperLinks {
       const target = resolvedTarget(root, link);
       const relative = path.relative(root, target);
       if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-        (existsSync(target) ? live : dangling).push(link);
+        (statSync(target, { throwIfNoEntry: false }) === undefined ? dangling : live).push(link);
       }
     }
   }
