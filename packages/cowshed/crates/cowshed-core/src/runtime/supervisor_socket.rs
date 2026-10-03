@@ -490,8 +490,8 @@ type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
 pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
-/// its substrate. The persistent file lease serializes the binders that take it; keeping the
-/// listener open keeps a socket attached to the file, so no binder of any build replaces it.
+/// its substrate. The persistent file lease serializes binders; an older build is drained before
+/// a new build binds, and the occupant probe still refuses any live inherited listener.
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
@@ -511,54 +511,21 @@ impl BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        // The listener is still open here: its file stays attached and its inode cannot be given
-        // to another file, so a file at the path with this identity is this socket's.
+        // The listener and lease remain held here. Remove only this socket's own file.
         match Instance::at(&self.path) {
-            Ok(Some(instance)) if instance == self.instance => {}
-            Ok(_) => return,
-            Err(error) => {
-                eprintln!(
-                    "cowshed: cannot inspect retired supervisor socket {}: {error}",
-                    self.path.display()
-                );
-                return;
-            }
-        }
-        // Inspecting the path and then unlinking it could remove a file that replaced this one
-        // between the two. Whatever is at the path moves, in one rename, to a name only this
-        // socket's identity gives, and is removed only if it is this socket's file.
-        let released = self.instance.private_name(&self.path, "gone");
-        match rename(&self.path, &released, Rename::Exclusive) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => {
-                eprintln!(
-                    "cowshed: cannot remove retired supervisor socket {}: {error}",
-                    self.path.display()
-                );
-                return;
-            }
-        }
-        match Instance::at(&released) {
             Ok(Some(instance)) if instance == self.instance => {
-                if let Err(error) = std::fs::remove_file(&released) {
+                if let Err(error) = std::fs::remove_file(&self.path) {
                     eprintln!(
                         "cowshed: cannot remove retired supervisor socket {}: {error}",
-                        released.display()
+                        self.path.display()
                     );
                 }
             }
-            // Another file replaced this socket between the inspection and the move.
-            _ => {
-                if let Err(error) = rename(&released, &self.path, Rename::Exclusive) {
-                    eprintln!(
-                        "cowshed: a socket that replaced retired supervisor socket {} is kept at \
-                         {}; move it back yourself: {error}",
-                        self.path.display(),
-                        released.display()
-                    );
-                }
-            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "cowshed: cannot inspect retired supervisor socket {}: {error}",
+                self.path.display()
+            ),
         }
     }
 }
@@ -588,12 +555,6 @@ impl Instance {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
-    }
-
-    /// A name beside `path` that no other file's identity gives while this file exists; as long
-    /// as the socket path's name, so it fits wherever that does.
-    fn private_name(self, path: &Path, role: &str) -> PathBuf {
-        path.with_file_name(format!("{:016x}{:016x}.{role}", self.device, self.inode))
     }
 }
 
@@ -632,17 +593,9 @@ fn occupant(path: &Path) -> io::Result<Occupant> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Rename {
-    /// Fail with `AlreadyExists` rather than replace a file at the destination.
-    Exclusive,
-    /// Exchange the two files, both of which must exist.
-    Swap,
-}
-
 /// Rename `from` to `to` in one step the kernel performs whole: Darwin's `renamex_np`, Linux's
 /// `renameat2`.
-fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let native = |path: &Path| {
         std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -651,19 +604,11 @@ fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
     let (from, to) = (native(from)?, native(to)?);
     #[cfg(target_os = "macos")]
     let renamed = {
-        let flags = match how {
-            Rename::Exclusive => libc::RENAME_EXCL,
-            Rename::Swap => libc::RENAME_SWAP,
-        };
         // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
-        unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) }
+        unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) }
     };
     #[cfg(target_os = "linux")]
     let renamed = {
-        let flags = match how {
-            Rename::Exclusive => libc::RENAME_NOREPLACE,
-            Rename::Swap => libc::RENAME_EXCHANGE,
-        };
         // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
         unsafe {
             libc::renameat2(
@@ -671,7 +616,7 @@ fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
                 from.as_ptr(),
                 libc::AT_FDCWD,
                 to.as_ptr(),
-                flags,
+                libc::RENAME_NOREPLACE,
             )
         }
     };
@@ -690,8 +635,8 @@ fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
 }
 
 /// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
-/// A socket file already at `path` is replaced only once the kernel shows nothing will accept on
-/// it again, and is never removed by its name: see `publish`.
+/// The lease serializes binders; old builds must drain first. Only a socket the kernel proves
+/// unattached is removed before the new private listener is published.
 pub async fn bind(path: &Path) -> Result<BoundSocket> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let directory = path.parent().ok_or_else(|| {
@@ -729,18 +674,19 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
             return Err(io("lock the socket lease of", error));
         }
     }
-    // A binder of a build without the lease can hold the socket while the lease is free.
-    let replacing =
-        match occupant(path).map_err(|error| io("inspect the current server of", error))? {
-            Occupant::Absent => false,
-            Occupant::Stopped => true,
-            Occupant::Live => {
-                return Err(CowshedError::conflict(
-                    format!("a workspace supervisor already serves {}", path.display()),
-                    "stop that supervisor first",
-                ));
-            }
-        };
+    match occupant(path).map_err(|error| io("inspect the current server of", error))? {
+        Occupant::Absent => {}
+        Occupant::Stopped => {
+            std::fs::remove_file(path)
+                .map_err(|error| io("remove the stopped socket at", error))?;
+        }
+        Occupant::Live => {
+            return Err(CowshedError::conflict(
+                format!("a workspace supervisor already serves {}", path.display()),
+                "stop that supervisor first",
+            ));
+        }
+    }
     // Bound and restricted under a name of its own, then published at `path` in one rename: no
     // client reaches it with a wider mode. The process umask is not narrowed around the bind:
     // it is process-wide, and another thread's files created meanwhile would get it.
@@ -781,30 +727,12 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
     };
     std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| io("restrict", error))?;
-    publish(socket, path, replacing)
+    publish(socket, path)
 }
 
-/// Put `socket`, bound under its private name, at `path`. When `replacing`, `path` held a socket
-/// file found stopped, and the two are exchanged in one rename: `path` is never empty, and every
-/// client reaches the one or the other. What comes back under the private name is whatever
-/// `path` held at that instant, which need no longer be the file inspected, so it is proven
-/// stopped again there -- a name nobody else uses -- before it is removed. Anything else is put
-/// back, and kept.
-fn publish(mut socket: BoundSocket, path: &Path, replacing: bool) -> Result<BoundSocket> {
-    if replacing {
-        match rename(&socket.path, path, Rename::Swap) {
-            Ok(()) => {
-                let displaced = std::mem::replace(&mut socket.path, path.to_owned());
-                return settle_displaced(socket, displaced, path);
-            }
-            // Removed since it was inspected: `path` is empty, and taken as such.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(socket_error(path, "replace the stopped socket at", error));
-            }
-        }
-    }
-    match rename(&socket.path, path, Rename::Exclusive) {
+/// Publish the private mode-0600 listener while its file lease is held.
+fn publish(mut socket: BoundSocket, path: &Path) -> Result<BoundSocket> {
+    match rename_exclusive(&socket.path, path) {
         Ok(()) => {
             socket.path = path.to_owned();
             Ok(socket)
@@ -818,92 +746,6 @@ fn publish(mut socket: BoundSocket, path: &Path, replacing: bool) -> Result<Boun
         )),
         Err(error) => Err(socket_error(path, "publish", error)),
     }
-}
-
-/// `socket` is published at `path`; `displaced` is the private name of what it replaced there.
-fn settle_displaced(
-    mut socket: BoundSocket,
-    displaced: PathBuf,
-    path: &Path,
-) -> Result<BoundSocket> {
-    let refusal = match occupant(&displaced) {
-        Ok(Occupant::Stopped) => {
-            if let Err(error) = std::fs::remove_file(&displaced) {
-                eprintln!(
-                    "cowshed: cannot remove stopped supervisor socket {}, replaced at {}: {error}",
-                    displaced.display(),
-                    path.display()
-                );
-            }
-            return Ok(socket);
-        }
-        Ok(Occupant::Absent) => return Ok(socket),
-        Ok(Occupant::Live) => CowshedError::conflict(
-            format!(
-                "a live socket replaced the stopped one at {} while it was being recovered; it \
-                 was put back",
-                path.display()
-            ),
-            "stop that supervisor first",
-        ),
-        Err(error) => socket_error(
-            path,
-            "prove stopped, so it was put back, the socket that replaced the stopped one at",
-            error,
-        ),
-    };
-    // A socket replaced the stopped one after it was inspected: exchanging again puts it back.
-    // While this socket's listener is open no other file has its identity, so finding it under
-    // the private name afterwards proves the exchange put back exactly what it displaced.
-    match rename(&displaced, path, Rename::Swap) {
-        Ok(()) => match Instance::at(&displaced) {
-            Ok(Some(instance)) if instance == socket.instance => {
-                socket.path = displaced;
-                Err(refusal)
-            }
-            // A third file took `path` from this socket meanwhile, and came back instead.
-            // Exchanging once more returns it to `path` and the displaced one to the private name.
-            _ => {
-                let reason = match rename(&displaced, path, Rename::Swap) {
-                    Ok(()) => "another socket took the path from this one meanwhile".to_owned(),
-                    Err(error) => format!(
-                        "another socket took the path from this one meanwhile, and could not be \
-                         returned to it: {error}"
-                    ),
-                };
-                Err(kept(path, &displaced, &reason, &refusal))
-            }
-        },
-        // This socket left `path` meanwhile: the displaced one moves back alone, onto nothing.
-        // `path` then holds a file that is not this socket's, which its release leaves alone.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match rename(&displaced, path, Rename::Exclusive) {
-                Ok(()) => Err(refusal),
-                Err(error) => Err(kept(path, &displaced, &error.to_string(), &refusal)),
-            }
-        }
-        Err(error) => Err(kept(path, &displaced, &error.to_string(), &refusal)),
-    }
-}
-
-/// A socket displaced from `path` could not be put back: it is kept, as is whatever holds `path`.
-fn kept(path: &Path, displaced: &Path, reason: &str, refusal: &CowshedError) -> CowshedError {
-    CowshedError::integrity(
-        format!(
-            "a socket that replaced the stopped one at {} could not be put back ({reason}); a \
-             socket is kept at {}, and nothing was removed. {}",
-            path.display(),
-            displaced.display(),
-            refusal.message
-        ),
-        format!(
-            "stop the processes serving {} and {}, then move the one that belongs back to {} \
-             yourself",
-            path.display(),
-            displaced.display(),
-            path.display()
-        ),
-    )
 }
 
 /// Serve `supervisor` on `socket`, one call per connection, until a `retire` call has
@@ -2088,25 +1930,6 @@ mod socket_ownership_tests {
         accepts(&socket.listener, &path).await;
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
         drop(socket);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-    }
-
-    /// A live socket that took the path after it was found stopped comes back from the exchange
-    /// under the private name, is proven live there, and is exchanged back: never removed.
-    #[tokio::test]
-    async fn a_live_socket_found_in_the_exchange_is_put_back() {
-        let path = path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let foreign = UnixListener::bind(&path).unwrap();
-        let before = inode(&path);
-        let ours = bind(&path.with_file_name("ours.sock")).await.unwrap();
-
-        let error = publish(ours, &path, true).expect_err("a live socket is never replaced");
-
-        assert_eq!(error.code, crate::ErrorCode::Conflict);
-        assert_eq!(inode(&path), before);
-        accepts(&foreign, &path).await;
-        assert_eq!(entries(&path), ["ours.sock.lock", "s.sock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

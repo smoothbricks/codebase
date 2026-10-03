@@ -185,13 +185,13 @@ the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and w
 serving process creates `<store>/run` mode `0700`, so no other user reaches a socket in it, binds the socket there and
 sets it `0600`, and verifies each connecting peer's uid before reading a byte. A persistent no-follow file lease at
 `<digest>.sock.lock` serializes binders and stale-socket replacement. The bound listener and lease are one owned value,
-held throughout serving or a workspace mutation. Stream refusal is not absence: a live Darwin listener can refuse when
-its backlog is full. Recovery probes the exact filesystem socket with a datagram connection; wrong-type or connected
-means a socket remains attached to that vnode, including one inherited after its creator exited. Only proven unattached
-socket instances may be replaced. New listeners bind privately and publish with atomic exclusive rename or exchange; the
-displaced private instance is checked again before deletion, and ambiguous/live replacements are restored or kept with a
-typed error. Cleanup likewise moves and verifies its own live inode without unlinking another public instance.
-Retirement releases the listener and lease **before** acknowledging success.
+held throughout serving or a workspace mutation. A supervisor of another build must finish the other-build drain before
+a new build binds; ensure refuses the old build while it still serves, and the lifecycle stop waits for its exit. Stream
+refusal is not absence: a live Darwin listener can refuse when its backlog is full. Recovery probes the exact filesystem
+socket with a datagram connection; wrong-type or connected means a socket remains attached to that vnode, including one
+inherited after its creator exited. Only a proven unattached socket is removed under the lease. New listeners bind
+privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
+while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
 
 Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
 stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
