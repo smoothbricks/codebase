@@ -5587,6 +5587,8 @@ mod process_death_tests {
             })
         };
         let status = fence.wait().await.unwrap();
+        // The fence, not std's handle, owns waitpid. A second reaper must find no child left.
+        assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
         done.store(true, Ordering::SeqCst);
         let outcomes = signaller.join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));

@@ -587,9 +587,7 @@ impl ExitWatch {
                     0,
                     &mut event,
                     1,
-                    limit
-                        .as_ref()
-                        .map_or(std::ptr::null(), |limit| std::ptr::from_ref(limit)),
+                    limit.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
                 )
             };
             if ready < 0 {
