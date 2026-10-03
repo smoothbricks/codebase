@@ -384,10 +384,16 @@ pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
     Ok(())
 }
 
-/// Plan and apply in one step, returning what was done so the caller can report refusals.
+/// Plan and apply in one step, returning the plan so the caller can report refusals.
+///
+/// A plan with any refusal applies nothing. The tree then still holds exactly the bytes it
+/// inherited, so a retry after the source is repaired judges every link afresh against the
+/// tree that produced it, instead of inheriting half of a pass that already failed.
 pub fn restore(tree_root: &Path, source_root: &Path) -> Result<LinkPlan> {
     let plan = plan(tree_root, source_root)?;
-    apply(tree_root, &plan)?;
+    if plan.refusals.is_empty() {
+        apply(tree_root, &plan)?;
+    }
     Ok(plan)
 }
 
@@ -551,17 +557,20 @@ mod tests {
     #[test]
     fn an_escaping_link_missing_from_the_source_is_named_never_guessed() {
         let base = temp_tree("refusal");
+        fs::create_dir_all(base.join("present/pkg")).expect("restorable target");
         let source = base.join("source");
         fs::create_dir_all(source.join("packages/app")).expect("source tree");
         let clone = base.join("clone");
         let clone_nested = clone.join("packages/app");
         fs::create_dir_all(&clone_nested).expect("clone tree");
         symlink("../../../gone/pkg", clone_nested.join("pkg")).expect("clone link");
+        symlink("../../../present/pkg", clone_nested.join("present")).expect("restorable link");
 
         let plan = restore(&clone, &source).expect("restore");
-        assert!(
-            plan.rewrites.is_empty(),
-            "nothing correct can be derived, so nothing is written"
+        assert_eq!(
+            plan.rewrites.len(),
+            1,
+            "the restorable link is still planned"
         );
         assert_eq!(plan.refusals.len(), 1);
         let refusal = &plan.refusals[0];
@@ -571,6 +580,11 @@ mod tests {
             fs::read_link(clone_nested.join("pkg")).expect("link"),
             Path::new("../../../gone/pkg"),
             "a refused link is left exactly as inherited"
+        );
+        assert_eq!(
+            fs::read_link(clone_nested.join("present")).expect("link"),
+            Path::new("../../../present/pkg"),
+            "a refused plan writes nothing, so a retry judges inherited bytes only"
         );
         let report = plan.refusal_report();
         assert!(

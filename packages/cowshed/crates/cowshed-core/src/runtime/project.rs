@@ -7119,11 +7119,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // soon as the checkout moves, and only the canonical mount is maintained by
             // `cowshed mv`.
             let main_mount = self.workspace_mount_path(&main_name())?;
-            // The tree the image came from is also where this workspace's Git identity comes
-            // from: main under a plain `new`, the sibling under `--from`. Only that context
-            // resolves the operator's `includeIf gitdir:` rules, and a fork of a workspace that
-            // already inherited one no longer needs the operator's global file at all.
+            // The tree the image came from: main under a plain `new`, the sibling under `--from`.
+            // It produced every byte the clone inherited, so it is what inherited links and the
+            // Git identity resolve against — never main unless main is the source.
             let source_mount = self.workspace_mount_path(&source_name)?;
+            let repository_shape = if git_worktree {
+                crate::git::WorkspaceRepository::LinkedWorktree
+            } else {
+                crate::git::WorkspaceRepository::Standalone
+            };
             let start = options.revision.as_ref().map(revision_target);
             let destination = workspace.clone();
             let receipt = self
@@ -7144,45 +7148,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         crate::inherited_daemons::macos::discard_in(&stage.mount_point),
                     )
                     .await?;
-                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                    if git_worktree {
-                        // Registration may have replaced the cloned `.git` directory with a
-                        // pointer before a kill. Resume that state machine before asking Git in
-                        // the workspace to inspect the environment hook.
-                        repository
-                            .adopt_as_linked_worktree_resumable(
-                                &destination.to_string(),
-                                &main_mount,
-                                start.as_deref(),
-                                stage.resuming,
-                            )
-                            .await?;
-                        repository.ensure_workspace_environment_wiring().await?;
-                    } else {
-                        timed_async(
-                            "new",
-                            "environment",
-                            repository.ensure_workspace_environment_wiring(),
+                    crate::git::GitRepository::from_root(&stage.mount_point)
+                        .mint_workspace(
+                            &destination.to_string(),
+                            crate::git::CloneOrigin {
+                                source: &source_mount,
+                                main: &main_mount,
+                            },
+                            repository_shape,
+                            start.as_deref(),
+                            stage.resuming,
                         )
-                        .await?;
-                        repository
-                            .prepare_workspace(
-                                &destination.to_string(),
-                                &main_mount,
-                                start.as_deref(),
-                                stage.resuming,
-                            )
-                            .await?;
-                    }
-                    // A sandboxed child reads this file as its whole global Git configuration.
-                    // Capturing at mint is what makes `git commit` in a fresh workspace author
-                    // as the operator instead of failing for want of an identity.
-                    timed_async(
-                        "new",
-                        "identity",
-                        repository.inherit_identity_from(&source_mount),
-                    )
-                    .await
+                        .await
                 })
                 .await
                 .map_err(native_staged_error)?;
@@ -7339,6 +7316,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             )
             .await?;
         let main_mount = self.workspace_mount_path(&main_name())?;
+        let source_mount = self.workspace_mount_path(&source)?;
         let forked = destination.clone();
         let plan = self
             .substrate
@@ -7358,6 +7336,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
                 crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                repository.restore_inherited_links(&source_mount).await?;
                 if source_is_git_worktree {
                     repository
                         .adopt_as_linked_worktree_resumable(

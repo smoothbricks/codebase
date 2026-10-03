@@ -348,6 +348,11 @@ Cross-repository `--from` is forbidden; select another repository with cwd or `-
 new Git branch at another revision and is mutually exclusive with `--from`. The storage clone remains warm regardless.
 `--browse` makes the volume visible in Finder; the default mount is nobrowse.
 
+A symlink the source left pointing outside its tree, such as a `bun install` `link:` dependency, is rewritten in the new
+workspace to the absolute path it named in the source: `main`, or the `--from` workspace, whatever its depth. In-tree
+relative links keep their bytes. A link whose target is missing from the source refuses the clone by name and rewrites
+nothing; repair it in the source, then rerun the same `cowshed new` to resume.
+
 `--slot <n>` binds the workspace to a build slot, so it mounts at that slot's stable path instead of one named after it
 — see [`cowshed path --slot`](#cowshed-path---slot-n--build-slots-and-compiler-cache-reuse). A slot already held by
 another workspace is a conflict (exit 4).
@@ -849,6 +854,10 @@ took. No `[land] warm` starts nothing.
 
 Clones a _running_ workspace — two divergent futures from the same mid-flight state, in milliseconds. Grants are **not**
 inherited; forks start closed.
+
+Escaping symlinks are resolved against `<src>` before Git or environment preparation, including when the source is
+`main`. In-tree links keep their relative bytes; a refused source target writes no link changes, so the same fork can
+resume after its source is repaired. This repair does not change the fork's inherited branch or remotes.
 
 ### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
 

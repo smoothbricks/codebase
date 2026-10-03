@@ -59,6 +59,31 @@ impl MainRemote {
     }
 }
 
+/// The two trees a freshly cloned workspace answers to at mint.
+///
+/// They are one tree only under a plain `cowshed new`. Under `--from` the image came from a
+/// sibling mounted at another depth than main, and every byte the clone inherited was written
+/// there: resolving those bytes against main instead names paths nobody wrote. Named fields
+/// rather than two positional paths, because swapping them is exactly that failure.
+#[derive(Clone, Copy, Debug)]
+pub struct CloneOrigin<'a> {
+    /// The mount whose image was cloned — main, or the `--from` workspace. Escaping symlinks
+    /// and the Git identity are re-resolved against it.
+    pub source: &'a Path,
+    /// Main's canonical mount. The `main` remote and a linked-worktree registration name it
+    /// whichever tree the image came from.
+    pub main: &'a Path,
+}
+
+/// How a minted workspace holds its repository.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceRepository {
+    /// The cloned `.git` directory stays, its remotes replaced by main's canonical mount.
+    Standalone,
+    /// The clone is re-registered as a linked worktree of main's repository.
+    LinkedWorktree,
+}
+
 /// One `merge.<name>.driver` entry and whether its program survives a moved checkout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeDriver {
@@ -1733,10 +1758,53 @@ impl GitRepository {
         }
     }
 
+    /// Turn a fresh clone into a workspace: restore what its inherited symlinks meant in the tree
+    /// that produced them, give it Git that answers to main, and capture the identity it commits
+    /// as. Replayable when `resuming`, which only the storage lifecycle fence may grant.
+    pub async fn mint_workspace(
+        &self,
+        name: &str,
+        origin: CloneOrigin<'_>,
+        repository: WorkspaceRepository,
+        start: Option<&str>,
+        resuming: bool,
+    ) -> Result<()> {
+        // Before any branch is checked out, so only what the clone inherited is judged. On resume
+        // every link still holds either the source's bytes or the absolute target an earlier pass
+        // derived from those same bytes, so the source remains the producer to resolve against.
+        timed_async("new", "links", self.restore_inherited_links(origin.source)).await?;
+        match repository {
+            WorkspaceRepository::LinkedWorktree => {
+                // Registration may have replaced the cloned `.git` directory with a pointer
+                // before a kill. Resume that state machine before asking Git in the workspace to
+                // inspect the environment hook.
+                self.adopt_as_linked_worktree_resumable(name, origin.main, start, resuming)
+                    .await?;
+                self.ensure_workspace_environment_wiring().await?;
+            }
+            WorkspaceRepository::Standalone => {
+                timed_async(
+                    "new",
+                    "environment",
+                    self.ensure_workspace_environment_wiring(),
+                )
+                .await?;
+                self.prepare_workspace(name, origin.main, start, resuming)
+                    .await?;
+            }
+        }
+        // A sandboxed child reads this file as its whole global Git configuration. Capturing at
+        // mint is what makes `git commit` in a fresh workspace author as the operator instead of
+        // failing for want of an identity. Only the source's context resolves the operator's
+        // `includeIf gitdir:` rules, and a fork of a workspace that already inherited one no
+        // longer needs the operator's global file at all.
+        timed_async("new", "identity", self.inherit_identity_from(origin.source)).await
+    }
+
     /// Configure local-only workspace Git. A fresh preparation refuses an existing branch; it
     /// continues this clone's branch only when `resuming` proves the canonical image came from
     /// the pending lifecycle record.
-    pub async fn prepare_workspace(
+    async fn prepare_workspace(
         &self,
         name: &str,
         main_mount: &Path,
@@ -1765,7 +1833,6 @@ impl GitRepository {
             Ok::<_, CowshedError>(())
         })
         .await?;
-        timed_async("new", "links", self.restore_inherited_links(main_mount)).await?;
         let main_remote =
             timed_async("new", "main-remote", self.configure_main_remote(main_mount)).await?;
 
@@ -1785,18 +1852,18 @@ impl GitRepository {
     /// Re-resolve this tree's symlinks that point outside it, against the tree they came from.
     ///
     /// Runs at mint, where the workspace is still cowshed's: a link that escapes the root is
-    /// generated state carrying main's depth, in the same way an inherited remote carries
-    /// main's URLs, and neither is the user's yet.
+    /// generated state carrying its source tree's depth, in the same way an inherited remote
+    /// carries main's URLs, and neither is the user's yet.
     ///
     /// Only escaping links are rewritten. That predicate is what keeps the step affordable on
     /// a tree whose whole value is being ready in seconds — the walk reads directory entries
     /// and rewrites the handful of links that need it, rather than reinstalling anything.
     ///
     /// An escaping link whose source-tree target does not exist is refused by name rather than
-    /// repointed at a guess. It is broken in main too, and a workspace that silently resolves
-    /// it to whatever happens to sit at that path in the new tree is the failure being fixed,
-    /// not an acceptable outcome.
-    pub async fn restore_inherited_links(
+    /// repointed at a guess, and the refusal writes nothing. It is broken in the source tree
+    /// too, and a workspace that silently resolves it to whatever happens to sit at that path in
+    /// the new tree is the failure being fixed, not an acceptable outcome.
+    pub(crate) async fn restore_inherited_links(
         &self,
         source_root: &Path,
     ) -> Result<crate::inherited_links::LinkPlan> {
@@ -3098,10 +3165,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BundleVerificationScratch, CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository,
-        MAIN_REMOTE, MainRemote, RemoteUrl, ensure_git_success, git_message,
-        held_by_repository_blocking, ignored_by, ignored_by_blocking, is_git_repository,
-        parse_lines, workspace_remote_name,
+        BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
+        GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, ensure_git_success,
+        git_message, held_by_repository_blocking, ignored_by, ignored_by_blocking,
+        is_git_repository, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -3820,6 +3887,287 @@ mod tests {
         assert!(!mount.join(".cowshed/worktree-staging").exists());
         fs::remove_dir_all(main).expect("remove main");
         fs::remove_dir_all(mount).expect("remove workspace");
+    }
+
+    /// Where the source's `link:` dependency sits in every tree, relative to the tree root.
+    const LINKED_PACKAGE: &str = "node_modules/@scope/pkg";
+
+    /// Main, a `--from` source and the new workspace at three different depths. The source holds
+    /// what `bun install` leaves for a `link:` dependency — a relative link that climbs out of the
+    /// tree into an immutable global install — beside an ordinary in-tree relative link.
+    struct ThreeDepths {
+        base: PathBuf,
+        main: PathBuf,
+        source: PathBuf,
+        destination: PathBuf,
+        /// The bytes the source recorded for its escaping link, valid only at the source's depth.
+        inherited: PathBuf,
+        /// What those bytes named in the source: outside every tree.
+        external: PathBuf,
+    }
+
+    impl ThreeDepths {
+        fn new(external_installed: bool) -> Self {
+            let seed = repository();
+            fs::write(seed.join(".git/info/exclude"), ".envrc\n")
+                .expect("ignore the workspace-owned environment hook");
+            let base = seed.with_extension("depths");
+            fs::create_dir_all(&base).expect("fixture base");
+            let base = base.canonicalize().expect("canonical fixture base");
+            let main = base.join("checkouts/home/user/dev/main");
+            let source = base.join("shed/a/fixture");
+            let destination = base.join("shed/b/c/raven");
+            fs::create_dir_all(main.parent().expect("main parent")).expect("main parent");
+            fs::rename(&seed, &main).expect("place main");
+            fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+            copy_tree(&main, &source);
+
+            let external = base.join("bun-links/pkg-0123abcd/global/node_modules/@scope/pkg");
+            if external_installed {
+                install(&external);
+            }
+            let package = source.join(LINKED_PACKAGE);
+            let package_parent = package.parent().expect("package parent");
+            fs::create_dir_all(package_parent).expect("source node_modules");
+            let climb = package_parent
+                .strip_prefix(&base)
+                .expect("source under fixture")
+                .components()
+                .count();
+            let inherited = PathBuf::from("../".repeat(climb)).join(
+                external
+                    .strip_prefix(&base)
+                    .expect("external under fixture"),
+            );
+            symlink(&inherited, &package).expect("source link: dependency");
+            fs::create_dir_all(source.join("vendor/lib")).expect("in-tree target");
+            fs::create_dir_all(source.join("packages/app")).expect("in-tree link parent");
+            symlink("../../vendor/lib", source.join("packages/app/lib")).expect("in-tree link");
+
+            // Main sits deeper than the source, so the same bytes resolved from main land on a
+            // real directory: the silent wrong answer, not merely a dangling one.
+            let decoy = crate::inherited_links::resolve_in_source(
+                &main,
+                Path::new(LINKED_PACKAGE).parent().expect("package parent"),
+                &inherited,
+            );
+            assert!(
+                decoy.starts_with(&base) && decoy != external,
+                "main's reading must be a distinct path inside the fixture: {}",
+                decoy.display()
+            );
+            fs::create_dir_all(decoy.join("decoy")).expect("decoy");
+
+            fs::create_dir_all(destination.parent().expect("destination parent"))
+                .expect("destination parent");
+            copy_tree(&source, &destination);
+            assert!(
+                !destination.join(LINKED_PACKAGE).exists(),
+                "the inherited bytes must miss at the clone's depth, or this proves nothing"
+            );
+            Self {
+                base,
+                main,
+                source,
+                destination,
+                inherited,
+                external,
+            }
+        }
+
+        fn origin(&self) -> CloneOrigin<'_> {
+            CloneOrigin {
+                source: &self.source,
+                main: &self.main,
+            }
+        }
+
+        fn assert_links_follow_the_source(&self) {
+            let package = self.destination.join(LINKED_PACKAGE);
+            assert_eq!(
+                fs::read_link(&package).expect("restored link"),
+                self.external,
+                "an escaping link names what it named in the source, never what it names from main"
+            );
+            assert!(
+                package.join("installed").is_file(),
+                "the restored link resolves to the source's install"
+            );
+            let lib = self.destination.join("packages/app/lib");
+            assert_eq!(
+                fs::read_link(&lib).expect("in-tree link"),
+                Path::new("../../vendor/lib"),
+                "an in-tree link keeps its relative bytes"
+            );
+            assert_eq!(
+                lib.canonicalize().expect("in-tree link resolves"),
+                self.destination.join("vendor/lib"),
+                "an in-tree link resolves inside the clone"
+            );
+        }
+
+        async fn assert_standalone_main_remote(&self, workspace: &GitRepository) {
+            assert_eq!(
+                workspace.current_branch().await.expect("branch").as_deref(),
+                Some("cowshed/raven")
+            );
+            assert_eq!(
+                workspace.remotes().await.expect("remotes"),
+                vec![RemoteUrl {
+                    name: MAIN_REMOTE.to_owned(),
+                    url: self.main.clone(),
+                }],
+                "the main remote names main's canonical mount, not the tree the image came from"
+            );
+        }
+
+        fn remove(self) {
+            fs::remove_dir_all(self.base).expect("remove fixture");
+        }
+    }
+
+    /// Copy a tree the way the substrate clones an image: links as links, `.git` included.
+    fn copy_tree(from: &Path, to: &Path) {
+        let status = Command::new("cp")
+            .args(["-RP".as_ref(), from.as_os_str(), to.as_os_str()])
+            .status()
+            .expect("copy tree");
+        assert!(status.success());
+    }
+
+    fn install(package: &Path) {
+        fs::create_dir_all(package).expect("install package");
+        fs::write(package.join("installed"), "").expect("install marker");
+    }
+
+    #[tokio::test]
+    async fn a_fork_repairs_links_from_its_producer_without_changing_git_identity() {
+        let trees = ThreeDepths::new(true);
+        let workspace = GitRepository::from_root(&trees.destination);
+        let branch = workspace.current_branch().await.expect("inherited branch");
+        let remotes = workspace.remotes().await.expect("inherited remotes");
+        workspace
+            .restore_inherited_links(&trees.source)
+            .await
+            .expect("repair fork links");
+        workspace
+            .ensure_workspace_environment_wiring()
+            .await
+            .expect("wire fork environment");
+        trees.assert_links_follow_the_source();
+        assert_eq!(
+            workspace.current_branch().await.expect("fork branch"),
+            branch
+        );
+        assert_eq!(workspace.remotes().await.expect("fork remotes"), remotes);
+        trees.remove();
+    }
+
+    #[tokio::test]
+    async fn a_standalone_mint_resolves_inherited_links_against_its_source_and_remotes_against_main()
+     {
+        let trees = ThreeDepths::new(true);
+        let workspace = GitRepository::from_root(&trees.destination);
+        workspace
+            .mint_workspace(
+                "raven",
+                trees.origin(),
+                WorkspaceRepository::Standalone,
+                None,
+                false,
+            )
+            .await
+            .expect("mint standalone workspace");
+        trees.assert_links_follow_the_source();
+        trees.assert_standalone_main_remote(&workspace).await;
+        trees.remove();
+    }
+
+    #[tokio::test]
+    async fn a_linked_worktree_mint_resolves_inherited_links_against_its_source_and_registers_in_main()
+     {
+        let trees = ThreeDepths::new(true);
+        let workspace = GitRepository::from_root(&trees.destination);
+        workspace
+            .mint_workspace(
+                "raven",
+                trees.origin(),
+                WorkspaceRepository::LinkedWorktree,
+                None,
+                false,
+            )
+            .await
+            .expect("mint linked worktree");
+        trees.assert_links_follow_the_source();
+        assert!(trees.destination.join(".git").is_file());
+        assert_eq!(
+            PathBuf::from(
+                fs::read_to_string(trees.main.join(".git/worktrees/raven/gitdir"))
+                    .expect("admin gitdir")
+                    .trim()
+            ),
+            trees.destination.join(".git"),
+            "the registration lives in main, whichever tree the image came from"
+        );
+        assert!(
+            git_stdout(&trees.main, &["branch", "--list", "cowshed/raven"])
+                .contains("cowshed/raven")
+        );
+        assert!(
+            workspace.remotes().await.expect("remotes").is_empty(),
+            "a linked worktree shares main's object store and has nothing to fetch"
+        );
+        trees.remove();
+    }
+
+    #[tokio::test]
+    async fn a_refused_inherited_link_writes_nothing_and_a_resumed_mint_repairs_it_from_the_source()
+    {
+        let trees = ThreeDepths::new(false);
+        let workspace = GitRepository::from_root(&trees.destination);
+        let error = workspace
+            .mint_workspace(
+                "raven",
+                trees.origin(),
+                WorkspaceRepository::Standalone,
+                None,
+                false,
+            )
+            .await
+            .expect_err("an escaping link its source cannot resolve fails closed");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert!(error.message.contains(LINKED_PACKAGE), "{}", error.message);
+        assert_eq!(
+            fs::read_link(trees.destination.join(LINKED_PACKAGE)).expect("refused link"),
+            trees.inherited,
+            "a refused link keeps the bytes it inherited"
+        );
+        assert_eq!(
+            workspace.current_branch().await.expect("branch").as_deref(),
+            Some("main"),
+            "a refusal stops the mint before any Git preparation"
+        );
+
+        // Repaired in the producer, as an operator would: the install target appears and the
+        // source's own link is normalized to it. The interrupted clone still holds the bytes it
+        // inherited, and only the tree that wrote them can say what they meant.
+        install(&trees.external);
+        let source_package = trees.source.join(LINKED_PACKAGE);
+        fs::remove_file(&source_package).expect("unlink source package");
+        symlink(&trees.external, &source_package).expect("normalize source package");
+        workspace
+            .mint_workspace(
+                "raven",
+                trees.origin(),
+                WorkspaceRepository::Standalone,
+                None,
+                true,
+            )
+            .await
+            .expect("resume mint");
+        trees.assert_links_follow_the_source();
+        trees.assert_standalone_main_remote(&workspace).await;
+        trees.remove();
     }
 
     /// Unregistering one workspace must leave every other registration alone — including one whose
