@@ -131,6 +131,12 @@ check adds overhead per entry, compounding to milliseconds on high-throughput sp
 - **User attributes**: Lazy by default - allocated only when first written or scope set
 - Clear separation enforced by codegen: system columns are direct TypedArray properties
 
+Thread-store schema attribute writers likewise establish writable/current-row ownership once per write and consume that
+already-current mapping for the cell store; they do not reread the binding's generation after the proof. Standalone
+logical-row lookup still refreshes ownership for callers that have no such proof. The private mapping preserves
+refused/released no-write behavior and rejects unmapped live log rows, while schema writers are bound once per schema
+rather than allocating per span or accepting caller-supplied freshness flags.
+
 ### 3. V8-Friendly Extensibility via Composition <a id="smoo/lmao!n/lmao-arch-3-v8-friendly-extensibility-via-composition"></a>
 
 **WHY**: V8 optimizes objects with stable property layouts (hidden classes). Dynamic property access and inheritance

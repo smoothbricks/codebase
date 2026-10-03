@@ -800,6 +800,10 @@ export class ThreadSpanView {
 
   physicalRow(index: number): number {
     this.currentRows();
+    return this.currentPhysicalRow(index);
+  }
+
+  private currentPhysicalRow(index: number): number {
     // Fakes 0/1 are the lifecycle pair; they are structural, never entries in
     // the log-row map, which tests and stamp accounting read as logs-only.
     if (index === 0) return this.startRow;
@@ -814,6 +818,17 @@ export class ThreadSpanView {
     // attributes, so an unmapped index is a writer bug — and guessing a row
     // would write another span's cell.
     throw new Error(`log row ${index} has no row in the thread store yet`);
+  }
+
+  static attributeWriter(field: ThreadAttributeField) {
+    // Defined in the class's lexical scope so the generated schema writer can consume the
+    // already-refreshed mapping privately, without a second binding generation lookup.
+    return function attributeWriter(this: ThreadSpanView, pos: number, val: unknown): ThreadSpanView {
+      if (val === null || val === undefined) return this;
+      if (!this.writable()) return this;
+      this.storeCell(field, this.currentPhysicalRow(pos), val);
+      return this;
+    };
   }
 
   /**
@@ -986,14 +1001,7 @@ function buildLayout(schema: LogSchema): ThreadSpanLayout {
   for (const field of fields.values()) {
     const valuesSlot = LANE_SCHEMA_BASE + field.index;
     descriptors[field.name] = {
-      value: function attributeWriter(this: ThreadSpanView, pos: number, val: unknown): ThreadSpanView {
-        if (val === null || val === undefined) return this;
-        // Any attribute can be a span's first write; its rows exist only once
-        // the store opened it, and never if the store refused it.
-        if (!this.writable()) return this;
-        this.storeCell(field, this.physicalRow(pos), val);
-        return this;
-      },
+      value: ThreadSpanView.attributeWriter(field),
       writable: true,
       configurable: true,
       enumerable: false,
