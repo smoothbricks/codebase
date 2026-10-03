@@ -1,0 +1,258 @@
+diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
+index 9bd7b61..c552b4b 100644
+--- a/dist/src/daemon/client/client.d.ts
++++ b/dist/src/daemon/client/client.d.ts
+@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
+ import { FileData, ProjectGraph } from '../../config/project-graph';
+ import { Task, TaskGraph } from '../../config/task-graph';
+ import { Hash } from '../../hasher/task-hasher';
+-import { NxWorkspaceFiles, TaskRun, TaskTarget } from '../../native';
++import { NxWorkspaceFiles } from '../../native';
+ import { PostTasksExecutionContext, PreTasksExecutionContext } from '../../project-graph/plugins/public-api';
+ import { ConfigurationSourceMaps } from '../../project-graph/utils/project-configuration/source-maps';
+ import type { FlushSyncGeneratorChangesResult, SyncGeneratorRunResult } from '../../utils/sync-generators';
+@@ -89,9 +89,6 @@ export declare class DaemonClient {
+     getFilesInDirectory(dir: string): Promise<string[]>;
+     hashGlob(globs: string[], exclude?: string[]): Promise<string>;
+     hashMultiGlob(globGroups: string[][]): Promise<string[]>;
+-    getFlakyTasks(hashes: string[]): Promise<string[]>;
+-    getEstimatedTaskTimings(targets: TaskTarget[]): Promise<Record<string, number>>;
+-    recordTaskRuns(taskRuns: TaskRun[]): Promise<void>;
+     getSyncGeneratorChanges(generators: string[]): Promise<SyncGeneratorRunResult[]>;
+     flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
+     getRegisteredSyncGenerators(): Promise<{
+diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
+index cebfd6d..9a76320 100644
+--- a/dist/src/daemon/client/client.js
++++ b/dist/src/daemon/client/client.js
+@@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
+ const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
+ const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
+ const streaming_messages_1 = require("../message-types/streaming-messages");
+-const task_history_1 = require("../message-types/task-history");
+ const update_workspace_context_1 = require("../message-types/update-workspace-context");
+ const tmp_dir_1 = require("../tmp-dir");
+ const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
+@@ -668,27 +667,6 @@ class DaemonClient {
+         };
+         return this.sendToDaemonViaQueue(message);
+     }
+-    getFlakyTasks(hashes) {
+-        const message = {
+-            type: task_history_1.GET_FLAKY_TASKS,
+-            hashes,
+-        };
+-        return this.sendToDaemonViaQueue(message);
+-    }
+-    async getEstimatedTaskTimings(targets) {
+-        const message = {
+-            type: task_history_1.GET_ESTIMATED_TASK_TIMINGS,
+-            targets,
+-        };
+-        return this.sendToDaemonViaQueue(message);
+-    }
+-    recordTaskRuns(taskRuns) {
+-        const message = {
+-            type: task_history_1.RECORD_TASK_RUNS,
+-            taskRuns,
+-        };
+-        return this.sendToDaemonViaQueue(message);
+-    }
+     getSyncGeneratorChanges(generators) {
+         const message = {
+             type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
+diff --git a/dist/src/daemon/message-types/task-history.d.ts b/dist/src/daemon/message-types/task-history.d.ts
+deleted file mode 100644
+index cc2b606..0000000
+--- a/dist/src/daemon/message-types/task-history.d.ts
++++ /dev/null
+@@ -1,19 +0,0 @@
+-import type { TaskRun, TaskTarget } from '../../native';
+-export declare const GET_FLAKY_TASKS: 'GET_FLAKY_TASKS';
+-export declare const GET_ESTIMATED_TASK_TIMINGS: 'GET_ESTIMATED_TASK_TIMINGS';
+-export declare const RECORD_TASK_RUNS: 'RECORD_TASK_RUNS';
+-export type HandleGetFlakyTasks = {
+-    type: typeof GET_FLAKY_TASKS;
+-    hashes: string[];
+-};
+-export type HandleGetEstimatedTaskTimings = {
+-    type: typeof GET_ESTIMATED_TASK_TIMINGS;
+-    targets: TaskTarget[];
+-};
+-export type HandleRecordTaskRunsMessage = {
+-    type: typeof RECORD_TASK_RUNS;
+-    taskRuns: TaskRun[];
+-};
+-export declare function isHandleGetFlakyTasksMessage(message: unknown): message is HandleGetFlakyTasks;
+-export declare function isHandleGetEstimatedTaskTimings(message: unknown): message is HandleGetEstimatedTaskTimings;
+-export declare function isHandleWriteTaskRunsToHistoryMessage(message: unknown): message is HandleRecordTaskRunsMessage;
+diff --git a/dist/src/daemon/message-types/task-history.js b/dist/src/daemon/message-types/task-history.js
+deleted file mode 100644
+index 12c1507..0000000
+--- a/dist/src/daemon/message-types/task-history.js
++++ /dev/null
+@@ -1,27 +0,0 @@
+-"use strict";
+-Object.defineProperty(exports, "__esModule", { value: true });
+-exports.RECORD_TASK_RUNS = exports.GET_ESTIMATED_TASK_TIMINGS = exports.GET_FLAKY_TASKS = void 0;
+-exports.isHandleGetFlakyTasksMessage = isHandleGetFlakyTasksMessage;
+-exports.isHandleGetEstimatedTaskTimings = isHandleGetEstimatedTaskTimings;
+-exports.isHandleWriteTaskRunsToHistoryMessage = isHandleWriteTaskRunsToHistoryMessage;
+-exports.GET_FLAKY_TASKS = 'GET_FLAKY_TASKS';
+-exports.GET_ESTIMATED_TASK_TIMINGS = 'GET_ESTIMATED_TASK_TIMINGS';
+-exports.RECORD_TASK_RUNS = 'RECORD_TASK_RUNS';
+-function isHandleGetFlakyTasksMessage(message) {
+-    return (typeof message === 'object' &&
+-        message !== null &&
+-        'type' in message &&
+-        message['type'] === exports.GET_FLAKY_TASKS);
+-}
+-function isHandleGetEstimatedTaskTimings(message) {
+-    return (typeof message === 'object' &&
+-        message !== null &&
+-        'type' in message &&
+-        message['type'] === exports.GET_ESTIMATED_TASK_TIMINGS);
+-}
+-function isHandleWriteTaskRunsToHistoryMessage(message) {
+-    return (typeof message === 'object' &&
+-        message !== null &&
+-        'type' in message &&
+-        message['type'] === exports.RECORD_TASK_RUNS);
+-}
+diff --git a/dist/src/daemon/server/handle-task-history.d.ts b/dist/src/daemon/server/handle-task-history.d.ts
+deleted file mode 100644
+index 70e1f4d..0000000
+--- a/dist/src/daemon/server/handle-task-history.d.ts
++++ /dev/null
+@@ -1,13 +0,0 @@
+-import type { TaskRun, TaskTarget } from '../../native';
+-export declare function handleRecordTaskRuns(taskRuns: TaskRun[]): Promise<{
+-    response: string;
+-    description: string;
+-}>;
+-export declare function handleGetFlakyTasks(hashes: string[]): Promise<{
+-    response: string[];
+-    description: string;
+-}>;
+-export declare function handleGetEstimatedTaskTimings(targets: TaskTarget[]): Promise<{
+-    response: Record<string, number>;
+-    description: string;
+-}>;
+diff --git a/dist/src/daemon/server/handle-task-history.js b/dist/src/daemon/server/handle-task-history.js
+deleted file mode 100644
+index 0051f7f..0000000
+--- a/dist/src/daemon/server/handle-task-history.js
++++ /dev/null
+@@ -1,30 +0,0 @@
+-"use strict";
+-Object.defineProperty(exports, "__esModule", { value: true });
+-exports.handleRecordTaskRuns = handleRecordTaskRuns;
+-exports.handleGetFlakyTasks = handleGetFlakyTasks;
+-exports.handleGetEstimatedTaskTimings = handleGetEstimatedTaskTimings;
+-const task_history_1 = require("../../utils/task-history");
+-async function handleRecordTaskRuns(taskRuns) {
+-    const taskHistory = (0, task_history_1.getTaskHistory)();
+-    await taskHistory.recordTaskRuns(taskRuns);
+-    return {
+-        response: 'true',
+-        description: 'handleRecordTaskRuns',
+-    };
+-}
+-async function handleGetFlakyTasks(hashes) {
+-    const taskHistory = (0, task_history_1.getTaskHistory)();
+-    const history = await taskHistory.getFlakyTasks(hashes);
+-    return {
+-        response: history,
+-        description: 'handleGetFlakyTasks',
+-    };
+-}
+-async function handleGetEstimatedTaskTimings(targets) {
+-    const taskHistory = (0, task_history_1.getTaskHistory)();
+-    const history = await taskHistory.getEstimatedTaskTimings(targets);
+-    return {
+-        response: history,
+-        description: 'handleGetEstimatedTaskTimings',
+-    };
+-}
+diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
+index b1c143e..43d3f13 100644
+--- a/dist/src/daemon/server/server.js
++++ b/dist/src/daemon/server/server.js
+@@ -34,7 +34,6 @@ const hash_glob_1 = require("../message-types/hash-glob");
+ const nx_console_1 = require("../message-types/nx-console");
+ const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
+ const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
+-const task_history_1 = require("../message-types/task-history");
+ const update_workspace_context_1 = require("../message-types/update-workspace-context");
+ const socket_utils_1 = require("../socket-utils");
+ const file_change_events_1 = require("./file-watching/file-change-events");
+@@ -57,7 +56,6 @@ const handle_outputs_tracking_1 = require("./handle-outputs-tracking");
+ const handle_process_in_background_1 = require("./handle-process-in-background");
+ const handle_request_project_graph_1 = require("./handle-request-project-graph");
+ const handle_request_shutdown_1 = require("./handle-request-shutdown");
+-const handle_task_history_1 = require("./handle-task-history");
+ const handle_tasks_execution_hooks_1 = require("./handle-tasks-execution-hooks");
+ const handle_update_workspace_context_1 = require("./handle-update-workspace-context");
+ const handle_outputs_changes_1 = require("./handle-outputs-changes");
+@@ -185,15 +183,6 @@ async function handleMessage(socket, data) {
+     else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
+         await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
+     }
+-    else if ((0, task_history_1.isHandleGetFlakyTasksMessage)(payload)) {
+-        await handleResult(socket, task_history_1.GET_FLAKY_TASKS, () => (0, handle_task_history_1.handleGetFlakyTasks)(payload.hashes), mode);
+-    }
+-    else if ((0, task_history_1.isHandleGetEstimatedTaskTimings)(payload)) {
+-        await handleResult(socket, task_history_1.GET_ESTIMATED_TASK_TIMINGS, () => (0, handle_task_history_1.handleGetEstimatedTaskTimings)(payload.targets), mode);
+-    }
+-    else if ((0, task_history_1.isHandleWriteTaskRunsToHistoryMessage)(payload)) {
+-        await handleResult(socket, task_history_1.RECORD_TASK_RUNS, () => (0, handle_task_history_1.handleRecordTaskRuns)(payload.taskRuns), mode);
+-    }
+     else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
+         await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
+     }
+diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
+index 34dbaa2..09f95b7 100644
+--- a/dist/src/utils/task-history.js
++++ b/dist/src/utils/task-history.js
+@@ -2,12 +2,13 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.TaskHistory = void 0;
+ exports.getTaskHistory = getTaskHistory;
+-const client_1 = require("../daemon/client/client");
+-const is_on_daemon_1 = require("../daemon/is-on-daemon");
+ const native_1 = require("../native");
+ const db_connection_1 = require("./db-connection");
+ class TaskHistory {
+     constructor() {
++        // TaskDetails records hashes on this process's connection. Keep history on
++        // that same connection: a daemon may have frozen a different cache/database
++        // namespace before a later client supplied its workspace-data overrides.
+         this.taskHistory = new native_1.NxTaskHistory((0, db_connection_1.getDbConnection)());
+     }
+     /**
+@@ -16,22 +17,13 @@ class TaskHistory {
+      * @returns a map where key is task id (project:target:configuration), value is average time of historical runs
+      */
+     async getEstimatedTaskTimings(targets) {
+-        if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+-            return this.taskHistory.getEstimatedTaskTimings(targets);
+-        }
+-        return await client_1.daemonClient.getEstimatedTaskTimings(targets);
++        return this.taskHistory.getEstimatedTaskTimings(targets);
+     }
+     async getFlakyTasks(hashes) {
+-        if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+-            return this.taskHistory.getFlakyTasks(hashes);
+-        }
+-        return await client_1.daemonClient.getFlakyTasks(hashes);
++        return this.taskHistory.getFlakyTasks(hashes);
+     }
+     async recordTaskRuns(taskRuns) {
+-        if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+-            return this.taskHistory.recordTaskRuns(taskRuns);
+-        }
+-        return client_1.daemonClient.recordTaskRuns(taskRuns);
++        return this.taskHistory.recordTaskRuns(taskRuns);
+     }
+ }
+ exports.TaskHistory = TaskHistory;
