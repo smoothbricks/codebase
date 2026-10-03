@@ -163,7 +163,7 @@ impl CommandRunner for RecordingRunner {
             Ok(self.inventory.respond(request))
         }
     }
-    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
     }
     fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -185,7 +185,7 @@ impl CommandRunner for UnreadableFirstInventoryRunner {
     fn run(&self, _: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         Ok(CommandOutput::success([]))
     }
-    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
     }
     fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -2426,8 +2426,8 @@ impl CommandRunner for EjectAtFsck {
         system.run(request)
     }
 
-    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
-        SystemCommandRunner.host_device_lease()
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -2594,8 +2594,8 @@ impl CommandRunner for EjectAfterAttach {
         Ok(output)
     }
 
-    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
-        SystemCommandRunner.host_device_lease()
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -5216,8 +5216,8 @@ impl CommandRunner for ImmutableDuringResize {
         output
     }
 
-    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
-        SystemCommandRunner.host_device_lease()
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {

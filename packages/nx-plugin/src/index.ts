@@ -434,6 +434,19 @@ function cargoRuntimeInput(projectRoot: string, command: string): { runtime: str
 }
 
 /**
+ * One shell command that runs `steps` in order and stops at the first failure.
+ *
+ * For a step that CONSUMES what an earlier step produces — the archive needs
+ * its directory, `wasm-bindgen` reads the `.wasm` that `cargo build` writes.
+ * The order lives in the command because that is the only place a
+ * producer-consumer pair inside one task can state it: `nx:run-commands`'
+ * `commands` array is a set of independent commands that Nx runs side by side.
+ */
+function sequence(steps: readonly string[]): string {
+  return steps.join(' && ');
+}
+
+/**
  * Everything a target actually runs, as one string. `nx:run-commands` accepts
  * either spelling and inference asks four questions of the text — does it run
  * frozen cargo, which tool's version keys its cache, which target directories
@@ -567,14 +580,15 @@ function createCargoWasmTarget(
 ): TargetConfiguration {
   const outputDirectory = repoRooted ? posix.join(projectRoot, config.outputDirectory) : config.outputDirectory;
   const cargoSelection = repoRooted ? `-p ${config.cargoPackage}` : `--manifest-path ${config.manifestPath}`;
-  const commands = (profile: CargoProfile): string[] => [
-    cargoFrozen(`build${CARGO_PROFILE_FLAG[profile]} --target wasm32-unknown-unknown ${cargoSelection}`),
-    ...config.targets.map(
-      ({ bindgenTarget, outputName }) =>
-        `wasm-bindgen --target ${bindgenTarget} --out-dir ${outputDirectory}/${outputName} ` +
-        `${cargoTargetDirectory}/wasm32-unknown-unknown/${CARGO_PROFILE_OUTPUT_DIR[profile]}/${config.libraryName}.wasm`,
-    ),
-  ];
+  const buildCommand = (profile: CargoProfile): string =>
+    sequence([
+      cargoFrozen(`build${CARGO_PROFILE_FLAG[profile]} --target wasm32-unknown-unknown ${cargoSelection}`),
+      ...config.targets.map(
+        ({ bindgenTarget, outputName }) =>
+          `wasm-bindgen --target ${bindgenTarget} --out-dir ${outputDirectory}/${outputName} ` +
+          `${cargoTargetDirectory}/wasm32-unknown-unknown/${CARGO_PROFILE_OUTPUT_DIR[profile]}/${config.libraryName}.wasm`,
+      ),
+    ]);
   return {
     executor: 'nx:run-commands',
     cache: true,
@@ -582,11 +596,10 @@ function createCargoWasmTarget(
     inputs: repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS,
     outputs: [`{projectRoot}/${config.outputDirectory}`],
     options: {
-      commands: commands('dev'),
+      command: buildCommand('dev'),
       cwd: repoRooted ? '.' : projectRoot,
-      parallel: false,
     },
-    configurations: { [RELEASE_CONFIGURATION]: { commands: commands('release') } },
+    configurations: { [RELEASE_CONFIGURATION]: { command: buildCommand('release') } },
   };
 }
 
@@ -597,11 +610,11 @@ function createCargoWasmTarget(
  * in its own unbounded target. Cargo reuses incremental compilation locally;
  * Nx cannot cache this warming action without restoring shared mutable state.
  *
- * Cargo flocks one `target/` per invocation. Nx must not run two cargo
- * writers on that directory at once — that is a mutex, not a deadlock, and
- * the second process sits in "Blocking waiting for file lock" until a
- * timeout. Inference serializes writers that share the default target dir
- * (`napi-debug` after compile).
+ * Cargo flocks one `target/` per invocation and owns that lock: a second cargo
+ * process on the same directory waits inside cargo ("Blocking waiting for file
+ * lock"). Inference adds no edge to keep writers apart — an edge says one
+ * target consumes another's output, and none of these do. These are unbounded
+ * `nx:run-commands` targets, so a wait is not charged against a test budget.
  *
  * Clippy runs ONCE over the whole workspace, in that same `target/`, rather
  * than once per crate. Clippy of a crate is a check build of its whole
@@ -645,6 +658,9 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
  * Cached, unlike `cargo-test-compile`, because it produces a VALUE: one file,
  * not a mutable build tree Nx would have to restore. `--workspace` matches the
  * clippy selection exactly, so both gates unify features the same way.
+ *
+ * The directory and the archive are ONE command: nextest does not create the
+ * archive's parent, so the archive step consumes what the `mkdir` produced.
  */
 function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): TargetConfiguration {
   return {
@@ -653,14 +669,13 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
     inputs: CARGO_INPUTS,
     outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`],
     options: {
-      commands: [
+      command: sequence([
         `mkdir -p ${posix.dirname(CARGO_TEST_ARCHIVE_FILE)}`,
         cargoFrozen(
           `nextest archive --workspace --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none ${toolConfig}`,
         ),
-      ],
+      ]),
       cwd: projectRoot,
-      parallel: false,
     },
   };
 }
@@ -727,13 +742,12 @@ function createCargoCrossTestTargets(
       outputs: [`{projectRoot}/${archiveFile}`],
       dependsOn: [CARGO_FETCH_TARGET],
       options: {
-        commands: [
+        command: sequence([
           `mkdir -p ${posix.dirname(archiveFile)}`,
           `cargo-nextest nextest archive --workspace --target ${triple} --frozen ` +
             `--archive-file ${archiveFile} --user-config-file none ${toolConfig}`,
-        ],
+        ]),
         cwd: projectRoot,
-        parallel: false,
         // `CARGO` is cargo's own driver variable and the only seam nextest
         // offers: it shells out to `$CARGO metadata` and
         // `$CARGO test --no-run --target <triple>`, so the declared script
@@ -1206,13 +1220,12 @@ async function createProjectTargets(
   // inferred list here, once when Nx merges the same declaration over this
   // result — duplicating the very edges the spread exists to add.
   //
-  // `dependsOn` REPLACES rather than unions. These lists are not a bag of
-  // independent wishes; they are the serialization chain that keeps two cargo
-  // writers off one flocked `target/` (see CARGO_TEST_COMPILE_TARGET), and their
-  // ORDER carries the invariant. A package that must re-route the chain — build
-  // its artifact ahead of the test run, or drop `cargo-test-compile` because it
-  // compiles differently — can only say so by replacing the list; a union would
-  // make every inferred edge unremovable and a corrected order unrepresentable.
+  // `dependsOn` REPLACES rather than unions. These lists state what each target
+  // consumes — the fetched registry, the archive, the debug addon — and a
+  // package that must re-route one (build its artifact ahead of the test run,
+  // or drop `cargo-test-compile` because it compiles differently) can only say
+  // so by replacing the list; a union would make every inferred edge
+  // unremovable and a corrected order unrepresentable.
   // Additive intent already has a spelling (`"..."` above), so a plugin-local
   // additive key would be a second convention beside a working one.
   //
@@ -1304,7 +1317,6 @@ async function createProjectTargets(
       options: {
         commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
         cwd: cargoWorkspaceRoot,
-        parallel: false,
       },
     };
     validationTargets.push('cargo-lint');
@@ -1445,8 +1457,8 @@ async function createProjectTargets(
   // Derived from the command text rather than a curated list of target names:
   // the fact that makes a target need this is that it runs frozen cargo, so a
   // frozen target added later is covered without anyone remembering to. The edge
-  // goes on EVERY frozen target, not just the head of the serialization chain,
-  // so re-routing that chain cannot strip a surviving target's precondition.
+  // goes on EVERY frozen target, so re-routing one target's `dependsOn` cannot
+  // strip another's precondition.
   // Package-rooted workspaces fetch beside their package.json; members of a
   // repository-root workspace all depend on the root project's one fetch.
   //
@@ -1469,6 +1481,8 @@ async function createProjectTargets(
       // there is nothing for Nx to restore in its place.
       cache: false,
       options: {
+        // One fetch per manifest, independent of the others: Cargo's own
+        // package-cache lock arbitrates the CARGO_HOME they share.
         commands: [...frozenCargoManifests]
           .sort()
           .map((manifestPath) =>
@@ -1477,9 +1491,6 @@ async function createProjectTargets(
               : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`,
           ),
         cwd: projectRoot,
-        // Two fetches into one CARGO_HOME contend on its package-cache flock;
-        // serializing here spends the wait in Nx instead of inside cargo.
-        parallel: false,
       },
     };
     for (const [name, target] of Object.entries(targets)) {
@@ -1524,8 +1535,8 @@ async function createProjectTargets(
     ];
   }
 
-  // Cargo flocks the workspace's default target/. Keep every writer out of the
-  // bounded test window by placing N-API debug builds behind the root compile.
+  // `build` warms the test executables' compile; in a nested package that names
+  // the root workspace's one compile.
   const cargoTestCompileDependency: CargoTargetDependency | null = targets[CARGO_TEST_COMPILE_TARGET]
     ? CARGO_TEST_COMPILE_TARGET
     : isCargoProject && cargoWorkspace
@@ -1535,18 +1546,10 @@ async function createProjectTargets(
         })
       : null;
   const napiDebug = targets['napi-debug'];
-  if (napiDebug && cargoTestCompileDependency) {
-    const dependsOn = napiDebug.dependsOn ?? [];
-    if (!hasCargoTargetDependency(dependsOn, cargoTestCompileDependency)) {
-      napiDebug.dependsOn = [...dependsOn, cargoTestCompileDependency];
-    }
-  }
   if (napiDebug && cargoWorkspace) {
     // A crate whose project also builds the debug cdylib runs its tests after
     // that build: the tests dlopen what `napi-debug` writes into `target/debug`,
-    // and an archived test binary still loads it from this tree. The old serial
-    // chain gave the same guarantee by accident, to whichever crate happened to
-    // be first; this states it for exactly the crates that own the artifact.
+    // and an archived test binary still loads it from this tree.
     for (const plan of cargoPackagePlans) {
       for (const piece of plan.pieces) {
         const target = targets[piece.targetName];
@@ -1562,9 +1565,7 @@ async function createProjectTargets(
       }
       const dependsOn = target.dependsOn ?? [];
       if (dependsOn.includes(CARGO_TEST_COMPILE_TARGET) && !dependsOn.includes('napi-debug')) {
-        target.dependsOn = dependsOn.map((dependency) =>
-          dependency === CARGO_TEST_COMPILE_TARGET ? 'napi-debug' : dependency,
-        );
+        target.dependsOn = [...dependsOn, 'napi-debug'];
       }
     }
     const cargoTest = targets[CARGO_TEST_TARGET];
@@ -1580,36 +1581,12 @@ async function createProjectTargets(
     }
   }
 
-  // `build` lists cargo-test-compile beside the host's platform binaries, and
-  // every one of those is a `napi build` — another cargo writer on the
-  // workspace's default `target/`, which cargo flocks.
-  //
-  // Only `cargo-napi` gets the ordering edge. A platform-suffixed target may NOT
-  // have one: `validatePlatformTargetDependencies` (package-target-policy.ts:674)
-  // walks each platform target's dependency closure and refuses any member of a
-  // different family, because the publish flow builds and collects one platform
-  // at a time — a `*-macos` collect that reached a familyless sibling would drag
-  // in work the macOS runner has no business doing. `cargo-napi` carries no
-  // platform suffix, so it is not scanned and the edge is legal there.
-  //
-  // The platform binaries therefore stay Nx siblings of cargo-test-compile and
-  // serialize on cargo's flock instead of on a graph edge. That is the same
-  // arrangement `cli-<arch>-<os>` and `napi-<arch>-<os>` already have with each
-  // other — both `napi build` on one target dir — so this adds a third
-  // participant to an existing wait, not a new hazard. The flock makes them wait;
-  // it does not corrupt anything, and these are unbounded `nx:run-commands`
-  // targets, so the wait is not charged against a test budget.
-  const cargoWriterNames = hostPlatformTargetNames(
+  // The inferring host's own platform binaries join the aggregate `build`;
+  // publish still owns foreign platforms.
+  const hostPlatformBinaries = hostPlatformTargetNames(
     [...Object.keys(declaredTargets), ...Object.keys(targets)],
     hostPlatform,
   );
-  const cargoNapi = targets['cargo-napi'];
-  if (cargoNapi && cargoTestCompileDependency) {
-    const dependsOn = cargoNapi.dependsOn ?? [];
-    if (!hasCargoTargetDependency(dependsOn, cargoTestCompileDependency)) {
-      cargoNapi.dependsOn = [...dependsOn, cargoTestCompileDependency];
-    }
-  }
 
   // A deploy is never cached; the build half beside it always is.
   //
@@ -1691,9 +1668,7 @@ async function createProjectTargets(
       executor: 'nx:noop',
       cache: true,
       outputs: [],
-      // `cargo-napi` is both an output family and a serialized cargo writer, so
-      // the two sources overlap; the Set keeps one edge per target while holding
-      // the order the families are listed in.
+      // One edge per target, in the order the sources are listed.
       dependsOn: [
         ...new Set([
           '^build',
@@ -1701,7 +1676,7 @@ async function createProjectTargets(
           // reuses its incremental state; Nx never restores that shared state.
           ...(cargoTestCompileDependency ? [cargoTestCompileDependency] : []),
           ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
-          ...cargoWriterNames,
+          ...hostPlatformBinaries,
         ]),
       ],
     };
@@ -1774,7 +1749,7 @@ async function createProjectTargets(
       ],
       ...(lintCommands.length > 0
         ? {
-            options: { commands: lintCommands, cwd: '.', parallel: false },
+            options: { commands: lintCommands, cwd: '.' },
           }
         : {}),
     };
@@ -2280,7 +2255,6 @@ interface CargoTargetRef {
 
 interface CargoTestPiece {
   extra: string;
-  parallelism: boolean;
   selector: string;
   targetName: string;
 }
@@ -2352,7 +2326,6 @@ async function resolveCargoWorkspaces(
         const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
         pieces.push({
           extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
-          parallelism: true,
           selector: shardable,
           targetName,
         });
@@ -2361,7 +2334,6 @@ async function resolveCargoWorkspaces(
         for (let index = 1; index <= pkg.testShards; index += 1) {
           pieces.push({
             extra: ` --partition hash:${index}/${pkg.testShards}`,
-            parallelism: false,
             selector: `package(${pkg.name}) and (${pin})`,
             targetName: cargoTestPackageTargetName(pkg.name, `${CARGO_TEST_EXCEPTIONS_SUFFIX}-shard${index}`),
           });
@@ -2394,8 +2366,8 @@ async function resolveCargoWorkspaces(
 
 /**
  * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
- * gets that many ordinary and exceptional shards. Exceptional shards run alone
- * so nextest's per-process group limits also hold across Nx tasks.
+ * gets that many ordinary and exceptional shards, so a class of tests with its
+ * own time bound never delays an ordinary shard.
  *
  * Every piece EXECUTES, it never builds: it runs the binaries
  * `cargo-test-archive` compiled once for the whole workspace. That is what
@@ -2437,12 +2409,11 @@ async function resolveCargoWorkspaces(
  * time: a test that spawns `env!("CARGO_BIN_EXE_x")` holds the producing tree's
  * path and must read the runtime variable instead to survive relocation.
  *
- * nextest.toml singles some tests out with an override, and each such class
- * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN
- * so the hash would dissolve it, and a raised `slow-timeout` marks a test whose
- * cost is not the suite's. Those are lifted OUT of the hash into one target and
- * the shards run the exact complement, so which tests a shard holds stops
- * depending on how the hash happened to fall.
+ * nextest.toml singles some tests out with an override: a raised `slow-timeout`
+ * marks a test whose cost is not the suite's. Those are lifted OUT of the hash
+ * into their own hash-partitioned targets and the ordinary shards run the exact
+ * complement, so which tests a shard holds stops depending on how the hash
+ * happened to fall.
  *
  * The two filtersets are exact complements, so their union is the crate whatever
  * either one matches. Every piece uses `--no-tests=pass`: a valid workspace
@@ -2456,9 +2427,9 @@ async function resolveCargoWorkspaces(
  * Detecting that regression requires a separate coverage policy rather than
  * making valid empty crates and shards fail execution.
  *
- * Pieces fan out rather than chain. The chain existed because every runner was
- * a cargo writer on one flocked `target/`; a reused-build run writes nothing
- * there, so the only serialization left is the one extraction per archive.
+ * Pieces fan out rather than chain: a reused-build run writes nothing to cargo's
+ * `target/`, so no piece waits on another. The one extraction per archive is
+ * coordinated by `smoo-nx-nextest-extract` itself.
  */
 async function addCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
@@ -2514,7 +2485,6 @@ async function addCargoTestTargets(
       targets[piece.targetName] = {
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
-        parallelism: piece.parallelism,
         inputs,
         dependsOn: [archive],
         options: {

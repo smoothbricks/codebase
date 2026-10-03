@@ -9,39 +9,11 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 # at test time. Filterset matches the class by test name rather than listing
 # today's two tests (`compile_fail_cases`, `lesser_capabilities_fail_to_compile_*`).
 #
-# 180s is provisional: measure on an idle machine with `--test-threads=1`.
+# 180s is provisional: measure the test alone on an idle machine.
 # An unbounded run phase is how a hung test becomes a hung lane.
 [[profile.default.overrides]]
 filter = 'test(/compile_fail|fail_to_compile/)'
 slow-timeout = { period = "180s", terminate-after = 1 }
-
-# Tests that drive the host's REAL APFS stack — creating, attaching, mounting and
-# detaching actual disk images — contend on a single machine-wide serialization
-# point: Disk Arbitration and the APFS driver. Measured on this host, a read-only
-# `diskutil apfs list -plist` costs 0.7s idle at 33 attached images but up to
-# 14.4s while another process is attaching/detaching. Run in parallel these tests
-# manufacture exactly that contention for each other, so each one's wall time
-# becomes a function of how many siblings happen to be mid-attach — a test whose
-# verdict depends on that is measuring the scheduler, not the code.
-#
-# `max-threads = 1` makes the group a mutex across the WHOLE run (groups are
-# run-wide, not per-binary, so the lib unit tests and the apfs_integration binary
-# serialize against each other as intended). The other ~830 tests stay parallel.
-#
-# This bounds contention; it does NOT grant more time. The per-test deadline above
-# is unchanged and each of these tests is expected to fit it on its own merits.
-# Membership is by name: `real_apfs_*` is the class marker, so a new real-APFS
-# test joins the group by being named for what it touches. A bare `real_*` filter
-# would be wrong here — unrelated `real_*` tests exist in columine-arrow,
-# cowshed-cli and cowshed-gateway that touch no disk image at all.
-#
-# The `@tool:smoo:` prefix is not decoration: this file is passed as
-# `--tool-config-file smoo:...` so a repository's own `.config/nextest.toml`
-# can override it, and nextest REFUSES a tool config whose groups are not
-# namespaced ("test groups must start with '@tool:<tool-name>:'") precisely so
-# a tool cannot collide with a repository's group of the same name.
-[test-groups]
-"@tool:smoo:real-apfs" = { max-threads = 1 }
 
 # The full-lifecycle real-APFS tests cannot meet the default deadline, and
 # `specs/cowshed/08_testing.md` already contains the arithmetic that proves it.
@@ -71,15 +43,9 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 # bounded because an unbounded run phase is how a hung test becomes a hung lane.
 # Re-derive it if the idle measurements in `apfs_integration.rs` change.
 #
-# Membership is by name and narrower than the group: the fast `real_apfs_*` unit
+# Membership is by name and narrower than the class: the fast `real_apfs_*` unit
 # tests in the lib keep the 30s default — they passed at 4.4s and 7.3s and have no
-# claim on more. This override precedes the group-only one so it wins the
-# first-match for both keys it sets.
+# claim on more.
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
 slow-timeout = { period = "60s", terminate-after = 1 }
-test-group = '@tool:smoo:real-apfs'
-
-[[profile.default.overrides]]
-filter = 'test(/real_apfs_/)'
-test-group = '@tool:smoo:real-apfs'

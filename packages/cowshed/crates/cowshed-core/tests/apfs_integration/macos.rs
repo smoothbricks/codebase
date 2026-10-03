@@ -105,9 +105,9 @@ impl Drop for ChurnGuard {
 ///
 /// The data work is sized to what the assertions need, not to the image: on a hosted CI runner
 /// the disk is the slow part. The stream is [`STREAM_MEBIBYTES`] MiB, and [`FRAGMENTED_PAGES`]
-/// pages move. The host's APFS driver and Disk Arbitration are shared with every other real-APFS
-/// test through the `real-apfs` nextest test group. A missing capability is a failure, never a
-/// skip.
+/// pages move. The host's APFS driver and Disk Arbitration are shared with every real-APFS test
+/// running beside this one; the backend's per-image leases keep their images independent rather
+/// than queueing them. A missing capability is a failure, never a skip.
 #[test]
 fn real_apfs_asif_substrate_lifecycle() {
     match run_lifecycle() {

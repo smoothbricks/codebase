@@ -838,11 +838,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-fetch']?.options).toEqual({
         commands: ['cargo fetch --locked'],
         cwd: 'packages/ferris',
-        parallel: false,
       });
-      // Every frozen cargo command carries the edge, not just the head of the
-      // serialization chain: offline cargo fails at resolution, so each one
-      // needs the locked graph downloaded whether or not the chain runs first.
+      // Every frozen cargo command carries the edge: offline cargo fails at
+      // resolution, so each one needs the locked graph downloaded before it runs.
       for (const name of [
         'cargo-test-compile',
         'cargo-test-archive',
@@ -879,17 +877,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-archive']?.cache).toBe(true);
       expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/target/nextest/archive.tar.zst']);
-      expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris', parallel: false });
+      expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris' });
       // nextest does not create the archive's parent directory and fails the
       // whole build if it is missing (measured: "error writing to archive").
-      expect(targets['cargo-test-archive']?.options?.commands?.[0]).toBe('mkdir -p target/nextest');
+      // The directory and the archive are ONE command, in the order the archive needs.
+      expect(targets['cargo-test-archive']?.options?.commands).toBeUndefined();
       // `--tool-config-file`, never `--config-file`: the plugin's settings must
       // sit UNDER the repository's `.config/nextest.toml`, which is the only
       // place an `archive.include` for a cdylib or fixture can be declared.
       // `$PWD` because tool config paths must be absolute and an absolute path
       // in the command text would split one cache entry per checkout.
-      expect(String(targets['cargo-test-archive']?.options?.commands?.[1])).toMatch(
-        /^cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+      expect(String(targets['cargo-test-archive']?.options?.command)).toMatch(
+        /^mkdir -p target\/nextest && cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
@@ -953,6 +952,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
+      expectNoSchedulerThrottle(targets);
     } finally {
       await workspace.cleanup();
     }
@@ -1037,6 +1037,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         `biome check --files-ignore-unknown=true '${root}'`,
         `eslint '${root}/src/index.ts'`,
       ]);
+      expectNoSchedulerThrottle(mixed);
     } finally {
       await workspace.cleanup();
     }
@@ -1113,7 +1114,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(root['cargo-fetch']?.options).toEqual({
         commands: ['cargo fetch --locked'],
         cwd: '.',
-        parallel: false,
       });
       expect(root['cargo-test-compile']?.options).toMatchObject({
         command: 'cargo --frozen test --workspace --no-run',
@@ -1157,14 +1157,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
       // Dev by default, in the workspace's own `target/`; only the release
       // configuration compiles, and binds, the release artifact.
-      expect(wasm['cargo-wasm']?.options?.commands).toEqual([
-        'cargo --frozen build --target wasm32-unknown-unknown -p runtime-wasm',
-        'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/debug/runtime_wasm.wasm',
-      ]);
-      expect(wasm['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]?.commands).toEqual([
-        'cargo --frozen build --release --target wasm32-unknown-unknown -p runtime-wasm',
-        'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/release/runtime_wasm.wasm',
-      ]);
+      expect(wasm['cargo-wasm']?.options?.command).toBe(
+        [
+          'cargo --frozen build --target wasm32-unknown-unknown -p runtime-wasm',
+          'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/debug/runtime_wasm.wasm',
+        ].join(' && '),
+      );
+      expect(wasm['cargo-wasm']?.options?.commands).toBeUndefined();
+      expect(wasm['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
+        command: [
+          'cargo --frozen build --release --target wasm32-unknown-unknown -p runtime-wasm',
+          'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/release/runtime_wasm.wasm',
+        ].join(' && '),
+      });
       expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist-wasm']);
       expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
       expect(wasm.build?.dependsOn).toContainEqual(rootCompile);
@@ -1173,7 +1178,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The crate whose project also builds the debug cdylib keeps that edge:
       // its tests load the artifact `napi-debug` writes into `target/debug`.
       expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootArchive, 'napi-debug']);
-      expect(native['napi-debug']?.dependsOn).toContainEqual(rootCompile);
+      // The addon build consumes only its dependencies' outputs; it is not
+      // ordered behind the test compile.
+      expect(native['napi-debug']?.dependsOn).toEqual(['^build']);
       // The addon depends on the package's napi block and the napi CLI's version,
       // never on the package version or the whole lockfile: a release bumps both
       // before it builds, and that must not recompile the native code.
@@ -1202,6 +1209,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(native.build?.dependsOn).toContainEqual(rootCompile);
       expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      for (const inferred of [root, runtime, wasm, native]) {
+        expectNoSchedulerThrottle(inferred);
+      }
     } finally {
       await workspace.cleanup();
     }
@@ -1533,30 +1543,31 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         inputs: expect.arrayContaining(['{projectRoot}/**/*.rs', '{projectRoot}/**/Cargo.toml']),
         outputs: ['{projectRoot}/generated/wasm'],
         options: {
-          commands: [
+          command: [
             'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
             'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
             'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
-          ],
+          ].join(' && '),
           cwd: 'packages/git-do',
-          parallel: false,
         },
       });
       // No workspace claims the crate, so cargo's default target dir is the one
       // beside its own manifest, and the release configuration reads the
       // release artifact from it.
-      expect(targets['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]?.commands).toEqual([
-        'cargo --frozen build --release --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
-        'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
-        'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
-      ]);
+      expect(targets['cargo-wasm']?.options?.commands).toBeUndefined();
+      expect(targets['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
+        command: [
+          'cargo --frozen build --release --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
+          'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+          'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+        ].join(' && '),
+      });
       // A wasm-bindgen crate in a nested Cargo workspace still needs its locked
       // graph downloaded, and the project root is not a member of it, so the
       // fetch names the crate manifest instead of relying on cwd.
       expect(targets['cargo-fetch']?.options).toEqual({
         commands: ['cargo fetch --locked --manifest-path crates/git-do/Cargo.toml'],
         cwd: 'packages/git-do',
-        parallel: false,
       });
       expect(targets['tsc-js']?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
       expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
@@ -1566,6 +1577,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // workspace-wide cargo-test/lint policy.
       expect(targets['cargo-test']).toBeUndefined();
       expect(targets['cargo-lint']).toBeUndefined();
+      expectNoSchedulerThrottle(targets);
     } finally {
       await workspace.cleanup();
     }
@@ -1635,9 +1647,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(unservedHostTargets['cargo-napi']).toMatchObject({
         executor: 'nx:run-commands',
         cache: true,
-        // The dedicated host build is another cargo writer on the default
-        // `target/`, and `build` lists it beside cargo-test-compile.
-        dependsOn: ['^build', 'cargo-test-compile'],
+        // The dedicated host build consumes only its dependencies' outputs; it is
+        // not ordered behind the test compile.
+        dependsOn: ['^build'],
         outputs: ['{projectRoot}/dist/native/host'],
         options: {
           cwd: 'packages/cowshed',
@@ -1661,10 +1673,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: darwinArm64Build(' --release'),
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
-      // No cargo-test-compile edge here, on ANY host: a platform target's
-      // dependency closure may only reach its own family
-      // (`validatePlatformTargetDependencies`), so this pair serializes on
-      // cargo's flock rather than on a graph edge.
+      // No cargo-test-compile edge here, on ANY host: the platform build consumes
+      // nothing from it, and a platform target's dependency closure may only reach
+      // its own family (`validatePlatformTargetDependencies`).
       expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
       // A macOS triple never gets a cross toolchain: `usesNapiCross` is
       // `family === 'linux' && target !== host`, so the family decides this one
@@ -1764,11 +1775,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           .sort();
         expect(hostNapiTargets.length).toBeGreaterThan(0);
         expect(inferred.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'tsc-js', ...hostNapiTargets]);
-        // Crate `cowshed-napi` names its bounded runner
-        // `cargo-test-cowshed-napi`, which the retired `*-napi` output-family
-        // glob matched on suffix alone. The runners are one serialized chain, so
-        // that single edge put the whole cargo test suite inside
-        // `nx run-many -t build`.
+        // Crate `cowshed-napi` names its bounded runner `cargo-test-cowshed-napi`;
+        // the retired `*-napi` output-family glob matched it on suffix alone and
+        // put the whole cargo test suite inside `nx run-many -t build`.
         expect(inferred['cargo-test-cowshed-napi']).toBeDefined();
         for (const dependency of inferred.build?.dependsOn ?? []) {
           expect(String(dependency).startsWith('cargo-test-')).toBe(dependency === 'cargo-test-compile');
@@ -1787,7 +1796,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['napi-debug']).toMatchObject({
         executor: 'nx:run-commands',
         cache: true,
-        dependsOn: ['^build', 'cargo-test-compile'],
+        dependsOn: ['^build'],
         outputs: ['{projectRoot}/.cache/native-debug'],
         options: {
           cwd: 'packages/cowshed',
@@ -1820,6 +1829,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           killAfterMs: 10000,
         },
       });
+      expectNoSchedulerThrottle(targets);
       await workspace.write('packages/cowshed/bunfig.napi-test.toml', '[test]\n');
       const targetsWithDedicatedBunfig = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
       expect(targetsWithDedicatedBunfig['napi-test']?.options?.command).toBe(
@@ -1883,16 +1893,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // Cargo writes a member's artifacts under its workspace root, not beside
       // the member's manifest, so the bindgen input is read from there.
-      expect(targets['cargo-wasm']?.options?.commands).toEqual([
-        'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/columine-wasm/Cargo.toml',
-        'wasm-bindgen --target web --out-dir dist-wasm/web target/wasm32-unknown-unknown/debug/columine_wasm.wasm',
-      ]);
+      expect(targets['cargo-wasm']?.options?.command).toBe(
+        [
+          'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/columine-wasm/Cargo.toml',
+          'wasm-bindgen --target web --out-dir dist-wasm/web target/wasm32-unknown-unknown/debug/columine_wasm.wasm',
+        ].join(' && '),
+      );
     } finally {
       await workspace.cleanup();
     }
   });
 
-  it('partitions ordinary and exceptional tests separately while keeping exceptional runs exclusive', async () => {
+  it('partitions ordinary and exceptional tests into disjoint hash shards of the same declared count', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
@@ -1911,8 +1923,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         /--workspace-remap \. -E 'package\(small\)' --no-tests=pass --user-config-file none/,
       );
       // The shards partition the crate MINUS the classes nextest.toml singles
-      // out, i of N. Those are lifted out because a test-group only holds
-      // within one nextest run, and because a test carrying a raised
+      // out, i of N. Those are lifted out because a test carrying a raised
       // slow-timeout costs what the suite does not — the compile-fail test
       // rustc's a fixture for 25.6s on a cold target dir against 1.8s warm.
       const exceptional = exceptionalTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
@@ -1925,15 +1936,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
-      // Exceptional partitions are the exact complement. Nx exclusivity keeps
-      // nextest's process-local group mutex effective across all their runs.
+      // Exceptional partitions are the exact complement, hashed by the same
+      // declared count; each keeps the full bounded window.
       for (const index of [1, 2, 3]) {
         const name = `cargo-test-big-exceptions-shard${index}`;
         expect(targets[name]?.options?.command).toContain(
           `-E 'package(big) and (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
         );
         expect(targets[name]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
-        expect(targets[name]?.parallelism).toBe(false);
         expect(packageNameFromCargoTestTarget(name)).toBe('big');
       }
       expect(targets['cargo-test-big-exceptions']).toBeUndefined();
@@ -1942,7 +1952,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-big']).toBeUndefined();
       // Every piece reaches the aggregate, and they all hang off the one
       // archive: a run extracts binaries to its own temp directory and writes
-      // nothing to cargo's flocked target/. Only exceptional runs serialize.
+      // nothing to cargo's target/, so no piece waits on another.
       expect(targets['cargo-test']?.dependsOn).toEqual([
         'cargo-test-big-shard1',
         'cargo-test-big-shard2',
@@ -1967,6 +1977,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // fit the bound, so any change to the crate invalidates all of them.
       expect(targets['cargo-test-big-shard2']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
       expect(targets['cargo-test-big-exceptions-shard1']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
+      // Exceptional pieces fan out like the ordinary ones: nothing is exclusive.
+      expectNoSchedulerThrottle(targets);
     } finally {
       await workspace.cleanup();
     }
@@ -2124,7 +2136,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('lets a declared dependsOn spread expand the inferred cargo chain', async () => {
     const workspace = await createWorkspace();
     // Additive intent has Nx's own spelling: `'...'` expands the inferred list
-    // at the token, so an added edge keeps the cargo serialization chain.
+    // at the token, so an added edge keeps the inferred cargo edges.
     const declared: Record<string, TargetConfiguration> = {
       'cargo-test': { dependsOn: ['...', 'cargo-wasm'] },
     };
@@ -2388,11 +2400,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(archive?.options?.env).toEqual({ CARGO: 'scripts/cargo-for-nextest.sh' });
       // The runner needs no driver: it never invokes cargo at all.
       expect(run?.options?.env).toBeUndefined();
-      expect(archive?.options?.commands?.[0]).toBe('mkdir -p target/nextest');
+      expect(archive?.options?.commands).toBeUndefined();
       // `cargo-nextest`, not `cargo nextest`: cargo overwrites CARGO for its
       // subcommands, and CARGO is the only seam a cross cargo driver has.
-      expect(String(archive?.options?.commands?.[1])).toMatch(
-        /^cargo-nextest nextest archive --workspace --target aarch64-apple-darwin --frozen --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+      expect(String(archive?.options?.command)).toMatch(
+        /^mkdir -p target\/nextest && cargo-nextest nextest archive --workspace --target aarch64-apple-darwin --frozen --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(archive?.configurations?.[RELEASE_CONFIGURATION]).toBeUndefined();
       expect(run?.configurations?.[RELEASE_CONFIGURATION]).toBeUndefined();
@@ -2411,6 +2423,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(packageNameFromCargoTestTarget('cargo-cross-test-aarch64-apple-darwin')).toBeNull();
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core']);
       expect(targets.build?.dependsOn ?? []).not.toContain('cargo-cross-test-archive-aarch64-apple-darwin');
+      expectNoSchedulerThrottle(targets);
     } finally {
       await workspace.cleanup();
     }
@@ -2694,4 +2707,17 @@ function cargoPackageSelection(command: string): {
       match[1] === undefined ? [] : [match[1]],
     ),
   };
+}
+
+/**
+ * Inference never throttles the scheduler: no target is exclusive and no
+ * run-commands target is run one command at a time. A pair that really is
+ * producer and consumer is one `&&` command; everything else is left to Nx and
+ * to the locks Cargo owns.
+ */
+function expectNoSchedulerThrottle(targets: Record<string, TargetConfiguration>): void {
+  for (const [name, target] of Object.entries(targets)) {
+    expect(target.parallelism, `${name} parallelism`).toBeUndefined();
+    expect(target.options?.parallel, `${name} options.parallel`).toBeUndefined();
+  }
 }

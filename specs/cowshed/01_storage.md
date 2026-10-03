@@ -272,8 +272,8 @@ reported blank whole device to be the image's exact single-device mapping in one
 Absence there is a contradiction, not lag: it fails at once, as does an observed conflicting mapping, and an unreadable
 inventory is a typed refusal; each leaves both the attachment and backing file intact for diagnosis. No mutation is
 retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
-state from an APFS volume: it rechecks the exact mapping under the lease and releases only that owned device without
-deleting the backing file first.
+state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
+without deleting the backing file first.
 
 Every release rechecks image ownership at the final detach boundary as well as the initial recovery read. Empty
 inventory is already released; a nonempty mapping that no longer contains the recorded device is a typed refusal, never
@@ -285,7 +285,7 @@ explicit cleanup from its destructor.
 
 Mounted-image release first uses `/sbin/umount <verified-volume-device>`, the kernel's unmount interface. Merely
 changing general eject to `hdiutil detach` did not remove the hosted mounted-volume delay: that command still spent
-10.694 s in the next release run. The native host reads kernel mount facts, then holds the host lease and a fresh raw
+10.694 s in the next release run. The native host reads kernel mount facts, then holds the image's lease and a fresh raw
 IOMedia pin while cross-checking exact image/whole-device/volume identity before unmount. It never unmounts a path
 selected by an untrusted child. Restart-owned mounts additionally require their incarnation marker and matching kernel
 source. `WhenIdle` returns native unmount's observed resource-busy refusal without force; `Release` waits the existing
@@ -293,19 +293,30 @@ grace before `umount -f`. Other errors remain errors. Only after filesystem remo
 release the device. Local real mounted-image probes measured 29–42 ms for native unmount; hosted deadline closure is not
 implied.
 
-Disk device names are reusable, not image identities. A private per-user `/private/tmp/cowshed-apfs-device-<uid>.lock`
-(`flock`, regular owner-only 0600 file, opened without following symlinks) coordinates physical create, attach, format,
-mount and detach across independent cowshed processes. It does **not** constrain another user's disk tools. Before
-`fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment
-inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns that raw
-descriptor across the `attach_verified` → `mount` method boundary. It is released after `mount_apfs` finishes, before
-intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
+Disk device names are reusable, not image identities. Each image has its own private per-user lease,
+`/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256 of the identity>.lock`: an `flock` on a regular owner-only 0600
+single-link file, opened without following symlinks, in a 0700 directory this user owns. The identity is the absolute
+path produced by `attachment_inventory_path`, matched against the kernel's `DiskImageURL` backing-file path; the lease
+hashes that same normalized identity, never a separately resolved alias. An alias with another identity fails closed.
+Every cooperating create, attach,
+format, `fsck_apfs`, mount, unmount, recovery and detach of one image holds that image's lease, so independent processes
+serialize on one image while operations on different images overlap. There is no host-wide device lock. A cooperating
+process acts on a device only after the inventory positively maps the identity to it under the lease (or while a raw pin
+holds it), and a device is freed only by a detach the same lease covers, so no same-user cowshed process recycles it
+inside the critical section. A contended lease is awaited on a helper thread that hands the locked descriptor back when
+the holder releases it, bounded by the 120 s disk-child deadline; expiry names the lease file, the image and the
+holder's recorded pid. The lease does **not** constrain another user's disk tools or a manual eject during the two
+mutations that cannot run raw-pinned, `newfs_apfs` and `hdiutil detach`, because a read-only raw pin makes both fail
+with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the
+attachment inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns
+that raw descriptor across the `attach_verified` → `mount` method boundary. It is released after `mount_apfs` finishes,
+before intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
 descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
 descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
 recycling its device name. If the image lost the reported device before the descriptor could be pinned, cowshed performs
 at most one fresh attachment, and only when inventory shows no remaining attachment for that image. A conflicting or
 unreadable mapping fails closed, without running fsck on the reported device. No live-fsck option authorizes touching a
-foreign mounted container. Blank-image formatting keeps its image-to-whole-device check under the host lease; its
+foreign mounted container. Blank-image formatting keeps its image-to-whole-device check under the image's lease; its
 exclusive formatter cannot share a raw-device descriptor with another opener.
 
 For every mounted attachment:

@@ -310,7 +310,6 @@ export interface NxTargetConfig {
   configurations?: Record<string, NxTargetConfig>;
   cache?: boolean;
   command?: string;
-  parallelism?: boolean;
 }
 
 export interface NxProjectJson {

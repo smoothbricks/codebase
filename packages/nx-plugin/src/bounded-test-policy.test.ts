@@ -297,7 +297,6 @@ describe('bounded test target policy', () => {
         executor: 'nx:run-commands',
         options: {
           commands: ['bun test test/', 'cd go && go test ./...'],
-          parallel: false,
           cwd: 'packages/schema',
         },
       };

@@ -106,12 +106,13 @@ fixtures provide the existing `.cowshed` directory that workspace creation owns.
 No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
 runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
-`file-link` to make this proof run. The ordinary CLI/core shards run inside the workspace sandbox. After
-`nx run @smoothbricks/codebase:cargo-lint`, run all five `cargo-test-cowshed-core-exceptions-shard1..5` targets through
-`nx run-many -p cowshed -t cargo-test-cowshed-core-exceptions-shard1 cargo-test-cowshed-core-exceptions-shard2 cargo-test-cowshed-core-exceptions-shard3 cargo-test-cowshed-core-exceptions-shard4 cargo-test-cowshed-core-exceptions-shard5`
-from an unsandboxed host-controller shell: those lanes also exercise real APFS image attachment through DiskManagement.
-Run the explicit `host-controller-test` target separately. Both are mandatory proofs; an ignored controller fixture in
-the ordinary chain is never evidence that its behavior passed.
+`file-link` to make this proof run. The `real_apfs_*` tests attach real images through DiskManagement and land in
+whichever ordinary or exceptional shard the hash assigns them, so no subset of shards is their proof: run the owning
+default Nx lint, test and build of `cowshed` (`nx run-many -p cowshed -t lint test build`, default parallelism, no
+per-lane selection) from an unsandboxed host-controller shell. A sandboxed run cannot attach images and is not evidence
+for those tests. Run the explicit `host-controller-test` target separately: it covers controller fixtures beyond the
+library's real fixtures. Both are mandatory proofs; an ignored controller fixture in the ordinary chain is never
+evidence that its behavior passed.
 
 The ordinary core lane also covers port allocation's publication handoff. A deterministic regression snapshots native
 inventory, lets another allocator reserve a block, publishes its workspace metadata, and releases its reservation before
@@ -152,37 +153,39 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 ## Integration tests (real substrate)
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
-skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS and serialized run-wide by the nextest
-`real-apfs` group: small `.asif` images (1 GiB caps) under `/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the
-production host — real `diskutil`/`hdiutil`/`mount_apfs`, the live kernel mount table. A mount state a test needs (wrong
-flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every
-scratch root selects its backing image paths, then calls the same production owned-attachment cleanup used by normal
-removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup
-rereads image/whole-device/volume identity, pins the raw IOMedia for native unmount, and releases the image under the
-host lease; a previously cached disk number or mountpoint never authorizes a detach. A failed release keeps the scratch
-tree intact for the next run, rather than deleting a still-attached image's backing files. Successful cleanup removes
-the root, and every run first reclaims roots and attachments whose owner pid is gone. On Linux: a scratch ZFS pool on a
-loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also
-exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*`
-volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
-ZFS) are tagged.
+skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.asif` images (1 GiB caps) under
+`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real `diskutil`/`hdiutil`/`mount_apfs`,
+the live kernel mount table. A mount state a test needs (wrong flags, an impostor volume, a busy holder) is produced on
+a real volume, never by a substitute mount source. Every scratch root selects its backing image paths, then calls the
+same production owned-attachment cleanup used by normal removal, recovery-marker reads, reverse-order teardown,
+duplicate-attachment rejection, and staging GC. Each cleanup rereads image/whole-device/volume identity, pins the raw
+IOMedia for native unmount, and releases the image under the image's lease; a previously cached disk number or
+mountpoint never authorizes a detach. A failed release keeps the scratch tree intact for the next run, rather than
+deleting a still-attached image's backing files. Successful cleanup removes the root, and every run first reclaims roots
+and attachments whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`)
+with datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
+Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
+both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
-The `real-apfs` group serializes these tests only inside one nextest run. Disk Arbitration and DiskImages are shared by
-the whole host, so `cargo-test-cowshed-cli` and the five inferred `cargo-test-cowshed-core-exceptions-shard1..5` targets
-declare `parallelism: false`. On a hosted arm64 macOS runner the CLI lane overlapped other cargo lanes. Checked land
-then timed out at 30s while still inside adopt, because its two production `hdiutil detach` calls took 6.4s and 9.1s.
-The core exceptions lane, which ran with no other task running, completed whole create/attach/format/detach tests in
-3.3–5.4s, but its 23 serialized tests did not fit one 120s window: 17 took 117.5s and six were still waiting.
-Exceptional tests are therefore partitioned by the crate's declared shard count, with exclusive Nx scheduling keeping
-the process-local group limit effective across those partitions. Test selection, per-test deadlines and the 120s target
-bound are unchanged.
+The `real_apfs_*` tests are scheduled like every other test: nextest runs them in parallel within a run, and the hash
+partitions place them in whichever Nx shard falls out. No nextest test group, `parallelism` flag, process cap or other
+throttle orders them, and the cowshed CLI lane is unrestricted the same way. What keeps concurrent fixtures from
+interfering is the production backend's per-image lease (01_storage.md), not scheduling: independent images overlap and
+one image is driven by one holder at a time. The earlier scheduling serialized these tests and was measured on a hosted
+arm64 macOS runner: the CLI lane overlapped other cargo lanes, checked land timed out at 30s while still inside adopt,
+and its two production `hdiutil detach` calls took 6.4s and 9.1s; the core exceptions lane, which ran with no other task
+running, completed whole create/attach/format/detach tests in 3.3–5.4s, but its 23 serialized tests did not fit one 120s
+window (17 took 117.5s, six were still waiting). Test selection, per-test deadlines and the 120s target bound are
+unchanged: `nextest.toml` singles out only tests carrying a raised `slow-timeout` (compile-fail tests and the real-APFS
+full-lifecycle tests), and those are hash-partitioned into `cargo-test-<crate>-exceptions-shard1..N` by the crate's
+declared shard count.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
 while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
-host-device lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A
+per-image lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A
 barrier starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home
 device and container must remain unchanged. The regression does not require machine-global
 `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation remains a separate
@@ -194,7 +197,7 @@ empty root; it never drops the record and assumes a reserved volume is absent. A
 observation still finds a reserved volume in another container. Mutation planning refuses the incomplete first scan;
 exhausted reads, invalid device names, and partially populated records other than that observed shape remain errors.
 
-APFS diagnostics distinguish host-device lease acquisition, blank-image creation and formatting, raw-device pinning,
+APFS diagnostics distinguish image-lease acquisition, blank-image creation and formatting, raw-device pinning,
 image/device identity inspection, attach, and fsck. Backend disk commands also report their operation and elapsed time,
 including attachment inventories and detach requests that previously appeared only as gaps between lifecycle spans.
 Adoption reports binding and inventory checks, identity ownership, intent publication, secret scanning, grant

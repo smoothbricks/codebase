@@ -720,8 +720,8 @@ export function listCargoCrossTestTargets(absoluteProjectRoot: string): CargoCro
 
 /**
  * Tests that nextest.toml singles out use this suffix before their shard name.
- * Exceptional shards run as exclusive Nx tasks, preserving nextest group limits
- * without leaving the whole exceptional class in one unbounded-duration run.
+ * The class is hash-partitioned by the same declared count as the ordinary
+ * shards, so it never sits in one run that outgrows the target's bound.
  */
 export const CARGO_TEST_EXCEPTIONS_SUFFIX = 'exceptions';
 
@@ -760,11 +760,10 @@ export function packageNameFromCargoTestTarget(targetName: string): string | nul
 /**
  * The tests nextest.toml singles out with an override, as one filterset.
  *
- * Overrides can encode constraints that must survive sharding: a test group
- * limits concurrency within one nextest run, while a raised slow timeout can
- * identify expensive tests that should not delay an otherwise bounded shard.
- * Partition exceptions separately and run their Nx targets exclusively, so a
- * group remains serialized across runs and every target retains its time bound.
+ * An override can give a test a bound of its own: a raised slow timeout
+ * identifies an expensive test that should not delay an otherwise bounded
+ * shard. Partition those tests separately, so every target keeps its time
+ * bound and each class runs beside the ordinary shards.
  *
  * Deriving this from the config that declares the classes, rather than
  * restating their filters, means adding an override there is the whole change —

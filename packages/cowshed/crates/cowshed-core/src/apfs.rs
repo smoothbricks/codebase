@@ -120,9 +120,28 @@ impl std::error::Error for CommandRunError {
 
 pub trait CommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError>;
-    /// Hold the host's APFS device namespace while an image's device is read and used.
+    /// Hold `identity`'s image lease while that image's device mapping is read and used.
+    ///
+    /// `identity` is the absolute path produced by `attachment_inventory_path`, the same value
+    /// matched against the kernel's `DiskImageURL` backing-file path for every positive
+    /// image-to-device mapping. The lease hashes that same normalized path, not a separately
+    /// resolved alias. Every cooperating create, attach, format, fsck, mount, unmount, recovery
+    /// and detach of one image holds this lease; different image identities overlap.
+    ///
+    /// The scope is sound because a device is only ever acted on after the inventory positively
+    /// maps `identity` to it under this lease (or while a raw pin holds it), and a device only
+    /// becomes free for another image when its record is detached — which a cooperating process
+    /// does only under the same lease. No same-user cowshed process can therefore recycle the
+    /// device inside the critical section. An alias with another identity cannot authorize use
+    /// of this record: the kernel mapping must match the lease identity, not merely name the
+    /// same inode. The real overlap regression exercises symlinked-parent and hard-link aliases
+    /// against that kernel authority while the registered image's lease remains held.
+    /// What the lease does not exclude is a non-cooperating eject (another user, a manual
+    /// `hdiutil`) inside the two unpinned mutations, `newfs_apfs` and `hdiutil detach`: a raw pin
+    /// makes both fail with EBUSY, so neither can run pinned.
+    ///
     /// Recording runners must explicitly opt out; production cannot silently omit the lease.
-    fn host_device_lease(&self) -> io::Result<Option<File>>;
+    fn image_lease(&self, identity: &Path) -> io::Result<Option<File>>;
     /// Open the raw volume before resolving its image identity. On macOS the open device
     /// prevents even a forced image eject until the descriptor closes. Recording runners
     /// explicitly opt out; production must not fall back to an unpinned pathname.
@@ -232,44 +251,10 @@ impl CommandRunner for SystemCommandRunner {
         self.run_with_deadline(request, DISK_CHILD_DEADLINE)
     }
 
-    fn host_device_lease(&self) -> io::Result<Option<File>> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        // Every process of this user sees the same Disk Arbitration device namespace, including
-        // independent Nx/Nextest workers. No workspace-owned lock can coordinate those workers.
-        let uid = unsafe { libc::geteuid() };
-        let path = PathBuf::from(format!("/private/tmp/cowshed-apfs-device-{uid}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != uid
-            || metadata.mode() & 0o777 != 0o600
-            || metadata.nlink() != 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "APFS host device lock {} is not a private regular file owned by this user",
-                    path.display()
-                ),
-            ));
-        }
-        loop {
-            // SAFETY: file owns this descriptor for the entire operation; flock does not consume it.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(Some(file));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+    fn image_lease(&self, identity: &Path) -> io::Result<Option<File>> {
+        let lease = image_lease_path(identity)?;
+        let file = open_image_lease(&lease)?;
+        acquire_image_lease(file, &lease, identity, DISK_CHILD_DEADLINE).map(Some)
     }
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>> {
         // A live raw-device descriptor pins this IOMedia, including against forced image detach.
@@ -290,6 +275,149 @@ impl CommandRunner for SystemCommandRunner {
         }
     }
 }
+
+/// The lock file of one image identity:
+/// `/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256(identity bytes)>.lock`.
+///
+/// Every process of this user shares the host's device namespace, independent Nx/Nextest
+/// workers included, so the lease lives in one host-wide per-user directory rather than in a
+/// workspace. The directory must be a real 0700 directory this user owns, so no other user can
+/// plant or swap a lock file in it. The digest keeps the name fixed-length whatever the image
+/// path. Lock files are never removed: unlinking one another process still has open would split
+/// one lease into two.
+fn image_lease_path(identity: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let directory = PathBuf::from(format!("/private/tmp/cowshed-apfs-image-leases-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "APFS image lease directory {} is not a private directory owned by this user",
+                directory.display()
+            ),
+        ));
+    }
+    let digest = crate::api::dto::Sha256Digest::compute(identity.as_os_str().as_encoded_bytes());
+    Ok(directory.join(format!("{}.lock", digest.to_hex())))
+}
+
+/// Open a lease file without following a link, refusing anything but this user's private
+/// regular file.
+fn open_image_lease(lease: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lease)?;
+    let metadata = file.metadata()?;
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "APFS image lease {} is not a private regular file owned by this user",
+                lease.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Lock `file`, the lease at `lease` for `identity`, within `deadline`.
+///
+/// An uncontended lease is taken without blocking. A contended one is waited for on a helper
+/// thread that hands the locked descriptor back the moment the holder releases it; nothing
+/// polls. At the deadline the wait fails naming the lease, the image and the holder's recorded
+/// pid. The helper keeps its descriptor, so the lock it takes after a timed-out caller left is
+/// released again as soon as it is taken.
+fn acquire_image_lease(
+    file: File,
+    lease: &Path,
+    identity: &Path,
+    deadline: Duration,
+) -> io::Result<File> {
+    match lock_file(&file, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => return record_lease_holder(file),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    let (locked, waiter) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("cowshed-apfs-image-lease".into())
+        .spawn(move || {
+            // A caller that timed out has dropped `waiter`: the failed send returns the
+            // descriptor inside its error, and dropping that releases the lock just taken.
+            let _ = locked.send(lock_file(&file, libc::LOCK_EX).map(|()| file));
+        })?;
+    match waiter.recv_timeout(deadline) {
+        Ok(result) => record_lease_holder(result?),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "APFS image lease {} for {} is still held after {deadline:?} by {}",
+                lease.display(),
+                identity.display(),
+                lease_holder(lease)
+            ),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "APFS image lease waiter for {} exited without an answer",
+            identity.display()
+        ))),
+    }
+}
+
+fn lock_file(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: `file` owns this descriptor for the whole call; flock does not consume it.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Record this process's pid in a lease it now holds, so a waiter that times out can name it.
+fn record_lease_holder(file: File) -> io::Result<File> {
+    use std::os::unix::fs::FileExt;
+
+    file.set_len(0)?;
+    file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)?;
+    Ok(file)
+}
+
+/// The holder a timed-out wait reports, as the current holder recorded itself.
+fn lease_holder(lease: &Path) -> String {
+    match fs::read_to_string(lease) {
+        Ok(recorded) if recorded.trim().is_empty() => {
+            "a holder that has not recorded its pid".into()
+        }
+        Ok(recorded) => format!("pid {}", recorded.trim()),
+        Err(error) => format!("a holder whose record is unreadable ({error})"),
+    }
+}
+
 /// Spawn a disk child detached into its own process group on Unix, so the deadline kill
 /// reaps the whole helper tree: a disk-image tool can fork helpers (`hdiutil` forks
 /// `diskimages-helper`), and killing only the direct child would leave a helper holding the wedge.
@@ -431,10 +559,10 @@ impl Sleeper for ThreadSleeper {
 /// as `resize` does, should not start the attach while the old device is still registered.
 ///
 /// After every whole-device detach the backend therefore re-reads the kernel inventory until the
-/// device is gone, logging each outcome. The bound is generous against a normally sub-second
-/// departure and the outcome is always soft: at the bound the operation proceeds exactly as it
-/// would have without the check, but loudly. No blind sleeps: the first poll runs immediately,
-/// and a departed device costs one registry read and no waiting.
+/// image no longer holds the device, logging each outcome. The bound is generous against a
+/// normally sub-second departure and the outcome is always soft: at the bound the operation
+/// proceeds exactly as it would have without the check, but loudly. No blind sleeps: the first
+/// poll runs immediately, and a departed device costs one registry read and no waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetachSettleGrace {
     pub total: Duration,
@@ -974,13 +1102,16 @@ impl<R, S> MacOsApfsBackend<R, S> {
 }
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
-    fn host_device_lease(&self, image: &Path) -> Result<Option<File>, ApfsError> {
-        timed_apfs_step(apfs_step_leg(image), "device-lease", || {
+    /// Hold `image`'s lease ([`CommandRunner::image_lease`]), keyed by the identity the
+    /// attachment inventory records for it.
+    fn image_lease(&self, image: &Path) -> Result<Option<File>, ApfsError> {
+        let identity = attachment_inventory_path(image)?;
+        timed_apfs_step(apfs_step_leg(image), "image-lease", || {
             self.runner
-                .host_device_lease()
+                .image_lease(&identity)
                 .map_err(|source| ApfsError::FileOperation {
-                    operation: "acquire host APFS device lease for image",
-                    path: image.to_owned(),
+                    operation: "acquire APFS image lease",
+                    path: identity.clone(),
                     source,
                 })
         })
@@ -1029,7 +1160,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         attachment: &AttachedImage,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        let _lease = self.host_device_lease(&attachment.image)?;
+        let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
         let mut waited = Duration::ZERO;
         let mut force = false;
@@ -1197,7 +1328,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Nothing here runs as root.
     fn create_asif(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path)?;
-        let _lease = self.host_device_lease(path)?;
+        let _lease = self.image_lease(path)?;
         let create = CommandRequest::new(
             DISKUTIL,
             [
@@ -1345,7 +1476,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         whole_device: &str,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        let _lease = self.host_device_lease(image)?;
+        let _lease = self.image_lease(image)?;
         match self.recovered_image_attachment(image)? {
             None => Ok(()),
             Some(RecoveredImageAttachment::Unformatted {
@@ -1455,7 +1586,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// registered at attach time is the identity, so the device is re-read against it
     /// immediately before every detach. The kernel inventory's absences are authoritative, so an
     /// image it does not hold is already released; a positive conflicting mapping is a refusal,
-    /// never release success. Its caller holds the host lease while the image identity is read
+    /// never release success. Its caller holds the image lease while the image identity is read
     /// and ejected.
     fn detach_image_device_unlocked(
         &self,
@@ -1475,7 +1606,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             )));
         }
         self.detach_device_checked(whole_device, intent)?;
-        self.settle_detached_device(whole_device);
+        self.settle_detached_device(image, whole_device);
         Ok(())
     }
 
@@ -1503,26 +1634,26 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    /// Bounded, logged confirmation that a detached whole device left the kernel inventory
-    /// before any later attach. The poll is keyed on the device rather than an image path: after
-    /// a detach there may be no image to scope by, and the question is whether the device is
-    /// gone at all.
+    /// Bounded, logged confirmation that the image's detached whole device left the kernel
+    /// inventory before any later attach. The poll reads the image's own mapping, not the
+    /// host-wide device list: image leases let another image's attach take the freed `diskN`
+    /// at once, and that reuse is a departure of this image's device, not a lingering one.
     ///
     /// Soft by design: the detach already succeeded, so a lingering or unreadable inventory is
     /// logged and the operation proceeds exactly as it would have without the check. Failing a
     /// detach that succeeded over the media's termination lag would turn a slow departure under
     /// load into a user-facing failure.
-    fn settle_detached_device(&self, whole_device: &str) {
+    fn settle_detached_device(&self, image: &Path, whole_device: &str) {
         let mut waited = Duration::ZERO;
         loop {
-            match self.detached_device_departed(whole_device) {
-                Ok(true) => {
+            match self.attached_whole_devices(image) {
+                Ok(held) if !held.contains(whole_device) => {
                     eprintln!(
                         "cowshed: apfs detach-settle {whole_device} departed waited={waited:?}"
                     );
                     return;
                 }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     eprintln!(
                         "cowshed: apfs detach-settle {whole_device} inventory unreadable ({error}); proceeding without confirmation waited={waited:?}"
@@ -1540,10 +1671,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             self.sleeper.sleep(self.settle.poll);
             waited = waited.saturating_add(self.settle.poll);
         }
-    }
-
-    fn detached_device_departed(&self, whole_device: &str) -> Result<bool, ApfsError> {
-        Ok(!inventory_devices(&self.attached_disk_images()?).contains(whole_device))
     }
 }
 
@@ -1644,7 +1771,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
         let leg = apfs_step_leg(image);
         let (mut attachment, request, output, pin) = {
-            let _lease = self.host_device_lease(image)?;
+            let _lease = self.image_lease(image)?;
             let mut retried_lost_device = false;
             loop {
                 let attachment =
@@ -1711,7 +1838,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsError> {
-        let _lease = self.host_device_lease(&attachment.image)?;
+        let _lease = self.image_lease(&attachment.image)?;
         let mut inherited_pin = attachment
             .pin
             .lock()
@@ -1752,7 +1879,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     }
 
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
-        let _lease = self.host_device_lease(&attachment.image)?;
+        let _lease = self.image_lease(&attachment.image)?;
         attachment.release_pin();
         self.detach_image_device_unlocked(&attachment.image, &attachment.whole_device, intent)
     }
@@ -2014,19 +2141,6 @@ fn existing_image_attachment(
         }
     }
     Ok(attachment)
-}
-
-/// Every whole device the kernel currently attaches for any disk image. The detach-settle
-/// check keys on the device rather than scoping by image: after a detach there may be no image
-/// to scope by, and the question is whether the device is gone at all. A node that is not a
-/// kernel device name names no device to wait on.
-fn inventory_devices(images: &[AttachedDiskImage]) -> BTreeSet<String> {
-    images
-        .iter()
-        .flat_map(|attached| &attached.media)
-        .filter_map(|media| device_path(&media.device))
-        .filter(|device| device_depth(device) == 0)
-        .collect()
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -2850,7 +2964,7 @@ mod tests {
                 other => panic!("test scripted {other:?} where {request:?} ran"),
             }
         }
-        fn host_device_lease(&self) -> io::Result<Option<File>> {
+        fn image_lease(&self, _: &Path) -> io::Result<Option<File>> {
             Ok(None)
         }
         fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
@@ -3064,7 +3178,7 @@ mod tests {
                 .remove(&self.new_device);
             Ok(CommandOutput::success([]))
         }
-        fn host_device_lease(&self) -> io::Result<Option<File>> {
+        fn image_lease(&self, _: &Path) -> io::Result<Option<File>> {
             Ok(None)
         }
         fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
@@ -4191,12 +4305,11 @@ mod tests {
     /// Detach-settle: a lingering device is polled until it departs, then the detach succeeds.
     #[test]
     fn detach_settle_polls_until_departure_then_returns() {
-        let lingering = || images(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
         let attachment = identity_attachment("settle-polls");
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
             ok([]),
-            lingering(),
+            holding(&attachment.image, &attachment.whole_device),
             no_images(),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
@@ -4213,14 +4326,13 @@ mod tests {
     /// slowness under load into user-facing failures; the loud log is the measurement.
     #[test]
     fn detach_settle_proceeds_loudly_at_bound_while_device_lingers() {
-        let lingering = || images(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
         let attachment = identity_attachment("settle-bound");
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
             ok([]),
-            lingering(),
-            lingering(),
-            lingering(),
+            holding(&attachment.image, &attachment.whole_device),
+            holding(&attachment.image, &attachment.whole_device),
+            holding(&attachment.image, &attachment.whole_device),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
         assert_eq!(backend.runner().steps().len(), 5);
@@ -4231,17 +4343,22 @@ mod tests {
         );
     }
 
+    /// Detach-settle reads the image's own mapping. Image leases let another image's attach take
+    /// the freed `diskN` immediately; that reuse proves this image's device departed, so it costs
+    /// one read and no waiting rather than the whole bound spent on someone else's attachment.
     #[test]
-    fn inventory_devices_collects_whole_devices_across_images() {
-        let devices = inventory_devices(&attached_images(&[
-            ("/tmp/a.asif", &["/dev/disk4"][..]),
-            ("/tmp/b.asif", &["disk5s1", "/dev/disk5"][..]),
-            // A node that is not a kernel device name names nothing to wait on.
-            ("/tmp/c.asif", &["not-a-device"][..]),
-        ]));
-        assert_eq!(
-            devices,
-            BTreeSet::from(["/dev/disk4".to_owned(), "/dev/disk5".to_owned()])
+    fn detach_settle_treats_a_device_reused_by_another_image_as_departed() {
+        let attachment = identity_attachment("settle-reused");
+        let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
+            ok([]),
+            images(&[("/tmp/someone-else.asif", &["/dev/disk12"][..])]),
+        ]);
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        assert_eq!(backend.runner().steps().len(), 3);
+        assert!(
+            backend.sleeper.waits().is_empty(),
+            "another image now holding the name is not a lingering departure"
         );
     }
 
@@ -4482,6 +4599,307 @@ mod tests {
             Ok(())
         })();
         finish_real_image_test(result, cleanup);
+    }
+
+    /// One identity's lease excludes every other holder of that identity — another descriptor
+    /// in this very process included — while other identities stay free, a contended holder is
+    /// handed the lease only after its release, and a wait that outlives its bound fails naming
+    /// the holder instead of hanging.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn image_lease_excludes_its_identity_leaves_others_free_and_bounds_the_wait() {
+        use std::os::unix::fs::MetadataExt;
+
+        let own = attachment_inventory_path(&temp_path("lease-own", IMAGE_EXTENSION)).unwrap();
+        let other = attachment_inventory_path(&temp_path("lease-other", IMAGE_EXTENSION)).unwrap();
+        let own_lease = image_lease_path(&own).unwrap();
+        let other_lease = image_lease_path(&other).unwrap();
+        assert_ne!(own_lease, other_lease);
+        let directory = own_lease.parent().expect("lease directory");
+        assert_eq!(other_lease.parent(), Some(directory));
+        assert_eq!(
+            fs::symlink_metadata(directory).unwrap().mode() & 0o777,
+            0o700
+        );
+
+        let held = SystemCommandRunner
+            .image_lease(&own)
+            .unwrap()
+            .expect("production takes a real lease");
+        assert_eq!(held.metadata().unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read_to_string(&own_lease).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+        let probe = open_image_lease(&own_lease).unwrap();
+        assert_eq!(
+            lock_file(&probe, libc::LOCK_EX | libc::LOCK_NB)
+                .expect_err("the identity is held")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(probe);
+        assert!(
+            SystemCommandRunner.image_lease(&other).unwrap().is_some(),
+            "another identity is free while this one is held"
+        );
+
+        let timed_out = acquire_image_lease(
+            open_image_lease(&own_lease).unwrap(),
+            &own_lease,
+            &own,
+            Duration::ZERO,
+        )
+        .expect_err("a held identity cannot be taken within a zero bound");
+        assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut);
+        let message = timed_out.to_string();
+        assert!(
+            message.contains(&format!("by pid {}", std::process::id())),
+            "{message}"
+        );
+        assert!(message.contains(own.to_str().unwrap()), "{message}");
+
+        let order = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let (own, order) = (&own, &order);
+            let (started, waiting) = std::sync::mpsc::channel();
+            let contender = scope.spawn(move || {
+                started.send(()).expect("the test awaits the contender");
+                let lease = SystemCommandRunner.image_lease(own);
+                order.lock().expect("order").push("acquired");
+                lease
+            });
+            waiting
+                .recv_timeout(DISK_CHILD_DEADLINE)
+                .expect("the contender started");
+            order.lock().expect("order").push("released");
+            drop(held);
+            assert!(
+                contender
+                    .join()
+                    .expect("contender thread")
+                    .expect("contended lease")
+                    .is_some()
+            );
+        });
+        assert_eq!(*order.lock().expect("order"), ["released", "acquired"]);
+        // Identities unique to this test: no other process can hold these files open.
+        fs::remove_file(own_lease).unwrap();
+        fs::remove_file(other_lease).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn lease_test_image(staged_stem: PathBuf, volume_name: &str) -> CreateImageRequest {
+        CreateImageRequest {
+            staged_stem,
+            capacity: capacity("64m"),
+            volume_name: volume_name.into(),
+            // SAFETY: `getuid` reads this process's credentials; it takes no pointers and
+            // cannot fail.
+            owner_uid: unsafe { libc::getuid() },
+            // SAFETY: `getgid` reads this process's credentials; it takes no pointers and
+            // cannot fail.
+            owner_gid: unsafe { libc::getgid() },
+        }
+    }
+
+    /// Plain filesystem paths a real-APFS test creates beside its images: alias links and mount
+    /// directories. Declared before the image cleanups, so on every exit — success, `?` or
+    /// unwind — it drops after them, once scoped threads have joined and devices are released.
+    /// A removal failure fails a passing test; during an unwind it is reported beside the
+    /// original failure instead of replacing it.
+    #[cfg(target_os = "macos")]
+    struct TestPaths(Vec<PathBuf>);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestPaths {
+        fn drop(&mut self) {
+            let mut retained = Vec::new();
+            for path in &self.0 {
+                let removed = match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_dir() => fs::remove_dir(path),
+                    Ok(_) => fs::remove_file(path),
+                    Err(error) => Err(error),
+                };
+                match removed {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => retained.push(format!("{}: {error}", path.display())),
+                }
+            }
+            if retained.is_empty() {
+                return;
+            }
+            let retained = retained.join("; ");
+            if std::thread::panicking() {
+                eprintln!("cowshed: retained test paths after the failure above: {retained}");
+            } else {
+                panic!("remove test paths: {retained}");
+            }
+        }
+    }
+
+    /// The device namespace is shared, but leases are per image: every cooperating step of one
+    /// image waits for that image's lease, and nothing of another image does.
+    ///
+    /// Holding image A's production lease, the test drives image B through a complete real
+    /// lifecycle on another thread — blank create, attach, format and detach; attach and fsck;
+    /// mount; native unmount; detach — while a real detach of A, started first, waits. Under a
+    /// host-wide lease B could not begin; without a per-image lease A's detach would not wait
+    /// for the release. Aliases of A's file (a symlinked parent, a hard link) take other leases
+    /// yet gain nothing: the inventory never maps them, so they can neither verify nor release
+    /// A's device. Every wait is an event; the only deadline is the hang bound, and it names the
+    /// step still open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
+        use std::sync::mpsc;
+
+        enum Progress {
+            Step(&'static str),
+            Done,
+        }
+
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let stem_a = temp_path("lease-held", "stem").with_extension("");
+        let stem_b = temp_path("lease-free", "stem").with_extension("");
+        let image_a = stem_a.with_extension(IMAGE_EXTENSION);
+        let image_b = stem_b.with_extension(IMAGE_EXTENSION);
+        let mount_b = temp_path("lease-free-mount", "dir");
+        let alias_parent = temp_path("lease-alias-parent", "dir");
+        let hard_link = temp_path("lease-hard-link", IMAGE_EXTENSION);
+        let _paths = TestPaths(vec![
+            alias_parent.clone(),
+            hard_link.clone(),
+            mount_b.clone(),
+        ]);
+        let order = std::sync::Mutex::new(Vec::new());
+        let mut cleanup_a = RealImageCleanup::new(&backend, image_a.clone());
+        let result = (|| -> Result<(), ApfsError> {
+            let created =
+                backend.create_staged_image(&lease_test_image(stem_a, "cowshed-lease-held"))?;
+            let attachment = cleanup_a.track(backend.attach_verified(&created)?);
+
+            std::os::unix::fs::symlink(image_a.parent().expect("temp parent"), &alias_parent)
+                .expect("symlinked-parent alias");
+            fs::hard_link(&image_a, &hard_link).expect("hard-link alias");
+            let symlinked = alias_parent.join(image_a.file_name().expect("image name"));
+
+            let held = backend
+                .image_lease(&image_a)?
+                .expect("production takes a real lease");
+            let identity = attachment_inventory_path(&image_a)?;
+            let probe = open_image_lease(&image_lease_path(&identity).expect("lease path"))
+                .expect("lease file");
+            assert_eq!(
+                lock_file(&probe, libc::LOCK_EX | libc::LOCK_NB)
+                    .expect_err("A's lease is held")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(probe);
+
+            // Each alias takes its own lease, so these run while A's is held; none may verify
+            // or disturb A's attachment.
+            for alias in [&symlinked, &hard_link] {
+                assert!(
+                    backend.recovered_image_attachment(alias)?.is_none(),
+                    "{} has an inventory mapping of its own",
+                    alias.display()
+                );
+                if let Ok(foreign) = backend.attach_verified(alias) {
+                    let released = backend.detach(&foreign, DetachIntent::Release);
+                    panic!(
+                        "{} verified device {}: {released:?}",
+                        alias.display(),
+                        foreign.whole_device()
+                    );
+                }
+                match backend.recovered_image_attachment(&image_a)? {
+                    Some(RecoveredImageAttachment::Apfs(still)) => assert_eq!(
+                        (still.whole_device(), still.volume_device()),
+                        (attachment.whole_device(), attachment.volume_device())
+                    ),
+                    _ => panic!("{} took A's attachment away", alias.display()),
+                }
+            }
+
+            let (detach_started, detach_waiting) = mpsc::channel();
+            let (progress, steps) = mpsc::channel();
+            std::thread::scope(|scope| -> Result<(), ApfsError> {
+                let (backend, order, mount_b) = (&backend, &order, &mount_b);
+                let detach_a = scope.spawn(move || {
+                    detach_started.send(()).expect("the test awaits A's detach");
+                    let detached = backend.detach(attachment, DetachIntent::Release);
+                    order.lock().expect("order").push("A detached");
+                    detached
+                });
+                detach_waiting
+                    .recv_timeout(DISK_CHILD_DEADLINE)
+                    .expect("A's detach started");
+                scope.spawn(move || {
+                    // A send fails only after the test panicked; the scope reports that panic.
+                    let report = |event: Progress| {
+                        if let Progress::Step(step) = &event {
+                            // On stderr too, so a harness kill still shows the open step.
+                            eprintln!("cowshed: lease test image B step `{step}` started");
+                        }
+                        let _ = progress.send(event);
+                    };
+                    let mut cleanup = RealImageCleanup::new(backend, image_b);
+                    let result = (|| -> Result<(), ApfsError> {
+                        report(Progress::Step("create"));
+                        let created = backend
+                            .create_staged_image(&lease_test_image(stem_b, "cowshed-lease-free"))?;
+                        report(Progress::Step("attach"));
+                        let attachment = cleanup.track(backend.attach_verified(&created)?);
+                        report(Progress::Step("mount"));
+                        backend.mount(attachment, mount_b, MountAccess::ReadWrite, false)?;
+                        fs::write(mount_b.join("written-beside-a-held-lease"), b"independent")
+                            .expect("write into B's volume");
+                        report(Progress::Step("unmount"));
+                        backend.unmount_verified(attachment, DetachIntent::Release)?;
+                        report(Progress::Step("detach"));
+                        backend.detach(attachment, DetachIntent::Release)
+                    })();
+                    report(Progress::Step("cleanup"));
+                    finish_real_image_test(result, cleanup);
+                    report(Progress::Done);
+                });
+                let mut open = "spawn";
+                loop {
+                    match steps.recv_timeout(DISK_CHILD_DEADLINE) {
+                        Ok(Progress::Step(step)) => open = step,
+                        Ok(Progress::Done) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                            "image B's `{open}` is still open after {DISK_CHILD_DEADLINE:?} \
+                             while only A's lease is held"
+                        ),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!("image B's lifecycle stopped inside `{open}`")
+                        }
+                    }
+                }
+                {
+                    let mut order = order.lock().expect("order");
+                    order.push("B finished");
+                    order.push("A released");
+                }
+                drop(held);
+                detach_a.join().expect("A's detach thread")
+            })?;
+
+            assert_eq!(
+                *order.lock().expect("order"),
+                ["B finished", "A released", "A detached"]
+            );
+            assert!(
+                backend.recovered_image_attachment(&image_a)?.is_none(),
+                "A's detach released its own device"
+            );
+            Ok(())
+        })();
+        finish_real_image_test(result, cleanup_a);
     }
 
     #[test]

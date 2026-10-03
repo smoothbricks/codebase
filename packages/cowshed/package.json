@@ -281,10 +281,6 @@
           "capability-probe-warmup"
         ]
       },
-      "cargo-test-cowshed-cli": {
-        "//": "Runs alone: its real_apfs_ dispatch tests adopt, land and detach real images. Overlapping other cargo lanes on a hosted arm64 runner stretched two production hdiutil detach calls to 6.4s and 9.1s and timed out checked land inside adopt.",
-        "parallelism": false
-      },
       "wire-warmup": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,

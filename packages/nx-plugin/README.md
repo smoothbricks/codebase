@@ -40,10 +40,10 @@ commands, dependencies, inputs and outputs because they override source-aware in
 
 The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
 `--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
-every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count,
-parallelism and standard 120-second target deadline stay unchanged. Refresh the portable timing manifest from this
-package directory with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data,
-not a test allowlist.
+every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count and
+standard 120-second target deadline stay unchanged. Refresh the portable timing manifest from this package directory
+with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data, not a test
+allowlist.
 
 ## Cargo Workspace Layouts
 
@@ -65,6 +65,12 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   compiled a second time. Cargo's own lock serializes the invocations that share the directory. `cargo-lint-cross` keeps
   `target/cargo-lint-cross`: a foreign triple's units are distinct anyway, and its own lock keeps the cross check from
   queueing behind host builds.
+- **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
+  edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
+  waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,
+  `napi-debug` before the tests that load its addon. A producer and its consumer inside one task are one `&&` command
+  (`mkdir` then the archive, `cargo build` then `wasm-bindgen`); independent commands (`cargo fmt` and clippy,
+  per-manifest `cargo fetch`, Biome and ESLint) stay in a `commands` list that Nx runs side by side.
 - **Overrides:** normal Nx merging applies. Explicit `nx.targets` fields replace inferred fields, while omitted fields
   retain their inferred base. Use `"dependsOn": ["...", "extra"]` to preserve inferred prerequisites when adding an
   edge; replacing the array makes its author responsible for fetching before frozen Cargo commands.
@@ -110,8 +116,7 @@ in that declaration, or in the named input it uses, or a toolchain bump will not
 
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
-access may consequently serialize on Cargo's package-cache lock. Clippy's dedicated target directory keeps its check
-artifacts out of the test build directory without splitting one directory per crate.
+access may consequently wait on Cargo's package-cache lock, which Cargo arbitrates itself; Nx adds no ordering for it.
 
 Graph inference persists locked, offline Cargo resolution in Nx's workspace-data directory. Its content key includes the
 canonical workspace and manifest paths, the complete indexed manifest set, local path-dependency and governing
@@ -320,29 +325,32 @@ Concrete targets come from concrete files:
   serves every checkout of the same commit; nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the
   extracted binaries at runtime, but a test that reads them through the compile-time `env!` macro keeps the producing
   tree's path. Per-crate runners accept an empty nextest selection because a valid workspace member may have no tests
-  and a hash partition may legitimately be empty. `napi-debug` stays behind `cargo-test-compile`, and a crate in the
-  project that builds the debug cdylib runs after it. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]`
-  also receives the cacheable `cargo-wasm` output target in its owning project.
+  and a hash partition may legitimately be empty. A crate in the project that builds the debug cdylib runs after
+  `napi-debug`, because its tests load that addon from `target/debug`. A crate declaring
+  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
+  project.
 - The plugin's own `nextest.toml` is passed as `--tool-config-file "smoo:$PWD/<path>"`, so it is a layer BENEATH the
   repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository can raise a
-  timeout, add a test group, or declare `archive.include` for a cdylib or fixture the archived test binaries need, and
-  its settings win. That file is an input of both the archive and every runner, so changing it invalidates the verdicts
-  it governs. `$PWD` keeps the command text identical across checkouts while satisfying nextest's requirement that a
-  tool config path be absolute; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must
-  not decide a cached verdict.
+  timeout or declare `archive.include` for a cdylib or fixture the archived test binaries need, and its settings win.
+  That file is an input of both the archive and every runner, so changing it invalidates the verdicts it governs. `$PWD`
+  keeps the command text identical across checkouts while satisfying nextest's requirement that a tool config path be
+  absolute; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must not decide a cached
+  verdict.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
   and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
 - Tests that a `nextest.toml` override singles out run separately in `cargo-test-<package>-exceptions-shard1..N`, using
   the same declared partition count. Ordinary shards run the complement, so the union still covers every test exactly
-  once. Exceptional shards declare `parallelism: false`: nextest's `test-group` mutex is process-local, and exclusive Nx
-  tasks preserve it across partitioned runs. Keeping all exceptions in one target is not bounded: a measured hosted
-  arm64 run spent 117.5s on 17 serialized real-APFS tests and hit its 120s deadline with six still waiting. Partitioning
-  keeps the existing test deadlines and every test, rather than relaxing the bound. The exceptional filter is derived
-  from the overrides in `nextest.toml`, so adding an override is the whole classification change. Only sharded crates
-  need these targets; an unsharded crate already runs its whole suite in one process. Empty partitions pass, including
-  platforms where the tests are `cfg`-ed out.
+  once. The plugin's own overrides raise `slow-timeout` for compile-fail tests and for the real-APFS full-lifecycle
+  tests; lifting them out keeps their raised bound from delaying an ordinary shard, and partitioning the class keeps
+  every target inside its deadline without relaxing it. Exceptional shards are scheduled like the ordinary ones: nothing
+  is exclusive, and isolation between concurrent real-APFS fixtures is the production backend's per-image lease, not Nx
+  scheduling. The exceptional filter is derived from the overrides in `nextest.toml`, so adding an override is the whole
+  classification change. Only sharded crates need these targets; an unsharded crate already runs its whole suite in one
+  process. Empty partitions pass, including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts`
+  executes the inferred archive and shard commands over 26 tests and asserts that the ordinary shards ran exactly the 13
+  ordinary tests once and the exceptional shards exactly the 13 exceptional ones.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
