@@ -917,6 +917,107 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
 }
 
 #[tokio::test]
+async fn node_native_fetch_uses_the_workspace_proxy_environment() {
+    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
+    let endpoint = free_endpoint();
+    let (audit_tx, mut audit_rx) = mpsc::channel(8);
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let (installed, token, ca_certificate) = session(
+        "node-fetch",
+        "owner/repo-node-fetch",
+        block_endpoint(endpoint),
+        35,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("node-fetch.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install Node workspace");
+    let root = secure_fixture_dir(&format!("cowshed-node-fetch-{}", std::process::id()));
+    let ca_path = root.join("ca.pem");
+    std::fs::write(
+        &ca_path,
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(ca_certificate.as_ref())
+        ),
+    )
+    .expect("write workspace trust anchor");
+    let proxy = format!("http://cowshed:{token}@127.0.0.1:{}", endpoint.port());
+    // This hostname does not resolve. Native fetch can reach it only through the authorized
+    // workspace proxy, without a custom Agent, TLS bypass, or a package-specific patch.
+    let mut command = tokio::process::Command::new("node");
+    command
+        .args([
+            "--input-type=module",
+            "-e",
+            "const response = await fetch(process.argv[1], {headers: {connection: 'close'}}); \
+             if (response.status !== 200) throw new Error(`HTTP ${response.status}`); \
+             console.log(await response.text());",
+            &format!("https://node-fetch.test:{upstream_port}/allowed/node"),
+        ])
+        .current_dir(&root)
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
+        .env("no_proxy", "127.0.0.1,localhost,::1")
+        .env("NODE_USE_ENV_PROXY", "1")
+        .env("NODE_EXTRA_CA_CERTS", &ca_path)
+        .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
+        .env_remove("NODE_OPTIONS")
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("Node fetch deadline")
+        .expect("run real Node");
+    assert!(
+        output.status.success(),
+        "native Node fetch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    let forwarded = captured.recv().await.expect("capture Node request");
+    assert!(
+        forwarded.starts_with("GET /allowed/node HTTP/1.1"),
+        "{forwarded}"
+    );
+    assert!(
+        !forwarded
+            .to_ascii_lowercase()
+            .contains("proxy-authorization")
+    );
+    assert!(!forwarded.contains(&token));
+    gateway.drain().await.expect("drain Node workspace");
+    let mut saw_request = false;
+    while let Ok(event) = audit_rx.try_recv() {
+        if event.method.as_deref() == Some("GET") && event.path.as_deref() == Some("/allowed/node")
+        {
+            assert_eq!(event.kind, AuditKind::Intercept);
+            assert_eq!(event.http_status, Some(200));
+            saw_request = true;
+        }
+    }
+    assert!(saw_request, "the workspace gateway audits native fetch");
+    std::fs::remove_dir_all(root).expect("remove Node workspace fixture");
+}
+
+#[tokio::test]
 async fn endpoint_identity_precedes_token_authentication() {
     let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
     let endpoint_a = free_endpoint();

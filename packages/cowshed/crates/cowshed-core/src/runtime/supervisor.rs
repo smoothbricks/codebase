@@ -1480,6 +1480,9 @@ pub(super) async fn sandbox_environment(
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         own(name, OsStr::new(&gateway_http));
     }
+    // Node's native HTTP and fetch clients opt in to the proxy environment separately.
+    // Own that opt-in alongside the endpoint so postinstalls cannot bypass workspace egress.
+    own("NODE_USE_ENV_PROXY", OsStr::new("1"));
     own("NO_PROXY", OsStr::new(loopback_no_proxy));
     own("no_proxy", OsStr::new(loopback_no_proxy));
     // The host and every workspace reach a shared tool home through one literal path (cargo
@@ -4755,6 +4758,7 @@ mod workspace_toolchain_tests {
             "extra-experimental-features = flakes".to_owned(),
         );
         env.insert("CALLER_ONLY".to_owned(), "kept".to_owned());
+        env.insert("NODE_USE_ENV_PROXY".to_owned(), "0".to_owned());
         env.insert("HOME".to_owned(), "/caller/home".to_owned());
 
         let environment = sandbox_environment(&sandbox, None, &env)
@@ -4856,6 +4860,10 @@ mod workspace_toolchain_tests {
                 "{name}"
             );
         }
+        assert_eq!(
+            vars.get("NODE_USE_ENV_PROXY").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
             Some(private.join("config"))

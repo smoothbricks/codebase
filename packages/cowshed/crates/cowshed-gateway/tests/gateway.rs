@@ -107,6 +107,11 @@ fn ca_fixture() -> CaFixture {
     let key = KeyPair::generate().expect("fixture CA key");
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // A CA and a leaf must not share rcgen's default subject: OpenSSL otherwise treats the
+    // leaf as self-signed instead of building its chain to the trusted workspace anchor.
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "cowshed fixture CA");
     let certificate = params.self_signed(&key).expect("fixture CA certificate");
     CaFixture {
         material: WorkspaceCa::new(certificate.pem(), key.serialize_pem())

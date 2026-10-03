@@ -190,7 +190,10 @@ Bun reads its registry from the repository's own configuration, cargo has no reg
 their public registries as intercepted hosts that trust the workspace CA; the gateway mirrors an eligible npm request in
 flight. Go's `GOENV` file names `proxy.golang.org` and `sum.golang.org`, reached through opaque tunnels, because
 `cmd/go` sends credentials only over HTTPS and never trusts the workspace CA on macOS. Linux clients do **not** speak
-HTTP over the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured.
+HTTP over the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured. Every
+exec and shell also owns `NODE_USE_ENV_PROXY=1`: Node 24.5+ native HTTP and `fetch` opt in to the same proxy variables,
+including during package postinstalls. The workspace CA remains an additive `NODE_EXTRA_CA_CERTS` trust anchor; no TLS
+check is disabled and no package-specific proxy agent is required.
 
 No wiring file carries the token. The proxy variables carry it as userinfo, which the client turns into
 `Proxy-Authorization: Basic` itself: a generic proxy client has no cowshed configuration file and no way to add a
