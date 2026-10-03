@@ -118,6 +118,9 @@ impl RunningProcess for FakeProcess {
         Ok(())
     }
 
+    // A fake has no pipe to close; the supervisor's own stdin state says it ended.
+    fn end_stdin(&mut self) {}
+
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
         self.observations
             .send(ProcessObservation::Signal(self.job_id, signal))
@@ -1840,6 +1843,57 @@ async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
         OrderObservation::Commitment("terminal")
     );
     assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Killed);
+}
+
+/// A job whose leader exited while descendants hold its output open is still running, and a kill
+/// still signals its group: the process stays held until the job concludes. The job ends Killed,
+/// with the leader's own exit, once its output ends.
+#[tokio::test]
+async fn a_kill_after_the_leader_exits_reaches_the_group_still_holding_its_output() {
+    let mut h = harness(1, 1024, false, false);
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    spawned
+        .events
+        .send(ProcessEvent::Exited {
+            job_id: job,
+            exit: ExitStatus::Exited { code: 3 },
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Running);
+
+    let handle = h.handle.clone();
+    let kill = tokio::spawn(async move { handle.kill(job).await });
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Signal(job, ProcessSignal::Term)
+    );
+    assert!(!kill.is_finished());
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        spawned
+            .events
+            .send(ProcessEvent::OutputEof {
+                job_id: job,
+                stream,
+            })
+            .await
+            .unwrap();
+    }
+    kill.await.unwrap().unwrap();
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.state, info.exit),
+        (JobState::Killed, Some(ExitStatus::Exited { code: 3 }))
+    );
 }
 
 #[tokio::test]

@@ -251,8 +251,8 @@ impl SupervisorManager {
             if path == manager || path.extension().is_none_or(|extension| extension != "sock") {
                 continue;
             }
-            match supervisor_socket::hello(&path).await {
-                Ok(hello) => watch_pid(hello.pid, path),
+            match supervisor_socket::hello_if_present(&path).await {
+                Ok(Some(hello)) => watch_pid(hello.pid, path),
                 // A supervisor of another cowshed build: let it finish its jobs and retire, so
                 // the next command for its workspace gets one of this build.
                 Err(error) if error.code == ErrorCode::Conflict => {
@@ -272,16 +272,15 @@ impl SupervisorManager {
                         ),
                     }
                 }
-                // A socket nothing answers is what a supervisor that died leaves: end the jobs
-                // it left running now; the next supervisor for the workspace seals them.
-                Err(error) => {
-                    eprintln!(
-                        "cowshed: workspace supervisor socket {} does not answer: {}",
-                        path.display(),
-                        error.message
-                    );
-                    end_lost_jobs(path, super::job_groups::Writer::Any).await;
-                }
+                // Only a positively absent listener authorizes lost-supervisor recovery. A
+                // wedged live peer or an unknown protocol outcome retains its jobs and ledger.
+                Ok(None) => end_lost_jobs(path, super::job_groups::Writer::Any).await,
+                Err(error) => eprintln!(
+                    "cowshed: cannot determine whether workspace supervisor {} stopped; its \
+                     jobs and ledger are retained: {}",
+                    path.display(),
+                    error.message
+                ),
             }
         }
     }
@@ -431,10 +430,14 @@ fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
                 "cowshed: workspace supervisor {} ended: {status}",
                 socket.display()
             ),
-            Err(error) => eprintln!(
-                "cowshed: cannot wait for workspace supervisor {}: {error}",
-                socket.display()
-            ),
+            Err(error) => {
+                eprintln!(
+                    "cowshed: cannot wait for workspace supervisor {}; its jobs and ledger are \
+                     retained: {error}",
+                    socket.display()
+                );
+                return;
+            }
         }
         end_lost_jobs(socket, super::job_groups::Writer::Process(pid)).await;
     });
@@ -462,6 +465,18 @@ fn watch_pid(pid: u32, socket: PathBuf) {
 /// End the process groups a supervisor that is gone left running. A supervisor that retired
 /// in order left none; the next supervisor of the workspace seals the jobs this ends.
 async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
+    let _socket = match supervisor_socket::bind(&socket).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!(
+                "cowshed: cannot exclusively recover workspace supervisor {}; its ledger is \
+                 retained: {}",
+                socket.display(),
+                error.message
+            );
+            return;
+        }
+    };
     let ledger = super::job_groups::ledger_path(&socket);
     let ended = tokio::task::spawn_blocking(move || {
         super::job_groups::end_recorded(&ledger, writer, LOST_JOB_GRACE)
@@ -649,6 +664,7 @@ pub async fn stop_other_build(socket: &Path) -> Result<u32> {
                 format!("stop pid {pid} yourself, then retry"),
             )
         })?;
+    let _socket = supervisor_socket::bind(socket).await?;
     let ledger = super::job_groups::ledger_path(socket);
     let taken = ledger.clone();
     let unresolved =
@@ -672,23 +688,6 @@ pub async fn stop_other_build(socket: &Path) -> Result<u32> {
             group.pgid(),
             ledger.display()
         );
-    }
-    match UnixStream::connect(socket).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => match std::fs::remove_file(socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "cannot remove the socket {} pid {pid} served: {error}",
-                        socket.display()
-                    ),
-                    "remove it yourself, then retry",
-                ));
-            }
-        },
     }
     Ok(pid)
 }

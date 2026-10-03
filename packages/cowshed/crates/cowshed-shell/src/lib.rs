@@ -9,9 +9,11 @@
 //! it cannot accept descriptors over a socket, named FIFOs are reachable by sibling jobs, and
 //! its `wait` folds a signal death into `128+N`. The host therefore is a small program that
 //! holds the activated environment and does what bash cannot: it receives the job's descriptors
-//! with `SCM_RIGHTS`, starts the job in its own process group, and reports the raw `waitpid`
-//! status. It runs under the executed-child Seatbelt profile like every command, so it adds no
-//! authority, and activation still runs repository code only inside that profile.
+//! with `SCM_RIGHTS`, starts the job in its own process group, reports the exit `waitid` reads
+//! without reaping, and holds the leader unreaped until the job is released, so the job's group
+//! stays signallable while descendants outlive the leader. It runs under the executed-child
+//! Seatbelt profile like every command, so it adds no authority, and activation still runs
+//! repository code only inside that profile.
 //!
 //! Activation is direnv's own: `direnv export json` evaluated from the host's sandbox
 //! environment, its diff applied once. The resulting `DIRENV_WATCHES` is reported to the
@@ -31,13 +33,14 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use cowshed_core::runtime::job_groups::Birth;
+use cowshed_core::api::dto::ExitStatus;
+use cowshed_core::runtime::job_groups::{self, Birth};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RUN,
-    REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_ARGUMENT, ShellHostProgram,
-    read_frame,
+    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE,
+    REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
+    SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
 };
 use cowshed_core::script::Binding;
 
@@ -65,15 +68,16 @@ pub fn dispatch() -> io::Result<()> {
     Ok(())
 }
 
-/// The wait status a shell reports for a command it could not execute: 127 when the program
-/// does not exist, 126 when it exists but cannot run.
-fn unexecutable_status(error: &io::Error) -> RawWaitStatus {
-    let code = if error.kind() == io::ErrorKind::NotFound {
-        127
-    } else {
-        126
-    };
-    code << 8
+/// The exit a shell reports for a command it could not execute: 127 when the program does not
+/// exist, 126 when it exists but cannot run.
+fn unexecutable_exit(error: &io::Error) -> ExitStatus {
+    ExitStatus::Exited {
+        code: if error.kind() == io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        },
+    }
 }
 
 /// Run the exec host on [`CONTROL_DESCRIPTOR`] until the supervisor closes it. Returns the
@@ -203,12 +207,11 @@ impl Host {
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
                 self.run(socket, &argv, &cwd, &overlay, [stdin, stdout, stderr])
             }
-            // A signal for a command that has already ended: it is reaped, so its id may name
-            // another process, and the signal reaches nothing.
-            REQUEST_SIGNAL => {
-                fields.i32()?;
-                fields.finish()
-            }
+            // Only a held command is signalled or released, inside its own exchange.
+            REQUEST_SIGNAL | REQUEST_RELEASE => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control request {tag} while no command is held"),
+            )),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown control request {other}"),
@@ -391,14 +394,18 @@ impl Host {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn();
-        let status = match spawned {
+        let exit = match spawned {
             Ok(child) => {
-                let pid = libc::pid_t::try_from(child.id()).map_err(io::Error::other)?;
-                // Before the wait below: this host is the command's parent, so until it reaps the
-                // child its pid names nothing else.
+                // The command holds the job's streams now; a copy kept here would keep its
+                // stderr from ending until the release, which waits for that end.
+                drop(diagnostics);
+                // Held from here: any failure below ends the command before it is reported.
+                let held = Held::new(child.id().cast_signed());
+                // Before any wait: this host is the command's parent, so until it reaps the child
+                // its pid names nothing else.
                 let birth = Birth::of(child.id());
                 reply(socket, FrameWriter::new(REPLY_STARTED).birth(&birth)?)?;
-                wait_serving_signals(socket, pid)?
+                return serve_command(socket, held);
             }
             Err(error) => {
                 let mut diagnostics = std::fs::File::from(diagnostics);
@@ -407,92 +414,157 @@ impl Host {
                     "cowshed: cannot run {}: {error}",
                     String::from_utf8_lossy(program)
                 );
-                unexecutable_status(&error)
+                unexecutable_exit(&error)
             }
         };
-        reply(socket, FrameWriter::new(REPLY_EXITED).i32(status))
+        reply(socket, FrameWriter::new(REPLY_EXITED).exit(&exit))
     }
 }
 
-/// How long a command whose supervisor went away has between SIGTERM and SIGKILL: the grace a
-/// supervisor gives its own jobs.
+/// How long a command whose supervisor went away, or whose serving failed, has between SIGTERM
+/// and SIGKILL: the grace a supervisor gives its own jobs.
 const ORPHANED_COMMAND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Wait for `pid`, this host's own child, to end, applying the supervisor's [`REQUEST_SIGNAL`]s to
-/// its group meanwhile, then reap it. Signals and the reap happen in this one thread, so no signal
-/// follows the reap: once collected, the child's id may name another process.
+/// How often an ended command's group is looked at for running processes within the grace.
+const ORPHANED_COMMAND_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A command this host forked and holds unreaped. Until it is reaped its pid -- the id of the
+/// group it leads -- names nothing else, so the group can be signalled, descendants that outlive
+/// the leader included. Signals and the reap happen in this one thread, so no signal follows the
+/// reap.
 ///
-/// A supervisor that goes away while the command runs leaves nothing that could observe or cancel
-/// it, so it ends here as a dropped supervisor's own jobs do: asked first, killed after the grace,
-/// and reaped.
-pub(crate) fn wait_serving_signals(
-    socket: &UnixStream,
+/// One dropped unreleased -- its supervisor went away, or serving it failed -- leaves nothing
+/// that could observe or cancel it, so it ends here as a dropped supervisor's own jobs do: its
+/// group is asked first, killed after the grace, and its leader reaped.
+pub(crate) struct Held {
     pid: libc::pid_t,
-) -> io::Result<RawWaitStatus> {
-    // SAFETY: killpg takes plain integers; `pid` leads this host's own unreaped child's group.
-    // A group already gone, or holding only the unreaped child, has nothing to signal.
-    let signal_group = |signal| unsafe { libc::killpg(pid, signal) };
-    let mut watch = ExitWatch::new(pid, socket)?;
-    let mut kill_at = None;
-    loop {
-        let timeout = kill_at
-            .map(|at: std::time::Instant| at.saturating_duration_since(std::time::Instant::now()));
-        match watch.next(timeout)? {
-            Ready::Exited => break,
-            Ready::Elapsed => {
-                signal_group(libc::SIGKILL);
-                kill_at = None;
+    reaped: bool,
+}
+
+impl Held {
+    /// Hold `pid`, this host's own child, which leads its own group and is not reaped.
+    pub(crate) fn new(pid: libc::pid_t) -> Self {
+        Self { pid, reaped: false }
+    }
+
+    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        job_groups::signal_unreaped_group(self.pid, signal)
+    }
+
+    /// Collect the exited leader. Its id may name another process from here on.
+    fn reap(&mut self) -> io::Result<()> {
+        loop {
+            // SAFETY: `pid` is this host's own child; a null status pointer is allowed.
+            let waited = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
+            if waited == self.pid {
+                self.reaped = true;
+                return Ok(());
             }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // Nothing is left to report to: the supervisor is gone, or this host is failing. Each
+        // step runs whatever the one before it did, so the group is ended as far as it can be.
+        let _ = self.signal(libc::SIGTERM);
+        let deadline = std::time::Instant::now() + ORPHANED_COMMAND_GRACE;
+        while matches!(job_groups::group_has_live_members(self.pid), Ok(true))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(ORPHANED_COMMAND_POLL);
+        }
+        let _ = self.signal(libc::SIGKILL);
+        let _ = self.reap();
+    }
+}
+
+/// Serve the held command's exchange until the supervisor releases it ([`REQUEST_RELEASE`]):
+/// its signals while it runs, its exit once its leader exits, and its signals while descendants
+/// run on. A supervisor that goes away, and any failure here, ends the command ([`Held`]).
+pub(crate) fn serve_command(socket: &UnixStream, mut held: Held) -> io::Result<()> {
+    let watch = ExitWatch::new(held.pid, socket)?;
+    loop {
+        match watch.next()? {
+            Ready::Exited => break,
             Ready::Request => match read_frame(socket)? {
+                // A release before the exit is refused, so this request leaves the command held.
                 Some((payload, _)) => {
-                    let (tag, mut fields) = FrameReader::new(&payload)?;
-                    if tag != REQUEST_SIGNAL {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("control request {tag} while a command runs"),
-                        ));
-                    }
-                    let signal = fields.i32()?;
-                    fields.finish()?;
-                    signal_group(signal);
+                    serve_request(socket, &mut held, &payload, false)?;
                 }
-                None => {
-                    watch.stop_requests()?;
-                    signal_group(libc::SIGTERM);
-                    kill_at = Some(std::time::Instant::now() + ORPHANED_COMMAND_GRACE);
-                }
+                None => return Ok(()),
             },
         }
     }
-    let mut status = 0;
+    drop(watch);
+    let exit = job_groups::await_exit_unreaped(held.pid)?;
+    reply(socket, FrameWriter::new(REPLY_EXITED).exit(&exit))?;
     loop {
-        // SAFETY: `pid` is this host's own child and `status` a valid out-pointer.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited == pid {
-            return Ok(status);
+        match read_frame(socket)? {
+            Some((payload, _)) => {
+                if serve_request(socket, &mut held, &payload, true)? {
+                    return Ok(());
+                }
+            }
+            None => return Ok(()),
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+    }
+}
+
+/// Serve one request about the held command; `true` once it is released.
+fn serve_request(
+    socket: &UnixStream,
+    held: &mut Held,
+    payload: &[u8],
+    exited: bool,
+) -> io::Result<bool> {
+    let (tag, mut fields) = FrameReader::new(payload)?;
+    match tag {
+        REQUEST_SIGNAL => {
+            let signal = fields.i32()?;
+            fields.finish()?;
+            if let Err(error) = held.signal(signal) {
+                reply(
+                    socket,
+                    FrameWriter::new(REPLY_SIGNAL_FAILED)
+                        .i32(signal)
+                        .bytes(error.to_string().as_bytes())?,
+                )?;
+            }
+            Ok(false)
         }
+        REQUEST_RELEASE if exited => {
+            fields.finish()?;
+            held.reap()?;
+            reply(socket, FrameWriter::new(REPLY_RELEASED))?;
+            Ok(true)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control request {other} while a command is held"),
+        )),
     }
 }
 
 enum Ready {
     /// The child exited; it is not reaped yet.
     Exited,
-    /// A request is readable on the control socket.
+    /// A request, or the end of the stream, is readable on the control socket.
     Request,
-    /// The timeout passed first.
-    Elapsed,
 }
 
 /// The child's exit and the control socket's requests, waited for together without reaping.
 #[cfg(target_os = "macos")]
 struct ExitWatch {
     queue: OwnedFd,
-    socket: libc::c_int,
-    serving: bool,
     /// The child had already exited when its exit was to be watched; it is not reaped yet.
     exited: bool,
 }
@@ -509,11 +581,16 @@ impl ExitWatch {
         let queue = unsafe { OwnedFd::from_raw_fd(queue) };
         let mut watch = Self {
             queue,
-            socket: socket.as_raw_fd(),
-            serving: true,
             exited: false,
         };
-        let requests = watch.socket_change(libc::EV_ADD)?;
+        let requests = libc::kevent {
+            ident: usize::try_from(socket.as_raw_fd()).map_err(io::Error::other)?,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
         watch.change(&[requests])?;
         let exit = libc::kevent {
             ident: usize::try_from(pid).map_err(io::Error::other)?,
@@ -531,17 +608,6 @@ impl ExitWatch {
             Err(error) => return Err(error),
         }
         Ok(watch)
-    }
-
-    fn socket_change(&self, flags: u16) -> io::Result<libc::kevent> {
-        Ok(libc::kevent {
-            ident: usize::try_from(self.socket).map_err(io::Error::other)?,
-            filter: libc::EVFILT_READ,
-            flags,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        })
     }
 
     fn change(&self, changes: &[libc::kevent]) -> io::Result<()> {
@@ -563,23 +629,14 @@ impl ExitWatch {
         Ok(())
     }
 
-    fn next(&self, timeout: Option<std::time::Duration>) -> io::Result<Ready> {
+    fn next(&self) -> io::Result<Ready> {
         if self.exited {
             return Ok(Ready::Exited);
         }
-        let limit = timeout
-            .map(|timeout| {
-                Ok::<_, io::Error>(libc::timespec {
-                    tv_sec: libc::time_t::try_from(timeout.as_secs()).map_err(io::Error::other)?,
-                    tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
-                })
-            })
-            .transpose()?;
         loop {
             // SAFETY: `kevent` is plain storage the call fills.
             let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-            // SAFETY: room for exactly one returned event; no changes are passed; `limit` lives
-            // across the call.
+            // SAFETY: room for exactly one returned event; no changes are passed; no timeout.
             let ready = unsafe {
                 libc::kevent(
                     self.queue.as_raw_fd(),
@@ -587,7 +644,7 @@ impl ExitWatch {
                     0,
                     &mut event,
                     1,
-                    limit.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                    std::ptr::null(),
                 )
             };
             if ready < 0 {
@@ -598,25 +655,14 @@ impl ExitWatch {
                 return Err(error);
             }
             if ready == 0 {
-                if timeout.is_some() {
-                    return Ok(Ready::Elapsed);
-                }
                 continue;
             }
-            if event.filter == libc::EVFILT_PROC {
-                return Ok(Ready::Exited);
-            }
-            if self.serving {
-                return Ok(Ready::Request);
-            }
+            return Ok(if event.filter == libc::EVFILT_PROC {
+                Ready::Exited
+            } else {
+                Ready::Request
+            });
         }
-    }
-
-    /// The supervisor closed its end: wait for the child alone.
-    fn stop_requests(&mut self) -> io::Result<()> {
-        self.serving = false;
-        let delete = self.socket_change(libc::EV_DELETE)?;
-        self.change(&[delete])
     }
 }
 
@@ -625,7 +671,6 @@ impl ExitWatch {
 struct ExitWatch {
     process: OwnedFd,
     socket: libc::c_int,
-    serving: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -641,15 +686,10 @@ impl ExitWatch {
             // SAFETY: a fresh descriptor this function alone owns.
             process: unsafe { OwnedFd::from_raw_fd(process) },
             socket: socket.as_raw_fd(),
-            serving: true,
         })
     }
 
-    fn next(&self, timeout: Option<std::time::Duration>) -> io::Result<Ready> {
-        let limit = match timeout {
-            Some(timeout) => libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX),
-            None => -1,
-        };
+    fn next(&self) -> io::Result<Ready> {
         loop {
             let mut descriptors = [
                 libc::pollfd {
@@ -658,22 +698,19 @@ impl ExitWatch {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.serving { self.socket } else { -1 },
+                    fd: self.socket,
                     events: libc::POLLIN,
                     revents: 0,
                 },
             ];
             // SAFETY: `descriptors` is a live array of two pollfd entries.
-            let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, limit) };
+            let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(error);
-            }
-            if ready == 0 {
-                return Ok(Ready::Elapsed);
             }
             if descriptors[0].revents != 0 {
                 return Ok(Ready::Exited);
@@ -682,12 +719,6 @@ impl ExitWatch {
                 return Ok(Ready::Request);
             }
         }
-    }
-
-    /// The supervisor closed its end: wait for the child alone.
-    fn stop_requests(&mut self) -> io::Result<()> {
-        self.serving = false;
-        Ok(())
     }
 }
 

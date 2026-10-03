@@ -25,6 +25,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::dto::ExitStatus;
+
+/// How often a group signalled with SIGKILL is read again for processes still running in it,
+/// and how many times before the group is reported as surviving SIGKILL.
+const KILL_SETTLE: Duration = Duration::from_millis(10);
+const KILL_ROUNDS: u32 = 100;
+
 /// The ledger beside a supervisor socket.
 pub fn ledger_path(socket: &Path) -> PathBuf {
     socket.with_extension("groups")
@@ -203,15 +210,36 @@ impl Birth {
     }
 }
 
+/// What a ledger rewrite carried over from the unresolved groups the supervisor inherited.
+#[derive(Debug)]
+pub struct Recorded {
+    /// The inherited groups processes still hold, and those that could not be inspected: an
+    /// inherited group is dropped only once it is seen released.
+    pub carried: Vec<UnresolvedGroup>,
+    /// Why some inherited groups could not be inspected. They are carried unchanged.
+    pub uninspected: Vec<io::Error>,
+}
+
 /// Replace the ledger at `path` with these `(job id, group leader)` pairs and the `inherited`
-/// unresolved groups processes still hold. Those found released are left out: the record of an
-/// unresolved group is dropped only once nothing holds its id. Returns the ones carried.
+/// unresolved groups not seen released. One that cannot be inspected is carried as it is, so the
+/// current jobs' groups are recorded whatever an inherited group's inspection does.
 pub fn record(
     path: &Path,
     groups: &[(u64, GroupLeader)],
     inherited: &[UnresolvedGroup],
-) -> io::Result<Vec<UnresolvedGroup>> {
-    let unresolved = still_held(inherited)?;
+) -> io::Result<Recorded> {
+    let mut carried = Vec::with_capacity(inherited.len());
+    let mut uninspected = Vec::new();
+    for group in inherited {
+        match group.still_held() {
+            Ok(false) => {}
+            Ok(true) => carried.push(*group),
+            Err(error) => {
+                carried.push(*group);
+                uninspected.push(error);
+            }
+        }
+    }
     let ledger = Ledger {
         supervisor: std::process::id(),
         ended: false,
@@ -224,10 +252,13 @@ pub fn record(
                 leader_start: None,
             })
             .collect(),
-        unresolved: unresolved.clone(),
+        unresolved: carried.clone(),
     };
     replace(path, &ledger)?;
-    Ok(unresolved)
+    Ok(Recorded {
+        carried,
+        uninspected,
+    })
 }
 
 fn still_held(groups: &[UnresolvedGroup]) -> io::Result<Vec<UnresolvedGroup>> {
@@ -357,10 +388,12 @@ enum Ownership {
 }
 
 /// TERM the owned groups' processes, wait `grace`, prove ownership again, then KILL those still
-/// running. Returns the jobs signalled and the groups left unresolved: their recorded leader is
-/// gone -- before TERM, or after it -- while processes still hold the id, so they are not
-/// signalled. A failed inspection or signal leaves the caller's original ledger available for
-/// retry.
+/// running, reading the group again after each KILL until nothing in it runs: a process that
+/// forked between a read and its own KILL leaves a child the next read finds. Returns the jobs
+/// signalled and the groups left unresolved: their recorded leader is gone -- before TERM, or
+/// after it -- while processes still hold the id, so they are not signalled. A failed inspection
+/// or signal, or a group still running after every KILL round, is an error and leaves the
+/// caller's original ledger available for retry.
 fn end_groups(groups: &[Group], grace: Duration) -> io::Result<(Vec<u64>, Vec<Group>)> {
     let mut signalled = Vec::with_capacity(groups.len());
     let mut unresolved = Vec::new();
@@ -385,19 +418,45 @@ fn end_groups(groups: &[Group], grace: Duration) -> io::Result<(Vec<u64>, Vec<Gr
             .iter()
             .filter(|group| signalled.contains(&group.job_id))
         {
-            match ownership(group)? {
-                Ownership::Owned(members) => {
-                    for member in &members {
-                        member.signal(libc::SIGKILL)?;
-                    }
-                }
-                Ownership::NotOwned => {}
-                // The leader died of TERM and was reaped while processes held on.
-                Ownership::Unidentified => unresolved.push(*group),
+            if kill_owned(group)? == Killed::Unidentified {
+                // The leader died and was reaped while processes held on.
+                unresolved.push(*group);
             }
         }
     }
     Ok((signalled, unresolved))
+}
+
+/// What KILLing a group's processes until none runs ended with.
+#[derive(Debug, Eq, PartialEq)]
+enum Killed {
+    /// Nothing of the job's runs in the group any more.
+    Ended,
+    /// The recorded leader is gone while processes hold the id: they are not signalled.
+    Unidentified,
+}
+
+fn kill_owned(group: &Group) -> io::Result<Killed> {
+    for _ in 0..KILL_ROUNDS {
+        match ownership(group)? {
+            Ownership::Owned(members) if members.is_empty() => return Ok(Killed::Ended),
+            Ownership::Owned(members) => {
+                for member in &members {
+                    member.signal(libc::SIGKILL)?;
+                }
+                std::thread::sleep(KILL_SETTLE);
+            }
+            Ownership::NotOwned => return Ok(Killed::Ended),
+            Ownership::Unidentified => return Ok(Killed::Unidentified),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "process group {} still has running processes after {KILL_ROUNDS} rounds of SIGKILL",
+            group.pgid
+        ),
+    ))
 }
 
 fn ownership(group: &Group) -> io::Result<Ownership> {
@@ -447,8 +506,93 @@ fn ownership(group: &Group) -> io::Result<Ownership> {
 }
 
 /// Whether a process that has not exited holds the group id.
-pub(super) fn group_has_live_members(pgid: i32) -> io::Result<bool> {
+pub fn group_has_live_members(pgid: i32) -> io::Result<bool> {
     Ok(!members_of(pgid)?.is_empty())
+}
+
+/// Signal the group `pgid` leads. Only for the leader's parent, while it holds the leader
+/// unreaped -- running, or exited and not yet collected: until the parent reaps it, the leader's
+/// pid, and with it the group's id, names nothing else. A group with nothing left running in it
+/// is not an error: Darwin refuses one whose only member is the unreaped leader.
+pub fn signal_unreaped_group(pgid: i32, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: killpg takes plain integers and touches no memory of ours.
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) if matches!(group_has_live_members(pgid), Ok(false)) => Ok(()),
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("cannot signal process group {pgid} with signal {signal}: {error}"),
+        )),
+    }
+}
+
+/// How the caller's own child `pid` ended, read without reaping it; `None` while it runs. The
+/// child stays unreaped, so its pid -- and the id of the group it leads -- names nothing else
+/// until its parent collects it.
+pub fn exit_unreaped(pid: i32) -> io::Result<Option<ExitStatus>> {
+    read_exit(pid, libc::WNOHANG)
+}
+
+/// Wait for the caller's own child `pid` to end and say how, without reaping it. For a caller
+/// told the child is exiting: Darwin reports a process exiting (`NOTE_EXIT`, or `ESRCH` when the
+/// exit is watched) before `waitid` can collect it (measured: 17 of 2000 children were not yet
+/// waitable right after either), so only a blocking read is sure to find the exit.
+pub fn await_exit_unreaped(pid: i32) -> io::Result<ExitStatus> {
+    read_exit(pid, 0)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "waiting for process {pid} returned before it exited"
+        ))
+    })
+}
+
+fn read_exit(pid: i32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
+    let id = libc::id_t::try_from(pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is valid storage for the call to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `pid` is the caller's own child and `info` writable storage; WNOWAIT leaves the
+        // child unreaped.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | options,
+            )
+        };
+        if waited != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid filled `info` as a child-state record, or left it zeroed.
+        let (reporter, status) = unsafe { (info.si_pid(), info.si_status()) };
+        if reporter == 0 {
+            return Ok(None);
+        }
+        return match info.si_code {
+            libc::CLD_EXITED => Ok(Some(ExitStatus::Exited { code: status })),
+            libc::CLD_KILLED => Ok(Some(ExitStatus::Signaled {
+                signal: status,
+                core_dumped: false,
+            })),
+            libc::CLD_DUMPED => Ok(Some(ExitStatus::Signaled {
+                signal: status,
+                core_dumped: true,
+            })),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("process {pid} reported child state {other}, not an exit"),
+            )),
+        };
+    }
 }
 
 /// A process held by an identity the kernel never gives another: its pid and that pid's version,
@@ -1172,7 +1316,11 @@ mod tests {
             // The next supervisor carries it in every ledger it writes, and a later recovery
             // takes it over again rather than forgetting it.
             assert_eq!(super::unresolved(&ledger).unwrap(), taken, "{label}");
-            assert_eq!(record(&ledger, &[], &taken).unwrap(), taken, "{label}");
+            assert_eq!(
+                record(&ledger, &[], &taken).unwrap().carried,
+                taken,
+                "{label}"
+            );
             assert_eq!(
                 take_lost(&ledger, Duration::ZERO).unwrap(),
                 taken,
@@ -1188,7 +1336,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert!(super::unresolved(&ledger).unwrap().is_empty(), "{label}");
-            assert!(record(&ledger, &[], &taken).unwrap().is_empty(), "{label}");
+            assert!(
+                record(&ledger, &[], &taken).unwrap().carried.is_empty(),
+                "{label}"
+            );
             assert!(
                 take_lost(&ledger, Duration::ZERO).unwrap().is_empty(),
                 "{label}"

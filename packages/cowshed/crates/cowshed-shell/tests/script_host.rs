@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use cowshed_core::api::{ScriptCommand, ScriptValue};
+use cowshed_core::api::{ExitStatus, ScriptCommand, ScriptValue};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_APPROVE, REQUEST_SCRIPT,
-    REQUEST_SIGNAL, read_frame, send_with_descriptors,
+    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_APPROVE,
+    REQUEST_RELEASE, REQUEST_SCRIPT, REQUEST_SIGNAL, read_frame, send_with_descriptors,
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 
@@ -91,7 +91,7 @@ impl Host {
     }
 }
 
-/// Ask the host to signal the command it runs.
+/// Ask the host to signal the command it holds.
 fn send_signal(control: &std::os::unix::net::UnixStream, signal: i32) {
     let frame = FrameWriter::new(REQUEST_SIGNAL)
         .i32(signal)
@@ -100,94 +100,148 @@ fn send_signal(control: &std::os::unix::net::UnixStream, signal: i32) {
     std::io::Write::write_all(&mut &*control, &frame).expect("send the signal");
 }
 
-/// Run a rendered script on a host's control socket; returns the job's raw status and streams.
+/// The command's exit, which the host reports once its leader exits.
+fn read_exit(control: &std::os::unix::net::UnixStream) -> ExitStatus {
+    let (last, _) = read_frame(control).unwrap().expect("an exit");
+    let (tag, mut fields) = FrameReader::new(&last).unwrap();
+    match tag {
+        REPLY_EXITED => {
+            let exit = fields.exit().unwrap();
+            fields.finish().unwrap();
+            exit
+        }
+        REPLY_HOST_FAILED => panic!(
+            "the host failed instead of reporting the exit: {}",
+            String::from_utf8_lossy(fields.bytes().unwrap())
+        ),
+        other => panic!("unexpected reply {other} instead of the exit"),
+    }
+}
+
+/// A script whose leader starts a descendant that records its pid in `marker` and outlives the
+/// leader, which exits with `code` once the descendant runs: a leader that exited first could end
+/// before the interpreter started its background command at all.
+fn outliving_descendant(marker: &Path, code: i32) -> RenderedScript {
+    text(&format!(
+        "sh -c 'printf \"%s\" \"$$\" > {marker}; exec sleep 300' & \
+         while [ ! -s {marker} ]; do sleep 0.01; done; exit {code}",
+        marker = marker.display()
+    ))
+}
+
+/// Release the held command, as a supervisor does once the job concluded, and see it reaped.
+fn release(control: &std::os::unix::net::UnixStream) {
+    let frame = FrameWriter::new(REQUEST_RELEASE).finish().unwrap();
+    std::io::Write::write_all(&mut &*control, &frame).expect("send the release");
+    let (reply, _) = read_frame(control).unwrap().expect("a release reply");
+    let (tag, fields) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_RELEASED);
+    fields.finish().unwrap();
+}
+
+/// A script request on its way: the host's first reply and the readers of the job's streams.
+struct Submitted {
+    reply: Vec<u8>,
+    readers: [std::thread::JoinHandle<String>; 2],
+}
+
+/// Send a rendered script to a host's control socket and read the host's first reply.
+fn submit(
+    control: &std::os::unix::net::UnixStream,
+    directory: &Path,
+    script: &RenderedScript,
+) -> Submitted {
+    let (stdout_read, stdout_write) = pipe();
+    let (stderr_read, stderr_write) = pipe();
+    let stdin = OwnedFd::from(std::fs::File::open("/dev/null").expect("null device"));
+    let mut frame = FrameWriter::new(REQUEST_SCRIPT)
+        .bytes(script.text.as_bytes())
+        .unwrap()
+        .u32(u32::try_from(script.bindings.len()).unwrap());
+    for binding in &script.bindings {
+        frame = match binding {
+            Binding::Scalar { name, value } => frame
+                .bytes(name.as_bytes())
+                .unwrap()
+                .u32(u32::from(BINDING_SCALAR))
+                .list(std::iter::once(value.as_bytes()))
+                .unwrap(),
+            Binding::Array { name, values } => frame
+                .bytes(name.as_bytes())
+                .unwrap()
+                .u32(u32::from(BINDING_ARRAY))
+                .list(values.iter().map(String::as_bytes))
+                .unwrap(),
+        };
+    }
+    let frame = frame
+        .bytes(directory.as_os_str().as_encoded_bytes())
+        .unwrap()
+        .list(std::iter::empty())
+        .unwrap()
+        .finish()
+        .unwrap();
+    let sent = send_with_descriptors(
+        control.as_raw_fd(),
+        &frame,
+        &[
+            stdin.as_raw_fd(),
+            stdout_write.as_raw_fd(),
+            stderr_write.as_raw_fd(),
+        ],
+    )
+    .expect("send the request");
+    std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
+    drop((stdin, stdout_write, stderr_write));
+    let readers = [stdout_read, stderr_read].map(|reader| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::fs::File::from(reader)
+                .read_to_end(&mut bytes)
+                .expect("read a job stream");
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    });
+    let (reply, _) = read_frame(control).unwrap().expect("a reply");
+    Submitted { reply, readers }
+}
+
+/// Run a rendered script on a host's control socket as a supervisor does: its exit, then its
+/// streams to their end, then its release. Returns the job's exit and streams.
 fn run_on(
     control: &std::os::unix::net::UnixStream,
     directory: &Path,
     script: &RenderedScript,
     signal: Option<i32>,
 ) -> Ran {
-    {
-        let (stdout_read, stdout_write) = pipe();
-        let (stderr_read, stderr_write) = pipe();
-        let stdin = OwnedFd::from(std::fs::File::open("/dev/null").expect("null device"));
-        let mut frame = FrameWriter::new(REQUEST_SCRIPT)
-            .bytes(script.text.as_bytes())
-            .unwrap()
-            .u32(u32::try_from(script.bindings.len()).unwrap());
-        for binding in &script.bindings {
-            frame = match binding {
-                Binding::Scalar { name, value } => frame
-                    .bytes(name.as_bytes())
-                    .unwrap()
-                    .u32(u32::from(BINDING_SCALAR))
-                    .list(std::iter::once(value.as_bytes()))
-                    .unwrap(),
-                Binding::Array { name, values } => frame
-                    .bytes(name.as_bytes())
-                    .unwrap()
-                    .u32(u32::from(BINDING_ARRAY))
-                    .list(values.iter().map(String::as_bytes))
-                    .unwrap(),
-            };
-        }
-        let frame = frame
-            .bytes(directory.as_os_str().as_encoded_bytes())
-            .unwrap()
-            .list(std::iter::empty())
-            .unwrap()
-            .finish()
-            .unwrap();
-        let sent = send_with_descriptors(
-            control.as_raw_fd(),
-            &frame,
-            &[
-                stdin.as_raw_fd(),
-                stdout_write.as_raw_fd(),
-                stderr_write.as_raw_fd(),
-            ],
-        )
-        .expect("send the request");
-        std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
-        drop((stdin, stdout_write, stderr_write));
-        let readers = [stdout_read, stderr_read].map(|reader| {
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                std::fs::File::from(reader)
-                    .read_to_end(&mut bytes)
-                    .expect("read a job stream");
-                String::from_utf8_lossy(&bytes).into_owned()
-            })
-        });
-        let (first, _) = read_frame(control).unwrap().expect("a reply");
-        let (tag, mut fields) = FrameReader::new(&first).unwrap();
-        let (birth, status) = match tag {
-            REPLY_SCRIPT_SYNTAX => (None, None),
-            REPLY_STARTED => {
-                let birth = fields.birth().unwrap();
-                fields.finish().unwrap();
-                if let Some(signal) = signal {
-                    send_signal(control, signal);
-                }
-                let (last, _) = read_frame(control).unwrap().expect("an exit");
-                let (tag, mut fields) = FrameReader::new(&last).unwrap();
-                assert_eq!(tag, REPLY_EXITED);
-                (Some(birth), Some(fields.i32().unwrap()))
+    let Submitted { reply, readers } = submit(control, directory, script);
+    let (tag, mut fields) = FrameReader::new(&reply).unwrap();
+    let (birth, status) = match tag {
+        REPLY_SCRIPT_SYNTAX => (None, None),
+        REPLY_STARTED => {
+            let birth = fields.birth().unwrap();
+            fields.finish().unwrap();
+            if let Some(signal) = signal {
+                send_signal(control, signal);
             }
-            REPLY_HOST_FAILED => panic!(
-                "the host failed: {}",
-                String::from_utf8_lossy(fields.bytes().unwrap())
-            ),
-            other => panic!("unexpected reply {other}"),
-        };
-        let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
-        Ran {
-            pid: birth.as_ref().map(Birth::pid),
-            birth,
-            status,
-            stdout,
-            stderr,
+            (Some(birth), Some(read_exit(control)))
         }
+        REPLY_HOST_FAILED => panic!(
+            "the host failed: {}",
+            String::from_utf8_lossy(fields.bytes().unwrap())
+        ),
+        other => panic!("unexpected reply {other}"),
+    };
+    let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
+    if birth.is_some() {
+        release(control);
+    }
+    Ran {
+        pid: birth.as_ref().map(Birth::pid),
+        birth,
+        status,
+        stdout,
+        stderr,
     }
 }
 
@@ -203,20 +257,24 @@ struct Ran {
     pid: Option<u32>,
     /// The job's group leader as the host observed it before reaping it.
     birth: Option<Birth>,
-    /// Raw `waitpid` status; `None` when the script did not parse.
-    status: Option<i32>,
+    /// `None` when the script did not parse.
+    status: Option<ExitStatus>,
     stdout: String,
     stderr: String,
 }
 
-fn exited(status: Option<i32>) -> Option<i32> {
-    let status = status?;
-    libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status))
+fn exited(status: Option<&ExitStatus>) -> Option<i32> {
+    match status {
+        Some(ExitStatus::Exited { code }) => Some(*code),
+        Some(ExitStatus::Signaled { .. }) | None => None,
+    }
 }
 
-fn signaled(status: Option<i32>) -> Option<i32> {
-    let status = status?;
-    libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status))
+fn signaled(status: Option<&ExitStatus>) -> Option<i32> {
+    match status {
+        Some(ExitStatus::Signaled { signal, .. }) => Some(*signal),
+        Some(ExitStatus::Exited { .. }) | None => None,
+    }
 }
 
 fn pipe() -> (OwnedFd, OwnedFd) {
@@ -285,18 +343,18 @@ fn a_script_has_its_own_streams_and_exact_status() {
     let mut host = Host::start("streams");
     let ran = host.run(&text("printf out; printf err >&2; exit 7"));
     assert_eq!((ran.stdout.as_str(), ran.stderr.as_str()), ("out", "err"));
-    assert_eq!(exited(ran.status), Some(7));
+    assert_eq!(exited(ran.status.as_ref()), Some(7));
 
     let ran = host.run(&text("kill -SEGV $$"));
     assert_eq!(
-        signaled(ran.status),
+        signaled(ran.status.as_ref()),
         Some(libc::SIGSEGV),
         "a script process that dies by a signal reports that signal, not 128+N"
     );
 
     let ran = host.run(&text("/bin/sh -c 'kill -TERM $$'"));
     assert_eq!(
-        exited(ran.status),
+        exited(ran.status.as_ref()),
         Some(128 + libc::SIGTERM),
         "a script whose last command died by a signal exits 128+N, as bash does"
     );
@@ -311,7 +369,7 @@ fn the_host_reports_the_leader_it_observed_before_reaping_it() {
     let mut host = Host::start("birth");
     for source in ["sleep 0.2", "exit 0"] {
         let ran = host.run(&text(source));
-        assert_eq!(exited(ran.status), Some(0));
+        assert_eq!(exited(ran.status.as_ref()), Some(0));
         let leader = ran
             .birth
             .as_ref()
@@ -321,20 +379,132 @@ fn the_host_reports_the_leader_it_observed_before_reaping_it() {
     }
 }
 
-/// A job's signal reaches its command through the host, the command's parent, which applies it
-/// while it still holds the command unreaped. One that arrives after the command ended and was
-/// reaped reaches nothing, and the host goes on to serve the next request.
+/// A job's signal reaches its command's group through the host, the command's parent, which holds
+/// the leader unreaped until the job is released -- after the leader exited too, so descendants
+/// that outlive it and hold the job's output open are still reached. The released host serves
+/// the next command.
 #[test]
-fn the_host_signals_its_running_command_and_ignores_a_late_signal() {
+fn the_host_signals_its_command_s_group_until_it_is_released() {
     let mut host = Host::start("signal");
     let ran = host.run_signalled(&text("sleep 30"), libc::SIGKILL);
-    assert_eq!(signaled(ran.status), Some(libc::SIGKILL));
+    assert_eq!(signaled(ran.status.as_ref()), Some(libc::SIGKILL));
+
+    let marker = host.directory.join("descendant");
+    let Submitted { reply, readers } = submit(
+        &host.control,
+        &host.directory,
+        &outliving_descendant(&marker, 3),
+    );
+    let (tag, _) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_STARTED);
+    assert_eq!(read_exit(&host.control), ExitStatus::Exited { code: 3 });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let descendant = loop {
+        if let Some(pid) = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the descendant never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut job = ScriptJobGuard {
+        host_pid: host.child.id(),
+        leader: -1,
+        descendant,
+        armed: true,
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(alive(descendant), "the descendant outlives the leader");
+    assert!(
+        readers.iter().all(|reader| !reader.is_finished()),
+        "the descendant holds the job's output open"
+    );
+
     send_signal(&host.control, libc::SIGKILL);
+    let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+    assert!(gone(descendant), "the signal reached the descendant");
+    job.armed = false;
+    release(&host.control);
+
     let ran = host.run(&text("printf after"));
     assert_eq!(
-        (exited(ran.status), ran.stdout.as_str()),
+        (exited(ran.status.as_ref()), ran.stdout.as_str()),
         (Some(0), "after")
     );
+}
+
+/// A supervisor that goes away while its command's leader has exited and descendants run on
+/// leaves nothing to signal them: the host ends the command's group itself, reaps the leader and
+/// exits.
+#[test]
+fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
+    let mut host = Host::start("orphan");
+    let marker = host.directory.join("descendant");
+    let Submitted { reply, readers } = submit(
+        &host.control,
+        &host.directory,
+        &outliving_descendant(&marker, 0),
+    );
+    let (tag, _) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_STARTED);
+    assert_eq!(read_exit(&host.control), ExitStatus::Exited { code: 0 });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let descendant = loop {
+        if let Some(pid) = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the descendant never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut job = ScriptJobGuard {
+        host_pid: host.child.id(),
+        leader: -1,
+        descendant,
+        armed: true,
+    };
+    host.control
+        .shutdown(std::net::Shutdown::Both)
+        .expect("close the supervisor's end");
+    let [stdout, _] = readers.map(|reader| reader.join().expect("stream reader"));
+    assert_eq!(stdout, "");
+    let host_status = loop {
+        if let Some(status) = host.child.try_wait().expect("host status") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the host never ended its command"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(host_status.code(), Some(0));
+    assert!(gone(descendant), "the host ended the descendant");
+    job.armed = false;
+}
+
+/// Whether `pid` stops existing within a bound: a killed descendant whose parent already exited
+/// is collected by init, not by this test.
+fn gone(pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 #[test]
@@ -428,7 +598,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         );
     });
     runner.join().unwrap();
-    assert_eq!(signaled(status), Some(libc::SIGTERM));
+    assert_eq!(signaled(status.as_ref()), Some(libc::SIGTERM));
     std::thread::sleep(Duration::from_millis(100));
     for pid in pids {
         assert!(!alive(pid), "process {pid} of the killed script survived");
@@ -457,7 +627,7 @@ fn scripts_forked_at_once_each_run_whole() {
             std::thread::spawn(move || {
                 (0..100)
                     .map(|_| host.run(&text("printf x")))
-                    .filter(|ran| ran.stdout != "x" || exited(ran.status) != Some(0))
+                    .filter(|ran| ran.stdout != "x" || exited(ran.status.as_ref()) != Some(0))
                     .map(|ran| {
                         format!(
                             "stdout {:?}, status {:?}, stderr {:?}",
@@ -486,7 +656,7 @@ fn nothing_one_script_does_to_its_process_reaches_the_next() {
     let first = host.run(&text(
         "umask 077; ulimit -n 64; cd /; export LEAK=1; trap 'echo trapped' EXIT",
     ));
-    assert_eq!(exited(first.status), Some(0));
+    assert_eq!(exited(first.status.as_ref()), Some(0));
     let second = host.run(&text(
         "umask; ulimit -n; printf '%s|%s\\n' \"$PWD\" \"${LEAK-}\"",
     ));

@@ -489,10 +489,53 @@ type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
 /// workspace's grants and compile the profile for them.
 pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
+/// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
+/// its substrate. The persistent file lease serializes stale-socket replacement between binders;
+/// keeping the listener alive prevents admission by a replacement supervisor.
+#[derive(Debug)]
+#[must_use = "hold the socket until serving or the workspace mutation has finished"]
+pub struct BoundSocket {
+    listener: UnixListener,
+    _lease: std::fs::File,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl BoundSocket {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt as _;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.dev() == self.device && metadata.ino() == self.inode => {
+                if let Err(error) = std::fs::remove_file(&self.path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "cowshed: cannot remove retired supervisor socket {}: {error}",
+                        self.path.display()
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "cowshed: cannot inspect retired supervisor socket {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
 /// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
 /// A socket file already at `path` is replaced only when nothing answers on it.
-pub async fn bind(path: &Path) -> Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt as _;
+pub async fn bind(path: &Path) -> Result<BoundSocket> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let directory = path.parent().ok_or_else(|| {
         CowshedError::internal(format!(
             "supervisor socket {} has no parent",
@@ -508,21 +551,60 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
     std::fs::create_dir_all(directory).map_err(|error| io("create the directory of", error))?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| io("restrict the directory of", error))?;
-    match UnixStream::connect(path).await {
-        Ok(_) => {
+    let lock_path = path.with_extension("sock.lock");
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|error| io("open the socket lease of", error))?;
+    match lease.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(CowshedError::conflict(
-                format!("a workspace supervisor already serves {}", path.display()),
-                "stop that supervisor first",
+                format!(
+                    "a supervisor or lifecycle operation owns {}",
+                    path.display()
+                ),
+                "wait for that operation to finish; do not unlink its socket or lock file",
             ));
         }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(io("lock the socket lease of", error));
+        }
+    }
+    match UnixStream::connect(path).await {
+        Ok(stream) => {
+            // NOTE_EXIT can precede the exiting process's final descriptor close. A connection
+            // alone therefore is not a live owner; only its non-reusable kernel identity can
+            // prove it no longer runs. Inspection/refusal errors never authorize replacement.
+            let owner = super::job_groups::Process::of_socket_peer(&stream)
+                .map_err(|error| io("identify the connected owner of", error))?;
+            if owner
+                .signal(0)
+                .map_err(|error| io("verify the connected owner of", error))?
+            {
+                return Err(CowshedError::conflict(
+                    format!("a workspace supervisor already serves {}", path.display()),
+                    "stop that supervisor first",
+                ));
+            }
+            std::fs::remove_file(path).map_err(|error| io("remove the stopped owner's", error))?;
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => match std::fs::remove_file(path) {
-            Ok(()) => {}
-            // The previous server can unlink its socket after our failed connect but before
-            // removal. The next bind still owns the result; this is not a missing directory.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io("remove the stale", error)),
-        },
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                // The previous server can unlink its socket after our failed connect but before
+                // removal. The next bind still owns the result; this is not a missing directory.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io("remove the stale", error)),
+            }
+        }
+        Err(error) => return Err(io("inspect the current server of", error)),
     }
     let listener = UnixListener::bind(path).map_err(|error| io("bind", error))?;
     // The directory already admits only this user; the socket's own mode says the same. The
@@ -530,27 +612,48 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
     // files created meanwhile would get it.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| io("restrict", error))?;
-    Ok(listener)
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| io("identify", error))?;
+    Ok(BoundSocket {
+        listener,
+        _lease: lease,
+        path: path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
-/// Serve `supervisor` on `listener`, one call per connection, until a `retire` call has
-/// retired it and been answered. The caller then unlinks the socket and exits.
+/// Serve `supervisor` on `socket`, one call per connection, until a `retire` call has
+/// retired it and been answered. Releasing the bound socket removes only its own socket inode.
 pub async fn serve(
-    listener: UnixListener,
+    socket: BoundSocket,
     supervisor: WorkspaceSupervisorHandle,
     advances: Option<Advances>,
     feed: Option<super::commitment_feed::CommitmentFeed>,
 ) -> Result<()> {
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
+    let (release, mut released) = mpsc::channel::<(UnixStream, serde_json::Value, Bytes)>(1);
     loop {
         let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted.map_err(|error| {
+            accepted = socket.listener.accept() => accepted.map_err(|error| {
                 CowshedError::environment_missing(
                     format!("workspace supervisor socket stopped accepting: {error}"),
                     "retry; cowshed restarts the workspace supervisor",
                 )
             })?,
+            response = released.recv() => {
+                let (mut stream, value, bytes) = response.ok_or_else(|| {
+                    CowshedError::internal("supervisor retirement reply lane closed")
+                })?;
+                // A successful retirement reply proves replacement admission can acquire the
+                // socket fence already: no acknowledgement-before-listener-release race.
+                drop(socket);
+                write_json(&mut stream, &Response::Ok { value, bytes: bytes.len() }).await?;
+                if !bytes.is_empty() {
+                    write_frame(&mut stream, &bytes, MAX_BYTES_FRAME).await?;
+                }
+                return Ok(());
+            }
             () = retired.notified() => return Ok(()),
         };
         let supervisor = supervisor.clone();
@@ -558,6 +661,7 @@ pub async fn serve(
         let retired = Arc::clone(&retired);
         let advances = advances.clone();
         let feed = feed.clone();
+        let release = release.clone();
         tokio::spawn(async move {
             match serve_call(
                 stream,
@@ -568,7 +672,17 @@ pub async fn serve(
             )
             .await
             {
-                Ok(Retirement::Retired) => retired.notify_one(),
+                Ok(Retirement::Retired {
+                    stream,
+                    value,
+                    bytes,
+                }) => {
+                    if release.send((stream, value, bytes)).await.is_err() {
+                        eprintln!(
+                            "cowshed: retired supervisor socket owner ended before its reply"
+                        );
+                    }
+                }
                 Ok(Retirement::Draining) => {
                     // Under the authority it holds now, which an advance may have moved.
                     let Ok(authority) = supervisor.current_authority().await else {
@@ -588,7 +702,11 @@ pub async fn serve(
 /// Whether a call left the supervisor retired, or asked it to retire once its jobs end.
 enum Retirement {
     Serving,
-    Retired,
+    Retired {
+        stream: UnixStream,
+        value: serde_json::Value,
+        bytes: Bytes,
+    },
     Draining,
 }
 
@@ -697,6 +815,14 @@ async fn serve_call(
             return Ok(Retirement::Serving);
         }
     };
+    if retiring {
+        // The serving loop releases the listener and lease before acknowledging retirement.
+        return Ok(Retirement::Retired {
+            stream,
+            value,
+            bytes,
+        });
+    }
     let answered = async {
         write_json(
             &mut stream,
@@ -712,10 +838,6 @@ async fn serve_call(
         Ok::<(), CowshedError>(())
     }
     .await;
-    if retiring {
-        // Retired is retired whether or not the caller stayed to hear it.
-        return Ok(Retirement::Retired);
-    }
     answered.map(|()| Retirement::Serving)
 }
 
@@ -954,21 +1076,50 @@ pub struct Hello {
 
 /// Who serves `path`, or why it cannot be used: unreachable, or of another cowshed build.
 pub async fn hello(path: &Path) -> Result<Hello> {
-    // A supervisor answers hello from its actor at once; one that cannot within the bound is
-    // wedged, and waiting on it would wedge the caller too.
-    let (value, _) =
-        tokio::time::timeout(HELLO_BOUND, exchange(path, &Request::Hello, Bytes::new()))
-            .await
-            .map_err(|_| {
-                CowshedError::environment_missing(
-                    format!(
-                        "the workspace supervisor at {} did not answer within {} seconds",
-                        path.display(),
-                        HELLO_BOUND.as_secs()
-                    ),
-                    "cowshed doctor --json",
-                )
-            })??;
+    hello_if_present(path).await?.ok_or_else(|| {
+        unavailable(
+            path,
+            &io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no supervisor serves this socket",
+            ),
+        )
+    })
+}
+
+/// Absence is only an absent or connection-refused socket. A live peer's unknown response,
+/// malformed protocol, or bounded hello timeout is an error, never proof it stopped.
+pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
+    tokio::time::timeout(HELLO_BOUND, async {
+        let mut stream = match UnixStream::connect(path).await {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(unavailable(path, &error)),
+        };
+        let (value, _) = exchange_on(&mut stream, path, &Request::Hello, Bytes::new()).await?;
+        decode_hello(path, value).map(Some)
+    })
+    .await
+    .map_err(|_| {
+        CowshedError::environment_missing(
+            format!(
+                "the workspace supervisor at {} did not answer within {} seconds",
+                path.display(),
+                HELLO_BOUND.as_secs()
+            ),
+            "cowshed doctor --json",
+        )
+    })?
+}
+
+fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
     // Read the build before the rest: another build's hello may carry fields this one cannot
     // decode, and the build is what says why. A hello naming no build is another build's too.
     let ours = BuildId::current()?;
@@ -1028,10 +1179,13 @@ pub async fn drain(path: &Path) -> Result<Drained> {
         .await
         .map_err(|error| unavailable(path, &error))?;
     let process = super::job_groups::Process::of_socket_peer(&stream).map_err(|error| {
-        protocol_error(format!(
-            "cannot identify the supervisor at {}: {error}",
-            path.display()
-        ))
+        CowshedError::environment_missing(
+            format!(
+                "cannot identify the supervisor at {}: {error}",
+                path.display()
+            ),
+            "use a host with kernel peer identities; retain the supervisor and its ledger",
+        )
     })?;
     let (value, _) = exchange_on(&mut stream, path, &Request::Drain, Bytes::new()).await?;
     let answered: u32 = decode(value)?;
@@ -1391,5 +1545,71 @@ async fn forward_exec(
             Bytes::new(),
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod socket_ownership_tests {
+    use super::*;
+
+    fn path() -> PathBuf {
+        PathBuf::from("/tmp")
+            .join(format!(
+                "cowshed-fence-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ))
+            .join("s.sock")
+    }
+
+    #[tokio::test]
+    async fn concurrent_binders_never_replace_the_winning_socket() {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = path();
+        let (first, second) = tokio::join!(bind(&path), bind(&path));
+        let winner = match (first, second) {
+            (Ok(socket), Err(error)) | (Err(error), Ok(socket)) => {
+                assert_eq!(error.code, crate::ErrorCode::Conflict);
+                socket
+            }
+            results => panic!("exactly one binder must own the socket: {results:?}"),
+        };
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(winner);
+        assert!(!path.exists(), "only the owning socket removes its inode");
+        let replacement = bind(&path).await.unwrap();
+        assert!(
+            path.exists(),
+            "released ownership permits a replacement listener"
+        );
+        drop(replacement);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_peer_closing_mid_hello_is_unknown_not_absent() {
+        let path = path();
+        let socket = bind(&path).await.unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = socket.listener.accept().await.unwrap();
+            drop(stream);
+            socket
+        });
+        hello_if_present(&path)
+            .await
+            .expect_err("a connected peer's interrupted outcome is unknown");
+        let socket = peer.await.unwrap();
+        assert_eq!(
+            bind(&path).await.unwrap_err().code,
+            crate::ErrorCode::Conflict
+        );
+        drop(socket);
+        assert_eq!(hello_if_present(&path).await.unwrap(), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

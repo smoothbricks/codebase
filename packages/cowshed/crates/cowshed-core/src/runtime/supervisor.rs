@@ -352,8 +352,16 @@ pub enum ProcessEvent {
     ScriptSyntax {
         job_id: JobId,
     },
+    /// A signal the job asked for did not reach its process group.
+    SignalFailed {
+        job_id: JobId,
+        error: CowshedError,
+    },
 }
 
+/// A job's running process. The leader is held unreaped until the handle is dropped -- once the
+/// job concluded, or when its supervisor goes away -- so the group id names the job's group alone
+/// for as long as signals may be sent, descendants that outlive the leader included.
 pub trait RunningProcess: Send {
     /// The command's process as its parent observed it before anything could reap it. `None`
     /// until the process exists; a warm-shell job reports it with [`ProcessEvent::Started`].
@@ -361,13 +369,11 @@ pub trait RunningProcess: Send {
     /// `Ok(false)` means the bounded process-input lane is full.
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
     fn close_stdin(&mut self) -> Result<()>;
-    /// Signal the job's process group, only while the process that reaps its leader proves the
+    /// The leader ended: close the job's stdin for good, so descendants reading it see its end.
+    fn end_stdin(&mut self);
+    /// Signal the job's process group, only while the process that reaps its leader holds the
     /// leader unreaped, so the group id still names the job's group ([`ChildFence`]).
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()>;
-    /// Collects the process's exit status if it has already exited. Only a supervisor that is
-    /// going away asks, once it has signalled the group for the last time: its own wait for the
-    /// process will never run.
-    fn reap_if_exited(&mut self) {}
 }
 
 #[async_trait]
@@ -1799,15 +1805,15 @@ impl SpawnSink for SystemSpawnSink {
             stderr,
             events.clone(),
         ));
-        let reaper = std::sync::Arc::clone(&fence);
+        let watcher = std::sync::Arc::clone(&fence);
         tokio::spawn(async move {
-            let event = match process_termination_from_wait(reaper.wait().await) {
+            let event = match watcher.exited().await {
                 Ok(exit) => ProcessEvent::Exited { job_id, exit },
                 Err(error) => {
-                    // The child was never reaped, so it may still be running. Kill the group
-                    // before reporting: a job that cannot be observed must not be left alive
-                    // behind a terminal record.
-                    let _ = reaper.signal(libc::SIGKILL);
+                    // The child's end was not observed, so it may still be running. Kill the
+                    // group before reporting: a job that cannot be observed must not be left
+                    // alive behind a terminal record.
+                    let _ = watcher.signal(libc::SIGKILL);
                     ProcessEvent::WaitFailed { job_id, error }
                 }
             };
@@ -1854,10 +1860,25 @@ pub(super) fn process_termination_from_wait(
 /// or the record that it is gone -- never a process that reused its id. Nothing else may reap
 /// it: the child is spawned through `std`, whose handle never reaps on its own, not through a
 /// Tokio handle whose dropped children Tokio reaps by pid in the background.
+///
+/// A job's leader is observed exiting without being reaped ([`Self::exited`]) and stays held
+/// until the job concludes ([`Self::release`]): descendants that outlive it may hold the job's
+/// output open, and a kill must still reach them through the group id the held leader keeps.
 pub(super) struct ChildFence {
     pid: i32,
     birth: Birth,
-    reaped: Mutex<bool>,
+    hold: Mutex<Hold>,
+}
+
+/// Where a fenced child is, as far as signalling its group is concerned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hold {
+    /// Unreaped, running or exited: its id names only it, and its group id only its group.
+    Held,
+    /// Unreaped, and wanted no longer: it is reaped as soon as it is seen exited.
+    Released,
+    /// Collected: its id may name another process, so no signal follows.
+    Reaped,
 }
 
 impl ChildFence {
@@ -1872,7 +1893,7 @@ impl ChildFence {
         Ok(Self {
             pid: leader,
             birth: Birth::of(pid),
-            reaped: Mutex::new(false),
+            hold: Mutex::new(Hold::Held),
         })
     }
 
@@ -1880,10 +1901,14 @@ impl ChildFence {
         &self.birth
     }
 
+    fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
+        self.hold.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Signal the group the child leads, while it is unreaped.
     pub(super) fn signal(&self, signal: i32) -> Result<()> {
-        let reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
-        if *reaped {
+        let hold = self.hold();
+        if *hold == Hold::Reaped {
             return Err(CowshedError::conflict(
                 format!(
                     "process {} has been reaped; processes still holding its group id cannot be \
@@ -1902,21 +1927,22 @@ impl ChildFence {
                 format!("inspect it with `ps -g {}`", self.pid),
             ));
         }
-        signal_unreaped_group(self.pid, signal)
+        super::job_groups::signal_unreaped_group(self.pid, signal).map_err(|error| {
+            CowshedError::environment_missing(
+                format!("failed to signal sandbox process tree: {error}"),
+                "inspect the job and retry",
+            )
+        })
     }
 
-    /// Reap the child, inside the fence, if it has exited; `None` while it runs.
-    pub(super) fn try_reap(&self) -> io::Result<Option<std::process::ExitStatus>> {
-        let mut reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
-        if *reaped {
-            return Err(io::Error::other("the child was already reaped"));
-        }
+    /// Collect the child inside the fence if it has exited; `None` while it runs.
+    fn collect(&self, hold: &mut Hold) -> io::Result<Option<std::process::ExitStatus>> {
         loop {
             let mut status = 0;
             // SAFETY: `pid` is this process's own child and `status` a valid out-pointer.
             let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             if waited == self.pid {
-                *reaped = true;
+                *hold = Hold::Reaped;
                 return Ok(Some(std::process::ExitStatus::from_raw(status)));
             }
             if waited == 0 {
@@ -1925,13 +1951,79 @@ impl ChildFence {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ECHILD) {
                 // Something else collected it: its id is free, so no signal may follow.
-                *reaped = true;
+                *hold = Hold::Reaped;
                 return Err(error);
             }
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
         }
+    }
+
+    /// How the child ended, if it has, read without reaping it -- unless it was released.
+    fn look(&self) -> io::Result<Option<ExitStatus>> {
+        let mut hold = self.hold();
+        if *hold == Hold::Reaped {
+            return Err(io::Error::other("the child was already reaped"));
+        }
+        let exit = match super::job_groups::exit_unreaped(self.pid) {
+            Ok(exit) => exit,
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    // Something else collected it: its id is free, so no signal may follow.
+                    *hold = Hold::Reaped;
+                }
+                return Err(error);
+            }
+        };
+        if exit.is_some() && *hold == Hold::Released {
+            self.collect(&mut hold)?;
+        }
+        Ok(exit)
+    }
+
+    /// Wait for the child to exit without reaping it: it stays held until [`Self::release`].
+    /// The child-exit notifications are subscribed before the first look, so none falls between
+    /// a look and the wait for the next.
+    pub(super) async fn exited(&self) -> Result<ExitStatus> {
+        let unobserved = |error: io::Error| {
+            CowshedError::integrity(
+                format!("cannot wait for the sandbox process: {error}"),
+                "cowshed doctor --json",
+            )
+        };
+        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(unobserved)?;
+        loop {
+            if let Some(exit) = self.look().map_err(unobserved)? {
+                return Ok(exit);
+            }
+            if exits.recv().await.is_none() {
+                return Err(unobserved(io::Error::other(
+                    "child-exit notifications ended",
+                )));
+            }
+        }
+    }
+
+    /// Nothing more is wanted of the child: reap it now if it has exited, or as soon as it is
+    /// seen exiting.
+    pub(super) fn release(&self) -> io::Result<()> {
+        let mut hold = self.hold();
+        if *hold != Hold::Held {
+            return Ok(());
+        }
+        *hold = Hold::Released;
+        self.collect(&mut hold).map(drop)
+    }
+
+    /// Reap the child, inside the fence, if it has exited; `None` while it runs.
+    pub(super) fn try_reap(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        let mut hold = self.hold();
+        if *hold == Hold::Reaped {
+            return Err(io::Error::other("the child was already reaped"));
+        }
+        self.collect(&mut hold)
     }
 
     /// Wait for the child to exit and reap it inside the fence. The child-exit notifications are
@@ -1949,29 +2041,6 @@ impl ChildFence {
     }
 }
 
-/// `killpg` for a group whose leader the caller holds unreaped.
-fn signal_unreaped_group(pgid: i32, signal: i32) -> Result<()> {
-    // SAFETY: killpg takes plain integers and touches no memory of ours.
-    if unsafe { libc::killpg(pgid, signal) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
-        // Darwin refuses a group whose only members are unreaped, like this leader: nothing in
-        // it is left to signal.
-        Some(libc::EPERM)
-            if matches!(super::job_groups::group_has_live_members(pgid), Ok(false)) =>
-        {
-            Ok(())
-        }
-        _ => Err(CowshedError::environment_missing(
-            format!("failed to signal sandbox process tree: {error}"),
-            "inspect the job and retry",
-        )),
-    }
-}
-
 pub(super) enum SystemStdin {
     Write(Bytes),
     Close,
@@ -1979,14 +2048,15 @@ pub(super) enum SystemStdin {
 
 /// The bounded lane from the actor to a job's stdin pump.
 pub(super) struct StdinLane {
-    sender: mpsc::Sender<SystemStdin>,
+    /// `None` once the job's leader ended: the pump then closes the pipe.
+    sender: Option<mpsc::Sender<SystemStdin>>,
     closed: bool,
 }
 
 impl StdinLane {
     pub(super) fn new(sender: mpsc::Sender<SystemStdin>) -> Self {
         Self {
-            sender,
+            sender: Some(sender),
             closed: false,
         }
     }
@@ -1998,13 +2068,19 @@ impl StdinLane {
                 "attach before closing stdin",
             ));
         }
-        match self.sender.try_send(SystemStdin::Write(bytes)) {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(CowshedError::conflict(
+        let unavailable = || {
+            CowshedError::conflict(
                 "job stdin is no longer available",
                 "inspect the terminal job status",
-            )),
+            )
+        };
+        let Some(sender) = &self.sender else {
+            return Err(unavailable());
+        };
+        match sender.try_send(SystemStdin::Write(bytes)) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(unavailable()),
         }
     }
 
@@ -2012,7 +2088,11 @@ impl StdinLane {
         if self.closed {
             return Ok(());
         }
-        match self.sender.try_send(SystemStdin::Close) {
+        let Some(sender) = &self.sender else {
+            self.closed = true;
+            return Ok(());
+        };
+        match sender.try_send(SystemStdin::Close) {
             Ok(()) => {
                 self.closed = true;
                 Ok(())
@@ -2026,6 +2106,13 @@ impl StdinLane {
                 Ok(())
             }
         }
+    }
+
+    /// The job's leader ended: drop the lane, so the pump closes the pipe once it has written
+    /// what it already took.
+    pub(super) fn end(&mut self) {
+        self.sender = None;
+        self.closed = true;
     }
 }
 
@@ -2047,17 +2134,28 @@ impl RunningProcess for SystemRunningProcess {
         self.stdin.close()
     }
 
+    fn end_stdin(&mut self) {
+        self.stdin.end();
+    }
+
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
         self.fence.signal(match signal {
             ProcessSignal::Term => libc::SIGTERM,
             ProcessSignal::Kill => libc::SIGKILL,
         })
     }
+}
 
-    fn reap_if_exited(&mut self) {
-        // A still-running child leaves nothing to collect, and an already-reaped one is the
-        // fence's record; either way the drop path has nothing more to do.
-        let _ = self.fence.try_reap();
+/// The job concluded, or its supervisor is going away: the leader is reaped now if it exited, or
+/// by its watcher as soon as it does.
+impl Drop for SystemRunningProcess {
+    fn drop(&mut self) {
+        if let Err(error) = self.fence.release() {
+            eprintln!(
+                "cowshed: cannot reap the sandbox process {}: {error}",
+                self.fence.birth().pid()
+            );
+        }
     }
 }
 
@@ -2784,10 +2882,10 @@ struct SupervisorActor {
 /// that stops its own children on SIGTERM (Nx's task runner stops task trees it keeps in their
 /// own sessions, beyond this group) gets to. Nothing runs after a drop, so the grace is waited out
 /// here, blocking, and only when a job was still running. A host that wants its jobs' cleanup to
-/// be asynchronous cancels them before it drops the runtime. Exited leaders are reaped only after
-/// the last signal, since its own wait will never run: reaping first would free the leader's id
-/// and leave nothing to prove the group the job's. Any failure to signal is reported, because the
-/// job then outlives its supervisor.
+/// be asynchronous cancels them before it drops the runtime. The leaders are released only after
+/// the last signal, when the job handles drop with the actor: releasing first would free a
+/// leader's id and leave nothing to prove the group the job's. Any failure to signal is reported,
+/// because the job then outlives its supervisor.
 impl Drop for SupervisorActor {
     fn drop(&mut self) {
         let grace = self.term_grace;
@@ -2806,7 +2904,6 @@ impl Drop for SupervisorActor {
         std::thread::sleep(grace);
         for (id, process) in &mut running {
             report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Kill));
-            process.reap_if_exited();
         }
     }
 }
@@ -3017,8 +3114,9 @@ impl SupervisorActor {
     }
 
     /// Replace the group ledger with the groups of the jobs whose terminal record is not durable,
-    /// and the inherited unresolved groups processes still hold. One found released is dropped
-    /// for good: its id may later name a stranger's group, which this ledger has no claim to.
+    /// or whose end was never observed, and the inherited unresolved groups processes still hold.
+    /// One found released is dropped for good: its id may later name a stranger's group, which
+    /// this ledger has no claim to.
     fn record_groups(&mut self) {
         let Some(path) = &self.group_ledger else {
             return;
@@ -3026,11 +3124,22 @@ impl SupervisorActor {
         let groups: Vec<(u64, super::job_groups::GroupLeader)> = self
             .jobs
             .iter()
-            .filter(|(_, job)| !job.sealed())
+            // A job sealed after a wait failure may have left its group running: nothing saw it
+            // end, so the ledger keeps it for whoever finds this supervisor gone.
+            .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
             .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)))
             .collect();
         match super::job_groups::record(path, &groups, &self.inherited_groups) {
-            Ok(carried) => self.inherited_groups = carried,
+            Ok(recorded) => {
+                for error in &recorded.uninspected {
+                    eprintln!(
+                        "cowshed: an inherited unresolved process group in {} could not be \
+                         inspected and is carried as it was: {error}",
+                        path.display()
+                    );
+                }
+                self.inherited_groups = recorded.carried;
+            }
             Err(error) => {
                 // The jobs run either way; what is lost is only the means to end them should
                 // this supervisor die, which is worth saying where the daemon log shows it.
@@ -3747,7 +3856,7 @@ impl SupervisorActor {
             ProcessEvent::Exited { job_id, exit } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.exit = Some(exit);
-                    release_exited_process(job);
+                    end_job_stdin(job);
                 }
             }
             ProcessEvent::WaitFailed { job_id, error } => {
@@ -3755,6 +3864,13 @@ impl SupervisorActor {
                     return;
                 };
                 if job.terminal() {
+                    // The job's record is final; what failed is the release of its process,
+                    // whose group is no longer provably the job's.
+                    eprintln!(
+                        "cowshed: job {}'s process was not released after the job concluded: {}",
+                        job_id.get(),
+                        error.message
+                    );
                     return;
                 }
                 // `exit` stays `None`: there is no truthful status to publish. The job seals as
@@ -3762,14 +3878,14 @@ impl SupervisorActor {
                 // can never be read as a completed one.
                 job.wait_failure = Some(error);
                 job.kill_reason = Some(KillReason::WaitFailure);
-                // The child was never reaped, so it may still be running. Kill the group before
-                // retiring the handle: an unobservable process must not outlive its record. The
-                // spawn sink's own wait task kills too, because it is the one component that is
-                // still alive if this actor has already stopped.
+                // The child's end was not observed, so it may still be running. Kill the group
+                // while the handle still holds it: an unobservable process must not outlive its
+                // record. The spawn sink's own wait task kills too, because it is the one
+                // component that is still alive if this actor has already stopped.
                 if let Some(process) = job.process.as_mut() {
                     let _ = process.signal_process_tree(ProcessSignal::Kill);
                 }
-                release_exited_process(job);
+                end_job_stdin(job);
             }
             ProcessEvent::StdinReady { job_id } => self.flush_stdin(job_id),
             ProcessEvent::StdinPumpWrite {
@@ -3808,7 +3924,7 @@ impl SupervisorActor {
                     code: error.exec_wrapper_exit_code().into(),
                 });
                 job.kill_reason = Some(KillReason::SpawnFailure);
-                release_exited_process(job);
+                end_job_stdin(job);
             }
             ProcessEvent::ScriptSyntax { job_id } => {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
@@ -3820,7 +3936,7 @@ impl SupervisorActor {
                 // Bash's own status for a script that does not parse.
                 job.exit = Some(ExitStatus::Exited { code: 2 });
                 job.kill_reason = Some(KillReason::ScriptSyntax);
-                release_exited_process(job);
+                end_job_stdin(job);
             }
             ProcessEvent::Escalate { job_id } => {
                 if let Some(job) = self.jobs.get_mut(&job_id)
@@ -3828,6 +3944,21 @@ impl SupervisorActor {
                     && let Some(process) = job.process.as_mut()
                 {
                     let _ = process.signal_process_tree(ProcessSignal::Kill);
+                }
+            }
+            ProcessEvent::SignalFailed { job_id, error } => {
+                let Some(job) = self.jobs.get_mut(&job_id) else {
+                    return;
+                };
+                // The job runs on: whoever asked for it to end is told it was not signalled, and
+                // the daemon log says so for the ends nobody waits on (retirement, output limit).
+                eprintln!(
+                    "cowshed: a signal for job {} did not reach it: {}",
+                    job_id.get(),
+                    error.message
+                );
+                for waiter in job.kill_waiters.drain(..) {
+                    let _ = waiter.send(Err(error.clone()));
                 }
             }
         }
@@ -4040,6 +4171,8 @@ impl SupervisorActor {
             Err(error) => Conclusion::Unsealed(error),
         };
         job.conclusion = Some(conclusion);
+        // The job concluded: nothing signals its group any more, and its leader is reaped.
+        job.process = None;
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
@@ -4278,9 +4411,12 @@ fn adopt_birth(job: &mut JobStateRecord, ledger: bool, birth: Birth) {
     job.birth = Some(birth);
 }
 
-/// Retire the process handle and release everything that was waiting on its stdin.
-fn release_exited_process(job: &mut JobStateRecord) {
-    job.process = None;
+/// The job's leader ended: its stdin closes for good and everything waiting on it is answered.
+/// The process stays held until the job concludes, so its group can still be signalled.
+fn end_job_stdin(job: &mut JobStateRecord) {
+    if let Some(process) = job.process.as_mut() {
+        process.end_stdin();
+    }
     for pending in job.pending_stdin.drain(..) {
         let _ = pending.reply.send(Err(CowshedError::conflict(
             "job exited before stdin was accepted",
@@ -5602,5 +5738,50 @@ mod process_death_tests {
         assert!(super::super::job_groups::group_has_live_members(pgid).unwrap());
         // SAFETY: the test's own descendant still holds the group it made.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+
+    /// A job's leader is observed exiting, with its exact status, while it stays unreaped: a kill
+    /// still reaches the descendants that outlive it and hold the job's output open. The leader
+    /// is reaped only once the job releases it, and nothing is signalled after that.
+    #[tokio::test]
+    async fn an_exited_leader_is_held_until_its_job_releases_it() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut job = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 300 & exit 3"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut output = job.stdout.take().unwrap();
+        let pgid = i32::try_from(job.id()).unwrap();
+        let fence = ChildFence::new(job.id()).unwrap();
+        assert_eq!(
+            fence.exited().await.unwrap(),
+            ExitStatus::Exited { code: 3 }
+        );
+        // Observing the exit did not reap it: it is observed again, and the descendant is still
+        // in the group the held leader's id names.
+        assert_eq!(
+            fence.exited().await.unwrap(),
+            ExitStatus::Exited { code: 3 }
+        );
+        assert!(super::super::job_groups::group_has_live_members(pgid).unwrap());
+        fence
+            .signal(libc::SIGKILL)
+            .expect("an exited, held leader's group is the job's");
+        let mut rest = Vec::new();
+        output
+            .read_to_end(&mut rest)
+            .expect("the output ends with the descendant");
+        assert!(rest.is_empty());
+        fence.release().unwrap();
+        assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            fence.signal(libc::SIGTERM).unwrap_err().code,
+            crate::error::ErrorCode::Conflict
+        );
     }
 }

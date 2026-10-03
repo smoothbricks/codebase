@@ -449,6 +449,59 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
     );
 }
 
+/// A warm command whose leader exits while a descendant holds the job's output open is still the
+/// job's: the job runs on, a kill reaches the descendant through the group the host still holds,
+/// and the job ends Killed with the leader's own exit. The warm shell serves the next command
+/// once the host released the command.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_kill_reaches_the_descendants_of_an_exited_leader() {
+    let workspace = Workspace::new("shell-pool-exited-leader", 41_344);
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    run(&handle, sh("true")).await.ok();
+    let job = handle
+        .exec(None, sh("sleep 300 & printf '%s\\n' $! > pid; exit 3"))
+        .await
+        .expect("admit");
+    let pid = workspace.mount().join("pid");
+    let recorded = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pid)
+                && text.ends_with('\n')
+            {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the job records its descendant");
+    let descendant: i32 = recorded.trim().parse().expect("pid");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        handle.info(job).await.expect("job status").state,
+        JobState::Running,
+        "the descendant holds the job's output open"
+    );
+    handle.kill(job).await.expect("kill");
+    let info = tokio::time::timeout(Duration::from_secs(10), handle.wait(job))
+        .await
+        .expect("the killed job ends")
+        .expect("killed job");
+    assert_eq!(
+        (info.state, info.exit),
+        (JobState::Killed, Some(ExitStatus::Exited { code: 3 }))
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !process_alive(descendant),
+        "the kill reached the exited leader's descendant"
+    );
+    assert_eq!(run(&handle, sh("printf again")).await.ok().stdout, "again");
+    assert_eq!(workspace.activations(), 1, "the warm shell was kept");
+}
+
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_read_only_and_read_write_never_share_a_shell() {

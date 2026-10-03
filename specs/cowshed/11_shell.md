@@ -52,17 +52,23 @@ group, so a kill reaches all of them and never the host; a killed script dies by
 
 **Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
 birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
-hosts are direct children held by a parent-owned reap/signal fence: signalling and `waitpid` serialize on that fence,
-and a reaped child can never be signalled by its old numeric pid. The parent waits through exit notifications, without
-holding a blocking lock across an await. A warm host reports the observed identity with its start reply; the supervisor
-never samples a reported pid later to manufacture one. A failed observation is explicit operational data and never
-becomes a signal or ledger claim.
+hosts are direct children held by a parent-owned reap/signal fence. A job's leader is observed exiting **without
+reaping** (`WNOWAIT`) and remains held until the complete job concludes: descendants can outlive the leader and keep its
+output pipes open. A later `kill`, quota stop, or retirement therefore still reaches their exact group. Only after both
+pipes end and the terminal outcome is established does the parent release and reap the leader. Signals and reaping
+serialize on the fence, without holding a blocking lock across an await; a released/reaped id grants no future signal
+rights. Birth-observation failure never becomes a ledger claim, but the actual parent's unreaped child remains its own.
 
-A warm command's signal is a framed request to its host, the command's actual parent, rather than `killpg` in the
-supervisor. The host retains the child unreaped while handling a signal, then returns its exact wait status. A signal
-that arrives after reaping reaches nothing, including the next command. A malformed or unknown control frame fails
-closed. Host/controller EOF still terminates and reaps the host's own command; it never turns a stale start reply into
-permission to signal another process.
+A warm command's signals are framed `REQUEST_SIGNAL`s to its actual parent host. The host reports the observed birth
+with `REPLY_STARTED`, and its exact typed exit with `REPLY_EXITED`, while keeping the leader unreaped. It continues
+serving signals until the supervisor concludes the job and sends `REQUEST_RELEASE`; `REPLY_RELEASED` acknowledges actual
+reaping, and only then may that host serve another command. Failed signal delivery is `REPLY_SIGNAL_FAILED`, not silent
+success. Signal/release while no command is held, malformed frames, and unknown tags fail closed.
+
+Parent-side output/diagnostic writers are dropped as soon as the command starts, not kept until release: otherwise EOF
+would wait for release while release waited for EOF. Every post-fork failure and controller EOF ends the host's own held
+command group with TERM, the existing grace, KILL, and reap. The supervisor never force-kills the host before that
+command retirement can run, and no stale start reply can authorize signalling another process.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
@@ -177,9 +183,11 @@ Each supervisor listens on a Unix socket at `<store>/run/<digest>.sock`, where `
 the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and workspace names together can exceed the
 104 bytes a socket path may hold on macOS; the digest keeps every path at 64 and no two workspaces share one. The
 serving process creates `<store>/run` mode `0700`, so no other user reaches a socket in it, binds the socket there and
-sets it `0600`, and verifies each connecting peer's uid before reading a byte. Binding replaces a socket file only when
-nothing answers on it; a live supervisor is never displaced. The serving process unlinks the socket when the supervisor
-is retired.
+sets it `0600`, and verifies each connecting peer's uid before reading a byte. A persistent no-follow file lease at
+`<digest>.sock.lock` serializes binders and stale-socket replacement. The bound listener and lease are one owned value,
+held throughout serving or a workspace mutation. A connected peer is never displaced unless its non-reusable kernel
+identity positively proves it no longer runs; unknown inspection or hello outcomes retain its socket and ledger.
+Retirement releases the listener and lease **before** acknowledging success, and removes only its own socket inode.
 
 Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
 stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
@@ -491,7 +499,10 @@ admitted but never sealed. Two things put that right:
   ledger operation signals a numeric pid or group after an ownership check. A reused live leader is left alone. A reaped
   or never-identified leader with surviving members is unresolved, never signalled or silently dropped. A full
   membership buffer is not absence evidence; inspection and signal failures retain the ledger and report the operational
-  error.
+  error. KILL is followed by bounded membership verification; live survivors or inspection errors retain the ledger
+  rather than claiming release. A sealed failed-wait record is not process-release proof, so its still-unaccounted-for
+  group remains recorded. Failed inspection of an inherited group likewise retains that entry while recording new
+  groups.
 
   Every replacement supervisor inherits unresolved entries with their original job, group, and lost supervisor. Each
   subsequent ledger rewrite carries them while the group remains unaccounted for, and drops only entries proven
@@ -543,10 +554,13 @@ layer is not optional glue but core to correct lifecycle.
 
 Lost-supervisor groups that cannot be safely identified do not block ordinary supervisor startup or new admission. They
 do block destroying or replacing the canonical image: `rm`, checkpoint restore, and adopted-main restore reconcile the
-ledger **after** stopping the supervisor and return a typed refusal while any unresolved group remains. Neither
-`--force` nor a prior ended marker authorizes detaching beneath an unaccounted-for writer. Ordinary detach and resize
-already use idle-only unmounting, without a force fallback. Grant changes retain their existing contract above: jobs
-already running keep their original profiles; a revision change is not a claim that every old-authority process died.
+ledger **after** stopping the supervisor while holding the exclusive socket/listener lease across the mutation. Unknown
+hello, retirement, or exit outcomes are errors, not proof of absence; no group takeover runs beside a live supervisor.
+The adopted-main refusal guard runs before recording any mutation intent, so a clean refusal cannot lock later safe
+admission out through intent replay. Neither `--force` nor an ended marker authorizes detaching beneath an
+unaccounted-for writer. Ordinary detach and resize use idle-only unmounting without a force fallback. Grant changes
+retain their existing contract above: running jobs keep their original profiles; a revision change never claims every
+old-authority process died.
 
 ## doctor awareness
 

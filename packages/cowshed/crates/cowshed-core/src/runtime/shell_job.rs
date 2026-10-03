@@ -2,9 +2,10 @@
 //!
 //! A job keeps every part of its contract: its own anonymous stdin/stdout/stderr pipes, pumped
 //! and quota-accounted by the supervisor exactly as for a one-shot child; its own process group
-//! (the host forks the argv with `setpgid`); its exact wait status (the host reports the raw
-//! `waitpid` status); and a kill that reaches its group — never the host's — unless the host
-//! itself is still activating for that job.
+//! (the host forks the argv with `setpgid`); its exact exit; and a kill that reaches its group —
+//! never the host's — unless the host itself is still activating for that job. The host holds the
+//! command's leader unreaped until the job concludes, so a kill also reaches descendants that
+//! outlive the leader.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -21,15 +22,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE,
-    REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY,
-    ShellHostProgram, send_with_descriptors,
+    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX, REPLY_SIGNAL_FAILED, REPLY_STARTED,
+    REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT,
+    REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram, send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
@@ -180,6 +181,7 @@ impl WorkspaceShells {
             events.clone(),
         ));
         let control = Arc::new(JobControl::default());
+        let (release, released) = oneshot::channel();
         tokio::spawn(drive(
             pool,
             JobIo {
@@ -193,12 +195,14 @@ impl WorkspaceShells {
                 overlay,
             },
             Arc::clone(&control),
+            released,
             job_id,
             events,
         ));
         Ok(Box::new(PooledProcess {
             stdin: StdinLane::new(stdin_sender),
             control,
+            _release: release,
         }))
     }
 }
@@ -243,9 +247,10 @@ fn null_device() -> io::Result<OwnedFd> {
 /// While a fresh host activates for the job, that host's group is the job (activation output and
 /// failure belong to the job): this process is the host's parent and signals it through the
 /// host's reap fence ([`ChildFence`]). Once the command starts, the command's own group is: the
-/// host forked the command and alone reaps it, so a signal is sent to the host, which applies it
-/// only while it still holds the command unreaped. No signal is ever sent to a group whose leader
-/// this process cannot vouch for. A signal requested before either exists is recorded and
+/// host forked the command and holds it unreaped until the job concludes, so a signal is sent to
+/// the host, which applies it to the command's group. No signal is ever sent to a group whose
+/// leader this process cannot vouch for. A signal requested while neither is published -- before
+/// the host exists, or between its activation and the command's start -- is recorded and
 /// delivered the moment one is published, so no window loses it.
 #[derive(Default)]
 pub(super) struct JobControl {
@@ -260,6 +265,7 @@ enum Target {
     Host(Arc<ChildFence>),
     /// The command's host, through the run that forwards signals to it.
     Command(mpsc::UnboundedSender<i32>),
+    /// The run ended: the command was released, or never started, or its host is gone.
     Finished,
 }
 
@@ -269,25 +275,33 @@ impl Target {
             Self::Host(fence) => fence.signal(signal),
             Self::Command(host) => host.send(signal).map_err(|_| {
                 CowshedError::conflict(
-                    "the job's run no longer forwards signals to its host: the command ended, its \
-                     host is gone, or the supervisor is going away, in which case the host ends \
-                     the command itself",
+                    "the job's run no longer forwards signals to its host: the host is gone",
                     "inspect the job's status",
                 )
             }),
-            Self::Pending | Self::Finished => Ok(()),
+            // Recorded in `requested`; delivered once a target is published.
+            Self::Pending => Ok(()),
+            Self::Finished => Err(CowshedError::conflict(
+                "the job's run has ended: its command was released or never started, or its \
+                 host is gone, so nothing of it is left to signal",
+                "inspect the job's status",
+            )),
         }
     }
 }
 
 impl JobControl {
-    fn publish(&self, published: Target) {
+    /// Publish where signals go from now on, delivering the one already requested, if any.
+    fn publish(&self, published: Target) -> Result<()> {
         let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
         let requested = self.requested.load(Ordering::SeqCst);
-        if requested != 0 {
-            let _ = published.deliver(requested);
-        }
+        let delivered = if requested == 0 {
+            Ok(())
+        } else {
+            published.deliver(requested)
+        };
         *target = published;
+        delivered
     }
 
     fn finish(&self) {
@@ -306,6 +320,9 @@ impl JobControl {
 struct PooledProcess {
     stdin: StdinLane,
     control: Arc<JobControl>,
+    /// Dropped with the handle, once the job concluded or its supervisor went away: the run then
+    /// has the host reap the command.
+    _release: oneshot::Sender<()>,
 }
 
 impl RunningProcess for PooledProcess {
@@ -320,6 +337,10 @@ impl RunningProcess for PooledProcess {
 
     fn close_stdin(&mut self) -> Result<()> {
         self.stdin.close()
+    }
+
+    fn end_stdin(&mut self) {
+        self.stdin.end();
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
@@ -347,6 +368,8 @@ struct RunCommand {
 
 enum Outcome {
     Exited(ExitStatus),
+    /// A started command's exit was reported as it happened, and its hold has ended.
+    Reported,
     /// The command ran but its end was not observed: its host is gone, and with it the only
     /// process that could prove the command's group its own, so the group was not signalled.
     Unobserved(CowshedError),
@@ -368,14 +391,29 @@ async fn drive(
     io: JobIo,
     command: RunCommand,
     control: Arc<JobControl>,
+    released: oneshot::Receiver<()>,
     job_id: JobId,
     events: mpsc::Sender<ProcessEvent>,
 ) {
-    let diagnostics = io.stderr.try_clone().ok();
-    let outcome = run_pooled(pool, io, command, &control, job_id, &events).await;
+    // A copy of the job's stderr, for saying why no command ran. It is closed the moment the
+    // command starts: while this process holds a writer, the job's stderr never ends, and the
+    // job never concludes.
+    let mut diagnostics = io.stderr.try_clone().ok();
+    let outcome = run_pooled(
+        pool,
+        io,
+        command,
+        &control,
+        released,
+        &mut diagnostics,
+        job_id,
+        &events,
+    )
+    .await;
     control.finish();
     let event = match outcome {
         Outcome::Exited(exit) => ProcessEvent::Exited { job_id, exit },
+        Outcome::Reported => return,
         Outcome::Unobserved(error) => ProcessEvent::WaitFailed { job_id, error },
         Outcome::NotLaunched(error) => {
             if let Some(diagnostics) = diagnostics {
@@ -403,15 +441,29 @@ fn note(stderr: &Option<OwnedFd>, error: &CowshedError) {
     }
 }
 
+/// Report a signal the job asked for that did not reach its target.
+async fn signal_failed(events: &mpsc::Sender<ProcessEvent>, job_id: JobId, delivered: Result<()>) {
+    if let Err(error) = delivered {
+        let _ = events
+            .send(ProcessEvent::SignalFailed { job_id, error })
+            .await;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one job's run: its pool, streams, command, control, release and event lane"
+)]
 async fn run_pooled(
     pool: ShellPool<HostActivator>,
     io: JobIo,
     command: RunCommand,
     control: &JobControl,
+    mut released: oneshot::Receiver<()>,
+    diagnostics: &mut Option<OwnedFd>,
     job_id: JobId,
     events: &mpsc::Sender<ProcessEvent>,
 ) -> Outcome {
-    let diagnostics = io.stderr.try_clone().ok();
     let acquired = match pool.acquire().await {
         Ok(acquired) => acquired,
         Err(error) => return Outcome::NotLaunched(error),
@@ -424,7 +476,12 @@ async fn run_pooled(
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
             };
-            control.publish(Target::Host(Arc::clone(&host.fence)));
+            signal_failed(
+                events,
+                job_id,
+                control.publish(Target::Host(Arc::clone(&host.fence))),
+            )
+            .await;
             let output = match (io.stdout.try_clone(), io.stderr.try_clone()) {
                 (Ok(stdout), Ok(stderr)) => (stdout, stderr),
                 (Err(error), _) | (_, Err(error)) => {
@@ -445,7 +502,7 @@ async fn run_pooled(
                     // here, is a launch that failed.
                     return match host.end().await {
                         HostEnd::Own(status) if libc::WIFSIGNALED(status) => {
-                            note(&diagnostics, &error);
+                            note(diagnostics, &error);
                             decode(status)
                         }
                         HostEnd::Own(_) | HostEnd::Killed => Outcome::NotLaunched(error),
@@ -454,6 +511,10 @@ async fn run_pooled(
             }
         }
     };
+    // The activation is over: a signal from here on waits for the command, which leads a group
+    // of its own. Signalling the host while it forks the command would kill the host and leave
+    // the command running with nothing to signal it.
+    signal_failed(events, job_id, control.publish(Target::Pending)).await;
     let host = checkout.host_mut();
     let JobIo {
         stdin,
@@ -464,30 +525,45 @@ async fn run_pooled(
     // decided by the command's process tree alone.
     let started = host.run(&command, [stdin, stdout, stderr]).await;
     let birth = match started {
-        Ok(Started::Running(birth)) => birth,
-        Ok(Started::Unexecutable(status)) => return decode(status),
+        Ok(Started::Running(birth)) => {
+            // The command runs and holds the job's streams; nothing here may.
+            *diagnostics = None;
+            birth
+        }
+        Ok(Started::Unexecutable(exit)) => return Outcome::Exited(exit),
         Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
         Err(error) => {
             checkout.poison();
             return Outcome::NotLaunched(error);
         }
     };
-    // The host applies the job's signals to the command while it holds it unreaped; the run
-    // forwards them until the host reports the command's end.
+    // The host applies the job's signals to the command's group while it holds the command; the
+    // run forwards them until the command is released.
     let (signals, mut forwarded) = mpsc::unbounded_channel();
-    control.publish(Target::Command(signals));
+    signal_failed(events, job_id, control.publish(Target::Command(signals))).await;
     let _ = events.send(ProcessEvent::Started { job_id, birth }).await;
-    let ended = host.exited(&mut forwarded).await;
-    control.finish();
-    match ended {
-        Ok(status) => decode(status),
+    let exit = match host.exited(&mut forwarded, job_id, events).await {
+        Ok(exit) => exit,
         Err(error) => {
             // Its host is gone, and with it the one process that could prove the command's group
             // its own: nothing signals the group from here.
             checkout.poison();
-            Outcome::Unobserved(error)
+            return Outcome::Unobserved(error);
         }
+    };
+    let _ = events.send(ProcessEvent::Exited { job_id, exit }).await;
+    // Descendants of the exited leader may run on, holding the job's output open; the leader
+    // stays held so a kill still reaches them, until the job concludes and drops its handle.
+    if let Err(error) = host
+        .released(&mut forwarded, &mut released, job_id, events)
+        .await
+    {
+        checkout.poison();
+        let _ = events
+            .send(ProcessEvent::WaitFailed { job_id, error })
+            .await;
     }
+    Outcome::Reported
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -501,13 +577,13 @@ pub(super) struct ExecHost {
     closed: bool,
 }
 
-/// A dropped host takes its activation with it: the host leads its own process group, which
-/// holds `direnv` and whatever the evaluation started, while every command it forked leads a
-/// group of its own and keeps running. The host is then reaped in the background, through its
-/// fence, so its id is freed only once no signal of this process can reach it.
+/// A dropped host's control socket closes with it. An idle host then exits; one activating ends
+/// its activation's group; one holding a command ends the command's group -- SIGTERM, a grace,
+/// SIGKILL -- reaps it, and exits. The host is not signalled here: a command it holds leads a
+/// group of its own, which only the host can still prove the command's. It is reaped in the
+/// background, through its fence.
 impl Drop for ExecHost {
     fn drop(&mut self) {
-        let _ = self.fence.signal(libc::SIGKILL);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let fence = Arc::clone(&self.fence);
             runtime.spawn(async move {
@@ -521,7 +597,7 @@ enum Started {
     /// The command runs; the host observed its group leader before it could reap it.
     Running(Birth),
     /// The argv could not be executed; the host already wrote why to the job's stderr.
-    Unexecutable(RawWaitStatus),
+    Unexecutable(ExitStatus),
     /// The script did not parse; the host already wrote why to the job's stderr.
     ScriptSyntax,
 }
@@ -626,7 +702,7 @@ impl ExecHost {
                 Started::Running(fields.birth().map_err(|e| protocol_error("reply", e))?)
             }
             REPLY_EXITED => {
-                Started::Unexecutable(fields.i32().map_err(|e| protocol_error("reply", e))?)
+                Started::Unexecutable(fields.exit().map_err(|e| protocol_error("reply", e))?)
             }
             REPLY_SCRIPT_SYNTAX => {
                 fields.bytes().map_err(|e| protocol_error("reply", e))?;
@@ -640,57 +716,135 @@ impl ExecHost {
         Ok(started)
     }
 
-    /// Wait for the command's end, forwarding the job's signals to the host meanwhile: the host
-    /// applies each to the command's group only while it still holds the command unreaped, and a
-    /// signal it reads after reporting the end reaches nothing.
+    /// Wait for the command's leader to exit, forwarding the job's signals meanwhile.
     async fn exited(
         &mut self,
         signals: &mut mpsc::UnboundedReceiver<i32>,
-    ) -> Result<RawWaitStatus> {
-        let mut closed = false;
-        let payload = {
-            let (mut replies, mut requests) = self.control.split();
-            let reply = receive_frame(&mut replies, &mut closed);
-            tokio::pin!(reply);
-            let mut forwarding = true;
-            loop {
-                tokio::select! {
-                    payload = &mut reply => break payload,
-                    signal = signals.recv(), if forwarding => match signal {
-                        Some(signal) => {
-                            let sent = FrameWriter::new(REQUEST_SIGNAL)
-                                .i32(signal)
-                                .finish()
-                                .map_err(io::Error::other);
-                            let sent = match sent {
-                                Ok(frame) => requests.write_all(&frame).await,
-                                Err(error) => Err(error),
-                            };
-                            if let Err(error) = sent {
-                                // The reply says how the host ended; the signal reached nothing.
-                                eprintln!("cowshed: cannot send a job signal to its host: {error}");
-                                forwarding = false;
-                            }
-                        }
-                        None => forwarding = false,
-                    },
-                }
-            }
-        };
-        self.closed |= closed;
-        let payload = payload?;
+        job_id: JobId,
+        events: &mpsc::Sender<ProcessEvent>,
+    ) -> Result<ExitStatus> {
+        let payload = self.next_reply(signals, None, job_id, events).await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         if tag != REPLY_EXITED {
             return Err(protocol_error("reply", format!("unexpected tag {tag}")));
         }
-        let status = fields
-            .i32()
+        let exit = fields
+            .exit()
             .map_err(|error| protocol_error("reply", error))?;
         fields
             .finish()
             .map_err(|error| protocol_error("reply", error))?;
-        Ok(status)
+        Ok(exit)
+    }
+
+    /// Keep forwarding the job's signals to its exited command's group until `release` resolves,
+    /// then have the host reap the command.
+    async fn released(
+        &mut self,
+        signals: &mut mpsc::UnboundedReceiver<i32>,
+        release: &mut oneshot::Receiver<()>,
+        job_id: JobId,
+        events: &mpsc::Sender<ProcessEvent>,
+    ) -> Result<()> {
+        let payload = self
+            .next_reply(signals, Some(release), job_id, events)
+            .await?;
+        let (tag, fields) =
+            FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
+        if tag != REPLY_RELEASED {
+            return Err(protocol_error("reply", format!("unexpected tag {tag}")));
+        }
+        fields
+            .finish()
+            .map_err(|error| protocol_error("reply", error))
+    }
+
+    /// The host's next reply about the held command, forwarding the job's signals meanwhile and
+    /// reporting each the host could not deliver ([`REPLY_SIGNAL_FAILED`]). With a `release`, the
+    /// command is released once it resolves: no signal follows the release request.
+    async fn next_reply(
+        &mut self,
+        signals: &mut mpsc::UnboundedReceiver<i32>,
+        release: Option<&mut oneshot::Receiver<()>>,
+        job_id: JobId,
+        events: &mpsc::Sender<ProcessEvent>,
+    ) -> Result<Vec<u8>> {
+        let mut closed = false;
+        let payload = {
+            let (mut replies, mut requests) = self.control.split();
+            let release = async move {
+                match release {
+                    // A dropped sender is a release as much as a sent one.
+                    Some(release) => {
+                        let _ = release.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(release);
+            let mut releasing = true;
+            let mut forwarding = true;
+            loop {
+                let reply = receive_frame(&mut replies, &mut closed);
+                tokio::pin!(reply);
+                let payload = loop {
+                    tokio::select! {
+                        payload = &mut reply => break payload,
+                        () = &mut release, if releasing => {
+                            releasing = false;
+                            forwarding = false;
+                            let sent = match FrameWriter::new(REQUEST_RELEASE).finish() {
+                                Ok(frame) => requests.write_all(&frame).await,
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = sent {
+                                // The reply says how the host ended.
+                                eprintln!(
+                                    "cowshed: cannot release job {}'s command to its host: \
+                                     {error}",
+                                    job_id.get()
+                                );
+                            }
+                        }
+                        signal = signals.recv(), if forwarding => match signal {
+                            Some(signal) => {
+                                let sent = match FrameWriter::new(REQUEST_SIGNAL).i32(signal).finish() {
+                                    Ok(frame) => requests.write_all(&frame).await,
+                                    Err(error) => Err(error),
+                                };
+                                if let Err(error) = sent {
+                                    // The reply says how the host ended; the signal reached
+                                    // nothing.
+                                    forwarding = false;
+                                    let _ = events
+                                        .send(ProcessEvent::SignalFailed {
+                                            job_id,
+                                            error: protocol_error("signal", error),
+                                        })
+                                        .await;
+                                }
+                            }
+                            None => forwarding = false,
+                        },
+                    }
+                };
+                let payload = match payload {
+                    Ok(payload) => payload,
+                    Err(error) => break Err(error),
+                };
+                match signal_failure(&payload) {
+                    Some(error) => {
+                        let _ = events
+                            .send(ProcessEvent::SignalFailed { job_id, error })
+                            .await;
+                    }
+                    None => break Ok(payload),
+                }
+            }
+        };
+        self.closed |= closed;
+        payload
     }
 
     /// End a host that broke its protocol. One that closed its end is exiting and is waited
@@ -704,7 +858,8 @@ impl ExecHost {
                     let _ = self.fence.wait().await;
                     return HostEnd::Killed;
                 }
-                // Not reapable: dropping the host still ends its group through the fence.
+                // Not reapable: something else collected the host, so its id may name another
+                // process and nothing is signalled.
                 Err(_) => return HostEnd::Killed,
             }
         }
@@ -713,6 +868,24 @@ impl ExecHost {
             Err(_) => HostEnd::Killed,
         }
     }
+}
+
+/// The failure a [`REPLY_SIGNAL_FAILED`] reply names; `None` for any other reply.
+fn signal_failure(payload: &[u8]) -> Option<CowshedError> {
+    let (REPLY_SIGNAL_FAILED, mut fields) = FrameReader::new(payload).ok()? else {
+        return None;
+    };
+    Some(match (fields.i32(), fields.bytes()) {
+        (Ok(signal), Ok(reason)) => CowshedError::environment_missing(
+            format!(
+                "the workspace shell host could not deliver signal {signal} to the job's \
+                 process group: {}",
+                String::from_utf8_lossy(reason)
+            ),
+            "inspect the job's processes",
+        ),
+        (Err(error), _) | (_, Err(error)) => protocol_error("reply", error),
+    })
 }
 
 /// One reply frame from a host's control socket. A host that names why it failed is closed, and

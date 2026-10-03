@@ -14,7 +14,7 @@
 //!   files — binds the script's values as shell variables, runs the program and exits with the
 //!   program's status.
 //!
-//! The host reports the child's raw `waitpid` status: a killed script dies by the signal, a
+//! The host reports the child's exact exit: a killed script dies by the signal, a
 //! script whose last command died by a signal exits `128+N` as bash's own scripts do. Anything
 //! a script does to its process — `cd`, `umask`, `ulimit`, `trap`, `exec` — ends with the child.
 
@@ -28,7 +28,7 @@ use std::path::Path;
 use brush_builtins::ShellBuilderExt as _;
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
-    CONTROL_DESCRIPTOR, FrameWriter, REPLY_EXITED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED,
+    CONTROL_DESCRIPTOR, FrameWriter, REPLY_SCRIPT_SYNTAX, REPLY_STARTED,
 };
 use cowshed_core::script::Binding;
 
@@ -121,13 +121,13 @@ pub(crate) fn run(
         }
     }
     drop(ready);
-    let pid_u32 = u32::try_from(pid).map_err(io::Error::other)?;
-    // Before the wait below: this host is the child's parent, so until it reaps the child its pid
+    // Held from here: the group exists, and any failure below ends it before it is reported.
+    let held = crate::Held::new(pid);
+    // Before any wait: this host is the child's parent, so until it reaps the child its pid
     // names nothing else.
-    let birth = Birth::of(pid_u32);
+    let birth = Birth::of(pid.cast_unsigned());
     reply(socket, FrameWriter::new(REPLY_STARTED).birth(&birth)?)?;
-    let status = crate::wait_serving_signals(socket, pid)?;
-    reply(socket, FrameWriter::new(REPLY_EXITED).i32(status))
+    crate::serve_command(socket, held)
 }
 
 /// A pipe whose ends close in any program the job execs.

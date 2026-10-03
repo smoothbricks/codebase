@@ -1886,7 +1886,6 @@ struct ServedSupervisor {
 impl Drop for ServedSupervisor {
     fn drop(&mut self) {
         self.server.abort();
-        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -3723,7 +3722,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
-        self.stop_supervisor(&main_name()).await?;
+        let _stopped = self.stop_supervisor(&main_name()).await?;
         self.substrate
             .unmount(&current.derived.workspace)
             .await
@@ -3973,9 +3972,13 @@ impl NativeProjectRuntimeHost {
         workspace: &WorkspaceName,
         initial: &NativeRemovalGitFence,
         force: bool,
-    ) -> Result<(NativeWorkspace, NativeRemovalGitFence)> {
-        self.stop_supervisor_for_removal(workspace, force).await?;
-        require_lost_groups_released(workspace, self.job_group_ledger(workspace), "remove").await?;
+    ) -> Result<(
+        NativeWorkspace,
+        NativeRemovalGitFence,
+        super::supervisor_socket::BoundSocket,
+    )> {
+        let stopped = self.stop_supervisor_for_removal(workspace, force).await?;
+        require_lost_groups_released(workspace, &stopped, "remove").await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
         let fence = self.removal_git_fence(&current).await?;
@@ -3986,7 +3989,7 @@ impl NativeProjectRuntimeHost {
                 &fence.head,
             ));
         }
-        Ok((current, fence))
+        Ok((current, fence, stopped))
     }
 
     /// Drop the workspace's host-side registrations, then retire its image.
@@ -4416,21 +4419,16 @@ impl NativeProjectRuntimeHost {
                     return Err(error);
                 }
             }
+            let incarnation = current.derived.workspace.incarnation().clone();
+            let stopped = self.stop_supervisor(&workspace).await?;
+            require_lost_groups_released(&workspace, &stopped, "restore main").await?;
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &incarnation)?;
+            let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
             if !was_pending {
                 self.begin_lifecycle_intent(intent.clone()).await?;
             }
             self.mark_lifecycle_intent_mutating(&workspace).await?;
-            let incarnation = current.derived.workspace.incarnation().clone();
-            self.stop_supervisor(&workspace).await?;
-            require_lost_groups_released(
-                &workspace,
-                self.job_group_ledger(&workspace),
-                "restore main",
-            )
-            .await?;
-            let current = self.current(&workspace).await?;
-            Self::require_exact_incarnation(&current, &incarnation)?;
-            let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
             if rollback_state != NativeAdoptRollbackState::Complete {
                 self.substrate
                     .restore_adopted_checkout(&current.derived.workspace, &pre_cowshed)
@@ -4480,7 +4478,7 @@ impl NativeProjectRuntimeHost {
             let initial_fence = self.removal_git_fence(&current).await?;
             self.require_removal_safe(&workspace, options, &initial_fence, containment)
                 .await?;
-            let (current, final_fence) = self
+            let (current, final_fence, _stopped) = self
                 .revalidated_removal_fence(&workspace, &initial_fence, options.force)
                 .await?;
             let abandoning = self
@@ -4506,7 +4504,7 @@ impl NativeProjectRuntimeHost {
 
         if main_initially_detached {
             let main = self.current(&main_name()).await?;
-            self.stop_supervisor(&main_name()).await?;
+            let _stopped = self.stop_supervisor(&main_name()).await?;
             self.substrate
                 .unmount(&main.derived.workspace)
                 .await
@@ -5044,7 +5042,7 @@ impl NativeProjectRuntimeHost {
             if self.served.contains_key(name) {
                 old.quiesce().await?;
                 old.retire().await?;
-                self.forget_served(name);
+                self.forget_served(name).await?;
             }
             self.sessions.retain(|(workspace, _), _| workspace != name);
         }
@@ -5347,7 +5345,10 @@ impl NativeProjectRuntimeHost {
         ))
     }
 
-    async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {
+    async fn stop_supervisor(
+        &mut self,
+        name: &WorkspaceName,
+    ) -> Result<super::supervisor_socket::BoundSocket> {
         self.stop_supervisor_with_mode(name, false).await
     }
 
@@ -5357,7 +5358,7 @@ impl NativeProjectRuntimeHost {
         &mut self,
         name: &WorkspaceName,
         force: bool,
-    ) -> Result<()> {
+    ) -> Result<super::supervisor_socket::BoundSocket> {
         self.stop_supervisor_with_mode(name, force).await
     }
 
@@ -5377,52 +5378,59 @@ impl NativeProjectRuntimeHost {
         &mut self,
         name: &WorkspaceName,
         terminate_jobs: bool,
-    ) -> Result<()> {
-        // The workspace's supervisor may be serving without this controller ever having used
-        // it: whatever answers its socket is the one to retire before the substrate changes.
+    ) -> Result<super::supervisor_socket::BoundSocket> {
+        let socket = super::supervisor_socket::socket_path(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+            name,
+        );
+        // An unknown hello or retirement outcome is never proof a supervisor stopped. The
+        // returned socket lease closes replacement admission until the caller's mutation ends.
         let handle = match self.supervisors.remove(name) {
             Some(handle) => Some(handle),
-            None => {
-                let socket = super::supervisor_socket::socket_path(
-                    self.descriptor.storage.store(),
-                    &self.descriptor.repo_id,
-                    name,
-                );
-                match super::supervisor_socket::hello(&socket).await {
-                    Ok(hello) => Some(super::supervisor_socket::connect(socket, hello.authority)),
-                    // Another build's supervisor cannot be retired through this build's
-                    // protocol, and the substrate must not change under it: it is stopped by
-                    // signal, and what its retirement would have ended is ended for it.
-                    Err(error) if error.code == crate::error::ErrorCode::Conflict => {
-                        let pid = super::supervisor_manager::stop_other_build(&socket).await?;
-                        eprintln!(
-                            "cowshed: stopped workspace {name}'s supervisor (pid {pid}) of another cowshed build"
-                        );
-                        None
-                    }
-                    Err(_) => None,
+            None => match super::supervisor_socket::hello_if_present(&socket).await {
+                Ok(Some(hello)) => Some(super::supervisor_socket::connect(
+                    socket.clone(),
+                    hello.authority,
+                )),
+                Ok(None) => None,
+                Err(error) if error.code == ErrorCode::Conflict => {
+                    let pid = super::supervisor_manager::stop_other_build(&socket).await?;
+                    eprintln!(
+                        "cowshed: stopped workspace {name}'s supervisor (pid {pid}) of another cowshed build"
+                    );
+                    None
                 }
-            }
+                Err(error) => return Err(error),
+            },
         };
         if let Some(handle) = handle {
-            let stopped = Self::stop_supervisor_handle(&handle, terminate_jobs).await;
-            match stopped {
-                Ok(()) => {}
-                // Another process's supervisor that no longer answers went with its process.
-                Err(error)
-                    if !self.served.contains_key(name)
-                        && error.code == crate::error::ErrorCode::EnvironmentMissing => {}
-                Err(error) => return Err(error),
-            }
+            Self::stop_supervisor_handle(&handle, terminate_jobs).await?;
         }
-        self.forget_served(name);
+        self.forget_served(name).await?;
         self.sessions.retain(|(workspace, _), _| workspace != name);
-        Ok(())
+        super::supervisor_socket::bind(&socket).await
     }
 
-    /// After its retirement: stop serving `name`'s supervisor and remove its socket.
-    fn forget_served(&mut self, name: &WorkspaceName) {
-        drop(self.served.remove(name));
+    /// After retirement, abort and join this process's socket server before another owner binds.
+    async fn forget_served(&mut self, name: &WorkspaceName) -> Result<()> {
+        if let Some(mut served) = self.served.remove(name) {
+            // A completed server already released its bound socket. Its result may have been
+            // consumed by the serving loop, so it must not be polled for a second time.
+            if !served.server.is_finished() {
+                served.server.abort();
+                match (&mut served.server).await {
+                    Ok(ended) => ended?,
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        return Err(CowshedError::internal(format!(
+                            "workspace {name}'s socket server could not retire: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Serve `name`'s supervisor from this process until it retires: the
@@ -5486,7 +5494,7 @@ impl NativeProjectRuntimeHost {
                 }
             }
         };
-        self.forget_served(&name);
+        self.forget_served(&name).await?;
         ended
     }
 
@@ -5737,7 +5745,8 @@ impl NativeProjectRuntimeHost {
                             containment,
                         )
                         .await?;
-                        this.stop_supervisor_for_removal(workspace, options.force)
+                        let _stopped = this
+                            .stop_supervisor_for_removal(workspace, options.force)
                             .await?;
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
@@ -5791,7 +5800,7 @@ impl NativeProjectRuntimeHost {
         .await;
         if main_detached {
             let main = self.current(&main_name()).await?;
-            self.stop_supervisor(&main_name()).await?;
+            let _stopped = self.stop_supervisor(&main_name()).await?;
             self.substrate
                 .unmount(&main.derived.workspace)
                 .await
@@ -7424,7 +7433,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // instead of laundering that through a removal override: the fork is the preservation, and
         // the fence above is what makes the retirement safe.
         let retirement = async {
-            let (retiring, _) = self
+            let (retiring, _, _stopped) = self
                 .revalidated_removal_fence(&source, &fence, false)
                 .await?;
             self.finish_retirement(retiring).await
@@ -7691,7 +7700,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         // Everything above the fence is reversible by doing nothing: a `Prepared` record is
         // discarded on the next open, leaving a project that is merely detached.
-        self.stop_supervisor(&main_name()).await?;
+        let _stopped = self.stop_supervisor(&main_name()).await?;
         self.substrate
             .unmount(&main_workspace)
             .await
@@ -7806,7 +7815,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         use crate::storage::lifecycle::Substrate;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
-        self.stop_supervisor(&workspace).await?;
+        let _stopped = self.stop_supervisor(&workspace).await?;
         self.substrate
             .unmount(&current.derived.workspace)
             .await
@@ -7831,12 +7840,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
-        self.stop_supervisor(&workspace).await?;
+        let stopped = self.stop_supervisor(&workspace).await?;
         let outcome = self
             .substrate
             .resize(&current.derived.workspace, requested)
             .await
             .map_err(native_storage_error)?;
+        drop(stopped);
         if was_mounted {
             self.ensure_supervisor(&workspace).await?;
         }
@@ -7862,12 +7872,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
-        self.stop_supervisor(&workspace).await?;
+        let stopped = self.stop_supervisor(&workspace).await?;
         let outcome = self
             .substrate
             .defragment(&current.derived.workspace)
             .await
             .map_err(native_storage_error)?;
+        drop(stopped);
         if was_mounted {
             self.ensure_supervisor(&workspace).await?;
         }
@@ -7970,9 +7981,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 info.git_worktree,
             )
             .await?;
-        self.stop_supervisor(&workspace).await?;
-        require_lost_groups_released(&workspace, self.job_group_ledger(&workspace), "restore")
-            .await?;
+        let stopped = self.stop_supervisor(&workspace).await?;
+        require_lost_groups_released(&workspace, &stopped, "restore").await?;
         let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
             current.derived.workspace.clone(),
             checkpoint.label.clone(),
@@ -8015,6 +8025,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 },
             )
             .await;
+        drop(stopped);
         match result {
             Ok(_) => {
                 self.ensure_supervisor(&workspace).await?;
@@ -8377,7 +8388,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(|error| CowshedError::internal(error.to_string()))?
             .map_err(native_integrity_error)?;
         if self.supervisors.contains_key(&workspace) {
-            self.stop_supervisor(&workspace).await?;
+            drop(self.stop_supervisor(&workspace).await?);
             self.ensure_supervisor(&workspace).await?;
         }
         Ok(())
@@ -10974,6 +10985,8 @@ mod removal_supervisor_tests {
             Ok(())
         }
 
+        fn end_stdin(&mut self) {}
+
         fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
             self.signals.lock().expect("signal log").push(signal);
             if signal == ProcessSignal::Kill {
@@ -13255,9 +13268,10 @@ fn native_finding(
 #[cfg(target_os = "macos")]
 async fn require_lost_groups_released(
     workspace: &WorkspaceName,
-    ledger: PathBuf,
+    socket: &super::supervisor_socket::BoundSocket,
     operation: &str,
 ) -> Result<()> {
+    let ledger = super::job_groups::ledger_path(socket.path());
     let read = ledger.clone();
     let groups = crate::storage::lifecycle::dispatch_blocking(move || {
         super::job_groups::take_lost(&read, LOST_JOB_GRACE)
@@ -13333,9 +13347,12 @@ mod unresolved_retirement_tests {
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready, "READY\n");
         assert!(child.wait().unwrap().success());
+        let stopped = super::super::supervisor_socket::bind(&root.join("supervisor.sock"))
+            .await
+            .unwrap();
 
         for operation in ["remove", "restore", "restore main"] {
-            let error = require_lost_groups_released(&workspace, ledger.clone(), operation)
+            let error = require_lost_groups_released(&workspace, &stopped, operation)
                 .await
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::Conflict);
@@ -13365,14 +13382,15 @@ mod unresolved_retirement_tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        require_lost_groups_released(&workspace, ledger.clone(), "remove")
+        require_lost_groups_released(&workspace, &stopped, "remove")
             .await
             .unwrap();
         assert!(
             !ledger.exists(),
             "released group evidence is reconciled before retirement"
         );
-        std::fs::remove_dir(root).unwrap();
+        drop(stopped);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

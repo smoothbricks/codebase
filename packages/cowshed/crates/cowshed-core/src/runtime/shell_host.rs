@@ -11,6 +11,15 @@
 //! `u32` payload length followed by the payload: a tag byte and its fields, each byte string
 //! length-prefixed. Descriptors ride as `SCM_RIGHTS` on the first bytes of a request frame.
 //! Requests are served strictly in order; the host is exclusive to one command at a time.
+//!
+//! A command's exchange: `REQUEST_RUN` or `REQUEST_SCRIPT`, then `REPLY_STARTED`, any number of
+//! `REQUEST_SIGNAL`s, `REPLY_EXITED` once the command's leader exited, more `REQUEST_SIGNAL`s while
+//! its descendants run on, and `REQUEST_RELEASE` once the job concluded, answered by
+//! `REPLY_RELEASED`. Until the release the host holds the leader unreaped, so its group id names
+//! the job's group alone and a signal can reach descendants that outlive the leader. A signal the
+//! host cannot deliver is answered by `REPLY_SIGNAL_FAILED` in the reply stream. A supervisor that
+//! closes the socket while the host holds a command has the host end the command's group --
+//! SIGTERM, a grace, SIGKILL -- and reap it.
 
 use std::ffi::OsString;
 use std::io;
@@ -19,6 +28,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use super::job_groups::{Birth, GroupLeader};
+use crate::api::dto::ExitStatus;
 
 /// The argument that turns the `cowshed` binary into an exec host.
 pub const SHELL_HOST_ARGUMENT: &str = "--cowshed-shell-host";
@@ -48,12 +58,14 @@ pub const REQUEST_RUN: u8 = 3;
 /// program there, so every process the script starts is in the job's group and the child's own
 /// wait status is the job's.
 pub const REQUEST_SCRIPT: u8 = 4;
-/// Signal the running command's group: `[signal]`. Sent only while a run or script request is
-/// served, between its `REPLY_STARTED` and `REPLY_EXITED`. The host is the command's parent and
-/// applies the signal only while it has not reaped the command, in the same thread that reaps
-/// it, so the signal never reaches a process that reused the command's id. One that arrives
-/// after the command ended reaches nothing.
+/// Signal the held command's group: `[signal]`. Sent between `REPLY_STARTED` and
+/// `REQUEST_RELEASE`. The host is the command's parent and holds the leader unreaped until the
+/// release, so the group id names the job's group alone. Unanswered when delivered; a failure
+/// is answered with `REPLY_SIGNAL_FAILED`.
 pub const REQUEST_SIGNAL: u8 = 5;
+/// The job concluded: reap its command `[]`. Sent once, after `REPLY_EXITED`; answered by
+/// `REPLY_RELEASED`, after which the host serves its next command.
+pub const REQUEST_RELEASE: u8 = 6;
 
 pub const REPLY_APPROVED: u8 = 1;
 pub const REPLY_ACTIVATION_EXITED: u8 = 2;
@@ -62,6 +74,8 @@ pub const REPLY_ACTIVATION_UNUSABLE: u8 = 4;
 /// The command started: `[birth]`, its group leader as the host observed it before it could
 /// reap the command ([`FrameWriter::birth`]).
 pub const REPLY_STARTED: u8 = 5;
+/// The command's leader exited, or the argv could not be executed: `[exit]`
+/// ([`FrameWriter::exit`]). A started command stays held, unreaped, until `REQUEST_RELEASE`.
 pub const REPLY_EXITED: u8 = 6;
 /// A script request's text did not parse; nothing ran. `[diagnostic]`, also written to the
 /// job's stderr.
@@ -69,6 +83,10 @@ pub const REPLY_SCRIPT_SYNTAX: u8 = 7;
 /// The host could not serve the request it was handling: `[reason]`. The host exits after
 /// sending it, so the supervisor learns why instead of seeing only a closed socket.
 pub const REPLY_HOST_FAILED: u8 = 8;
+/// The held command was reaped: `[]`.
+pub const REPLY_RELEASED: u8 = 9;
+/// A `REQUEST_SIGNAL` could not be delivered to the command's group: `[signal, reason]`.
+pub const REPLY_SIGNAL_FAILED: u8 = 10;
 
 /// A script binding's value kind on the wire.
 pub const BINDING_SCALAR: u8 = 0;
@@ -77,6 +95,10 @@ pub const BINDING_ARRAY: u8 = 1;
 /// A [`Birth`]'s kind on the wire.
 const BIRTH_OBSERVED: u32 = 0;
 const BIRTH_UNOBSERVED: u32 = 1;
+
+/// An [`ExitStatus`]'s kind on the wire.
+const EXIT_CODE: u32 = 0;
+const EXIT_SIGNAL: u32 = 1;
 
 /// A raw `waitpid` status, decoded only where it is reported.
 pub type RawWaitStatus = i32;
@@ -122,6 +144,20 @@ impl FrameWriter {
                 .u32(BIRTH_UNOBSERVED)
                 .u32(*pid)
                 .bytes(reason.as_bytes()),
+        }
+    }
+
+    /// `[kind, value, core dumped]`: an exit code, or a terminating signal.
+    pub fn exit(self, exit: &ExitStatus) -> Self {
+        match *exit {
+            ExitStatus::Exited { code } => self.u32(EXIT_CODE).i32(code).u32(0),
+            ExitStatus::Signaled {
+                signal,
+                core_dumped,
+            } => self
+                .u32(EXIT_SIGNAL)
+                .i32(signal)
+                .u32(u32::from(core_dumped)),
         }
     }
 
@@ -209,6 +245,23 @@ impl<'a> FrameReader<'a> {
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown birth kind {other}"),
+            )),
+        }
+    }
+
+    pub fn exit(&mut self) -> io::Result<ExitStatus> {
+        let kind = self.u32()?;
+        let value = self.i32()?;
+        let core_dumped = self.u32()?;
+        match (kind, core_dumped) {
+            (EXIT_CODE, 0) => Ok(ExitStatus::Exited { code: value }),
+            (EXIT_SIGNAL, 0 | 1) => Ok(ExitStatus::Signaled {
+                signal: value,
+                core_dumped: core_dumped == 1,
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed exit status (kind {kind}, core flag {core_dumped})"),
             )),
         }
     }
@@ -501,6 +554,42 @@ mod tests {
             let frame = malformed.finish().unwrap();
             let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
             assert!(fields.birth().is_err());
+        }
+    }
+
+    /// An exit code and a signal death keep their kind across the wire; a code with a core flag,
+    /// a core flag other than 0 or 1, and an unknown kind are refused rather than read as one.
+    #[test]
+    fn an_exit_crosses_the_wire_unchanged_and_a_malformed_one_is_refused() {
+        let exits = [
+            ExitStatus::Exited { code: 3 },
+            ExitStatus::Exited { code: 255 },
+            ExitStatus::Signaled {
+                signal: libc::SIGKILL,
+                core_dumped: false,
+            },
+            ExitStatus::Signaled {
+                signal: libc::SIGSEGV,
+                core_dumped: true,
+            },
+        ];
+        for exit in exits {
+            let frame = FrameWriter::new(REPLY_EXITED).exit(&exit).finish().unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert_eq!(fields.exit().unwrap(), exit);
+            fields.finish().unwrap();
+        }
+        for malformed in [
+            FrameWriter::new(REPLY_EXITED).u32(EXIT_CODE).i32(3).u32(1),
+            FrameWriter::new(REPLY_EXITED)
+                .u32(EXIT_SIGNAL)
+                .i32(9)
+                .u32(2),
+            FrameWriter::new(REPLY_EXITED).u32(7).i32(3).u32(0),
+        ] {
+            let frame = malformed.finish().unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert!(fields.exit().is_err());
         }
     }
 
