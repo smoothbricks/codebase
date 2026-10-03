@@ -1814,8 +1814,6 @@ fn build_seed(
         private_network_authorized,
         audit_kind: match protocol {
             Some(MirrorProtocol::Npm) => AuditKind::Npm,
-            Some(MirrorProtocol::Cargo) => AuditKind::Cargo,
-            Some(MirrorProtocol::Go) => AuditKind::Go,
             None => intent.audit_kind,
         },
         method: intent.method.clone(),

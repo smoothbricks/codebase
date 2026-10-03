@@ -228,8 +228,6 @@ impl From<MirrorProtocol> for CredentialProtocol {
     fn from(value: MirrorProtocol) -> Self {
         match value {
             MirrorProtocol::Npm => Self::Npm,
-            MirrorProtocol::Cargo => Self::Cargo,
-            MirrorProtocol::Go => Self::Go,
         }
     }
 }

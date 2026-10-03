@@ -87,7 +87,7 @@ impl MirrorRequest {
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
         );
-        let metadata = classify(protocol, &upstream_path, expected)?;
+        let metadata = classify(&upstream_path, expected)?;
         let representation = match (protocol, metadata.kind) {
             (MirrorProtocol::Npm, MirrorResourceKind::Metadata) => {
                 let representation = PackumentRepresentation::requested(&headers)?;
@@ -954,7 +954,7 @@ fn redirect_outcome(
         .path_and_query()
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| redirected.path().to_owned());
-    let metadata = classify(request.protocol, &path, request.metadata.expected)?;
+    let metadata = classify(&path, request.metadata.expected)?;
     if metadata.identity != request.metadata.identity {
         return Err(MirrorError::UnsafeRedirect);
     }
@@ -975,16 +975,12 @@ fn redirect_outcome(
 }
 
 fn classify(
-    protocol: MirrorProtocol,
     path_and_query: &str,
     supplied: Option<ObjectExpectation>,
 ) -> Result<MirrorProtocolMetadata, MirrorError> {
     let path = path_and_query
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path);
-    if protocol != MirrorProtocol::Npm {
-        return Err(MirrorError::InvalidProtocolPath);
-    }
     validate_mirror_path(path)?;
     let (kind, identity) = classify_npm(path)?;
     Ok(MirrorProtocolMetadata {

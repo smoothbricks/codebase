@@ -301,16 +301,12 @@ fn is_git_upload_pack(path: &str) -> bool {
 #[serde(rename_all = "kebab-case")]
 pub enum MirrorProtocol {
     Npm,
-    Cargo,
-    Go,
 }
 
 impl MirrorProtocol {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Npm => "npm",
-            Self::Cargo => "cargo",
-            Self::Go => "go",
         }
     }
 }
