@@ -1352,8 +1352,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// hands the same name to the next attach anywhere on the host, and detaching the recorded
     /// name would take that image away from its owner. The image path `hdiutil` recorded at
     /// attach time is the identity (it survives renaming the file while attached), so the device
-    /// is re-read against it immediately before every detach. An image that no longer holds the
-    /// device is already released; nothing is detached and the refusal is logged.
+    /// is re-read against it immediately before every detach. Empty inventory is already
+    /// released; a positive conflicting mapping is a refusal, never release success.
     /// Its caller holds the host lease while the image identity is read and ejected.
     fn detach_image_device_unlocked(
         &self,
@@ -1362,12 +1362,15 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let held = self.attached_whole_devices(image)?;
-        if !held.contains(whole_device) {
-            eprintln!(
-                "cowshed: apfs detach {} no longer holds {whole_device} (holds {held:?}); not detaching a device it does not own",
-                image.display()
-            );
+        if held.is_empty() {
             return Ok(());
+        }
+        if !held.contains(whole_device) {
+            return Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} still holds {held:?}, not {whole_device}; retaining the attached \
+                 image rather than claiming it was released",
+                image.display()
+            )));
         }
         self.detach_device_checked(whole_device, intent)?;
         self.settle_detached_device(whole_device);
@@ -2722,29 +2725,59 @@ mod tests {
             self.attachment.insert(attachment)
         }
 
-        fn finish(mut self) -> Result<(), ApfsError> {
+        fn release_attachment(&self) -> Result<(), ApfsError> {
             if let Some(attachment) = self.attachment.as_ref() {
-                self.backend.detach(attachment, DetachIntent::Release)?;
-                self.attachment = None;
+                return self.backend.detach(attachment, DetachIntent::Release);
             }
-            let result = self.backend.delete_image(&self.image);
-            if result.is_ok() {
-                self.armed = false;
+            // Creation can fail after attach but before the caller receives an AttachedImage.
+            // No tracked handle is not proof of a detached fixture or permission to unlink it.
+            match self.backend.recovered_image_attachment(&self.image)? {
+                Some(RecoveredImageAttachment::Apfs(attachment)) => {
+                    self.backend.detach(&attachment, DetachIntent::Release)
+                }
+                Some(RecoveredImageAttachment::Unformatted {
+                    image,
+                    whole_device,
+                }) => self.backend.detach_unformatted_image(
+                    &image,
+                    &whole_device,
+                    DetachIntent::Release,
+                ),
+                None if !self.image.exists() => Ok(()),
+                None => Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "cannot prove fixture image {} was released; retaining its backing file",
+                    self.image.display()
+                ))),
             }
-            result
+        }
+
+        fn finish(mut self) -> Result<(), ApfsError> {
+            // Exactly one cleanup attempt: a failure retains its media and original error.
+            self.armed = false;
+            self.release_attachment()?;
+            if self.image.exists() {
+                self.backend.delete_image(&self.image)?;
+            }
+            Ok(())
         }
     }
 
     #[cfg(target_os = "macos")]
     impl Drop for RealImageCleanup<'_> {
         fn drop(&mut self) {
-            let detached = self.attachment.take().is_none_or(|attachment| {
-                self.backend
-                    .detach(&attachment, DetachIntent::Release)
-                    .is_ok()
-            });
-            if detached && self.armed {
-                let _ = self.backend.delete_image(&self.image);
+            if self.armed {
+                let released = self.release_attachment().and_then(|()| {
+                    if self.image.exists() {
+                        self.backend.delete_image(&self.image)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = released {
+                    eprintln!(
+                        "cowshed: retained real APFS fixture {}: {error}",
+                        self.image.display()
+                    );
+                }
             }
         }
     }
@@ -3299,6 +3332,28 @@ mod tests {
                 .iter()
                 .any(|request| { request.args.first().is_some_and(|arg| arg == "detach") }),
             "a cached device name is not ownership evidence"
+        );
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn a_second_observation_conflict_cannot_claim_unformatted_media_was_released() {
+        let image = temp_path("unformatted-second-map", IMAGE_EXTENSION);
+        fs::write(&image, b"unformatted").unwrap();
+        let backend =
+            graced_backend([holding(&image, "/dev/disk8"), holding(&image, "/dev/disk9")]);
+        let error = backend
+            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
+            .unwrap_err();
+        assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
+        assert_eq!(fs::read(&image).unwrap(), b"unformatted");
+        assert!(
+            !backend
+                .runner()
+                .requests()
+                .iter()
+                .any(|request| { request.args.first().is_some_and(|arg| arg == "detach") }),
+            "a second positive conflicting mapping retains the image without a false release"
         );
         fs::remove_file(image).unwrap();
     }

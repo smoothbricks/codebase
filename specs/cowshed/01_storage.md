@@ -270,6 +270,14 @@ retried and no unproved device is formatted. Shared owned-image cleanup distingu
 state from an APFS volume: it rechecks the exact mapping under the lease and releases only that owned device without
 deleting the backing file first.
 
+Every release rechecks image ownership at the final detach boundary as well as the initial recovery read. Empty
+inventory is already released; a nonempty mapping that no longer contains the recorded device is a typed refusal, never
+successful release or permission to delete its backing file. An APFS image can expose both its physical and synthesized
+whole devices, so ownership is membership in that exact image's current mapping, not an invented single-device rule
+after formatting. Real fixture cleanup likewise cannot treat a missing returned attachment handle as release proof: it
+recovers the current typed attachment before unlinking and retains unproved media on failure, without retrying a failed
+explicit cleanup from its destructor.
+
 Mounted-image release first uses `/sbin/umount <verified-volume-device>`, the kernel's unmount interface. Merely
 changing general eject to `hdiutil detach` did not remove the hosted mounted-volume delay: that command still spent
 10.694 s in the next release run. The native host reads kernel mount facts, then holds the host lease and a fresh raw
