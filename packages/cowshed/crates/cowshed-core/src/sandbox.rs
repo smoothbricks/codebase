@@ -669,6 +669,12 @@ pub fn seatbelt_profile(
         "/etc/static/profiles",
         "/private/etc/profiles",
         "/private/etc/static/profiles",
+        // Nix's own configuration. Nix clients stat their config files before reading them,
+        // including optional ones (Determinate Nix's `sentry-endpoint`) whose absence must
+        // surface as ENOENT; `file-read-data` alone answers that stat with EPERM, which nix treats
+        // as fatal. Read-only, and only this tree: the rest of `/etc` keeps its metadata denied.
+        "/etc/nix",
+        "/private/etc/nix",
         "/private/var/select",
         "/sbin",
         "/usr",
@@ -1741,6 +1747,41 @@ mod tests {
     }
 
     #[test]
+    fn nix_config_metadata_is_readable_without_widening_etc() {
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config(RunSandboxMode::ReadWrite), role).unwrap();
+            for root in ["/etc/nix", "/private/etc/nix"] {
+                for operation in ["file-read*", "file-read-data"] {
+                    let rule =
+                        format!("(allow {operation} (literal \"{root}\") (subpath \"{root}\"))");
+                    assert!(profile.contains(&rule), "{role:?} lacks {rule}");
+                }
+            }
+            for ancestor in ["/etc", "/private/etc"] {
+                assert!(
+                    profile.contains(&format!("(allow file-read* (literal \"{ancestor}\"))")),
+                    "{role:?} must traverse {ancestor}"
+                );
+                assert!(
+                    !profile.contains(&format!("(subpath \"{ancestor}\")")),
+                    "{role:?} must not read all of {ancestor}"
+                );
+            }
+            assert!(
+                profile
+                    .lines()
+                    .filter(|line| line.contains("file-write"))
+                    .all(|line| !line.contains("/etc")),
+                "{role:?} must not grant writes under /etc"
+            );
+        }
+    }
+
+    #[test]
     fn secret_denies_follow_grants_and_carve_backs() {
         let profile = seatbelt_profile(
             &config(RunSandboxMode::ReadWrite),
@@ -2102,5 +2143,135 @@ mod tests {
             "fstat on a write-only /dev/null stdout: {}",
             String::from_utf8_lossy(&fstat.stderr)
         );
+    }
+
+    /// Nix stats its configuration files before reading them, optional ones included: a Nix
+    /// command in a workspace died on `/etc/nix/sentry-endpoint` because the stat came back
+    /// EPERM instead of ENOENT. Probes the host's real Nix config read-only; the only write
+    /// attempt opens an existing file for append and writes nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_nix_config_metadata_is_readable_and_nothing_else_in_etc() {
+        fn stderr(output: &std::process::Output) -> String {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        }
+        let nix_conf = Path::new("/etc/nix/nix.conf");
+        let sentry = Path::new("/etc/nix/sentry-endpoint");
+        let unrelated = Path::new("/etc/hosts");
+        assert!(
+            nix_conf.is_file(),
+            "the host must have a Nix config at {}",
+            nix_conf.display()
+        );
+        assert!(
+            unrelated.is_file(),
+            "the host must have {}",
+            unrelated.display()
+        );
+        let host_config = fs::read(nix_conf).unwrap();
+        let host_modified = fs::metadata(nix_conf).unwrap().modified().unwrap();
+
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let absent = PathBuf::from(format!(
+            "/etc/nix/cowshed-absent-{}-{sequence}",
+            std::process::id()
+        ));
+        assert!(
+            !absent.exists(),
+            "{} must not exist on the host",
+            absent.display()
+        );
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-nix-config-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        for directory in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
+            fs::create_dir_all(directory).unwrap();
+        }
+
+        let mut failures = Vec::new();
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap();
+            let run = |program: &str, args: &[&std::ffi::OsStr]| {
+                std::process::Command::new("/usr/bin/sandbox-exec")
+                    .args(["-p", &profile, "--", program])
+                    .args(args)
+                    .current_dir(&config.workspace_mount)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap()
+            };
+            let stat = |path: &Path| run("/usr/bin/stat", &[path.as_os_str()]);
+            let config_stat = stat(nix_conf);
+            if !config_stat.status.success() {
+                failures.push(format!("{role:?}: stat nix.conf: {}", stderr(&config_stat)));
+            }
+            let config_read = run("/bin/cat", &[nix_conf.as_os_str()]);
+            if !config_read.status.success() || config_read.stdout != host_config {
+                failures.push(format!("{role:?}: read nix.conf: {}", stderr(&config_read)));
+            }
+            let sentry_stat = stat(sentry);
+            let sentry_ok = if sentry.exists() {
+                sentry_stat.status.success()
+            } else {
+                !sentry_stat.status.success()
+                    && stderr(&sentry_stat).contains("No such file or directory")
+            };
+            if !sentry_ok {
+                failures.push(format!(
+                    "{role:?}: stat sentry-endpoint: {}",
+                    stderr(&sentry_stat)
+                ));
+            }
+            let absent_stat = stat(&absent);
+            if absent_stat.status.success()
+                || !stderr(&absent_stat).contains("No such file or directory")
+            {
+                failures.push(format!(
+                    "{role:?}: a missing Nix config file must be ENOENT: {}",
+                    stderr(&absent_stat)
+                ));
+            }
+            let unrelated_stat = stat(unrelated);
+            if unrelated_stat.status.success()
+                || !stderr(&unrelated_stat).contains("Operation not permitted")
+            {
+                failures.push(format!(
+                    "{role:?}: metadata outside /etc/nix must stay denied: {}",
+                    stderr(&unrelated_stat)
+                ));
+            }
+            let append = run(
+                "/bin/sh",
+                &[
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(": >> \"$1\""),
+                    std::ffi::OsStr::new("sh"),
+                    nix_conf.as_os_str(),
+                ],
+            );
+            if append.status.success() {
+                failures.push(format!("{role:?}: nix.conf must not open for writing"));
+            }
+        }
+
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(fs::read(nix_conf).unwrap(), host_config);
+        assert_eq!(
+            fs::metadata(nix_conf).unwrap().modified().unwrap(),
+            host_modified
+        );
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

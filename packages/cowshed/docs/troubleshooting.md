@@ -108,6 +108,10 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   the workspace's `GOENV` wiring (an unwrapped spawn, or an editor without direnv integration). Run it through
   `cowshed exec`/a direnv shell, or fix the editor's direnv plugin; never grant `~/go`. `cowshed doctor` prints the same
   hint, and checks the host for a stray `~/go` that predates adoption (safe to delete — it is only cache).
+- **`nix` fails on `/etc/nix/<file>` with "Operation not permitted"**: the sandbox answered a config stat with EPERM
+  instead of ENOENT (Determinate Nix probes an optional `sentry-endpoint`). Workspace profiles grant read-only metadata
+  on `/etc/nix` — both spellings, since `/etc` resolves to `/private/etc` — and on nothing else in `/etc`, so a cowshed
+  that still shows this predates that rule. Never grant `/etc` to work around it.
 - **Denial persists after a grant**: filesystem grants apply from the _next_ exec; a long-running process (watcher, dev
   server) keeps its launch-time profile. Restart that process.
 
