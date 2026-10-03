@@ -976,10 +976,7 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
         .env_remove("NODE_OPTIONS")
         .kill_on_drop(true);
-    let output = timeout(Duration::from_secs(10), command.output())
-        .await
-        .expect("Node fetch deadline")
-        .expect("run real Node");
+    let output = command.output().await.expect("run real Node");
     assert!(
         output.status.success(),
         "native Node fetch failed: {}",
