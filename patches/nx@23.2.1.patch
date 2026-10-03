@@ -210,6 +210,41 @@ index b1c143e..43d3f13 100644
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
+diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
+index 4a34ba2..c08789f 100644
+--- a/dist/src/tasks-runner/cache.js
++++ b/dist/src/tasks-runner/cache.js
+@@ -549,7 +549,29 @@ function resolveMaxCacheSize(nxJson) {
+     const rawMaxCacheSize = process.env.NX_MAX_CACHE_SIZE ?? nxJson.maxCacheSize;
+     return rawMaxCacheSize !== undefined
+         ? parseMaxCacheSize(rawMaxCacheSize)
+-        : (0, native_1.getDefaultMaxCacheSize)(cache_directory_1.cacheDir);
++        : defaultMaxCacheSize(cache_directory_1.cacheDir);
++}
++/**
++ * A tenth of the filesystem that holds the cache directory, asked of that one
++ * filesystem through its nearest existing ancestor (the directory may not
++ * exist yet). The native default lists every mounted disk to find it, which
++ * on macOS costs IOKit and CacheDelete round trips per mount on this thread,
++ * between hashing and the first task.
++ */
++function defaultMaxCacheSize(cachePath) {
++    for (let directory = cachePath;;) {
++        try {
++            const { blocks, bsize } = (0, node_fs_1.statfsSync)(directory);
++            return Math.floor(blocks * bsize * 0.1);
++        }
++        catch (error) {
++            const parent = (0, path_1.dirname)(directory);
++            if (error?.code !== 'ENOENT' || parent === directory) {
++                throw error;
++            }
++            directory = parent;
++        }
++    }
+ }
+ /**
+  * Converts a string representation of a max cache size to a number.
 diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
 index 34dbaa2..09f95b7 100644
 --- a/dist/src/utils/task-history.js
