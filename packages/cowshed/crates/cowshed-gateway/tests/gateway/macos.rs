@@ -188,22 +188,11 @@ impl AuditSink for ChannelAudit {
         Ok(())
     }
 }
-/// A gateway port block no other test process is about to claim.
+/// Claim a gateway block in the kernel before probing its endpoint.
 ///
-/// nextest runs every test in its own process, so a counter seeded at `MACOS_PORT_MIN` hands the
-/// identical sequence to every process and they race for the same block — `install` then fails with
-/// `AddrInUse`, intermittently, depending on which process binds first. Offsetting the start by pid
-/// makes concurrent processes walk disjoint parts of the range.
-///
-/// The bind probe still runs, because it is the only thing that catches a block held by something
-/// outside the test run: a live `cowshed gateway run` daemon owns real blocks on a developer host.
-/// The probe alone cannot make this reliable — the listener has to drop before the caller binds —
-/// and neither can `process::id() % BLOCKS`, which is a hash, not a partition: nextest runs every
-/// test in its own process, so two concurrent pids congruent mod `BLOCKS` walk the same order and
-/// hand out the same port. That is what produced `AddrInUse` on a varying subset of tests each run.
-///
-/// The block is therefore claimed with `flock` before it is probed. The kernel releases it when the
-/// process exits, so a crashed or killed test cannot strand a block the way a lockfile would.
+/// A PID modulo the block count is not unique, and file locks under TMPDIR are not shared
+/// across test runners with different temp roots. Hold the block's next port for this process's
+/// lifetime instead: every runner sees the same reservation, independent of its filesystem.
 fn free_endpoint() -> SocketAddr {
     const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN)
         / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
@@ -224,10 +213,6 @@ fn free_endpoint() -> SocketAddr {
     panic!("no free macOS gateway port block in {BLOCKS} candidates");
 }
 
-/// Claim one port block for this process's lifetime, across processes.
-///
-/// The descriptor is deliberately leaked: the claim must outlive this call and last until the test
-/// process exits, which is precisely what dropping the probe listener failed to do.
 /// The session endpoint for a block [`free_endpoint`] claimed.
 fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
     WorkspaceEndpoint::Tcp {
@@ -237,21 +222,30 @@ fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
 }
 
 fn claim_port_block(index: u16) -> bool {
-    let path = std::env::temp_dir().join(format!("cowshed-gateway-port-block-{index}.lock"));
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-    else {
+    let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE + 1;
+    let Ok(listener) = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
         return false;
     };
-    let descriptor = std::os::unix::io::IntoRawFd::into_raw_fd(file);
-    if unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return true;
-    }
-    unsafe { libc::close(descriptor) };
-    false
+    // The claim must outlive the availability probe and every session installed by this test.
+    // The kernel releases the descriptor when the test process exits, including after a panic.
+    let _descriptor = std::os::unix::io::IntoRawFd::into_raw_fd(listener);
+    true
+}
+
+#[test]
+fn gateway_port_claim_is_a_live_kernel_reservation() {
+    let endpoint = free_endpoint();
+    let index =
+        (endpoint.port() - cowshed_gateway::MACOS_PORT_MIN) / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
+    assert!(
+        !claim_port_block(index),
+        "a second claimant cannot acquire the live block"
+    );
+    let error = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, endpoint.port() + 1))
+        .expect_err("the shared kernel reservation remains bound");
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    std::net::TcpListener::bind(endpoint)
+        .expect("the gateway endpoint remains available for install");
 }
 
 fn tls_client_hello(host: &str) -> Vec<u8> {

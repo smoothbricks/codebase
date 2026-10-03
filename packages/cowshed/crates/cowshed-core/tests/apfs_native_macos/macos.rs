@@ -237,13 +237,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(test: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "cowshed-apfs-boundary-{}-{test}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
+            "cowshed-apfs-boundary-{test}-{}",
+            uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&root).expect("fixture root");
+        std::fs::create_dir(&root).expect("fixture root");
         Self { root }
     }
 
@@ -258,8 +256,29 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let result = match std::fs::symlink_metadata(&self.root) {
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&self.root),
+            Ok(_) => std::fs::remove_file(&self.root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            eprintln!("remove APFS fixture {}: {error}", self.root.display());
+        }
     }
+}
+
+#[test]
+fn fixture_cleanup_removes_a_store_root_replaced_by_a_file() {
+    let fixture = Fixture::new("cleanup-file-root");
+    let root = fixture.root.clone();
+    std::fs::remove_dir(&root).expect("replace fixture directory");
+    std::fs::write(&root, b"not a directory").expect("file store root");
+    drop(fixture);
+    assert!(
+        !root.exists(),
+        "a corrupt store fixture must not survive its test"
+    );
 }
 
 /// A store on real APFS images: a scratch root under `/private/tmp` laid out like [`Fixture`]'s,

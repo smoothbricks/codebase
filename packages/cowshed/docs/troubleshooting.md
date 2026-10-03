@@ -206,6 +206,13 @@ time (cargo and nextest set it for every test).
 Xcode DerivedData does key on absolute paths: slot mounts (`new --slot`) recycle a stable path for it. `bun install`,
 `node_modules`, zig, and gradle caches are path-independent.
 
+## Parallel test fixture collisions
+
+Keep the normal Nx and nextest parallelism. Gateway fixtures reserve a block's next port in the kernel for the test
+process's lifetime; PID-modulo selection and file locks under different `TMPDIR` roots do not establish global
+ownership. The gateway endpoint itself remains available for the session being tested. APFS fixtures use unique per-run
+roots and remove a root even when a corruption test replaced its directory with a regular file.
+
 ## sccache reports a 0% hit rate and the shared cache never grows
 
 A misdirected cache looks exactly like a broken one. Check where the client is actually writing before believing
