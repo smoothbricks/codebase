@@ -87,7 +87,11 @@ async function nxProjectJson(root: string, projectName: string): Promise<NxProje
   // environmental reasons -- an unbuilt plugin, an unreadable cache, a graph
   // error. runText prints what nx said before throwing; a bare `.quiet()`
   // template here reported only "Failed with exit code 1" and dropped the rest.
-  const stdout = await runText('nx', ['show', 'project', projectName, '--json'], root);
+  // Bound to `root` like every other Nx the release runs: a daemon started under
+  // an inherited alias spelling of this tree refuses clients that name it `root`.
+  const stdout = await runText('nx', ['show', 'project', projectName, '--json'], root, {
+    NX_WORKSPACE_ROOT_PATH: root,
+  });
   const parsed = parseNxProjectJsonText(stdout);
   if (!parsed) {
     throw new Error(`Unable to inspect Nx project ${projectName}: nx show project returned unparseable JSON.`);

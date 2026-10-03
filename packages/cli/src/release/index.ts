@@ -864,13 +864,28 @@ async function runNxReleaseVersion(
   // runs in every release-candidate job before Build, Lint, and Unit Tests, so a
   // tag written here would survive a red candidate and collide on the next run.
   // `smoo release tag` creates the tags once, in the publishing job.
-  const nxArgs = ['release', 'version'];
+  const nxArgs = ['version'];
   if (bump !== 'auto') {
     nxArgs.push(bump);
   }
   nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=false', '--git-push=false');
-  await run('nx', nxArgs, root);
+  await runNxRelease(root, nxArgs);
   return [];
+}
+
+/**
+ * `nx release` in a child process, bound to `root` exactly as the in-process
+ * preview is (`withNxWorkspaceRoot`). Nx reads each project's commits through
+ * `git log --relative=<workspace root relative to git's top level>` and takes
+ * the workspace root from an inherited `NX_WORKSPACE_ROOT_PATH`. When the shell
+ * names this tree by another path -- CI's devenv exports the stable bind mount
+ * of the checkout while the step runs in the checkout itself -- that relative
+ * path leaves the repository, git lists no file for any commit, and Nx reports
+ * "No changes" for every project the preview planned a bump for. `root` is the
+ * top level git reports from the child's cwd, so the relative path is empty.
+ */
+async function runNxRelease(root: string, args: string[]): Promise<void> {
+  await run('nx', ['release', ...args], root, { NX_WORKSPACE_ROOT_PATH: root });
 }
 
 async function runNxReleaseVersionPreview(root: string, projects: string, bump: string): Promise<ReleasePackage[]> {
@@ -929,21 +944,16 @@ async function runNxReleaseVersionPreview(root: string, projects: string, bump: 
 }
 
 async function runNxNextPrereleaseVersion(root: string, projects: string): Promise<void> {
-  await run(
-    'nx',
-    [
-      'release',
-      'version',
-      'prerelease',
-      `--projects=${projects}`,
-      '--preid=next',
-      '--git-commit=true',
-      '--git-tag=false',
-      '--git-push=false',
-      '--git-commit-message=chore(release): prepare next prerelease',
-    ],
-    root,
-  );
+  await runNxRelease(root, [
+    'version',
+    'prerelease',
+    `--projects=${projects}`,
+    '--preid=next',
+    '--git-commit=true',
+    '--git-tag=false',
+    '--git-push=false',
+    '--git-commit-message=chore(release): prepare next prerelease',
+  ]);
 }
 
 async function releasePackagesAtHead(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {

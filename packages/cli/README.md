@@ -253,6 +253,12 @@ Downstream dependency bumps are intentionally left to Nx release. If package A i
 public package B when B depends on A, even when B has no direct file changes. `smoo` should not pre-expand direct
 candidates to downstream dependents because that would duplicate Nx's dependency graph and can over-select packages.
 
+The dry run asks Nx in-process; candidate selection and the real run spawn `nx`. All of them are bound to the repository
+root git reports, never to an inherited `NX_WORKSPACE_ROOT_PATH`. Nx reads each project's commits through
+`git log --relative` from that root, so a shell naming the same checkout by another path (CI's devenv bind mount) would
+otherwise hide every commit's files from the real run and version nothing the dry run planned; with the daemon on, a
+daemon started under one spelling also refuses clients that use the other.
+
 ## Nx Conventions
 
 `smoo` keeps Nx target names predictable and separates tool work from aggregate workflows.
