@@ -223,6 +223,8 @@ pub struct LaunchAgentSpec {
     environment: Vec<(String, String)>,
     lifecycle: ServiceLifecycle,
     standard_error_path: PathBuf,
+    /// A finite soft limit with unlimited hard authority, inherited by descendants.
+    soft_number_of_files: Option<u64>,
 }
 
 /// Everything that varies between one agent definition and another.
@@ -292,16 +294,21 @@ impl LaunchAgentSpec {
             environment,
             lifecycle,
             standard_error_path,
+            soft_number_of_files: None,
         })
     }
 
     pub fn gateway(executable: &HostStableExecutable) -> Result<Self, LaunchdError> {
-        Self::new_user(
+        let mut spec = Self::new_user(
             executable,
             GATEWAY_LABEL,
             vec!["gateway".into(), "run".into()],
             ServiceLifecycle::KeepAlive,
-        )
+        )?;
+        // A finite kernel-sized soft limit keeps sysconf(_SC_OPEN_MAX) usable by fd-closing tools.
+        // Hard authority remains Darwin's RLIM_INFINITY, owned by the service, not child spawns.
+        spec.soft_number_of_files = Some(245_760);
+        Ok(spec)
     }
 
     /// The host-owned sccache server agent.
@@ -452,6 +459,19 @@ impl LaunchAgentSpec {
                 push_xml_string(&mut plist, value);
             }
             plist.push_str("  </dict>\n");
+        }
+        if let Some(soft) = self.soft_number_of_files {
+            use std::fmt::Write as _;
+            for (key, limit) in [
+                ("SoftResourceLimits", soft),
+                ("HardResourceLimits", 9_223_372_036_854_775_807),
+            ] {
+                writeln!(
+                    plist,
+                    "  <key>{key}</key>\n  <dict>\n    <key>NumberOfFiles</key>\n    <integer>{limit}</integer>\n  </dict>"
+                )
+                .expect("writing into a String cannot fail");
+            }
         }
         plist.push_str("</dict>\n</plist>\n");
         plist.into_bytes()

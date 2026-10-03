@@ -1201,10 +1201,10 @@ where
     }
 }
 
-/// The outcome of reconciling one installed host-service binary with the invoking build.
+/// The outcome of reconciling one installed host service with the invoking build and definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceBinaryRefresh {
-    /// The installed copy was stale; it was reinstalled and the service kickstarted.
+    /// The binary or agent definition was stale; it was reconciled and the service reloaded.
     Refreshed { service: String },
     /// The installed copy is stale, but this invocation cannot durably refresh it; the remedy
     /// names what can.
@@ -1225,47 +1225,71 @@ pub fn installed_binary_is_stale(state: &ExecutableInstallState) -> bool {
     !state.is_current()
 }
 
-/// Reconcile the gateway's installed stable binary with the build running this command.
+/// Reconcile the gateway's stable binary and generated agent definition with this command.
 ///
-/// Setup never refuses to repair a host, and a service left running a binary from before the
-/// build being invoked is exactly the drift a repair exists to end. `None` means there is
-/// nothing to say: no gateway agent installed (nothing runs the binary), the bytes already
-/// match, or this IS the installed copy speaking. A stale copy is reinstalled through the same
-/// atomic plan `gateway start` uses and the agent is kickstarted so the running daemon picks the
-/// new bytes up. The invoking build may live on a workspace volume; the copy does not.
+/// Setup never refuses to repair a host. `None` means no gateway agent is installed, or both
+/// installed artifacts already match. Plist drift is repaired even when the invoking build is
+/// byte-identical to the installed copy, including when setup runs from that copy itself.
+/// Binary drift uses the same atomic install and activation rollback as `gateway start`.
 ///
 /// The build has to be fit to supervise *before* anything is copied, and a failed activation puts
 /// the old binary back: this is the function that, unguarded, replaced a host's supervised gateway
 /// with a debug build and then stranded it with no loaded agent.
 pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh>> {
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    refresh_gateway_from(
+        home,
+        running_executable()?,
+        cfg!(debug_assertions),
+        &mut executor,
+    )
+}
+
+fn refresh_gateway_from<C: LaunchctlCommand>(
+    home: &Path,
+    source: PathBuf,
+    debug_build: bool,
+    executor: &mut LaunchdExecutor<NativeFilesystem, C>,
+) -> Result<Option<ServiceBinaryRefresh>> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let source = running_executable()?;
-    if source == executable.path() {
-        return Ok(None);
-    }
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
     if observed.plist.is_none() {
         return Ok(None);
     }
+    let plan = plan_install(
+        &spec,
+        InstallState {
+            launch_agents_directory_mode: observed.directory_mode,
+            plist: observed.plist.as_ref().map(|plist| ExistingPlist {
+                bytes: &plist.bytes,
+                mode: plist.mode,
+            }),
+        },
+    );
     let state = observe_executable_install(&executable, &source)?;
-    if !installed_binary_is_stale(&state) {
+    let binary_is_stale = installed_binary_is_stale(&state);
+    if !binary_is_stale && plan.is_noop() {
         return Ok(None);
     }
-    // Refused only once drift has been established: a debug build whose bytes already match the
-    // installed copy has nothing to install, and refusing there would report a finding on every
-    // `setup` run from a development build for no reason.
-    if let Err(refusal) = refuse_unsupervisable_build(source.clone(), cfg!(debug_assertions)) {
+    // Refuse only a binary replacement: reconciling an agent definition does not install this
+    // invocation's bytes. Preserve the existing supervised binary when it already matches.
+    if binary_is_stale
+        && let Err(refusal) = refuse_unsupervisable_build(source.clone(), debug_build)
+    {
         return Ok(Some(ServiceBinaryRefresh::Refused {
             service: spec.label().to_owned(),
             reason: refusal.message,
             remedy: refusal.hint,
         }));
     }
-    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    // `Changed` forces the deactivate half of activation: the daemon currently running the old
-    // bytes has to exit before the kickstart can start the new ones.
-    install_and_activate_gateway(&mut executor, home, &source, &spec, InstallOutcome::Changed)?;
+    let plist = executor.execute_install(&plan).map_err(launchd_error)?;
+    if binary_is_stale {
+        // Binary drift requires a restart even when the agent definition itself did not change.
+        install_and_activate_gateway(executor, home, &source, &spec, InstallOutcome::Changed)?;
+    } else {
+        activate_launch_agent(executor, effective_uid(), spec.target(), plist)?;
+    }
     Ok(Some(ServiceBinaryRefresh::Refreshed {
         service: spec.label().to_owned(),
     }))
@@ -1299,7 +1323,8 @@ fn observe_executable_install(
     let installed = match inspect_existing(executable.path())? {
         Some(metadata) if is_user_owned(&metadata, false) => Some(InstalledExecutable {
             mode: metadata.permissions().mode() & 0o777,
-            matches_source: same_contents(source, executable.path(), metadata.len())?,
+            matches_source: source == executable.path()
+                || same_contents(source, executable.path(), metadata.len())?,
         }),
         Some(_) => {
             return Err(CowshedError::integrity(
@@ -1529,6 +1554,100 @@ mod tests {
         assert!(!installed_binary_is_stale(&state));
 
         fs::remove_dir_all(&home).ok();
+    }
+
+    #[derive(Default)]
+    struct RecordingGatewayLaunchctl {
+        argv: Vec<Vec<std::ffi::OsString>>,
+    }
+
+    impl LaunchctlCommand for RecordingGatewayLaunchctl {
+        fn run(
+            &mut self,
+            executable: &Path,
+            arguments: &[std::ffi::OsString],
+        ) -> io::Result<crate::launchd::LaunchctlOutput> {
+            assert_eq!(executable, Path::new("/bin/launchctl"));
+            self.argv.push(arguments.to_vec());
+            Ok(crate::launchd::LaunchctlOutput {
+                status: if arguments[0] == "print" {
+                    crate::launchd::CommandStatus::ExitCode(113)
+                } else {
+                    crate::launchd::CommandStatus::Success
+                },
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn setup_refresh_rewrites_an_old_plist_with_a_matching_installed_binary() {
+        let home = scratch_root("plist-drift");
+        let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).unwrap();
+        let spec = LaunchAgentSpec::gateway(&executable).unwrap();
+        let mut filesystem = NativeFilesystem::new();
+        for directory in [
+            executable.support_directory(),
+            executable.directory(),
+            spec.launch_agents_directory(),
+        ] {
+            filesystem
+                .ensure_directory(directory, PRIVATE_DIRECTORY_MODE)
+                .unwrap();
+        }
+        fs::write(executable.path(), b"the already installed release").unwrap();
+        fs::set_permissions(
+            executable.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        )
+        .unwrap();
+        let source = home.join("matching-build");
+        fs::copy(executable.path(), &source).unwrap();
+        let desired = spec.plist_bytes();
+        let desired_text = std::str::from_utf8(&desired).unwrap();
+        let limits_start = desired_text
+            .find("  <key>SoftResourceLimits</key>")
+            .unwrap();
+        let limits_end = desired_text.rfind("</dict>\n</plist>\n").unwrap();
+        let mut legacy = desired_text.to_owned();
+        legacy.replace_range(limits_start..limits_end, "");
+        assert_ne!(legacy.as_bytes(), desired);
+        fs::write(spec.plist_path(), &legacy).unwrap();
+        fs::set_permissions(
+            spec.plist_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(crate::launchd::PRIVATE_PLIST_MODE),
+        )
+        .unwrap();
+        let installed_inode = fs::metadata(executable.path()).unwrap().ino();
+        let mut executor = LaunchdExecutor::new(filesystem, RecordingGatewayLaunchctl::default());
+
+        for source in [source, executable.path().to_path_buf()] {
+            let refreshed =
+                refresh_gateway_from(&home, source.clone(), true, &mut executor).unwrap();
+            assert_eq!(
+                refreshed,
+                Some(ServiceBinaryRefresh::Refreshed {
+                    service: GATEWAY_LABEL.to_owned(),
+                })
+            );
+            assert_eq!(fs::read(spec.plist_path()).unwrap(), desired);
+            assert_eq!(
+                fs::metadata(executable.path()).unwrap().ino(),
+                installed_inode
+            );
+            assert_eq!(
+                refresh_gateway_from(&home, source, true, &mut executor).unwrap(),
+                None
+            );
+            // Exercise setup invoked from the stable binary too, not just an identical external build.
+            fs::write(spec.plist_path(), &legacy).unwrap();
+        }
+        let (_, command) = executor.into_parts();
+        assert_eq!(command.argv.len(), 6);
+        assert_eq!(command.argv[2][0], "bootstrap");
+        assert_eq!(command.argv[5][0], "bootstrap");
+        fs::remove_dir_all(home).unwrap();
     }
 
     fn scratch_root(label: &str) -> PathBuf {

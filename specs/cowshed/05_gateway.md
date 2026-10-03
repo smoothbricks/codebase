@@ -17,6 +17,12 @@ them ran at priority 4 with throttled I/O: on a host at load 80 a fresh workspac
 its first `cowshed exec` spent 537 s inside `direnv export json`. The sccache LaunchAgent is Standard for the same
 reason (launchd.rs `PROCESS_TYPE`).
 
+The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the finite kernel-sized value `245760` and
+`HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful
+to tools that close inherited descriptors. Workspace supervisors, warm shell hosts, and jobs inherit these limits
+naturally; child-spawn code does not change them. Kernel-wide descriptor capacity still applies. `cowshed setup`
+reconciles the generated plist as well as the binary, including on hosts whose installed binary already matches.
+
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
 `/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable
 from a workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644`

@@ -589,7 +589,7 @@ async fn a_refreshed_service_binary_is_reported_and_owns_the_status_line() {
     assert_eq!(streams.exit, 0);
     let refreshed = streams
         .stderr
-        .find("cowshed: dev.cowshed.gateway ran a stale binary; refreshed and restarted\n")
+        .find("cowshed: dev.cowshed.gateway had a stale binary or agent definition; refreshed and restarted\n")
         .expect("the refresh is reported");
     let status = streams
         .stderr

@@ -1220,7 +1220,7 @@ fn render_repair<W: Write, E: Write>(
     for refresh in services {
         let line = match refresh {
             ServiceBinaryRefresh::Refreshed { service } => Some(format!(
-                "{service} ran a stale binary; refreshed and restarted"
+                "{service} had a stale binary or agent definition; refreshed and restarted"
             )),
             ServiceBinaryRefresh::Refused {
                 service, reason, ..

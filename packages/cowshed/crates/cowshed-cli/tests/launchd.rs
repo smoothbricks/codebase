@@ -96,6 +96,16 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <string>Standard</string>\n",
         "  <key>StandardErrorPath</key>\n",
         "  <string>/Users/cowshed-test/Library/Logs/cowshed/daemon-stderr.log</string>\n",
+        "  <key>SoftResourceLimits</key>\n",
+        "  <dict>\n",
+        "    <key>NumberOfFiles</key>\n",
+        "    <integer>245760</integer>\n",
+        "  </dict>\n",
+        "  <key>HardResourceLimits</key>\n",
+        "  <dict>\n",
+        "    <key>NumberOfFiles</key>\n",
+        "    <integer>9223372036854775807</integer>\n",
+        "  </dict>\n",
         "</dict>\n",
         "</plist>\n",
     );
@@ -1230,4 +1240,195 @@ fn native_filesystem_copies_a_binary_with_the_exec_bit_and_exact_bytes() {
     );
 
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+mod descriptor_inheritance {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    const SOCKET_ENV: &str = "COWSHED_LAUNCHD_DESCRIPTOR_SOCKET";
+    const CHILD_TEST: &str = "descriptor_inheritance::host_controller_launchd_descriptor_child";
+    const DESCRIPTORS: usize = 10_000;
+
+    /// This child is launched directly by launchd from the generated gateway plist, not by
+    /// cowshed's spawn code. Its descriptors remain open through the report.
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_launchd_descriptor_child() -> io::Result<()> {
+        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
+            return Ok(());
+        };
+        let mut report = UnixStream::connect(socket)?;
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit initializes the writable rlimit on success.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } == -1 {
+            let error = io::Error::last_os_error();
+            writeln!(report, "getrlimit failed: {error}")?;
+            return Err(error);
+        }
+        // SAFETY: the successful getrlimit initialized both fields.
+        let limits = unsafe { limits.assume_init() };
+        let mut files = Vec::with_capacity(DESCRIPTORS);
+        for index in 0..DESCRIPTORS {
+            match fs::File::open("/dev/null") {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    writeln!(
+                        report,
+                        "opening descriptor {index} failed: {error}; soft={} hard={}",
+                        limits.rlim_cur, limits.rlim_max
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
+        writeln!(
+            report,
+            "{}",
+            serde_json::json!({
+                "held": files.len(),
+                "soft": limits.rlim_cur,
+                "hard": limits.rlim_max,
+                // SAFETY: sysconf reads the inherited descriptor limit without changing it.
+                "open_max": unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+            })
+        )?;
+        Ok(())
+    }
+
+    struct Agent {
+        root: PathBuf,
+        target: String,
+        loaded: bool,
+    }
+
+    impl Drop for Agent {
+        fn drop(&mut self) {
+            if self.loaded {
+                match std::process::Command::new(LAUNCHCTL_EXECUTABLE)
+                    .args(["bootout", &self.target])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => eprintln!(
+                        "cannot unload descriptor probe {}: {} {}",
+                        self.target,
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(error) => {
+                        eprintln!("cannot unload descriptor probe {}: {error}", self.target)
+                    }
+                }
+            }
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                eprintln!(
+                    "cannot remove descriptor probe {}: {error}",
+                    self.root.display()
+                );
+            }
+        }
+    }
+
+    fn quote(path: &Path) -> String {
+        format!(
+            "'{}'",
+            path.to_str()
+                .expect("UTF-8 probe path")
+                .replace('\'', "'\\''")
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    async fn host_controller_generated_gateway_plist_gives_a_real_child_10000_descriptors() {
+        let root = scratch("fd");
+        let label = format!("dev.cowshed.descriptors.{}", std::process::id());
+        // SAFETY: geteuid has no preconditions.
+        let domain = format!("gui/{}", unsafe { libc::geteuid() });
+        let mut agent = Agent {
+            root: root.clone(),
+            target: format!("{domain}/{label}"),
+            loaded: false,
+        };
+        let executable =
+            HostStableExecutable::new(&root, COWSHED_BINARY_NAME).expect("probe program");
+        let spec = LaunchAgentSpec::gateway(&executable).expect("generated gateway definition");
+        fs::create_dir_all(executable.path().parent().expect("binary directory"))
+            .expect("binary directory");
+        fs::create_dir_all(spec.standard_error_path().parent().expect("log directory"))
+            .expect("log directory");
+        let socket = root.join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("descriptor report socket");
+        let program = format!(
+            "#!/bin/sh\nexport {SOCKET_ENV}={}\nexec {} --exact {CHILD_TEST} --ignored --nocapture\n",
+            quote(&socket),
+            quote(&std::env::current_exe().expect("probe test binary"))
+        );
+        fs::write(executable.path(), program).expect("launchd probe executable");
+        fs::set_permissions(
+            executable.path(),
+            fs::Permissions::from_mode(STABLE_BINARY_MODE),
+        )
+        .expect("executable mode");
+        // The service is isolated by label and is one-shot so it cannot restart a successful
+        // probe. All generated resource-limit bytes remain exactly as the gateway writes them.
+        let plist = String::from_utf8(spec.plist_bytes())
+            .expect("UTF-8 plist")
+            .replace(
+                &format!("<string>{GATEWAY_LABEL}</string>"),
+                &format!("<string>{label}</string>"),
+            )
+            .replace(
+                "<key>KeepAlive</key>\n  <true/>",
+                "<key>KeepAlive</key>\n  <false/>",
+            );
+        let plist_path = root.join("probe.plist");
+        fs::write(&plist_path, plist).expect("generated probe plist");
+        fs::set_permissions(&plist_path, fs::Permissions::from_mode(PRIVATE_PLIST_MODE))
+            .expect("plist mode");
+        let launched = std::process::Command::new(LAUNCHCTL_EXECUTABLE)
+            .args(["bootstrap", &domain])
+            .arg(&plist_path)
+            .output()
+            .expect("launchctl bootstrap");
+        assert!(
+            launched.status.success(),
+            "launchctl bootstrap {}: {}",
+            launched.status,
+            String::from_utf8_lossy(&launched.stderr)
+        );
+        agent.loaded = true;
+        let report = tokio::time::timeout(Duration::from_secs(30), async {
+            use tokio::io::AsyncReadExt as _;
+            let (mut child, _) = listener.accept().await.expect("launchd child connects");
+            let mut bytes = Vec::new();
+            child
+                .read_to_end(&mut bytes)
+                .await
+                .expect("child report reaches EOF");
+            bytes
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "launched descriptor probe never connected or closed its report; stderr: {}",
+                fs::read_to_string(spec.standard_error_path())
+                    .unwrap_or_else(|error| format!("cannot read probe stderr: {error}"))
+            )
+        });
+        let result: serde_json::Value = serde_json::from_slice(&report).unwrap_or_else(|error| {
+            panic!(
+                "descriptor report {error}: {}",
+                String::from_utf8_lossy(&report)
+            )
+        });
+        assert_eq!(result["held"].as_u64(), Some(10_000));
+        assert_eq!(result["soft"].as_u64(), Some(245_760));
+        assert_eq!(result["hard"].as_u64(), Some(libc::RLIM_INFINITY));
+        assert_eq!(result["open_max"].as_u64(), Some(245_760));
+    }
 }
