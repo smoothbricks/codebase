@@ -2223,8 +2223,10 @@ fn records_path(workspace_root: &Path) -> PathBuf {
         .join(RECORDS_FILE)
 }
 
+/// The records `flock`, fenced so another store instance takes it as soon as this one drops it
+/// (`fork_lock`).
 struct RecordsLock<'path> {
-    _file: File,
+    _file: crate::fork_lock::Fenced<File>,
     records: &'path Path,
 }
 
@@ -2255,6 +2257,7 @@ impl<'path> RecordsLock<'path> {
         }
         let file = options
             .open(&path)
+            .map(crate::fork_lock::Fenced::new)
             .map_err(|error| io_error(&path, error))?;
         let metadata = file.metadata().map_err(|error| io_error(&path, error))?;
         reject_hardlink(&path, &metadata)?;

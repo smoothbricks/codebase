@@ -11,6 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use cowshed_core::fork_lock::{Run as _, Spawn as _};
 use http::{Method, Request, header};
 use http_body_util::Empty;
 use hyper::client::conn::{http1, http2};
@@ -411,7 +412,7 @@ async fn run_fetch_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_locked()
         .map_err(|_| RepoMirrorError::HelperUnavailable)?;
     let mut stdin = child.stdin.take().ok_or(RepoMirrorError::HelperProtocol)?;
     let stdout = child.stdout.take().ok_or(RepoMirrorError::HelperProtocol)?;
@@ -622,7 +623,7 @@ fn fetch_with_git(mut request: HelperRequest) -> Result<Option<String>, ()> {
     let init = git_command(git, extra_header.as_ref())
         .args(["init", "--bare", "--template="])
         .arg(destination)
-        .status()
+        .status_locked()
         .map_err(|_| ())?;
     if !init.success() {
         return Err(());
@@ -639,7 +640,7 @@ fn fetch_with_git(mut request: HelperRequest) -> Result<Option<String>, ()> {
             "+refs/heads/*:refs/heads/*",
             "+refs/tags/*:refs/tags/*",
         ])
-        .status()
+        .status_locked()
         .map_err(|_| ())?;
     if !fetch.success() {
         return Err(());
@@ -653,7 +654,7 @@ fn fetch_with_git(mut request: HelperRequest) -> Result<Option<String>, ()> {
             "--sort=refname",
             "refs/heads",
         ])
-        .output()
+        .output_locked()
         .map_err(|_| ())?;
     if !output.status.success() {
         return Ok(None);

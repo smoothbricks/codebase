@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
 use crate::error::{CowshedError, Result as CowshedResult};
+use crate::fork_lock::Fenced;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
@@ -443,10 +444,11 @@ impl LifecycleIntentJournal {
 /// replaying it runs it a second time beside the first — a second clone, a second bundle writer
 /// on the same trash path. The journal cannot tell the two apart; an exclusive lock can. The
 /// executing process holds one per workspace for as long as it works on it, and the kernel
-/// releases it when that process ends, however it ends.
+/// releases it when that process ends, however it ends. Dropping it releases it at once: it is
+/// fenced, so no child still being spawned holds it (`fork_lock`).
 #[derive(Debug)]
 pub struct IntentLease {
-    _file: File,
+    _file: Fenced<File>,
 }
 
 impl IntentLease {
@@ -475,8 +477,8 @@ impl IntentLease {
     }
 }
 
-/// Open (creating) a lock file without following a symlink planted at its name.
-fn open_lock_file(path: &Path) -> CowshedResult<File> {
+/// Open (creating) a lock file without following a symlink planted at its name, fenced.
+fn open_lock_file(path: &Path) -> CowshedResult<Fenced<File>> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -484,6 +486,7 @@ fn open_lock_file(path: &Path) -> CowshedResult<File> {
         .truncate(false)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
+        .map(Fenced::new)
         .map_err(|error| {
             CowshedError::environment_missing(
                 format!("cannot open lifecycle lock {}: {error}", path.display()),

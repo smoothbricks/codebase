@@ -858,6 +858,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "cowshed-core",
  "cowshed-gateway-types",
  "http",
  "http-body",

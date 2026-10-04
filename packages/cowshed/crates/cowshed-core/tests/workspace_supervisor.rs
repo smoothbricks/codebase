@@ -13,6 +13,7 @@ use cowshed_core::api::{
     RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WarmAdmission, WarmRange, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
+use cowshed_core::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
@@ -1520,7 +1521,7 @@ fn owned_group() -> std::process::Child {
         .args(["-c", "sleep 300 & wait"])
         .stdin(std::process::Stdio::null())
         .process_group(0)
-        .spawn()
+        .spawn_locked()
         .expect("a test-owned process group")
 }
 
@@ -1653,7 +1654,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .process_group(0)
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let pgid = i32::try_from(leaderless.id()).unwrap();
     let mut ready = String::new();
@@ -2458,7 +2459,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
         tokio::process::Command::new(self.child[0])
             .args(&self.child[1..])
             .kill_on_drop(true)
-            .spawn()
+            .spawn_locked()
     }
 }
 

@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{CreateOptions, RemoveOptions, RemoveReport};
+use cowshed_core::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
@@ -141,7 +142,7 @@ fn crash_then_recover(operation: &str) {
         .args(["--exact", "lifecycle_intent_child", "--nocapture"])
         .env(CHILD_MODE, operation)
         .env(CHILD_ROOT, root.path())
-        .status()
+        .status_locked()
         .expect("spawn crash child");
     assert!(
         !status.success(),
@@ -351,7 +352,7 @@ fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
         .args(["--exact", "lifecycle_intent_child", "--nocapture"])
         .env(CHILD_MODE, "create")
         .env(CHILD_ROOT, root.path())
-        .status()
+        .status_locked()
         .expect("spawn create child");
     assert!(!status.success(), "the create child is killed mid-flight");
 
@@ -412,7 +413,7 @@ fn recovery_leaves_a_running_removal_to_its_process_and_takes_it_over_once_that_
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", "lifecycle_lease_child", "--nocapture"])
         .env(LEASE_CHILD_ROOT, root.path())
-        .spawn()
+        .spawn_locked()
         .expect("spawn removal child");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !root.path().join("ready").exists() {

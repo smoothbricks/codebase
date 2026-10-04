@@ -34,6 +34,7 @@ use crate::api::dto::{
     Sha256Digest, StdinSource, TraceContext, WarmAdmission, WarmRange, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
+use crate::fork_lock::Fenced;
 use crate::storage::job_artifact::StreamKind;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
@@ -494,12 +495,14 @@ pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapsh
 
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
 /// its substrate. The persistent file lease serializes binders; an older build is drained before
-/// a new build binds, and the occupant probe still refuses any live inherited listener.
+/// a new build binds, and the occupant probe still refuses any live inherited listener. The
+/// listener and the lease are fenced: once either is closed, no child still being spawned holds
+/// it, so the next binder finds the socket stopped and the lease free (`fork_lock`).
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
-    pub(super) listener: UnixListener,
-    _lease: std::fs::File,
+    pub(super) listener: Fenced<UnixListener>,
+    _lease: Fenced<std::fs::File>,
     /// Where its socket file is: the workspace's socket path once published, a private name
     /// before.
     path: PathBuf,
@@ -632,15 +635,17 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| io("restrict the directory of", error))?;
     let lock_path = path.with_extension("sock.lock");
-    let lease = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .map_err(|error| io("open the socket lease of", error))?;
+    let lease = Fenced::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| io("open the socket lease of", error))?,
+    );
     match lease.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -680,7 +685,8 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
         )
     })?;
     let fresh = directory.join(format!("{:032x}.bind", u128::from_ne_bytes(random)));
-    let listener = UnixListener::bind(&fresh).map_err(|error| io("bind", error))?;
+    let listener =
+        Fenced::create(|| UnixListener::bind(&fresh)).map_err(|error| io("bind", error))?;
     let instance = match Instance::at(&fresh) {
         Ok(Some(instance)) => instance,
         outcome => {
@@ -1697,6 +1703,7 @@ async fn forward_exec(
 #[cfg(test)]
 mod socket_ownership_tests {
     use super::*;
+    use crate::fork_lock::Spawn as _;
 
     fn path() -> PathBuf {
         PathBuf::from("/tmp")
@@ -1851,12 +1858,14 @@ mod socket_ownership_tests {
     }
 
     /// A socket a binder without the lease left when it stopped -- every descriptor of it
-    /// closed -- is absent to hello, and the next bind replaces it.
+    /// closed -- is absent to hello, and the next bind replaces it. The binder creates and closes
+    /// its listener as `bind` and a product release do, fenced: otherwise a child another test
+    /// of this process is spawning meanwhile would hold it attached.
     #[tokio::test]
     async fn a_stopped_socket_of_a_binder_without_the_lease_is_replaced() {
         let path = path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        drop(UnixListener::bind(&path).unwrap());
+        drop(Fenced::create(|| UnixListener::bind(&path)).unwrap());
         let stopped = inode(&path);
 
         assert_eq!(hello_if_present(&path).await.unwrap(), None);
@@ -1903,7 +1912,7 @@ mod socket_ownership_tests {
             .env(BOUND_SOCKET, &path)
             .stdout(std::process::Stdio::null())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         // Published last, once the owner holds the lease.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1959,7 +1968,7 @@ mod socket_ownership_tests {
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn()
+                .spawn_locked()
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -1984,7 +1993,7 @@ mod socket_ownership_tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         // The child that inherited the listener reads this until it is dropped.
         let holder_input = creator.stdin.take().unwrap();

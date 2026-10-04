@@ -19,6 +19,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::checkout::CheckoutRecord;
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PortBlock, PublicationState,
@@ -219,7 +220,7 @@ impl Relocated {
             .arg("-C")
             .arg(&self.session)
             .args(["config", "--get", &format!("remote.{name}.url")])
-            .output()
+            .output_locked()
             .expect("run git config");
         output.status.success().then(|| {
             String::from_utf8_lossy(&output.stdout)
@@ -280,7 +281,7 @@ where
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -302,7 +303,7 @@ fn commit(root: &Path, message: &str) {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git commit");
     assert!(
         output.status.success(),
@@ -332,7 +333,7 @@ async fn a_relocated_project_has_every_recorded_path_repaired() {
             .args(["ls-remote", "--exit-code", "main", "refs/heads/main"])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
+            .output_locked()
             .expect("run git ls-remote")
             .status
             .code()

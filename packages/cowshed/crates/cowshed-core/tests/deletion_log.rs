@@ -30,10 +30,16 @@ impl CommandRunner for StubRunner {
     ) -> Result<CommandOutput, cowshed_core::apfs::CommandRunError> {
         Ok(CommandOutput::success(Vec::new()))
     }
-    fn image_lease(&self, _: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(
+        &self,
+        _: &std::path::Path,
+    ) -> std::io::Result<Option<cowshed_core::fork_lock::Fenced<std::fs::File>>> {
         Ok(None)
     }
-    fn pin_raw_device(&self, _: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(
+        &self,
+        _: &std::path::Path,
+    ) -> std::io::Result<Option<cowshed_core::fork_lock::Fenced<std::fs::File>>> {
         Ok(None)
     }
     fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_core::apfs::AttachedDiskImage>> {

@@ -11,6 +11,7 @@ use cowshed_core::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
     MountAccess, SystemCommandRunner, volume_name,
 };
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{
     GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
@@ -463,7 +464,7 @@ fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
         .arg("-c")
         .arg(image)
         .arg(&holder)
-        .status()?;
+        .status_locked()?;
     if !cloned.success() {
         return Err(format!("cp -c {} failed: {cloned}", image.display()).into());
     }

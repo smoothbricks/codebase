@@ -29,6 +29,8 @@ use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
+#[cfg(target_os = "macos")]
+use crate::fork_lock::RunAsync as _;
 use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
@@ -6580,12 +6582,13 @@ enum NativeAdoptRollbackState {
 #[cfg(all(test, target_os = "macos"))]
 mod rebase_recovery_tests {
     use super::*;
+    use crate::fork_lock::Run as _;
 
     fn git(root: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .args(args)
             .current_dir(root)
-            .output()
+            .output_locked()
             .expect("run fixture git command")
     }
 
@@ -6776,7 +6779,7 @@ mod rebase_recovery_tests {
                 .args(["clone", "--quiet"])
                 .arg(source)
                 .arg(&root)
-                .output()
+                .output_locked()
                 .expect("clone");
             assert!(output.status.success(), "{output:?}");
             Self::identify(&root);
@@ -8984,7 +8987,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .arg("--mirror")
                 .arg(url.as_str())
                 .arg(&root)
-                .output()
+                .output_locked()
                 .await
                 .map_err(|error| {
                     CowshedError::environment_missing(error.to_string(), "install git")
@@ -11562,7 +11565,7 @@ async fn run_git_with_read<const N: usize>(
 ) -> Result<()> {
     let mut command =
         tokio::process::Command::from(crate::git::sandboxed_git_command_with_read(root, read)?);
-    let output = command.args(args).output().await.map_err(|error| {
+    let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
             "restore /usr/bin/git and sandbox-exec",
@@ -11576,7 +11579,7 @@ async fn run_git_with_read<const N: usize>(
 #[cfg(target_os = "macos")]
 async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::from(crate::git::sandboxed_git_command_at(root)?);
-    command.args(args).output().await.map_err(|error| {
+    command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
             "restore /usr/bin/git and sandbox-exec",
@@ -12795,10 +12798,16 @@ mod retired_recovery_tests {
         ) -> std::result::Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
             panic!("reclaiming a detached retired image ran a disk command: {request:?}");
         }
-        fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+        fn image_lease(
+            &self,
+            identity: &Path,
+        ) -> std::io::Result<Option<crate::fork_lock::Fenced<std::fs::File>>> {
             panic!("reclaiming a detached retired image took an APFS image lease: {identity:?}");
         }
-        fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+        fn pin_raw_device(
+            &self,
+            device: &Path,
+        ) -> std::io::Result<Option<crate::fork_lock::Fenced<std::fs::File>>> {
             panic!("reclaiming a detached retired image pinned a raw APFS device: {device:?}");
         }
         fn attached_disk_images(&self) -> std::io::Result<Vec<crate::apfs::AttachedDiskImage>> {
@@ -13297,7 +13306,8 @@ fn abandoned_clone_origin(
 }
 
 /// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork, restore
-/// or retirement holds on the image for as long as it works on it.
+/// or retirement holds on the image for as long as it works on it. A probe that takes the lock
+/// holds it until it is dropped, so it is fenced like every lease (`fork_lock`).
 #[cfg(target_os = "macos")]
 fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -13310,7 +13320,7 @@ fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock)
     {
-        Ok(file) => file,
+        Ok(file) => crate::fork_lock::Fenced::new(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(CowshedError::environment_missing(
@@ -13601,6 +13611,7 @@ async fn require_lost_groups_released(
 #[cfg(all(test, target_os = "macos"))]
 mod unresolved_retirement_tests {
     use super::*;
+    use crate::fork_lock::Spawn as _;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::process::CommandExt as _;
     use std::time::Duration;
@@ -13624,7 +13635,7 @@ mod unresolved_retirement_tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let birth = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
         super::super::job_groups::record(&ledger, &[(9, birth)], &[]).unwrap();

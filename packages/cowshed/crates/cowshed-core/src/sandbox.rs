@@ -1148,6 +1148,10 @@ fn push_line(profile: &mut String, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::fork_lock::Run as _;
+    #[cfg(target_os = "macos")]
+    use crate::fork_lock::Spawn as _;
     use std::fs;
     #[cfg(target_os = "macos")]
     use std::process::Stdio;
@@ -2007,28 +2011,28 @@ mod tests {
         }
         let host_name = std::process::Command::new("/usr/bin/id")
             .arg("-un")
-            .output()
+            .output_locked()
             .unwrap();
         assert!(host_name.status.success(), "{host_name:?}");
         let name = std::str::from_utf8(&host_name.stdout).unwrap().trim();
         let record = format!("/Users/{name}");
         let host_record = std::process::Command::new("/usr/bin/dscl")
             .args([".", "-read", &record, "UniqueID"])
-            .output()
+            .output_locked()
             .unwrap();
         assert!(host_record.status.success(), "{host_record:?}");
         let key = config.workspace_mount.join("identity-key");
         let generated = std::process::Command::new("/usr/bin/ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(&key)
-            .output()
+            .output_locked()
             .unwrap();
         assert!(generated.status.success(), "{generated:?}");
         let public_key = key.with_extension("pub");
         let host_fingerprint = std::process::Command::new("/usr/bin/ssh-keygen")
             .arg("-lf")
             .arg(&public_key)
-            .output()
+            .output_locked()
             .unwrap();
         assert!(host_fingerprint.status.success(), "{host_fingerprint:?}");
         for role in [
@@ -2039,14 +2043,14 @@ mod tests {
             let profile = seatbelt_profile(&config, role).unwrap();
             let identity = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/id", "-un"])
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(identity.status.success(), "{role:?}: {identity:?}");
             assert_eq!(identity.stdout, host_name.stdout, "{role:?}");
             let fingerprint = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/ssh-keygen", "-lf"])
                 .arg(&public_key)
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(fingerprint.status.success(), "{role:?}: {fingerprint:?}");
             assert_eq!(fingerprint.stdout, host_fingerprint.stdout, "{role:?}");
@@ -2061,7 +2065,7 @@ mod tests {
                     &record,
                     "UniqueID",
                 ])
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(
                 !denied_record.status.success(),
@@ -2108,25 +2112,25 @@ mod tests {
             .args(["-p", &supervisor, "--", "/usr/bin/touch"])
             .arg(&canonical_stream)
             .stderr(Stdio::null())
-            .status()
+            .status_locked()
             .unwrap();
         let child_write = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &child, "--", "/usr/bin/touch"])
             .arg(&child_stream)
             .stderr(Stdio::null())
-            .status()
+            .status_locked()
             .unwrap();
         let ordinary_write = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &child, "--", "/usr/bin/touch"])
             .arg(&workspace_file)
             .stderr(Stdio::null())
-            .status()
+            .status_locked()
             .unwrap();
         let hardlink_attempt = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &supervisor, "--", "/bin/ln"])
             .args([&canonical_stream, &hardlink])
             .stderr(Stdio::null())
-            .status()
+            .status_locked()
             .unwrap();
 
         for path in [&git_config, &git_alias] {
@@ -2134,7 +2138,7 @@ mod tests {
                 .args(["-p", &child, "--", "/usr/bin/tee"])
                 .arg(path)
                 .stdin(Stdio::null())
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(
                 !write.status.success(),
@@ -2146,7 +2150,7 @@ mod tests {
             .args(["-p", &child, "--", "/bin/mv"])
             .arg(config.workspace_mount.join(".cowshed"))
             .arg(config.workspace_mount.join("moved-metadata"))
-            .output()
+            .output_locked()
             .unwrap();
         assert!(
             !replace_parent.status.success(),
@@ -2194,7 +2198,9 @@ mod tests {
             .current_dir(&config.workspace_mount)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .output()
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .and_then(std::process::Child::wait_with_output)
             .unwrap();
 
         fs::remove_dir_all(&root).unwrap();
@@ -2269,7 +2275,7 @@ mod tests {
                     .args(args)
                     .current_dir(&config.workspace_mount)
                     .stdin(Stdio::null())
-                    .output()
+                    .output_locked()
                     .unwrap()
             };
             let stat = |path: &Path| run("/usr/bin/stat", &[path.as_os_str()]);

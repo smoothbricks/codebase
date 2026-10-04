@@ -7,6 +7,7 @@ pub mod copy;
 mod device;
 pub mod error;
 pub mod exec;
+pub mod fork_lock;
 mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;

@@ -209,6 +209,8 @@ fn publish_git_fetch_config(mount: &Path, mappings: &[GitFetchMapping]) -> Resul
 /// Parsing only directory names also means a remote in an included config is never identity.
 #[cfg(target_os = "macos")]
 async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
+    use crate::fork_lock::Spawn as _;
+
     let profile =
         crate::sandbox::seatbelt_profile(sandbox, crate::sandbox::SandboxProfileRole::GitDiscovery)
             .map_err(|error| failure(error.to_string()))?;
@@ -247,7 +249,7 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     crate::exec::prepare_child_descriptors(command.as_std_mut())
         .map_err(|error| failure(error.source.to_string()))?;
     let mut child = command
-        .spawn()
+        .spawn_locked()
         .map_err(|error| failure(format!("cannot inspect local Git object store: {error}")))?;
     let (stdout, stderr, status) = collect_probe_output(&mut child).await.map_err(|error| {
         failure(format!(
@@ -462,6 +464,9 @@ async fn refresh_from_store(store: &Path, sandbox: &SandboxConfig) -> Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::fork_lock::Run as _;
+    use crate::fork_lock::Spawn as _;
 
     fn mapping(url: &str, path: &str) -> GitFetchMapping {
         GitFetchMapping {
@@ -681,7 +686,7 @@ mod tests {
             .env("PATH", "/usr/bin:/bin")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
+            .output_locked()
             .expect("git");
         assert!(
             output.status.success(),
@@ -714,7 +719,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_locked()
             .expect("Git ls-remote");
         let (stdout, stderr, status) = collect_probe_output(&mut child)
             .await
@@ -738,7 +743,7 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
+                .spawn_locked()
                 .expect("unbounded output process");
             assert!(
                 collect_probe_output(&mut child).await.is_err(),

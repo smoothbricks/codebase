@@ -13,6 +13,7 @@ use cowshed_core::apfs::{
     CommandRunError, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource, MountAccess,
     SystemCommandRunner,
 };
+use cowshed_core::fork_lock::{Fenced, Run as _, Spawn as _};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
     Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
@@ -163,10 +164,10 @@ impl CommandRunner for RecordingRunner {
             Ok(self.inventory.respond(request))
         }
     }
-    fn image_lease(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
     }
-    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
     }
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
@@ -191,10 +192,10 @@ impl CommandRunner for UnreadableFirstInventoryRunner {
     fn run(&self, _: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         Ok(CommandOutput::success([]))
     }
-    fn image_lease(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
     }
-    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
     }
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
@@ -381,7 +382,7 @@ impl RealFixture {
             .args(["-o", options])
             .arg(attachment.volume_device())
             .arg(mount_point)
-            .output()
+            .output_locked()
             .expect("run mount_apfs");
         assert!(
             mounted.status.success(),
@@ -2396,11 +2397,11 @@ impl CommandRunner for EjectAtFsck {
         system.run(request)
     }
 
-    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.image_lease(identity)
     }
 
-    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.pin_raw_device(device)
     }
 
@@ -2458,12 +2459,12 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
     let ejected = Command::new("/usr/sbin/diskutil")
         .args(["eject", "force"])
         .arg(attachment.whole_device())
-        .output()
+        .output_locked()
         .expect("external forced eject");
     let image_driver_ejected = Command::new("/usr/bin/hdiutil")
         .args(["detach", "-force"])
         .arg(attachment.whole_device())
-        .output()
+        .output_locked()
         .expect("external image-driver forced detach");
     assert!(
         !image_driver_ejected.status.success(),
@@ -2473,7 +2474,7 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
         let attached_foreign = Command::new("/usr/sbin/diskutil")
             .args(["image", "attach", "--nobrowse", "--plist"])
             .arg(&foreign)
-            .output()
+            .output_locked()
             .expect("external foreign attachment");
         assert!(
             attached_foreign.status.success(),
@@ -2568,11 +2569,11 @@ impl CommandRunner for EjectAfterAttach {
         Ok(output)
     }
 
-    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.image_lease(identity)
     }
 
-    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.pin_raw_device(device)
     }
 
@@ -4299,7 +4300,7 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         assert_eq!(result.is_ok(), expected_valid, "{options}: {result:?}");
         let unmounted = Command::new("/sbin/umount")
             .arg(&mount)
-            .output()
+            .output_locked()
             .expect("umount");
         assert!(
             unmounted.status.success(),
@@ -4376,7 +4377,7 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
         if crash {
             command.env("COWSHED_FLOCK_HELPER_CRASH", "1");
         }
-        let mut child = command.spawn().expect("spawn lock helper");
+        let mut child = command.spawn_locked().expect("spawn lock helper");
         wait_for_path(&ready);
         assert!(
             first
@@ -4889,11 +4890,11 @@ impl CommandRunner for ImmutableDuringResize {
         grown
     }
 
-    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.image_lease(identity)
     }
 
-    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         SystemCommandRunner.pin_raw_device(device)
     }
 

@@ -380,6 +380,7 @@ mod tests {
     use super::{
         count_extents, next_data_region, punch_hole, rewrite_contiguously, rewrite_sibling,
     };
+    use crate::fork_lock::Run as _;
 
     const MIB: u64 = 1024 * 1024;
     const PAGE: u64 = 16 * 1024;
@@ -442,7 +443,7 @@ mod tests {
                 .arg("-c")
                 .arg(&path)
                 .arg(&holder)
-                .status()
+                .status_locked()
                 .expect("cp -c")
                 .success()
         );

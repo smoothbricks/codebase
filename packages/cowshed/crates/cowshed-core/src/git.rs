@@ -10,6 +10,7 @@ use tokio::process::Command;
 
 use crate::api::dto::GitOid;
 use crate::error::{CowshedError, Result};
+use crate::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use crate::timing::timed_async;
 use crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH;
 
@@ -572,7 +573,9 @@ impl GitRepository {
                     // ordinary controller Git must not load the operator's config.
                     command.env_remove("GIT_CONFIG_GLOBAL");
                 }
-                let output = command.output().map_err(|error| git_spawn_error(&error))?;
+                let output = command
+                    .output_locked()
+                    .map_err(|error| git_spawn_error(&error))?;
                 if output.status.code() == Some(1) {
                     continue; // git-config's documented absent-key status, not an empty value.
                 }
@@ -651,7 +654,7 @@ impl GitRepository {
                             OsStr::new(key),
                             value.as_os_str(),
                         ])
-                        .output()
+                        .output_locked()
                         .map_err(|error| git_spawn_error(&error))?;
                     if !output.status.success() {
                         return Err(git_internal("encode inherited Git identity", &output));
@@ -2562,7 +2565,7 @@ where
     }
     command.kill_on_drop(true);
     command
-        .output()
+        .output_locked()
         .await
         .map_err(|error| git_spawn_error(&error))
 }
@@ -2884,7 +2887,7 @@ where
     }
     command.kill_on_drop(true);
     command
-        .output()
+        .output_locked()
         .await
         .map_err(|error| git_spawn_error(&error))
 }
@@ -2910,7 +2913,7 @@ pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_locked()
     {
         Ok(child) => child,
         Err(_) => return Vec::new(),
@@ -3010,7 +3013,7 @@ fn git_batch_blocking(checkout: &Path, args: &[&str], input: Vec<u8>) -> Vec<u8>
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_locked()
     {
         Ok(child) => child,
         Err(_) => return Vec::new(),
@@ -3185,6 +3188,7 @@ fn parse_one_line<'a>(bytes: &'a [u8], description: &str) -> Result<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
+    use crate::fork_lock::Run as _;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -3251,7 +3255,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&main)
             .arg(&workspace)
-            .status()
+            .status_locked()
             .expect("clone workspace");
         assert!(cloned.success());
         let main = main.canonicalize().expect("canonical main");
@@ -3260,7 +3264,7 @@ mod tests {
         let denied = super::sandboxed_git_command_at(&workspace)
             .expect("narrow Git")
             .args(["fetch", "--no-tags", source])
-            .output()
+            .output_locked()
             .expect("sandboxed fetch");
         assert!(
             !denied.status.success(),
@@ -3269,7 +3273,7 @@ mod tests {
         let admitted = super::sandboxed_git_command_with_read(&workspace, &main)
             .expect("trusted read grant")
             .args(["fetch", "--no-tags", source])
-            .output()
+            .output_locked()
             .expect("sandboxed fetch");
         assert!(
             admitted.status.success(),
@@ -3293,7 +3297,7 @@ mod tests {
         let status = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(&root)
-            .status()
+            .status_locked()
             .expect("run git init");
         assert!(status.success());
         fs::write(root.join("README"), "test\n").expect("write fixture");
@@ -3308,7 +3312,7 @@ mod tests {
                 "add",
                 ".",
             ])
-            .status()
+            .status_locked()
             .expect("run git add");
         assert!(status.success());
         let status = Command::new("git")
@@ -3323,7 +3327,7 @@ mod tests {
                 "-qm",
                 "initial",
             ])
-            .status()
+            .status_locked()
             .expect("run git commit");
         assert!(status.success());
         root
@@ -3544,7 +3548,10 @@ mod tests {
             fs::read(&envrc).unwrap(),
             b"export PROJECT_ENV_WIRING_PROBE=project-owned\n# cowshed: workspace environment\nsource_env_if_exists .cowshed/env\nexport PROJECT_ENV_WIRING_TAIL=tail-owned\n",
         );
-        let stdlib = Command::new("direnv").arg("stdlib").output().unwrap();
+        let stdlib = Command::new("direnv")
+            .arg("stdlib")
+            .output_locked()
+            .unwrap();
         assert!(
             stdlib.status.success(),
             "direnv stdlib failed: {}",
@@ -3564,8 +3571,7 @@ mod tests {
                 ])
                 .current_dir(&root)
                 .env_remove("BASH_ENV")
-                .env_remove("COWSHED_ENV_WIRING_PROBE")
-                .output()
+                .env_remove("COWSHED_ENV_WIRING_PROBE").output_locked()
                 .unwrap();
             assert!(
                 loaded.status.success(),
@@ -3680,7 +3686,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["switch", "--detach", "--quiet", "HEAD"])
-            .status()
+            .status_locked()
             .expect("detach HEAD");
         assert!(status.success());
 
@@ -3805,7 +3811,7 @@ mod tests {
                 "origin",
                 "https://example.invalid/private.git",
             ])
-            .status()
+            .status_locked()
             .expect("add inherited network remote");
         assert!(status.success());
 
@@ -3840,7 +3846,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["switch", "--quiet", "main"])
-            .status()
+            .status_locked()
             .expect("move HEAD away after branch creation");
         assert!(switched.success());
         repo.prepare_workspace("raven", &root, Some("main"), true)
@@ -3867,7 +3873,7 @@ mod tests {
         let mount = main.with_extension("workspace");
         let status = Command::new("cp")
             .args(["-R".as_ref(), main.as_os_str(), mount.as_os_str()])
-            .status()
+            .status_locked()
             .expect("clone image");
         assert!(status.success());
         mount
@@ -3878,7 +3884,7 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(args)
-            .output()
+            .output_locked()
             .expect("run git");
         assert!(output.status.success(), "{args:?}");
         String::from_utf8(output.stdout).expect("git output is utf-8")
@@ -4123,7 +4129,7 @@ mod tests {
     fn copy_tree(from: &Path, to: &Path) {
         let status = Command::new("cp")
             .args(["-RP".as_ref(), from.as_os_str(), to.as_os_str()])
-            .status()
+            .status_locked()
             .expect("copy tree");
         assert!(status.success());
     }
@@ -4352,7 +4358,7 @@ mod tests {
             .arg("-C")
             .arg(&main)
             .args(["branch", "cowshed/raven"])
-            .status()
+            .status_locked()
             .expect("create colliding branch");
         assert!(status.success());
 
@@ -4565,7 +4571,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["remote", "get-url", MAIN_REMOTE])
-            .output()
+            .output_locked()
             .expect("read raw main remote");
         assert!(output.status.success());
         assert_eq!(
@@ -4632,7 +4638,7 @@ mod tests {
             .arg("-C")
             .arg(&host)
             .args(["update-ref", "refs/remotes/origin/main", host_head.as_str()])
-            .status()
+            .status_locked()
             .expect("write remote-tracking ref");
         assert!(status.success());
         assert!(
@@ -4647,7 +4653,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&host)
             .arg(&session)
-            .status()
+            .status_locked()
             .expect("clone session");
         assert!(status.success());
         fs::write(session.join("session-only"), "unpublished\n").expect("write session change");
@@ -4662,7 +4668,7 @@ mod tests {
                 "add",
                 ".",
             ])
-            .status()
+            .status_locked()
             .expect("stage session change");
         assert!(status.success());
         let status = Command::new("git")
@@ -4677,7 +4683,7 @@ mod tests {
                 "-qm",
                 "session-only",
             ])
-            .status()
+            .status_locked()
             .expect("commit session change");
         assert!(status.success());
         let session_head = GitRepository::from_root(&session)
@@ -4695,7 +4701,7 @@ mod tests {
             .arg("-C")
             .arg(&session)
             .args(["push", "-q", "origin", "HEAD:refs/cowshed/raven/heads/main"])
-            .status()
+            .status_locked()
             .expect("publish preservation ref");
         assert!(status.success());
         assert!(
@@ -4790,7 +4796,7 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(["add", "."])
-            .status()
+            .status_locked()
             .expect("run git add");
         assert!(status.success());
         let status = Command::new("git")
@@ -4805,14 +4811,14 @@ mod tests {
                 "-qm",
                 label,
             ])
-            .status()
+            .status_locked()
             .expect("run git commit");
         assert!(status.success());
         let output = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"])
-            .output()
+            .output_locked()
             .expect("read head");
         assert!(output.status.success());
         String::from_utf8(output.stdout)
@@ -4826,7 +4832,7 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(args)
-            .status()
+            .status_locked()
             .expect("run git");
         assert!(status.success(), "git {args:?}");
     }
@@ -4844,7 +4850,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["config", "--local", "--get", "core.ignorecase"])
-            .output()
+            .output_locked()
             .expect("read core.ignorecase");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"false\n");
@@ -4956,7 +4962,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&main)
             .arg(&workspace)
-            .status()
+            .status_locked()
             .expect("clone workspace");
         assert!(status.success());
         git(&workspace, &["config", "user.name", "Cowshed Test"]);
@@ -5030,7 +5036,7 @@ mod tests {
             .arg(&recovery)
             .args(["bundle", "verify"])
             .arg(&bundle)
-            .output()
+            .output_locked()
             .expect("verify bundle in empty repository");
         assert!(
             verify.status.success(),

@@ -1200,6 +1200,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, record, take_lost};
+    #[cfg(target_os = "macos")]
+    use crate::fork_lock::Run as _;
+    use crate::fork_lock::Spawn as _;
 
     fn leader(pid: u32) -> GroupLeader {
         GroupLeader::observe(pid).expect("observe a live test group leader")
@@ -1211,7 +1214,7 @@ mod tests {
             .args(["-c", "sleep 300 & wait"])
             .stdin(Stdio::null())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .expect("spawn a job group")
     }
 
@@ -1238,7 +1241,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let mut group = OwnedGroup(child);
         let pgid = i32::try_from(group.0.id()).unwrap();
@@ -1408,7 +1411,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .expect("spawn a job group");
         let mut ready = String::new();
         std::io::BufReader::new(child.stdout.take().expect("its stdout"))
@@ -1502,7 +1505,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .process_group(0)
-                .spawn()
+                .spawn_locked()
                 .unwrap();
             let mut group = OwnedGroup(child);
             let pgid = i32::try_from(group.0.id()).unwrap();
@@ -1633,8 +1636,7 @@ mod tests {
                     "runtime::job_groups::tests::permission_denials_preserve_the_owned_ledger_and_allow_retry",
                     "--nocapture",
                 ])
-                .env(LEDGER_ENV, &ledger)
-                .output()
+                .env(LEDGER_ENV, &ledger).output_locked()
                 .expect("real restricted cleanup process");
             let after = std::fs::read(&ledger).unwrap();
             let survived_refusal = group_alive(pgid);

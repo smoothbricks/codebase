@@ -1,4 +1,5 @@
 use cowshed_core::api::*;
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::{CowshedError, ErrorCode};
 use serde_json::json;
 use std::ffi::OsString;
@@ -1097,7 +1098,7 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
         .arg("--target-dir")
         .arg(&target)
         .current_dir(&probe)
-        .output()
+        .output_locked()
         .unwrap_or_else(|error| panic!("cargo check: {error}"))
 }
 

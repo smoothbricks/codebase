@@ -193,6 +193,20 @@ inherited after its creator exited. Only a proven unattached socket is removed u
 privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
 while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
 
+A spawn copies every descriptor of the spawning process into the child, which holds the copies until its `exec` closes
+the close-on-exec ones; a listener or lease closed meanwhile by another thread is not released — the socket stays
+attached (a client connects, then reads end of stream) and the lease stays held (a peer sees `Conflict`). One
+process-wide fork lock (`cowshed_core::fork_lock`, Go's `syscall.ForkLock`) closes that window. Every child
+cowshed-core, the CLI and the gateway spawn is spawned holding it shared across the spawn call only, which returns once
+the child has run `exec` or failed to, never across a wait; spawns stay concurrent. Every descriptor whose release a
+peer observes — the supervisor listener and its `.sock.lock` lease, the APFS image lease and raw-device pin, image
+lifecycle locks, the intent lease and journal lock, the job records lock, cargo's cache locks — is fenced from the
+moment it is opened: its close takes the lock exclusive, waiting only for spawns in flight. A socket, which Darwin
+cannot create close-on-exec in one system call, is also created exclusive, or a child forked between `socket` and
+`fcntl` would keep it for life. cowshed-core's clippy configuration refuses unlocked `spawn`/`output`/`status`. Perf
+finding: a spawn holds the shared guard for a whole `fork` of a large supervisor address space, which a release then
+waits out; a `posix_spawn` spawner, which forks nothing, is the later improvement.
+
 Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
 stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
 answer carries (a log chunk), and both sides close. A frame is a big-endian `u32` length and that many bytes. A long

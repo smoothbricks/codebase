@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
@@ -1355,8 +1356,7 @@ async fn host_controller_native_file_watching_observes_allowed_updates_without_p
             "-p",
             "require.resolve(`@nx/nx-${process.platform}-${process.arch}`, { paths: [process.argv[1]] })",
         ])
-        .arg(modules.join("nx").canonicalize().expect("canonical Nx package"))
-        .output()
+        .arg(modules.join("nx").canonicalize().expect("canonical Nx package")).output_locked()
         .expect("resolve the native watcher dependency");
     assert!(
         resolved.status.success(),

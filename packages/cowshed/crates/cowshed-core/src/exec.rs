@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use crate::fork_lock::Spawn as _;
 use crate::repository::is_lexically_canonical;
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
 #[cfg(target_os = "linux")]
@@ -326,7 +327,7 @@ impl SpawnRunner for SystemSpawnRunner {
             .stderr(Stdio::inherit());
         prepare_child_descriptors(&mut command)?;
 
-        let mut child = command.spawn().map_err(classify_spawn_error)?;
+        let mut child = command.spawn_locked().map_err(classify_spawn_error)?;
         child.wait().map_err(|source| SpawnFailure {
             stage: WrapperStage::Wait,
             source,

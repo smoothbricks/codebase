@@ -28,6 +28,7 @@ use super::supervisor_socket::{
     self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
+use crate::fork_lock::Spawn as _;
 use crate::metadata::WorkspaceName;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
@@ -113,7 +114,7 @@ impl SupervisorSpawner for ProgramSpawner {
                 Ok(())
             });
         }
-        let child = command.spawn();
+        let child = command.spawn_locked();
         // The child holds its own copy now; the manager's would keep the report from ending.
         drop(report);
         child
@@ -972,7 +973,7 @@ mod tests {
                 .env(OTHER_BUILD_SOCKET, &socket)
                 .stdout(std::process::Stdio::null())
                 .kill_on_drop(true)
-                .spawn()
+                .spawn_locked()
                 .expect("start the supervisor of another build");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&socket).await.is_err() {
@@ -987,7 +988,7 @@ mod tests {
             .arg("60")
             .process_group(0)
             .kill_on_drop(true)
-            .spawn()
+            .spawn_locked()
             .expect("a job leading its own group");
         let group = job.id().expect("the job runs");
         let ledger = super::super::job_groups::ledger_path(&socket);

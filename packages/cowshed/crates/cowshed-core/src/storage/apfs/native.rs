@@ -109,8 +109,10 @@ fn should_retry_lock(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::Interrupted)
 }
 
+/// The image lifecycle locks one operation holds. Fenced: a peer's try-lock succeeds as soon as
+/// the guard is dropped, whatever this process is spawning (`fork_lock`).
 pub struct ImageLockGuard {
-    _files: Vec<File>,
+    _files: Vec<crate::fork_lock::Fenced<File>>,
 }
 
 fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsStorageError> {
@@ -226,7 +228,7 @@ fn acquire_image_locks(
     paths.dedup();
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let file = open_lock_file(root, &path)?;
+        let file = crate::fork_lock::Fenced::new(open_lock_file(root, &path)?);
         let operation = match mode {
             LockMode::Wait => WAIT_LOCK_OPERATION,
             LockMode::Try => TRY_LOCK_OPERATION,
@@ -5919,6 +5921,7 @@ fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarna
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fork_lock::Run as _;
 
     /// A recovery pass lists a directory other workspaces' lifecycle verbs write to at the same
     /// time: an entry removed between the listing and its inspection is skipped, never a failure
@@ -5958,7 +5961,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["init", "-q"])
                 .arg(&checkout)
-                .status()
+                .status_locked()
                 .expect("git init")
                 .success()
         );
@@ -5996,7 +5999,7 @@ mod tests {
                     .arg("-C")
                     .arg(&checkout)
                     .args(args)
-                    .status()
+                    .status_locked()
                     .expect("git")
                     .success()
             );

@@ -26,6 +26,7 @@ use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
+use crate::fork_lock::Spawn as _;
 use crate::fsio::AnchoredDirectory;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -1747,7 +1748,7 @@ impl SpawnSink for SystemSpawnSink {
         // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
         let mut child = command
             .into_std()
-            .spawn()
+            .spawn_locked()
             .map_err(classify_spawn_error)
             .map_err(ExecError::from)
             .map_err(map_exec_error)?;
@@ -4674,6 +4675,8 @@ fn retiring_error() -> CowshedError {
 mod workspace_toolchain_tests {
     use super::*;
     #[cfg(target_os = "macos")]
+    use crate::fork_lock::Run as _;
+    #[cfg(target_os = "macos")]
     use crate::sandbox::{
         RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, nix_daemon_socket,
         seatbelt_profile,
@@ -5030,8 +5033,7 @@ mod workspace_toolchain_tests {
                 ])
                 .env_clear()
                 .envs(environment.iter().copied())
-                .env(ENVIRONMENT_PROBE, &mount)
-                .output()
+                .env(ENVIRONMENT_PROBE, &mount).output_locked()
                 .expect("run the environment probe");
             assert!(
                 output.status.success(),
@@ -5308,7 +5310,7 @@ mod workspace_toolchain_tests {
         let status = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &profile, "--", "/bin/test", "-x"])
             .arg(&tool)
-            .status()
+            .status_locked()
             .expect("sandbox-exec");
         // Asserted here, before the fallback-path mutations below. Deferring it to the end of the
         // function meant any later panic silently discarded the only runtime check in the file.
@@ -5658,6 +5660,7 @@ mod lifecycle_commitment_tests {
 #[cfg(test)]
 mod sandbox_environment_tests {
     use super::*;
+    use crate::fork_lock::Run as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root =
@@ -5757,7 +5760,7 @@ mod sandbox_environment_tests {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .envs(environment)
-                .output()
+                .output_locked()
                 .expect("git config")
         };
         let control = run(injected
@@ -5874,7 +5877,7 @@ mod process_death_tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let pgid = i32::try_from(job.id()).unwrap();
         let mut ready = String::new();
@@ -5938,7 +5941,7 @@ mod process_death_tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let mut output = job.stdout.take().unwrap();
         let pgid = i32::try_from(job.id()).unwrap();

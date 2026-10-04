@@ -34,6 +34,7 @@ use super::shared::{
 };
 use crate::apfs::{RegisteredApfsContainer, registered_apfs_containers};
 use crate::error::CowshedError;
+use crate::fork_lock::{Run as _, Spawn as _};
 use crate::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, SystemKernelMountSource,
 };
@@ -109,7 +110,7 @@ impl BootstrapHost for SystemBootstrapHost {
             .map(HostCommandOutput::from);
         }
         run_command_with(command, |program, args| {
-            Command::new(program).args(args).output()
+            Command::new(program).args(args).output_locked()
         })
     }
 
@@ -545,7 +546,7 @@ fn mount_service_files(
 fn mount_service_loaded() -> bool {
     Command::new(LAUNCHCTL)
         .args(["print", MOUNT_SERVICE_TARGET])
-        .output()
+        .output_locked()
         .is_ok_and(|output| output.status.success())
 }
 
@@ -1474,7 +1475,7 @@ fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
         ],
     );
     run_command_with(&command, |program, args| {
-        Command::new(program).args(args).output()
+        Command::new(program).args(args).output_locked()
     })
     .map(|output| output.succeeded())
 }
@@ -3613,7 +3614,7 @@ mod tests {
         let mut shell = Command::new("/bin/sh")
             .arg("-n")
             .stdin(Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("spawn system shell parser");
         shell
             .stdin
@@ -6993,7 +6994,7 @@ mod unix {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .map_err(|source| host_io_error("execute", program, source))?;
         let started = Instant::now();
         loop {

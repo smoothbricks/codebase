@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use cowshed_core::api::{CredentialReport, CredentialRoute as CredentialRouteReport};
+use cowshed_core::fork_lock::RunAsync as _;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::host_config::{CredentialRoute, HostConfig};
@@ -301,7 +302,7 @@ async fn run_secret_command(argv: &[String]) -> Result<Zeroizing<String>> {
     let output = tokio::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
-        .output()
+        .output_locked()
         .await
         .map_err(|error| {
             CowshedError::environment_missing(

@@ -6,6 +6,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
+use cowshed_core::fork_lock::RunAsync as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -120,7 +122,7 @@ impl SimRunner for XcrunSimRunner {
             }
         }
         process.kill_on_drop(true);
-        let output = timeout(Duration::from_secs(120), process.output())
+        let output = timeout(Duration::from_secs(120), process.output_locked())
             .await
             .map_err(|_| SimBrokerError::RunnerTimeout)?
             .map_err(|_| SimBrokerError::RunnerFailed)?;

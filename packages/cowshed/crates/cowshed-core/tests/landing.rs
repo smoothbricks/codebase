@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{LandingCommits, WorkspaceLanding};
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::landing::{measure, resolve_target};
 
 const TARGET: &str = "main";
@@ -112,7 +113,7 @@ where
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -139,7 +140,7 @@ fn commit(root: impl AsRef<Path>, message: &str) {
         .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git commit");
     assert!(
         output.status.success(),
@@ -272,7 +273,7 @@ async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             fixture.parent().join(".git/objects"),
         )
-        .output()
+        .output_locked()
         .expect("run merge-base");
     assert_eq!(
         ancestry.status.code(),
@@ -410,7 +411,7 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git commit");
     assert!(output.status.success(), "empty commit");
 
@@ -425,7 +426,7 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git commit");
     assert!(upstream.status.success(), "upstream empty commit");
 
@@ -460,7 +461,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
         .args(["rebase", "FETCH_HEAD"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git rebase");
     assert!(
         !rebase.status.success(),
@@ -478,7 +479,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_locked()
         .expect("run git rebase --continue");
     assert!(
         resolved.status.success(),
@@ -590,7 +591,7 @@ async fn alternate_object_store_is_what_makes_the_comparison_possible() {
         .arg("-C")
         .arg(&mount)
         .args(["cat-file", "-e", &tip])
-        .output()
+        .output_locked()
         .expect("run cat-file");
     assert!(
         !visible.status.success(),

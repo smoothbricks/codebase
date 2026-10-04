@@ -13,6 +13,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 
+use crate::fork_lock::{Fenced, Run as _};
 use crate::sandbox::{CARGO_HOME_STATE_FILES, HostCache, RELOCATED_TOOL_CACHES, SHARED_TOOL_HOMES};
 
 /// Every host cache setup relocates: the shared tool homes' links, then the other tools'.
@@ -175,7 +176,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
         .args(options)
         .arg(from)
         .arg(to)
-        .status()?;
+        .status_locked()?;
     if !status.success() {
         return Err(io::Error::other(format!("{program} exited with {status}")));
     }
@@ -185,21 +186,24 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 /// Cargo's own package-cache locks, held exclusively while its caches move.
 ///
 /// Cargo takes these same `flock`s before it reads or writes `registry` or `git`, so holding
-/// them keeps every cargo process on the host out of the caches for the duration.
+/// them keeps every cargo process on the host out of the caches for the duration. Fenced: cargo
+/// gets them back as soon as this is dropped, whatever this process is spawning (`fork_lock`).
 pub struct CargoCacheLock {
-    _files: Vec<fs::File>,
+    _files: Vec<Fenced<fs::File>>,
 }
 
 /// `Ok(None)` when a cargo process holds a lock right now.
 pub fn try_lock_cargo_caches(cargo_home: &Path) -> io::Result<Option<CargoCacheLock>> {
     let mut files = Vec::with_capacity(2);
     for name in &CARGO_HOME_STATE_FILES[..2] {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(cargo_home.join(name))?;
+        let file = Fenced::new(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(cargo_home.join(name))?,
+        );
         // SAFETY: the descriptor is owned by `file`, which outlives the call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = io::Error::last_os_error();

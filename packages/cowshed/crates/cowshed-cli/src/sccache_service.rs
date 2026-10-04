@@ -21,6 +21,7 @@ use crate::launchd::{
 use crate::output::Output;
 use crate::sccache_nix;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
+use cowshed_core::fork_lock::RunAsync as _;
 use cowshed_core::metadata::ImageCapacity;
 use cowshed_core::sandbox::{sccache_cache_directory, sccache_server_socket};
 use cowshed_core::storage::bootstrap::ValidatedHostStorage;
@@ -415,7 +416,7 @@ async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
     let output = tokio::process::Command::new(installed_program(home).ok()?.program())
         .args(["--show-stats", "--stats-format", "json"])
         .env("SCCACHE_SERVER_UDS", socket)
-        .output()
+        .output_locked()
         .await
         .ok()?;
     if !output.status.success() {

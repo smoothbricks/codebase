@@ -35,6 +35,7 @@
 use crate::gateway_service::launchd_error;
 use crate::launchd::{SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram};
 use cowshed_core::api::{Finding, FindingSeverity};
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::sandbox::sccache_gc_root;
 use cowshed_core::{CowshedError, Result};
 use std::path::{Path, PathBuf};
@@ -232,7 +233,7 @@ pub fn build(home: &Path, flake: &Path) -> Result<BuildOutcome> {
         .arg(format!("{}#{FLAKE_ATTRIBUTE}", flake.display()))
         .arg("--out-link")
         .arg(&root)
-        .output()
+        .output_locked()
     {
         Ok(output) => output,
         // Only "there is no such program" is a missing prerequisite. Anything else — a permission

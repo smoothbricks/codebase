@@ -4,6 +4,7 @@
 //! command adapters so callers can keep one mutable, actor-owned executor while
 //! tests remain entirely host-independent.
 
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::ImageCapacity;
 use std::error::Error;
 use std::ffi::OsString;
@@ -1167,7 +1168,7 @@ pub struct NativeLaunchctlCommand;
 
 impl LaunchctlCommand for NativeLaunchctlCommand {
     fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
-        let output = Command::new(executable).args(arguments).output()?;
+        let output = Command::new(executable).args(arguments).output_locked()?;
         let status = if output.status.success() {
             CommandStatus::Success
         } else if let Some(code) = output.status.code() {

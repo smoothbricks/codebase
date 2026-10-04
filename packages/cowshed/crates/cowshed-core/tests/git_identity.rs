@@ -14,6 +14,7 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::git::{
     GitRepository, WORKSPACE_GIT_IDENTITY_CONFIG_PATH, workspace_git_identity_config,
 };
@@ -151,7 +152,7 @@ where
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
-    command.output().expect("run git")
+    command.output_locked().expect("run git")
 }
 
 #[derive(Clone, Copy)]

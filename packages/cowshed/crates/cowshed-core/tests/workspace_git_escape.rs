@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::git::{git_command_at, sandboxed_git_command_at};
 use cowshed_core::metadata::PortBlock;
 use cowshed_core::sandbox::{
@@ -17,7 +18,7 @@ fn git(root: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output()
+        .output_locked()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -56,7 +57,7 @@ fn job(config: &SandboxConfig, script: &str) -> std::process::Output {
         .env("HOME", config.workspace_mount.join(".cowshed/home"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
+        .output_locked()
         .expect("sandboxed job")
 }
 
@@ -108,7 +109,7 @@ fn workspace_hooks_cannot_run_as_controller_on_rebase() {
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-            .output()
+            .output_locked()
             .expect("controller rebase");
         assert!(
             rebase.status.success(),
@@ -212,7 +213,7 @@ fn repository_filter_cannot_write_to_controller_home() {
         let output = sandboxed_git_command_at(&checkout)
             .expect("sandboxed Git")
             .args(["checkout", "--", "data"])
-            .output()
+            .output_locked()
             .expect("sandboxed checkout");
         assert!(
             output.status.success(),

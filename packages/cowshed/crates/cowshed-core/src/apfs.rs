@@ -3,6 +3,7 @@
 //! Every external operation crosses [`CommandRunner`]. Commands are represented
 //! as an executable plus an argument vector; this module never invokes a shell.
 
+use crate::fork_lock::{Fenced, Spawn as _};
 use crate::metadata::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 pub use crate::process::{CommandOutput, ProcessStatus};
 use crate::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
@@ -141,11 +142,14 @@ pub trait CommandRunner {
     /// makes both fail with EBUSY, so neither can run pinned.
     ///
     /// Recording runners must explicitly opt out; production cannot silently omit the lease.
-    fn image_lease(&self, identity: &Path) -> io::Result<Option<File>>;
+    /// The lease is fenced (`fork_lock`): once it is dropped, no child this process is still
+    /// spawning holds it, so the next holder takes it at once.
+    fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>>;
     /// Open the raw volume before resolving its image identity. On macOS the open device
     /// prevents even a forced image eject until the descriptor closes. Recording runners
-    /// explicitly opt out; production must not fall back to an unpinned pathname.
-    fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>>;
+    /// explicitly opt out; production must not fall back to an unpinned pathname. The pin is
+    /// fenced like the lease: once it is dropped, an eject is no longer refused.
+    fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>>;
     /// Every disk image the kernel has attached right now, read from the I/O Registry.
     ///
     /// This is the one attachment inventory, and its absences are authoritative. `hdiutil info
@@ -265,15 +269,16 @@ impl CommandRunner for SystemCommandRunner {
         self.run_with_deadline(request, DISK_CHILD_DEADLINE)
     }
 
-    fn image_lease(&self, identity: &Path) -> io::Result<Option<File>> {
+    fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
         let lease = image_lease_path(identity)?;
         let file = open_image_lease(&lease)?;
         acquire_image_lease(file, &lease, identity, DISK_CHILD_DEADLINE).map(Some)
     }
-    fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>> {
+    fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
         // A live raw-device descriptor pins this IOMedia, including against forced image detach.
         // Open first, then confirm the image-to-volume mapping while it cannot be recycled.
-        OpenOptions::new().read(true).open(device).map(Some)
+        let pin = OpenOptions::new().read(true).open(device)?;
+        Ok(Some(Fenced::new(pin)))
     }
     fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
         #[cfg(target_os = "macos")]
@@ -460,16 +465,18 @@ fn image_lease_path(identity: &Path) -> io::Result<PathBuf> {
 
 /// Open a lease file without following a link, refusing anything but this user's private
 /// regular file.
-fn open_image_lease(lease: &Path) -> io::Result<File> {
+fn open_image_lease(lease: &Path) -> io::Result<Fenced<File>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(lease)?;
+    let file = Fenced::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(lease)?,
+    );
     let metadata = file.metadata()?;
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
     let uid = unsafe { libc::geteuid() };
@@ -497,11 +504,11 @@ fn open_image_lease(lease: &Path) -> io::Result<File> {
 /// pid. The helper keeps its descriptor, so the lock it takes after a timed-out caller left is
 /// released again as soon as it is taken.
 fn acquire_image_lease(
-    file: File,
+    file: Fenced<File>,
     lease: &Path,
     identity: &Path,
     deadline: Duration,
-) -> io::Result<File> {
+) -> io::Result<Fenced<File>> {
     match lock_file(&file, libc::LOCK_EX | libc::LOCK_NB) {
         Ok(()) => return record_lease_holder(file),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -547,7 +554,7 @@ fn lock_file(file: &File, operation: libc::c_int) -> io::Result<()> {
 }
 
 /// Record this process's pid in a lease it now holds, so a waiter that times out can name it.
-fn record_lease_holder(file: File) -> io::Result<File> {
+fn record_lease_holder(file: Fenced<File>) -> io::Result<Fenced<File>> {
     use std::os::unix::fs::FileExt;
 
     file.set_len(0)?;
@@ -593,7 +600,7 @@ fn spawn_disk_child(request: &CommandRequest) -> io::Result<std::process::Child>
             });
         }
     }
-    command.spawn()
+    command.spawn_locked()
 }
 
 /// Kill a disk child and, on Unix, its whole process group.
@@ -785,7 +792,7 @@ pub struct AttachedImage {
     /// An attachment verified but not yet mounted holds its raw IOMedia open. The kernel
     /// refuses even forced ejects until mount finishes; no second process can reuse diskN
     /// between the two backend method calls. Existing mounted attachments have no pin.
-    pin: std::sync::Mutex<Option<File>>,
+    pin: std::sync::Mutex<Option<Fenced<File>>>,
 }
 
 impl AttachedImage {
@@ -1286,7 +1293,7 @@ impl<R, S> MacOsApfsBackend<R, S> {
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Hold `image`'s lease ([`CommandRunner::image_lease`]), keyed by the identity the
     /// attachment inventory records for it.
-    fn image_lease(&self, image: &Path) -> Result<Option<File>, ApfsError> {
+    fn image_lease(&self, image: &Path) -> Result<Option<Fenced<File>>, ApfsError> {
         let identity = attachment_inventory_path(image)?;
         timed_apfs_step(apfs_step_leg(image), "image-lease", || {
             self.runner
@@ -1299,7 +1306,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         })
     }
 
-    fn pin_attached_volume(&self, attachment: &AttachedImage) -> Result<Option<File>, ApfsError> {
+    fn pin_attached_volume(
+        &self,
+        attachment: &AttachedImage,
+    ) -> Result<Option<Fenced<File>>, ApfsError> {
         let raw = PathBuf::from(raw_device_from(&attachment.volume_device));
         let pin = timed_apfs_step(apfs_step_leg(&attachment.image), "pin", || {
             self.runner
@@ -3574,10 +3584,10 @@ mod tests {
                 other => panic!("test scripted {other:?} where {request:?} ran"),
             }
         }
-        fn image_lease(&self, _: &Path) -> io::Result<Option<File>> {
+        fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
         }
-        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
+        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
         }
         fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
@@ -3794,10 +3804,10 @@ mod tests {
                 .remove(&self.new_device);
             Ok(CommandOutput::success([]))
         }
-        fn image_lease(&self, _: &Path) -> io::Result<Option<File>> {
+        fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
         }
-        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
+        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
         }
         fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
@@ -6177,10 +6187,10 @@ mod tests {
             fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
                 panic!("growing spawned {request:?}");
             }
-            fn image_lease(&self, identity: &Path) -> io::Result<Option<File>> {
+            fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
                 SystemCommandRunner.image_lease(identity)
             }
-            fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>> {
+            fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
                 panic!("growing pinned {}", device.display());
             }
             fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {

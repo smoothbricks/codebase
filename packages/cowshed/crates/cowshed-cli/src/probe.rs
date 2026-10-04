@@ -19,6 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::{CowshedError, Result};
@@ -248,7 +249,7 @@ fn git_at<const N: usize>(
         command.env(key, value);
     }
     let output = command
-        .output()
+        .output_locked()
         .map_err(|error| cowshed_core::git::git_spawn_error(&error))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -1,0 +1,10 @@
+# Every child cowshed-core spawns is spawned under the fork lock, so no spawn in flight holds a
+# socket or lease another thread is releasing (src/fork_lock.rs).
+disallowed-methods = [
+  { path = "std::process::Command::spawn", reason = "spawn with cowshed_core::fork_lock::Spawn::spawn_locked" },
+  { path = "std::process::Command::output", reason = "run with cowshed_core::fork_lock::Run::output_locked" },
+  { path = "std::process::Command::status", reason = "run with cowshed_core::fork_lock::Run::status_locked" },
+  { path = "tokio::process::Command::spawn", reason = "spawn with cowshed_core::fork_lock::Spawn::spawn_locked" },
+  { path = "tokio::process::Command::output", reason = "run with cowshed_core::fork_lock::RunAsync::output_locked" },
+  { path = "tokio::process::Command::status", reason = "run with cowshed_core::fork_lock::RunAsync::status_locked" },
+]
