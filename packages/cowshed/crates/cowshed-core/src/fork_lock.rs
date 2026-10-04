@@ -234,7 +234,10 @@ mod tests {
             let (go_reader, go) = std::io::pipe().unwrap();
             let (started_fd, go_fd) = (started_writer.as_raw_fd(), go_reader.as_raw_fd());
             let go_writer_fd = go.as_raw_fd();
-            let mut command = Command::new("/usr/bin/true");
+            // `/bin/sh` is the one program path every supported host has: NixOS keeps no
+            // `/usr/bin/true`, and its absence there made the spawn itself fail with ENOENT.
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", ":"]);
             // SAFETY: the closure runs in the forked child before `exec`, calling only `close`,
             // `write` and `read`, which are async-signal-safe, on descriptors this test keeps open
             // until the spawn has returned. The child closes its own copy of the writer first, so
