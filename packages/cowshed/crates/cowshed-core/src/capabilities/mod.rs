@@ -14,6 +14,7 @@ pub mod cache;
 mod installations;
 mod direnv;
 pub mod nx;
+pub mod cargo;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -232,7 +233,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 2] = [&direnv::DETECTOR, &nx::DETECTOR];
+pub static DETECTORS: [&Detector; 3] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
