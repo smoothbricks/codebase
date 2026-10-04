@@ -16441,38 +16441,67 @@ mod port_reservation_tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The host's port range is shared with live workspaces and every concurrent allocator, which
+    /// all bind the lowest free block base first. So the test takes its block from the allocator,
+    /// observes release on connections only its own listeners accepted, and never asserts that a
+    /// port it let go of is still free when it looks again.
     #[tokio::test]
     async fn a_port_bound_outside_inventory_cannot_be_allocated_to_a_workspace() {
-        use std::net::{Ipv4Addr, TcpListener};
+        use std::io::{ErrorKind, Read};
+        use std::net::TcpStream;
 
         let root = root("external-listener");
         let (inventory, _) = inventory(&root);
         let staging = root.join("store/.staging");
-        let mut used = crate::metadata::ReservedPortBlocks::default();
-        let (blocked, listener) = PortBlock::macos_candidates()
-            .find_map(
-                |block| match TcpListener::bind((Ipv4Addr::LOCALHOST, block.base() + 1)) {
-                    Ok(listener) => Some((block, listener)),
-                    Err(_) => {
-                        used.insert(block).expect("disjoint candidate blocks");
-                        None
-                    }
-                },
-            )
-            .expect("one test block with a free service port");
-        let granted = reserve_port_grants(&inventory, &staging, used)
+        let mut reservation = reserve_port_grants(&inventory, &staging, Default::default())
             .await
-            .expect("allocator skips a kernel-owned service port");
-        assert_ne!(
-            granted.grants.port_block,
-            Some(blocked),
-            "the persisted grant must not include a port another process already holds"
-        );
-        let granted_base = granted.grants.port_block.expect("selected block").base();
-        drop((granted, listener));
-        let released = TcpListener::bind((Ipv4Addr::LOCALHOST, granted_base))
-            .expect("dropping the publication guard releases its kernel listeners");
-        drop(released);
+            .expect("a block no listener on the host holds");
+        let block = reservation.grants.port_block.expect("selected block");
+        // A listener no inventory records: one service port of that block, outliving the guard.
+        let service = reservation
+            .listeners
+            .iter()
+            .position(|listener| {
+                listener.local_addr().expect("listener address").port() == block.base() + 1
+            })
+            .expect("the guard listens on every port of its block");
+        let outside = reservation.listeners.remove(service);
+        // Each connection waits, unaccepted, in one guard listener's queue; closing that listener
+        // resets it, so the reset is the kernel's own word that the listener is gone.
+        let mut clients = reservation
+            .listeners
+            .iter()
+            .map(|listener| {
+                TcpStream::connect(listener.local_addr().expect("listener address"))
+                    .expect("connect to a guard listener")
+            })
+            .collect::<Vec<_>>();
+        drop(reservation);
+        for client in &mut clients {
+            let reset = client
+                .read(&mut [0])
+                .expect_err("a connection queued on a closed listener is reset");
+            assert_eq!(
+                reset.kind(),
+                ErrorKind::ConnectionReset,
+                "dropping the publication guard closes its kernel listeners"
+            );
+        }
+        // Every other candidate is held, so the block with the outside listener is the only offer.
+        let mut others = crate::metadata::ReservedPortBlocks::default();
+        for candidate in PortBlock::macos_candidates().filter(|candidate| *candidate != block) {
+            others.insert(candidate).expect("disjoint candidate blocks");
+        }
+        let refused = match reserve_port_grants(&inventory, &staging, others).await {
+            Ok(granted) => panic!(
+                "allocated {:?} although another listener holds port {}",
+                granted.grants.port_block,
+                block.base() + 1
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
+        drop(outside);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
