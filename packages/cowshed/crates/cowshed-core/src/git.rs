@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek as _, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -155,7 +155,7 @@ const WORKSPACE_ENVIRONMENT_MARKER: &[u8] = b"# cowshed: workspace environment";
 const LOCAL_ENVIRONMENT_LOADER: &[u8] = b"source_env_if_exists \"$local_override\"";
 
 fn workspace_environment_source() -> String {
-    format!("source_env_if_present {WORKSPACE_ENVIRONMENT_PATH}")
+    format!("source_env_if_exists {WORKSPACE_ENVIRONMENT_PATH}")
 }
 
 fn local_workspace_environment_source() -> String {
@@ -313,11 +313,25 @@ fn read_environment_hook(path: &Path) -> Result<Vec<u8>> {
     Ok(existing)
 }
 
-fn append_environment_hook(root: &Path, path: &Path, source: &[u8]) -> Result<()> {
+fn owned_environment_source(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0;
+    let mut lines = bytes.split_inclusive(|byte| *byte == b'\n');
+    while let Some(line) = lines.next() {
+        offset += line.len();
+        if line.strip_suffix(b"\n").unwrap_or(line) == WORKSPACE_ENVIRONMENT_MARKER {
+            let source = lines.next()?;
+            return Some(offset..offset + source.len() - usize::from(source.ends_with(b"\n")));
+        }
+    }
+    None
+}
+
+fn reconcile_environment_hook(root: &Path, path: &Path, source: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
-        .append(true)
+        .write(true)
         .create(true)
+        .truncate(false)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| {
@@ -339,19 +353,31 @@ fn append_environment_hook(root: &Path, path: &Path, source: &[u8]) -> Result<()
             "repair the repository environment hook and retry",
         )
     })?;
-    if environment_hook_contains(&existing, source) {
-        return Ok(());
-    }
-
-    let mut addition = Vec::with_capacity(WORKSPACE_ENVIRONMENT_MARKER.len() + source.len() + 3);
-    if !existing.is_empty() && !existing.ends_with(b"\n") {
+    let written = if let Some(range) = owned_environment_source(&existing) {
+        if &existing[range.clone()] == source {
+            return Ok(());
+        }
+        drop(existing.splice(range, source.iter().copied()));
+        let length = u64::try_from(existing.len()).expect("a loaded file length fits in u64");
+        file.rewind()
+            .and_then(|()| file.write_all(&existing))
+            .and_then(|()| file.set_len(length))
+    } else {
+        if environment_hook_contains(&existing, source) {
+            return Ok(());
+        }
+        let mut addition =
+            Vec::with_capacity(WORKSPACE_ENVIRONMENT_MARKER.len() + source.len() + 3);
+        if !existing.is_empty() && !existing.ends_with(b"\n") {
+            addition.push(b'\n');
+        }
+        addition.extend_from_slice(WORKSPACE_ENVIRONMENT_MARKER);
         addition.push(b'\n');
-    }
-    addition.extend_from_slice(WORKSPACE_ENVIRONMENT_MARKER);
-    addition.push(b'\n');
-    addition.extend_from_slice(source);
-    addition.push(b'\n');
-    file.write_all(&addition).map_err(|error| {
+        addition.extend_from_slice(source);
+        addition.push(b'\n');
+        file.write_all(&addition)
+    };
+    written.map_err(|error| {
         CowshedError::integrity(
             format!(
                 "cannot update workspace environment hook {}: {error}",
@@ -987,11 +1013,11 @@ impl GitRepository {
         ensure_git_success("record the case-sensitive filesystem", output)
     }
 
-    /// Add the one repository-visible hook that loads cowshed's in-image environment.
+    /// Reconcile the one repository-visible hook that loads cowshed's in-image environment.
     ///
     /// A tracked hook is immutable workspace input. When it exposes the repository's ignored local
     /// override, cowshed writes there instead; otherwise publication fails rather than making every
-    /// new workspace dirty. Untracked hooks retain the direct append behavior.
+    /// new workspace dirty. Untracked hooks reconcile their marked loader and preserve all project lines.
     pub async fn ensure_workspace_environment_wiring(&self) -> Result<()> {
         let root = self.root.clone();
         let (hook, existing) = tokio::task::spawn_blocking(move || {
@@ -1009,7 +1035,11 @@ impl GitRepository {
                 "workspace environment inspection task failed: {error}"
             ))
         })??;
-        if environment_hook_contains(&existing, workspace_environment_source().as_bytes()) {
+        let workspace_source = workspace_environment_source();
+        if environment_hook_contains(&existing, workspace_source.as_bytes())
+            && owned_environment_source(&existing)
+                .is_none_or(|range| &existing[range] == workspace_source.as_bytes())
+        {
             return Ok(());
         }
 
@@ -1062,12 +1092,12 @@ impl GitRepository {
                     "track a workspace environment hook or ignore .envrc before creating a workspace",
                 ));
             }
-            (hook.path, workspace_environment_source())
+            (hook.path, workspace_source)
         };
 
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
-            append_environment_hook(&root, &path, source.as_bytes())
+            reconcile_environment_hook(&root, &path, source.as_bytes())
         })
         .await
         .map_err(|error| {
@@ -3460,7 +3490,7 @@ mod tests {
 
         assert_eq!(
             fs::read(&envrc).expect("read envrc"),
-            b"# cowshed: workspace environment\nsource_env_if_present .cowshed/env\n"
+            b"# cowshed: workspace environment\nsource_env_if_exists .cowshed/env\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -3483,9 +3513,72 @@ mod tests {
 
         assert_eq!(
             fs::read(&envrc).expect("read envrc"),
-            b"use flake\n# project-owned tail\n# cowshed: workspace environment\nsource_env_if_present .cowshed/env\n"
+            b"use flake\n# project-owned tail\n# cowshed: workspace environment\nsource_env_if_exists .cowshed/env\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn workspace_environment_wiring_reconciles_its_loader_with_real_direnv() {
+        let root = repository();
+        let envrc = root.join(".envrc");
+        fs::write(root.join(".git/info/exclude"), ".envrc\n").unwrap();
+        fs::write(
+            &envrc,
+            b"export PROJECT_ENV_WIRING_PROBE=project-owned\n# cowshed: workspace environment\nsource_env_if_present .cowshed/env\nexport PROJECT_ENV_WIRING_TAIL=tail-owned\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join(".cowshed")).unwrap();
+        let environment = root.join(WORKSPACE_ENVIRONMENT_PATH);
+        fs::write(&environment, b"export COWSHED_ENV_WIRING_PROBE=published\n").unwrap();
+        let repository = GitRepository::from_root(&root);
+        repository
+            .ensure_workspace_environment_wiring()
+            .await
+            .unwrap();
+        repository
+            .ensure_workspace_environment_wiring()
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&envrc).unwrap(),
+            b"export PROJECT_ENV_WIRING_PROBE=project-owned\n# cowshed: workspace environment\nsource_env_if_exists .cowshed/env\nexport PROJECT_ENV_WIRING_TAIL=tail-owned\n",
+        );
+        let stdlib = Command::new("direnv").arg("stdlib").output().await.unwrap();
+        assert!(
+            stdlib.status.success(),
+            "direnv stdlib failed: {}",
+            String::from_utf8_lossy(&stdlib.stderr)
+        );
+        let stdlib = std::str::from_utf8(&stdlib.stdout).unwrap();
+        for expected in ["published", "absent"] {
+            if expected == "absent" {
+                fs::remove_file(&environment).unwrap();
+            }
+            let loaded = Command::new("bash")
+                .args([
+                    "-c",
+                    "set -e; eval \"$1\"; source .envrc; printf '%s\\n' \"${COWSHED_ENV_WIRING_PROBE-absent}\" \"$PROJECT_ENV_WIRING_PROBE\" \"$PROJECT_ENV_WIRING_TAIL\"",
+                    "cowshed-env-probe",
+                    stdlib,
+                ])
+                .current_dir(&root)
+                .env_remove("BASH_ENV")
+                .env_remove("COWSHED_ENV_WIRING_PROBE")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                loaded.status.success(),
+                "generated envrc failed with real direnv: {}",
+                String::from_utf8_lossy(&loaded.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(loaded.stdout).unwrap(),
+                format!("{expected}\nproject-owned\ntail-owned\n")
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

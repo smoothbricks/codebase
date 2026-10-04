@@ -888,13 +888,16 @@ slot, or trusted from a marker alone.
 The repo-visible wiring is one line. When a checkout has no `.envrc`, cowshed writes:
 
 ```bash
-source_env_if_present .cowshed/env
+source_env_if_exists .cowshed/env
 ```
 
-When the project tracks its own `.envrc`, cowshed appends that single line under a marker comment instead — one
-committed line upstream, values never dirtying the tree across rotations. Interactive shells get real values through
-direnv; agent processes get the same environment injected at spawn by the supervisor (04_sandbox.md), so no verb exists
-to print these exports on demand.
+The loader is direnv's `source_env_if_exists`, including when the optional file is absent. An untracked hook's marked
+loader is reconciled in place; all project-owned lines remain unchanged. Tracked hooks remain immutable input.
+
+When the project tracks `.envrc`, that input is never rewritten: it must already load this file, or expose an ignored
+`.envrc-local` through `source_env_if_exists "$local_override"`. Cowshed writes its marked loader to that untracked
+local hook. Interactive shells get real values through direnv; agent processes get the same environment injected at
+spawn by the supervisor (04_sandbox.md), so no verb exists to print these exports on demand.
 
 **Empty mountpoints are not user-visible state.** A mountpoint directory exists only while its workspace is attached;
 detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project before

@@ -104,11 +104,15 @@ The gateway owns credentials, registry mirrors, and egress policy. Workspaces re
 workspace token; secrets are not copied into the workspace.
 
 Every published workspace image carries its environment in `.cowshed/env`. Cowshed creates a two-line `.envrc` when the
-checkout has none, or appends its marked source line exactly once when the project already owns `.envrc`:
+file is absent and already ignored, or reconciles its marked loader in an existing untracked hook:
 
 ```sh
-source_env_if_present .cowshed/env
+source_env_if_exists .cowshed/env
 ```
+
+This is direnv's standard optional-file loader. On an untracked hook, cowshed replaces only its own marked loader when
+reconciling the environment; project-owned lines stay unchanged. Tracked hooks must already load the file or expose an
+ignored `.envrc-local`; cowshed writes there without changing the tracked input.
 
 The sourced file exports workspace-local `GOENV` and `COWSHED_*` values and is rewritten whenever cowshed rotates the
 workspace token. After a reboot or manual eject, reattach explicitly; devenv-native repositories then use their own
