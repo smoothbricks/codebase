@@ -4,8 +4,8 @@ The central convention: **main is the base**. There are no templates, no refresh
 The **main workspace** is the adopted image-backed workspace and its standalone Git repository/object store. It is not
 the checked-out Git `main` branch, and it is not shorthand for that branch's working tree or index. The main workspace
 is warm because the user works in its currently checked-out working tree and merges land there; every new workspace is a
-copy-on-write clone of the main workspace's live image. Main's build state reaches later forks through build
-generations: a land points main at the landed workspace's generation, so main never builds (16_build_caching.md).
+copy-on-write clone of the main workspace's live image plus a clone of main's latest build-volume seed. A land points
+main at the landed workspace's build volume, so main never rebuilds what the workspace built (16_build_volumes.md).
 Operations that update only a non-checked-out ref in its repository do not change its checked-out branch, index, or
 working tree.
 
@@ -778,7 +778,12 @@ step.
    the moved value. Cowshed never retries against a new base internally; the coordinator decides whether to rebase and
    re-run checks.
 
-4. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
+4. **Adopt the build volume and check it**: the target takes the workspace's build volume by renaming its one
+   `.cowshed/build` link, re-runs the check on the adopted volume and requires 100% Nx cache hits, reporting every miss
+   as a configuration finding, then freezes a new seed for later forks. The target builds nothing the workspace built.
+   16_build_volumes.md owns this step: when the swap is skipped, what a miss means, and garbage collection.
+
+5. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
    the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*` preservation refs on the
    host. The retire gate is `rm`'s, measured against the branch the workspace just landed on, in the target's
    repository: a lane unit whose commits its lane base holds retires, though main does not hold them yet. A retire

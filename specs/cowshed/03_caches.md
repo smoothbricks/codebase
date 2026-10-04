@@ -62,8 +62,10 @@ share with zero duplication and no speed penalty. Bun's Linux _default_ backend 
 datasets; its isolated linker needs neither.
 
 **Workspace-keyed state** — `target/`, materialized `node_modules`, `DerivedData`, `.nx`, `.zig-cache`, Metro/Expo
-caches — is not shareable concurrently under any mechanism. It stays in-image, warm because the image was cloned from
-main.
+caches — is not shareable concurrently under any mechanism. A build tool's per-tree incremental state that capability
+detection names (Cargo target directories, Nx's cache and task database) lives on the workspace's build volume, cloned
+from main's seed at fork and adopted by main at land (16_build_volumes.md). The rest stays in the workspace image, warm
+because the image was cloned from main.
 
 ## The reflink-reachability rule
 
