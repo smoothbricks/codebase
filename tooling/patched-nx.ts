@@ -40,6 +40,7 @@ const UPSTREAM = [
   ['nrwl/nx#37268', 'record task history on the client\u2019s own database connection'],
   ['nrwl/nx#37269', 'size the default cache bound from the cache\u2019s own filesystem'],
   ['nrwl/nx#37271', 'keep daemon plugin workers with graph hooks alive between graphs'],
+  ['nrwl/nx#37272', 'resolve typescript and release version actions from the workspace root'],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
@@ -189,7 +190,7 @@ function notes(built: Release): string {
     `- ${built.asset}: \`${built.integrity}\``,
     `- uncompressed tar sha256: \`${built.tarSha256}\``,
     '',
-    'Drop the override, and this release with it, once the installed Nx release contains all three fixes.',
+    'Drop the override, and this release with it, once the installed Nx release contains all of these fixes.',
     '',
   ].join('\n');
 }

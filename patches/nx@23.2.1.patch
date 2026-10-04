@@ -1,3 +1,23 @@
+diff --git a/dist/src/command-line/release/version/version-actions.js b/dist/src/command-line/release/version/version-actions.js
+index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d5160b97bc32 100644
+--- a/dist/src/command-line/release/version/version-actions.js
++++ b/dist/src/command-line/release/version/version-actions.js
+@@ -5,13 +5,14 @@ exports.resolveVersionActionsForProject = resolveVersionActionsForProject;
+ const node_path_1 = require("node:path");
+ const register_1 = require("../../../plugins/js/utils/register");
+ const utils_1 = require("../../../tasks-runner/utils");
++const installation_directory_1 = require("../../../utils/installation-directory");
+ const workspace_root_1 = require("../../../utils/workspace-root");
+ const config_1 = require("../config/config");
+ const semver_1 = require("../utils/semver");
+ const release_group_processor_1 = require("./release-group-processor");
+ function resolveVersionActionsPath(path, projectGraphNode) {
+     try {
+-        return require.resolve(path);
++        return (0, installation_directory_1.resolveFromWorkspace)(path);
+     }
+     catch {
+         try {
 diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
 index 9bd7b61..c552b4b 100644
 --- a/dist/src/daemon/client/client.d.ts
@@ -210,6 +230,87 @@ index b1c143e..43d3f13 100644
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
+diff --git a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
+index 81a6ebea371390c69fc2c3ab3da95d7dbec13a37..5746704ac8457eddfcedfbcd171504f3e36082e1 100644
+--- a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
++++ b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
+@@ -2,6 +2,7 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.buildExplicitDependencies = buildExplicitDependencies;
+ const explicit_package_json_dependencies_1 = require("./explicit-package-json-dependencies");
++const installation_directory_1 = require("../../../../utils/installation-directory");
+ const explicit_project_dependencies_1 = require("./explicit-project-dependencies");
+ const target_project_locator_1 = require("./target-project-locator");
+ function buildExplicitDependencies(jsPluginConfig, ctx) {
+@@ -24,7 +25,7 @@ function buildExplicitDependencies(jsPluginConfig, ctx) {
+         jsPluginConfig.analyzeSourceFiles === true) {
+         let tsExists = false;
+         try {
+-            require.resolve('typescript');
++            (0, installation_directory_1.resolveFromWorkspace)('typescript');
+             tsExists = true;
+         }
+         catch { }
+diff --git a/dist/src/plugins/js/utils/register.js b/dist/src/plugins/js/utils/register.js
+index 151dfb805f179c65391587b379033fd53257d909..ae75a76b87d7974a5e1866e5ecbbf758e26533ca 100644
+--- a/dist/src/plugins/js/utils/register.js
++++ b/dist/src/plugins/js/utils/register.js
+@@ -25,6 +25,7 @@ exports.getTsNodeCompilerOptions = getTsNodeCompilerOptions;
+ const path_1 = require("path");
+ const fs_1 = require("fs");
+ const logger_1 = require("../../../utils/logger");
++const installation_directory_1 = require("../../../utils/installation-directory");
+ const workspace_root_1 = require("../../../utils/workspace-root");
+ const typescript_1 = require("./typescript");
+ const swcNodeInstalled = packageIsInstalled('@swc-node/register');
+@@ -663,7 +664,7 @@ const registered = new Map();
+ function getTranspiler(compilerOptions, tsConfigRaw) {
+     const preferTsNode = process.env.NX_PREFER_TS_NODE === 'true';
+     if (!ts) {
+-        ts = require('typescript');
++        ts = require((0, installation_directory_1.resolveFromWorkspace)('typescript'));
+     }
+     compilerOptions.lib = ['es2021'];
+     compilerOptions.module = ts.ModuleKind.CommonJS;
+@@ -1167,7 +1168,7 @@ function packageIsInstalled(m) {
+  */
+ function getTsNodeCompilerOptions(compilerOptions) {
+     if (!ts) {
+-        ts = require('typescript');
++        ts = require((0, installation_directory_1.resolveFromWorkspace)('typescript'));
+     }
+     const flagMap = {
+         module: 'ModuleKind',
+diff --git a/dist/src/plugins/js/utils/typescript.js b/dist/src/plugins/js/utils/typescript.js
+index f756066cc6009478b6e16136d8ba4b5a5614c63c..7b0f3b4b5b270650f2ac0a1c28259e84f1c04811 100644
+--- a/dist/src/plugins/js/utils/typescript.js
++++ b/dist/src/plugins/js/utils/typescript.js
+@@ -10,6 +10,7 @@ exports.getRootTsConfigCustomConditions = getRootTsConfigCustomConditions;
+ exports.getRootTsConfigResolveExportsConditions = getRootTsConfigResolveExportsConditions;
+ exports.getPluginResolveConditionNodeArgs = getPluginResolveConditionNodeArgs;
+ exports.findNodes = findNodes;
++const installation_directory_1 = require("../../../utils/installation-directory");
+ const workspace_root_1 = require("../../../utils/workspace-root");
+ const fs_1 = require("fs");
+ const path_1 = require("path");
+@@ -17,7 +18,7 @@ const normalizedAppRoot = workspace_root_1.workspaceRoot.replace(/\\/g, '/');
+ let tsModule;
+ function readTsConfig(tsConfigPath, sys) {
+     if (!tsModule) {
+-        tsModule = require('typescript');
++        tsModule = require((0, installation_directory_1.resolveFromWorkspace)('typescript'));
+     }
+     sys ??= tsModule.sys;
+     const readResult = tsModule.readConfigFile(tsConfigPath, sys.readFile);
+@@ -25,7 +26,7 @@ function readTsConfig(tsConfigPath, sys) {
+ }
+ function readTsConfigWithoutFiles(tsConfigPath) {
+     if (!tsModule) {
+-        tsModule = require('typescript');
++        tsModule = require((0, installation_directory_1.resolveFromWorkspace)('typescript'));
+     }
+     // We only care about options, so we don't need to scan source files, and thus
+     // `readDirectory` is stubbed for performance.
 diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff917bf214bb 100644
 --- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js
@@ -340,6 +441,49 @@ index 4a34ba2..c08789f 100644
  }
  /**
   * Converts a string representation of a max cache size to a number.
+diff --git a/dist/src/utils/installation-directory.d.ts b/dist/src/utils/installation-directory.d.ts
+index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24adc4adf7a8 100644
+--- a/dist/src/utils/installation-directory.d.ts
++++ b/dist/src/utils/installation-directory.d.ts
+@@ -1,2 +1,10 @@
+ export declare function getNxInstallationPath(root?: string): string;
+ export declare function getNxRequirePaths(root?: string): string[];
++/**
++ * Resolves a package the workspace provides (typescript, a release version
++ * actions implementation, ...) from the workspace first, then from this nx
++ * installation. A package manager's global or content-addressed store links nx
++ * only to its own dependencies, so resolving from nx's location alone cannot
++ * see what the workspace installs.
++ */
++export declare function resolveFromWorkspace(specifier: string, root?: string): string;
+diff --git a/dist/src/utils/installation-directory.js b/dist/src/utils/installation-directory.js
+index a6e742172f09e800da486af4716e9747d5ff2304..29f3376dfc5a00f83e90a7a2a7ce1a4eeed1a14e 100644
+--- a/dist/src/utils/installation-directory.js
++++ b/dist/src/utils/installation-directory.js
+@@ -2,6 +2,7 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.getNxInstallationPath = getNxInstallationPath;
+ exports.getNxRequirePaths = getNxRequirePaths;
++exports.resolveFromWorkspace = resolveFromWorkspace;
+ const path_1 = require("path");
+ const workspace_root_1 = require("./workspace-root");
+ function getNxInstallationPath(root = workspace_root_1.workspaceRoot) {
+@@ -10,3 +11,15 @@ function getNxInstallationPath(root = workspace_root_1.workspaceRoot) {
+ function getNxRequirePaths(root = workspace_root_1.workspaceRoot) {
+     return [getNxInstallationPath(root), root];
+ }
++/**
++ * Resolves a package the workspace provides (typescript, a release version
++ * actions implementation, ...) from the workspace first, then from this nx
++ * installation. A package manager's global or content-addressed store links nx
++ * only to its own dependencies, so resolving from nx's location alone cannot
++ * see what the workspace installs.
++ */
++function resolveFromWorkspace(specifier, root = workspace_root_1.workspaceRoot) {
++    return require.resolve(specifier, {
++        paths: [...getNxRequirePaths(root), __dirname],
++    });
++}
 diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
 index 34dbaa2..09f95b7 100644
 --- a/dist/src/utils/task-history.js
