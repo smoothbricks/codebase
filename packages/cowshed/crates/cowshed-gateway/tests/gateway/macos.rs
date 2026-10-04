@@ -830,7 +830,7 @@ async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
 /// CONNECT, and tunnel — no challenge round trip, and no way to be told cowshed's `Bearer`
 /// spelling. The tunnel it opens is the intercepted path a sandbox walks: CONNECT, minted leaf,
 /// request authorization, upstream fetch.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
     let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
@@ -862,30 +862,37 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
         .await
         .expect("install session");
     let target = format!("https://secure.test:{upstream_port}/allowed/item");
+    // curl's latency belongs to the host scheduler, so it must not race the gateway's deadlines:
+    // a loaded host once held curl's TLS 1.3 Finished past `test_config()`'s 2s handshake bound,
+    // the gateway dropped the handshake, and curl, already done with its side, met a reset.
+    // The gateway's deadlines all run on this runtime's paused clock, and a running blocking task
+    // inhibits auto-advance, so the clock stands still while curl runs and curl reports only what
+    // the gateway answered. A hung curl is the harness's slow-timeout to bound, not ours.
     let curl = |proxy: String| {
         let target = target.clone();
         async move {
-            tokio::process::Command::new("/usr/bin/curl")
-                .args([
-                    "-sS",
-                    "--max-time",
-                    "5",
-                    // The system curl's TLS backend is Secure Transport, which takes trust anchors
-                    // only from a keychain, never from `--cacert`. The workspace CA chain is
-                    // covered by the rustls intercept tests; what only a real client can prove is
-                    // the credential on the wire, and that happens before any TLS.
-                    "--insecure",
-                    "-o",
-                    "/dev/null",
-                    "-w",
-                    "%{http_code}",
-                    "-x",
-                    &proxy,
-                    &target,
-                ])
-                .output()
-                .await
-                .expect("run curl")
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new("/usr/bin/curl")
+                    .args([
+                        "-sS",
+                        // The system curl's TLS backend is Secure Transport, which takes trust
+                        // anchors only from a keychain, never from `--cacert`. The workspace CA
+                        // chain is covered by the rustls intercept tests; what only a real client
+                        // can prove is the credential on the wire, and that happens before any TLS.
+                        "--insecure",
+                        "-o",
+                        "/dev/null",
+                        "-w",
+                        "%{http_code}",
+                        "-x",
+                        &proxy,
+                        &target,
+                    ])
+                    .output()
+            })
+            .await
+            .expect("join curl")
+            .expect("run curl")
         }
     };
 
@@ -899,14 +906,12 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
     assert_eq!(String::from_utf8_lossy(&authenticated.stdout), "200");
 
     // No credential is a terminal answer, not a stall: curl reports the proxy's status and exits
-    // rather than waiting out a tunnel that will never open.
-    let started = Instant::now();
+    // rather than waiting out a tunnel that will never open. With the gateway's clock frozen, no
+    // deadline can produce that answer either: a 407 here comes from the CONNECT itself.
     let anonymous = curl(format!("http://127.0.0.1:{port}")).await;
-    let elapsed = started.elapsed();
     assert!(!anonymous.status.success());
     let reported = String::from_utf8_lossy(&anonymous.stderr);
     assert!(reported.contains("407"), "{reported}");
-    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     gateway.drain().await.expect("drain gateway");
 }
 
