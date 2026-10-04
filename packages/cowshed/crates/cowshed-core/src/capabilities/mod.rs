@@ -12,6 +12,7 @@ use cache::{HostCache, SharedLayout, SharedToolHome};
 
 pub mod cache;
 mod installations;
+mod direnv;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -230,7 +231,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 0] = [];
+pub static DETECTORS: [&Detector; 1] = [&direnv::DETECTOR];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
