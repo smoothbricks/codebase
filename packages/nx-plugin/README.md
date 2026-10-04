@@ -482,6 +482,28 @@ smoo-nx-exec my-cli:build --workspace-root "$root"
 A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target on
 stderr.
 
+## Nx 23.2.1 Runtime Patch
+
+The repository registers [`patches/nx@23.2.1.patch`](../../patches/nx@23.2.1.patch) in its root `patchedDependencies`.
+It repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
+
+- **Task history uses the client's native database connection.** Task details and history must share that connection; a
+  daemon can have frozen a different database namespace before a later client supplies workspace-data overrides. The
+  patch removes the obsolete history RPCs and retains native errors, including post-run failures. See
+  [upstream Nx #37268](https://github.com/nrwl/nx/pull/37268).
+- **The default cache limit uses the cache's own filesystem.** It takes ten percent of `statfs(cacheDir)` capacity, or
+  its nearest existing ancestor when the directory has not been created. This avoids synchronously inventorying every
+  mounted disk. Explicit `NX_MAX_CACHE_SIZE` and `nx.json.maxCacheSize` retain their precedence; filesystem errors other
+  than a missing directory still fail the operation.
+
+Publishing or installing `@smoothbricks/nx-plugin` does **not** apply this repository-root patch to a consumer's Nx. A
+consumer needing these repairs must carry the exact patch, register it for `nx@23.2.1` in its own root
+`patchedDependencies`, regenerate its lockfile, and prove a frozen install and its affected normal Nx gates. Do not
+replace the registry dependency with a local link or hide a failure by resetting the database or disabling the daemon.
+
+The patch is version-specific. On an Nx upgrade, remove each hunk only when the installed upstream release contains that
+repair and the task-history namespace and cache-bound regressions pass; preserve any repair not yet released.
+
 ## Bun Test Tracing Generator
 
 Configure a package for the Bun test tracing + no-emit test typechecking pattern used in this repo.
