@@ -217,7 +217,6 @@ pub struct JobArtifactRecord {
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
     pub failure: Option<JobFailure>,
-    pub warm: Option<WarmRange>,            // main's warm step only (02_workspaces.md "Warm main")
     pub exit: Option<ExitStatus>,           // terminal records whose end was observed
     pub duration_ms: Option<u64>,           // terminal records whose end was observed
 }
@@ -309,7 +308,6 @@ pub struct JobInfo {
     pub output_limit: Option<OutputLimitInfo>, // present exactly for OutputLimit
     pub stdin: StdinInfo,
     pub failure: Option<JobFailure>,         // a failed job that failed before its command ran
-    pub warm: Option<WarmRange>,             // main's warm step only: the landed commits it builds
 }
 
 pub struct OutputLimitInfo {
@@ -443,20 +441,6 @@ pub struct LandReport {
     pub previous_target_head: Option<GitOid>,
     pub target_was_checked_out: bool,
     pub retired: bool,
-    pub warm: Option<WarmAdmission>,        // None when the project declares no `[land] warm`
-}
-
-/// The landed commits one warm run builds: `base` is the target's head before the oldest land it
-/// covers (None for an unborn target), `head` what the newest landed.
-pub struct WarmRange {
-    pub base: Option<GitOid>,
-    pub head: GitOid,
-}
-
-#[serde(tag = "state")]
-pub enum WarmAdmission {
-    Started { job_id: JobId, range: WarmRange },   // the target's job building `range` now
-    Queued { behind: JobId, range: WarmRange },    // the one run waiting behind the target's warm job
 }
 ```
 
@@ -704,10 +688,8 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   so size zero, a size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and
   struct-literal forgery fail.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
-  `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, warm? }`;
-  `WarmRange = { base?, head }`;
-  `WarmAdmission = { state: "started", jobId, range } | { state: "queued", behind, range }`; `JobInfo.warm?` is a
-  `WarmRange`; `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
+  `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired }`;
+  `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
 - `GatewayStatus = { running, socket, cacheEntries, cacheBytes, activeWorkspaces }`.
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 

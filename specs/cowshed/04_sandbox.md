@@ -702,12 +702,12 @@ remains unchanged: `just verify` runs through this activation without a caller-p
 Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
 workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the workspace's writable temporary
 directory, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md). Both are prepared before activation, for every job
-the supervisor starts — an `exec`, a named session's command, a land check, a warm step. The temporary directory lies
-outside every checkout, because a tool may need scratch space outside the project it builds (a transform whose scratch
-directory must not sit under the project root), and outside the image, so a clone starts with an empty one and never
-copies another workspace's scratch. It is keyed by the workspace's name like its checkpoints, survives a restore, and
-goes when the retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these
-scoped directories, but the baseline still denies writes to the world-shared `/private/tmp` and to the host user's own
+the supervisor starts — an `exec`, a named session's command, a land check. The temporary directory lies outside every
+checkout, because a tool may need scratch space outside the project it builds (a transform whose scratch directory must
+not sit under the project root), and outside the image, so a clone starts with an empty one and never copies another
+workspace's scratch. It is keyed by the workspace's name like its checkpoints, survives a restore, and goes when the
+retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these scoped
+directories, but the baseline still denies writes to the world-shared `/private/tmp` and to the host user's own
 temporary directory under `/private/var/folders`; shell activation does not require a blanket temporary-directory grant.
 A process that reaches a temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one,
 then fails to create its cache, prints its `mkstemp` path, and resolves every lookup the slow way.

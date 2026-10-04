@@ -20,8 +20,8 @@ use cowshed_core::api::{
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
     ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WarmAdmission, WorkspaceInfo, WorkspaceLanding,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
@@ -1541,7 +1541,7 @@ where
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
-                emit_land(output, &report, args.into.as_deref().unwrap_or("main"))?;
+                emit_land(output, &report)?;
             }
             Ok(success())
         }
@@ -2742,12 +2742,7 @@ fn emit_push<W: Write, E: Write>(output: &mut Output<W, E>, report: &PushReport)
         .map_err(output_error)
 }
 
-/// `into` names the workspace landed into, whose warm step the guidance line reports.
-fn emit_land<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    report: &LandReport,
-    into: &str,
-) -> Result<()> {
+fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport) -> Result<()> {
     output
         .bare(report.target_branch.as_bytes())
         .and_then(|()| output.bare(b"\t"))
@@ -2761,17 +2756,6 @@ fn emit_land<W: Write, E: Write>(
             })
         })
         .and_then(|()| output.bare(b"\n"))
-        .and_then(|()| match &report.warm {
-            None => Ok(()),
-            Some(WarmAdmission::Started { job_id, range }) => output.guidance(&format!(
-                "{into}'s warm step builds {range} as job {}",
-                job_id.get()
-            )),
-            Some(WarmAdmission::Queued { behind, range }) => output.guidance(&format!(
-                "{into}'s warm step builds {range} once job {} ends",
-                behind.get()
-            )),
-        })
         .map_err(output_error)
 }
 

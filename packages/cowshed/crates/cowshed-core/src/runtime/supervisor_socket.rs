@@ -31,7 +31,7 @@ use super::supervisor::{
 };
 use crate::api::dto::{
     CommandArg, ExecCommand, ExecRequest, JobId, OutputPublication, RunSandboxMode, ScriptCommand,
-    Sha256Digest, StdinSource, TraceContext, WarmAdmission, WarmRange, WorkspacePath,
+    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::fork_lock::Fenced;
@@ -253,11 +253,6 @@ enum Call {
         session: Option<SessionWire>,
         background: bool,
         request: Box<ExecWire>,
-    },
-    /// Main's warm step for one land (`WorkspaceSupervisorHandle::warm`).
-    Warm {
-        argv: Vec<CommandArg>,
-        range: WarmRange,
     },
     #[serde(rename_all = "camelCase")]
     StdinWrite {
@@ -1081,10 +1076,6 @@ async fn answer(
             }
             (unit()?, Bytes::new())
         }
-        Call::Warm { argv, range } => (
-            to_value(&supervisor.warm(argv, range).await?)?,
-            Bytes::new(),
-        ),
         Call::Info { job_id } => (to_value(&supervisor.info(job_id).await?)?, Bytes::new()),
         Call::Sealed { job_id } => (to_value(&supervisor.sealed(job_id).await?)?, Bytes::new()),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
@@ -1493,17 +1484,6 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             background,
             reply,
         } => forward_exec(path, authority, session, *request, background, reply).await,
-        Command::Warm {
-            authority,
-            argv,
-            range,
-            reply,
-        } => {
-            let _ = reply.send(
-                call::<WarmAdmission>(path, &authority, Call::Warm { argv, range }, Bytes::new())
-                    .await,
-            );
-        }
         Command::StdinWrite {
             authority,
             job_id,

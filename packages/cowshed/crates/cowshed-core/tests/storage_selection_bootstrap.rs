@@ -102,16 +102,10 @@ fn command_line(operation: &HostOperation) -> Option<String> {
 #[test]
 fn cowshed_config_parser_accepts_only_complete_known_sections() {
     let config = parse_cowshed_config(
-        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n[land]\nwarm = [\"tooling/warm-main\"]\n",
+        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n",
     )
     .unwrap();
     assert_eq!(config.substrate().unwrap().pool(), "tank");
-    assert_eq!(config.land().unwrap().warm(), ["tooling/warm-main"]);
-
-    let substrate_only =
-        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n").unwrap();
-    assert_eq!(substrate_only.substrate().unwrap().pool(), "tank");
-    assert_eq!(substrate_only.land(), None);
 
     assert_eq!(
         parse_cowshed_config("[repository]\nname = \"widget\"\n").unwrap_err(),
@@ -199,51 +193,13 @@ pool = "tank"
     }
 }
 
+/// `land` runs nothing in its target, so `.cowshed.toml` has no `[land]` section: a file that
+/// still declares one is refused, never read as if its step ran.
 #[test]
-fn land_warm_is_one_non_empty_argv() {
-    let config =
-        parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\", \"--all\"] # after land\n")
-            .unwrap();
-    assert_eq!(
-        config.land().unwrap().warm(),
-        ["tooling/warm-main", "--all"]
-    );
-    assert_eq!(
-        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n")
-            .unwrap()
-            .land(),
-        None
-    );
-
-    let invalid = [
-        ("[land]\n", "missing [land] key \"warm\""),
-        (
-            "[land]\nwarm = []\n",
-            "non-empty array of non-empty strings",
-        ),
-        (
-            "[land]\nwarm = [\"\"]\n",
-            "non-empty array of non-empty strings",
-        ),
-        (
-            "[land]\nwarm = \"tooling/warm-main\"\n",
-            "non-empty array of non-empty strings",
-        ),
-        (
-            "[land]\nwarm = [\"a\", 1]\n",
-            "non-empty array of non-empty strings",
-        ),
-        ("[land]\nwarm = [\"a\"]\nwarm = [\"b\"]\n", "duplicated"),
-        ("[land]\ncheck = \"cargo test\"\n", "unknown [land] key"),
-        (
-            "[land]\nwarm = [\"a\"]\n[land]\nwarm = [\"a\"]\n",
-            "duplicated",
-        ),
-    ];
-    for (source, message) in invalid {
-        let error = parse_cowshed_config(source).unwrap_err();
-        assert!(error.to_string().contains(message), "{source:?}: {error}");
-    }
+fn a_land_section_is_refused() {
+    let error = parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\"]\n").unwrap_err();
+    assert_eq!(error, ConfigError::UnknownSection("land".to_owned()));
+    assert_eq!(error.to_string(), "unknown configuration section [land]");
 }
 
 /// `[sandbox] deny` is a one-line array of workspace-relative paths, normalized, sorted and
@@ -259,7 +215,7 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
         [PathBuf::from(".runtime"), PathBuf::from("a/b")]
     );
     assert!(
-        parse_cowshed_config("[land]\nwarm = [\"x\"]\n")
+        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n")
             .unwrap()
             .sandbox_deny()
             .is_empty()

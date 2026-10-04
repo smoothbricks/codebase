@@ -243,10 +243,10 @@ cowshed land "$LANE" --check 'just verify' --project "$PROJECT"
 ```
 
 `rebase --into` catches a unit up with what its lane-mates have already landed in the lane base, and `land --into` moves
-the lane base's checked-out branch, runs the lane base's warm step, and retires the unit once the lane base holds its
-commits. Cowshed keeps no record of the lane: `--into` names a workspace, and your script is what knows which units
-belong to it. If the lane base is removed and recreated under the same name while units are in flight, their lands
-refuse it rather than land into a workspace they were not forked from.
+the lane base's checked-out branch and retires the unit once the lane base holds its commits. Cowshed keeps no record of
+the lane: `--into` names a workspace, and your script is what knows which units belong to it. If the lane base is
+removed and recreated under the same name while units are in flight, their lands refuse it rather than land into a
+workspace they were not forked from.
 
 ## Machine-readable operation
 

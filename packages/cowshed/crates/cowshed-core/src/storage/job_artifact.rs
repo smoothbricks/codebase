@@ -15,18 +15,18 @@ use arrow_array::{
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
-    DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId, JobState, MAX_ARGV_BYTES,
+    DtoError, ExecCommand, ExitStatus, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES,
     MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
     OutputStorage, OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
-    TerminalCommitment, WarmRange, WorkspaceIntroducedCommitment, WorkspacePath,
-    WorkspaceRetiredCommitment, validate_command_argv,
+    TerminalCommitment, WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    validate_command_argv,
 };
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
@@ -57,13 +57,21 @@ const RECORD_SEQUENCE_BYTES: usize = 24;
 const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
 const CHECKPOINT_BARRIER_MAGIC: &[u8; 8] = b"CSBAR001";
 const CHECKPOINT_BARRIER_BYTES: usize = 24;
-/// The layout every new record is written in: version 4 adds main's warm range and the job's
-/// exit status and duration.
-const RECORD_SCHEMA_VERSION: u64 = 4;
-/// The layouts earlier cowshed builds wrote, newest first, as the version and how many trailing
-/// columns of the current layout each lacks: version 3 has no warm, exit or duration columns,
-/// and version 2 no `failure` either. Read, never written.
-const EARLIER_RECORD_LAYOUTS: [(u64, usize); 2] = [(3, 6), (2, 7)];
+/// The layout every new record is written in: version 5 drops the two range columns version 4
+/// carried between `failure` and the exit columns.
+const RECORD_SCHEMA_VERSION: u64 = 5;
+/// Version 4: the current layout with [`VERSION_4_RANGE_COLUMNS`] ahead of [`EXIT_COLUMN`]. The
+/// range a since-removed build step recorded in them is skipped on read. Read, never written.
+const VERSION_4: u64 = 4;
+/// The columns only version 4 has, in order, between `failure` and `exit_code`.
+const VERSION_4_RANGE_COLUMNS: [&str; 2] = ["warm_base", "warm_head"];
+/// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
+/// `duration_ms`.
+const EXIT_COLUMN: usize = 34;
+/// The layouts before version 4, newest first, as the version and how many trailing columns of
+/// the current layout each lacks: version 3 has no exit or duration columns, and version 2 no
+/// `failure` either. Read, never written.
+const EARLIER_RECORD_LAYOUTS: [(u64, usize); 2] = [(3, 4), (2, 5)];
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -280,8 +288,6 @@ pub struct JobArtifactRecord {
     pub stderr: StreamInfo,
     /// Why a failed job failed when no status of its own says so.
     pub failure: Option<crate::api::dto::JobFailure>,
-    /// Main's warm step only: the landed commits the job builds.
-    pub warm: Option<WarmRange>,
     /// A terminal job's status as `wait(2)` reported it; absent while the job runs and for a job
     /// whose end nothing observed.
     pub exit: Option<ExitStatus>,
@@ -502,10 +508,9 @@ pub struct CheckpointManifestRecord {
 
 impl CheckpointManifestRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
-        let known = u64::from(self.version) == RECORD_SCHEMA_VERSION
-            || EARLIER_RECORD_LAYOUTS
-                .iter()
-                .any(|&(version, _)| u64::from(self.version) == version);
+        let known = record_layouts()
+            .iter()
+            .any(|&(version, _)| u64::from(self.version) == version);
         if !known || self.barrier_id == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -783,7 +788,6 @@ impl ArtifactStore {
         job_id: JobId,
         grant_revision: u64,
         command: &ExecCommand,
-        warm: Option<&WarmRange>,
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
@@ -817,7 +821,6 @@ impl ArtifactStore {
             stdout: empty_stream(&targets.stdout)?,
             stderr: empty_stream(&targets.stderr)?,
             failure: None,
-            warm: warm.cloned(),
             exit: None,
             duration_ms: None,
         };
@@ -827,7 +830,6 @@ impl ArtifactStore {
             LiveJobState {
                 grant_revision,
                 command: command.clone(),
-                warm: warm.cloned(),
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -1203,7 +1205,6 @@ struct QuotaAdmission {
 struct LiveJobState {
     grant_revision: u64,
     command: ExecCommand,
-    warm: Option<WarmRange>,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1431,7 +1432,6 @@ impl ArtifactStore {
                 stdout,
                 stderr,
                 failure: None,
-                warm: live.warm.clone(),
                 exit,
                 duration_ms,
             };
@@ -3279,8 +3279,6 @@ fn build_protected_record_schema() -> Arc<Schema> {
             true,
         ),
         field("failure", DataType::Utf8, true),
-        field("warm_base", DataType::Utf8, true),
-        field("warm_head", DataType::Utf8, true),
         field("exit_code", DataType::Int32, true),
         field("exit_signal", DataType::Int32, true),
         field("exit_core_dumped", DataType::Boolean, true),
@@ -3288,21 +3286,35 @@ fn build_protected_record_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Every layout a record may be read in, newest first: the current one, then each of
+/// Every layout a record may be read in, newest first: the current one, version 4, then each of
 /// [`EARLIER_RECORD_LAYOUTS`] as the current layout without its trailing columns.
 fn record_layouts() -> &'static [(u64, Arc<Schema>)] {
     static LAYOUTS: LazyLock<Vec<(u64, Arc<Schema>)>> = LazyLock::new(|| {
         let current = protected_record_schema();
         let fields = current.fields();
+        let (through_failure, exit_and_duration) = fields.split_at(EXIT_COLUMN);
+        let version_4: Vec<FieldRef> = through_failure
+            .iter()
+            .cloned()
+            .chain(
+                VERSION_4_RANGE_COLUMNS
+                    .map(|name| Arc::new(field(name, DataType::Utf8, true)) as FieldRef),
+            )
+            .chain(exit_and_duration.iter().cloned())
+            .collect();
         let earlier = EARLIER_RECORD_LAYOUTS.iter().map(|&(version, missing)| {
             (
                 version,
                 Arc::new(Schema::new(fields[..fields.len() - missing].to_vec())),
             )
         });
-        std::iter::once((RECORD_SCHEMA_VERSION, Arc::clone(&current)))
-            .chain(earlier)
-            .collect()
+        [
+            (RECORD_SCHEMA_VERSION, Arc::clone(&current)),
+            (VERSION_4, Arc::new(Schema::new(version_4))),
+        ]
+        .into_iter()
+        .chain(earlier)
+        .collect()
     });
     &LAYOUTS
 }
@@ -3316,10 +3328,10 @@ fn batch_layout_version(batch: &RecordBatch) -> Option<u64> {
         .map(|&(version, _)| version)
 }
 
-/// The layout of a batch a newer cowshed wrote, when it is one. Layouts grow by trailing
-/// columns ([`EARLIER_RECORD_LAYOUTS`]), so a newer one begins with every column of the current
-/// layout and has more; a job record in it declares a version above [`RECORD_SCHEMA_VERSION`].
-/// Anything else this build cannot read is damage, not a newer writer.
+/// The layout of a batch a newer cowshed wrote, when it is one. Layouts after this one grow by
+/// trailing columns, so a newer one begins with every column of the current layout and has more;
+/// a job record in it declares a version above [`RECORD_SCHEMA_VERSION`]. Anything else this
+/// build cannot read is damage, not a newer writer.
 fn newer_layout(batch: &RecordBatch) -> Option<UnknownLayout> {
     let current = protected_record_schema();
     let known = current.fields().len();
@@ -3539,16 +3551,6 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         ])),
         Arc::new(command_argv_array(&record.command)?),
         Arc::new(StringArray::from(vec![record.failure.map(failure_name)])),
-        Arc::new(StringArray::from(vec![
-            record
-                .warm
-                .as_ref()
-                .and_then(|warm| warm.base.as_ref())
-                .map(GitOid::as_str),
-        ])),
-        Arc::new(StringArray::from(vec![
-            record.warm.as_ref().map(|warm| warm.head.as_str()),
-        ])),
         Arc::new(Int32Array::from(vec![exit_code])),
         Arc::new(Int32Array::from(vec![exit_signal])),
         Arc::new(BooleanArray::from(vec![exit_core_dumped])),
@@ -3570,15 +3572,16 @@ fn exit_columns(exit: Option<&ExitStatus>) -> (Option<i32>, Option<i32>, Option<
     }
 }
 
-fn decode_exit(batch: &RecordBatch) -> Result<Option<ExitStatus>, ArtifactError> {
-    let code = (!batch.column(36).is_null(0))
-        .then(|| int32(batch, 36).map(|column| column.value(0)))
+/// The exit columns of a job batch whose `exit_code` column is `first`.
+fn decode_exit(batch: &RecordBatch, first: usize) -> Result<Option<ExitStatus>, ArtifactError> {
+    let code = (!batch.column(first).is_null(0))
+        .then(|| int32(batch, first).map(|column| column.value(0)))
         .transpose()?;
-    let signal = (!batch.column(37).is_null(0))
-        .then(|| int32(batch, 37).map(|column| column.value(0)))
+    let signal = (!batch.column(first + 1).is_null(0))
+        .then(|| int32(batch, first + 1).map(|column| column.value(0)))
         .transpose()?;
-    let core_dumped = (!batch.column(38).is_null(0))
-        .then(|| boolean(batch, 38).map(|column| column.value(0)))
+    let core_dumped = (!batch.column(first + 2).is_null(0))
+        .then(|| boolean(batch, first + 2).map(|column| column.value(0)))
         .transpose()?;
     match (code, signal, core_dumped) {
         (None, None, None) => Ok(None),
@@ -3589,22 +3592,6 @@ fn decode_exit(batch: &RecordBatch) -> Result<Option<ExitStatus>, ArtifactError>
         })),
         _ => Err(ArtifactError::Arrow(
             "exit columns must name one exit code, or one signal and its core dump".into(),
-        )),
-    }
-}
-
-fn decode_warm(batch: &RecordBatch) -> Result<Option<WarmRange>, ArtifactError> {
-    let oid = |index| -> Result<Option<GitOid>, ArtifactError> {
-        if batch.column(index).is_null(0) {
-            return Ok(None);
-        }
-        Ok(Some(GitOid::new(string(batch, index)?.value(0))?))
-    };
-    match (oid(34)?, oid(35)?) {
-        (None, None) => Ok(None),
-        (base, Some(head)) => Ok(Some(WarmRange { base, head })),
-        (Some(_), None) => Err(ArtifactError::Arrow(
-            "a warm base column needs its warm head".into(),
         )),
     }
 }
@@ -3648,19 +3635,26 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         }
     };
     let command = decode_command(batch, 32)?;
-    // Each layout holds the columns of every version up to its own.
+    // Every layout from version 3 holds `failure`; from version 4 the exit and duration columns,
+    // which version 4 alone places after its range columns.
     let failure = if version >= 3 && !batch.column(33).is_null(0) {
         Some(parse_failure(string(batch, 33)?.value(0))?)
     } else {
         None
     };
-    let (warm, exit, duration_ms) = if version >= 4 {
-        let duration_ms = (!batch.column(39).is_null(0))
-            .then(|| uint64(batch, 39).map(|column| column.value(0)))
+    let (exit, duration_ms) = if version >= VERSION_4 {
+        let exit_column = if version == VERSION_4 {
+            EXIT_COLUMN + VERSION_4_RANGE_COLUMNS.len()
+        } else {
+            EXIT_COLUMN
+        };
+        let duration_column = exit_column + 3;
+        let duration_ms = (!batch.column(duration_column).is_null(0))
+            .then(|| uint64(batch, duration_column).map(|column| column.value(0)))
             .transpose()?;
-        (decode_warm(batch)?, decode_exit(batch)?, duration_ms)
+        (decode_exit(batch, exit_column)?, duration_ms)
     } else {
-        (None, None, None)
+        (None, None)
     };
     Ok(JobArtifactRecord {
         repo_id,
@@ -3674,7 +3668,6 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         stdout,
         stderr,
         failure,
-        warm,
         exit,
         duration_ms,
     })
@@ -4720,8 +4713,8 @@ mod tests {
     #[test]
     fn earlier_layouts_read_without_their_later_columns() {
         // A workspace's records.arrow outlives the cowshed that wrote it: version-2 batches,
-        // without `failure`, and version-3 batches, without the warm, exit and duration columns,
-        // read as they always did.
+        // without `failure`, and version-3 batches, without the exit and duration columns, read
+        // as they always did.
         let record = valid_job_record(4);
         let current = job_record_to_batch(&record).unwrap();
         for &(version, missing) in &EARLIER_RECORD_LAYOUTS {
@@ -4758,28 +4751,55 @@ mod tests {
     }
 
     #[test]
-    fn the_current_layout_keeps_failure_warm_range_exit_and_duration() {
-        let oid = |digit: char| GitOid::new(digit.to_string().repeat(40)).unwrap();
+    fn version_4_reads_past_its_range_columns() {
+        // Version 4 held a landed range between `failure` and the exit columns; a record written
+        // then reads as the same job, its exit and duration intact, the range skipped.
+        let record = JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 3 }),
+            duration_ms: Some(42),
+            ..valid_job_record(4)
+        };
+        let current = job_record_to_batch(&record).unwrap();
+        let layout = record_layouts()
+            .iter()
+            .find(|(version, _)| *version == VERSION_4)
+            .map(|(_, layout)| Arc::clone(layout))
+            .unwrap();
+        let oid = |digit: char| Some(digit.to_string().repeat(40));
+        let (through_failure, exit_and_duration) = current.columns().split_at(EXIT_COLUMN);
+        let columns = |version: u64| -> Vec<ArrayRef> {
+            let mut columns = through_failure.to_vec();
+            columns[1] = Arc::new(UInt64Array::from(vec![version]));
+            columns.push(Arc::new(StringArray::from(vec![oid('a')])));
+            columns.push(Arc::new(StringArray::from(vec![oid('b')])));
+            columns.extend(exit_and_duration.iter().cloned());
+            columns
+        };
+        let version_4 = RecordBatch::try_new(Arc::clone(&layout), columns(VERSION_4)).unwrap();
+        let ProtectedRecord::Job(read) = batch_to_protected_record(&version_4).unwrap() else {
+            panic!("a job record");
+        };
+        assert_eq!(read, record);
+
+        // Version 4's layout claiming the current version is neither.
+        let mislabeled = RecordBatch::try_new(layout, columns(RECORD_SCHEMA_VERSION)).unwrap();
+        assert!(batch_to_protected_record(&mislabeled).is_err());
+    }
+
+    #[test]
+    fn the_current_layout_keeps_failure_exit_and_duration() {
         let lost = JobArtifactRecord {
             state: JobState::Failed,
             failure: Some(crate::api::dto::JobFailure::SupervisorLost),
             ..valid_job_record(5)
         };
-        let warmed = JobArtifactRecord {
-            warm: Some(WarmRange {
-                base: Some(oid('a')),
-                head: oid('b'),
-            }),
+        let exited = JobArtifactRecord {
             exit: Some(ExitStatus::Exited { code: 0 }),
             duration_ms: Some(1234),
             ..valid_job_record(6)
         };
         let signaled = JobArtifactRecord {
             state: JobState::Signaled,
-            warm: Some(WarmRange {
-                base: None,
-                head: oid('c'),
-            }),
             exit: Some(ExitStatus::Signaled {
                 signal: 9,
                 core_dumped: true,
@@ -4787,7 +4807,7 @@ mod tests {
             duration_ms: Some(5),
             ..valid_job_record(7)
         };
-        for record in [lost, warmed, signaled] {
+        for record in [lost, exited, signaled] {
             let ProtectedRecord::Job(read) =
                 batch_to_protected_record(&job_record_to_batch(&record).unwrap()).unwrap()
             else {
@@ -4820,7 +4840,6 @@ mod tests {
             stdout: inline_stream(b""),
             stderr: inline_stream(b""),
             failure: None,
-            warm: None,
             exit: None,
             duration_ms: None,
         }
@@ -5095,7 +5114,6 @@ mod tests {
                 job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5125,7 +5143,6 @@ mod tests {
                 foreign_job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5270,7 +5287,6 @@ mod tests {
                     next,
                     1,
                     &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                    None,
                     OutputTargets::default(),
                 )
                 .unwrap();
@@ -5534,7 +5550,6 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5599,7 +5614,6 @@ mod tests {
                 job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5642,7 +5656,6 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5678,7 +5691,6 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5713,7 +5725,6 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5812,7 +5823,6 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

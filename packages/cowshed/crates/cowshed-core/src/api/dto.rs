@@ -1619,8 +1619,6 @@ pub struct JobInfo {
     /// Set only for a job that failed before its command ran, for a reason its exit status
     /// cannot name.
     pub failure: Option<JobFailure>,
-    /// Set only for a land target's warm step: the landed commits this job builds.
-    pub warm: Option<WarmRange>,
 }
 
 impl JobInfo {
@@ -1689,8 +1687,6 @@ struct JobInfoRef<'a> {
     stdin: &'a StdinInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<JobFailure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warm: Option<&'a WarmRange>,
 }
 
 #[derive(Deserialize)]
@@ -1724,8 +1720,6 @@ struct JobInfoWire {
     stdin: StdinInfo,
     #[serde(default)]
     failure: Option<JobFailure>,
-    #[serde(default)]
-    warm: Option<WarmRange>,
 }
 
 /// The wire's two mutually exclusive command spellings, `argv` and `script`, as one command.
@@ -1754,7 +1748,6 @@ impl Serialize for JobInfo {
             output_limit: self.output_limit.as_ref(),
             stdin: &self.stdin,
             failure: self.failure,
-            warm: self.warm.as_ref(),
         }
         .serialize(serializer)
     }
@@ -1789,7 +1782,6 @@ impl<'de> Deserialize<'de> for JobInfo {
             output_limit: wire.output_limit,
             stdin: wire.stdin,
             failure: wire.failure,
-            warm: wire.warm,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -2615,59 +2607,6 @@ pub struct LandReport {
     pub previous_target_head: Option<GitOid>,
     pub target_was_checked_out: bool,
     pub retired: bool,
-    /// Main's warm step for this land; absent when the project declares no `[land] warm`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warm: Option<WarmAdmission>,
-}
-
-/// The landed commits one run of a land target's warm step builds.
-///
-/// `head` is the head the newest covered land landed. `base` is the target's head before the
-/// oldest covered land: runs that waited behind a running one coalesce, so one run can cover
-/// several lands. It is absent when that land moved an unborn target.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WarmRange {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<GitOid>,
-    pub head: GitOid,
-}
-
-impl WarmRange {
-    /// The run that covers `self` and then `later`: the older base, the newer head.
-    #[must_use]
-    pub fn through(self, later: Self) -> Self {
-        Self {
-            base: self.base,
-            head: later.head,
-        }
-    }
-}
-
-/// `base..head`, as git spells a range; the head alone when the target was unborn.
-impl fmt::Display for WarmRange {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.base {
-            Some(base) => write!(formatter, "{base}..{}", self.head),
-            None => write!(formatter, "{}", self.head),
-        }
-    }
-}
-
-/// What `land` asked of the target's warm step. Land never waits for the build itself.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "state",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum WarmAdmission {
-    /// Main's job `job_id` builds `range` now.
-    Started { job_id: JobId, range: WarmRange },
-    /// Main's warm job `behind` is still running; `range` is the one run waiting behind it, which
-    /// starts when it ends.
-    Queued { behind: JobId, range: WarmRange },
 }
 
 /// The commits a `--abandon` removal destroyed, and where their bundle went.

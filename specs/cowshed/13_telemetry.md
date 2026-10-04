@@ -204,13 +204,13 @@ The flat Arrow schema begins `record_kind, record_version, repo_id`. A Job row t
 `stdout_storage_kind, stdout_source_path, stdout_inline_bytes, stdout_protected_path, stdout_bytes, stdout_sha256, stdout_summary_version, stdout_summary_text, stdout_summary_truncated`
 and equivalent `stderr_*` columns, optional output-limit columns, required `argv: List<Binary>`, which holds a script
 job as the two elements `\0script` and the script's JSON, a nullable `failure` naming why a `failed` job failed when no
-status of its own says so (`supervisorLost`), then `warm_base, warm_head` (Utf8: the landed range main's warm step
-builds, 02_workspaces.md "Warm main"; `warm_base` is null for an unborn target), `exit_code` (Int32) or
-`exit_signal, exit_core_dumped` (Int32, Boolean) for the status `wait(2)` reported, and `duration_ms` (UInt64). The exit
-and duration columns are null on a running record and on a terminal one whose end nothing observed (a job refused before
-its command ran, `supervisorLost`). Records are written at `record_version` 4; version-3 records, which have every
-column up to `failure`, and version-2 records, which lack `failure` too, are read as they were, and a batch whose layout
-and version disagree is rejected. A CheckpointManifest row instead uses
+status of its own says so (`supervisorLost`), then `exit_code` (Int32) or `exit_signal, exit_core_dumped` (Int32,
+Boolean) for the status `wait(2)` reported, and `duration_ms` (UInt64). The exit and duration columns are null on a
+running record and on a terminal one whose end nothing observed (a job refused before its command ran,
+`supervisorLost`). Records are written at `record_version` 5. Version-4 records carry two more Utf8 columns,
+`warm_base, warm_head`, between `failure` and the exit columns; they are read with those columns skipped. Version-3
+records, which have every column up to `failure`, and version-2 records, which lack `failure` too, are read as they
+were, and a batch whose layout and version disagree is rejected. A CheckpointManifest row instead uses
 `origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
 `visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the

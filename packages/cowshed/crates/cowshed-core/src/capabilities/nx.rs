@@ -6,7 +6,7 @@
 //! The daemon's rendezvous record, `d/server-process.json`, lives in the same workspace-data
 //! directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` or
 //! `NX_PROJECT_GRAPH_CACHE_DIRECTORY` moves the record, the database and the cache together.
-//! A sandbox that names its own directories therefore owns a second cache: a warm step that fills
+//! A sandbox that names its own directories therefore owns a second cache: a build that fills
 //! one leaves a gate reading the other cold, and every clone inherits both half-warm. So a
 //! read-write job names the checkout's own `.nx` — the directories a host shell's Nx uses — and
 //! every boundary of the checkout shares one record, one daemon, one database and one cache.

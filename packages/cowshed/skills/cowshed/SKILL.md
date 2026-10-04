@@ -76,10 +76,7 @@ direnv users need nothing extra.
 5. A successful `land` retires by default. If it was run with `--no-retire`, if you used `push`, or if land's error says
    it landed but kept the workspace, run `cowshed rm <ws>` after main contains the workspace `HEAD` (never land again:
    main already moved). Do not use `--abandon` unless destroying unlanded commits is intentional.
-6. If main's `.cowshed.toml` declares `[land] warm`, land starts that build in main as a background job and names the
-   job on stderr (`main's warm step builds <base>..<head> as job N`). Do not wait for it or run it yourself: the next
-   workspace cloned from main inherits whatever it has built.
-7. A unit forked from a lane base (`cowshed fork <lane> <ws>`) does steps 2 and 4 with `--into <lane>` (in place of
+6. A unit forked from a lane base (`cowshed fork <lane> <ws>`) does steps 2 and 4 with `--into <lane>` (in place of
    `--target main`): it rebases onto and lands into the lane base, not main. The lane base itself then rebases and lands
    as an ordinary workspace.
 

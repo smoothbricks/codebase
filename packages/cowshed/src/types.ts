@@ -161,9 +161,9 @@ export interface RebaseOptions {
 export interface LandOptions {
   /**
    * The workspace this unit lands into — the lane base it was forked from; main when absent. Land
-   * fast-forwards the branch that workspace has checked out, runs its warm step, and retires the
-   * unit once that workspace holds its commits. The reference carries the incarnation it was
-   * resolved at: a workspace removed and recreated under the same name is refused.
+   * fast-forwards the branch that workspace has checked out and retires the unit once that
+   * workspace holds its commits. The reference carries the incarnation it was resolved at: a
+   * workspace removed and recreated under the same name is refused.
    */
   readonly into?: WorkspaceRef;
   readonly targetBranch?: string;
@@ -280,24 +280,7 @@ export interface LandReport {
   readonly previousTargetHead?: string;
   readonly targetWasCheckedOut: boolean;
   readonly retired: boolean;
-  /** Main's warm step for this land; absent when the project declares no `[land] warm`. */
-  readonly warm?: WarmAdmission;
 }
-
-/**
- * The landed commits one run of a land target's warm step builds: `head` is the head the newest
- * covered land landed, `base` the target's head before the oldest, absent when that target was
- * unborn.
- */
-export interface WarmRange {
-  readonly base?: string;
-  readonly head: string;
-}
-
-/** What `land` asked of the target's warm step, which it never waits for. */
-export type WarmAdmission =
-  | { readonly state: 'started'; readonly jobId: number; readonly range: WarmRange }
-  | { readonly state: 'queued'; readonly behind: number; readonly range: WarmRange };
 
 export interface GcCandidate {
   readonly identity: string;
@@ -444,8 +427,6 @@ export interface JobInfoFields {
   readonly stdin: StdinInfo;
   /** Present only for a failed job that failed before its command ran. */
   readonly failure?: JobFailure;
-  /** Present only for a land target's warm step: the landed commits the job builds. */
-  readonly warm?: WarmRange;
 }
 
 /** Why a job failed when no command's own status explains it. */

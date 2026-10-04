@@ -9032,21 +9032,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ),
         )
         .await?;
-        // The target has moved, so build it at what landed: every later clone of it copies its
-        // build outputs and starts warm — a fork taken later in a lane starts with its lane-mates'
-        // work built. The target's supervisor runs the declared step in the background and answers
-        // at once; a land that moved nothing has nothing to build.
-        let warm = if previous.as_ref() == Some(&source_head) {
-            Ok(None)
-        } else {
-            let range = crate::api::dto::WarmRange {
-                base: previous.clone(),
-                head: source_head.clone(),
-            };
-            let target = into.name.clone();
-            super::land_warm::warm_after_land(&into.root, range, || self.ensure_supervisor(&target))
-                .await
-        };
         if retire {
             // The target has already moved, so a refused retire must not read as a refused land:
             // the retry its hint names would land nothing. Containment is measured against the
@@ -9065,24 +9050,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     )
                 })?;
         }
-        // The same reading as a refused retire: the target moved, only its build did not start.
-        let warm = warm.map_err(|refused| {
-            CowshedError::new(
-                refused.code,
-                format!(
-                    "landed {source_head} on {target_branch}, but {}'s warm step did not start: {}",
-                    into.name, refused.message
-                ),
-                refused.hint,
-            )
-        })?;
         Ok(LandReport {
             landed_head: source_head,
             target_branch,
             previous_target_head: previous,
             target_was_checked_out: true,
             retired: retire,
-            warm,
         })
     }
 
@@ -11284,7 +11257,6 @@ mod removal_supervisor_tests {
             _job_id: JobId,
             _grant_revision: u64,
             _command: &ExecCommand,
-            _warm: Option<&crate::api::dto::WarmRange>,
         ) -> Result<()> {
             Ok(())
         }

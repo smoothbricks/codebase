@@ -80,7 +80,6 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
             complete: true,
         },
         failure: None,
-        warm: None,
     }
 }
 
@@ -838,7 +837,6 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         previous_target_head: Some(oid('a')),
         target_was_checked_out: true,
         retired: true,
-        warm: None,
     };
     assert_eq!(
         serde_json::to_value(land).unwrap()["targetWasCheckedOut"],

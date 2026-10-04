@@ -3,10 +3,11 @@
 The central convention: **main is the base**. There are no templates, no refresh pipelines, and no registration steps.
 The **main workspace** is the adopted image-backed workspace and its standalone Git repository/object store. It is not
 the checked-out Git `main` branch, and it is not shorthand for that branch's working tree or index. The main workspace
-is warm because the user works in its currently checked-out working tree, merges land there, and each land builds it at
-what landed through the project's declared warm step ("Warm main" below); every new workspace is a copy-on-write clone
-of the main workspace's live image. Operations that update only a non-checked-out ref in its repository do not change
-its checked-out branch, index, or working tree.
+is warm because the user works in its currently checked-out working tree and merges land there; every new workspace is a
+copy-on-write clone of the main workspace's live image. Main's build state reaches later forks through build
+generations: a land points main at the landed workspace's generation, so main never builds (16_build_caching.md).
+Operations that update only a non-checked-out ref in its repository do not change its checked-out branch, index, or
+working tree.
 
 Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
 own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
@@ -777,39 +778,7 @@ step.
    the moved value. Cowshed never retries against a new base internally; the coordinator decides whether to rebase and
    re-run checks.
 
-4. **Warm the target**: build the target at what landed, so every later clone of it starts warm — for a lane base, the
-   forks taken later in the lane start with their lane-mates' work built. The target's `.cowshed.toml` declares the
-   build as one argv, read from the target's checkout at the landed head:
-
-   ```toml
-   [land]
-   warm = ["tooling/warm-main"]
-   ```
-
-   Land hands it to **the target's workspace supervisor** as a background job of the target's sandbox — an ordinary
-   read-write exec from the target's root with `COWSHED_LAND_BASE` (the target's head before the land; unset when the
-   target was unborn) and `COWSHED_LAND_HEAD` (the landed head) in its environment — and **never waits for it**: the
-   report carries the admission (`warm`: `started` with the job id, or `queued` behind the warm job running), the CLI
-   names that job on stderr, and the build's outcome is the job's. The argv is never a shell string; a build that needs
-   the heads interpolated runs a tracked script that reads them. The job's environment is every job's (03_caches.md):
-   its `TMPDIR` is the target's temp dir, and an Nx it runs fills the target's sandboxed Nx cache (04_sandbox.md), the
-   entries the target's later clones inherit.
-
-   **One warm job per target, one run waiting.** The target's supervisor keeps the queue: a land that arrives while a
-   warm job runs does not start another; it becomes the one run waiting behind it, and a later land replaces that
-   waiting run, keeping its `COWSHED_LAND_BASE` and taking the newer `COWSHED_LAND_HEAD` (and the newer argv). When the
-   running job ends, whatever its exit, the waiting run starts, so the run that follows a burst of lands builds
-   everything they landed once. The lane lives in the supervisor: a supervisor that retires with a run waiting drops it,
-   saying so on its stderr, and the next land's run covers only its own range.
-
-   The warm job is recorded like every job, with its range: `JobInfo.warm` and the protected record's
-   `warm_base`/`warm_head` columns name the landed commits it builds beside its exit status and duration
-   (13_telemetry.md), so "did main's warm step run at the landed head" is a query over main's job records. No
-   `[land] warm`, or a land that moved nothing, starts no job and asks the target's supervisor nothing. A warm step that
-   cannot start (an invalid `.cowshed.toml`, a supervisor that refuses) fails the land after the fact the way a refused
-   retire does: the message starts with the landed head and target, because the target has moved.
-
-5. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
+4. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
    the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*` preservation refs on the
    host. The retire gate is `rm`'s, measured against the branch the workspace just landed on, in the target's
    repository: a lane unit whose commits its lane base holds retires, though main does not hold them yet. A retire
@@ -831,8 +800,8 @@ fast-forward main and remove the lane base.
 
 The caller (an external coordinator) tracks the tree; cowshed stores nothing about lanes. `--into` names a workspace,
 and every lane rule is read off that workspace at the moment of the call: its checked-out branch is the target, its
-repository is where the unit's commits are fetched and fast-forwarded, its supervisor runs the warm step, and its branch
-is what the retire measures against. A standalone `cowshed rm` of a unit still measures against main.
+repository is where the unit's commits are fetched and fast-forwarded, and its branch is what the retire measures
+against. A standalone `cowshed rm` of a unit still measures against main.
 
 `--into` refuses the unit itself (exit 2), and `--into main` is the default. In the API the lane is a `WorkspaceRef`
 rather than a name: the reference carries the incarnation it was resolved at, and land and rebase refuse (exit 4, naming

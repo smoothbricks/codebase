@@ -18,7 +18,7 @@ use crate::api::dto::{
     BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
     JobState, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
     SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WarmAdmission, WarmRange, WorkspacePath,
+    UtcTimestamp, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
@@ -37,7 +37,6 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::land_warm::{WarmLane, WarmRun, WarmTurn};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -425,13 +424,7 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    fn admit(
-        &mut self,
-        job_id: JobId,
-        grant_revision: u64,
-        command: &ExecCommand,
-        warm: Option<&WarmRange>,
-    ) -> Result<()>;
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
     fn seal(
@@ -504,22 +497,10 @@ impl ArtifactSink for ArtifactStoreSink {
         })
     }
 
-    fn admit(
-        &mut self,
-        job_id: JobId,
-        grant_revision: u64,
-        command: &ExecCommand,
-        warm: Option<&WarmRange>,
-    ) -> Result<()> {
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()> {
         let token = self
             .store
-            .begin_job(
-                job_id,
-                grant_revision,
-                command,
-                warm,
-                OutputTargets::default(),
-            )
+            .begin_job(job_id, grant_revision, command, OutputTargets::default())
             .map_err(map_artifact_error)?;
         if token.job_id() != job_id || self.tokens.insert(job_id, token).is_some() {
             return Err(CowshedError::integrity(
@@ -1977,19 +1958,6 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    /// Hand this workspace's warm step one land's range: it starts now, or waits behind the warm
-    /// job running, merged into the one run waiting there. Answered at once, never at the build's
-    /// end.
-    pub async fn warm(&self, argv: Vec<CommandArg>, range: WarmRange) -> Result<WarmAdmission> {
-        self.call(|reply| Command::Warm {
-            authority: self.authority.clone(),
-            argv,
-            range,
-            reply,
-        })
-        .await
-    }
-
     pub async fn stdin_write(&self, job_id: JobId, bytes: Bytes) -> Result<()> {
         if bytes.len() > PROCESS_IO_CHUNK {
             return Err(CowshedError::usage(
@@ -2239,7 +2207,6 @@ impl WorkspaceSupervisor {
             quiesce_waiters: Vec::new(),
             retire_waiters: Vec::new(),
             command_lane_closed: false,
-            warm: WarmLane::default(),
             nx_daemon,
         };
         tokio::spawn(actor.run());
@@ -2275,12 +2242,6 @@ pub(super) enum Command {
         request: Box<ExecRequest>,
         background: bool,
         reply: oneshot::Sender<Result<JobId>>,
-    },
-    Warm {
-        authority: WorkspaceAuthoritySnapshot,
-        argv: Vec<CommandArg>,
-        range: WarmRange,
-        reply: oneshot::Sender<Result<WarmAdmission>>,
     },
     StdinWrite {
         authority: WorkspaceAuthoritySnapshot,
@@ -2516,8 +2477,6 @@ struct SupervisorActor {
     quiesce_waiters: Vec<oneshot::Sender<Result<()>>>,
     retire_waiters: Vec<oneshot::Sender<Result<()>>>,
     command_lane_closed: bool,
-    /// Main's warm step: the one warm job running and the one run waiting behind it.
-    warm: WarmLane,
     /// A shed's keeper of its sandboxed Nx daemon ([`super::nx_daemon`]); main keeps none.
     nx_daemon: Option<NxDaemonKeeper>,
 }
@@ -2595,7 +2554,6 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
-            self.advance_warm_lane().await;
             self.finish_lifecycle_waiters();
         }
     }
@@ -2643,17 +2601,8 @@ impl SupervisorActor {
                 reply,
             } => {
                 let result = self
-                    .admit_exec(authority, session, *request, background, None)
+                    .admit_exec(authority, session, *request, background)
                     .await;
-                let _ = reply.send(result);
-            }
-            Command::Warm {
-                authority,
-                argv,
-                range,
-                reply,
-            } => {
-                let result = self.warm(&authority, WarmRun { argv, range }).await;
                 let _ = reply.send(result);
             }
             Command::StdinWrite {
@@ -2961,14 +2910,13 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// Admit and spawn one job. `warm` marks it as a land target's warm step for that landed range.
+    /// Admit and spawn one job.
     async fn admit_exec(
         &mut self,
         authority: WorkspaceAuthoritySnapshot,
         session: Option<SessionToken>,
         request: ExecRequest,
         background: bool,
-        warm: Option<WarmRange>,
     ) -> Result<JobId> {
         self.validate_authority(&authority)
             .and_then(|()| {
@@ -3055,12 +3003,8 @@ impl SupervisorActor {
             })?;
         {
             let _span = crate::timing::span("admit", "record");
-            self.artifacts.admit(
-                job_id,
-                self.authority.grant_revision,
-                &command,
-                warm.as_ref(),
-            )?;
+            self.artifacts
+                .admit(job_id, self.authority.grant_revision, &command)?;
         }
         self.next_job_id = expected_next;
         let admission = crate::timing::spanned(
@@ -3119,7 +3063,6 @@ impl SupervisorActor {
             output_limit: None,
             stdin: stdin_info,
             failure: None,
-            warm,
         };
         let spawn_span = crate::timing::span("admit", "spawn");
         let spawn = self
@@ -3210,74 +3153,6 @@ impl SupervisorActor {
         }
     }
 
-    /// One land's warm run: start it when no warm job runs, else fold it into the run waiting
-    /// behind the one that does.
-    async fn warm(
-        &mut self,
-        authority: &WorkspaceAuthoritySnapshot,
-        run: WarmRun,
-    ) -> Result<WarmAdmission> {
-        self.validate_authority(authority)?;
-        if self.lifecycle != ActorLifecycle::Running {
-            return Err(retiring_error());
-        }
-        match self.warm.admit(run) {
-            WarmTurn::Wait(admission) => Ok(admission),
-            WarmTurn::Start(run) => {
-                let job_id = self.start_warm(&run).await?;
-                Ok(WarmAdmission::Started {
-                    job_id,
-                    range: run.range,
-                })
-            }
-        }
-    }
-
-    async fn start_warm(&mut self, run: &WarmRun) -> Result<JobId> {
-        let authority = self.authority.clone();
-        let job_id = self
-            .admit_exec(
-                authority,
-                None,
-                run.request(),
-                true,
-                Some(run.range.clone()),
-            )
-            .await?;
-        self.warm.started(job_id);
-        Ok(job_id)
-    }
-
-    /// Once the running warm job has ended, start the run that waited behind it. Nobody waits for
-    /// that answer — the lands it covers returned long ago — so a run that cannot start is said
-    /// where the supervisor's own failures go.
-    async fn advance_warm_lane(&mut self) {
-        let Some(running) = self.warm.running() else {
-            return;
-        };
-        if self.jobs.get(&running).is_some_and(|job| !job.terminal()) {
-            return;
-        }
-        let Some(run) = self.warm.ended() else {
-            return;
-        };
-        if self.lifecycle != ActorLifecycle::Running {
-            eprintln!(
-                "cowshed: main's supervisor is retiring, so the warm run for {} that waited \
-                 behind job {} does not start",
-                run.range,
-                running.get()
-            );
-            return;
-        }
-        if let Err(error) = self.start_warm(&run).await {
-            eprintln!(
-                "cowshed: main's warm run for {} did not start: {}",
-                run.range, error.message
-            );
-        }
-    }
-
     /// One probe of a shed's Nx daemon: nothing while the keeper's start job runs; once it has
     /// ended, say how it went unless it left the daemon live; start the daemon, inside the
     /// sandbox, when the probe finds none live. Nobody waits for the start, so a start that is
@@ -3310,7 +3185,7 @@ impl SupervisorActor {
         }
         let authority = self.authority.clone();
         let started = match super::nx_daemon::start_request(&self.workspace_root, &project_root) {
-            Ok(request) => self.admit_exec(authority, None, request, true, None).await,
+            Ok(request) => self.admit_exec(authority, None, request, true).await,
             Err(error) => Err(error),
         };
         match started {
@@ -5234,7 +5109,6 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 7,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5257,7 +5131,6 @@ mod lifecycle_commitment_tests {
                 JobId::new(2).unwrap(),
                 8,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5376,7 +5249,6 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
                 OutputTargets::default(),
             )
             .unwrap();

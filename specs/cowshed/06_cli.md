@@ -370,8 +370,6 @@ port_range = "32768-49151"    # macOS only: reserved range workspace port blocks
 extra_workspace_dirs = ["build-out"]
 [shell]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
-[land]
-warm = ["tooling/warm-main"]  # argv main's supervisor runs after every land (02_workspaces.md "Warm main")
 ```
 
 Workspace environment lives inside the image as `.cowshed/env`: it exports `COWSHED_WORKSPACE_TOKEN` (controller-minted

@@ -26,9 +26,8 @@ use cowshed_core::{
         GcReport, GitOid, GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits,
         OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
         RemoveReport, RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
-        StreamInfo, TraceContext, TraceId, UtcTimestamp, WarmAdmission, WarmRange,
-        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
-        WorkspaceRole, WorkspaceState,
+        StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspaceIncarnation, WorkspaceInfo,
+        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -166,7 +165,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
-        warm: None,
     };
 
     // A running job with every optional present, a workspace-file stdin, and both stream storage
@@ -198,7 +196,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
-        warm: None,
     };
 
     // An exited job with inline stdin.
@@ -228,7 +225,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
-        warm: None,
     };
 
     // A signalled job carrying a non-UTF-8 argument. This is the case a `string[]` argv cannot
@@ -258,7 +254,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
-        warm: None,
     };
 
     // The output-limit state is the only one that carries `outputLimit`, and an incomplete
@@ -289,7 +284,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: false,
         },
         failure: None,
-        warm: None,
     };
 
     // A cancelled job may die from a signal or exit normally after handling it.
@@ -342,25 +336,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
-    // Main's warm step: the one job that carries the landed range it builds; an unborn target has
-    // no base.
-    let warm = JobInfo {
-        job_id: JobId::new(9).expect("fixture job id"),
-        warm: Some(WarmRange {
-            base: Some(oid("2222222222222222222222222222222222222222")),
-            head: oid("1111111111111111111111111111111111111111"),
-        }),
-        ..exited.clone()
-    };
-    let warm_unborn = JobInfo {
-        job_id: JobId::new(10).expect("fixture job id"),
-        warm: Some(WarmRange {
-            base: None,
-            head: oid("1111111111111111111111111111111111111111"),
-        }),
-        ..exited.clone()
-    };
-
     let list = vec![queued.clone(), running.clone()];
 
     BTreeMap::from([
@@ -376,8 +351,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ),
         ("failed", document("job status", &failed)),
         ("scriptSyntax", document("job status", &script_syntax)),
-        ("warm", document("job status", &warm)),
-        ("warmUnbornTarget", document("job status", &warm_unborn)),
         ("list", document("job list", &list)),
     ])
 }
@@ -505,34 +478,12 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         previous_target_head: None,
         target_was_checked_out: false,
         retired: false,
-        warm: None,
     };
     let land_retired = LandReport {
         previous_target_head: Some(oid("2222222222222222222222222222222222222222")),
         target_was_checked_out: true,
         retired: true,
         ..land_first.clone()
-    };
-    // Main's warm step started at once, or waiting behind the warm job still running.
-    let land_warmed = LandReport {
-        warm: Some(WarmAdmission::Started {
-            job_id: JobId::new(9).expect("fixture job id"),
-            range: WarmRange {
-                base: Some(oid("2222222222222222222222222222222222222222")),
-                head: oid("1111111111111111111111111111111111111111"),
-            },
-        }),
-        ..land_retired.clone()
-    };
-    let land_warm_queued = LandReport {
-        warm: Some(WarmAdmission::Queued {
-            behind: JobId::new(9).expect("fixture job id"),
-            range: WarmRange {
-                base: Some(oid("2222222222222222222222222222222222222222")),
-                head: oid("5555555555555555555555555555555555555555"),
-            },
-        }),
-        ..land_retired.clone()
     };
 
     let push_new = PushReport {
@@ -642,8 +593,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             BTreeMap::from([
                 ("firstLanding", document("land report", &land_first)),
                 ("retired", document("land report", &land_retired)),
-                ("warmStarted", document("land report", &land_warmed)),
-                ("warmQueued", document("land report", &land_warm_queued)),
             ]),
         ),
         (

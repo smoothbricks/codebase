@@ -69,7 +69,6 @@ const MARKER_VERSION: u32 = 1;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CowshedConfig {
     substrate: Option<SubstrateConfig>,
-    land: Option<LandConfig>,
     /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
     /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
     sandbox_deny: Vec<PathBuf>,
@@ -82,10 +81,6 @@ pub struct CowshedConfig {
 impl CowshedConfig {
     pub fn substrate(&self) -> Option<&SubstrateConfig> {
         self.substrate.as_ref()
-    }
-
-    pub fn land(&self) -> Option<&LandConfig> {
-        self.land.as_ref()
     }
 
     pub fn sandbox_deny(&self) -> &[PathBuf] {
@@ -113,24 +108,9 @@ impl SubstrateConfig {
     }
 }
 
-/// What `land` does after it moves the target: `[land] warm`, the argv main's workspace runs so
-/// every later clone of main starts warm.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LandConfig {
-    /// Never empty, and no element is empty: the parser refuses both.
-    warm: Vec<String>,
-}
-
-impl LandConfig {
-    pub fn warm(&self) -> &[String] {
-        &self.warm
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigSection {
     Substrate,
-    Land,
     Sandbox,
     Capability(crate::capabilities::CapabilityId),
 }
@@ -139,7 +119,6 @@ impl ConfigSection {
     const fn name(self) -> &'static str {
         match self {
             Self::Substrate => "substrate",
-            Self::Land => "land",
             Self::Sandbox => "sandbox",
             Self::Capability(id) => id.section_name(),
         }
@@ -152,16 +131,14 @@ struct ParsedCapability {
     directory: Option<PathBuf>,
 }
 
-/// Parse repository-owned storage, landing, sandbox deny and convention-only capability overrides.
+/// Parse repository-owned storage, sandbox deny and convention-only capability overrides.
 /// Unknown or duplicated settings fail rather than silently changing project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
-    let mut saw_land = false;
     let mut saw_sandbox = false;
     let mut kind = None;
     let mut pool = None;
-    let mut warm = None;
     let mut sandbox_deny = None;
     let mut capabilities =
         std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
@@ -179,7 +156,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 .trim();
             let section = match name {
                 "substrate" => ConfigSection::Substrate,
-                "land" => ConfigSection::Land,
                 "sandbox" => ConfigSection::Sandbox,
                 other => {
                     let id = other
@@ -198,7 +174,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             // A capability section is deduplicated by its insertion above.
             let seen = match section {
                 ConfigSection::Substrate => Some(&mut saw_substrate),
-                ConfigSection::Land => Some(&mut saw_land),
                 ConfigSection::Sandbox => Some(&mut saw_sandbox),
                 ConfigSection::Capability(_) => None,
             };
@@ -227,9 +202,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 section,
                 "pool",
             )?,
-            (ConfigSection::Land, "warm") => {
-                set_once(&mut warm, parse_argv(value, line_number)?, section, "warm")?;
-            }
             (ConfigSection::Sandbox, "deny") => {
                 set_once(
                     &mut sandbox_deny,
@@ -305,16 +277,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         None
     };
-    let land = if saw_land {
-        Some(LandConfig {
-            warm: warm.ok_or(ConfigError::MissingKey {
-                section: "land",
-                key: "warm",
-            })?,
-        })
-    } else {
-        None
-    };
     let sandbox_deny = if saw_sandbox {
         sandbox_deny.ok_or(ConfigError::MissingKey {
             section: "sandbox",
@@ -337,7 +299,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         .collect();
     Ok(CowshedConfig {
         substrate,
-        land,
         sandbox_deny,
         capabilities,
     })
@@ -356,14 +317,6 @@ fn set_once<T>(
         });
     }
     Ok(())
-}
-
-/// An argv, written as a TOML array of basic strings on one line: exactly JSON's array syntax.
-fn parse_argv(value: &str, line: usize) -> Result<Vec<String>, ConfigError> {
-    match serde_json::from_str::<Vec<String>>(value) {
-        Ok(argv) if !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()) => Ok(argv),
-        _ => Err(ConfigError::ExpectedArgv { line }),
-    }
 }
 
 /// `[sandbox] deny`: a TOML array of workspace-relative paths on one line, each a non-empty
@@ -437,8 +390,6 @@ pub enum ConfigError {
     UnsupportedKind(String),
     #[error("[{section}] value at line {line} must be a quoted string")]
     ExpectedQuotedString { section: &'static str, line: usize },
-    #[error("[land] warm at line {line} must be a non-empty array of non-empty strings")]
-    ExpectedArgv { line: usize },
     #[error("[sandbox] deny at line {line} must be an array of quoted paths")]
     ExpectedPathArray { line: usize },
     #[error(

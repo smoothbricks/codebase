@@ -852,42 +852,16 @@ naming the conflicted paths.
 ### `cowshed land <name> [--into <lane>] [--check <cmd>]`
 
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
-workspace's branch, start the target's warm step, retire the workspace. The target is main, or with `--into <lane>` the
-lane base `<lane>`. A dirty tree, read the way `rm` reads it, is refused before the check runs: the check sees the
-working tree but only the commit lands. Land does not rebase; when the target has moved past the workspace's base the
-fast-forward is refused, and `cowshed rebase <name>` (with the same `--into`) is the next step. Any failing step before
-the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps the workspace and
-exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not another land. The
-retire measures the workspace against the branch it just landed on, so a lane unit retires once its lane base holds its
-commits. The target branch (`--target`, default the branch the target's checkout has checked out) must be the
-checked-out one. `--into` refuses the workspace itself (exit 2). `--no-retire` keeps the workspace; `--push-only` stops
-after validation for review-gated flows.
-
-**The warm step.** A clone starts warm because its source's build outputs copy with it, so after the fast-forward land
-builds the target at what landed, with the argv the target's `.cowshed.toml` declares:
-
-```toml
-[land]
-warm = ["tooling/warm-main"]   # one argv, never a shell string
-```
-
-It runs as a background job of the target's workspace supervisor, from the target's root, with `COWSHED_LAND_BASE` (the
-target's head before the land) and `COWSHED_LAND_HEAD` (the landed head) in its environment. Land does not wait for it:
-it prints the job on stderr and returns. At most one warm job runs per target; lands that arrive while one runs coalesce
-into the one run waiting behind it, from the oldest waiting base to the newest head, which starts when the running job
-ends. Landing a unit into a lane base warms the lane base, so units forked later in the lane start with their
-lane-mates' work built.
-
-```
-$ cowshed land raven
-main	<landed head>	true
-cowshed: main's warm step builds <main's previous head>..<landed head> as job 12
-```
-
-`--json` carries it as `warm`: `{ "state": "started", "jobId", "range": { "base", "head" } }`, or `"queued"` with
-`behind` naming the running warm job. The job's record (`JobInfo.warm`, and the protected records' `warm_base`,
-`warm_head`, `exit_code` and `duration_ms` columns) says which landed commits it built, how it exited and how long it
-took. No `[land] warm` starts nothing.
+workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
+tree, read the way `rm` reads it, is refused before the check runs: the check sees the working tree but only the commit
+lands. Land does not rebase; when the target has moved past the workspace's base the fast-forward is refused, and
+`cowshed rebase <name>` (with the same `--into`) is the next step. Any failing step before the fast-forward exits 4 with
+the workspace intact. A retire refused after the fast-forward keeps the workspace and exits with that refusal, whose
+message starts with what landed, so the retry is `cowshed rm`, not another land. The retire measures the workspace
+against the branch it just landed on, so a lane unit retires once its lane base holds its commits. The target branch
+(`--target`, default the branch the target's checkout has checked out) must be the checked-out one. `--into` refuses the
+workspace itself (exit 2). `--no-retire` keeps the workspace; `--push-only` stops after validation for review-gated
+flows.
 
 ## Time travel
 

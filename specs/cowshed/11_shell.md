@@ -153,13 +153,6 @@ exec-temp roots.
 - **Named sessions** (`--session <name>`, `WorkspaceHandle::shell(Some(name))`) keep a cwd, an environment overlay, and
   the set of their background jobs until explicitly closed or the supervisor stops. They hold no process of their own.
   This is how a coordinator gives one subagent a stable working directory and environment for a multi-step task.
-- **The warm lane** runs main's warm step (02_workspaces.md "Warm main"). `land` hands main's supervisor the declared
-  argv and the landed range; the supervisor answers at once — `started` with the job it admitted, or `queued` behind the
-  warm job running — and never makes the caller wait for the build. At most one warm job runs; a land that arrives while
-  it runs becomes the one run waiting, and a later one replaces it, keeping the waiting base and taking the new head and
-  argv. When the running warm job ends, however it ends, the supervisor starts the waiting run as an ordinary background
-  job carrying `COWSHED_LAND_BASE`/`COWSHED_LAND_HEAD` and its range in `JobInfo.warm`. The waiting run is supervisor
-  memory: a supervisor that retires first drops it and says so on its stderr.
 
 Execution cwd has one representation across `ExecRequest`, supervisor/session state, `JobInfo`, JSON, and Arrow:
 `Option<WorkspacePath>`. `None` denotes the workspace mount root; `Some(path)` denotes exactly one validated, normalized
@@ -234,16 +227,16 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   supervisor process's own sink, the host's default; a controller whose sink is its own reads them here, records them
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
-- **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `warm`, `stdinWrite`, `stdinClose`,
-  `streamChunk`, `streamEnd`, `info`, `sealed`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`:
-  one per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it
-  exactly as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not
-  served under the wrong profile. An accepted `exec` answers with the numeric `jobId`, allocated before process
-  creation; a spawn failure is therefore a terminal job, not a response with no identity. `warm` answers with the
-  `WarmAdmission` above. `info`, `list`, `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's
-  terminal record from the workspace's records — state, exit, failure, duration, output limit and both streams — for any
-  job of the incarnation that has one, including a job an earlier supervisor ran and sealed, and `logRead` reads such a
-  job's sealed streams from any offset as it reads its own terminal jobs'.
+- **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
+  `streamEnd`, `info`, `sealed`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per
+  supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it
+  fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the
+  wrong profile. An accepted `exec` answers with the numeric `jobId`, allocated before process creation; a spawn failure
+  is therefore a terminal job, not a response with no identity. `info`, `list`, `kill` and `wait` answer the
+  supervisor's own jobs; `sealed` answers a job's terminal record from the workspace's records — state, exit, failure,
+  duration, output limit and both streams — for any job of the incarnation that has one, including a job an earlier
+  supervisor ran and sealed, and `logRead` reads such a job's sealed streams from any offset as it reads its own
+  terminal jobs'.
 - **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file the supervisor opens
   inside the sandbox boundary, or a stream: the client forwards its source as `streamChunk` calls in order, each
   answered only once the job's bounded queue took it, and ends it with `streamEnd`, naming the source's error if it

@@ -1074,7 +1074,6 @@ impl ProjectRuntimeHost for FakeHost {
             previous_target_head: None,
             target_was_checked_out: true,
             retired: false,
-            warm: None,
         })
     }
 
