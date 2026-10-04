@@ -995,6 +995,9 @@ pub struct GrantSet {
     /// Paths within this workspace that no job may write, even when its mount is writable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_write: Vec<PathBuf>,
+    /// Paths within this workspace that no job may read or write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<PathBuf>,
     #[serde(default)]
     pub egress: Vec<EgressRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

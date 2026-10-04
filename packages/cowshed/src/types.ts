@@ -97,6 +97,7 @@ export interface GrantSet {
   readonly read: readonly string[];
   readonly write: readonly string[];
   readonly denyWrite?: readonly string[];
+  readonly deny?: readonly string[];
   readonly egress: readonly EgressRule[];
   readonly repos?: readonly string[];
   readonly sim: readonly SimVerb[];
@@ -130,6 +131,7 @@ export interface GrantDelta {
   readonly read?: readonly string[];
   readonly write?: readonly string[];
   readonly denyWrite?: readonly string[];
+  readonly deny?: readonly string[];
   readonly egress?: readonly EgressRule[];
   readonly repos?: readonly string[];
   readonly sim?: readonly SimVerb[];

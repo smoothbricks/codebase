@@ -8659,6 +8659,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.validate_binding().await?;
         normalize_grant_paths(&mut delta.read)?;
         normalize_relative_denies(&mut delta.deny_write)?;
+        normalize_relative_denies(&mut delta.deny)?;
         // Every workspace runs under the project's grants, so the candidate is validated as the
         // one workspace every project has runs: main, with its own grants plus the candidate. The
         // denies that differ between workspaces are their own mounts, which the mount-root deny
@@ -8684,6 +8685,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let previous = policy.grants.clone();
             update_ordered_set(&mut policy.grants.read, delta.read, revoke);
             update_ordered_set(&mut policy.grants.deny_write, delta.deny_write, revoke);
+            update_ordered_set(&mut policy.grants.deny, delta.deny, revoke);
             update_egress(&mut policy.grants.egress, delta.egress, revoke);
             if policy.grants == previous {
                 return Ok(previous);
@@ -12110,7 +12112,8 @@ fn requested_port_block_size(delta: &GrantDelta, revoke: bool) -> Result<Option<
 fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
     normalize_grant_paths(&mut delta.write)?;
-    normalize_relative_denies(&mut delta.deny_write)
+    normalize_relative_denies(&mut delta.deny_write)?;
+    normalize_relative_denies(&mut delta.deny)
 }
 
 #[cfg(target_os = "macos")]
@@ -12260,6 +12263,7 @@ fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     update_ordered_set(&mut grants.read, delta.read, revoke);
     update_ordered_set(&mut grants.write, delta.write, revoke);
     update_ordered_set(&mut grants.deny_write, delta.deny_write, revoke);
+    update_ordered_set(&mut grants.deny, delta.deny, revoke);
     update_egress(&mut grants.egress, delta.egress, revoke);
     update_ordered_set(&mut grants.repos, delta.repos, revoke);
     update_ordered_set(&mut grants.sim, delta.sim, revoke);
@@ -12430,6 +12434,67 @@ mod grant_unit_tests {
         let mut paths = vec![PathBuf::from(".git/hooks/"), PathBuf::from(".git/hooks")];
         normalize_relative_denies(&mut paths).expect("valid workspace deny");
         assert_eq!(paths, [PathBuf::from(".git/hooks")]);
+    }
+
+    /// A read+write deny is granted and revoked like a write deny, and a workspace cannot revoke
+    /// the project's.
+    #[test]
+    fn read_write_denies_merge_like_write_denies() {
+        let project = crate::project_policy::ProjectGrants {
+            deny: vec![PathBuf::from(".runtime")],
+            ..crate::project_policy::ProjectGrants::default()
+        };
+        let mut workspace = GrantSet::default();
+        apply_grant_delta(
+            &mut workspace,
+            GrantDelta {
+                deny: vec![PathBuf::from(".env"), PathBuf::from("secrets")],
+                ..GrantDelta::default()
+            },
+            false,
+        );
+        apply_grant_delta(
+            &mut workspace,
+            GrantDelta {
+                deny: vec![PathBuf::from(".runtime"), PathBuf::from("secrets")],
+                ..GrantDelta::default()
+            },
+            true,
+        );
+        assert_eq!(workspace.deny, [PathBuf::from(".env")]);
+        let effective =
+            crate::project_policy::effective_grants(&workspace, &project).expect("revisions fit");
+        assert_eq!(
+            effective.deny,
+            [PathBuf::from(".env"), PathBuf::from(".runtime")]
+        );
+    }
+
+    /// Main's `.cowshed.toml` is the only source of `[sandbox] deny`: an absent file declares
+    /// nothing, and an invalid one refuses rather than run without the deny.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn main_cowshed_config_reads_sandbox_denies_and_refuses_an_invalid_file() {
+        let main = std::env::temp_dir().join(format!(
+            "cowshed-main-config-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&main).unwrap();
+        let absent = main_cowshed_config(&main).unwrap();
+        std::fs::write(
+            main.join(".cowshed.toml"),
+            "[sandbox]\n# runtime secrets live here\ndeny = [\".runtime\"]\n",
+        )
+        .unwrap();
+        let declared = main_cowshed_config(&main).unwrap();
+        std::fs::write(main.join(".cowshed.toml"), "[sandbox]\ndeny = [\"../x\"]\n").unwrap();
+        let invalid = main_cowshed_config(&main).expect_err("escaping deny refused");
+        std::fs::remove_dir_all(&main).unwrap();
+
+        assert!(absent.sandbox_deny().is_empty());
+        assert_eq!(declared.sandbox_deny(), [PathBuf::from(".runtime")]);
+        assert_eq!(invalid.code.as_str(), "usage");
     }
 
     /// A host has one egress rule: its mode and ports are that rule. Granting a
@@ -12641,6 +12706,7 @@ fn supervisor_sandbox(
     mount: PathBuf,
     main_mount: PathBuf,
 ) -> Result<crate::sandbox::SandboxConfig> {
+    let repository = main_cowshed_config(&main_mount)?;
     crate::sandbox::workspace_sandbox(crate::sandbox::WorkspaceSandbox {
         home,
         mount_root: &layout.project().host_mount_root,
@@ -12648,11 +12714,38 @@ fn supervisor_sandbox(
         main_mount: &main_mount,
         telemetry_root,
         grants,
+        repository_deny: repository.sandbox_deny(),
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
         workspace_mount: mount,
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)
             .map_err(native_integrity_error)?,
+    })
+}
+
+/// Main's `.cowshed.toml`, the only copy whose `[sandbox]` section is trusted: main's checkout
+/// is the operator's, while a workspace's copy is the agent's to edit. A missing file declares
+/// nothing; an unreadable or invalid one refuses the launch rather than drop a deny.
+#[cfg(target_os = "macos")]
+fn main_cowshed_config(main_mount: &Path) -> Result<crate::storage::bootstrap::CowshedConfig> {
+    let path = main_mount.join(".cowshed.toml");
+    let input = match std::fs::read_to_string(&path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::storage::bootstrap::CowshedConfig::default());
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!("cannot read {}: {error}", path.display()),
+                "make main's .cowshed.toml readable, then retry",
+            ));
+        }
+    };
+    crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
+        CowshedError::usage(
+            format!("invalid {}: {error}", path.display()),
+            "fix main's .cowshed.toml, then retry",
+        )
     })
 }
 

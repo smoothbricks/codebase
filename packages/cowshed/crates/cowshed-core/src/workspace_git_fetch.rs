@@ -667,6 +667,7 @@ mod tests {
                 read: vec![checkout.to_owned()],
                 write: Vec::new(),
                 deny_write: Vec::new(),
+                deny: Vec::new(),
                 egress: Vec::new(),
             },
             allowed_unix_sockets: Vec::new(),

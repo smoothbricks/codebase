@@ -22,7 +22,10 @@ pub struct EgressGrant {
 pub struct SandboxGrants {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    /// Workspace-relative paths no job may write.
     pub deny_write: Vec<PathBuf>,
+    /// Workspace-relative paths no job may read or write.
+    pub deny: Vec<PathBuf>,
     pub egress: Vec<EgressGrant>,
 }
 
@@ -496,6 +499,9 @@ pub struct WorkspaceSandbox<'a> {
     pub telemetry_root: &'a Path,
     /// The workspace's effective grants: its own and the project's.
     pub grants: &'a crate::metadata::GrantSet,
+    /// `[sandbox] deny` from main's `.cowshed.toml`: workspace-relative paths the operator's
+    /// own checkout declares no job may read or write. Never a workspace's copy of the file.
+    pub repository_deny: &'a [PathBuf],
     /// The `.git` of main's mount, for a git-worktree workspace only.
     pub git_worktree_repository: Option<PathBuf>,
     pub workspace_mount: PathBuf,
@@ -515,6 +521,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         main_mount,
         telemetry_root,
         grants,
+        repository_deny,
         git_worktree_repository,
         workspace_mount: mount,
         exec_temp_dir,
@@ -527,6 +534,9 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
     if mount != main_mount {
         additional_denies.push(main_mount.to_path_buf());
     }
+    let mut deny: Vec<PathBuf> = grants.deny.iter().chain(repository_deny).cloned().collect();
+    deny.sort();
+    deny.dedup();
     Ok(SandboxConfig {
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
@@ -547,6 +557,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
             read: grants.read.clone(),
             write: grants.write.clone(),
             deny_write: grants.deny_write.clone(),
+            deny,
             egress: grants
                 .egress
                 .iter()
@@ -661,7 +672,7 @@ fn validated_sandbox_paths(
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
-    for relative in &config.grants.deny_write {
+    for relative in config.grants.deny_write.iter().chain(&config.grants.deny) {
         if relative.as_os_str().is_empty()
             || relative
                 .components()
@@ -968,17 +979,22 @@ pub fn seatbelt_profile(
     // Last-match-wins: a workspace-relative deny must follow every mount and grant allow.
     // Deny rename/unlink on ancestors too, or renaming `.git` would move the protected
     // children out of the denied spelling before rewriting them.
-    for relative in &config.grants.deny_write {
-        let mut parent = config.workspace_mount.clone();
-        for component in relative.components() {
-            parent.push(component);
-            push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
+    for (relatives, operations) in [
+        (&config.grants.deny_write, "deny file-write*"),
+        (&config.grants.deny, "deny file-read* file-write*"),
+    ] {
+        for relative in relatives {
+            let mut parent = config.workspace_mount.clone();
+            for component in relative.components() {
+                parent.push(component);
+                push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
+            }
+            push_exact_and_subpath_rule(
+                &mut profile,
+                operations,
+                &config.workspace_mount.join(relative),
+            )?;
         }
-        push_exact_and_subpath_rule(
-            &mut profile,
-            "deny file-write*",
-            &config.workspace_mount.join(relative),
-        )?;
     }
     let workspace_metadata = config.workspace_mount.join(".cowshed");
     let job_artifacts = workspace_metadata.join("job");
@@ -1275,6 +1291,7 @@ mod tests {
                 read: vec![PathBuf::from("/opt/shared"), PathBuf::from("/opt/shared")],
                 write: vec![PathBuf::from("/opt/output")],
                 deny_write: Vec::new(),
+                deny: Vec::new(),
                 egress: vec![EgressGrant {
                     host: "example.com".into(),
                     ports: vec![443],
@@ -1505,6 +1522,7 @@ mod tests {
                 main_mount: main,
                 telemetry_root: Path::new("/private/cowshed/store/telemetry"),
                 grants: &grants,
+                repository_deny: &[],
                 git_worktree_repository: None,
                 workspace_mount: mount.to_path_buf(),
                 exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
@@ -1537,6 +1555,83 @@ mod tests {
         let profile = seatbelt_profile(&itself, SandboxProfileRole::ExecutedChild).unwrap();
         assert!(!profile.contains(main_deny));
         assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/Dev/widget\"))"));
+    }
+
+    /// A workspace-relative deny closes reads and writes beneath a path of the job's own mount:
+    /// the read+write deny (with its file-read-data twin) and the ancestor unlink denies follow
+    /// every mount allow, the same shape a write-only deny has.
+    #[test]
+    fn a_workspace_relative_deny_closes_reads_and_writes_after_every_mount_allow() {
+        let mount = "/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount";
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.grants.deny = vec![PathBuf::from(".runtime/secrets")];
+        config.grants.deny_write = vec![PathBuf::from(".git/hooks")];
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let target = format!("{mount}/.runtime/secrets");
+        let deny = profile
+            .find(&format!(
+                "(deny file-read* file-write* (literal \"{target}\") (subpath \"{target}\"))\n(deny file-read-data (literal \"{target}\") (subpath \"{target}\"))\n"
+            ))
+            .expect("read+write deny with its data twin");
+        for ancestor in [".runtime", ".runtime/secrets"] {
+            let unlink = profile
+                .find(&format!(
+                    "(deny file-write-unlink (literal \"{mount}/{ancestor}\"))"
+                ))
+                .unwrap_or_else(|| panic!("{ancestor} cannot be renamed away"));
+            assert!(unlink < deny);
+        }
+        for allow in [
+            format!("(allow file-read* (subpath \"{mount}\"))"),
+            format!("(allow file-write* (subpath \"{mount}\"))"),
+        ] {
+            assert!(profile.find(&allow).unwrap() < deny, "{allow} must precede");
+        }
+        // The write-only deny keeps its own, narrower shape.
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{mount}/.git/hooks\") (subpath \"{mount}/.git/hooks\"))"
+        )));
+        assert!(!profile.contains(&format!(
+            "(deny file-read* file-write* (literal \"{mount}/.git/hooks\")"
+        )));
+
+        for escaping in ["../main", "/etc", ""] {
+            config.grants.deny = vec![PathBuf::from(escaping)];
+            assert_eq!(
+                validate_sandbox_config(&config),
+                Err(SandboxError::InvalidPath {
+                    path: PathBuf::from(escaping),
+                    reason: "workspace deny must be relative without traversal",
+                })
+            );
+        }
+    }
+
+    /// Main's `[sandbox] deny` joins the workspace's own granted denies, as one sorted set.
+    #[test]
+    fn the_workspace_builder_unions_granted_and_repository_denies() {
+        let grants = crate::metadata::GrantSet {
+            port_block: Some(PortBlock::new(40_960, 16).unwrap()),
+            deny: vec![PathBuf::from("b"), PathBuf::from("a")],
+            ..crate::metadata::GrantSet::default()
+        };
+        let config = workspace_sandbox(WorkspaceSandbox {
+            home: Path::new("/Users/tester"),
+            mount_root: Path::new("/Users/tester/.cowshed/mnt"),
+            project_root: Path::new("/private/cowshed/store/projects/acme"),
+            main_mount: Path::new("/Users/tester/Dev/widget"),
+            telemetry_root: Path::new("/private/cowshed/store/telemetry"),
+            grants: &grants,
+            repository_deny: &[PathBuf::from("c"), PathBuf::from("a")],
+            git_worktree_repository: None,
+            workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
+            exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
+        })
+        .unwrap();
+        assert_eq!(
+            config.grants.deny,
+            [PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
     }
 
     #[test]

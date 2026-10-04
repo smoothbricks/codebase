@@ -71,6 +71,9 @@ pub struct CowshedConfig {
     substrate: Option<SubstrateConfig>,
     devenv: Option<DevenvConfig>,
     land: Option<LandConfig>,
+    /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
+    /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
+    sandbox_deny: Vec<PathBuf>,
 }
 
 impl CowshedConfig {
@@ -84,6 +87,10 @@ impl CowshedConfig {
 
     pub fn land(&self) -> Option<&LandConfig> {
         self.land.as_ref()
+    }
+
+    pub fn sandbox_deny(&self) -> &[PathBuf] {
+        &self.sandbox_deny
     }
 }
 
@@ -128,6 +135,7 @@ enum ConfigSection {
     Substrate,
     Devenv,
     Land,
+    Sandbox,
 }
 
 impl ConfigSection {
@@ -136,24 +144,27 @@ impl ConfigSection {
             Self::Substrate => "substrate",
             Self::Devenv => "devenv",
             Self::Land => "land",
+            Self::Sandbox => "sandbox",
         }
     }
 }
 
 /// Parse the complete repository-owned cowshed configuration.
 ///
-/// Only `[substrate]`, `[devenv]` and `[land]` are accepted. Keeping this parser narrow means a
-/// typo never silently disables storage selection, workspace toolchain evaluation, or main's warm
-/// step.
+/// Only `[substrate]`, `[devenv]`, `[land]` and `[sandbox]` are accepted. Keeping this parser
+/// narrow means a typo never silently disables storage selection, workspace toolchain
+/// evaluation, main's warm step, or a sandbox deny.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
     let mut saw_devenv = false;
     let mut saw_land = false;
+    let mut saw_sandbox = false;
     let mut kind = None;
     let mut pool = None;
     let mut devenv_dir = None;
     let mut warm = None;
+    let mut sandbox_deny = None;
 
     for (index, original) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -171,12 +182,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 "substrate" => ConfigSection::Substrate,
                 "devenv" => ConfigSection::Devenv,
                 "land" => ConfigSection::Land,
+                "sandbox" => ConfigSection::Sandbox,
                 other => return Err(ConfigError::UnknownSection(other.to_owned())),
             };
             let seen = match section {
                 ConfigSection::Substrate => &mut saw_substrate,
                 ConfigSection::Devenv => &mut saw_devenv,
                 ConfigSection::Land => &mut saw_land,
+                ConfigSection::Sandbox => &mut saw_sandbox,
             };
             if *seen {
                 return Err(ConfigError::DuplicateSection(section.name()));
@@ -212,6 +225,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             )?,
             (ConfigSection::Land, "warm") => {
                 set_once(&mut warm, parse_argv(value, line_number)?, section, "warm")?;
+            }
+            (ConfigSection::Sandbox, "deny") => {
+                set_once(
+                    &mut sandbox_deny,
+                    parse_sandbox_deny(value, line_number)?,
+                    section,
+                    "deny",
+                )?;
             }
             (_, other) => {
                 return Err(ConfigError::UnknownKey {
@@ -260,10 +281,19 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         None
     };
+    let sandbox_deny = if saw_sandbox {
+        sandbox_deny.ok_or(ConfigError::MissingKey {
+            section: "sandbox",
+            key: "deny",
+        })?
+    } else {
+        Vec::new()
+    };
     Ok(CowshedConfig {
         substrate,
         devenv,
         land,
+        sandbox_deny,
     })
 }
 
@@ -288,6 +318,28 @@ fn parse_argv(value: &str, line: usize) -> Result<Vec<String>, ConfigError> {
         Ok(argv) if !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()) => Ok(argv),
         _ => Err(ConfigError::ExpectedArgv { line }),
     }
+}
+
+/// `[sandbox] deny`: a TOML array of workspace-relative paths on one line, each a non-empty
+/// path of plain components — no root, no `.` or `..` — sorted and deduplicated.
+fn parse_sandbox_deny(value: &str, line: usize) -> Result<Vec<PathBuf>, ConfigError> {
+    let paths = serde_json::from_str::<Vec<String>>(value)
+        .map_err(|_| ConfigError::ExpectedPathArray { line })?;
+    let mut deny = Vec::with_capacity(paths.len());
+    for path in paths {
+        let relative = Path::new(&path);
+        if path.is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ConfigError::InvalidSandboxDeny(path));
+        }
+        deny.push(relative.components().collect::<PathBuf>());
+    }
+    deny.sort();
+    deny.dedup();
+    Ok(deny)
 }
 
 fn validate_devenv_dir(value: &str) -> Result<PathBuf, ConfigError> {
@@ -354,6 +406,12 @@ pub enum ConfigError {
     ExpectedQuotedString { section: &'static str, line: usize },
     #[error("[land] warm at line {line} must be a non-empty array of non-empty strings")]
     ExpectedArgv { line: usize },
+    #[error("[sandbox] deny at line {line} must be an array of quoted paths")]
+    ExpectedPathArray { line: usize },
+    #[error(
+        "[sandbox] deny entries must be non-empty workspace-relative paths without `.` or `..`: {0:?}"
+    )]
+    InvalidSandboxDeny(String),
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
     #[error("[devenv] dir must be a non-empty relative path without `..`: {0:?}")]

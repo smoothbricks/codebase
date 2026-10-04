@@ -363,6 +363,7 @@ pub struct GrantArgs {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub deny_write: Vec<PathBuf>,
+    pub deny: Vec<PathBuf>,
     /// Hosts this workspace may reach through the gateway. Network reach is a separate decision
     /// from filesystem reach, and separately auditable: the gateway logs every admission.
     pub egress: Vec<String>,
@@ -754,6 +755,7 @@ fn cli_command() -> ClapCommand {
                     path_values("read"),
                     path_values("write"),
                     path_values("deny-write"),
+                    path_values("deny"),
                 ])
                 .arg(append_value("egress"))
                 .arg(flag("opaque"))
@@ -2144,14 +2146,15 @@ const GRANT: CommandSpec = CommandSpec {
         "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
         "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
         "A path is recorded under its resolved spelling. A symlink planted beside the workspace so `../<name>` resolves (for example `<shed>/<org>/<project>/<name>` pointing at a sibling repository) is readable through the link exactly when its target is granted; grant the target, not the link.",
-        "`--project-wide` changes the project's standing policy instead: read paths, egress hosts and workspace-relative write denies every workspace — main, new, and forks — runs under. A workspace grant cannot remove a project deny. A write allow stays per workspace. With no other flags, prints the project's standing policy.",
+        "`--project-wide` changes the project's standing policy instead: read paths, egress hosts and workspace-relative write and read denies every workspace — main, new, and forks — runs under. A workspace grant cannot remove a project deny. A write allow stays per workspace. With no other flags, prints the project's standing policy.",
+        "`--deny` hides workspace-relative paths from every job: reads and writes beneath them fail with EPERM. The same denies can be declared durably in main's `.cowshed.toml` as `[sandbox] deny = [\"<relative-path>\", …]`; cowshed reads that section only from main's checkout, never from a workspace's copy, and adds it to every workspace's grants from its next supervisor launch.",
         "An egress host is intercepted by default: the gateway terminates its TLS under the workspace CA, audits each request, and can attach a credential the host holds. `--opaque` grants the hosts named in the same invocation as opaque tunnels instead, for a client that verifies the real certificate — a pinned client, or Go on macOS, whose platform verifier never trusts the workspace CA. A host holds one rule, so granting it again restates its mode.",
         "On macOS a workspace's port block starts at 64 ports: the gateway listener at `$COWSHED_PORT_BASE` and 63 service ports above it, and a sandboxed process can connect only to its own blocks. `--ports <N>` grows the block to hold at least N service ports, not counting the gateway port — `cowshed grant raven --ports 80` yields a 128-port block. A block never shrinks, and a count it already holds changes nothing. The block grows into a larger block that contains it when one is free, and otherwise moves to a free larger block; a block it moved from stays reserved to the workspace, and connectable by its jobs, until the workspace is removed. Growth needs an idle workspace: while any of its jobs is running the grant is refused at once rather than queued, so grant ports before launching services. The next exec gets the new `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` and the matching sandbox profile. The ports come from the host's finite reserved range, so a block that cannot be placed is refused. Linux has no port block — each workspace's private loopback already holds every port — and refuses `--ports`.",
     ],
     options: &[
         Opt {
             spelling: "--project-wide",
-            meaning: "change or print the project's standing policy; takes --read, --deny-write, --egress and --opaque",
+            meaning: "change or print the project's standing policy; takes --read, --deny-write, --deny, --egress and --opaque",
         },
         Opt {
             spelling: "--read <path...>",
@@ -2164,6 +2167,10 @@ const GRANT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--deny-write <relative-path...>",
             meaning: "deny writes at workspace-relative paths and beneath directories; project-wide policy applies to main and all workspaces",
+        },
+        Opt {
+            spelling: "--deny <relative-path...>",
+            meaning: "deny reads and writes at workspace-relative paths and beneath directories; project-wide policy applies to main and all workspaces",
         },
         Opt {
             spelling: "--egress <host>",
@@ -2235,6 +2242,10 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .unwrap_or_default(),
         deny_write: matches
             .get_many::<PathBuf>("deny-write")
+            .map(|paths| paths.cloned().collect())
+            .unwrap_or_default(),
+        deny: matches
+            .get_many::<PathBuf>("deny")
             .map(|paths| paths.cloned().collect())
             .unwrap_or_default(),
         egress,
@@ -2839,6 +2850,49 @@ mod tests {
         // Without a target the verb still asks for the workspace, as before.
         let missing = parse_args(["grant", "--read", "/opt/shared"]).expect_err("no target");
         assert!(missing.message.contains("grant requires a workspace"));
+    }
+
+    /// `--deny` takes workspace-relative paths for one workspace or the whole project, repeatably,
+    /// beside `--deny-write`; the two lists stay separate because they deny different things.
+    #[test]
+    fn grant_deny_takes_relative_paths_for_a_workspace_or_the_project() {
+        for (argv, target) in [
+            (
+                vec![
+                    "grant",
+                    "raven",
+                    "--deny",
+                    ".runtime",
+                    "secrets/vault",
+                    "--deny-write",
+                    ".git/hooks",
+                ],
+                GrantTarget::Workspace("raven".to_owned()),
+            ),
+            (
+                vec![
+                    "grant",
+                    "--project-wide",
+                    "--deny",
+                    ".runtime",
+                    "--deny",
+                    "secrets/vault",
+                    "--deny-write",
+                    ".git/hooks",
+                ],
+                GrantTarget::Project,
+            ),
+        ] {
+            let Command::Grant(grant) = parse_args(argv.clone()).expect("parses").command else {
+                panic!("expected grant")
+            };
+            assert_eq!(grant.target, target, "{argv:?}");
+            assert_eq!(
+                grant.deny,
+                [PathBuf::from(".runtime"), PathBuf::from("secrets/vault")]
+            );
+            assert_eq!(grant.deny_write, [PathBuf::from(".git/hooks")]);
+        }
     }
 
     /// `--opaque` is the mode of the hosts the same invocation grants, for the workspace or the

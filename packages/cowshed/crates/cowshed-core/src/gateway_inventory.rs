@@ -2215,6 +2215,7 @@ mod tests {
                 revision: 2,
                 read: vec![PathBuf::from("/opt/shared")],
                 deny_write: Vec::new(),
+                deny: Vec::new(),
                 egress: vec![crate::metadata::EgressRule {
                     host: "registry.example.test".to_owned(),
                     ports: Vec::new(),

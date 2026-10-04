@@ -2555,6 +2555,8 @@ pub struct GrantDelta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_write: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<EgressRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoRule>,
@@ -2577,7 +2579,7 @@ pub struct GrantDelta {
 }
 
 /// A change to the project's standing policy: read grants, egress grants and
-/// workspace-relative write denies. A write allow stays per-workspace (`GrantDelta`).
+/// workspace-relative denies. A write allow stays per-workspace (`GrantDelta`).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectGrantDelta {
@@ -2585,6 +2587,8 @@ pub struct ProjectGrantDelta {
     pub read: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_write: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<EgressRule>,
     #[serde(skip_serializing_if = "Option::is_none")]

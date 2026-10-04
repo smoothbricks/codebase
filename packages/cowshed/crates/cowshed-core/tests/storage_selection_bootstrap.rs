@@ -267,6 +267,48 @@ fn land_warm_is_one_non_empty_argv() {
     }
 }
 
+/// `[sandbox] deny` is a one-line array of workspace-relative paths, normalized, sorted and
+/// deduplicated; anything that could name a path outside the workspace is refused.
+#[test]
+fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
+    let config = parse_cowshed_config(
+        "# operator-owned denies\n[sandbox]\n# runtime secrets\ndeny = [\".runtime\", \"a/./b\", \".runtime\"] # trailing\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.sandbox_deny(),
+        [PathBuf::from(".runtime"), PathBuf::from("a/b")]
+    );
+    assert!(
+        parse_cowshed_config("[devenv]\ndir = \"x\"\n")
+            .unwrap()
+            .sandbox_deny()
+            .is_empty()
+    );
+    assert!(
+        parse_cowshed_config("[sandbox]\ndeny = []\n")
+            .unwrap()
+            .sandbox_deny()
+            .is_empty()
+    );
+
+    let invalid = [
+        ("[sandbox]\n", "missing [sandbox] key \"deny\""),
+        ("[sandbox]\ndeny = \".runtime\"\n", "array of quoted paths"),
+        ("[sandbox]\ndeny = [1]\n", "array of quoted paths"),
+        ("[sandbox]\ndeny = [\"\"]\n", "workspace-relative"),
+        ("[sandbox]\ndeny = [\"/etc\"]\n", "workspace-relative"),
+        ("[sandbox]\ndeny = [\"../main\"]\n", "workspace-relative"),
+        ("[sandbox]\ndeny = [\"a/../../b\"]\n", "workspace-relative"),
+        ("[sandbox]\ndeny = [\"a\"]\ndeny = [\"b\"]\n", "duplicated"),
+        ("[sandbox]\nread = [\"a\"]\n", "unknown [sandbox] key"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
 #[test]
 fn selection_matrix_uses_evidence_without_guessing() {
     let apfs = select_substrate(apfs_evidence(), None).unwrap();

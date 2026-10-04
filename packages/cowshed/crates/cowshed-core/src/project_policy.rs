@@ -28,8 +28,8 @@ pub struct ProjectPolicy {
 
 /// Policy every workspace of the project holds from its first supervisor launch.
 ///
-/// Reads, egress and write denies are standing decisions. A standing write allow would hand
-/// every workspace a shared writable tree outside its image; that stays per-workspace.
+/// Reads, egress and workspace-relative denies are standing decisions. A standing write allow
+/// would hand every workspace a shared writable tree outside its image; that stays per-workspace.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectGrants {
@@ -45,6 +45,9 @@ pub struct ProjectGrants {
     /// Workspace-relative paths forbidden to every job, including main's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_write: Vec<PathBuf>,
+    /// Workspace-relative paths no job may read or write, including main's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<PathBuf>,
 }
 
 impl ProjectPolicy {
@@ -68,7 +71,7 @@ impl ProjectPolicy {
 
 /// The grant snapshot a workspace runs under: its own grants plus the project's standing ones.
 ///
-/// Reads and workspace-relative write denies are sorted unions. Egress keeps a workspace
+/// Reads and workspace-relative denies are sorted unions. Egress keeps a workspace
 /// rule over the project's rule for the same host (its ports and mode). The revision is
 /// the sum of both revisions — each only ever grows, so the sum grows whenever either does.
 pub fn effective_grants(
@@ -88,6 +91,9 @@ pub fn effective_grants(
         .extend(project.deny_write.iter().cloned());
     effective.deny_write.sort();
     effective.deny_write.dedup();
+    effective.deny.extend(project.deny.iter().cloned());
+    effective.deny.sort();
+    effective.deny.dedup();
     for rule in &project.egress {
         if !workspace.egress.iter().any(|own| own.host == rule.host) {
             effective.egress.push(rule.clone());
@@ -119,6 +125,7 @@ mod tests {
             revision: 7,
             read: vec![PathBuf::from("/opt/b")],
             egress: vec![rule("git.example.test", &[443])],
+            deny: vec![PathBuf::from(".runtime")],
             ..GrantSet::default()
         };
         let project = ProjectGrants {
@@ -129,6 +136,7 @@ mod tests {
                 rule("registry.example.test", &[]),
             ],
             deny_write: Vec::new(),
+            deny: vec![PathBuf::from(".env"), PathBuf::from(".runtime")],
         };
 
         let effective = effective_grants(&workspace, &project).expect("revisions fit");
@@ -147,6 +155,10 @@ mod tests {
             ]
         );
         assert!(effective.write.is_empty());
+        assert_eq!(
+            effective.deny,
+            [PathBuf::from(".env"), PathBuf::from(".runtime")]
+        );
     }
 
     #[test]
@@ -216,6 +228,7 @@ mod tests {
             read: vec![PathBuf::from("/opt/shared")],
             egress: vec![rule("registry.example.test", &[])],
             deny_write: Vec::new(),
+            deny: vec![PathBuf::from(".runtime")],
         };
         policy.write(&path).unwrap();
         assert_eq!(ProjectPolicy::read(&path).unwrap(), policy);
@@ -228,7 +241,8 @@ mod tests {
                 "grants": {
                     "revision": 1,
                     "read": ["/opt/shared"],
-                    "egress": [{ "host": "registry.example.test" }]
+                    "egress": [{ "host": "registry.example.test" }],
+                    "deny": [".runtime"]
                 }
             })
         );

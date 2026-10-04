@@ -1173,6 +1173,7 @@ where
             let changed = !args.read.is_empty()
                 || !args.write.is_empty()
                 || !args.deny_write.is_empty()
+                || !args.deny.is_empty()
                 || !args.egress.is_empty()
                 || args.service_ports.is_some();
             let workspace = match args.target {
@@ -1184,6 +1185,7 @@ where
                         json,
                         args.read,
                         args.deny_write,
+                        args.deny,
                         egress_rules(&args.egress, args.egress_mode),
                     )
                     .await;
@@ -1200,6 +1202,7 @@ where
                             read: args.read,
                             write: args.write,
                             deny_write: args.deny_write,
+                            deny: args.deny,
                             egress,
                             service_ports: args.service_ports.map(NonZeroU16::get),
                             ..GrantDelta::default()
@@ -1234,11 +1237,12 @@ where
                 }
                 output
                     .guidance(&format!(
-                        "grants for {} now: {} read, {} write, {} denied writes, {} egress",
+                        "grants for {} now: {} read, {} write, {} denied writes, {} denied paths, {} egress",
                         workspace,
                         grants.read.len(),
                         grants.write.len(),
                         grants.deny_write.len(),
+                        grants.deny.len(),
                         grants.egress.len()
                     ))
                     .map_err(output_error)?;
@@ -2003,14 +2007,17 @@ async fn grant_project<S: CliService, W: Write, E: Write>(
     json: bool,
     read: Vec<PathBuf>,
     deny_write: Vec<PathBuf>,
+    deny: Vec<PathBuf>,
     egress: Vec<EgressRule>,
 ) -> Result<DispatchExit> {
-    let changed = !read.is_empty() || !deny_write.is_empty() || !egress.is_empty();
+    let changed =
+        !read.is_empty() || !deny_write.is_empty() || !deny.is_empty() || !egress.is_empty();
     let grants = if changed {
         service
             .grant_project(ProjectGrantDelta {
                 read,
                 deny_write,
+                deny,
                 egress,
                 expected_revision: None,
             })
@@ -2026,6 +2033,7 @@ async fn grant_project<S: CliService, W: Write, E: Write>(
             &GrantSet {
                 read: grants.read.clone(),
                 deny_write: grants.deny_write.clone(),
+                deny: grants.deny.clone(),
                 egress: grants.egress.clone(),
                 ..GrantSet::default()
             },
@@ -2034,9 +2042,10 @@ async fn grant_project<S: CliService, W: Write, E: Write>(
     if changed {
         output
             .guidance(&format!(
-                "project grants now: {} read, {} denied writes, {} egress (revision {})",
+                "project grants now: {} read, {} denied writes, {} denied paths, {} egress (revision {})",
                 grants.read.len(),
                 grants.deny_write.len(),
+                grants.deny.len(),
                 grants.egress.len(),
                 grants.revision
             ))
@@ -2065,6 +2074,7 @@ fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet)
         (b"read".as_slice(), &grants.read),
         (b"write".as_slice(), &grants.write),
         (b"deny-write".as_slice(), &grants.deny_write),
+        (b"deny".as_slice(), &grants.deny),
     ] {
         for path in paths {
             output.bare(kind).map_err(output_error)?;

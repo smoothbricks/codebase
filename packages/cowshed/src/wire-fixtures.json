@@ -109,6 +109,7 @@
       "write": []
     },
     "open": {
+      "deny": [".runtime"],
       "denyWrite": [".git/hooks", ".git/config"],
       "egress": [
         {

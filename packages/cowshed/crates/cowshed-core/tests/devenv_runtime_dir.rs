@@ -1465,7 +1465,12 @@ const timer = setInterval(async () => {
 }
 
 /// A workspace sandbox built by the production builder, [`workspace_sandbox`], for a mount the
-/// fixture prepares the way `cowshed new` leaves one: private bin and token in place.
+/// fixture prepares the way `cowshed new` leaves one: private bin and token in place. `deny` is
+/// the workspace's granted read+write deny, `repository_deny` main's `[sandbox] deny`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one fixture input per builder input"
+)]
 fn production_workspace(
     root: &Path,
     home: &Path,
@@ -1473,6 +1478,8 @@ fn production_workspace(
     main: &Path,
     mount: PathBuf,
     port_base: u16,
+    deny: Vec<PathBuf>,
+    repository_deny: &[PathBuf],
 ) -> SandboxConfig {
     std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
     std::fs::write(
@@ -1490,8 +1497,10 @@ fn production_workspace(
         telemetry_root: &root.join("telemetry"),
         grants: &GrantSet {
             port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
+            deny,
             ..GrantSet::default()
         },
+        repository_deny,
         git_worktree_repository: None,
         workspace_mount: mount,
         exec_temp_dir,
@@ -1545,8 +1554,26 @@ async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_all
         std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture dir");
         std::fs::write(path, contents).expect("fixture file");
     }
-    let main_sandbox = production_workspace(&root, &home, &mount_root, &main, main.clone(), 42_496);
-    let sandbox = production_workspace(&root, &home, &mount_root, &main, raven.clone(), 42_512);
+    let main_sandbox = production_workspace(
+        &root,
+        &home,
+        &mount_root,
+        &main,
+        main.clone(),
+        42_496,
+        Vec::new(),
+        &[],
+    );
+    let sandbox = production_workspace(
+        &root,
+        &home,
+        &mount_root,
+        &main,
+        raven.clone(),
+        42_512,
+        Vec::new(),
+        &[],
+    );
     let own = raven.join("own.txt");
     std::fs::write(&own, "own-sentinel").expect("own fixture");
     let main_token = main.join(WORKSPACE_TOKEN_PATH);
@@ -1613,6 +1640,8 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
         &main,
         mount_root.join("acme/widget/raven"),
         42_528,
+        Vec::new(),
+        &[],
     );
     install_real_tool(&sandbox, "direnv");
     let mount = &sandbox.workspace_mount;
@@ -1694,5 +1723,82 @@ for link in "$@"; do /bin/realpath "$link"; done"#
         (ExitStatus::Exited { code: 0 }, expected),
         "stderr: {}",
         String::from_utf8_lossy(&stderr)
+    );
+}
+
+/// A workspace-relative deny hides a path inside the job's own mount: reads and writes beneath
+/// it fail, and the job can neither rename the path away nor replace it. The deny arrives both
+/// ways it can — a `cowshed grant --deny` and main's `[sandbox] deny` — and the rest of the
+/// mount stays readable.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_workspace_relative_deny_hides_reads_and_writes() {
+    let root = scratch("relative-deny");
+    let home = root.join("home");
+    let mount_root = home.join("Dev/.cowshed");
+    let main = root.join("checkouts/widget");
+    let raven = mount_root.join("acme/widget/raven");
+    let sandbox = production_workspace(
+        &root,
+        &home,
+        &mount_root,
+        &main,
+        raven.clone(),
+        42_544,
+        vec![PathBuf::from(".runtime")],
+        &[PathBuf::from("secrets/vault")],
+    );
+    let granted = raven.join(".runtime/token");
+    let declared = raven.join("secrets/vault/key");
+    let open = raven.join("secrets/open.txt");
+    for (path, contents) in [
+        (&granted, "runtime-sentinel"),
+        (&declared, "vault-sentinel"),
+        (&open, "open-sentinel"),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture dir");
+        std::fs::write(path, contents).expect("fixture file");
+    }
+
+    let reads = read_outcomes(&sandbox, &[&granted, &declared, &open]).await;
+    // Each attempt runs on its own and names itself only if it succeeded.
+    let (write_exit, succeeded, _) = run_in_sandbox(
+        &sandbox,
+        &raven,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"(echo planted > .runtime/planted) 2>/dev/null && echo write
+mv .runtime moved 2>/dev/null && echo rename-granted
+mv secrets/vault vault-moved 2>/dev/null && echo rename-declared
+exit 0"#
+                .into(),
+        ],
+    )
+    .await;
+    let planted = raven.join(".runtime/planted").exists();
+    let runtime_kept = granted.is_file();
+    let vault_kept = declared.is_file();
+    std::fs::remove_dir_all(&root).expect("remove relative-deny fixture");
+
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(_, outcome)| outcome.ends_with("Operation not permitted"))
+            .collect::<Vec<_>>(),
+        [true, true, false],
+        "{reads:#?}"
+    );
+    assert_eq!(reads[2].1, "read \"open-sentinel\"");
+    assert_eq!(write_exit, ExitStatus::Exited { code: 0 });
+    assert_eq!(
+        String::from_utf8_lossy(&succeeded),
+        "",
+        "no write, create or rename may succeed beneath a denied path"
+    );
+    assert!(!planted, "nothing may be created beneath a denied path");
+    assert!(
+        runtime_kept && vault_kept,
+        "denied paths stay where they are"
     );
 }

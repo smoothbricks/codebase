@@ -335,6 +335,7 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   "read": ["<project-root>/shared-fixtures"],
   "write": ["<project-root>/artifacts/raven"],
   "denyWrite": [".git/hooks", ".git/config"],
+  "deny": [".runtime"],
   "egress": [
     { "host": "registry.npmjs.org" },
     { "host": "api.example.com", "mode": "intercept" },
@@ -348,8 +349,8 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 - Paths are canonicalized on write. A read or write grant that intersects the effective deny union is refused (exit 6 /
   `CowshedError::SandboxDenied`); this check is repeated when loading a grant snapshot so a newly added trusted or
   repository deny narrows old grants without rewriting them.
-- `denyWrite` is workspace-relative. It is kept in the controller-owned grant snapshot, and a project policy can add
-  denies to every workspace without giving workspace jobs authority over that policy.
+- `denyWrite` and `deny` are workspace-relative. They are kept in the controller-owned grant snapshot, and a project
+  policy can add denies to every workspace without giving workspace jobs authority over that policy.
 - `workspaceIncarnation` is public detached identity, not authority or a credential. Create/fork/restore mint it as
   specified in 01/02; job records retain the incarnation that produced them so numeric job IDs remain unambiguous across
   copied or discarded timelines.
@@ -409,9 +410,9 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 
 ### Project-standing grants
 
-A project's standing policy combines read paths, egress hosts and workspace-relative write denies for every workspace —
-main, new workspaces and forks. It lives in the trusted project policy, beside its checkpoint quotas; a workspace grant
-delta cannot remove a project deny.
+A project's standing policy combines read paths, egress hosts and workspace-relative write and read+write denies for
+every workspace — main, new workspaces and forks. It lives in the trusted project policy, beside its checkpoint quotas;
+a workspace grant delta cannot remove a project deny.
 
 ```json
 {
@@ -420,20 +421,29 @@ delta cannot remove a project deny.
     "revision": 3,
     "read": ["/Users/alice/Dev/acme/shared-fixtures"],
     "egress": [{ "host": "index.crates.io" }, { "host": "github.com" }],
-    "denyWrite": [".git/hooks", ".git/config"]
+    "denyWrite": [".git/hooks", ".git/config"],
+    "deny": [".runtime"]
   }
 }
 ```
 
-- **Reads, egress and write denies only.** A standing write allow would hand every workspace, forks included, one shared
+- **Reads, egress and denies only.** A standing write allow would hand every workspace, forks included, one shared
   writable tree outside its image; a write allow stays per workspace.
-- **Workspace-relative denies.** `denyWrite` paths are checked for traversal and emitted after the workspace write allow
-  as exact-name and descendant `file-write*` denies. Link creation remains denied; attempts to rename protected
-  ancestors are denied by the parent's unlink operation. Existing workspaces use the same effective project policy as
-  new ones.
-- **Composition.** Reads and write denies are sorted unions of workspace and project policy; egress is workspace rules
-  plus every standing rule for a host the workspace does not name. Project denies cannot be removed by a workspace
-  `grant` or `revoke` delta. A fork receives the standing policy, never another workspace's own grants.
+- **Workspace-relative denies.** `denyWrite` and `deny` paths are checked for traversal and emitted after the workspace
+  write allow as exact-name and descendant denies — `file-write*` for `denyWrite`, `file-read* file-write*` (with its
+  `file-read-data` twin) for `deny`. Link creation remains denied; attempts to rename protected ancestors are denied by
+  the parent's unlink operation. Existing workspaces use the same effective project policy as new ones.
+- **Repository-declared read+write denies.** Main's `.cowshed.toml` may declare `[sandbox] deny = ["<relative>", …]`
+  (one-line array of non-empty workspace-relative paths without `.`/`..`; comments allowed). The supervisor reads it
+  from main's checkout only — the operator's — never from a workspace's copy, which a job can edit; an unreadable or
+  invalid file refuses the supervisor launch rather than run without the deny. Its paths join the effective `deny` set
+  at the next supervisor launch.
+- **Composition.** Reads and both deny lists are sorted unions of workspace and project policy (plus main's
+  `[sandbox] deny`); egress is workspace rules plus every standing rule for a host the workspace does not name. Project
+  denies cannot be removed by a workspace `grant` or `revoke` delta. A fork receives the standing policy, never another
+  workspace's own grants.
+- **Linux.** Neither workspace-relative deny has a Linux enforcement yet: `denyWrite` is Seatbelt-only today and `deny`
+  follows it exactly; both land together with the Linux workspace filesystem ruleset.
 - **Effective revision.** The standing grants carry their own `revision`, advanced by every effective change and never
   reset. The revision a workspace's supervisor launches under, its jobs record, and its gateway session is installed at
   is the workspace's own revision plus the project's: each only grows, so the sum grows whenever either does, and a
@@ -475,8 +485,8 @@ Grant files are small, but they are the authority record — mutations are speci
 ### Widening and narrowing
 
 ```
-cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--egress <host>]… [--ports <N>]
-cowshed grant  --project-wide [--read <path>]… [--deny-write <relative-path>]… [--egress <host>]…
+cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]… [--ports <N>]
+cowshed grant  --project-wide [--read <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]…
 ```
 
 Rust API: `Workspace::grant(delta)` / `Workspace::revoke(delta)`. The coordinator starts workers closed and opens paths

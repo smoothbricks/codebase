@@ -706,7 +706,7 @@ next: cowshed attach raven
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--egress <host>] [--opaque] [--ports <N>]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--deny <relative-path...>] [--egress <host>] [--opaque] [--ports <N>]`
 
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
 toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
@@ -735,6 +735,10 @@ next: cowshed exec raven -- <retry your command>
   `cowshed grant --project-wide --deny-write .git/hooks .git/config` puts the same restriction on main and every current
   and future workspace. Workspace grants cannot remove a project deny. Set this from the trusted host, not an
   in-workspace job.
+- `--deny` hides a path relative to the workspace root and everything below it: reads and writes there fail with EPERM,
+  with the same link and rename protection as `--deny-write`. `--project-wide --deny .runtime` applies it to main and
+  every workspace. Main's `.cowshed.toml` can declare it durably as `[sandbox] deny = [".runtime"]`; cowshed reads that
+  section only from main's checkout, never from a workspace's copy.
 - `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
   80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway records
   every admission in its Arrow audit telemetry ([telemetry.md](telemetry.md)). Holding a credential for a registry does

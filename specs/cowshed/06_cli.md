@@ -240,11 +240,11 @@ takes no flag for it. A bare `cowshed grant <ws>` (no flags) prints the current 
 rows.
 
 `cowshed grant --project-wide` addresses the project's standing policy: read paths, egress hosts, and workspace-relative
-`--deny-write` paths every workspace (including main) runs under. The policy lives outside the workspaces
+`--deny-write` and `--deny` paths every workspace (including main) runs under. The policy lives outside the workspaces
 (04_sandbox.md, "Project-standing grants"), so a workspace grant cannot remove a project deny. The project comes from
 ordinary discovery — the cwd, or `--project <git-root>`. `--write` and a `<ws>` alongside `--project-wide` are usage
 errors; a write allow remains a per-workspace decision. A bare `cowshed grant --project-wide` prints the standing set,
-and `--json` includes `{ revision, read, denyWrite, egress }`.
+and `--json` includes `{ revision, read, denyWrite, deny, egress }`.
 
 `--sim <verb>` grants personal-session simulator broker verbs (`openurl`, `install` — 04/05/14); dev-side headless
 simulators need the `--preset simulator` profile class instead (CoreSimulator IPC), not a `--sim` grant. `install` is
