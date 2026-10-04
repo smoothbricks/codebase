@@ -1591,7 +1591,11 @@ where
         Command::Land(args) => {
             let reconcile_gateway = args.retire;
             let options = LandOptions {
-                target_branch: args.target.map(os_branch).transpose()?,
+                target_branch: args
+                    .target
+                    .map(os_branch)
+                    .transpose()?
+                    .map(|branch| branch.as_str().to_owned()),
                 check: (!args.checks.is_empty())
                     .then(|| {
                         args.checks
@@ -1746,10 +1750,8 @@ fn os_revision(value: std::ffi::OsString) -> Result<RevisionTarget> {
     })
 }
 
-fn os_branch(value: std::ffi::OsString) -> Result<String> {
-    let value = os_utf8(value)?;
-    BranchName::new(value)
-        .map(|branch| branch.as_str().to_owned())
+fn os_branch(value: std::ffi::OsString) -> Result<BranchName> {
+    BranchName::new(os_utf8(value)?)
         .map_err(|error| usage(error.to_string(), "use a valid local branch name"))
 }
 

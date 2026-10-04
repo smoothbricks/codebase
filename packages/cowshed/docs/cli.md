@@ -873,9 +873,10 @@ git setup.
 
 ### `cowshed push <name> [--branch <b>]`
 
-Delivers the workspace branch to main's repository. Under the hood this is a _host-side fetch from the workspace mount_
-— the trusted side runs git, so nothing inside the workspace (hooks, `.git/config`) ever executes outside the sandbox.
-Never touches main's checked-out branch.
+Preserves the workspace branch (`cowshed/<name>`, or `--branch <b>`) in main's repository as
+`refs/cowshed/<name>/heads/<branch>`. Under the hood this is a _host-side fetch from the workspace mount_ — the trusted
+side runs git in main's repository and reads the workspace by path, so nothing inside the workspace (hooks,
+`.git/config`, its remotes) ever executes outside the sandbox. Never touches main's checked-out branch.
 
 ```
 $ cowshed push raven

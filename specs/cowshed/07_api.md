@@ -528,7 +528,7 @@ pub struct CheckpointOptions {
 pub enum ExpectedRefHead { Missing, Oid(GitOid) }
 
 pub struct PushOptions {
-    pub branch: Option<String>,
+    pub branch: Option<BranchName>, // the workspace's local source branch; `cowshed/<ws>` when absent
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_destination_head: Option<ExpectedRefHead>,
@@ -542,12 +542,15 @@ pub struct PushReport {
 ```
 
 The destination is the non-checked-out `refs/cowshed/<ws>/heads/<branch>` ref in the main workspace's standalone
-repository/object store. A push fetches and installs the exact `source_head`; it never checks out or advances the Git
-`main` branch and never changes the main workspace index or working tree. Each supplied expectation is checked as one
-atomic destination-ref update. An incarnation, source-head, or destination-head mismatch is `CowshedError::Conflict`,
-leaves the destination unchanged, and does not retire the source workspace. `Missing` lets a caller assert first
-publication rather than accepting an overwrite. After success, the source may be retired only when all commits that must
-survive are reachable from the returned durable ref. Remote publication and workflow policy are not part of this API.
+repository/object store, where `<branch>` is the source branch. A push fetches and installs the exact `source_head` (the
+fetched source branch tip) through host-side Git in the main repository, reading the workspace mount by path: it needs
+no remote on either side and never runs the workspace's Git configuration or hooks. It never checks out or advances the
+Git `main` branch and never changes the main workspace index or working tree. Each supplied expectation is checked as
+one atomic destination-ref update. An incarnation, source-head, or destination-head mismatch is
+`CowshedError::Conflict`, leaves the destination unchanged, and does not retire the source workspace. `Missing` lets a
+caller assert first publication rather than accepting an overwrite. After success, the source may be retired only when
+all commits that must survive are reachable from the returned durable ref. Remote publication and workflow policy are
+not part of this API.
 
 `WorkspaceHandle::checkpoint` is intentionally available to a worker for retry points, but it is not unbounded storage
 authority. `Coordinator::set_checkpoint_quota(ws, quota)` owns a cap for exactly that workspace. Before the supervisor

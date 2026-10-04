@@ -2674,8 +2674,9 @@ impl Default for LandOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PushOptions {
+    /// The workspace's local branch to preserve; `cowshed/<ws>` when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    pub branch: Option<BranchName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     #[serde(skip_serializing_if = "Option::is_none")]

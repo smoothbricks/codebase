@@ -561,6 +561,107 @@ async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_gran
     drop(competing_listener);
 }
 
+/// `push` preserves a workspace minted with today's remote layout — one remote, `main` — in
+/// main's repository. Push once spoke to a remote named `host`, which the layout no longer
+/// creates, so every push of a current workspace failed before it moved anything.
+#[tokio::test]
+async fn real_apfs_push_preserves_a_current_workspace_branch_in_mains_repository() {
+    let mut fixture = Fixture::new();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    // `new` refuses without a gateway to install the workspace's session on; push needs none.
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("install main gateway session");
+    let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
+    assert_eq!(
+        created.unwrap_or_else(|error| panic!(
+            "create real APFS topic: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let topic = service.path("topic", false).await.expect("mounted topic");
+    assert_eq!(
+        git_stdout(&topic.mount, &["remote"]),
+        "main",
+        "the current layout gives a workspace exactly one remote"
+    );
+    fs::write(topic.mount.join("feature.txt"), b"feature\n").expect("topic change");
+    git(&topic.mount, &["add", "feature.txt"]);
+    git(&topic.mount, &["commit", "-q", "-m", "feature"]);
+    let head = git_stdout(&topic.mount, &["rev-parse", "HEAD"]);
+    let main_before = git_stdout(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+
+    let (pushed, stdout, stderr) = run(&mut service, ["push", "topic"]).await;
+    assert_eq!(
+        pushed.unwrap_or_else(|error| panic!(
+            "push through real service: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let preserved = "refs/cowshed/topic/heads/cowshed/topic";
+    assert_eq!(
+        String::from_utf8(stdout).expect("push answers UTF-8"),
+        format!("{preserved}\t{head}\n")
+    );
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", preserved]),
+        head
+    );
+    assert_eq!(
+        git_stdout(
+            &fixture.checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/cowshed/topic"]
+        ),
+        preserved,
+        "the preservation ref is the only ref push leaves behind"
+    );
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        main_before,
+        "push never advances main's branch"
+    );
+    assert!(
+        !fixture.checkout.join("feature.txt").exists(),
+        "push never touches main's working tree"
+    );
+
+    // The destination expectation is a compare-and-swap: a preservation ref that already exists
+    // refuses `missing` and stays exactly where it was.
+    fs::write(topic.mount.join("feature.txt"), b"feature, revised\n").expect("topic revision");
+    git(&topic.mount, &["commit", "-q", "-a", "-m", "revision"]);
+    let (refused, stdout, _) = run(
+        &mut service,
+        ["push", "topic", "--expected-destination-head", "missing"],
+    )
+    .await;
+    assert_eq!(
+        refused
+            .expect_err("an existing preservation ref is not missing")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert!(stdout.is_empty(), "a refusal has no machine answer");
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", preserved]),
+        head
+    );
+    assert_eq!(
+        git_stdout(
+            &fixture.checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/cowshed/topic"]
+        ),
+        preserved,
+        "a refused push leaves no staging ref behind"
+    );
+    service.shutdown().await.expect("shutdown runtime");
+    fixture.stop_gateway().await;
+}
+
 #[tokio::test]
 async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_forwards() {
     let started = std::time::Instant::now();

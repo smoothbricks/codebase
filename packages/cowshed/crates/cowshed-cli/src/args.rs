@@ -2617,19 +2617,19 @@ const PUSH: CommandSpec = CommandSpec {
     trailing: "",
     summary: "preserve a workspace ref",
     about: &[
-        "Delivers the workspace branch into main's repository. Under the hood it is a host-side fetch from the workspace mount, so nothing inside the sandbox — hooks, `.git/config` — ever runs outside it. Naming no workspace pushes the one you are standing in.",
+        "Preserves a workspace branch in main's repository as `refs/cowshed/<ws>/heads/<branch>`, without touching main's checked-out branch, index, or working tree. Under the hood it is a host-side fetch from the workspace mount, so nothing inside the sandbox — hooks, `.git/config`, its remotes — ever runs outside it. Naming no workspace pushes the one you are standing in.",
         "The `--expected-*` preconditions are for a coordinator driving several workspaces at once: each is checked before anything moves, so a stale plan is refused rather than applied to a workspace that changed underneath it.",
     ],
     options: &[
         Opt {
             spelling: "--branch <name>",
-            meaning: "destination branch in main's repository instead of the workspace's own",
+            meaning: "workspace branch to preserve instead of `cowshed/<ws>`",
         },
         EXPECTED_WORKSPACE_INCARNATION,
         EXPECTED_SOURCE_HEAD,
         Opt {
             spelling: "--expected-destination-head <oid|missing>",
-            meaning: "refuse unless the destination branch is still this commit, or `missing` for one that must not exist yet",
+            meaning: "refuse unless the preservation ref is still this commit, or `missing` for one that must not exist yet",
         },
     ],
 };

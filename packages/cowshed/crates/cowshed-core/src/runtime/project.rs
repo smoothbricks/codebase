@@ -9797,32 +9797,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &expected_incarnation)?;
-        let root = current_snapshot_mount(self, &current)?;
-        let source_head = git_oid(&root).await?;
-        if options
-            .expected_source_head
-            .as_ref()
-            .is_some_and(|expected| expected != &source_head)
-        {
-            return Err(CowshedError::conflict(
-                "workspace source head is stale",
-                "refresh the workspace revision and retry push",
-            ));
-        }
-        let branch = options.branch.unwrap_or_else(|| workspace.to_string());
-        let destination_ref = format!("refs/heads/{branch}");
-        let previous_destination_head = git_remote_ref_oid(&root, "host", &destination_ref).await?;
-        require_expected_ref(
+        let source_mount = current_snapshot_mount(self, &current)?;
+        let source_branch = match options.branch {
+            Some(branch) => branch,
+            None => crate::api::dto::BranchName::new(format!("cowshed/{workspace}"))
+                .map_err(|error| CowshedError::internal(error.to_string()))?,
+        };
+        preserve_workspace_branch(
+            &self.descriptor.git_root,
+            &source_mount,
+            &workspace,
+            &source_branch,
+            options.expected_source_head.as_ref(),
             options.expected_destination_head.as_ref(),
-            previous_destination_head.as_ref(),
-            "push destination",
-        )?;
-        run_git(&root, ["push", "host", &format!("HEAD:{destination_ref}")]).await?;
-        Ok(PushReport {
-            source_head,
-            destination_ref,
-            previous_destination_head,
-        })
+        )
+        .await
     }
 
     async fn repo_mirror(&mut self, workspace: WorkspaceName, url: Url) -> Result<MirrorInfo> {
@@ -12374,6 +12363,129 @@ async fn deliver_into(
     run_git(target_root, ["merge", "--ff-only", source_head.as_str()]).await
 }
 
+/// Preserve the workspace branch `source_branch` in main's repository at `main_root`, as
+/// `refs/cowshed/<workspace>/heads/<source_branch>`.
+///
+/// Pull-based like every other direction cowshed moves work: git runs in main's repository and
+/// only reads the workspace mount, so nothing the workspace configured — its remotes, its hooks —
+/// takes part, and no remote name has to exist on either side. The fetch lands in a staging ref,
+/// so the destination only ever moves to the exact object the caller's expectations were checked
+/// against, in one compare-and-swap `update-ref`. The staging ref is removed on every path.
+#[cfg(target_os = "macos")]
+async fn preserve_workspace_branch(
+    main_root: &Path,
+    source_mount: &Path,
+    workspace: &WorkspaceName,
+    source_branch: &crate::api::dto::BranchName,
+    expected_source_head: Option<&GitOid>,
+    expected_destination_head: Option<&crate::api::dto::ExpectedRefHead>,
+) -> Result<PushReport> {
+    let branch = source_branch.as_str();
+    let source_ref = format!("refs/heads/{branch}");
+    if git_optional_ref_oid(source_mount, &source_ref)
+        .await?
+        .is_none()
+    {
+        return Err(CowshedError::conflict(
+            format!("workspace {workspace} has no branch {branch} to push"),
+            format!(
+                "commit on {branch} in the workspace, or name the branch to preserve: cowshed push {workspace} --branch <name>"
+            ),
+        ));
+    }
+    let destination_ref = format!("refs/cowshed/{workspace}/heads/{branch}");
+    let staging_ref = format!(
+        "refs/cowshed/{workspace}/staging/{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    run_git_with_read(
+        main_root,
+        source_mount,
+        [
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            source_mount
+                .to_str()
+                .ok_or_else(|| CowshedError::internal("workspace mount path is not valid UTF-8"))?,
+            &format!("+{source_ref}:{staging_ref}"),
+        ],
+    )
+    .await?;
+    let installed = install_preserved(
+        main_root,
+        &staging_ref,
+        destination_ref,
+        expected_source_head,
+        expected_destination_head,
+    )
+    .await;
+    let unstaged = run_git(main_root, ["update-ref", "-d", &staging_ref]).await;
+    match (installed, unstaged) {
+        (installed, Ok(())) => installed,
+        (installed, Err(leak)) => Err(CowshedError::integrity(
+            format!(
+                "{}; the staging ref {staging_ref} in {} remains: {}",
+                match installed {
+                    Ok(report) => format!(
+                        "preserved {} at {}",
+                        report.destination_ref,
+                        report.source_head.as_str()
+                    ),
+                    Err(error) => error.message,
+                },
+                main_root.display(),
+                leak.message
+            ),
+            format!("git -C {} update-ref -d {staging_ref}", main_root.display()),
+        )),
+    }
+}
+
+/// Move `destination_ref` to what `staging_ref` holds, refusing any expectation that moved.
+#[cfg(target_os = "macos")]
+async fn install_preserved(
+    main_root: &Path,
+    staging_ref: &str,
+    destination_ref: String,
+    expected_source_head: Option<&GitOid>,
+    expected_destination_head: Option<&crate::api::dto::ExpectedRefHead>,
+) -> Result<PushReport> {
+    let source_head = git_revision_oid(main_root, staging_ref).await?;
+    if expected_source_head.is_some_and(|expected| expected != &source_head) {
+        return Err(CowshedError::conflict(
+            "workspace source head is stale",
+            "refresh the workspace revision and retry push",
+        ));
+    }
+    let previous_destination_head = git_optional_ref_oid(main_root, &destination_ref).await?;
+    require_expected_ref(
+        expected_destination_head,
+        previous_destination_head.as_ref(),
+        "push destination",
+    )?;
+    // The old value makes the install a compare-and-swap under git's ref lock: a destination that
+    // moved after it was read refuses rather than being overwritten. Empty means "must not exist".
+    let previous = previous_destination_head
+        .as_ref()
+        .map_or("", GitOid::as_str);
+    run_git(
+        main_root,
+        [
+            "update-ref",
+            &destination_ref,
+            source_head.as_str(),
+            previous,
+        ],
+    )
+    .await?;
+    Ok(PushReport {
+        source_head,
+        destination_ref,
+        previous_destination_head,
+    })
+}
+
 /// Bring the branch a lane base has checked out into the unit at `unit_root`, as
 /// `refs/cowshed/targets/<target>/<branch>`, and answer that ref: what the unit rebases onto.
 ///
@@ -12632,24 +12744,6 @@ async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<Git
     GitOid::new(value.trim_end())
         .map(Some)
         .map_err(native_integrity_error)
-}
-
-#[cfg(target_os = "macos")]
-async fn git_remote_ref_oid(root: &Path, remote: &str, reference: &str) -> Result<Option<GitOid>> {
-    let output = invoke_git(root, &["ls-remote", "--refs", remote, reference]).await?;
-    require_git_success("resolve remote git reference", &output)?;
-    if output.stdout.is_empty() {
-        return Ok(None);
-    }
-    let value = String::from_utf8(output.stdout)
-        .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git remote"))?;
-    let oid = value.split_whitespace().next().ok_or_else(|| {
-        CowshedError::integrity(
-            "remote reference response is empty",
-            "repair the git remote",
-        )
-    })?;
-    GitOid::new(oid).map(Some).map_err(native_integrity_error)
 }
 
 #[cfg(target_os = "macos")]
