@@ -28,15 +28,15 @@ function parseArguments(args: readonly string[]): { manifest: string; options: C
 
 const parsed = parseArguments(process.argv.slice(2));
 if (parsed === undefined) {
-  process.stderr.write('usage: smoo-nx-cargo-hash [--include-workspace] [--closure <directory>] [Cargo.toml]\n');
+  process.stdout.write('cargo-input-invalid-arguments\n');
   process.exit(2);
 }
 try {
   process.stdout.write(`${await hashCargoPathInputs(resolve(parsed.manifest), process.cwd(), parsed.options)}\n`);
-} catch (error) {
-  process.stderr.write(`smoo-nx-cargo-hash: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.stderr.write(
-    'Restore the declared Cargo path dependencies and locked offline dependency cache, then rerun the Nx target.\n',
-  );
+} catch {
+  // Nx hashes stderr even when a runtime input exits nonzero. Only a fixed
+  // sentinel belongs in this input; the Cargo producer reports the actual
+  // missing dependency or invalid manifest when it runs.
+  process.stdout.write('cargo-input-unavailable\n');
   process.exitCode = 1;
 }

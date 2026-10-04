@@ -100,6 +100,50 @@ it('the runtime input is byte-identical under cargo lock contention: nothing on 
   }
 });
 
+it('failed runtime inputs have the same fixed key at different checkout paths', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-refusal-'));
+  try {
+    const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
+    for (const directory of ['first', 'second']) {
+      const workspace = join(root, directory);
+      await mkdir(workspace);
+      const child = Bun.spawn(['node', bin, 'Cargo.toml'], {
+        cwd: workspace,
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect({ exitCode, stdout, stderr }).toEqual({
+        exitCode: 1,
+        stdout: 'cargo-input-unavailable\n',
+        stderr: '',
+      });
+      // The fixed input is not a verdict: the real producer must still refuse
+      // the missing manifest with Cargo's operational cause.
+      const producer = Bun.spawn(['cargo', 'build', '--locked', '--offline'], {
+        cwd: workspace,
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [producerCode, producerError] = await Promise.all([
+        producer.exited,
+        new Response(producer.stderr).text(),
+        new Response(producer.stdout).text(),
+      ]);
+      expect(producerCode).not.toBe(0);
+      expect(producerError).toContain('Cargo.toml');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function workspaceCargoFixture(root: string) {
   const workspace = join(root, 'workspace');
   const manifest = join(workspace, 'Cargo.toml');
@@ -204,7 +248,8 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
     ]) {
       const refused = await run(args);
       expect(refused.exitCode, refused.stderr).toBe(2);
-      expect(refused.stdout).toBe('');
+      expect(refused.stdout).toBe('cargo-input-invalid-arguments\n');
+      expect(refused.stderr).toBe('');
     }
   } finally {
     await rm(root, { recursive: true, force: true });
