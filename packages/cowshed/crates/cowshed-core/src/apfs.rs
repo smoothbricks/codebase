@@ -806,6 +806,20 @@ impl AttachedImage {
     }
 }
 
+/// The slowest an accepted `hdiutil detach` normally takes: measured 35–500ms on idle and
+/// loaded developer hosts alike. A slower one keeps hdiutil's account of what it went through.
+const SLOW_DETACH: Duration = Duration::from_secs(1);
+
+/// A child's diagnostic output as one trace line: lines joined with ` | `, blank lines dropped.
+fn one_line(output: &[u8]) -> String {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// The exact image mapping may be a just-created whole device or a formatted APFS attachment.
 pub(crate) enum RecoveredImageAttachment {
     Unformatted {
@@ -1716,15 +1730,38 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
+    /// One `hdiutil detach -verbose`. hdiutil's verbose account is the only record of what an
+    /// eject went through, so it is kept as an attribute of the detach step whenever the eject
+    /// was refused (`dissent=`, DiskArbitration's reason) or slower than the normal floor
+    /// (`waited=`, at least [`SLOW_DETACH`]); a fast, accepted eject adds nothing to the trace.
     fn detach_once(&self, target: &OsStr, force: bool) -> Result<(), ApfsError> {
-        let mut args = Vec::with_capacity(2 + usize::from(force));
+        let mut args = Vec::with_capacity(3 + usize::from(force));
         args.push(OsString::from("detach"));
         if force {
             args.push(OsString::from("-force"));
         }
+        args.push(OsString::from("-verbose"));
         args.push(target.to_owned());
-        self.run_checked("detach image", CommandRequest::new(HDIUTIL, args))
-            .map(|_| ())
+        let started = std::time::Instant::now();
+        let result = self.run_checked("detach image", CommandRequest::new(HDIUTIL, args));
+        let account = match &result {
+            Ok(output) => {
+                (started.elapsed() >= SLOW_DETACH).then_some(("waited", output.stderr.as_slice()))
+            }
+            Err(ApfsError::CommandFailed { output, .. }) => {
+                Some(("dissent", output.stderr.as_slice()))
+            }
+            Err(_) => None,
+        };
+        if let Some((key, stderr)) = account {
+            crate::timing::attribute(
+                "apfs-command",
+                format_args!("detach image"),
+                key,
+                one_line(stderr),
+            );
+        }
+        result.map(|_| ())
     }
 
     /// Detach `whole_device` only while the kernel still shows `image` holding it.
@@ -3631,7 +3668,7 @@ mod tests {
             }
             assert!(
                 request.program == Path::new(HDIUTIL)
-                    && args == ["detach", self.new_device.as_str()],
+                    && args == ["detach", "-verbose", self.new_device.as_str()],
                 "unexpected command: {request:?}"
             );
             if self.fail_detach {
@@ -3947,7 +3984,10 @@ mod tests {
         assert_eq!(argv(steps[3].command()), ["-q", "/dev/rdisk5s1"]);
         assert_eq!(steps[4], Seen::Inventory);
         assert_eq!(steps[5].command().program, Path::new(HDIUTIL));
-        assert_eq!(argv(steps[5].command()), ["detach", "/dev/disk5"]);
+        assert_eq!(
+            argv(steps[5].command()),
+            ["detach", "-verbose", "/dev/disk5"]
+        );
         assert!(
             !commands(&steps)
                 .iter()
@@ -4023,7 +4063,10 @@ mod tests {
         );
         assert_eq!(steps[2], Seen::Inventory);
         assert_eq!(steps[3], Seen::Inventory);
-        assert_eq!(argv(steps[4].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(
+            argv(steps[4].command()),
+            ["detach", "-verbose", "/dev/disk8"]
+        );
         assert_eq!(steps[6], Seen::Inventory);
         assert!(!commands(&steps).iter().any(|request| {
             let args = argv(request);
@@ -4092,7 +4135,10 @@ mod tests {
         assert_eq!(steps[1], Seen::Inventory);
         assert_eq!(steps[3], Seen::Inventory);
         assert_eq!(steps[4], Seen::Inventory);
-        assert_eq!(argv(steps[5].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(
+            argv(steps[5].command()),
+            ["detach", "-verbose", "/dev/disk8"]
+        );
         assert_eq!(steps[6], Seen::Inventory);
         fs::remove_file(image).unwrap();
     }
@@ -4126,7 +4172,10 @@ mod tests {
         }
         let steps = backend.runner().steps();
         assert_eq!(steps.len(), 6);
-        assert_eq!(argv(steps[4].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(
+            argv(steps[4].command()),
+            ["detach", "-verbose", "/dev/disk8"]
+        );
         assert_eq!(steps[5], Seen::Inventory);
     }
 
@@ -4278,7 +4327,8 @@ mod tests {
         assert_eq!(fs::read(&image).unwrap(), b"unformatted");
         assert!(
             backend.runner().requests().iter().any(|request| {
-                request.program == Path::new(HDIUTIL) && argv(request) == ["detach", "/dev/disk8"]
+                request.program == Path::new(HDIUTIL)
+                    && argv(request) == ["detach", "-verbose", "/dev/disk8"]
             }),
             "positive fresh image ownership permits only its own device release"
         );
@@ -4362,7 +4412,10 @@ mod tests {
         assert_eq!(steps.len(), 8);
         assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
         assert_eq!(steps[5], Seen::Inventory);
-        assert_eq!(argv(steps[6].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(
+            argv(steps[6].command()),
+            ["detach", "-verbose", "/dev/disk8"]
+        );
         assert_eq!(steps[7], Seen::Inventory);
         assert!(
             !commands(&steps)
@@ -4512,7 +4565,10 @@ mod tests {
         assert_eq!(steps.len(), 8);
         assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
         assert_eq!(steps[5], Seen::Inventory);
-        assert_eq!(argv(steps[6].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(
+            argv(steps[6].command()),
+            ["detach", "-verbose", "/dev/disk8"]
+        );
         assert_eq!(steps[7], Seen::Inventory);
     }
 
@@ -4847,13 +4903,26 @@ mod tests {
             assert_eq!(request.program, Path::new(HDIUTIL));
         }
         for request in requests.iter().take(3) {
-            assert_eq!(argv(request), ["detach", "/dev/disk4"]);
+            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
         }
-        assert_eq!(argv(&requests[3]), ["detach", "-force", "/dev/disk4"]);
+        assert_eq!(
+            argv(&requests[3]),
+            ["detach", "-force", "-verbose", "/dev/disk4"]
+        );
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)]
         );
+    }
+
+    /// A child's diagnostic output becomes one trace line, its blank lines dropped.
+    #[test]
+    fn child_output_reads_as_one_trace_line() {
+        assert_eq!(
+            one_line(b"hdiutil: detach: processing \"/dev/disk4\"\n\n  \"disk4\" ejected.\n"),
+            "hdiutil: detach: processing \"/dev/disk4\" | \"disk4\" ejected."
+        );
+        assert_eq!(one_line(b""), "");
     }
 
     /// `WhenIdle` is the whole reason the intent exists: `resize`, `unmount`, and the adoption

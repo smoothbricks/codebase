@@ -158,6 +158,18 @@ fn done(label: fmt::Arguments<'_>, started: Instant, ok: bool) {
     );
 }
 
+/// Attach one fact to a lifecycle step: printed unconditionally as
+/// `cowshed: <scope> <step> <key>=<value>`, next to the step's own `start`/`done` lines, so a slow
+/// or refused step says why in the same trace that says how long it took.
+pub fn attribute(
+    scope: &'static str,
+    step: fmt::Arguments<'_>,
+    key: &'static str,
+    value: impl fmt::Display,
+) {
+    eprintln!("cowshed: {scope} {step} {key}={value}");
+}
+
 /// Where one call's lifecycle steps are reported while it runs. A caller that asked for its
 /// steps hears each [`timed`] and [`timed_async`] step start and end as it happens, so it can say
 /// which step a slow or hung call is in while the call is still in it.
