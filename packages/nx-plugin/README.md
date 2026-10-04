@@ -496,8 +496,22 @@ stderr.
 
 ## Nx 23.2.1 Runtime Patch
 
-The repository registers [`patches/nx@23.2.1.patch`](../../patches/nx@23.2.1.patch) in its root `patchedDependencies`.
-It repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
+The repository installs Nx 23.2.1 with [`patches/nx@23.2.1.patch`](../../patches/nx@23.2.1.patch) applied, from an
+immutable release tarball: the root `package.json` keeps `devDependencies.nx` at `23.2.1` and sets `overrides.nx` to the
+release asset's URL, and `bun.lock` pins its sha512. `tooling/patched-nx.ts` builds the tarball reproducibly from the
+registry tarball and the patch; the `Patched Nx` workflow publishes it once from `main`, under a tag named for the
+uncompressed tar's sha256, and verifies the served asset on every later run. A tarball, unlike a `patchedDependencies`
+entry, stays in Bun's read-only global store (`~/.bun/install/cache/links`), so a sandbox can run Nx without being able
+to write it.
+
+`@nx/js` imports `nx` (`nx/release`, `nx/src/…`) without declaring it
+([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)), and a global-store entry links only declared dependencies,
+so `@nx/js` in that store cannot find Nx: its version actions, and this plugin's that extend them, would fail.
+`patches/@nx%2Fjs@23.2.1.patch` declares the peer. Being patched, `@nx/js` installs project-local under
+`node_modules/.bun/`, where `nx` resolves through the hoisted `node_modules/.bun/node_modules/nx` link to the same
+tarball entry; Bun's lock still records only the registry peers, so the placement is what makes the import resolve.
+
+The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
 
 - **Task history uses the client's native database connection.** Task details and history must share that connection; a
   daemon can have frozen a different database namespace before a later client supplies workspace-data overrides. The
@@ -506,22 +520,29 @@ It repairs upstream Nx runtime behavior, separately from this plugin's workspace
 - **The default cache limit uses the cache's own filesystem.** It takes ten percent of `statfs(cacheDir)` capacity, or
   its nearest existing ancestor when the directory has not been created. This avoids synchronously inventorying every
   mounted disk. Explicit `NX_MAX_CACHE_SIZE` and `nx.json.maxCacheSize` retain their precedence; filesystem errors other
-  than a missing directory still fail the operation.
+  than a missing directory still fail the operation. See [upstream Nx #37269](https://github.com/nrwl/nx/pull/37269).
 - **The daemon keeps graph plugin workers running.** Nx stops an isolated plugin worker after the last phase it has
   hooks for, which for a graph-only plugin is every graph; the daemon recomputes the graph on every tracked file change,
   so each change spawned and loaded every graph plugin's worker again (median 199 ms against 63 ms from edit to graph in
   a one-project fixture, 0.9–1.5 s per worker under a gate's load). On the daemon a worker with graph hooks now lives as
   long as the daemon; one-shot clients and task-only plugins keep the eager shutdown. See
   [upstream Nx #37271](https://github.com/nrwl/nx/pull/37271).
+- **Nx resolves typescript and release version actions from the workspace.** Nx 23.2.1 loads both with a plain `require`
+  from its own location, which in Bun's global store holds only Nx's own dependencies. There it finds no `typescript`,
+  so its dependency analysis skips every source import without a warning (this repository lost 12 of 44 graph edges),
+  and `release version` cannot resolve `@nx/js`'s version actions. The patch resolves both through `getNxRequirePaths`
+  (the workspace first), falling back to Nx's own location. See
+  [upstream Nx #37272](https://github.com/nrwl/nx/pull/37272).
 
-Publishing or installing `@smoothbricks/nx-plugin` does **not** apply this repository-root patch to a consumer's Nx. A
-consumer needing these repairs must carry the exact patch, register it for `nx@23.2.1` in its own root
-`patchedDependencies`, regenerate its lockfile, and prove a frozen install and its affected normal Nx gates. Do not
+Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
+sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
+`patchedDependencies`, regenerates its lockfile, and proves a frozen install and its affected normal Nx gates. Do not
 replace the registry dependency with a local link or hide a failure by resetting the database or disabling the daemon.
 
-The patch is version-specific. On an Nx upgrade, remove each hunk only when the installed upstream release contains that
-repair and the task-history namespace, cache-bound and resident-worker regressions pass; preserve any repair not yet
-released.
+The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
+remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
+cache-bound, resident-worker and store-resolution regressions pass; preserve any repair not yet released. When every
+hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 

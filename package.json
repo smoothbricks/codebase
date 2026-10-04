@@ -122,10 +122,11 @@
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
     "bun-types@1.4.2": "patches/bun-types@1.4.2.patch",
     "ttsc@0.30.4": "patches/ttsc@0.30.4.patch",
-    "nx@23.2.1": "patches/nx@23.2.1.patch"
+    "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch"
   },
   "overrides": {
-    "typia": "14.0.6"
+    "typia": "14.0.6",
+    "nx": "https://github.com/smoothbricks/codebase/releases/download/nx-23.2.1-patched-9bfd0f126e16/nx-23.2.1.tgz"
   },
   "smoo": {
     "github": {

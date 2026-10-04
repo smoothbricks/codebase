@@ -61,4 +61,7 @@ jobs:
           fi
           # What GitHub serves is what consumers install: verify the downloaded asset, never the local build.
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/published"
-          bun tooling/patched-nx.ts verify "$RUNNER_TEMP/published/$asset"
+          bun tooling/patched-nx.ts verify "$RUNNER_TEMP/published/$asset" | tee "$RUNNER_TEMP/published.json"
+          # bun.lock must pin this release's URL with exactly the served asset's sha512; Bun's frozen install above
+          # already refused any asset whose bytes differ from what the lock records.
+          bun tooling/patched-nx.ts lock "$(jq -r .integrity "$RUNNER_TEMP/published.json")"

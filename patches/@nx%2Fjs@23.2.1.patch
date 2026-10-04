@@ -1,0 +1,14 @@
+diff --git a/package.json b/package.json
+index 2e32de0af6535e67f201d6f7f3a743267f2c8323..e6413b8c29c8e7b6acd5be2397b877f981a82128 100644
+--- a/package.json
++++ b/package.json
+@@ -162,7 +162,8 @@
+   },
+   "peerDependencies": {
+     "@swc/cli": ">=0.6.0 <0.9.0",
+-    "verdaccio": "^6.0.5"
++    "verdaccio": "^6.0.5",
++    "nx": "23.2.1"
+   },
+   "peerDependenciesMeta": {
+     "@swc/cli": {
