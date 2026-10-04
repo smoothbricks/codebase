@@ -3725,6 +3725,8 @@ mod io_registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::scratch_apfs::ScratchRoot;
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
@@ -5607,7 +5609,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
-        let stem = temp_path("real-asif-resolution", "stem").with_extension("");
+        let root = ScratchRoot::new("asif-resolution").expect("scratch root");
+        let stem = root.path().join("image");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let mut cleanup = RealImageCleanup::new(&backend, image);
@@ -5637,7 +5640,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_grow_refuses_an_attached_image_and_lands_once_detached() {
-        let stem = temp_path("real-asif-grow", "stem").with_extension("");
+        let root = ScratchRoot::new("asif-grow").expect("scratch root");
+        let stem = root.path().join("image");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let mut cleanup = RealImageCleanup::new(&backend, image);
@@ -5822,14 +5826,18 @@ mod tests {
             Done,
         }
 
+        let root = ScratchRoot::new("leases").expect("scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let stem_a = temp_path("lease-held", "stem").with_extension("");
-        let stem_b = temp_path("lease-free", "stem").with_extension("");
+        let stem_a = root.path().join("lease-held");
+        let stem_b = root.path().join("lease-free");
         let image_a = stem_a.with_extension(IMAGE_EXTENSION);
         let image_b = stem_b.with_extension(IMAGE_EXTENSION);
-        let mount_b = temp_path("lease-free-mount", "dir");
-        let alias_parent = temp_path("lease-alias-parent", "dir");
-        let hard_link = temp_path("lease-hard-link", IMAGE_EXTENSION);
+        let mount_b = root.path().join("lease-free-mount");
+        let alias_parent = root.path().join("lease-alias-parent");
+        let hard_link = root
+            .path()
+            .join("lease-hard-link")
+            .with_extension(IMAGE_EXTENSION);
         let _paths = TestPaths(vec![
             alias_parent.clone(),
             hard_link.clone(),
@@ -5962,6 +5970,109 @@ mod tests {
             Ok(())
         })();
         finish_real_image_test(result, cleanup_a);
+    }
+
+    /// How [`real_apfs_fixture_run_ended_by_its_parent`] ends: `panic`, `kill` or `sweep`.
+    #[cfg(target_os = "macos")]
+    const FIXTURE_ENDING: &str = "COWSHED_TEST_FIXTURE_ENDING";
+    /// The line a fixture run prints once its image is attached and tracked.
+    #[cfg(target_os = "macos")]
+    const FIXTURE_IMAGE: &str = "cowshed-test-fixture-image=";
+
+    /// A real-image fixture leaves nothing attached however its run ends. A panic unwinds
+    /// through the fixture's own teardown. A kill — nextest's `terminate-after`, a host-wide
+    /// stop — runs no teardown at all, so only the next run's sweep can release the image, and
+    /// the sweep finds only images staged under a scratch root that names the dead run's pid.
+    /// Fixtures staged under `$TMPDIR` stayed attached until reboot after every timed-out run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_fixture_images_are_released_however_their_run_ends() {
+        use crate::fork_lock::Spawn;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Child, Command, Stdio};
+
+        let run = |ending: &str| -> Child {
+            Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "apfs::tests::real_apfs_fixture_run_ended_by_its_parent",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(FIXTURE_ENDING, ending)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn_locked()
+                .expect("spawn a fixture run")
+        };
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        for ending in ["panic", "kill"] {
+            let mut child = run(ending);
+            let mut lines = BufReader::new(child.stdout.take().expect("run stdout")).lines();
+            let image = lines
+                .by_ref()
+                .map(|line| line.expect("run stdout"))
+                .find_map(|line| line.strip_prefix(FIXTURE_IMAGE).map(PathBuf::from))
+                .unwrap_or_else(|| panic!("the {ending} run never attached its fixture"));
+            // A red run must not leak the image it proves leaked.
+            let _leak = RealImageCleanup::new(&backend, image.clone());
+            if ending == "kill" {
+                child.kill().expect("kill the run mid-fixture");
+            }
+            lines.for_each(drop);
+            let status = child.wait().expect("reap the run");
+            match ending {
+                "panic" => assert_eq!(status.code(), Some(101), "the run panicked"),
+                _ => {
+                    assert_eq!(status.signal(), Some(libc::SIGKILL), "the run was killed");
+                    let next = run("sweep").wait().expect("the next run");
+                    assert!(next.success(), "the next run swept: {next}");
+                }
+            }
+            assert!(
+                backend
+                    .recovered_image_attachment(&image)
+                    .expect("attachment inventory")
+                    .is_none(),
+                "{ending}: {} is still attached",
+                image.display()
+            );
+            assert!(!image.exists(), "{ending}: {} remains", image.display());
+        }
+    }
+
+    /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it panics or waits to be
+    /// killed once its image is attached, or (`sweep`) only opens a root, which sweeps dead runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "spawned by real_apfs_fixture_images_are_released_however_their_run_ends"]
+    fn real_apfs_fixture_run_ended_by_its_parent() {
+        let Some(ending) = std::env::var_os(FIXTURE_ENDING) else {
+            return;
+        };
+        let root = ScratchRoot::new("fixture-run").expect("scratch root");
+        if ending == "sweep" {
+            return;
+        }
+        let stem = root.path().join("image");
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let mut cleanup = RealImageCleanup::new(&backend, stem.with_extension(IMAGE_EXTENSION));
+        let created = backend
+            .create_staged_image(&lease_test_image(stem, "cowshed-fixture-run"))
+            .expect("create the fixture image");
+        cleanup.track(
+            backend
+                .attach_verified(&created)
+                .expect("attach the fixture image"),
+        );
+        println!("{FIXTURE_IMAGE}{}", created.display());
+        if ending == "panic" {
+            panic!("the fixture's run fails with its image attached");
+        }
+        // Killed here; the parent's stdin closes only if it failed first.
+        let _ = io::stdin().read_line(&mut String::new());
+        finish_real_image_test(Ok(()), cleanup);
     }
 
     #[test]

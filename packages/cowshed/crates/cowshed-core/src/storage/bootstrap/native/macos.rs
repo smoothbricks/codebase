@@ -3347,17 +3347,6 @@ fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
 }
 
 #[cfg(test)]
-use crate::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
-#[cfg(test)]
-use crate::storage::apfs::ApfsSubstrateConfig;
-#[cfg(test)]
-use crate::storage::apfs::native::MacOsApfsExecutionHost;
-
-#[cfg(test)]
-#[path = "../../../../tests/support/scratch_apfs.rs"]
-mod scratch_apfs;
-
-#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -3383,7 +3372,8 @@ mod tests {
         };
         use crate::metadata::ImageCapacity;
 
-        let root = scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
+        let root =
+            crate::scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let image = backend
             .create_staged_image(&CreateImageRequest {

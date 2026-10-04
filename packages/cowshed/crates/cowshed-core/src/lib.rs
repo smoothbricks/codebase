@@ -37,6 +37,16 @@ pub mod workspace_credentials;
 pub mod workspace_environment;
 pub mod workspace_git_fetch;
 
+// Every real-image fixture in the lib test binary shares this one scratch-root protocol: one
+// sweep, one sequence, whichever module attaches the image.
+#[cfg(all(test, target_os = "macos"))]
+use crate::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+#[cfg(all(test, target_os = "macos"))]
+use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/scratch_apfs.rs"]
+mod scratch_apfs;
+
 pub use error::{CowshedError, ErrorCode, OtherBuild, Result};
 pub use gateway_inventory::{
     AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,
