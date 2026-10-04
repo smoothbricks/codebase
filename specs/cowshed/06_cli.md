@@ -11,7 +11,7 @@ make that possible and they are absolute:
 3. **A command that may trigger an authorization prompt says so first.** Any operation that can escalate — volume
    provisioning, a remount macOS classifies as privileged, plist installation — emits a `cowshed:` line naming the
    action and the prompt before the dialog appears
-   (`cowshed: one administrator authorization will remount cowshed.caches at /private/cowshed/caches`). A silent
+   (`cowshed: one administrator authorization will remount cowshed.store at /private/cowshed/store`). A silent
    SecurityAgent dialog behind an unrelated read-only verb is a contract violation, not a platform quirk to tolerate.
    Where the platform permits (fstab-pinned mounts), cowshed prefers designs in which no prompt can occur at all
    (01_storage.md).
@@ -39,7 +39,9 @@ Two verbs own the host story, both runnable from any directory:
   versus canonical mountpoint, marker validity), service status, workspace inventory summary, project checks when an
   adopted checkout resolves. It never mutates: its project open finishes no unfinished lifecycle operation, interrupted
   publication or restore, retired-image reclamation, identity change or binding heal, and reports each as a finding for
-  the next opening command to finish. `doctor --repair` opens the way every other verb does.
+  the next opening command to finish. `doctor --repair` opens the way every other verb does. While the retired caches
+  volume still exists it reports the `caches-volume` warning, whose hint is `cowshed setup --retire-caches-volume` once
+  only the volume's marker remains and `cowshed setup, then cowshed setup --retire-caches-volume` before that.
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
@@ -50,8 +52,11 @@ Two verbs own the host story, both runnable from any directory:
   the next build to repopulate. No build state is copied. A project refusal is reported on stderr without hiding later
   projects; the command exits with the first typed failure and the number of failed projects, never a success JSON
   envelope first. Uninstall and a failed storage repair never run migration. A fully migrated healthy host changes
-  nothing and says so. The non-destructive storage promise applies to host store/cache volumes and source data, not to
-  rebuildable incremental state.
+  nothing and says so. The non-destructive storage promise applies to the host store volume, layer-3 caches and source
+  data, not to rebuildable incremental state. On a host that still has the retired caches volume, setup moves what the
+  volume holds to the host HOME without authorization, and `setup --retire-caches-volume` deletes the emptied volume,
+  its `/etc/fstab` pin and its mount-service entry inside that same single session, refusing while anything but the
+  marker is left (03_caches.md "Retiring the caches volume").
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its
@@ -182,7 +187,7 @@ never errors).
 | `cowshed path <ws>`                           | mount path                                       | Exit 3 if unknown; attaches if detached (unless `--no-attach`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cowshed exec <ws> -- <cmd…>`                 | child's stdout                                   | Sandboxed byte-exact argv exec (04). Post-`--` arguments remain `OsString`; each is capped at 128 KiB and their decoded total at 1 MiB. Every submission creates a numeric `JobId`; structured binary stdin is separate from shell text. `--stdout-copy <rel>` / `--stderr-copy <rel>` request independent post-terminal publication; default policy is `CreateNew`, and `--replace-output` changes all requested copies to `Replace`. `--ro`, `--cwd <rel>`. Child exit passes through unchanged; wrapper errors use 100–106. |
 | `cowshed shell <ws>`                          | — (interactive)                                  | Sandboxed login shell inside the mount.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `cowshed repo mirror <url>`                   | mirror path                                      | Gateway fetches `<url>` into a read-only bare mirror on the cache volume (02/05). Repo-scoped egress grant required.                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `cowshed repo mirror <url>`                   | mirror path                                      | Gateway fetches `<url>` into a read-only bare mirror in cowshed's own cache directory (02/05). Repo-scoped egress grant required.                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cowshed repo clone <url> [dir]`              | clone path                                       | `repo mirror` then a local `git clone --dissociate` into the workspace (default dir: repo basename).                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `cowshed sim export <ws> [artifact]`          | drop path                                        | Copy a built iOS `.app` to the one-way drop dir for the personal-session simulator (02/14). Default: newest built app.                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `cowshed app export <ws> [artifact]`          | drop path                                        | Mac-target sibling of `sim export`: copy a built macOS `.app` to the drop dir (02/14).                                                                                                                                                                                                                                                                                                                                                                                                                                         |

@@ -115,35 +115,34 @@ Shape:
 ;; projects adopted after this profile was generated. Operation specificity
 ;; and emission order both matter; scoped carve-backs follow this deny:
 (deny file-read* file-read-data file-write* (subpath "/private/cowshed/store"))
-(allow file-read* file-read-data (subpath "/private/cowshed/caches")) ;; layer-1/3 caches: readable
-;; sccache is absent from the write list: its store is daemon-write-only
-;; (03_caches.md) — clients speak to the host daemon over the socket above
-;; and never touch the store directly.
-;; Each detected capability's cache mounts (15_capabilities.md); with every
-;; detector active the list is:
-(allow file-write*
-  (subpath "/private/cowshed/caches/cargo/registry")
-  (subpath "/private/cowshed/caches/cargo/git")
-  (subpath "/private/cowshed/caches/bun/install/cache")
-  (subpath "/private/cowshed/caches/npm")
-  (subpath "/private/cowshed/caches/pnpm/store")
-  (subpath "/private/cowshed/caches/uv")
-  (subpath "/private/cowshed/caches/zig")
-  (subpath "/private/cowshed/caches/gradle/caches")
-  (subpath "/private/cowshed/caches/nix/cache")
-  (subpath "/private/cowshed/caches/nix/state")
-  (subpath "/private/cowshed/caches/go/mod")
-  (subpath "/private/cowshed/caches/go/build"))
-;; HOME carve-backs come only from detected capabilities' grants
-;; (15_capabilities.md), which the capability merge collects in one place. A grant
-;; is never HOME itself and never inside a protected path. A grant's ancestors
-;; beneath HOME get `file-read-metadata` literals only, so they resolve but are
-;; never listable. With the matching detectors active they are:
-;;   - a shared tool home (03_caches.md), reached through the host's literal path
-;;     once its caches are relocated: literal reads of that path and of cargo's
-;;     registry/git links, and read-write literals for cargo's root state files.
-;;     A grant is never a subpath of a host tool home;
-;;   - bun's install cache while it is still a private host directory (subtree);
+;; No cache lives under the cowshed tree, so nothing here is carved back for one.
+;; sccache's store is daemon-write-only (03_caches.md) — clients speak to the host
+;; daemon over the socket above and never touch the store directly.
+;; HOME carve-backs come only from detected capabilities' contributions
+;; (15_capabilities.md), which the capability merge collects in one place. A
+;; shared cache is strictly beneath HOME and never intersects a protected path or
+;; cowshed's controller state (~/Library/Application Support/dev.cowshed,
+;; ~/Library/Caches/dev.cowshed). Ancestors beneath HOME get `file-read-metadata`
+;; literals only, so they resolve but are never listable. With every detector
+;; active they are:
+;;   - each shared cache (03_caches.md "Tool homes stay where the tool keeps
+;;     them") as a read-write subtree at the tool's own default, which the
+;;     supervisor creates before a child runs, and one per `[caches] home` entry
+;;     in main's .cowshed.toml:
+(allow file-read* file-read-data file-write*
+  (subpath "~/.cargo/registry") (subpath "~/.cargo/git")
+  (subpath "~/.bun/install/cache") (subpath "~/.npm")
+  (subpath "~/Library/pnpm/store") (subpath "~/.cache/uv") (subpath "~/.cache/zig")
+  (subpath "~/.gradle/caches")
+  (subpath "~/.cache/nix") (subpath "~/.local/state/nix")
+  (subpath "~/go/pkg/mod") (subpath "~/Library/Caches/go-build")
+  … one subtree per [caches] home entry …)
+;;   - a split tool home's root as a literal read (the directory, not its
+;;     contents), and cargo's root state files as read-write literals:
+(allow file-read* file-read-data (literal "~/.cargo") (literal "~/.gradle"))
+(allow file-read* file-read-data file-write*
+  (literal "~/.cargo/.package-cache") (literal "~/.cargo/.package-cache-mutate")
+  (literal "~/.cargo/.global-cache") (literal "~/.cargo/.global-cache-journal"))
 ;;   - every HOME path the sandboxed supervisor probes when it repeats detection:
 ;;     each bootstrap candidate as its literal program path
 ;;     (~/.nix-profile/bin/<tool>, ~/.local/state/nix/profile/bin/<tool>,
@@ -170,7 +169,6 @@ Shape:
   (literal "~/.cargo/config.toml") (literal "~/.cargo/config")
   (literal "~/.cargo/credentials.toml") (literal "~/.cargo/credentials")
   (literal "~/.gradle/gradle.properties")
-  (subpath "~/go")                                     ;; misconfig tripwire, not a secret (see notes)
   (subpath "~/Library/Keychains")
   (subpath "<project root>") (subpath "<telemetry root>")
   (subpath "<main's canonical mount>")                 ;; every workspace but main
@@ -226,21 +224,22 @@ Notes:
   broad `allow file-read-data`; adding an explicit `deny file-read-data` blocks the read. Operation specificity must
   match before emission order can protect a boundary; "last match wins" alone is not the rule. Scoped read allows also
   name `file-read-data` explicitly so they can carve back their authorized subtrees. Profiles retain four ordered
-  **layers** — broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read,
-  designated cache-subtree writes, own mount, own temp dir) → secret denies — and a unit test (08_testing.md) asserts
-  the layer order plus probe paths (grant file, CA key, sibling image, sibling mount unreadable; own mount and
-  designated caches writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the
-  old enumerated list: sibling workspace mounts and projects adopted after profile generation are covered without being
+  **layers** — broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (detected capabilities'
+  shared caches and grants, own mount, own temp dir) → secret denies — and a unit test (08_testing.md) asserts the layer
+  order plus probe paths (grant file, CA key, sibling image, sibling mount unreadable; own mount and detected shared
+  caches writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the old
+  enumerated list: sibling workspace mounts and projects adopted after profile generation are covered without being
   named.
 - **Read policy.** The broad `file-read-data` allow exists for system paths outside HOME (dyld, `/usr`, `/System`,
   `/Applications`, `/nix/store`, `/opt`, …), which stay readable. Under HOME a read is denied unless a rule names it,
   and the rules that do are exactly: explicit `read`/`write` grants, the workspace's own mount (and the exact literal
-  ancestors `getcwd` needs), the exec temp dir, allowed sockets' ancestors, and detected capabilities' grants (above).
-  Those come from the capability merge alone (15_capabilities.md): a detector that needs a HOME path, including one it
-  only probes while the sandboxed supervisor repeats detection, contributes it as a grant, and nothing else adds one. A
-  workspace's sandbox `HOME`, `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a
-  child's private home holds. Reported leak this closes: a job `cat`ting `~/.omp/agent/agent.db` or
-  `~/Library/Application Support/*` — the broad data allow admitted any file whose metadata was denied.
+  ancestors `getcwd` needs), the exec temp dir, allowed sockets' ancestors, and detected capabilities' shared caches and
+  grants (above). Those come from the capability merge alone (15_capabilities.md): a detector that needs a HOME path,
+  including one it only probes while the sandboxed supervisor repeats detection, contributes it as a grant or shared
+  cache, main's `[caches] home` entries join the same merge, and nothing else adds one. A workspace's sandbox `HOME`,
+  `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds.
+  Reported leak this closes: a job `cat`ting `~/.omp/agent/agent.db` or `~/Library/Application Support/*` — the broad
+  data allow admitted any file whose metadata was denied.
 - **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the configured mount root,
   so the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
   but main now carries main's canonical mount among its policy denies (`file-read* file-write*`, exact and subpath, the
@@ -248,24 +247,25 @@ Notes:
   refused by validation, and project-wide grants are validated against that non-main shape as well as main's. A
   git-worktree workspace's `.git` carve-back still follows the deny, narrowed to `.git`. Explicit read grants of another
   repository's main are unaffected.
-- The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
-  the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
-- `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
-  are (03_caches.md). The deny list above pins their config and credential paths to the host precisely because the cache
-  volume is sandbox-writable. A cargo project on a rustup host reads `~/.cargo/bin` and `~/.rustup`'s settings and
-  toolchains, never writes them. Once a shared tool's caches are relocated, a child of a project that uses the tool is
-  pointed at the host's literal path — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`,
-  `UV_CACHE_DIR=~/.cache/uv` (the one path that keeps cargo's dependency fingerprints and bun's `node_modules/.bun`
-  links equal across checkouts) — and its profile adds exactly: literal reads of that path (its ancestors beneath HOME
-  metadata only) and of cargo's `registry` and `git` links, and read-write literals for cargo's root state files
+- Gateway mirrors (layer 1) live in cowshed's own cache directory, `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}`
+  (Linux `$XDG_CACHE_HOME/cowshed/…`), and only the gateway writes them (03_caches.md, 05_gateway.md). That directory
+  and `~/Library/Application Support/dev.cowshed` are cowshed's controller state: no grant names them, so the HOME read
+  deny keeps a sandbox from reading or writing either, and the profile builder refuses a shared cache that intersects
+  one of them or a hard deny (`GrantIntersectsDeny`), as it refuses one that is HOME itself or lies outside HOME.
+- `~/.cargo` and `~/.gradle` are never shared wholesale — only their cache subtrees are (03_caches.md). The deny list
+  above pins their config and credential paths to the host precisely because those subtrees beside them are
+  sandbox-writable. A cargo project on a rustup host reads `~/.cargo/bin` and `~/.rustup`'s settings and toolchains,
+  never writes them. A child of a project that uses a shared tool is pointed at the host's literal path —
+  `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`, `UV_CACHE_DIR=~/.cache/uv` (the one path that
+  keeps cargo's dependency fingerprints and bun's `node_modules/.bun` links equal across checkouts) — and its profile
+  adds exactly: the tool's cache directories as read-write subtrees, a split tool home's root (`~/.cargo`, `~/.gradle`)
+  as a literal read, every ancestor beneath HOME as metadata only, and read-write literals for cargo's root state files
   `.package-cache`, `.package-cache-mutate`, `.global-cache` and `.global-cache-journal`. Nothing else in `~/.cargo`,
-  `~/.bun` or `~/.cache` is granted. A bun child is pointed at `~/.bun/install/cache` before relocation too, never a
-  private store (03_caches.md); until then that path stays readable, never writable: a clone's `node_modules` carries
-  main's links into it. The denies above still follow every one of those grants.
-- The `~/go` deny is a **misconfiguration tripwire, not secret protection**: a Go project's `GOMODCACHE`/`GOCACHE` name
-  the caches volume and its `GOPATH` defaults under the private `HOME`, so nothing sandboxed should ever touch the
-  host's `~/go`. A stray absolute reference would otherwise silently regrow a gigabyte-scale `~/go` on the Data volume;
-  the deny turns it into a loud EPERM.
+  `~/.gradle`, `~/.bun` or `~/.cache` is granted. The denies above still follow every one of those grants.
+- `~/go` carries no deny of its own: a Go project's `GOMODCACHE` is Go's default `~/go/pkg/mod`, shared read-write like
+  every layer-3 cache, and its `GOCACHE` the user cache directory's `go-build`. The rest of `~/go` stays under the HOME
+  read deny — `~/go` and `~/go/pkg` resolve as metadata only — and `GOPATH`, with `go install`'s binaries, stays at Go's
+  default under the private `HOME`, so nothing sandboxed reads or writes the host's `~/go/bin`.
 - Each workspace serves on its own block ports (`base+1 … base+size-1`), so dev servers that honor the port convention
   never collide — the port block _is_ the collision fix. Because bind stays permissive (macOS has no per-process network
   namespace), a sibling may still _bind_ any loopback port, including a hardcoded default; isolation holds anyway
@@ -651,15 +651,14 @@ guarantees cowshed owns:
   is therefore an off-gateway egress path — accepted as a trusted-mediator channel (root daemon, signature-checked
   caches), documented, never proxied. GC-root registration for `.devenv` profiles is likewise daemon-side; no grant
   needed.
-- **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees `nix/cache`
-  and `nix/state` under `/private/cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files;
-  they stay on the host and are shared across workspaces like any concurrency-safe cache. Every child's `HOME`,
-  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are private, in-image directories; before a
-  child runs, the supervisor links its `XDG_CACHE_HOME/nix` to `nix/cache` and its `XDG_STATE_HOME/nix` to `nix/state`
-  (a stale link is replaced, a real directory a workspace owns is left alone, and a host without the caches volume keeps
-  plain private directories). The user's own `~/.cache` and `~/.local/state` are never granted beyond the literal reads
-  a shared tool home's path needs (above): admitting them would hand every workspace the rest of what those roots
-  contain.
+- **Nix client state**: a Nix project's contribution shares the host's own `~/.cache/nix` and `~/.local/state/nix`
+  read-write (eval/fetcher caches, profiles state; 03_caches.md). These are small SQLite files; they stay on the host
+  and are shared across workspaces like any concurrency-safe cache. Every child's `HOME`, `XDG_CONFIG_HOME`,
+  `XDG_CACHE_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are private, in-image directories; before a child runs, the
+  supervisor creates both host directories and links its `XDG_CACHE_HOME/nix` to `~/.cache/nix` and its
+  `XDG_STATE_HOME/nix` to `~/.local/state/nix` (a stale link is replaced, and a real directory a workspace owns is left
+  alone). The rest of the user's `~/.cache` and `~/.local/state` is never granted beyond the metadata-only ancestors
+  those two paths need (above): admitting them would hand every workspace the rest of what those roots contain.
 - **direnv trust is path-keyed.** Approval belongs to the workspace's private direnv configuration, never the host
   user's trust store. Before activation, cowshed approves only the selected workspace-contained `.envrc` using that
   private configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated
@@ -811,8 +810,8 @@ binary with client-supplied arguments and environment, unsandboxed, at the clien
 arbitrary user-uid execution outside the sandbox. Accepted: the confinement threat model (semi-trusted agents running
 the user's own code) already concedes that class to a deliberate adversary through layer-3 cache poisoning — a poisoned
 sccache entry feeds main's next build (03_caches.md) — so the daemon adds immediacy, not new reach. In exchange the
-store itself narrows: the `/private/cowshed/caches/sccache` write carve-back is gone and every cache write flows through
-the daemon.
+store itself narrows: no sandbox holds any grant on sccache's store, `~/Library/Caches/Mozilla.sccache`, which the HOME
+read deny covers, and every cache write flows through the daemon.
 
 ## Linux enforcement (ZFS substrate)
 
@@ -879,12 +878,12 @@ case with no test yet is an open gap, not a guarantee:
   outbound-enforced; sibling binds are not prevented);
 - assert profile behavior end-to-end: a secret-deny path stays denied despite broad read-data and ancestor allows;
   explicit operation-specific denies and their position are both load-bearing;
-- write to `~/.cargo/bin`, cargo config/credentials, or `~/.gradle/gradle.properties` — directly and via the
-  sandbox-writable cache volume;
-- write to `~/go` (the misconfig tripwire — must EPERM); write to another workspace's `go install` directory under its
-  private `HOME` (unreachable across the mount boundary); chmod a 0444 `/private/cowshed/caches/go/mod` entry writable
-  and modify it (allowed by scope — the accepted layer-3 poisoning risk — but asserted to appear in telemetry as a
-  mutation of a shared cache);
+- write to `~/.cargo/bin`, cargo config/credentials, or `~/.gradle/gradle.properties` — directly and through a link
+  planted in the sandbox-writable shared caches beside them;
+- write to `~/go/bin` or anywhere else in the host's `~/go` outside `~/go/pkg/mod` (must EPERM); write to another
+  workspace's `go install` directory under its private `HOME` (unreachable across the mount boundary); chmod a 0444
+  `~/go/pkg/mod` entry writable and modify it (allowed by scope — the accepted layer-3 poisoning risk — but asserted to
+  appear in telemetry as a mutation of a shared cache);
 - read the workspace's own CA **private key** or any sibling workspace's CA key (both on the store volume — denied): a
   workspace can read only its own in-image CA **cert** (a public anchor), never a signing key, and cannot obtain a leaf
   signed for a host it was not granted; a sibling's in-image trust anchor is not reachable across the mount boundary;

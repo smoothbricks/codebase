@@ -1,8 +1,9 @@
 # Troubleshooting
 
-First move for anything weird: `cowshed doctor`. It checks every invariant (images ↔ markers ↔ mounts ↔ grants, caches
-volume, gateway) and prints one `cowshed:` line per problem with a `next:` fix. Because cowshed has no database, doctor
-isn't reconciling state — it's _deriving_ it from disk and the mount table, so what it reports is the truth.
+First move for anything weird: `cowshed doctor`. It checks every invariant (images ↔ markers ↔ mounts ↔ grants, gateway,
+a retired caches volume still present) and prints one `cowshed:` line per problem with a `next:` fix. Because cowshed
+has no database, doctor isn't reconciling state — it's _deriving_ it from disk and the mount table, so what it reports
+is the truth.
 
 ## Mounts
 
@@ -110,9 +111,10 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   credential problem, not a slow network. 403 means endpoint and credential authenticated but policy denied the
   destination; use the gateway's grant hint. Port 7644 by itself is not workspace identity: the private netns plus
   mounted socket inode selects the workspace.
-- **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug. In a sandbox Go's caches and `GOPATH`
-  never resolve to the host's `~/go` (a Go project names the shared caches; `GOPATH` defaults under the private `HOME`),
-  so something passed the host path explicitly. Find that setting; never grant `~/go`.
+- **`go` denied writing under `~/go`**: a Go project shares exactly `~/go/pkg/mod` (and the user cache directory's
+  `go-build`); `GOPATH`, and with it `go install`'s binaries, stays at Go's default under the private `HOME`. A write
+  anywhere else in the host's `~/go` means something passed the host `GOPATH` explicitly. Find that setting; never grant
+  `~/go`.
 - **`nix` fails on `/etc/nix/<file>` with "Operation not permitted"**: the sandbox answered a config stat with EPERM
   instead of ENOENT (Determinate Nix probes an optional `sentry-endpoint`). Workspace profiles grant read-only metadata
   on `/etc/nix` — both spellings, since `/etc` resolves to `/private/etc` — and on nothing else in `/etc`, so a cowshed
@@ -158,30 +160,28 @@ and names `cowshed defrag main` when the next `new` would pay for it.
 
 Attribution: `du` on the images directory tells you per-workspace cost; _inside_ a mounted workspace, normal `du` works
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
-sizes" overstates real usage. `df -h /private/cowshed/caches` covers the shared cache volume; it shares the container's
-free space with everything else.
+sizes" overstates real usage. `df -h /private/cowshed/store` covers the store volume. The shared tool caches are
+ordinary directories at each tool's default in your HOME, so `du -sh` on one (`~/.cargo/registry`,
+`~/.bun/install/cache`, `~/Library/Caches/Mozilla.sccache`) attributes it; both share the container's free space with
+everything else.
 
-Cargo's shared writable caches are `/private/cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors
-are separate at `/private/cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
+Cargo's shared writable caches are its own `~/.cargo/{registry,git}`; gateway-owned bare repository mirrors are separate
+at `~/Library/Caches/dev.cowshed/repo-mirrors` and are never reachable from a sandbox.
 
 **A workspace rebuilds every dependency its copied `target/` already holds, refetches a crate the host has, or its
 `bun install` relinks all of `node_modules`.** Cargo fingerprints a registry or git dependency by the absolute path of
 its source under `$CARGO_HOME`, and Bun's isolated linker writes its cache path into every `node_modules/.bun` link, so
-every checkout must use one literal path for each. A sandbox uses the host's own `~/.cargo` only once
-`~/.cargo/registry` and `~/.cargo/git` both link to `/private/cowshed/caches/cargo/{registry,git}`, the host's
-`~/.bun/install/cache` only once it links to `/private/cowshed/caches/bun/install/cache`, and the host's `~/.cache/uv`
-only once it links to `/private/cowshed/caches/uv`; until then that tool keeps a private cache in the sandbox's own
-HOME. `cowshed doctor` reports each unshared cache as `host-cache-unshared`; `cowshed setup --imperative-host-setup`
-moves the host's caches onto the caches volume and links them back. It holds cargo's own package-cache locks while
-cargo's caches move and refuses while a cargo process holds one; Bun and uv have no such lock, so run it once builds and
-installs are idle. A host cache and a shared directory that both already hold a cache are a conflict it leaves
-untouched: keep one, delete the other, and rerun.
+every checkout must use one literal path for each. Every sandboxed child of a project that uses the tool already gets
+the host's own default — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`, `UV_CACHE_DIR=~/.cache/uv`
+— and a caller's own value for these never reaches it. The other side of the comparison is what differs: a host shell
+that sets one of these variables to another path built main against that path. Unset it, or warm main through
+`cowshed exec main --`.
 
-**Nix cache/state points at the host filesystem.** On declarative hosts the module must own
-`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `setup`
-and `doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
-`cowshed setup --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
-automatic recovery from mixed or broken ownership.
+**Nix cache/state.** A Nix project's sandbox uses the host's own `~/.cache/nix` and `~/.local/state/nix`: the supervisor
+links the private `$XDG_CACHE_HOME/nix` and `$XDG_STATE_HOME/nix` to them, so nothing on the host is relocated and a
+declarative configuration has nothing to own. A home-manager, NixOS or nix-darwin module that still links either path
+into the retired caches volume is a conflict `cowshed setup` names, with the module option to remove, and leaves alone;
+it never rewrites module-owned paths. Remove that option, switch, then rerun `cowshed setup`.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)
 
@@ -228,29 +228,29 @@ anything about hit rates: from a directory outside every workspace, with `SCCACH
 
 ```
 $ sccache --show-stats | head -3
-Cache location                  Local disk: "/private/cowshed/caches/sccache"
+Cache location                  Local disk: "/Users/you/Library/Caches/Mozilla.sccache"
 Max cache size                     200 GiB
 ```
 
-`Cache location` must be `/private/cowshed/caches/sccache`. If it names something under `~/Library/Caches` or
-`~/.cache`, that client is filling a private cache nobody reads, the shared store is serving nothing, and the 0% is the
-consequence rather than the fault. `--show-stats` reports the resolved configuration without starting a server, so this
-is safe to run against a live host.
+`Cache location` must be `~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache` on Linux), sccache's own default and the
+directory the daemon serves. If it names anything else, that client is filling a cache the daemon never reads, the
+shared store is serving nothing, and the 0% is the consequence rather than the fault. `--show-stats` reports the
+resolved configuration without starting a server, so this is safe to run against a live host.
 
 The fix is `cowshed setup`, which writes and owns the `[cache.disk]` table in sccache's own config file (see
 [cli.md](cli.md#cowshed-setup---uninstall---force---mount-root-dir)). Run it and look at the line it prints about that
 file. If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to overwrite
-it; the line names the directory it found. Point that `dir` at `/private/cowshed/caches/sccache` yourself, or delete the
-`[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
+it; the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or delete
+the `[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
 deliberately is not cowshed's to move.
 
 Two symptoms of the same cause worth recognising. **Orphaned stores**: every directory that was ever a wrong destination
-keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in
-`~/Library/Caches/Mozilla.sccache` (and possibly older per-home paths) doing nothing. They are disposable by contract —
-delete them once `--show-stats` names the shared store. **A shrinking shared cache**: a client that finds no daemon
-starts a server of its own over whatever directory its config names, with sccache's 10 GiB default cap unless the config
-says otherwise, and that server will evict a larger shared store down to 10 GiB. This is why the file `setup` writes
-carries a `size` beside the `dir`, and why a hand-edited `[cache.disk]` should carry one too.
+keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in the directories its config
+named doing nothing. They are disposable by contract — delete them once `--show-stats` names the shared store. **A
+shrinking shared cache**: a client that finds no daemon starts a server of its own over whatever directory its config
+names, with sccache's 10 GiB default cap unless the config says otherwise, and that server will evict a larger shared
+store down to 10 GiB. This is why the file `setup` writes carries a `size` beside the `dir`, and why a hand-edited
+`[cache.disk]` should carry one too.
 
 A build _inside_ a workspace never depends on any of this: the supervisor exports `SCCACHE_DIR` and
 `SCCACHE_SERVER_UDS`, and the environment beats the config file. The config governs exactly the store-less case — which
@@ -258,10 +258,11 @@ is also why you cannot verify it from a shell that has the project environment l
 
 ## Backup and durability (read once, remember forever)
 
-**The store and caches volumes are excluded from backup** — deliberately. Multi-gigabyte images with constant internal
-churn would bloat every backup (and, on the Data volume, every hourly local snapshot — that is why they live on
-dedicated volumes at all; see 01_storage.md). Source and caches follow the durability rules below. Protected job content
-is authoritative within its origin incarnation/checkpoint snapshot, but a workspace image is still not an off-machine
+**The store volume is excluded from backup** — deliberately. Multi-gigabyte images with constant internal churn would
+bloat every backup (and, on the Data volume, every hourly local snapshot — that is why they live on a dedicated volume
+at all; see 01_storage.md). Source follows the durability rules below; the shared tool caches are the tools' own
+directories in your HOME, rebuildable from their registries and never anything to restore. Protected job content is
+authoritative within its origin incarnation/checkpoint snapshot, but a workspace image is still not an off-machine
 backup.
 
 - Committed + pushed (`cowshed push`, or merged in main): it's in main's repo — and main's off-machine durability is its
@@ -277,11 +278,12 @@ materializes a clone, reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
-A ZFS host uses exactly three sibling datasets under the configured root: `<pool>/cowshed/store` at
-`/private/cowshed/store`, `<pool>/cowshed/caches` at `/private/cowshed/caches`, and `<pool>/cowshed/projects` for
-`<owner>/<repo>/{main,ws/...}`. If `statfs` does not locate a suitable delegated ZFS dataset, configure
-`[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed deliberately refuses to scan pools or guess. `cowshed doctor`
-reports the selected pool and any missing sibling, mountpoint, or delegation.
+A ZFS host uses exactly two sibling datasets under the configured root: `<pool>/cowshed/store` at
+`/private/cowshed/store` and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. A `<pool>/cowshed/caches`
+dataset from an earlier release is kept mounted at `/private/cowshed/caches` until `cowshed setup` has moved what it
+holds and `cowshed setup --retire-caches-volume` destroys it. If `statfs` does not locate a suitable delegated ZFS
+dataset, configure `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed deliberately refuses to scan pools or
+guess. `cowshed doctor` reports the selected pool and any missing sibling, mountpoint, or delegation.
 
 **Restore interrupted.** Before detached metadata publication, recovery restores the displaced workspace, old
 incarnation, and old token. After publication, recovery completes the replacement forward; it never rolls back across
@@ -329,10 +331,11 @@ re-derived after detach, but protected job content exists only in its origin inc
 export. To reset attachment state, detach each workspace with `cowshed detach`; subsequent commands re-derive mounts and
 controller wiring. There is no cache to clear and no database to reset.
 
-For cache-volume corruption specifically there is a bigger, equally safe hammer: nothing unique lives on
-`cowshed.caches`, so `diskutil apfs deleteVolume` and letting cowshed lazily recreate it is always an option — the
-mirror refetches, sccache and registries rebuild. `cowshed doctor` suggests it when the caches volume fails its checks.
-(Never do this to `cowshed.store` — that volume holds your images.)
+A corrupt shared cache is the tool's own problem, solved the tool's own way: nothing unique lives in one, so delete that
+tool's cache directory (`~/.cargo/registry`, `~/.bun/install/cache`, `~/.cache/uv`, …) and the tool refetches or
+rebuilds it. sccache's `~/Library/Caches/Mozilla.sccache` and the gateway mirror under `~/Library/Caches/dev.cowshed`
+belong to running daemons: stop the daemon first (`cowshed sccache stop`, `cowshed gateway stop`), delete, then start it
+again. (Never delete anything under `/private/cowshed/store` — that volume holds your images.)
 
 ## Every verb prints `could not install gateway session …: (EndpointConflict)`
 

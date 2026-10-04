@@ -70,16 +70,19 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
         <owner>/<repo>/sessions/<ws>.asif                         repo-mirror verb · Arrow audit (13)
         <owner>/<repo>/sessions/<ws>.asif.grants.json                   │
                     │                                                ▼
-                    ▼ diskutil image attach, mount_apfs      cowshed.caches APFS volume
-        <mount-root>/<owner>/<repo>/<ws>/                        ◄─ sccache/zig/gradle ─  /private/cowshed/caches/
+                    ▼ diskutil image attach, mount_apfs      ~/Library/Caches/dev.cowshed/
+        <mount-root>/<owner>/<repo>/<ws>/                        {mirror,repo-mirrors}/  (gateway-only)
         (workspace: src + .git + node_modules + target)
+                    │
+                    └─ cargo · bun · zig · gradle ─►  each tool's own cache in the host HOME (03_caches.md)
 ```
 
 The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS volume in one ASIF file (`.asif`),
 attached with `diskutil image attach` (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place
-of image files and the store mounted directly at `/private/cowshed/store` with the caches dataset nested at
-`/private/cowshed/caches` (09_substrates.md). Both volumes are dedicated: the Data volume carries no cowshed bytes
-(01_storage.md).
+of image files and the store mounted directly at `/private/cowshed/store` (09_substrates.md). The store volume is
+dedicated: the Data volume carries no image or store byte (01_storage.md). Shared caches are not on the store: each
+tool's cache stays at the tool's own default in the host HOME, and the gateway's mirrors in cowshed's user cache
+directory (03_caches.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
 Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted

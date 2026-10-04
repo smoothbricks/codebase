@@ -57,7 +57,6 @@ pub trait Substrate: LifecyclePlanner {
         intent: MountIntent,
     ) -> Result<PathBuf, Self::Error>;
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
-    async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(
         &self,
         workspace: &LifecycleWorkspace,
@@ -174,14 +173,14 @@ and intended operations, but no open descriptors, caller-supplied mounted paths,
 may synchronously wait at the outermost process boundary; library consumers await futures.
 
 Selection is convention, not guesswork, and the host storage anchor is distinct from the selected project path. On
-macOS, `statfs` of the invoking user's home directory selects the APFS container that owns `cowshed.store` and
-`cowshed.caches`; cowshed never derives that container from the project root because an adopted root is itself mounted
-from a workspace image, and an unadopted source may live on another filesystem. The project path is still validated
-lexically and supplies repository identity/copy input, not host-volume authority. On Linux, `statfs` of an existing ZFS
-project selects its containing dataset only if the pool has a suitable delegated cowshed root. A non-ZFS checkout whose
-workspace data should live on ZFS requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`;
-cowshed never scans pools or silently picks one. A configured pool must contain or permit creation of the exact
-hierarchy below. `cowshed doctor` prints the selected substrate, pool, and evidence.
+macOS, `statfs` of the invoking user's home directory selects the APFS container that owns `cowshed.store`; cowshed
+never derives that container from the project root because an adopted root is itself mounted from a workspace image, and
+an unadopted source may live on another filesystem. The project path is still validated lexically and supplies
+repository identity/copy input, not host-volume authority. On Linux, `statfs` of an existing ZFS project selects its
+containing dataset only if the pool has a suitable delegated cowshed root. A non-ZFS checkout whose workspace data
+should live on ZFS requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed never
+scans pools or silently picks one. A configured pool must contain or permit creation of the exact hierarchy below.
+`cowshed doctor` prints the selected substrate, pool, and evidence.
 
 ## APFS image substrate (reference)
 
@@ -208,7 +207,7 @@ first write slow until `cowshed defrag main` (01_storage.md, "Clone cost follows
 | `cowshed fork <src> <dst>`        | `zfs snapshot src@cowshed:fork-<dst>` + clone                                                                                                                                                                |
 | `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves) |
 | capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                            |
-| shared caches (layers 1 and 3)    | `<pool>/cowshed/caches` dataset mounted at `/private/cowshed/caches`                                                                                                                                         |
+| shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                         |
 | Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                            |
 | compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                 |
 
@@ -262,32 +261,31 @@ unprivileged.
 
 ### Linux host paths
 
-State paths are identical across platforms — the store volume/dataset at `/private/cowshed/store`, caches nested at
-`/private/cowshed/caches` — only the volume technology behind each mountpoint differs. ZFS additionally keeps workspace
-data in the sibling `projects` dataset tree:
+State paths are identical across platforms — the store volume/dataset at `/private/cowshed/store` — only the volume
+technology behind the mountpoint differs. Shared caches are not datasets: they live in the host HOME on both platforms
+(03_caches.md). ZFS additionally keeps workspace data in the sibling `projects` dataset tree:
 
 | macOS                                                                                                          | Linux                                                                 |
 | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`            |
-| `cowshed.caches` APFS volume at `/private/cowshed/caches`                                                      | `<pool>/cowshed/caches` dataset at `/private/cowshed/caches`          |
 | project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers |
 
 ### Fixed dataset hierarchy
 
-The ZFS root has exactly three sibling children; project datasets never sit beside or beneath the store dataset:
+The ZFS root has exactly two sibling children; project datasets never sit beside or beneath the store dataset:
 
 ```
 <pool>/cowshed
 ├── store       mountpoint=/private/cowshed/store
-├── caches      mountpoint=/private/cowshed/caches
 └── projects    mountpoint=none
     └── <owner>/<repo>/{main,ws/...}
 ```
 
-`store` contains repository bindings, trusted `policy.json`, grants, quarantine, gateway state, and telemetry. `caches`
-is wholly rebuildable. `projects` contains only workspace datasets and their snapshots. Creation, helper containment
-checks, discovery, send/receive, and GC all use these exact roots; the three siblings are not configurable
-independently.
+`store` contains repository bindings, trusted `policy.json`, grants, quarantine, gateway state, and telemetry.
+`projects` contains only workspace datasets and their snapshots. Creation, helper containment checks, discovery,
+send/receive, and GC all use these exact roots; the two siblings are not configurable independently. A host that still
+has the `<pool>/cowshed/caches` dataset of an earlier release keeps it mounted, never creating one, until its retirement
+destroys it (03_caches.md, "Retiring the caches volume").
 
 ### Restore transaction
 

@@ -23,7 +23,7 @@ Ranked SSOT table (concept / locations / proposed owner):
 | macOS 16-port block 40960–49151       | `metadata.rs:13-16` vs `config.rs:20-22`                                                 | **gateway** (leaf); core re-export                                                               |
 | 32-byte workspace token               | `workspace_credentials.rs:26-27` vs `config.rs:19` vs `supervisor.rs:1084-1088`          | **gateway `TOKEN_BYTES` + `WorkspaceToken::parse`**                                              |
 | egress grant / mode                   | `metadata.rs:856-878` vs `sandbox.rs:11-21` vs `policy.rs:8-191` vs `control.rs:525-531` | **gateway `EgressGrant`**; core `EgressRule` is the durable form, sandbox drops mode             |
-| `/private/cowshed` roots              | `bootstrap.rs:31-33` vs `sandbox.rs:8` vs `host_config.rs:56`                            | **core `STORE_ROOT`/`CACHES_ROOT`**; derive the parent                                           |
+| `/private/cowshed` roots              | `bootstrap.rs:31-35` vs `sandbox.rs:8` vs `host_config.rs:56`                            | **core `STORE_ROOT`**; derive the parent (`RETIRED_CACHES_MOUNTPOINT` is retirement-only)        |
 | `COWSHED_{PORT_BASE,WORKSPACE_TOKEN}` | `workspace_environment.rs:58-64` vs `supervisor.rs:1271-1272`                            | **`workspace_environment`**                                                                      |
 | SHA-256 hex                           | `dto.rs:972-1004` vs `cache.rs:1487-1524` vs `gateway_sessions.rs:178-183`               | **gateway `hex_*`** (leaf); core keep `Sha256Digest` as wrapper                                  |
 | git no-prompt / no-system config      | `git.rs:1844-1846` vs `repo_mirror.rs:579-585` vs `supervisor.rs:1256-1258`              | **core `git_command_at` for checkout git**; gateway helper stays separate but share env literals |
@@ -211,11 +211,12 @@ default-port table next to `EgressRule`, not inline in the adapter. Cost/Risk: g
 
 ### F5 — MEDIUM — SSOT — `/private/cowshed` restated instead of derived from `STORE_ROOT`
 
-Evidence: `packages/cowshed/crates/cowshed-core/src/storage/bootstrap.rs:31-33`
+Evidence: `packages/cowshed/crates/cowshed-core/src/storage/bootstrap.rs:31-35` (`CACHES_ROOT` is gone; the retired
+volume's mountpoint survives only for its retirement)
 
 ```
 pub const STORE_ROOT: &str = "/private/cowshed/store";
-pub const CACHES_ROOT: &str = "/private/cowshed/caches";
+pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
 ```
 
 Evidence: `packages/cowshed/crates/cowshed-core/src/sandbox.rs:8,223-224,318`

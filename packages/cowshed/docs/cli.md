@@ -75,16 +75,17 @@ repairs an adopted identity with `cowshed mv main --repo-id`.
 
 ### `cowshed setup [--uninstall] [--force] [--mount-root <dir>]`
 
-Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates
-absent volumes, remounts detached or mis-mounted ones at their canonical paths, FileVault-encrypts unencrypted volumes
-in place, stores each independent random passphrase in `/Library/Keychains/System.keychain`, validates each volume
-marker, pins the boot mounts in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon.
-That daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
+Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates an
+absent store volume, remounts a detached or mis-mounted one at its canonical path, FileVault-encrypts an unencrypted
+volume in place, stores its independent random passphrase in `/Library/Keychains/System.keychain`, validates the volume
+marker, pins the boot mount in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon. That
+daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
 (`/Library/Application Support/dev.cowshed/mount-volumes.sh`); before login and without invoking the cowshed binary, it
 reads each passphrase from System.keychain, runs `diskutil apfs unlockVolume -nomount`, then mounts the volume with
-`-nobrowse` at its canonical path. fstab keeps `noauto` so Disk Arbitration does not race it. Setup never deletes or
-recreates a volume: existing volumes are encrypted in place. On a healthy host it changes nothing and says so. Every
-storage error in the CLI points here — a host with no volumes has no checkout to adopt.
+`-nobrowse` at its canonical path. fstab keeps `noauto` so Disk Arbitration does not race it. Setup never recreates a
+volume: existing volumes are encrypted in place, and the only volume it ever deletes is a retired caches volume, under
+`--retire-caches-volume` (below). On a healthy host it changes nothing and says so. Every storage error in the CLI
+points here — a host with no volumes has no checkout to adopt.
 
 `--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
@@ -105,21 +106,17 @@ is stated outright, because the macOS dialog gives you no way to tell a mount fr
 escalate raises no prompt at all. `-q` drops the per-volume outcome rows, but never the pre-dialog disclosure: hiding
 what you are about to authorize is not a thing `--quiet` may do.
 
-The common repair — volumes that already exist but have lost their boot pins:
+The common repair — a store volume that already exists but has lost its boot pin:
 
 ```
 $ cowshed setup
 cowshed: setup will request administrator authorization once, for the actions below
 cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be mounted at /private/cowshed/store
-cowshed: cowshed.caches exists (UUID 1D6F0E1A-…-BBBB, 2.0 TB) and will be mounted at /private/cowshed/caches
 cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
-cowshed: cowshed.caches exists (UUID 1D6F0E1A-…-BBBB, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
 cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-AAAA at /private/cowshed/store so it mounts at every boot
-cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-BBBB at /private/cowshed/caches so it mounts at every boot
 cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
 cowshed: cowshed.store (store): present but not mounted -> mounted
-cowshed: cowshed.caches (caches): present but not mounted -> mounted
 cowshed: pinned the boot mounts in /etc/fstab
 cowshed: host storage is set up (one administrator authorization was used)
 ```
@@ -146,22 +143,16 @@ $ cowshed setup
 cowshed: setup will request administrator authorization once, for the actions below
 cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store
-cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
-cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
 cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot
-cowshed: /etc/fstab will pin UUID …-B at /private/cowshed/caches so it mounts at every boot
 cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store: done
-cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — resource busy
-cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: not attempted
-cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: not attempted
-cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot: not attempted
-cowshed: /etc/fstab will pin UUID …-B at /private/cowshed/caches so it mounts at every boot: not attempted
+cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: done
+cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot: FAILED — could not write /etc/fstab
 cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login: not attempted
-cowshed: host storage is NOT set up: 1 action done, 1 failed, 5 not attempted
-cowshed: cowshed.caches could not be mounted: resource busy
-next: cowshed doctor
+cowshed: host storage is NOT set up: 2 actions done, 1 failed, 1 not attempted
+cowshed: could not write /etc/fstab
+next: cowshed doctor --json
 ```
 
 Each outcome line repeats its intent sentence verbatim, so the line you authorized and the line reporting it are
@@ -172,7 +163,7 @@ because the frozen envelope has no partial state and answering `ok:true` over a 
 A dialog dismissed _partway_ through says so, and pointedly does not claim nothing changed — earlier actions had already
 succeeded. It still exits 6.
 
-The stranded-user recovery, after a reboot left the volumes unmounted:
+The stranded-user recovery, after a reboot left the store unmounted:
 
 ```
 $ cowshed new raven
@@ -182,16 +173,14 @@ next: cowshed setup
 $ cowshed setup
 …
 cowshed: cowshed.store (store): present but not mounted -> mounted
-cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted
 cowshed: /etc/fstab already pins the boot mounts
-cowshed: wrote ~/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /private/cowshed/caches/sccache
+cowshed: wrote ~/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in ~/Library/Caches/Mozilla.sccache
 cowshed: host storage is set up
 
 $ cowshed setup
 cowshed: cowshed.store (store): mounted at its canonical path -> already-current
-cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current
 cowshed: /etc/fstab already pins the boot mounts
-cowshed: ~/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache
+cowshed: ~/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to ~/Library/Caches/Mozilla.sccache
 cowshed: everything already set up
 ```
 
@@ -205,13 +194,13 @@ cowshed: data is safe on disk4s7; cowshed left it untouched
 cowshed: host storage is partially set up: 1 volume lives outside this host's container and left untouched
 ```
 
-`setup` also writes **sccache's own config file** — the one host-level thing that decides where a compile cache lands
-for a client that has no cowshed environment at all. Every workspace gets `SCCACHE_DIR` from its supervisor, so a build
-inside a workspace already reaches the daemon; a `cargo` invoked anywhere else is still wrapped (`RUSTC_WRAPPER=sccache`
-survives in any shell that once loaded a project environment) and would otherwise fall back to sccache's private
-per-user directory, where nothing is shared and the hit rate reads as zero. The file names
-`/private/cowshed/caches/sccache` and the same cap the daemon uses, because a client that finds no daemon starts a
-server of its own over that directory and sccache's 10 GiB default would evict the shared store down to it.
+`setup` also writes **sccache's own config file** — the one host-level thing that decides where a compile cache lands,
+and how large it may grow, for a client that has no cowshed environment at all. Every workspace gets `SCCACHE_DIR` from
+its supervisor, so a build inside a workspace already reaches the daemon; a `cargo` invoked anywhere else is still
+wrapped (`RUSTC_WRAPPER=sccache` survives in any shell that once loaded a project environment), and a client that finds
+no daemon starts a server of its own. The file names the daemon's own store, sccache's default
+`~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache` on Linux), and the same cap the daemon uses, so that server
+neither forks a second cache nor lets sccache's 10 GiB default evict the shared store down to it.
 
 The destination is whichever config path sccache itself would load — `~/Library/Application Support/Mozilla.sccache/` on
 macOS, `$XDG_CONFIG_HOME/sccache/` elsewhere, and the legacy `~/Library/Preferences/Mozilla.sccache/` when a config
@@ -222,23 +211,58 @@ appended below whatever is already there, and a `cache.disk.dir` cowshed did not
 than overwritten —
 
 ```
-cowshed: left ~/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to ~/Library/Caches/Mozilla.sccache; a store-less sccache client will not share /private/cowshed/caches/sccache until cache.disk.dir names it
+cowshed: left ~/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to /Volumes/Scratch/sccache; a store-less sccache client will not share ~/Library/Caches/Mozilla.sccache until cache.disk.dir names it
 ```
 
 which is a report, not a failure: the host's storage is set up either way. A block cowshed _did_ write is refreshed on
 every run, so a cap that has drifted upward as projects were adopted is repaired by running `setup` again; a foreign
-`dir` never is, and has to be resolved by hand. Nothing is written at all when the caches volume is not mounted, since a
-config naming a directory beneath an empty mountpoint would resolve onto the boot disk and become one more orphaned
-cache.
+`dir` never is, and has to be resolved by hand. Nothing is written at all when the store volume is not mounted, since
+the cap is derived from the mains it holds; the line then says the file was not written and why.
+
+`--retire-caches-volume` finishes retiring the `cowshed.caches` volume that earlier releases kept the shared tool caches
+on (`specs/cowshed/03_caches.md`, "Retiring the caches volume"). On a host that still has one, every `setup` first moves
+what it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to
+`~/Library/Caches/dev.cowshed`, sccache's store to `~/Library/Caches/Mozilla.sccache`, a repository's cache to the
+`[caches] home` path its main declares — merging where both sides hold a cache. That needs no authorization, and until
+the volume is deleted it stays mounted and pinned. After the storage rows, setup names every cache it moved and every
+directory it could not place, with its size:
+
+```
+$ cowshed setup
+…
+cowshed: caches volume: cargo registry -> ~/.cargo/registry: 2.5 GB moved, 400.0 MB dropped as duplicates
+cowshed: caches volume: nix fetcher cache -> ~/.cache/nix: 0 B moved, 14.0 GB dropped (the host's copy wins)
+cowshed: caches volume: left /private/cowshed/caches/ttsc (42.0 MB) in place: no detector names it and no adopted project's main declares a [caches] home path named ttsc
+cowshed: caches volume: cowshed setup --retire-caches-volume cannot run until each directory above is placed
+```
+
+Declaring the path in main's `.cowshed.toml` (`[caches] home = [".cache/ttsc"]`), or removing the directory, lets the
+next run finish. Once only the marker is left, a plain `setup` names the attended step and never escalates for it; the
+flag plans the deletion, the fstab rewrite and the mount-service rewrite into setup's one authorization, and refuses —
+deleting nothing — while anything else is still on the volume:
+
+```
+$ cowshed setup
+…
+cowshed: caches volume: /private/cowshed/caches holds nothing but its marker; cowshed setup --retire-caches-volume deletes it
+next: cowshed setup --retire-caches-volume
+
+$ cowshed setup --retire-caches-volume
+cowshed: setup will request administrator authorization once, for the actions below
+cowshed: cowshed.caches (UUID 1D6F0E1A-…-BBBB) at /private/cowshed/caches holds nothing but its marker and will be deleted; its /etc/fstab pin and mount-service entry are rewritten without it
+…
+```
+
+`cowshed doctor` reports `caches-volume` until the volume is gone, with the same next step.
 
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
-the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` and
-`cowshed.caches` items in `/Library/Keychains/System.keychain`, the `dev.cowshed.gateway` and `dev.cowshed.sccache`
-LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it
-removes holds data; everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while
-their occupancy cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says
-the caller means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed
-command line:
+the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` item in
+`/Library/Keychains/System.keychain` (and a retired volume's `cowshed.caches` item, if one is still there), the
+`dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the installed cowshed binary, and sccache's nix GC root —
+and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It
+therefore refuses while the volumes still hold workspaces, or while their occupancy cannot be established at all (an
+unmounted store looks empty to every cheap check), until `--force` says the caller means it anyway. There is no
+interactive prompt — the refusal is the prompt, and its hint is the completed command line:
 
 ```
 $ cowshed setup --uninstall
@@ -248,16 +272,16 @@ next: cowshed setup --uninstall --force
 ```
 
 With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
-and every service artifact it touched, in the order it touched them (system daemon, then both System.keychain items,
-then both user agents, then both binaries). A teardown that found nothing installed reports an empty `services` list
-rather than omitting the field:
+and every service artifact it touched, in the order it touched them (system daemon, then each System.keychain item it
+removed, then both user agents, then the cowshed binary and sccache's GC root). A teardown that found nothing installed
+reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"cowshed.caches System.keychain item","outcome":"already-absent"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"sccache nix GC root","outcome":"already-absent"}]}}
 ```
 
 `outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
@@ -270,11 +294,11 @@ number of repository-scoped mains. Adoption is the only operation that copies th
 
 On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first adopt on
 a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
-space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly mounted,
-later adopts only validate them and do not prompt.
+space-sharing `cowshed.store` APFS volume. Once it is present and correctly mounted, later adopts only validate it and
+do not prompt.
 
 Every other command (`new`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in existing-only
-mode. If either volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
+mode. If the store volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
 setup actions, and prints `next: cowshed setup`; it never creates a volume, repairs a mount, or requests administrator
 authorization. Launchd agents and future background services use the same existing-only entrypoint, so a background
 process can report missing setup but can never cause a macOS authorization prompt.
@@ -284,7 +308,7 @@ adopt, and `adopt` would ask for one.
 
 ```
 $ cd <project-root> && cowshed adopt
-cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)
+cowshed: created dedicated volume cowshed.store (space-sharing, excluded from backup)
 cowshed: creating image /private/cowshed/store/acme/widget/main.asif (capacity 100g, asif)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
@@ -733,8 +757,9 @@ next: cowshed attach raven
 
 ### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--deny <relative-path...>] [--egress <host>] [--opaque] [--ports <N>]`
 
-Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
-toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
+Workspaces start **closed**: write access to their own volume, the shared caches of the tools their project uses (at
+each tool's own default in the host HOME), and temp; read access to the toolchains and system; egress to the localhost
+gateway only. Widen filesystem and network access per workspace:
 
 ```
 $ cowshed grant raven --read <project-root>/reference-corpus
@@ -930,8 +955,9 @@ workspace or the nix store is copied rather than refused — the copy is precise
 path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the plist, leaving the
 installed binary — that copy is host state rather than agent state, and keeping it makes the next `start` a plist write
 instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done with the gateway rather
-than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, and both installed
-binaries at once. All of these are idempotent, and a `--purge` with nothing installed says so rather than failing.
+than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed cowshed
+binary and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with nothing installed says so
+rather than failing.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 
@@ -1034,8 +1060,8 @@ its unix socket at `/private/cowshed/store/sccache.sock`. The mode-0600 plist ru
 at `~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
 invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket
 server: `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
-`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at
-`/private/cowshed/caches/sccache`. Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the
+`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at sccache's own default,
+`~/Library/Caches/Mozilla.sccache`. Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the
 agent and removes the plist; both operations are idempotent. The copy is what keeps the daemon alive across a devenv
 update or nix garbage collection: an sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies
 on byte drift and rewrites the plist only on drift.
@@ -1108,8 +1134,8 @@ daemon-write-only. `sccache --show-stats` works from any shell with the export s
 A client with no export set at all is `cowshed setup`'s business rather than this verb's: it reads sccache's own config
 file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir) above).
 `sccache --show-stats` run from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the
-check that the file took effect: `Cache location` must read `Local disk: "/private/cowshed/caches/sccache"`. It reports
-the resolved configuration without starting a server, so it is safe to run against a live host.
+check that the file took effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`.
+It reports the resolved configuration without starting a server, so it is safe to run against a live host.
 
 ### `cowshed controller`
 
@@ -1133,11 +1159,11 @@ actually freed by successful candidates.
 
 ### `cowshed doctor`
 
-Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
-reachable, and git identity at the workspace mount root matches the checkout (`includeIf gitdir:` files that would not
-apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5). Stdout is
-`healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry — findings
-first, hints after, never interleaved.
+Invariant checks: every image has a marker, every mount matches an image, grants files parse, the gateway is reachable,
+no retired caches volume is left (`caches-volume`), and git identity at the workspace mount root matches the checkout
+(`includeIf gitdir:` files that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the
+most severe finding (3/4/5). Stdout is `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:`
+commands those findings carry — findings first, hints after, never interleaved.
 
 Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
 doctor records a finding for it while checking other projects.

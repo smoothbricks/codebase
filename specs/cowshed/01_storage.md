@@ -1,9 +1,9 @@
 # Storage Layout
 
-cowshed stores all durable artifacts on two dedicated APFS volumes and derives all runtime state from the filesystem and
-the kernel. Nothing cowshed creates is visible in Finder, the Desktop, or the user's home directory listing — and
-nothing cowshed churns lives on the Data volume, so the user's unique data keeps its metadata, fsck time, and snapshots
-to itself.
+cowshed stores all durable artifacts on one dedicated APFS volume and derives all runtime state from the filesystem and
+the kernel. Nothing cowshed creates is visible in Finder, the Desktop, or the user's home directory listing — and no
+image or store churn lands on the Data volume, so the user's unique data keeps its metadata, fsck time, and snapshots to
+itself.
 
 ## Repository identity
 
@@ -41,7 +41,7 @@ directory tree on Data and not inside any user's home. There is no intermediate 
 layout root:
 
 ```
-/private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (see "Dedicated volumes")
+/private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (see "Dedicated store volume")
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
   host.json                          # host configuration: mount root, credential routes
   .staging/                          # port-block reservations held while a workspace's grants are minted
@@ -89,7 +89,7 @@ layout root:
       <workspaceIncarnation>.sock    # bind-mounted into exactly one attached workspace; absent after detach/restore fence
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
-  (rebuildable caches live on the sibling `/private/cowshed/caches` volume, not beneath this tree)
+  (rebuildable caches are not beneath this tree: each tool keeps its own in the host HOME; see 03_caches.md)
   (workspaces mount under a host-configured mount root — default `~/.cowshed/mnt`; see 02_workspaces.md)
 ```
 
@@ -117,18 +117,20 @@ Sidecar suffixes append to the complete image filename (`<workspace>.asif.grants
 metadata is optional and platform-specific: it is present only for macOS workspaces and is omitted on Linux; Linux does
 not synthesize a base port in persistent metadata.
 
-The Data-volume footprint is limited to the two empty `/private/cowshed/{store,caches}` mountpoint directories and the
-per-user workspace mount root (default `~/.cowshed/mnt`). Durable evidence and rebuildable cache churn live on the
-dedicated volumes, outside Data's snapshots, backups, and fsck domain.
+The Data-volume footprint is limited to the empty `/private/cowshed/store` mountpoint directory, the per-user workspace
+mount root (default `~/.cowshed/mnt`), and cowshed's user cache directory `~/Library/Caches/dev.cowshed`, which holds
+the gateway's registry and repository mirrors. Durable evidence lives on the dedicated store volume, outside Data's
+snapshots, backups, and fsck domain. Layer-3 caches belong to the tools and stay where the tools keep them in HOME
+(03_caches.md).
 
 ### Two `.cowshed` namespaces
 
-The name appears in two namespaces that must not be confused. **Host-absolute `/private/cowshed/{store,caches}`** exists
-once — the herd's store volume holds images, grants, and telemetry, while the cache volume holds rebuildable shared
-caches. **In-image relative `.cowshed/`** exists once _per workspace_, at each workspace volume root — the marker,
-token, CA certificate, in-image cache roots, and job spools — and travels with every clone. The wiring rule follows the
-split: shared state resolves to the appropriate host-absolute `/private/cowshed/{store,caches}/...` path (the same
-string in every context), while workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in
+The name appears in two namespaces that must not be confused. **Host-absolute `/private/cowshed/store`** exists once —
+the herd's store volume holds images, grants, and telemetry. **In-image relative `.cowshed/`** exists once _per
+workspace_, at each workspace volume root — the marker, token, CA certificate, in-image cache roots, and job spools —
+and travels with every clone. The wiring rule follows the split: shared state resolves to a host-absolute path — under
+`/private/cowshed/store/...`, or a shared cache's own directory in the host HOME (03_caches.md) — that is the same
+string in every context, while workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in
 every clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
 
 ## Images
@@ -216,9 +218,9 @@ every clone automatically). Main and sessions use identical wiring; only the san
   `nobrowse` mount is not indexed (measured: no `.Spotlight-V100` store appears after writes, and `mdutil -s` reports no
   indexing state). A `--browse` mount is an ordinary visible volume to Spotlight.
 - **Time Machine**: nothing to set. Backup policy is one per-volume decision, not path exclusions, and Time Machine
-  already leaves both volumes out: measured on macOS 26.6,
-  `tmutil isexcluded /private/cowshed/store /private/cowshed/caches` reports both `[Excluded]` though cowshed applies no
-  exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never backup.
+  already leaves the store volume out: measured on macOS 26.6, `tmutil isexcluded /private/cowshed/store` reports
+  `[Excluded]` though cowshed applies no exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never
+  backup.
 
 ### Format measurements
 
@@ -484,27 +486,27 @@ What follows: volume labels are free to be plain, and manual renaming is harmles
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact
 within one project, but that key is computed from metadata on both sides and never read back off a volume.
 
-## Dedicated volumes
+## Dedicated store volume
 
-All cowshed bytes live on two dedicated APFS volumes, split by **rebuildability class**, so the Data volume carries no
-cowshed churn at all:
+All of cowshed's durable bytes live on one dedicated APFS volume, so the Data volume carries no image or store churn:
 
-- **`cowshed.caches`**, mounted at `/private/cowshed/caches` — everything rebuildable. Layout:
-  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state}}` (see
-  03_caches.md). `repo-mirrors/` holds bare git mirrors (`<host>/<org>/<repo>.git`) — written only by the gateway via
-  `cowshed repo mirror`, sandbox-read-only, and distinct from Cargo's shared writable `cargo/git` cache. Because nothing
-  unique lives here, the nuclear recovery path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror
-  refetches, sccache and registries rebuild. `cowshed doctor` offers it as the fix for cache-volume corruption;
-  `cowshed gc` never needs more than it.
 - **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config
   and audit, telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves
   (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions →
   checkpoints and trash renames all stay within `cowshed.store`.
 
-Both volumes are created once by explicit foreground `cowshed setup`
-(`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`) and share the container's
-free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
-provisioning authorization session described in 14_nix.md.
+Rebuildable caches do not live on it. Each tool's cache stays at the tool's own default in the host HOME; the gateway's
+npm mirror and bare repository mirrors live in cowshed's user cache directory, `~/Library/Caches/dev.cowshed/mirror` and
+`~/Library/Caches/dev.cowshed/repo-mirrors`, written only by the gateway and readable by no sandbox; sccache's store is
+sccache's own default directory, written only by its daemon. 03_caches.md gives the placement rule and how sandboxes
+reach each cache. A host that still has the `cowshed.caches` volume of an earlier release keeps it mounted, encrypted,
+and pinned by the same machinery below — never creating one — until `cowshed setup --retire-caches-volume` deletes it
+(03_caches.md, "Retiring the caches volume").
+
+The store is created once by explicit foreground `cowshed setup`
+(`diskutil apfs addVolume <container> APFS cowshed.store -nomount`) and shares the container's free-space pool — no
+sizing. The complete create/mount/pin transaction uses the one provisioning authorization session described in
+14_nix.md.
 
 Host-storage planning takes its APFS listing from the kernel, never from `diskutil apfs list`. One IORegistry snapshot
 names every container (BSD name, capacity ceiling) and every volume (BSD name, name, volume UUID); the kernel mount
@@ -518,30 +520,29 @@ an empty root while an unrelated image detached; the registry has no such transi
 somewhere other than its canonical path is attested by `statfs` at that path before it is reported as mis-mounted.
 
 The registry's per-volume `Encrypted` property is not FileVault — the Data volume is encrypted without FileVault — and
-no kernel property reports FileVault. FileVault state is therefore read, only for the selected reserved `cowshed.store`
-/ `cowshed.caches` records, from one `diskutil info -plist <identifier>` each. That answer is accepted only when its
-`DeviceIdentifier`, `VolumeUUID`, `APFSContainerReference`, and `VolumeName` all match the kernel record and it states
-`FileVault` as a boolean; an empty, foreign, unreadable, or silent answer fails closed. It is per-volume crypto
-metadata, never a listing and never a global query. The execution-time pre-create recheck inside the authorization
-session reads a fresh kernel snapshot the same way, and an unreadable or empty snapshot refuses the create.
+no kernel property reports FileVault. FileVault state is therefore read, only for the selected reserved-name records,
+from one `diskutil info -plist <identifier>` each. That answer is accepted only when its `DeviceIdentifier`,
+`VolumeUUID`, `APFSContainerReference`, and `VolumeName` all match the kernel record and it states `FileVault` as a
+boolean; an empty, foreign, unreadable, or silent answer fails closed. It is per-volume crypto metadata, never a listing
+and never a global query. The execution-time pre-create recheck inside the authorization session reads a fresh kernel
+snapshot the same way, and an unreadable or empty snapshot refuses the create.
 
-**Boot mounting is owned by a root system LaunchDaemon, and both volumes are FileVault-encrypted.** At provision, the
-same authorization session:
+**Boot mounting is owned by a root system LaunchDaemon, and the store is FileVault-encrypted.** At provision, the same
+authorization session:
 
-1. Creates absent volumes (`diskutil apfs addVolume … -nomount`) or mounts already-created ones at their canonical
-   paths. Existing volumes are never deleted.
+1. Creates the store when absent (`diskutil apfs addVolume … -nomount`) or mounts an already-created one at its
+   canonical path. An existing store is never deleted.
 2. Encrypts each volume that is not already FileVaulted, in place:
    `diskutil apfs encryptVolume <uuid> -user disk -stdinpassphrase` after it is mounted. A 32-character random
    passphrase per volume is stored in `/Library/Keychains/System.keychain` (`add-generic-password -a <label> -s <label>`
-   with label `cowshed.store` / `cowshed.caches`, ACL limited to `/usr/bin/security` and the APFS user agents). A volume
-   that is already FileVaulted without a usable keychain item fails closed — setup does not invent a new password and
-   does not `deleteVolume`.
+   with label `cowshed.store`, ACL limited to `/usr/bin/security` and the APFS user agents). A volume that is already
+   FileVaulted without a usable keychain item fails closed — setup does not invent a new password and does not
+   `deleteVolume`.
 3. Appends one idempotent, comment-tagged fstab line per volume:
 
 <!-- prettier-ignore -->
 ```
 UUID=<store-uuid>  /private/cowshed/store   apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.store
-UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.caches
 ```
 
 4. Installs and loads `dev.cowshed.storage` (`/Library/LaunchDaemons/dev.cowshed.storage.plist`) running a fixed
@@ -554,57 +555,57 @@ UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noow
 UUID form is mandatory because labels are mutable (the same lesson nix-installer learned in
 DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from racing the credentialed remounter — Disk
 Arbitration cannot supply System.keychain secrets. The script lives outside every user home and cowshed volume, so it
-unlocks and mounts both volumes before login without depending on the cowshed binary or its version. `nobrowse` keeps
-both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
+unlocks and mounts the store before login without depending on the cowshed binary or its version. `nobrowse` keeps the
+store out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
 
 **`noowners` is deliberate.** The herd is machine-global and shared by every local account: with ownership honoring off,
 every user sees the same bytes as their own, which is exactly right for git checkouts (git tracks mode bits, never
-owners) and rebuildable caches. It also removes the entire class of "mounted by another uid" classification failures.
-FileVault here is at-rest protection for a stolen disk, not isolation between local accounts. The trust consequence is
-stated plainly: any local user can read or write anything on either volume once it is mounted. Cowshed is for machines
-whose local accounts trust each other; stronger isolation is a different product.
+owners). It also removes the entire class of "mounted by another uid" classification failures. FileVault here is at-rest
+protection for a stolen disk, not isolation between local accounts. The trust consequence is stated plainly: any local
+user can read or write anything on the store once it is mounted. Cowshed is for machines whose local accounts trust each
+other; stronger isolation is a different product.
 
-If either dedicated volume is absent, unencrypted, missing its System.keychain item, or the mountpoint holds anything
-other than a reclaimable stub, existing-only commands fail before mutation with `environment-missing` and an explanation
-of exactly which volumes are missing, detached, unencrypted, or mis-mounted. A volume mounted anywhere but its canonical
-root — `/Volumes/<name>`, say — is **mis-mounted**, not missing. `cowshed doctor` reports the observed and canonical
-paths and prescribes `cowshed setup`; setup announces the complete repair — including in-place encryption of an existing
+If the store volume is absent, unencrypted, missing its System.keychain item, or its mountpoint holds anything other
+than a reclaimable stub, existing-only commands fail before mutation with `environment-missing` and an explanation of
+exactly what is missing, detached, unencrypted, or mis-mounted. A volume mounted anywhere but its canonical root —
+`/Volumes/<name>`, say — is **mis-mounted**, not missing. `cowshed doctor` reports the observed and canonical paths and
+prescribes `cowshed setup`; setup announces the complete repair — including in-place encryption of an existing
 unencrypted volume — opens one authorization session, and converges mounts, FileVault, keychain, fstab, and the boot
 daemon.
 
 **`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
-provision absent volumes, repair detached or mis-mounted ones, encrypt unencrypted ones in place, store passphrases,
-validate markers, pin fstab, and converge the boot mount LaunchDaemon — reporting each volume's observed state and the
-action taken. Storage-error hints across the CLI point at `cowshed setup`, never at adopting a directory. Diagnosis is
-canonical: the same volume evidence yields the same verdict regardless of incidental mountpoint contents, and
-reclaimable stubs are enumerated (by name) and reclaimed, not treated as fatal masking. A volume that exists but carries
-a wrong or missing marker is reported precisely (role, expected versus observed); it is never silently re-provisioned,
-because re-provisioning means deleteVolume. `--uninstall` removes fstab pins, the system daemon and script, user agents,
-installed binaries, and both System.keychain items; it never deletes a volume.
+provision an absent store, repair a detached or mis-mounted volume, encrypt an unencrypted one in place, store
+passphrases, validate markers, pin fstab, and converge the boot mount LaunchDaemon — reporting each volume's observed
+state and the action taken. Storage-error hints across the CLI point at `cowshed setup`, never at adopting a directory.
+Diagnosis is canonical: the same volume evidence yields the same verdict regardless of incidental mountpoint contents,
+and reclaimable stubs are enumerated (by name) and reclaimed, not treated as fatal masking. A volume that exists but
+carries a wrong or missing marker is reported precisely (role, expected versus observed); it is never silently
+re-provisioned, because re-provisioning means deleteVolume. `--uninstall` removes fstab pins, the system daemon and
+script, user agents, installed binaries, and cowshed's System.keychain items; it never deletes a volume.
 
-**Mount ordering and the unmounted-masking guard.** Store and caches are sibling mountpoints on Data; neither canonical
-root depends on the other, and each root's `.cowshed-volume.json` marker distinguishes a mounted cowshed volume from its
-bare mountpoint directory. launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either
-mountpoint, so a reboot cannot recreate a masking stub. What does land on a bare mountpoint before its volume is mounted
-— the sccache agent's socket and compile cache, the gateway heal's directory-only `mnt/` scaffolding, Finder's
-`.DS_Store`, empty directories — is reclaimed before remount; any other entry keeps the mountpoint masked.
+**Mount ordering and the unmounted-masking guard.** The store's mountpoint is a plain directory on Data, and its root's
+`.cowshed-volume.json` marker distinguishes the mounted cowshed volume from that bare directory. launchd agents write
+pre-tracer stderr under `~/Library/Logs/cowshed/`, never under the mountpoint, so a reboot cannot recreate a masking
+stub. What does land on a bare mountpoint before its volume is mounted — the sccache agent's socket and compile cache,
+the gateway heal's directory-only `mnt/` scaffolding, Finder's `.DS_Store`, empty directories — is reclaimed before
+remount; any other entry keeps the mountpoint masked.
 
-Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
+Why a volume and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
-backup, not snapshotting). Dedicated volumes get no local snapshots, collapse backup policy to one per-volume decision,
-isolate fsck domains and corruption blast radius (cache loss = re-download; store loss = WIP since last autosave; Data
-untouched either way), and leave the only volume with sandbox-writable subtrees — the caches volume — holding nothing
-precious.
+backup, not snapshotting). A dedicated volume gets no local snapshots, collapses backup policy to one per-volume
+decision, and isolates the fsck domain and corruption blast radius (store loss = WIP since last autosave; Data untouched
+either way). Rebuildable caches are not images: they stay at the tools' own defaults in HOME, where the host's own
+builds already keep them (03_caches.md).
 
 ### One herd, multiple users
 
-There is one cowshed per machine, anchored to no account. `/private/cowshed/{store,caches}` are plain directories on
-Data created once at provision; they exist only as mountpoints and fstab targets. The per-user convenience is a
-`~/.cowshed/mnt` workspace mount root (plain directories on Data), configurable at setup. No cowshed evidence, sandbox
-profile, or metadata path derives from `$HOME`. Workspace images remain on the store volume while their live mounts
-appear under `<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing;
-concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and cross-user `gc`
-policy is deliberately blunt: any user may retire any shed, because `noowners` already made the trust model explicit.
+There is one cowshed per machine, anchored to no account. `/private/cowshed/store` is a plain directory on Data created
+once at provision; it exists only as a mountpoint and fstab target. The per-user convenience is a `~/.cowshed/mnt`
+workspace mount root (plain directories on Data), configurable at setup. No cowshed evidence, sandbox profile, or
+metadata path derives from `$HOME`. Workspace images remain on the store volume while their live mounts appear under
+`<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing; concurrent
+multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and cross-user `gc` policy is
+deliberately blunt: any user may retire any shed, because `noowners` already made the trust model explicit.
 
 ## Runtime state: derived, never stored
 
@@ -757,17 +758,18 @@ a shared namespace where Finder surfaces them and name collisions get renamed (`
 gives short, stable, hidden paths cowshed fully owns.
 
 **`~/Library/Application Support` rejected.** The Apple-idiomatic location puts multi-GB churning images on the Data
-volume, where local snapshots pin their rewritten blocks and backup policy needs per-path exclusion machinery. Two
-dedicated volumes cost nothing (container space-sharing) and reduce cowshed's `~/Library` footprint to the launchd
-plists that must live there.
+volume, where local snapshots pin their rewritten blocks and backup policy needs per-path exclusion machinery. A
+dedicated volume costs nothing (container space-sharing) and keeps every image, grant, and telemetry segment out of
+`~/Library`.
 
 **A sub-mountpoint below the store root rejected.** The store volume mounts at `/private/cowshed/store` itself, not at a
 directory beneath a Data-volume wrapper: one empty mountpoint inode on Data, no wrapper level that means nothing to
 users, and every path one level shorter. The costs — mount ordering and the bare-directory guard above — are machinery
 `attach` already had for the workspaces.
 
-**Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container
-volumes already pool free space, and the reflink boundary that matters is the image's _inner_ filesystem — clonefile
-cannot cross it regardless of where the image file sits (the wall 03_caches.md's reflink-reachability rule names). The
-only same-volume relationship images need is with each other. Merging would also destroy the caches volume's defining
-property — that deleting it is always safe.
+**Caches beside the images rejected.** Co-locating caches with images on the store unlocks no additional sharing: the
+reflink boundary that matters is the image's _inner_ filesystem — clonefile cannot cross it regardless of which volume
+the cache or the image file sits on (the wall 03_caches.md's reflink-reachability rule names). The only same-volume
+relationship images need is with each other. Layer-3 caches therefore stay at the tools' own defaults in HOME, where the
+host's own builds already use them; 03_caches.md ("A dedicated caches volume rejected") explains why they get no volume
+of their own either.

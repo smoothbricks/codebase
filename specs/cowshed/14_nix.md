@@ -1,18 +1,16 @@
 # Declarative Host Setup
 
-cowshed's host-side setup — cache-subtree symlinks, launchd agents, tool defaults, backup exclusions — is a handful of
-imperative mutations of `$HOME`. On nix hosts those mutations belong to the user's configuration, not to `adopt`: this
-spec defines the home-manager module that owns them, the detection that switches cowshed from _mutating_ to
-_validating_, and the deployment postures (which uid runs all of this). The NixOS sibling for CI runners is
-`services.cowshed-runner` (10_ci.md); this file is its workstation counterpart.
+cowshed's host-side setup — launchd agents, tool defaults, backup exclusions — is a handful of imperative mutations of
+`$HOME`. On nix hosts those mutations belong to the user's configuration, not to `adopt`: this spec defines the
+home-manager module that owns them, the detection that switches cowshed from _mutating_ to _validating_, and the
+deployment postures (which uid runs all of this). The NixOS sibling for CI runners is `services.cowshed-runner`
+(10_ci.md); this file is its workstation counterpart.
 
 ## `programs.cowshed` (home-manager)
 
 ```nix
 programs.cowshed = {
   enable = true;               # puts the cowshed binary in home.packages
-  relocations = true;          # cache-subtree symlinks: ~/.cargo/{registry,git}, ~/.cache/zig, ~/.gradle/caches,
-                               #   ~/.cache/nix, ~/.local/state/nix → /private/cowshed/caches/… (03_caches.md table)
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
   sccache.launchd = true;      # dev.cowshed.sccache LaunchAgent: host-owned foreground sccache UDS server
                                #   (03_caches.md "The sccache daemon"); imperative counterpart: cowshed sccache start
@@ -21,9 +19,11 @@ programs.cowshed = {
 };
 ```
 
-With the module enabled, cowshed's last `~/Library` residue (the launchd plists) becomes a home-manager generation —
-declared, rollbackable, never drifting. Combined with the store volume mounted at `/private/cowshed/store`
-(01_storage.md), the Data-volume home footprint is: one empty mountpoint directory, plus HM-managed artifacts.
+With the module enabled, cowshed's launchd plists become a home-manager generation — declared, rollbackable, never
+drifting. Combined with the store volume mounted at `/private/cowshed/store` (01_storage.md), the Data-volume home
+footprint is: one empty mountpoint directory, HM-managed artifacts, cowshed's own support and cache directories
+(`~/Library/Application Support/dev.cowshed`, `~/Library/Caches/dev.cowshed`: installed service binaries, the sccache GC
+root, the gateway's mirrors), and the layer-3 caches the tools already keep at their own defaults (03_caches.md).
 
 On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI) installs the controller-side launcher
 and declares the dedicated connector uid/process restrictions and cgroup subtree. The launcher may enter the already
@@ -39,11 +39,11 @@ When home-manager owns the host setup, `adopt` and `setup` **validate and refuse
 not configured: HM-created symlinks resolve into `/nix/store` (verification item: confirm across HM's symlink strategies
 — `home.file` vs `mkOutOfStoreSymlink`). Per artifact:
 
-| Artifact                | HM-owned (declarative)                                                   | Unowned (imperative fallback)      |
-| ----------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
-| Cache-subtree symlinks  | validate targets; `doctor` → `next: enable programs.cowshed.relocations` | `adopt` writes them (03_caches.md) |
-| launchd agents          | validate loaded; `doctor` → `next:` the HM option                        | `adopt` installs plists            |
-| Linux connector runtime | validate launcher identity/cgroup; `doctor` → `next:` the module option  | `adopt` refuses until installed    |
+| Artifact                            | HM-owned (declarative)                                                          | Unowned (imperative fallback)               |
+| ----------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------- |
+| Link into the retired caches volume | a conflict naming the module option that declares it; `setup` never rewrites it | `setup` moves the bytes home (03_caches.md) |
+| launchd agents                      | validate loaded; `doctor` → `next:` the HM option                               | `adopt` installs plists                     |
+| Linux connector runtime             | validate launcher identity/cgroup; `doctor` → `next:` the module option         | `adopt` refuses until installed             |
 
 `doctor` findings in declarative mode always name the nix option, never a mutating command — the self-driving contract
 (06_cli.md) pointed at configuration instead of side effects.
@@ -63,10 +63,10 @@ declarative remediation hint, never an imperative fallback derived from a checko
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is
 capability-fenced further: only an explicit, foreground `cowshed setup` or `cowshed adopt` (which runs the same host
 setup first) uses provisioning mode and may cause the one-time macOS administrator authorization prompt that creates
-`cowshed.store` and `cowshed.caches`. All other commands and every launchd/background service use existing-only mode.
-They may validate filesystem, `diskutil`, mount, and marker evidence, reclaim a launchd StandardErrorPath stub, and
-remount an already-created cowshed volume at its canonical `-nobrowse` path. A plan that would create a volume, write a
-marker, or otherwise require authorization is rejected before executor dispatch with `environment-missing` and
+`cowshed.store`. All other commands and every launchd/background service use existing-only mode. They may validate
+filesystem, `diskutil`, mount, and marker evidence, reclaim a launchd StandardErrorPath stub, and remount an
+already-created cowshed volume at its canonical `-nobrowse` path. A plan that would create a volume, write a marker, or
+otherwise require authorization is rejected before executor dispatch with `environment-missing` and
 `next: cowshed setup`. Per-project/per-workspace artifacts live inside cowshed's volumes, not `$HOME`; there is nothing
 for a dotfile generation to own. Trusted repository bindings and policy are the exception: despite living under the
 cowshed volume, they remain host-bootstrap-owned and outside workspace authority.
@@ -92,7 +92,7 @@ confinement ceiling 00_overview.md documents.
 
 ### Posture B — dedicated `dev` uid (recommended hardening)
 
-The entire cowshed stack belongs to a second macOS account `dev`: both volumes (owned by dev's uid), the gateway and its
+The entire cowshed stack belongs to a second macOS account `dev`: the store volume (owned by dev's uid), the gateway and
 Keychain items, the launchd jobs, the home-manager generation, every editor backend and agent. What it buys:
 
 - a **kernel uid boundary outside Seatbelt** that covers exactly the surfaces Seatbelt doesn't — unsandboxed main and
@@ -125,10 +125,10 @@ services.cowshed = {            # nix-darwin sibling of programs.cowshed
 };
 ```
 
-home-manager keeps owning dev's _home_ artifacts (relocations, go defaults, dotfiles); nix-darwin owns the daemons. One
-wrinkle, stated honestly: dev's **login keychain is not auto-unlocked** without a login session — the first dev shell
-(or an explicit `cowshed unlock`) unlocks it, and the gateway defers Keychain reads until then (mirror cache hits and
-unauthenticated upstreams work before unlock; credentialed flows queue a clear exit-5 hint).
+home-manager keeps owning dev's _home_ artifacts (dotfiles); nix-darwin owns the daemons. One wrinkle, stated honestly:
+dev's **login keychain is not auto-unlocked** without a login session — the first dev shell (or an explicit
+`cowshed unlock`) unlocks it, and the gateway defers Keychain reads until then (mirror cache hits and unauthenticated
+upstreams work before unlock; credentialed flows queue a clear exit-5 hint).
 
 These daemons always enter cowshed through the existing-only runtime API. Boot or login remounts already-created volumes
 and reclaims a leftover launchd stub; that never opens an administrator authorization dialog. Volume creation still
@@ -246,10 +246,11 @@ remote-backend shell or explicit uid switch is fine and expected.
 
 ## Tradeoffs
 
-**Imperative-only host setup rejected.** cowshed symlinking `~/.cargo/registry` on a home-manager host is exactly the
-out-of-band drift HM users adopted HM to eliminate; the next `home-manager switch` may fight it. Dual-mode costs one
-detection check and keeps both audiences: nix hosts get generation-owned state, everyone else relocates with one
-explicit `cowshed setup --imperative-host-setup`.
+**Imperative-only host setup rejected.** cowshed writing its own LaunchAgent plists on a home-manager host is exactly
+the out-of-band drift HM users adopted HM to eliminate; the next `home-manager switch` may fight it. Dual-mode costs one
+detection check and keeps both audiences: nix hosts get generation-owned state, everyone else gets the same agents from
+`cowshed gateway start` and `cowshed sccache start`. Layer-3 caches need neither mode: they stay at the tools' own
+defaults, where no module and no command has to place them (03_caches.md).
 
 **Fixed shared path rejected** (see Deployment postures): a group-writable shared state root breaks the 0600
 controller-owned policy and grant model and Keychain scoping for no gain — the uid boundary is the point of posture B,

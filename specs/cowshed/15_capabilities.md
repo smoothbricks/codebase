@@ -7,9 +7,9 @@ hooks.
 ## Detection inputs
 
 Detection reads convention markers inside the workspace, never an enclosing checkout or the operator's shell
-environment. Its input is the workspace mount, command cwd, host home, shared-cache root, private environment root,
-short runtime directory, and optional public gateway trust bundle. Paths derive from those inputs; secrets and ambient
-PATH are not detection inputs.
+environment. Its input is the workspace mount, command cwd, host home, main's `[caches] home` entries (below), private
+environment root, short runtime directory, and optional public gateway trust bundle. Paths derive from those inputs;
+secrets and ambient PATH are not detection inputs.
 
 Project-scoped detectors inspect the workspace root, or the contained relative directory selected by that capability's
 override. A tool invoked through a task runner gets the same cache and daemon authority as one invoked directly. There
@@ -49,8 +49,8 @@ independent Cargo workspaces, so a root-only detector misses build state.
 
 Go likewise detects any git-tracked `go.mod` in the selected tree; its directory override narrows that snapshot.
 **Why**: monorepos keep Go modules nested under `packages/`. A root-only detector missed those modules and broke
-sandboxed Go checks because the sandbox could not write `/private/cowshed/caches/go`. Cargo, Go and sccache share one
-lazy tracked-manifest snapshot per detector loop, with no recursive walk and no extra Git query.
+sandboxed Go checks because the sandbox could not write Go's shared module cache. Cargo, Go and sccache share one lazy
+tracked-manifest snapshot per detector loop, with no recursive walk and no extra Git query.
 
 Cargo runs `cargo metadata --no-deps --offline --format-version 1` once per root exactly as a Cargo job of the workspace
 runs: sandboxed in the executed-child profile, from the job environment, after the workspace shell's activation inside
@@ -96,11 +96,16 @@ Each detector returns data through one `CapabilityContribution`:
 - **Filesystem grants:** exact paths or subtrees, with read or read/write access. Grants pass through the same
   protected-path validation as the core sandbox. Detection never grants host credentials, binaries' parent homes, a
   sibling workspace or cowshed controller state.
-- **Cache mounts:** a shared cache source, optional private-environment link target, and any host-cache relocation
-  descriptor. The same descriptor supplies environment, preparation and sandbox authority; no second table owns cache
-  permissions. Only detected capabilities use their cache mounts. Without provisioned shared caches a tool uses private
-  state — except a link-target cache (Bun's install cache, 03_caches.md): checkouts write its path into their links, so
-  its variable always names the host's literal path, read-only until host setup relocates it.
+- **Shared caches:** host cache directories (`SharedCache`), each with an optional private-environment link. A detector
+  names its tool's cache once, as a `SharedToolHome`: the variable that points a child at it, for a tool that reads one;
+  the tool's own default beneath HOME (03_caches.md); and whether that whole directory is the cache or only named
+  subdirectories are, with the root state files the tool writes beside them. `add_shared_tool_home` derives the owned
+  variable, the cache directories, the split root's literal read and the state files' read-write literals from it; no
+  second table owns cache permissions. The supervisor creates every cache directory before a child runs and links it
+  from its private path when the tool finds it there rather than through a variable (Nix's XDG cache and state, Gradle's
+  `caches` under a private `GRADLE_USER_HOME`). The sandbox grants each read-write as a subtree with metadata-only
+  ancestors, and refuses one that is HOME itself, lies outside HOME, or intersects a protected path or cowshed
+  controller state. Only detected capabilities' caches and main's `[caches] home` entries are shared.
 - **Build state:** `BuildStatePath` pairs a normalized checkout-relative tool path with its normalized volume-relative
   destination (16_build_volumes.md). Overlapping contributions fail; identical ones coalesce. The storage implementation
   applies fixed relative links through the checkout's one `.cowshed/build` link.
@@ -124,17 +129,15 @@ Each detector returns data through one `CapabilityContribution`:
 - **Shell activation:** an optional contained direnv directory. Absence leaves the ordinary sandbox environment and
   supports argv and script jobs.
 
-Host setup can relocate declared cache descriptors globally so host checkouts and clones retain identical cache path
-spellings. Descriptor declarations live with their detectors; host preparation does not enable a capability in a
-repository. Cargo's cache locks remain part of its detector's host relocation operation. A relocated descriptor's
-variable names the host path, which resolves to the shared cache: a sandboxed `bun install` extracts into
-`/private/cowshed/caches/bun/install/cache` through `~/.bun/install/cache`, as cargo's registry and Go's `GOCACHE` land
-there.
+Shared caches stay at each tool's own default in the host HOME, so host checkouts and clones reach the same bytes
+through identical path spellings with no host-side relocation: a sandboxed `bun install` extracts into
+`~/.bun/install/cache`, the path every checkout's `node_modules/.bun` links name, as cargo's registry and Go's `GOCACHE`
+land at their own defaults. Cache declarations live with their detectors; host preparation does not enable a capability
+in a repository.
 
-Shared cache mounts grant metadata-only access to their physical ancestors, after the store-wide deny. Cargo/libgit2
-canonicalizes a newly fetched Git cache path; a writable cache subtree is insufficient when `/private/cowshed` itself
-cannot be inspected. This authority comes from the cache mount, never an unrelated daemon socket, and does not allow
-reading or writing controller state.
+A shared cache's ancestors get metadata-only access after the HOME read deny. Cargo/libgit2 canonicalizes a newly
+fetched Git cache path; a writable cache subtree is insufficient when its parents cannot be inspected. This authority
+comes from the shared cache itself, never an unrelated daemon socket, and does not allow listing or reading HOME.
 
 ## Ordering and conflicts
 
@@ -145,10 +148,10 @@ launched.
 Cowshed core reserves HOME, XDG roots, TMPDIR, PATH, workspace token/port variables, gateway routing, isolated Git
 identity and controller-owned Git configuration. A detector attempting to own a reserved variable fails. Two detectors
 contributing different actions or values to the same variable fail with both capability names and the variable;
-byte-identical contributions coalesce. Identical grants, mounts, bootstrap entries and isolation paths coalesce. A
-read/write subtree subsumes a read grant only within the same validated path. Conflicting link targets fail rather than
-depending on order. Capability grants never override immutable denies. Read-only jobs keep source files read-only while
-sharing the checkout's writable build volume and Nx daemon/socket, not a private second Nx state.
+byte-identical contributions coalesce. Identical grants, shared caches, bootstrap entries and isolation paths coalesce.
+A read/write subtree subsumes a read grant only within the same validated path. Conflicting link targets fail rather
+than depending on order. Capability grants never override immutable denies. Read-only jobs keep source files read-only
+while sharing the checkout's writable build volume and Nx daemon/socket, not a private second Nx state.
 
 ## Explicit overrides
 
@@ -162,6 +165,14 @@ Directory overrides also root repository-relative contribution paths at that dir
 and inherited `.nx` rendezvous directory follow the selected Nx directory. Private environment state remains scoped to
 the whole sandbox. Credential and controller-state denies remain unconditional core policy even when the corresponding
 tool capability is absent.
+
+`[caches] home = ["<path relative to HOME>", …]` in main's `.cowshed.toml` declares caches a repository's own tooling
+places beneath HOME that no detector names, such as a compiler plugin cache. It is trusted only from main, exactly like
+`[sandbox] deny`; a workspace's copy is the agent's to edit and is never read for it. Each entry is a non-empty path of
+plain components and joins the merged contribution as a shared cache at `<host home>/<path>`, linked from
+`<private HOME>/<path>`, so a tool resolving `$HOME/<path>` reaches the same bytes on the host and in every sandbox. An
+entry that reaches a protected path is refused like any shared cache. A repository that declares none shares nothing
+beyond its detectors' caches.
 
 ## Required evidence
 

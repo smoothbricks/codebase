@@ -16,10 +16,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Profile specificity and ordering invariant (layered)**: an explicit broad `allow file-read-data` defeats a later
   wildcard `deny file-read*`; read denials must name `file-read-data` explicitly (04_sandbox.md). Every generated
   profile MUST also emit its four layers in order: broad allows → the `/private/cowshed/store` volume-wide deny → scoped
-  carve-backs (caches read, designated cache-subtree writes, own mount) → secret denies (04_sandbox.md). This test
+  carve-backs (detected capabilities' shared caches and grants, own mount) → secret denies (04_sandbox.md). This test
   asserts the layer order structurally over generated grant sets AND by probe paths: grant file, CA key, sibling image,
-  sibling mount must resolve to deny; own mount and designated cache subtrees to allow; secret paths to deny regardless
-  of grants. Real Seatbelt probes must confirm data reads are denied, not merely that deny text occurs later in the
+  sibling mount must resolve to deny; own mount and detected shared caches to allow; secret paths to deny regardless of
+  grants. Real Seatbelt probes must confirm data reads are denied, not merely that deny text occurs later in the
   generated profile.
 - **Path policy**: cwd validation, `..`/symlink-shape normalization, workspace-name validation.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
@@ -198,9 +198,8 @@ The native inventory teardown regression runs the production read-only host-stor
 while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
 per-image lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A
 barrier starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home
-device and container must remain unchanged. The regression does not require machine-global
-`cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation remains a separate
-contract and still refuses missing storage.
+device and container must remain unchanged. The regression does not require machine-global `cowshed.store` installation
+on an ephemeral runner. Installation validation remains a separate contract and still refuses missing storage.
 
 Real teardown also produces a nonempty global plist containing a container dictionary with only `ContainerReference`.
 Read-only planning reobserves that departing-container snapshot within the existing four-read bound, just as it does an
@@ -297,9 +296,9 @@ Covered flows:
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
   unchanged (01_storage.md, "Clone cost follows extents, not size");
-- attach healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
-  volumes (lazy recreate + canonical-flag remount, 01_storage.md), stub `.envrc`;
-- lazy volume creation at adopt: both dedicated volumes created idempotently before the first image;
+- attach healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` volume (lazy recreate +
+  canonical-flag remount, 01_storage.md), stub `.envrc`;
+- lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
 - gc: trash drain, checkpoint pruning, orphan mountpoint removal;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT

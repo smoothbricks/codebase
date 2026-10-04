@@ -68,9 +68,9 @@ not a best-effort script:
    `/private/cowshed/store/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
    exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
    validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
-   applied otherwise — and both dedicated volumes exist: run the same host setup `cowshed setup` runs, which creates and
-   mounts the sibling volumes `cowshed.store` (at `/private/cowshed/store`) and `cowshed.caches` (at
-   `/private/cowshed/caches`; the volume marker in 01_storage.md) before any image is created.
+   applied otherwise — and the dedicated store volume exists: run the same host setup `cowshed setup` runs, which
+   creates and mounts `cowshed.store` at `/private/cowshed/store` (the volume marker in 01_storage.md) before any image
+   is created.
 2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) at its canonical name, `<owner>/<repo>/main.asif`,
    behind a fence: its complete sibling host sidecar is written first, in publication state `PendingFence`, which keeps
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
@@ -671,12 +671,13 @@ was removed or now names another repository, and follows one that moved servers.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself
-  with Keychain-held credentials into a bare mirror it owns at
-  `/private/cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`, writes one audit line, and returns the mirror path on
-  stdout. Mirrors are created by the gateway with its own config — no agent-writable git config is ever in the loop —
-  and are fetch-only, sandbox-read-only (01_storage.md, 05_gateway.md).
-- **`cowshed repo clone <url> [dir]`** — sugar: mirror, then a local `git clone --dissociate <mirror>` run inside the
-  sandbox.
+  with Keychain-held credentials into a bare mirror it owns under cowshed's user cache directory,
+  `~/Library/Caches/dev.cowshed/repo-mirrors/` (Linux `$XDG_CACHE_HOME/cowshed/repo-mirrors/`), writes one audit line,
+  and returns the mirror path on stdout. Mirrors are created by the gateway with its own config — no agent-writable git
+  config is ever in the loop — and are fetch-only and gateway-only: that directory is cowshed controller state, which no
+  sandbox can read or write (01_storage.md, 03_caches.md, 05_gateway.md).
+- **`cowshed repo clone <url> [dir]`** — sugar: mirror, then a host-side `git clone --dissociate <mirror>` into the
+  workspace, so the clone holds its own objects and the sandbox never reads the mirror.
 
 The project's own origin is just another mirror — mirroring it covers "the agent needs `refs/pull/123/head`". GitHub API
 operations (creating PRs, issues) are coordinator work in v1: they require credentials and therefore live outside the

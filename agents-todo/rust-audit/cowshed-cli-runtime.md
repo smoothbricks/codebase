@@ -318,8 +318,8 @@ uuid/path keep working if those fields stay on the struct.
   `CliService` impl is a thin `Coordinator` adapter plus exec presentation/timeout. Not a second orchestrator for
   project-scoped verbs.
 - `LANDING_TARGET_BRANCH` aliases `cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH` (`:1974`). `STORE_ROOT` /
-  `CACHES_ROOT` / `DEFAULT_IMAGE_CAPACITY` / `MOUNT_SERVICE_PLIST` / `RETIRED_LAYOUT_HINT` are imported, not recopied.
-  Tests at `:3442-3475` pin that.
+  `RETIRED_CACHES_MOUNTPOINT` (retirement only; `CACHES_ROOT` is gone) / `DEFAULT_IMAGE_CAPACITY` /
+  `MOUNT_SERVICE_PLIST` / `RETIRED_LAYOUT_HINT` are imported, not recopied. Tests at `:3442-3475` pin that.
 - `adopt_options` / `os_*` validate at the CLI boundary then fill core DTOs (`AdoptOptions`, `CreateOptions`,
   `PushOptions`, `ExecRequest`, …). Shapes are not restated as parallel structs. `ExecCommand` is CLI-only (timeout,
   session, background) wrapping `ExecRequest`.

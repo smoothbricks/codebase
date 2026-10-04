@@ -109,16 +109,17 @@ rules, start with [usage.md](usage.md).
 
 ## Where things live
 
-| What                                                                                                      | Where                                                                                  |
-| --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Images (main + workspaces + checkpoints)                                                                  | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)       |
-| Workspace mounts                                                                                          | `<mount-root>/<owner>/<repo>/<workspace>`                                              |
-| Adopted main mount                                                                                        | its original `<project-root>`                                                          |
-| Trusted project policy                                                                                    | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied) |
-| Repository binding                                                                                        | `/private/cowshed/store/<owner>/<repo>/repository.json`                                |
-| Shared writable build caches of detected tools (Cargo, Bun, npm, pnpm, uv, sccache, zig, Gradle, Go, Nix) | exact tool subdirectories under `/private/cowshed/caches`                              |
-| Gateway registry and repository mirrors                                                                   | `/private/cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only)     |
-| Host cache directories (Cargo, Bun, npm, pnpm, uv, zig, Gradle, Nix)                                      | symlinks into `/private/cowshed/caches` (`cowshed setup --imperative-host-setup`)      |
+| What                                                                                             | Where                                                                                                 |
+| ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Images (main + workspaces + checkpoints)                                                         | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)                      |
+| Workspace mounts                                                                                 | `<mount-root>/<owner>/<repo>/<workspace>`                                                             |
+| Adopted main mount                                                                               | its original `<project-root>`                                                                         |
+| Trusted project policy                                                                           | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied)                |
+| Repository binding                                                                               | `/private/cowshed/store/<owner>/<repo>/repository.json`                                               |
+| Shared writable build caches of detected tools (Cargo, Bun, npm, pnpm, uv, zig, Gradle, Go, Nix) | each tool's own default in your HOME (`~/.cargo/registry`, `~/.bun/install/cache`, `~/go/pkg/mod`, …) |
+| Repository-placed caches declared in main's `.cowshed.toml` `[caches] home`                      | the declared HOME-relative path (`~/<path>`), linked from each sandbox's private HOME                 |
+| sccache compile cache                                                                            | `~/Library/Caches/Mozilla.sccache` (daemon-owned, sandbox-denied)                                     |
+| Gateway registry and repository mirrors                                                          | `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}` (gateway-owned, sandbox-denied)                  |
 
 Before adoption, cowshed derives a stable lowercase `owner/repo` identity from configured remotes when the choice is
 unambiguous. The binding is recorded and revalidated whenever the project opens. Moving the checkout does not change the
@@ -134,25 +135,26 @@ retry without duplicating or wedging the operation.
 
 ## The cache model in one paragraph
 
-Downloads happen once, ever: registry artifacts the gateway mirrors are cached in `/private/cowshed/caches`, and the
-shared tool caches below keep what cargo and Go download. On macOS each workspace's clients use its own localhost
-`portBlock.base` as their proxy; on Linux, where no port block exists, proxy-aware clients — Bun, Cargo, Go and git —
-use `http://127.0.0.1:7644` inside their private netns. A trusted per-workspace connector forwards those bytes only to
-the mounted per-workspace Unix gateway socket, which remains the primary endpoint identity. Shared caches live under
-`/private/cowshed/caches`, and a sandbox writes only those of the tools its project uses (15_capabilities.md): Cargo
-uses distinct writable `cargo/{registry,git}` directories; Bun's global install cache is `bun/install/cache`; npm's is
-`npm` and pnpm's `pnpm/store`; uv's is `uv`; Go uses `go/{mod,build}`; Nix uses `nix/{cache,state}`; sccache, zig, and
-Gradle have named roots. `cowshed setup --imperative-host-setup` moves the host's own caches there and links them back,
-and from then on every sandbox uses the host's own paths — `CARGO_HOME=~/.cargo`,
-`BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`, `UV_CACHE_DIR=~/.cache/uv`. One literal path is what makes sharing work:
-cargo fingerprints a dependency by the absolute path of its source under `$CARGO_HOME`, so a clone's copied `target/`
-stays fresh only against the same path, and Bun's isolated linker writes its cache path into every `node_modules/.bun`
-link, so main's `node_modules` and every clone's resolve only against the same cache. A crate or package anything on the
-host has already downloaded installs offline in every workspace. Gateway artifacts are not tool caches: registry objects
-live under `mirror/` and bare repository mirrors under `repo-mirrors/`, both gateway-owned and read-only to workspaces.
-On declarative hosts, the system/home-manager module owns all relocations, including `~/.cache/nix → nix/cache` and
-`~/.local/state/nix → nix/state`; cowshed only validates them. `cowshed setup --imperative-host-setup` is an explicit
-exception for non-declarative hosts, never an automatic fallback after declarative validation fails.
+Downloads happen once, ever: registry artifacts the gateway mirrors are cached in `~/Library/Caches/dev.cowshed/mirror`,
+and the shared tool caches below keep what cargo and Go download. On macOS each workspace's clients use its own
+localhost `portBlock.base` as their proxy; on Linux, where no port block exists, proxy-aware clients — Bun, Cargo, Go
+and git — use `http://127.0.0.1:7644` inside their private netns. A trusted per-workspace connector forwards those bytes
+only to the mounted per-workspace Unix gateway socket, which remains the primary endpoint identity. Shared caches are
+the tools' own, each at its default in your HOME, and a sandbox writes only those of the tools its project uses
+(15_capabilities.md): Cargo's `~/.cargo/{registry,git}`, Bun's `~/.bun/install/cache`, npm's `~/.npm`, pnpm's
+`~/Library/pnpm/store`, uv's `~/.cache/uv`, Go's `~/go/pkg/mod` and `~/Library/Caches/go-build`, Zig's `~/.cache/zig`,
+Gradle's `~/.gradle/caches`, Nix's `~/.cache/nix` and `~/.local/state/nix`. The rest of HOME stays denied. Every sandbox
+uses the host's own paths — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`,
+`UV_CACHE_DIR=~/.cache/uv` — so the bytes a sandbox writes are the bytes your own `cargo`, `bun` or `go` reads next. One
+literal path is what makes sharing work: cargo fingerprints a dependency by the absolute path of its source under
+`$CARGO_HOME`, so a clone's copied `target/` stays fresh only against the same path, and Bun's isolated linker writes
+its cache path into every `node_modules/.bun` link, so main's `node_modules` and every clone's resolve only against the
+same cache. A crate or package anything on the host has already downloaded installs offline in every workspace. Gateway
+artifacts are not tool caches: registry objects live under `mirror/` and bare repository mirrors under `repo-mirrors/`,
+both written only by the gateway and unreachable from workspaces. Nothing is relocated or linked, so a declarative host
+has nothing to declare for these caches. A cache your repository's own tooling places, which no detector names, is
+shared by naming its HOME-relative path in main's `.cowshed.toml` — `[caches] home = [".cache/ttsc"]` — trusted only
+from main, like `[sandbox] deny`.
 
 ## Reusing compiled output across workspaces
 
@@ -215,16 +217,16 @@ Ask three questions of any build cache before sharing it between workspaces:
 2. Is a reused artifact still correct at a different path?
 3. Does one process own the store and its size cap?
 
-| Toolchain           | How it lands                                                                                                                                                                                                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. In a Go project (`go.mod` or `go.work`) every sandboxed job names both under `/private/cowshed/caches/go/{build,mod}` whenever that root exists.                                               |
-| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries, outside `node_modules` so installs stay lean. Cowshed has no ttsc capability, so a sandbox writes no shared ttsc root: keep the cache inside the checkout (`.cache/ttsc`), where every clone inherits main's warm copy through the image.                          |
-| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                                                     |
-| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A clone enters with the environment it copied only if that environment is free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose path names no checkout.                                                       |
-| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                                                        |
-| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                                                                                                                                                                             |
-| Nx                  | An Nx project (`nx.json`) has one `.nx/cache`, one `.nx/workspace-data` and one daemon/socket namespace across host, read-write and source-read-only jobs. Both state directories are fixed links into its private build volume. Caller Nx directory overrides never pass; inherited daemon records are deleted at fork. |
-| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                                            |
+| Toolchain           | How it lands                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. In a Go project (`go.mod` or `go.work`) every sandboxed job names both at the host's own Go defaults: `~/go/pkg/mod` and the user cache directory's `go-build` (`~/Library/Caches/go-build`).                                                                |
+| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries, outside `node_modules` so installs stay lean. Cowshed has no ttsc capability: point it at `$HOME/.cache/ttsc` and declare `[caches] home = [".cache/ttsc"]` in main's `.cowshed.toml` to share it from your HOME, or keep it inside the checkout (`.cache/ttsc`), where every clone inherits main's warm copy through the image. |
+| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                                                                                                                   |
+| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A clone enters with the environment it copied only if that environment is free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose path names no checkout.                                                                                                                     |
+| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                                                                                                                      |
+| Zig, Gradle         | Shared at the tools' own defaults, `~/.cache/zig` and `~/.gradle/caches`; the same three questions apply.                                                                                                                                                                                                                                                                              |
+| Nx                  | An Nx project (`nx.json`) has one `.nx/cache`, one `.nx/workspace-data` and one daemon/socket namespace across host, read-write and source-read-only jobs. Both state directories are fixed links into its private build volume. Caller Nx directory overrides never pass; inherited daemon records are deleted at fork.                                                               |
+| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                                                                                                          |
 
 ## Documentation
 

@@ -61,48 +61,49 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **Denial evidence, never string-sniffing**: exit/typed 6 is emitted only on authoritative evidence: pre-spawn
   validation, profile-application failure, gateway policy denial, or a verified kernel signal. Child output and bounded
   summaries never establish a denial or synthesize a grant.
-- **Layout — two dedicated volumes, zero `~/Library`** (except the launchd plists, which must live there;
-  home-manager-owned on nix hosts): `cowshed.store` mounted AT `~/.cowshed` (the dotdir IS the volume — no `store/`
-  level; images, grants, quarantine, gateway state, telemetry at the volume root) and `cowshed.caches` NESTED at
-  `~/.cowshed/caches` (mirror, git mirrors, layer-3 caches — fully rebuildable, nukeable). Both lazily created,
-  space-sharing the container; store mounts first (the other mountpoints live on it) and the volume-root marker
-  `.cowshed-volume.json` distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts
-  at `<mount-root>/<owner>/<repo>/<ws>` (the host-configured root defaults to `~/.cowshed/mnt`; primary `repo_id`, with
+- **Layout — one dedicated volume, zero `~/Library` for images** (except the launchd plists, which must live there,
+  home-manager-owned on nix hosts, and cowshed's own cache directory `~/Library/Caches/dev.cowshed` holding the gateway
+  mirrors): `cowshed.store` mounted AT `~/.cowshed` (the dotdir IS the volume — no `store/` level; images, grants,
+  quarantine, gateway state, telemetry at the volume root). Layer-3 caches stay at each tool's own default in the host
+  HOME (03_caches.md), so no caches volume is provisioned; an earlier release's `cowshed.caches` is emptied by
+  `cowshed setup` and deleted by `cowshed setup --retire-caches-volume`. The store is lazily created, space-sharing the
+  container; it mounts first (the workspace mountpoints live on it) and the volume-root marker `.cowshed-volume.json`
+  distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts at
+  `<mount-root>/<owner>/<repo>/<ws>` (the host-configured root defaults to `~/.cowshed/mnt`; primary `repo_id`, with
   each component separately validated and encoded; nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one
   empty mountpoint directory. Rationale: Data's local snapshots would pin churned image blocks (path-level tmutil
-  exclusion doesn't stop snapshotting); dedicated volumes also collapse backup policy to per-volume decisions and
-  separate fsck/corruption domains by rebuildability class. Sandbox consequence: ONE `~/.cowshed` subtree deny +
-  carve-backs replaces the enumerated store/sibling-mount denies (04_sandbox.md). Spec: 01_storage.md.
+  exclusion doesn't stop snapshotting); a dedicated volume also collapses backup policy to a per-volume decision and
+  separates the images' fsck/corruption domain. Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs
+  replaces the enumerated store/sibling-mount denies (04_sandbox.md). Spec: 01_storage.md.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
-  cache-subtree symlinks, launchd agents, go env defaults, and TM exclusions declaratively — `adopt`/`doctor` VALIDATE
-  and never mutate when HM owns the host (detection: HM symlinks resolve into /nix/store); imperative mode stays the
-  non-nix fallback. Volume creation and per-project artifacts stay imperative always. Postures: A = single-account
-  (Seatbelt-only boundary, main unsandboxed); B2 (recommended) = dedicated `dev` uid used as a remote-backend "localhost
-  dev machine" (one personal GUI session; shells via `ssh dev@localhost`/`sudo -u dev -i`; editors via
-  Remote-SSH/Gateway/Zed-remote; gateway/autosave as nix-darwin LaunchDaemons with `UserName = dev`). Cross-uid FILE
-  access is rejected; same-uid-or-nothing. Spec: 14_nix.md.
-- **Cache taxonomy (3 layers, discriminated by USE not concurrency safety)**: (1) gateway mirror artifacts on the cache
-  volume — download dedupe; (2) clone-materializing caches — the cache is the reflink source (bun materializes
-  node_modules by cloning from it; APFS clonefile is same-volume-only) — kept reflink-reachable INSIDE the workspace
-  image, inherited from main via CoW; today that means "bun, on APFS", possibly nothing on ZFS (BRT crosses datasets —
-  verify); (3) read-at-build caches (cargo registry, sccache, zig global, gradle) — read at build time, outputs written
-  elsewhere, so sharing costs nothing — on the shared cache volume, reached via the tools' DEFAULT paths relocated once
-  at first adopt. **Relocate only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`, gradle's
-  cache dirs → symlinks) — NOT `~/.cargo` wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on
-  PATH); moving those onto a sandbox-writable volume would be a persistence-escape surface. Workspace-keyed state
-  (target/, node_modules, DerivedData, .nx) in-image. Env wiring is 0–2 vars total, each only until its verification
-  passes; everything else is in-image config files + host paths. Main uses identical wiring. Spec: 03_caches.md.
-- **Go: `~/go` is never created.** `GOMODCACHE`/`GOCACHE` on the caches volume (`~/.cowshed/caches/go/{mod,build}` —
-  read-at-build, layer 3; go's sum/ziphash verification + 0444 entries make it the strongest-postured shared cache);
-  `GOPATH`/`GOBIN` in-image (`go install` binaries are the `~/.cargo/bin` hazard); `GOTOOLCHAIN=local` (toolchain is
-  nix/devenv-pinned; `auto` contradicts the declarative env — deliberate opt-in lands downloads in GOMODCACHE, on the
-  caches volume). Wired by an in-image `GOENV` file at `.cowshed/cache/go/env` carrying
-  `GOPROXY=https://proxy.golang.org` and `GOSUMDB=sum.golang.org` (no `,direct`), reached via the `GOENV` export riding
-  `.envrc`/direnv — Go has no directory-scoped config, so this is a second load-bearing export beside the token
-  candidate. Go is not a gateway mirror client: `cmd/go` sends credentials only over HTTPS, so both hosts are reached
-  through the proxy variables as opaque tunnels under project-standing grants (workspace git reaches a forge only
-  through a grant, fetch-only, so the proxy IS the private-module path). `~/go` is deny-listed as a misconfiguration
-  tripwire (04_sandbox.md). Specs: 03_caches.md, 04_sandbox.md, 05_gateway.md.
+  launchd agents and TM exclusions declaratively — `adopt`/`doctor` VALIDATE and never mutate when HM owns the host
+  (detection: HM symlinks resolve into /nix/store); imperative mode stays the non-nix fallback. Volume creation and
+  per-project artifacts stay imperative always. Postures: A = single-account (Seatbelt-only boundary, main unsandboxed);
+  B2 (recommended) = dedicated `dev` uid used as a remote-backend "localhost dev machine" (one personal GUI session;
+  shells via `ssh dev@localhost`/`sudo -u dev -i`; editors via Remote-SSH/Gateway/Zed-remote; gateway/autosave as
+  nix-darwin LaunchDaemons with `UserName = dev`). Cross-uid FILE access is rejected; same-uid-or-nothing. Spec:
+  14_nix.md.
+- **Cache taxonomy (3 layers, discriminated by USE not concurrency safety)**: (1) gateway mirror artifacts in cowshed's
+  own cache directory (`~/Library/Caches/dev.cowshed/mirror`) — download dedupe; (2) clone-materializing caches — the
+  cache is the reflink source (bun materializes node_modules by cloning from it; APFS clonefile is same-volume-only) —
+  kept reflink-reachable INSIDE the workspace image, inherited from main via CoW; today that means "bun, on APFS",
+  possibly nothing on ZFS (BRT crosses datasets — verify); (3) read-at-build caches (cargo registry, sccache, zig
+  global, gradle) — read at build time, outputs written elsewhere, so sharing costs nothing — at each tool's own default
+  path in the host HOME, shared into the sandboxes of projects that use the tool; no relocation, no symlinks. **Share
+  only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`, `~/.gradle/caches`) — NOT `~/.cargo`
+  wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on PATH); granting those writable to a
+  sandbox would be a persistence-escape surface. Workspace-keyed state (target/, node_modules, DerivedData, .nx)
+  in-image. Env wiring is 0–2 vars total, each only until its verification passes; everything else is in-image config
+  files + host paths. Main uses identical wiring. Spec: 03_caches.md.
+- **Go: shared caches at Go's own defaults.** `GOMODCACHE`/`GOCACHE` name the host's `~/go/pkg/mod` and the user cache
+  directory's `go-build` (`~/Library/Caches/go-build`) — read-at-build, layer 3; go's sum/ziphash verification + 0444
+  entries make it the strongest-postured shared cache — and the host's own `go` uses the same two directories without
+  configuration. `GOPATH`/`GOBIN` stay at Go's default under the private HOME, in-image (`go install` binaries are the
+  `~/.cargo/bin` hazard). No Go configuration file is written: `GOPROXY`, `GOSUMDB` and `GOTOOLCHAIN` are Go's defaults
+  or the project's own setting, and the supervisor sets the two cache variables. Go is not a gateway mirror client:
+  `cmd/go` sends credentials only over HTTPS, so both hosts are reached through the proxy variables as opaque tunnels
+  under project-standing grants (workspace git reaches a forge only through a grant, fetch-only, so the proxy IS the
+  private-module path). Specs: 03_caches.md, 04_sandbox.md, 05_gateway.md.
 - **iOS/Xcode topology (posture B)**: Xcode has no remote mode and Simulator.app cannot attach cross-uid, so the
   **personal-session simulator is an artifact host** (human inspection, fed by the one-way drop dir
   `<shared-drop-root>/<owner>/<repo>/`, using the separately validated components of the primary `repo_id`, via
