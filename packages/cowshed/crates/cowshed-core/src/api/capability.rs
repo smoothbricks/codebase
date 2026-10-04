@@ -1840,6 +1840,12 @@ impl WorkspaceHandle {
         self.workspace.mount_path()
     }
 
+    /// Returns the immutable information this handle was minted on, incarnation included: the fence
+    /// every call it makes carries, so a caller proves the incarnation without another inventory RPC.
+    pub fn info(&self) -> &WorkspaceInfo {
+        self.workspace.info()
+    }
+
     pub async fn exec(&self, request: ExecRequest) -> Result<JobHandle> {
         exec_job(&self.runtime, Arc::clone(&self.authority), None, request).await
     }
@@ -2506,6 +2512,42 @@ mod tests {
             .expect("workspace resolution");
         assert_eq!(workspace.name().as_str(), "raven");
         server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_handle_info_is_the_minted_snapshot_its_calls_fence_on() {
+        let template_runtime: Arc<dyn ControllerRuntime> = Arc::new(TestRuntime::default());
+        let mut minted = workspace_ref(template_runtime).into_info();
+        minted.workspace_incarnation =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap();
+        let response = json!({ "info": minted, "grants": GrantSet::default() });
+        let (runtime, mut server) = actor_pair();
+        let coordinator = coordinator(runtime);
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "coordinator.worker");
+            write_rpc_success(&mut server, request["id"].as_u64().unwrap(), response, None).await;
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "workspace.grants");
+            let fence = request["params"]["workspaceIncarnation"].clone();
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!(GrantSet::default()),
+                None,
+            )
+            .await;
+            fence
+        });
+
+        let handle = coordinator.worker("raven").await.expect("worker mint");
+        assert_eq!(handle.info(), &minted);
+        handle.grants().await.expect("grants read");
+        assert_eq!(
+            server_task.await.unwrap(),
+            json!(handle.info().workspace_incarnation)
+        );
     }
 
     #[cfg(unix)]

@@ -499,6 +499,8 @@ pub struct WorkspaceHandle {
 impl WorkspaceHandle {
     pub fn name(&self) -> &WorkspaceName;
     pub fn mount_path(&self) -> &Path;
+    // The immutable WorkspaceInfo the handle was minted on; its incarnation is the fence every call carries.
+    pub fn info(&self) -> &WorkspaceInfo;
     pub async fn exec(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
