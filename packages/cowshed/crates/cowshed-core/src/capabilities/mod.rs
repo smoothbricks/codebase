@@ -21,6 +21,7 @@ mod bun;
 mod npm;
 mod pnpm;
 mod uv;
+mod zig;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -239,7 +240,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 8] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR, &npm::DETECTOR, &pnpm::DETECTOR, &uv::DETECTOR];
+pub static DETECTORS: [&Detector; 9] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR, &npm::DETECTOR, &pnpm::DETECTOR, &uv::DETECTOR, &zig::DETECTOR];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
