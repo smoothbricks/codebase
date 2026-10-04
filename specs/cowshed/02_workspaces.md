@@ -70,10 +70,13 @@ not a best-effort script:
    applied otherwise — and both dedicated volumes exist: run the same host setup `cowshed setup` runs, which creates and
    mounts the sibling volumes `cowshed.store` (at `/private/cowshed/store`) and `cowshed.caches` (at
    `/private/cowshed/caches`; the volume marker in 01_storage.md) before any image is created.
-2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) under a staged, non-enumerated name:
-   `<owner>/<repo>/.staging/main-<incarnation>.asif`. Both components come from the validated primary `repo_id` and are
-   encoded independently as specified in 01_storage.md. Create its complete sibling host sidecar before the first
-   attach; the readdir registry never sees staged objects. Attach at a staging mountpoint.
+2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) at its canonical name, `<owner>/<repo>/main.asif`,
+   behind a fence: its complete sibling host sidecar is written first, in publication state `PendingFence`, which keeps
+   main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
+   components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
+   blank file is written under a staging name and renamed into place before its first attach, so the canonical name only
+   ever holds a complete file. That attach formats the volume and is the only one main gets: the volume is verified with
+   `fsck_apfs -q` and mounted at a staging mountpoint.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
@@ -87,10 +90,12 @@ not a best-effort script:
    git relies on it matching the filesystem. The main sidecar contains `portBlock` only on macOS; Linux omits it and
    creates its per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree
    against the source before publication.
-5. Publish, building every durable artifact before the user's tree is touched: create the mountpoint with the
-   self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place, `fsync` the parent
-   directories around each rename, and attach. Only then does the checkout path change hands, in the way the chosen
-   layout prescribes.
+5. Publish, building every durable artifact before the user's tree is touched: unmount the staging mount through the
+   kernel (`umount`, no Disk Arbitration), then activate the sidecar from `PendingFence` to `Active` in one atomic
+   rewrite — the publication point. Only then does the checkout path change hands, in the way the chosen layout
+   prescribes, and the same attachment mounts there with `mount_apfs`. The normal path has no detach, image rename,
+   second attach, or second fsck: an attached image is never renamed, because its identity is the backing path it was
+   attached from.
 
 ## Checkout layouts
 
@@ -131,15 +136,28 @@ from it; honoring the path condition by telling the user exactly which rule to e
 
 6. Print the mount path on stdout.
 
-Every step is idempotent to re-run. Intent is fsynced before image mutation. If adoption dies during the tree copy, the
-next open clone-copies the partial staged image under a fresh incarnation and the delta copier skips every completed
-leaf before resuming; it does not start the repository copy over. At later crash points the next command that opens the
-project — `cowshed gc`, `cowshed doctor --repair`, any verb — resumes or rolls back from the image, companion, and
-checkout-swap facts; plain `cowshed doctor` reports the unfinished adoption (`unfinished-intent`) and changes nothing.
-Because the durable half completes first, the post-copy resumable state is _mount and image published, checkout still
-the original directory, swap pending_ — recovery needs nothing from the user's tree to finish it, and
-`<root>.pre-cowshed` does not exist yet. `<root>.pre-cowshed` is retained until the user deletes it; cowshed never
-auto-deletes it.
+Every step is idempotent to re-run. Intent is fsynced before image mutation, and the next command that opens the project
+— `cowshed gc`, `cowshed doctor --repair`, any verb — finishes the adoption; plain `cowshed doctor` reports it
+(`unfinished-intent`) and changes nothing. An unpublished main resumes in place: the delta copier skips every completed
+leaf, so the repository copy never starts over. Replacement is the one exception and is safe because the checkout was
+never touched before activation: a fenced main whose sidecar records a different checkout root or commit, or whose
+payload never became a verified APFS volume, is discarded and adoption starts fresh. A `PendingFence` main no unfinished
+intent names and no process holds (intent lease and lifecycle lock both free) is retired by `gc` and `doctor --repair`
+as the adopt its metadata records: image, sidecar, and CA key are reclaimed. After activation the resumable state is
+_main published, checkout still the original directory, swap pending_ — recovery needs nothing from the user's tree to
+finish it, and `<root>.pre-cowshed` does not exist yet. `<root>.pre-cowshed` is retained until the user deletes it;
+cowshed never auto-deletes it.
+
+| Kill window                        | Durable state                                                    | Recovery action and guard                                                                                                                                      |
+| ---------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Before the sidecar                 | Intent only                                                      | Re-run adopt normally.                                                                                                                                         |
+| After the sidecar, before payload  | `PendingFence` sidecar, maybe a staging blank                    | Startup recovery removes the sidecar-only record; gc reclaims the orphan staging blank.                                                                        |
+| During creation, before format     | `PendingFence` + blank or unformatted canonical image            | The payload never held a copy: it is detached, reclaimed with its sidecar, and adoption starts over under a fresh incarnation.                                 |
+| After attach, before staging mount | `PendingFence` + verified, unmounted attachment                  | The unmounted attachment is settled and the ordinary verified attach repeats before mounting; same incarnation.                                                |
+| During the copy or initializer     | `PendingFence` + staging mount of the canonical image            | An exact source device and canonical flags reuse the surviving mount; the delta copier resumes; credentials and marker are idempotent; the initializer reruns. |
+| After activation, before the swap  | `Active` main, attached or not, checkout still the original tree | Adopt's intent finishes it: the swap runs, then main mounts at the checkout, reusing or replacing the surviving attachment.                                    |
+| After the swap, before the mount   | `Active` main, stub at the checkout, original at `.pre-cowshed`  | The swap is recognized as done; main mounts at the checkout.                                                                                                   |
+| After the mount, before completion | `Active` main mounted at the checkout + pending intent           | Finishing validates the mounted marker, records the append-safe commitment, and completes the intent.                                                          |
 
 Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
 `<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied mountpoint directory
