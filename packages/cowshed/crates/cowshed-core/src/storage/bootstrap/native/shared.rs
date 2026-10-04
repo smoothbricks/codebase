@@ -362,8 +362,14 @@ pub enum NativeBootstrapError {
     },
     #[error("kernel device {device:?} belongs to no APFS container in the kernel APFS registry")]
     ContainerNotFound { device: String },
-    #[error("diskutil info cannot attest FileVault for APFS volume {identifier:?}: {reason}")]
-    VolumeFileVaultEvidence { identifier: String, reason: String },
+    #[error(
+        "reserved APFS volume {name:?} ({identifier}) registers APFS role {role:?}; cowshed volumes are role-less, and only a role-less volume's kernel Encrypted flag establishes FileVault"
+    )]
+    ReservedVolumeRole {
+        identifier: String,
+        name: String,
+        role: Option<u64>,
+    },
     #[error("APFS container {container:?} has {matches} volumes named {name:?}")]
     AmbiguousVolume {
         container: String,

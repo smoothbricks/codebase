@@ -2970,6 +2970,14 @@ pub(crate) struct RegisteredApfsVolume {
     /// The volume's `UUID`, canonical uppercase hyphenated. Unique within its container only:
     /// a cloned image attached beside its source registers the same volume UUIDs.
     pub volume_uuid: String,
+    /// The volume's `RoleValue`, the APFS `APFS_VOL_ROLE_*` code: 0 for a role-less volume,
+    /// 64 for a volume group's Data, 8 for VM, and so on. `None` when no `RoleValue` registers;
+    /// every one of 138 volumes on the measuring host registered one.
+    pub role: Option<u64>,
+    /// Whether the volume registers `Encrypted = Yes`. The registry publishes the key only on
+    /// encrypted volumes (4 of 138 on the measuring host, never `Encrypted = No`), so its
+    /// absence is an unencrypted volume.
+    pub encrypted: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -2995,6 +3003,8 @@ struct ApfsVolumeFacts {
     identifier: Option<String>,
     name: Option<String>,
     uuid: Option<String>,
+    role: Option<u64>,
+    encrypted: Option<bool>,
 }
 
 /// Validate one registry snapshot's APFS facts into the container inventory.
@@ -3110,6 +3120,8 @@ fn project_registered_apfs(
             name,
             identifier,
             volume_uuid,
+            role: volume.role,
+            encrypted: volume.encrypted.unwrap_or(false),
         });
     }
 
@@ -3243,6 +3255,8 @@ mod io_registry {
         fn CFGetTypeID(object: CfType) -> usize;
         fn CFStringGetTypeID() -> usize;
         fn CFNumberGetTypeID() -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(boolean: CfType) -> u8;
         fn CFStringCreateWithBytes(
             allocator: CfType,
             bytes: *const u8,
@@ -3304,6 +3318,8 @@ mod io_registry {
         size: Cf,
         full_name: Cf,
         uuid: Cf,
+        role: Cf,
+        encrypted: Cf,
     }
 
     /// The registry entries one IOKit iterator yields, as owned references.
@@ -3433,7 +3449,7 @@ mod io_registry {
             return Ok(());
         };
         let capacity = if owner.is_whole {
-            Some(size_property(media, &keys.size)?.map(ImageCapacity::from_bytes))
+            Some(u64_property(media, &keys.size, "Size")?.map(ImageCapacity::from_bytes))
         } else {
             None
         };
@@ -3477,6 +3493,8 @@ mod io_registry {
             size: key("Size")?,
             full_name: key("FullName")?,
             uuid: key("UUID")?,
+            role: key("RoleValue")?,
+            encrypted: key("Encrypted")?,
         };
         let mut media: BTreeMap<u64, ApfsMediaFacts> = BTreeMap::new();
         let mut volumes = Vec::new();
@@ -3547,11 +3565,15 @@ mod io_registry {
             };
             let name = string_property(entry, &keys.full_name, "FullName")?;
             let uuid = string_property(entry, &keys.uuid, "UUID")?;
+            let role = u64_property(entry, &keys.role, "RoleValue")?;
+            let encrypted = bool_property(entry, &keys.encrypted, "Encrypted")?;
             volumes.push(ApfsVolumeFacts {
                 media: record_apfs_media(media, &container_media, keys)?,
                 identifier,
                 name,
                 uuid,
+                role,
+                encrypted,
             });
         }
         Ok(())
@@ -3567,7 +3589,7 @@ mod io_registry {
         let id = entry_id(entry, "read an APFS container media's registry id")?;
         if let Entry::Vacant(slot) = media.entry(id) {
             let reference = string_property(entry, &keys.bsd_name, "BSD Name")?;
-            let capacity_bytes = size_property(entry, &keys.size)?;
+            let capacity_bytes = u64_property(entry, &keys.size, "Size")?;
             slot.insert(ApfsMediaFacts {
                 reference,
                 capacity_bytes,
@@ -3751,23 +3773,39 @@ mod io_registry {
         Ok(Some(text))
     }
 
-    fn size_property(entry: &Object, key: &Cf) -> Read<Option<u64>> {
+    fn u64_property(entry: &Object, key: &Cf, name: &str) -> Read<Option<u64>> {
         let Some(value) = property(entry, key)? else {
             return Ok(None);
         };
         // SAFETY: `value` is a live CF object.
         if unsafe { CFGetTypeID(value.0) != CFNumberGetTypeID() } {
-            return Err(invalid("registry property Size is not a number").into());
+            return Err(invalid(format!("registry property {name} is not a number")).into());
         }
-        let mut size = 0i64;
-        // SAFETY: `value` is a live CFNumber and `size` is writable storage for an SInt64.
-        if unsafe { CFNumberGetValue(value.0, CF_NUMBER_SINT64_TYPE, (&raw mut size).cast()) } == 0
+        let mut number = 0i64;
+        // SAFETY: `value` is a live CFNumber and `number` is writable storage for an SInt64.
+        if unsafe { CFNumberGetValue(value.0, CF_NUMBER_SINT64_TYPE, (&raw mut number).cast()) }
+            == 0
         {
-            return Err(invalid("registry property Size is not an exact 64-bit integer").into());
+            return Err(invalid(format!(
+                "registry property {name} is not an exact 64-bit integer"
+            ))
+            .into());
         }
-        let size =
-            u64::try_from(size).map_err(|_| invalid("registry property Size is negative"))?;
-        Ok(Some(size))
+        let number = u64::try_from(number)
+            .map_err(|_| invalid(format!("registry property {name} is negative")))?;
+        Ok(Some(number))
+    }
+
+    fn bool_property(entry: &Object, key: &Cf, name: &str) -> Read<Option<bool>> {
+        let Some(value) = property(entry, key)? else {
+            return Ok(None);
+        };
+        // SAFETY: `value` is a live CF object.
+        if unsafe { CFGetTypeID(value.0) != CFBooleanGetTypeID() } {
+            return Err(invalid(format!("registry property {name} is not a boolean")).into());
+        }
+        // SAFETY: `value` is a live CFBoolean.
+        Ok(Some(unsafe { CFBooleanGetValue(value.0) } != 0))
     }
 
     fn invalid(message: impl Into<String>) -> io::Error {
@@ -3836,7 +3874,7 @@ mod io_registry {
                 Err(Unread::Gone)
             ));
             assert!(matches!(
-                size_property(&entry, &keys.size),
+                u64_property(&entry, &keys.size, "Size"),
                 Err(Unread::Gone)
             ));
             let mut images = BTreeMap::new();
@@ -6951,6 +6989,8 @@ mod tests {
             identifier: identifier.map(str::to_owned),
             name: name.map(str::to_owned),
             uuid: uuid.map(str::to_owned),
+            role: Some(0),
+            encrypted: None,
         }
     }
 
@@ -6959,7 +6999,58 @@ mod tests {
             name: name.to_owned(),
             identifier: identifier.to_owned(),
             volume_uuid: uuid.to_owned(),
+            role: Some(0),
+            encrypted: false,
         }
+    }
+
+    /// The registry rows measured on a host with FileVault off, where `diskutil info` answered
+    /// FileVault No for Data and VM and Yes for the three role-less passphrase volumes.
+    #[test]
+    fn registered_apfs_carries_each_volume_role_and_encryption() {
+        let media = BTreeMap::from([(0x10, apfs_media(Some("disk3"), Some(7_998_499_225_600)))]);
+        let row = |identifier: &str, name: &str, role: Option<u64>, encrypted: Option<bool>| {
+            let mut uuid = [0u8; 16];
+            uuid[..identifier.len()].copy_from_slice(identifier.as_bytes());
+            ApfsVolumeFacts {
+                role,
+                encrypted,
+                ..apfs_volume(
+                    0x10,
+                    Some(identifier),
+                    Some(name),
+                    Some(&uuid::Uuid::from_bytes(uuid).hyphenated().to_string()),
+                )
+            }
+        };
+        let inventory = project_registered_apfs(
+            &media,
+            vec![
+                row("disk3s5", "Data", Some(64), Some(true)),
+                row("disk3s6", "VM", Some(8), None),
+                row("disk3s7", "Nix Store", Some(0), Some(true)),
+                row("disk3s8", "cowshed.store", Some(0), Some(true)),
+                row("disk3s9", "cowshed.caches", Some(0), Some(false)),
+                row("disk3s10", "unpublished", None, None),
+            ],
+        )
+        .unwrap();
+        let facts = inventory[0]
+            .volumes
+            .iter()
+            .map(|volume| (volume.identifier.as_str(), volume.role, volume.encrypted))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            [
+                ("disk3s10", None, false),
+                ("disk3s5", Some(64), true),
+                ("disk3s6", Some(8), false),
+                ("disk3s7", Some(0), true),
+                ("disk3s8", Some(0), true),
+                ("disk3s9", Some(0), false),
+            ]
+        );
     }
 
     #[test]

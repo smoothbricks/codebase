@@ -1797,15 +1797,6 @@ trait EvidenceSource {
         &mut self,
         path: &Path,
     ) -> Result<MountedVolumeEvidence, NativeBootstrapError>;
-    /// FileVault state of one reserved volume already selected from the kernel inventory.
-    ///
-    /// No kernel property carries FileVault, so this is per-volume crypto metadata for that
-    /// exact record — never a listing and never a global query.
-    fn volume_file_vault(
-        &mut self,
-        container: &str,
-        volume: &ApfsVolume,
-    ) -> Result<bool, NativeBootstrapError>;
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError>;
     /// Whether the mounted retired caches volume holds nothing but its marker and its
     /// filesystem's own bookkeeping.
@@ -1854,21 +1845,6 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
             uid: metadata.uid(),
             gid: metadata.gid(),
         })
-    }
-
-    fn volume_file_vault(
-        &mut self,
-        container: &str,
-        volume: &ApfsVolume,
-    ) -> Result<bool, NativeBootstrapError> {
-        let command = HostCommand::new(DISKUTIL, ["info", "-plist", volume.identifier.as_str()]);
-        let output = self.host.run_command(&command)?;
-        if !output.succeeded() {
-            return Err(NativeBootstrapError::CommandFailed(
-                HostCommandFailure::new(command, output),
-            ));
-        }
-        attest_volume_file_vault(&output.stdout, container, volume)
     }
 
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError> {
@@ -1989,8 +1965,8 @@ fn gather_existing_apfs_evidence(
         retired_caches,
         VolumeRole::Caches,
     )?;
-    guard_absent_volume_globally(source, &inventory, APFS_STORE_VOLUME, &mut store)?;
-    guard_absent_volume_globally(source, &inventory, APFS_CACHES_VOLUME, &mut caches)?;
+    guard_absent_volume_globally(&inventory, APFS_STORE_VOLUME, &mut store)?;
+    guard_absent_volume_globally(&inventory, APFS_CACHES_VOLUME, &mut caches)?;
 
     // The retired caches volume is classified, mounted and pinned only while a host still has
     // one; a host without it never gets one (03_caches.md).
@@ -2070,7 +2046,6 @@ fn gather_existing_apfs_evidence(
 }
 
 fn guard_absent_volume_globally(
-    source: &mut impl EvidenceSource,
     inventory: &ApfsInventory,
     name: &'static str,
     classified: &mut ClassifiedStorage,
@@ -2101,7 +2076,7 @@ fn guard_absent_volume_globally(
                 size_bytes: container.capacity_bytes,
                 mounted_at,
             };
-            classified.file_vault = Some(source.volume_file_vault(&container.reference, volume)?);
+            classified.file_vault = Some(reserved_volume_file_vault(volume)?);
             Ok(())
         }
         _ => Err(NativeBootstrapError::AmbiguousVolume {
@@ -2166,9 +2141,8 @@ struct ApfsContainer {
     volumes: Vec<ApfsVolume>,
 }
 
-/// Kernel identity of one volume. FileVault is deliberately absent: the registry's `Encrypted`
-/// property is per-volume encryption (the Data volume is encrypted without FileVault), so the
-/// FileVault answer comes from [`EvidenceSource::volume_file_vault`] for reserved volumes only.
+/// Kernel identity of one volume, including the registry's `RoleValue` and `Encrypted` facts
+/// [`reserved_volume_file_vault`] derives FileVault from.
 #[derive(Clone, Debug)]
 struct ApfsVolume {
     name: String,
@@ -2176,6 +2150,10 @@ struct ApfsVolume {
     /// The kernel mount-table mountpoint of this exact device; `None` means detached.
     mountpoint: Option<PathBuf>,
     volume_uuid: String,
+    /// The registry `RoleValue`; `Some(0)` is a role-less volume.
+    role: Option<u64>,
+    /// The registry publishes `Encrypted = Yes`.
+    encrypted: bool,
 }
 
 /// IORegistry names the containers and volumes, the kernel mount table names where each volume
@@ -2274,6 +2252,8 @@ impl ApfsInventory {
                     identifier: volume.identifier,
                     mountpoint,
                     volume_uuid: volume.volume_uuid,
+                    role: volume.role,
+                    encrypted: volume.encrypted,
                 });
             }
             containers.push(ApfsContainer {
@@ -2305,47 +2285,29 @@ fn malformed(message: impl Into<String>) -> NativeBootstrapError {
     NativeBootstrapError::MalformedApfsInventory(message.into())
 }
 
-/// Read FileVault from one volume's `diskutil info -plist` answer. The answer counts only when
-/// it names the exact kernel record — device, volume UUID, container and name — and states
-/// `FileVault` explicitly; an empty, foreign, or silent answer is unknown and fails closed.
-fn attest_volume_file_vault(
-    bytes: &[u8],
-    container: &str,
-    volume: &ApfsVolume,
-) -> Result<bool, NativeBootstrapError> {
-    let refuse = |reason: String| NativeBootstrapError::VolumeFileVaultEvidence {
-        identifier: volume.identifier.clone(),
-        reason,
-    };
-    let value = Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| refuse(format!("unreadable plist: {error}")))?;
-    let info = value
-        .as_dictionary()
-        .ok_or_else(|| refuse("plist root is not a dictionary".to_owned()))?;
-    for (key, expected) in [
-        ("DeviceIdentifier", volume.identifier.as_str()),
-        ("APFSContainerReference", container),
-        ("VolumeName", volume.name.as_str()),
-    ] {
-        let actual = info.get(key).and_then(Value::as_string);
-        if actual != Some(expected) {
-            return Err(refuse(format!(
-                "{key} is {actual:?}, expected {expected:?}"
-            )));
-        }
-    }
-    let uuid = info.get("VolumeUUID").and_then(Value::as_string);
-    if !uuid.is_some_and(|uuid| uuid.eq_ignore_ascii_case(&volume.volume_uuid)) {
-        return Err(refuse(format!(
-            "VolumeUUID is {uuid:?}, expected {:?}",
-            volume.volume_uuid
-        )));
-    }
-    match info.get("FileVault") {
-        Some(Value::Boolean(enabled)) => Ok(*enabled),
-        other => Err(refuse(format!(
-            "FileVault is {other:?}, expected a boolean"
-        ))),
+/// FileVault of one reserved volume, from its kernel registry record alone.
+///
+/// No registry property names a volume's crypto users. `Encrypted` alone is not FileVault: a
+/// volume group's Data volume is encrypted at rest with a hardware-bound key and no user, so it
+/// registers `Encrypted = Yes` while FileVault is off. That keyless encryption exists only for
+/// volume-group roles; a role-less volume is encrypted only by adding a crypto user, which is
+/// what `diskutil apfs encryptVolume -user disk` does at setup. So a role-less volume's
+/// `Encrypted` is its FileVault state. Measured on a FileVault-off host, registry row against
+/// `diskutil info` FileVault: Data (RoleValue 64, Encrypted) No; VM (8, unencrypted) No; Nix
+/// Store, cowshed.store, cowshed.caches (0, Encrypted) Yes.
+///
+/// The answer guards [`NativeBootstrapError::MissingVolumeKeychain`]: a FileVault volume with no
+/// System.keychain passphrase can never be remounted at boot. A reserved volume carrying any
+/// role, or none registered, is outside that rule and is refused rather than guessed, so the
+/// guard cannot be skipped by misreading keyless encryption as no FileVault or vice versa.
+fn reserved_volume_file_vault(volume: &ApfsVolume) -> Result<bool, NativeBootstrapError> {
+    match volume.role {
+        Some(0) => Ok(volume.encrypted),
+        role => Err(NativeBootstrapError::ReservedVolumeRole {
+            identifier: volume.identifier.clone(),
+            name: volume.name.clone(),
+            role,
+        }),
     }
 }
 
@@ -2450,7 +2412,7 @@ fn classify_volume(
         }
     };
     let file_vault = match matches.first() {
-        Some(volume) => Some(source.volume_file_vault(&container.reference, volume)?),
+        Some(volume) => Some(reserved_volume_file_vault(volume)?),
         None => None,
     };
     Ok(ClassifiedStorage {
@@ -3603,16 +3565,17 @@ mod tests {
         assert_eq!(plan.substrate(), &expected);
     }
 
-    /// Read-only host evidence that panics on any diskutil listing. The captured failure was
-    /// `diskutil apfs list -plist` exiting 0 with an empty root dictionary; the only diskutil
-    /// call planning may make is one `info -plist` FileVault attestation per reserved volume,
-    /// which is recorded and delegated to the real tool.
+    /// Read-only host evidence that records every command validation asks for and refuses
+    /// diskutil outright. Validation must read APFS identity, mounts, and FileVault from the
+    /// kernel: `diskutil info -plist` queues behind Disk Arbitration, and on a host with ~130
+    /// images attached one call blocked for 279 s before a consumer's test harness killed it.
+    /// The System.keychain probe is delegated to the real tool; it never touches diskutil.
     #[derive(Default)]
-    struct ListingForbiddenHost {
-        file_vault_queries: Mutex<Vec<String>>,
+    struct DiskutilForbiddenHost {
+        commands: Mutex<Vec<HostCommand>>,
     }
 
-    impl BootstrapHost for ListingForbiddenHost {
+    impl BootstrapHost for DiskutilForbiddenHost {
         fn verify_zfs_delegation(
             &self,
             _pool: &str,
@@ -3634,21 +3597,20 @@ mod tests {
         }
 
         fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
-            match (command.program(), command.args()) {
-                (DISKUTIL, [info, plist, identifier])
-                    if info == "info"
-                        && plist == "-plist"
-                        && valid_volume_identifier(identifier.as_bytes()) =>
-                {
-                    self.file_vault_queries
-                        .lock()
-                        .expect("query log")
-                        .push(identifier.clone());
-                    SystemBootstrapHost.run_command(command)
-                }
-                (DISKUTIL, args) => panic!("APFS planning invoked a diskutil listing: {args:?}"),
-                (SECURITY, _) => Ok(HostCommandOutput::success(Vec::new())),
-                (program, args) => panic!("unexpected planning command {program} {args:?}"),
+            self.commands
+                .lock()
+                .expect("command log")
+                .push(command.clone());
+            match command.program() {
+                DISKUTIL => Err(HostError::new(format!(
+                    "read-only validation spawned diskutil {:?}",
+                    command.args()
+                ))),
+                SECURITY => SystemBootstrapHost.run_command(command),
+                program => panic!(
+                    "unexpected validation command {program} {:?}",
+                    command.args()
+                ),
             }
         }
 
@@ -3670,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn production_planner_reads_kernel_authority_without_any_diskutil_listing() {
+    fn existing_host_storage_validation_reads_the_kernel_without_spawning_diskutil() {
         let home = std::env::home_dir().expect("home directory");
         let snapshot = system_statfs(&home).expect("home filesystem");
         assert_eq!(snapshot.fs_type, "apfs");
@@ -3695,28 +3657,49 @@ mod tests {
             "the kernel mount table and statfs must name the same home mount"
         );
 
-        let host = ListingForbiddenHost::default();
-        let plan = plan_existing_host_storage(&mut SystemEvidenceSource { host: &host }, &home)
-            .expect("production planner over the kernel snapshot");
+        let host = DiskutilForbiddenHost::default();
+        let started = std::time::Instant::now();
+        let plan = plan_existing_host_storage(&mut SystemEvidenceSource { host: &host }, &home);
+        let elapsed = started.elapsed();
+        let commands = host.commands.into_inner().expect("command log");
+        let diskutil = commands
+            .iter()
+            .filter(|command| command.program() == DISKUTIL)
+            .collect::<Vec<_>>();
+        assert!(
+            diskutil.is_empty(),
+            "read-only validation must not spawn diskutil: {diskutil:?}"
+        );
+        let plan = plan.expect("production planner over the kernel snapshot");
         assert!(matches!(
             plan.substrate(),
             crate::storage::bootstrap::SelectedSubstrate::Apfs { container: selected, .. }
                 if *selected == container.reference
         ));
-        let reserved = inventory
-            .containers
-            .iter()
-            .flat_map(|container| &container.volumes)
-            .filter(|volume| volume.name == APFS_STORE_VOLUME || volume.name == APFS_CACHES_VOLUME)
-            .map(|volume| volume.identifier.clone())
-            .collect::<BTreeSet<_>>();
-        let queried = host.file_vault_queries.into_inner().expect("query log");
-        assert!(
-            queried
+        // Where this host already carries the store at its canonical root, and a retired caches
+        // volume (if one is left) at its own, the kernel evidence alone must validate them;
+        // elsewhere validation names setup work.
+        let roots = CanonicalRoots::global();
+        let mounted_at = |name: &str| {
+            inventory
+                .containers
                 .iter()
-                .all(|identifier| reserved.contains(identifier)),
-            "FileVault is attested only for reserved volumes: {queried:?} vs {reserved:?}"
+                .flat_map(|container| &container.volumes)
+                .find(|volume| volume.name == name)
+                .map(|volume| volume.mountpoint.as_deref())
+        };
+        let canonical = mounted_at(APFS_STORE_VOLUME) == Some(Some(roots.store()))
+            && mounted_at(APFS_CACHES_VOLUME)
+                .is_none_or(|at| at == Some(Path::new(RETIRED_CACHES_MOUNTPOINT)));
+        let actions = read_only_validation_actions(&plan);
+        eprintln!(
+            "existing host storage validation: elapsed={elapsed:?} canonical={canonical} commands={:?} actions={actions:?}",
+            commands
+                .iter()
+                .map(|command| command.program())
+                .collect::<Vec<_>>()
         );
+        assert_eq!(actions.is_empty(), canonical, "{actions:?}");
     }
 
     fn mount_service_pins() -> Vec<FstabPin> {
@@ -3915,13 +3898,11 @@ mod tests {
         ));
     }
 
-    /// Typed kernel evidence: IORegistry container records plus the kernel mount table, and
-    /// the per-volume FileVault answer a reserved record's attestation would return.
+    /// Typed kernel evidence: IORegistry container records plus the kernel mount table.
     #[derive(Clone, Debug)]
     struct KernelFixture {
         containers: Vec<RegisteredApfsContainer>,
         mounts: Vec<KernelMountSnapshot>,
-        file_vault: BTreeMap<String, bool>,
     }
 
     impl KernelFixture {
@@ -3933,7 +3914,6 @@ mod tests {
     struct VolumeFixture {
         record: RegisteredApfsVolume,
         mountpoint: Option<PathBuf>,
-        file_vault: bool,
     }
 
     /// A canonical uppercase volume UUID unique to `identifier`.
@@ -3952,13 +3932,7 @@ mod tests {
     ) -> KernelFixture {
         let mut records = Vec::new();
         let mut mounts = Vec::new();
-        let mut file_vault = BTreeMap::new();
-        for VolumeFixture {
-            record,
-            mountpoint,
-            file_vault: enabled,
-        } in volumes
-        {
+        for VolumeFixture { record, mountpoint } in volumes {
             if let Some(mountpoint) = mountpoint {
                 mounts.push(KernelMountSnapshot::new(
                     0,
@@ -3968,7 +3942,6 @@ mod tests {
                     true,
                 ));
             }
-            file_vault.insert(record.identifier.clone(), enabled);
             records.push(record);
         }
         KernelFixture {
@@ -3978,7 +3951,6 @@ mod tests {
                 volumes: records,
             }],
             mounts,
-            file_vault,
         }
     }
 
@@ -3987,12 +3959,10 @@ mod tests {
         let mut snapshot = KernelFixture {
             containers: Vec::new(),
             mounts: Vec::new(),
-            file_vault: BTreeMap::new(),
         };
         for part in parts {
             snapshot.containers.extend(part.containers);
             snapshot.mounts.extend(part.mounts);
-            snapshot.file_vault.extend(part.file_vault);
         }
         snapshot
     }
@@ -4001,6 +3971,8 @@ mod tests {
         volume_with_filevault(name, identifier, mountpoint, true)
     }
 
+    /// A role-less volume whose registry `Encrypted` flag is `file_vault`, which is exactly how
+    /// [`reserved_volume_file_vault`] reads FileVault.
     fn volume_with_filevault(
         name: &str,
         identifier: &str,
@@ -4012,9 +3984,10 @@ mod tests {
                 name: name.to_owned(),
                 identifier: identifier.to_owned(),
                 volume_uuid: volume_uuid(identifier),
+                role: Some(0),
+                encrypted: file_vault,
             },
             mountpoint: mountpoint.map(PathBuf::from),
-            file_vault,
         }
     }
 
@@ -4025,7 +3998,6 @@ mod tests {
         /// `Err` is an unreadable registry; the error kind is what IOKit would surface.
         kernel: Result<KernelFixture, io::ErrorKind>,
         inventory_reads: usize,
-        file_vault_queries: Vec<String>,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
         keychain_items: BTreeMap<&'static str, bool>,
@@ -4077,22 +4049,6 @@ mod tests {
             })
         }
 
-        fn volume_file_vault(
-            &mut self,
-            _container: &str,
-            volume: &ApfsVolume,
-        ) -> Result<bool, NativeBootstrapError> {
-            self.file_vault_queries.push(volume.identifier.clone());
-            self.kernel
-                .as_ref()
-                .ok()
-                .and_then(|kernel| kernel.file_vault.get(&volume.identifier).copied())
-                .ok_or_else(|| NativeBootstrapError::VolumeFileVaultEvidence {
-                    identifier: volume.identifier.clone(),
-                    reason: "no fixture answer".to_owned(),
-                })
-        }
-
         fn keychain_item_usable(
             &mut self,
             label: &'static str,
@@ -4121,7 +4077,6 @@ mod tests {
             statfs_paths: Vec::new(),
             kernel: Ok(kernel),
             inventory_reads: 0,
-            file_vault_queries: Vec::new(),
             mountpoints: BTreeMap::from([
                 (
                     PathBuf::from("/private/cowshed/store"),
@@ -6520,7 +6475,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
         assert_eq!(source.statfs_paths, [PathBuf::from("/Users/alice")]);
         assert_eq!(source.inventory_reads, 1);
-        assert_eq!(source.file_vault_queries, ["disk3s8", "disk3s9"]);
         assert!(
             plan.operations()
                 .iter()
@@ -6842,26 +6796,44 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     }
 
     #[test]
-    fn filevault_is_attested_only_for_reserved_kernel_records() {
-        let mut source = healthy_existing_source();
-        prepare_setup_snapshot(
-            &mut source,
-            Path::new("/Users/alice"),
-            "",
-            CachesVolume::Keep,
-        )
-        .expect("healthy setup plan");
-        assert_eq!(source.file_vault_queries, ["disk3s8", "disk3s9"]);
-
-        let mut silent = healthy_existing_source();
-        if let Ok(kernel) = &mut silent.kernel {
-            kernel.file_vault.remove("disk3s9");
+    fn reserved_volume_with_an_apfs_role_is_refused_by_setup_and_validation() {
+        let with_caches_role = |role: Option<u64>| {
+            let mut source = healthy_existing_source();
+            let Ok(kernel) = &mut source.kernel else {
+                unreachable!("the healthy fixture reads the registry")
+            };
+            kernel
+                .containers
+                .iter_mut()
+                .flat_map(|container| &mut container.volumes)
+                .filter(|volume| volume.identifier == "disk3s9")
+                .for_each(|volume| volume.role = role);
+            source
+        };
+        let refused = |result: Result<(), NativeBootstrapError>, role: Option<u64>| {
+            matches!(
+                result,
+                Err(NativeBootstrapError::ReservedVolumeRole { identifier, name, role: refused })
+                    if identifier == "disk3s9" && name == APFS_CACHES_VOLUME && refused == role
+            )
+        };
+        for role in [Some(64), Some(8), None] {
+            assert!(refused(
+                prepare_setup_snapshot(
+                    &mut with_caches_role(role),
+                    Path::new("/Users/alice"),
+                    "",
+                    CachesVolume::Keep,
+                )
+                .map(drop),
+                role
+            ));
+            assert!(refused(
+                plan_existing_host_storage(&mut with_caches_role(role), Path::new("/Users/alice"))
+                    .map(drop),
+                role
+            ));
         }
-        assert!(matches!(
-            prepare_setup_snapshot(&mut silent, Path::new("/Users/alice"), "", CachesVolume::Keep),
-            Err(NativeBootstrapError::VolumeFileVaultEvidence { identifier, .. })
-                if identifier == "disk3s9"
-        ));
     }
 
     #[test]
@@ -6877,7 +6849,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
                 uuid,
             }) if uuid == volume_uuid("disk7s2")
         ));
-        assert_eq!(missing_keychain.file_vault_queries, ["disk7s2"]);
 
         let mut source = source_with_foreign_store();
         let gathered = gather_existing_apfs_evidence(&mut source, Path::new("/Users/alice"))
@@ -6911,81 +6882,55 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         ]))
     }
 
-    fn volume_info(entries: &[(&str, Value)]) -> Vec<u8> {
-        let mut info = plist::Dictionary::new();
-        for (key, value) in entries {
-            info.insert((*key).to_owned(), value.clone());
-        }
-        let mut bytes = Vec::new();
-        Value::Dictionary(info)
-            .to_writer_xml(&mut bytes)
-            .expect("encode volume info");
-        bytes
-    }
-
+    /// Registry rows measured on a FileVault-off host, with `diskutil info`'s FileVault answer
+    /// for each: Data (RoleValue 64, Encrypted) No; VM (8, unencrypted) No; Nix Store,
+    /// cowshed.store, cowshed.caches (0, Encrypted) Yes.
     #[test]
-    fn filevault_attestation_requires_the_exact_kernel_record_and_an_explicit_answer() {
-        let store = ApfsVolume {
-            name: APFS_STORE_VOLUME.to_owned(),
-            identifier: "disk3s8".to_owned(),
-            mountpoint: Some(PathBuf::from("/private/cowshed/store")),
-            volume_uuid: volume_uuid("disk3s8"),
+    fn reserved_volume_file_vault_reads_role_less_encryption_and_refuses_any_role() {
+        let row = |name: &str, identifier: &str, role: Option<u64>, encrypted: bool| ApfsVolume {
+            name: name.to_owned(),
+            identifier: identifier.to_owned(),
+            mountpoint: None,
+            volume_uuid: volume_uuid(identifier),
+            role,
+            encrypted,
         };
-        let exact = |file_vault: Option<Value>| {
-            let mut entries = vec![
-                ("DeviceIdentifier", Value::from("disk3s8")),
-                ("VolumeUUID", Value::from(volume_uuid("disk3s8"))),
-                ("APFSContainerReference", Value::from("disk3")),
-                ("VolumeName", Value::from(APFS_STORE_VOLUME)),
-                // Per-volume encryption is reported independently and must not stand in.
-                ("EncryptionThisVolumeProper", Value::Boolean(true)),
-            ];
-            entries.extend(file_vault.map(|value| ("FileVault", value)));
-            entries
-        };
-        let attest = |entries: &[(&str, Value)]| {
-            attest_volume_file_vault(&volume_info(entries), "disk3", &store)
-        };
+        for (name, identifier) in [
+            ("Nix Store", "disk3s7"),
+            (APFS_STORE_VOLUME, "disk3s8"),
+            (APFS_CACHES_VOLUME, "disk3s9"),
+        ] {
+            assert!(
+                matches!(
+                    reserved_volume_file_vault(&row(name, identifier, Some(0), true)),
+                    Ok(true)
+                ),
+                "role-less and Encrypted is FileVault: {name}"
+            );
+        }
         assert!(matches!(
-            attest(&exact(Some(Value::Boolean(true)))),
-            Ok(true)
-        ));
-        assert!(matches!(
-            attest(&exact(Some(Value::Boolean(false)))),
+            reserved_volume_file_vault(&row(APFS_STORE_VOLUME, "disk3s8", Some(0), false)),
             Ok(false)
         ));
-
-        let refused = |result: Result<bool, NativeBootstrapError>| {
-            matches!(
-                result,
-                Err(NativeBootstrapError::VolumeFileVaultEvidence { identifier, .. })
-                    if identifier == "disk3s8"
-            )
-        };
-        assert!(refused(attest_volume_file_vault(
-            b"not a plist",
-            "disk3",
-            &store
-        )));
-        assert!(refused(attest(&[])), "an empty root is unknown evidence");
-        assert!(
-            refused(attest(&exact(None))),
-            "missing FileVault is not false"
-        );
-        assert!(refused(attest(&exact(Some(Value::from("true"))))));
-        for (key, foreign) in [
-            ("DeviceIdentifier", Value::from("disk3s9")),
-            ("VolumeUUID", Value::from(volume_uuid("disk3s9"))),
-            ("APFSContainerReference", Value::from("disk7")),
-            ("VolumeName", Value::from(APFS_CACHES_VOLUME)),
+        for (name, identifier, role, encrypted) in [
+            ("Data", "disk3s5", Some(64), true),
+            ("VM", "disk3s6", Some(8), false),
+            (APFS_STORE_VOLUME, "disk3s8", Some(64), true),
+            (APFS_STORE_VOLUME, "disk3s8", Some(1), false),
+            (APFS_STORE_VOLUME, "disk3s8", None, true),
         ] {
-            let mut entries = exact(Some(Value::Boolean(true)));
-            for entry in &mut entries {
-                if entry.0 == key {
-                    entry.1 = foreign.clone();
-                }
-            }
-            assert!(refused(attest(&entries)), "foreign {key} must be refused");
+            let answer = reserved_volume_file_vault(&row(name, identifier, role, encrypted));
+            assert!(
+                matches!(
+                    &answer,
+                    Err(NativeBootstrapError::ReservedVolumeRole {
+                        identifier: refused,
+                        role: refused_role,
+                        ..
+                    }) if refused == identifier && *refused_role == role
+                ),
+                "a volume with role {role:?} must be refused: {answer:?}"
+            );
         }
     }
 

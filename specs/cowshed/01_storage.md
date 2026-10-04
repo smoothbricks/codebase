@@ -514,23 +514,44 @@ sizing. The complete create/mount/pin transaction uses the one provisioning auth
 14_nix.md.
 
 Host-storage planning takes its APFS listing from the kernel, never from `diskutil apfs list`. One IORegistry snapshot
-names every container (BSD name, capacity ceiling) and every volume (BSD name, name, volume UUID); the kernel mount
-table (`getmntinfo`) names where each volume is mounted, and a volume with no mount entry is detached. That one snapshot
-selects the container holding the home directory's exact mount-source volume and is the global reserved-name guard, so
-the two decisions cannot observe different listings. The snapshot is read once, with no retry or delay, and fails
-closed: an unreadable registry, an empty registry, a duplicated container or volume identifier, a volume outside its
-container or at snapshot depth, an empty name, a non-canonical volume UUID, a zero capacity, or two kernel mounts of one
-volume is an error, never evidence that a reserved volume is absent. The listing `diskutil apfs list -plist` read back
-an empty root while an unrelated image detached; the registry has no such transient projection. A volume mounted
-somewhere other than its canonical path is attested by `statfs` at that path before it is reported as mis-mounted.
+names every container (BSD name, capacity ceiling) and every volume (BSD name, name, volume UUID, `RoleValue`,
+`Encrypted`); the kernel mount table (`getmntinfo`) names where each volume is mounted, and a volume with no mount entry
+is detached. That one snapshot selects the container holding the home directory's exact mount-source volume and is the
+global reserved-name guard, so the two decisions cannot observe different listings. The snapshot is read once, with no
+retry or delay, and fails closed: an unreadable registry, an empty registry, a duplicated container or volume
+identifier, a volume outside its container or at snapshot depth, an empty name, a non-canonical volume UUID, a zero
+capacity, or two kernel mounts of one volume is an error, never evidence that a reserved volume is absent. The listing
+`diskutil apfs list -plist` read back an empty root while an unrelated image detached; the registry has no such
+transient projection. A volume mounted somewhere other than its canonical path is attested by `statfs` at that path
+before it is reported as mis-mounted.
 
-The registry's per-volume `Encrypted` property is not FileVault — the Data volume is encrypted without FileVault — and
-no kernel property reports FileVault. FileVault state is therefore read, only for the selected reserved-name records,
-from one `diskutil info -plist <identifier>` each. That answer is accepted only when its `DeviceIdentifier`,
-`VolumeUUID`, `APFSContainerReference`, and `VolumeName` all match the kernel record and it states `FileVault` as a
-boolean; an empty, foreign, unreadable, or silent answer fails closed. It is per-volume crypto metadata, never a listing
-and never a global query. The execution-time pre-create recheck inside the authorization session reads a fresh kernel
-snapshot the same way, and an unreadable or empty snapshot refuses the create.
+Neither planning nor read-only validation spawns `diskutil`. `diskutil info` is answered through Disk Arbitration, which
+congests when many images are attached: on a host with about 130 images attached, a consumer's test harness saw one
+`diskutil info -plist` of the store volume block for 279 s until its own 300 s deadline interrupted it, and gateways and
+cache services run the same validation at startup. The same call answered in 0.43–0.64 s on that host once the
+congestion passed; validation's latency no longer depends on Disk Arbitration at all.
+
+FileVault is therefore derived from the registry record. No registry property names a volume's crypto users, and
+`Encrypted` alone is not FileVault: a volume group's Data volume is encrypted at rest with a hardware-bound key and no
+user. That keyless encryption exists only inside a volume group; a role-less volume is encrypted only by adding a crypto
+user, which is exactly what setup's `diskutil apfs encryptVolume -user disk` does. This is an observed platform fact,
+measured on a FileVault-off host against `diskutil info -plist`'s `FileVault`:
+
+| Volume                            | `RoleValue` | `Encrypted` | `diskutil info` FileVault |
+| --------------------------------- | ----------- | ----------- | ------------------------- |
+| Data                              | 64          | Yes         | No                        |
+| VM                                | 8           | absent      | No                        |
+| Nix Store                         | 0           | Yes         | Yes                       |
+| `cowshed.store`, `cowshed.caches` | 0           | Yes         | Yes                       |
+
+All 138 volumes registered a `RoleValue`, and none registered `Encrypted = No`, so an absent `Encrypted` is an
+unencrypted volume. For the selected reserved `cowshed.store` / `cowshed.caches` records, a role-less volume's FileVault
+is its `Encrypted`; a reserved volume with any role, or none registered, is refused (`ReservedVolumeRole`), because for
+it `Encrypted` can be keyless encryption. The rule protects the `MissingVolumeKeychain` refusal: a FileVault volume
+without a usable System.keychain passphrase can never be remounted at boot, and reading keyless encryption as FileVault,
+or FileVault as unencrypted, would let that refusal be skipped or misapplied. Setup shares the same evidence, so its
+encrypt-in-place decision reads the same derivation. The execution-time pre-create recheck inside the authorization
+session reads a fresh kernel snapshot the same way, and an unreadable or empty snapshot refuses the create.
 
 **Boot mounting is owned by a root system LaunchDaemon, and the store is FileVault-encrypted.** At provision, the same
 authorization session:
