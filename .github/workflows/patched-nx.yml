@@ -1,0 +1,64 @@
+# Builds the patched Nx (`tooling/patched-nx.ts`) from patches/nx@<version>.patch and keeps its GitHub release
+# immutable: a tag names one uncompressed tar, published once from main and only ever verified afterwards.
+name: Patched Nx
+on:
+  pull_request:
+    paths:
+      - 'patches/nx@*.patch'
+      - 'tooling/patched-nx.ts'
+      - 'bun.lock'
+      - 'package.json'
+      - '.github/workflows/patched-nx.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/nx@*.patch'
+      - 'tooling/patched-nx.ts'
+      - 'bun.lock'
+      - 'package.json'
+      - '.github/workflows/patched-nx.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  # Never cancelled: a run that has created the release must also finish verifying it.
+  group: patched-nx-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Creating the release on main; a pull request's token stays read-only.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-devenv
+      - name: Verify frozen dependencies
+        run: bun install --frozen-lockfile
+      - name: Build the patched Nx twice, byte for byte
+        run: |
+          bun tooling/patched-nx.ts build "$RUNNER_TEMP/first" > "$RUNNER_TEMP/first.json"
+          bun tooling/patched-nx.ts build "$RUNNER_TEMP/second" > "$RUNNER_TEMP/second.json"
+          cmp "$RUNNER_TEMP/first/$(jq -r .asset "$RUNNER_TEMP/first.json")" \
+            "$RUNNER_TEMP/second/$(jq -r .asset "$RUNNER_TEMP/second.json")"
+          cat "$RUNNER_TEMP/first.json"
+      - name: Publish the release once, or verify the published one
+        run: |
+          tag=$(jq -r .tag "$RUNNER_TEMP/first.json")
+          asset=$(jq -r .asset "$RUNNER_TEMP/first.json")
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            if [ "$GITHUB_EVENT_NAME" = pull_request ] || [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::notice::$tag is not published; it is published when this lands on main"
+              exit 0
+            fi
+            gh release create "$tag" "$RUNNER_TEMP/first/$asset" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Patched Nx $tag" --notes-file "$RUNNER_TEMP/first/release-notes.md"
+          fi
+          # What GitHub serves is what consumers install: verify the downloaded asset, never the local build.
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/published"
+          bun tooling/patched-nx.ts verify "$RUNNER_TEMP/published/$asset"
