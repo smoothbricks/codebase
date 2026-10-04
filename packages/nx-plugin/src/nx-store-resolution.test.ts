@@ -1,7 +1,7 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
@@ -22,8 +22,11 @@ const repositoryRoot = join(import.meta.dir, '../../..');
 
 it('keeps the source-import edges when Nx is linked from the global store', async () => {
   const nx = await realpath(join(repositoryRoot, 'node_modules/nx'));
-  // The regression only exists for a store-linked Nx; anywhere else this test would prove nothing.
-  expect(nx.startsWith(join(homedir(), '.bun/install/cache/links/'))).toBe(true);
+  // The regression only exists for an Nx linked from Bun's store, outside this checkout (wherever the install
+  // cache lives on this host); a project-local Nx resolves typescript by walking up to the repository's
+  // node_modules, and this test would prove nothing.
+  const checkout = await realpath(repositoryRoot);
+  expect(nx.startsWith(`${checkout}/`), `${nx} is inside the checkout`).toBe(false);
 
   const root = await realpath(await mkdtemp(join(tmpdir(), 'nx-store-resolution-')));
   try {
