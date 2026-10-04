@@ -2777,6 +2777,7 @@ impl NativeProjectRuntimeHost {
         // no log replay has anything to add to what the images say.
         {
             let retired_incarnations = retired
+                .recorded
                 .iter()
                 .map(|fact| fact.workspace().incarnation())
                 .collect::<std::collections::BTreeSet<_>>();
@@ -6266,7 +6267,7 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     config: crate::storage::apfs::ApfsSubstrateConfig,
     repo_id: &RepoId,
     restored: &[crate::storage::apfs::PendingPublicationFact],
-    retired: Vec<crate::storage::lifecycle::RetiredRef>,
+    retired: RetiredTrash,
     commitments: &mut super::supervisor::CommitmentPublisherHandle,
     scope: &RecoveryScope,
 ) -> Result<crate::storage::apfs::ApfsSubstrate<H>> {
@@ -6291,7 +6292,7 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     }
     let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
     let _span = crate::timing::span("open", "reclaim");
-    for retirement in retired {
+    for retirement in retired.recorded {
         // Trash reclamation is best effort: the retirement is already a fact of the inventory,
         // and an image left in the trash is reclaimed by the next open or by `gc`. A failure is
         // said, never dropped.
@@ -6302,6 +6303,20 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
                 "cowshed: retired workspace {workspace} (incarnation {incarnation}) stays in \
                  sessions/.trash: reclaiming it failed ({error}); the next cowshed command or \
                  cowshed gc retries, and cowshed doctor reports it as retired-trash"
+            );
+        }
+    }
+    // An image whose record is already gone is already reclaimed as a retirement; its bytes go
+    // the same best-effort way.
+    for image in retired.unrecorded {
+        if let Err(error) = substrate
+            .reclaim_unrecorded_retired(repo_id, image.clone())
+            .await
+        {
+            eprintln!(
+                "cowshed: retired image {} stays in sessions/.trash: reclaiming it failed \
+                 ({error}); the next cowshed command or cowshed gc retries",
+                image.display()
             );
         }
     }
@@ -12633,13 +12648,20 @@ fn supervisor_sandbox(
     })
 }
 
+/// What the project's `sessions/.trash` holds: retirements whose sidecar records them, and
+/// images whose sidecar is already gone. The latter's record was reclaimed (cowshed removes the
+/// sidecar last, so only an outside deletion leaves this), and only their bytes remain.
 #[cfg(target_os = "macos")]
-fn native_retired_refs(
-    project_root: &Path,
-    repo_id: &RepoId,
-) -> Result<Vec<crate::storage::lifecycle::RetiredRef>> {
+#[derive(Debug, Default)]
+struct RetiredTrash {
+    recorded: Vec<crate::storage::lifecycle::RetiredRef>,
+    unrecorded: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+fn native_retired_refs(project_root: &Path, repo_id: &RepoId) -> Result<RetiredTrash> {
     use crate::metadata::{
-        DetachedWorkspaceMetadata, IMAGE_EXTENSION, WorkspaceRole, is_image_path,
+        DetachedWorkspaceMetadata, IMAGE_EXTENSION, WorkspaceRole, is_image_path, sidecar_path,
     };
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
 
@@ -12655,7 +12677,9 @@ fn native_retired_refs(
                     "cowshed doctor --json",
                 )
             })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RetiredTrash::default());
+        }
         Err(error) => {
             return Err(CowshedError::integrity(
                 format!("cannot enumerate retired workspace trash: {error}"),
@@ -12673,6 +12697,7 @@ fn native_retired_refs(
     retired
         .try_reserve(images.len())
         .map_err(|_| CowshedError::internal("cannot reserve retired workspace recovery facts"))?;
+    let mut unrecorded = Vec::new();
     for entry in images {
         let file_type = entry.file_type().map_err(|error| {
             CowshedError::integrity(
@@ -12688,6 +12713,23 @@ fn native_retired_refs(
                 ),
                 "cowshed doctor --json",
             ));
+        }
+        let sidecar = sidecar_path(&entry.path());
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                unrecorded.push(entry.path());
+                continue;
+            }
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "cannot inspect retired workspace metadata {}: {error}",
+                        sidecar.display()
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
         }
         let metadata = DetachedWorkspaceMetadata::read_for_image(&entry.path())
             .map_err(native_integrity_error)?;
@@ -12739,7 +12781,10 @@ fn native_retired_refs(
             })?;
         retired.push(RetiredRef::new(workspace, resulting_revision));
     }
-    Ok(retired)
+    Ok(RetiredTrash {
+        recorded: retired,
+        unrecorded,
+    })
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -12789,7 +12834,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+        let retired = native_retired_refs(&project_root, &repo_id)
+            .unwrap()
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -12843,7 +12890,8 @@ mod retired_recovery_tests {
         .expect("retired sidecar");
 
         let retired = native_retired_refs(&project_root, &repo_id)
-            .expect("retired pending image is recoverable from its exact trash identity");
+            .expect("retired pending image is recoverable from its exact trash identity")
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -12874,7 +12922,8 @@ mod retired_recovery_tests {
             .write_for_image(&live)
             .expect("new canonical metadata");
         let retired = native_retired_refs(&project_root, &repo_id)
-            .expect("new use of the name cannot invalidate old retired trash");
+            .expect("new use of the name cannot invalidate old retired trash")
+            .recorded;
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert!(live.exists(), "discovery cannot touch the new workspace");
         assert!(image.exists(), "discovery cannot delete old retired bytes");
@@ -12923,7 +12972,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+        let retired = native_retired_refs(&project_root, &repo_id)
+            .unwrap()
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -13028,7 +13079,7 @@ mod retired_recovery_tests {
             )
             .unwrap();
             let retired = native_retired_refs(&project_root, &repo_id).unwrap();
-            assert_eq!(retired.len(), 1, "the retired image is found");
+            assert_eq!(retired.recorded.len(), 1, "the retired image is found");
             finish_store_residue(
                 host,
                 config.clone(),
@@ -13052,6 +13103,84 @@ mod retired_recovery_tests {
 
         open(RecoveryScope::Workspaces(Default::default())).await;
         assert!(!image.exists(), "a repairing open left {}", image.display());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A retired entry whose grants sidecar was deleted by hand (its image and CA key left behind)
+    /// once failed every open of the project with a metadata I/O error, which blocked every land
+    /// and doctor in the repository. The record is gone, so the retirement is already reclaimed:
+    /// an open of any kind succeeds, and a repairing open reclaims the bytes that remain.
+    #[tokio::test]
+    async fn a_trash_image_without_its_sidecar_is_reclaimed_not_an_open_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-unrecorded-trash-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let layout = crate::storage::StorageLayout::new(&root, &repo_id).unwrap();
+        let project_root = layout.project().project_root.clone();
+        let trash = project_root.join("sessions/.trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let image = trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.asif");
+        let companion = crate::metadata::append_suffix(&image, ".ca.key");
+        std::fs::write(&image, b"retired image").unwrap();
+        std::fs::write(&companion, b"retired CA key").unwrap();
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
+            &root,
+            root.join("caches"),
+            root.join("checkout"),
+        );
+        let mut commitments = super::super::supervisor::CommitmentPublisher::open(
+            root.join("telemetry"),
+            crate::storage::audit::ContinuityAudit::Off,
+            ROUTER_CAPACITY,
+        )
+        .unwrap();
+        let mut open = async |scope: RecoveryScope| {
+            let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
+                NoDiskCommands,
+                config.clone(),
+            )
+            .unwrap();
+            let retired = native_retired_refs(&project_root, &repo_id)
+                .expect("a sidecarless trash image does not fail the open");
+            assert!(retired.recorded.is_empty());
+            assert_eq!(retired.unrecorded, std::slice::from_ref(&image));
+            finish_store_residue(
+                host,
+                config.clone(),
+                &repo_id,
+                &[],
+                retired,
+                &mut commitments,
+                &scope,
+            )
+            .await
+            .unwrap();
+        };
+
+        open(RecoveryScope::Inspect).await;
+        assert!(
+            image.exists(),
+            "an inspecting open reclaimed {}",
+            image.display()
+        );
+
+        open(RecoveryScope::Workspaces(Default::default())).await;
+        assert!(!image.exists(), "a repairing open left {}", image.display());
+        assert!(
+            !companion.exists(),
+            "a repairing open left {}",
+            companion.display()
+        );
+        let log = std::fs::read_to_string(project_root.join("deletion-log.jsonl"))
+            .expect("the reclaim is recorded in the deletion log");
+        assert!(
+            log.lines()
+                .any(|line| line.contains("\"op\":\"reclaim-image\"")
+                    && line.contains(image.to_str().unwrap())),
+            "deletion log does not record the reclaimed image: {log}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

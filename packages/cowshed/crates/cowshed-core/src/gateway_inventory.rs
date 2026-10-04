@@ -799,6 +799,10 @@ impl NativeGatewayInventory {
                             && crate::metadata::is_image_path(&path)
                             && fs::symlink_metadata(&path)
                                 .is_ok_and(|metadata| metadata.file_type().is_file())
+                            // A retired image without its sidecar has no record left to name a
+                            // checkout; it is bytes awaiting reclaim, not a claim on the root.
+                            && !fs::symlink_metadata(sidecar_path(&path))
+                                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                         {
                             images.push(path);
                         }

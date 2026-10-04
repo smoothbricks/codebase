@@ -626,6 +626,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         config: &ApfsSubstrateConfig,
         retired: &RetiredRef,
     ) -> Result<(), ApfsStorageError>;
+    /// Reclaims a trash image whose retirement record, its grants sidecar, is already gone. The
+    /// caller holds the lock of the workspace name the file carries.
+    fn reclaim_unrecorded_retired(
+        &self,
+        config: &ApfsSubstrateConfig,
+        repo: &RepoId,
+        image: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     fn pending_publications(
         &self,
@@ -1577,6 +1585,32 @@ where
     {
         self.dispatch_with_locks(vec![lock_path], false, move |_, _| Ok(job()))
             .await
+    }
+
+    /// Reclaims a trash image whose grants sidecar is gone, under the lock of the name its
+    /// `<workspace>-<incarnation>` file name carries: a retirement holds that lock between moving
+    /// the image and moving its sidecar, so waiting on it means never deleting one mid-flight.
+    pub async fn reclaim_unrecorded_retired(
+        &self,
+        repo: &RepoId,
+        image: PathBuf,
+    ) -> Result<(), ApfsStorageError> {
+        let (name, _) = image
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(split_retired_stem)
+            .ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "trash image is not named <workspace>-<incarnation>: {}",
+                    image.display()
+                ))
+            })?;
+        let lock_paths = vec![workspace_lock_path(&self.config, repo, &name)?];
+        let repo = repo.clone();
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            host.reclaim_unrecorded_retired(&config, &repo, &image)
+        })
+        .await
     }
 }
 

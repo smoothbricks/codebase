@@ -1939,6 +1939,55 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     );
 }
 
+/// A retired entry whose grants sidecar was deleted by hand once failed every GC preview, and so
+/// every doctor, with a metadata I/O error. Its record is gone, so it is already reclaimed as a
+/// retirement: the preview plans its remaining bytes and the GC reclaims them beside a recorded
+/// retirement.
+#[test]
+fn gc_reclaims_a_retired_image_whose_sidecar_is_already_gone() {
+    const RECORDED: &str = "1836ace7b0cd4b41b3ca31a9eb1d131a";
+    const UNRECORDED: &str = "a5e833cf3c73476184ef904ef11846d1";
+    let fixture = Fixture::new("retired-sidecar-gone");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    create_image(layout.main_image().expect("main").image());
+    let trash = layout.project().sessions.join(".trash");
+    let recorded = trash.join(format!("cpg-review-{RECORDED}.asif"));
+    create_image(&recorded);
+    write_session_metadata(&recorded, "cpg-review", RECORDED);
+    let unrecorded = trash.join(format!("cpg-review3-{UNRECORDED}.asif"));
+    create_image(&unrecorded);
+    std::fs::remove_file(sidecar_path(&unrecorded)).expect("delete the sidecar by hand");
+
+    let plan = host
+        .preview_gc(&config, &repo())
+        .expect("a sidecarless retired image does not fail the preview");
+    let retired = plan
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
+        .map(|candidate| candidate.path().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(retired, [recorded.clone(), unrecorded.clone()]);
+    host.execute_gc(&config, plan)
+        .expect("collect the recorded and the unrecorded retirement");
+
+    for image in [&recorded, &unrecorded] {
+        assert!(!image.exists(), "{} image remains", image.display());
+        assert!(
+            !sidecar_path(image).exists(),
+            "{} grants remain",
+            image.display()
+        );
+        assert!(
+            !ca_key_path(image).exists(),
+            "{} CA key remains",
+            image.display()
+        );
+    }
+}
+
 /// Retiring one name twice leaves two independently collectable entries. The paths keyed on the
 /// name alone belong to exactly one of them, so they are collected once rather than claimed twice
 /// or abandoned along with the entry that did not own them.

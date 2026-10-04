@@ -836,6 +836,15 @@ impl ApfsExecutionHost for FakeHost {
             Ok(())
         }
     }
+    fn reclaim_unrecorded_retired(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &RepoId,
+        _: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("reclaim-unrecorded");
+        Ok(())
+    }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
         Ok(self
