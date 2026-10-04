@@ -295,7 +295,6 @@ pub struct ProcessSpawnRequest {
     pub command: SpawnCommand,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
-    pub devenv_dir: Option<PathBuf>,
     pub policy: SandboxPolicy,
     /// Requested narrowing of the policy's ceiling.
     pub mode: crate::api::dto::RunSandboxMode,
@@ -708,63 +707,6 @@ impl CommitmentSink for CommitmentPublisherHandle {
     }
 }
 
-const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
-const DEVENV_PROFILE_BIN: &str = ".devenv/profile/bin";
-#[derive(Clone, Debug)]
-struct DevenvResolutionError {
-    message: String,
-}
-
-impl DevenvResolutionError {
-    fn into_cowshed_error(self) -> CowshedError {
-        CowshedError::environment_missing(
-            self.message,
-            "repair .cowshed.toml or the configured devenv directory, then retry",
-        )
-    }
-}
-
-fn resolve_devenv_dir(
-    workspace_mount: &Path,
-) -> std::result::Result<Option<PathBuf>, DevenvResolutionError> {
-    let config_path = workspace_mount.join(COWSHED_CONFIG_FILE);
-    let config = match fs::read_to_string(&config_path) {
-        Ok(input) => Some(
-            crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
-                DevenvResolutionError {
-                    message: format!("invalid {}: {error}", config_path.display()),
-                }
-            })?,
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(DevenvResolutionError {
-                message: format!("cannot read {}: {error}", config_path.display()),
-            });
-        }
-    };
-
-    if let Some(configured) = config.as_ref().and_then(|config| config.devenv()) {
-        let devenv_dir = workspace_mount.join(configured.dir());
-        let devenv_nix = devenv_dir.join("devenv.nix");
-        if !devenv_nix.is_file() {
-            return Err(DevenvResolutionError {
-                message: format!(
-                    "configured devenv directory {} is missing {}",
-                    devenv_dir.display(),
-                    devenv_nix.display()
-                ),
-            });
-        }
-        return Ok(Some(devenv_dir));
-    }
-
-    let root_devenv_nix = workspace_mount.join("devenv.nix");
-    Ok(root_devenv_nix
-        .is_file()
-        .then(|| workspace_mount.to_owned()))
-}
-
 /// Resolve a shell input without letting discovery cross the workspace boundary.
 fn contained_shell_path(workspace_mount: &Path, path: &Path) -> Result<PathBuf> {
     let resolved = fs::canonicalize(path).map_err(|error| {
@@ -797,125 +739,38 @@ fn shell_input_exists(workspace_mount: &Path, path: &Path) -> Result<bool> {
     }
 }
 
-/// Configuration is rooted beside its `.cowshed.toml`, not at the requested command cwd.
-fn shell_project(
-    workspace_mount: &Path,
-    cwd: &Path,
-    configured_dir: Option<&Path>,
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    if let Some(directory) = configured_dir {
-        let directory = contained_shell_path(workspace_mount, directory)?;
-        return Ok(Some((workspace_mount.to_owned(), directory)));
-    }
-    for root in cwd
-        .ancestors()
-        .take_while(|root| root.starts_with(workspace_mount))
-    {
-        // Validate links before the config parser reads any workspace-controlled path.
-        shell_input_exists(workspace_mount, &root.join(COWSHED_CONFIG_FILE))?;
-        shell_input_exists(workspace_mount, &root.join("devenv.nix"))?;
-        if let Some(directory) =
-            resolve_devenv_dir(root).map_err(DevenvResolutionError::into_cowshed_error)?
-        {
-            let directory = contained_shell_path(workspace_mount, &directory)?;
-            contained_shell_path(workspace_mount, &directory.join("devenv.nix"))?;
-            return Ok(Some((root.to_owned(), directory)));
-        }
-    }
-    Ok(None)
-}
-
-/// How a command in some cwd enters the workspace shell.
-enum ShellEntry {
-    /// The nearest workspace-contained `.envrc`, loaded by direnv.
-    Envrc(PathBuf),
-    /// A configured devenv project without an `.envrc`, entered with `devenv shell`.
-    Devenv { root: PathBuf, directory: PathBuf },
-    /// No shell to enter.
-    Bare,
-}
-
-struct ShellSelection {
-    entry: ShellEntry,
-    /// The devenv project whose evaluated profile bootstraps PATH, if any.
-    devenv_dir: Option<PathBuf>,
-}
-
-/// Select the shell entry for `cwd`: the nearest `.envrc` walking up to the workspace
-/// boundary, else a configured devenv project, else none. An unrelated ancestor's `.envrc`
-/// outside the workspace is neither authorized nor evaluated.
-fn select_shell(
-    sandbox: &SandboxConfig,
-    cwd: &Path,
-    configured_dir: Option<&Path>,
-) -> Result<ShellSelection> {
-    let project = shell_project(&sandbox.workspace_mount, cwd, configured_dir)?;
-    let mut envrc_directory = None;
+/// The directory of the nearest `.envrc` from `cwd` up to the workspace boundary: the shell a
+/// command in `cwd` activates. `None` runs the command in the plain sandbox environment. An
+/// unrelated ancestor's `.envrc` outside the workspace is neither authorized nor evaluated.
+fn envrc_directory(sandbox: &SandboxConfig, cwd: &Path) -> Result<Option<PathBuf>> {
     for directory in cwd
         .ancestors()
         .take_while(|directory| directory.starts_with(&sandbox.workspace_mount))
     {
         if shell_input_exists(&sandbox.workspace_mount, &directory.join(".envrc"))? {
-            envrc_directory = Some(directory.to_path_buf());
-            break;
+            return Ok(Some(directory.to_path_buf()));
         }
     }
-    let devenv_dir = project.as_ref().map(|(_, directory)| directory.clone());
-    let entry = match (envrc_directory, project) {
-        (Some(directory), _) => ShellEntry::Envrc(directory),
-        (None, Some((root, directory))) => ShellEntry::Devenv { root, directory },
-        (None, None) => ShellEntry::Bare,
-    };
-    Ok(ShellSelection { entry, devenv_dir })
+    Ok(None)
 }
 
 /// One-shot activation is part of the executed child: it inherits the same sandbox, pipes and
-/// process group, and its failure is the job's failure. Only constant scripts are shell code;
-/// cwd and the complete original argv remain positional arguments, never interpolated shell
-/// code.
-fn wrap_one_shot(plan: &mut SpawnPlan, entry: &ShellEntry) {
-    let mut activation = match entry {
-        // Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME), never the
-        // user's host trust database. No workspace code executes until sandbox-exec.
-        ShellEntry::Envrc(directory) => vec![
-            OsString::from("/bin/sh"),
-            OsString::from("-c"),
-            OsString::from(
-                r#"directory=$1; shift; direnv allow "$directory/.envrc" && exec direnv exec "$directory" "$@""#,
-            ),
-            OsString::from("cowshed-direnv"),
-            directory.as_os_str().to_owned(),
-        ],
-        ShellEntry::Devenv { root, directory } => {
-            let mut source = OsString::from("path:");
-            source.push(directory);
-            vec![
-                OsString::from("/bin/sh"),
-                OsString::from("-c"),
-                OsString::from(
-                    r#"root=$1; source=$2; cwd=$3; shift 3; cd "$root" && exec devenv --from "$source" shell -- /bin/sh -c 'cd "$1" && shift && exec "$@"' cowshed-command "$cwd" "$@""#,
-                ),
-                OsString::from("cowshed-devenv"),
-                root.as_os_str().to_owned(),
-                source,
-                plan.cwd.as_os_str().to_owned(),
-            ]
-        }
-        ShellEntry::Bare => return,
-    };
+/// process group, and its failure is the job's failure. Only the constant script is shell code;
+/// the `.envrc` directory and the complete original argv remain positional arguments, never
+/// interpolated shell code. Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME),
+/// never the user's host trust database, and no workspace code executes until sandbox-exec.
+fn wrap_one_shot(plan: &mut SpawnPlan, envrc_directory: &Path) {
+    let mut activation = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(
+            r#"directory=$1; shift; direnv allow "$directory/.envrc" && exec direnv exec "$directory" "$@""#,
+        ),
+        OsString::from("cowshed-direnv"),
+        envrc_directory.as_os_str().to_owned(),
+    ];
     activation.extend(plan.args.drain(3..));
     plan.args.extend(activation);
-}
-
-/// Resolve a store-backed profile for bootstrap tool discovery only.
-///
-/// Canonical activation owns the resulting PATH. These existing profiles only make direnv and
-/// devenv reachable before activation; both locations retain the immutable store guard.
-fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<PathBuf> {
-    [devenv_dir, workspace_mount].into_iter().find_map(|root| {
-        let resolved = fs::canonicalize(root.join(DEVENV_PROFILE_BIN)).ok()?;
-        resolved.starts_with("/nix/store").then_some(resolved)
-    })
 }
 
 /// The Nix profiles that belong to the host's user and the host itself rather than to any
@@ -989,10 +844,9 @@ fn effective_user_name() -> Option<OsString> {
     Some(OsString::from_vec(name.to_bytes().to_vec()))
 }
 
-fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<OsString> {
+fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     bootstrap_path_from(
         sandbox,
-        devenv_dir,
         &host_profile_bins(&sandbox.home, effective_user_name().as_deref()),
     )
 }
@@ -1000,18 +854,8 @@ fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<
 /// The PATH a child starts from, before its shell activates: the workspace's own tools, the
 /// bootstrap packages, then the platform. Nothing comes from the PATH that started this
 /// process — another checkout's shell or a user's login PATH is not the workspace's.
-fn bootstrap_path_from(
-    sandbox: &SandboxConfig,
-    devenv_dir: Option<&Path>,
-    host_profiles: &[PathBuf],
-) -> Result<OsString> {
+fn bootstrap_path_from(sandbox: &SandboxConfig, host_profiles: &[PathBuf]) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
-    if let Some(profile) = workspace_profile_bin(
-        &sandbox.workspace_mount,
-        devenv_dir.unwrap_or(&sandbox.workspace_mount),
-    ) {
-        paths.push(profile);
-    }
     for bin in bootstrap_tool_bins(host_profiles) {
         if !paths.contains(&bin) {
             paths.push(bin);
@@ -1294,7 +1138,6 @@ impl SandboxEnvironment {
 /// PATH here discovers bootstrap tools and the workspace shell owns PATH from then on.
 pub(super) async fn sandbox_environment(
     sandbox: &SandboxConfig,
-    devenv_dir: Option<&Path>,
     caller: &BTreeMap<String, String>,
 ) -> Result<SandboxEnvironment> {
     let private_root = sandbox.workspace_mount.join(".cowshed");
@@ -1360,7 +1203,7 @@ pub(super) async fn sandbox_environment(
     // before capture existed keeps the empty device and fails an authorless commit loudly,
     // rather than silently borrowing whatever the controller's user happens to be.
     let git_identity = crate::git::workspace_git_identity_config(&sandbox.workspace_mount)?;
-    let path = bootstrap_path(sandbox, devenv_dir)?;
+    let path = bootstrap_path(sandbox)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
@@ -1670,18 +1513,13 @@ impl SpawnSink for SystemSpawnSink {
         let (sandbox, profile) = request.policy.child(request.mode);
         let cwd = crate::exec::contained_cwd(&sandbox.workspace_mount, &request.cwd)
             .map_err(map_exec_error)?;
-        let selection = select_shell(sandbox, &cwd, request.devenv_dir.as_deref())?;
+        let envrc_directory = envrc_directory(sandbox, &cwd)?;
         let environment = crate::timing::spanned(
             "spawn",
             "environment",
-            sandbox_environment(sandbox, selection.devenv_dir.as_deref(), &request.env),
+            sandbox_environment(sandbox, &request.env),
         )
         .await?;
-        let activation = match &selection.entry {
-            ShellEntry::Envrc(directory) => Some(Some(directory.clone())),
-            ShellEntry::Bare => Some(None),
-            ShellEntry::Devenv { .. } => None,
-        };
         let pooled = |command, environment| super::shell_job::PooledSpawn {
             job_id: request.job_id,
             command,
@@ -1689,19 +1527,18 @@ impl SpawnSink for SystemSpawnSink {
             profile,
             read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
             workspace_mount: sandbox.workspace_mount.clone(),
-            envrc_directory: activation.clone().flatten(),
+            envrc_directory: envrc_directory.clone(),
             environment,
             caller: &request.env,
             grant_revision: request.authority.grant_revision,
         };
         let argv = match request.command {
             SpawnCommand::Script(script) => {
-                let (Some(shells), Some(_)) = (self.shells.as_mut(), &activation) else {
+                let Some(shells) = self.shells.as_mut() else {
                     return Err(CowshedError::environment_missing(
                         "a script job runs in the workspace's exec host, which needs the cowshed \
-                         binary and a workspace .envrc or no shell configuration at all",
-                        "run the script through the cowshed CLI; a devenv-only project needs an \
-                         .envrc that uses devenv",
+                         binary",
+                        "run the script through the cowshed CLI",
                     ));
                 };
                 return shells.spawn(
@@ -1711,9 +1548,9 @@ impl SpawnSink for SystemSpawnSink {
             }
             SpawnCommand::Argv(argv) => argv,
         };
-        // Warm hosts serve commands under a workspace `.envrc`; a bare workspace and a
-        // devenv-only project keep one-shot activation for argv jobs.
-        if let (Some(Some(_)), Some(shells)) = (&activation, self.shells.as_mut()) {
+        // Warm hosts serve commands under a workspace `.envrc`; a bare workspace keeps one-shot
+        // spawns for argv jobs.
+        if let (Some(_), Some(shells)) = (&envrc_directory, self.shells.as_mut()) {
             return shells.spawn(
                 pooled(super::shell_job::HostCommand::Argv(argv), environment),
                 events,
@@ -1721,7 +1558,9 @@ impl SpawnSink for SystemSpawnSink {
         }
         let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
             .map_err(map_exec_error)?;
-        wrap_one_shot(&mut plan, &selection.entry);
+        if let Some(directory) = &envrc_directory {
+            wrap_one_shot(&mut plan, directory);
+        }
         let mut command = sandboxed_command(&plan, &environment.child(&request.env));
         command
             .stdin(Stdio::piped())
@@ -3479,7 +3318,6 @@ impl SupervisorActor {
                         .map(Path::to_path_buf)
                         .unwrap_or_default(),
                     env: merged_env,
-                    devenv_dir: None,
                     // Rendered when this authority was taken. The request may narrow the
                     // ceiling, never widen it, and narrowing one job alters no other job.
                     policy: self.policy.clone(),
@@ -4678,13 +4516,9 @@ mod workspace_toolchain_tests {
     #[cfg(target_os = "macos")]
     use crate::fork_lock::Run as _;
     #[cfg(target_os = "macos")]
-    use crate::sandbox::{
-        RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, nix_daemon_socket,
-        seatbelt_profile,
-    };
+    use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants, nix_daemon_socket};
 
-    // Only the macOS host-controller test below builds a sandbox; on the Linux
-    // cross lint the helper would be dead code.
+    // Only macOS tests build a sandbox; on the Linux cross lint the helper would be dead code.
     #[cfg(target_os = "macos")]
     fn sandbox_at(mount: &Path) -> SandboxConfig {
         SandboxConfig {
@@ -4761,7 +4595,7 @@ mod workspace_toolchain_tests {
         env.insert("NODE_USE_ENV_PROXY".to_owned(), "0".to_owned());
         env.insert("HOME".to_owned(), "/caller/home".to_owned());
 
-        let environment = sandbox_environment(&sandbox, None, &env)
+        let environment = sandbox_environment(&sandbox, &env)
             .await
             .expect("environment");
         let child = environment.child(&env);
@@ -4908,7 +4742,7 @@ mod workspace_toolchain_tests {
             ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
         ]);
         let wiring = async || {
-            let environment = sandbox_environment(&sandbox, None, &caller)
+            let environment = sandbox_environment(&sandbox, &caller)
                 .await
                 .expect("environment");
             let child = environment.child(&caller);
@@ -4964,7 +4798,7 @@ mod workspace_toolchain_tests {
         };
         let mut sandbox = sandbox_at(Path::new(&mount));
         sandbox.port_block = crate::metadata::PortBlock::new(49_040, 16).expect("port block");
-        let environment = sandbox_environment(&sandbox, None, &BTreeMap::new())
+        let environment = sandbox_environment(&sandbox, &BTreeMap::new())
             .await
             .expect("environment");
         for (name, value) in environment.child(&BTreeMap::new()) {
@@ -5108,72 +4942,33 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Only a workspace-contained `.envrc` selects a shell, the nearest one above the command's
+    /// cwd. A `devenv.nix` is not a shell backend, and an `.envrc` above the workspace is never
+    /// the workspace's.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn a_workspace_without_an_evaluated_profile_is_unchanged() {
-        let root = scratch("absent");
+    fn only_the_nearest_contained_envrc_selects_a_shell() {
+        let root = scratch("envrc-selection");
         let mount = root.join("workspace");
-        std::fs::create_dir_all(&mount).expect("mount");
-        let devenv_root = mount.join("tooling/devenv");
-        std::fs::create_dir_all(&devenv_root).expect("devenv root");
+        let nested = mount.join("packages/app");
+        std::fs::create_dir_all(&nested).expect("nested project");
+        std::fs::write(mount.join("devenv.nix"), "{ ... }: { }\n").expect("devenv.nix");
+        std::fs::write(root.join(".envrc"), "exit 1\n").expect("ancestor envrc");
+        let sandbox = sandbox_at(&mount);
 
-        assert_eq!(workspace_profile_bin(&mount, &devenv_root), None);
+        assert_eq!(envrc_directory(&sandbox, &nested).expect("selection"), None);
 
-        // A profile that does not resolve into the store is not a profile. This is the substitution
-        // guard: a workspace can create any symlink it likes inside its own volume, and only one
-        // that lands in the immutable store may go on PATH.
-        let profile_state = devenv_root.join(".devenv");
-        std::fs::create_dir_all(&profile_state).expect("devenv state");
-        let decoy = root.join("decoy/bin");
-        std::fs::create_dir_all(&decoy).expect("decoy");
-        std::os::unix::fs::symlink(root.join("decoy"), profile_state.join("profile"))
-            .expect("decoy link");
-        assert_eq!(workspace_profile_bin(&mount, &devenv_root), None);
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn devenv_resolution_prefers_config_then_root_then_none() {
-        let root = scratch("resolution");
-        let mount = root.join("workspace");
-        let configured = mount.join("tooling/devenv");
-        std::fs::create_dir_all(&configured).expect("configured devenv");
-        std::fs::write(mount.join("devenv.nix"), "{}").expect("root devenv");
-        std::fs::write(configured.join("devenv.nix"), "{}").expect("configured devenv");
-        std::fs::write(
-            mount.join(COWSHED_CONFIG_FILE),
-            "[devenv]\ndir = \"tooling/devenv\"\n",
-        )
-        .expect("config");
-
-        assert_eq!(resolve_devenv_dir(&mount).unwrap(), Some(configured));
-
-        std::fs::remove_file(mount.join(COWSHED_CONFIG_FILE)).expect("remove config");
-        assert_eq!(resolve_devenv_dir(&mount).unwrap(), Some(mount.clone()));
-
-        std::fs::remove_file(mount.join("devenv.nix")).expect("remove root devenv");
-        assert_eq!(resolve_devenv_dir(&mount).unwrap(), None);
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn configured_devenv_without_devenv_nix_is_an_error() {
-        let root = scratch("configured-missing");
-        let mount = root.join("workspace");
-        std::fs::create_dir_all(&mount).expect("mount");
-        std::fs::write(
-            mount.join(COWSHED_CONFIG_FILE),
-            "[devenv]\ndir = \"tooling/devenv\"\n",
-        )
-        .expect("config");
-
-        let error = resolve_devenv_dir(&mount).unwrap_err();
+        std::fs::write(mount.join(".envrc"), "").expect("workspace envrc");
         assert_eq!(
-            error.into_cowshed_error().code,
-            crate::error::ErrorCode::EnvironmentMissing
+            envrc_directory(&sandbox, &nested).expect("selection"),
+            Some(mount.clone())
         );
 
+        std::fs::write(nested.join(".envrc"), "").expect("nested envrc");
+        assert_eq!(
+            envrc_directory(&sandbox, &nested).expect("selection"),
+            Some(nested.clone())
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5221,7 +5016,7 @@ mod workspace_toolchain_tests {
             home_reads: Vec::new(),
         };
 
-        let path = bootstrap_path_from(&sandbox, None, &[profile]).expect("bootstrap PATH");
+        let path = bootstrap_path_from(&sandbox, &[profile]).expect("bootstrap PATH");
         let mut expected = vec![sandbox.workspace_mount.join(".cowshed/bin"), package];
         expected.extend(developer_directory().map(|directory| directory.join("usr/bin")));
         expected.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
@@ -5230,110 +5025,6 @@ mod workspace_toolchain_tests {
             expected,
             "only {tool}'s package joins PATH, not the rest of its profile nor this process's PATH"
         );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// The end of the mechanism, exercised for real: a workspace whose `devenv` evaluation
-    /// materialized a store profile gets that profile's tools on `PATH`, ahead of the inherited
-    /// roots, and can actually execute them inside its own Seatbelt sandbox.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    fn host_controller_an_evaluated_workspace_profile_leads_path_and_runs_inside_the_sandbox() {
-        // A store-resolved profile root, standing in for a devenv-generated one without pinning
-        // a generated store path. The daemon profile is the obvious candidate but is absent on a
-        // single-user Nix install, so any store `bin` already on PATH serves equally: it is the
-        // same immutable-store class, reached through the same canonicalization this test is
-        // about.
-        //
-        // Absence is a FAILURE, not a skip. Nix is a hard requirement of cowshed -- the sandbox
-        // admits the daemon socket as a standing grant, this repository's own dev shell is
-        // devenv, and a host with no store cannot run a workspace at all. The `return`s that used
-        // to sit here made this test report success on exactly the hosts where its subject does
-        // not exist, which is the one outcome worse than failing.
-        let store_profile = std::fs::canonicalize("/nix/var/nix/profiles/default")
-            .ok()
-            .filter(|profile| profile.starts_with("/nix/store"))
-            .or_else(|| {
-                std::env::split_paths(&std::env::var_os("PATH")?)
-                    .filter_map(|entry| std::fs::canonicalize(entry).ok())
-                    .find(|entry| entry.starts_with("/nix/store") && entry.ends_with("bin"))
-                    .and_then(|bin| bin.parent().map(Path::to_path_buf))
-            })
-            .expect(
-                "no /nix/store profile is resolvable on this host; cowshed requires Nix, so this \
-                 is a broken environment rather than a test that does not apply",
-            );
-        let tool = std::fs::read_dir(store_profile.join("bin"))
-            .expect("a store profile has a bin directory")
-            .find_map(|entry| {
-                let path = entry.ok()?.path();
-                path.is_file().then_some(path)
-            })
-            .expect("a store profile's bin directory is not empty");
-
-        let root = scratch("profile");
-        let mount = root.join("workspace");
-        let devenv_root = mount.join("tooling/devenv");
-        let config = sandbox_at(&mount);
-        for directory in [
-            &devenv_root.join(".devenv"),
-            &config.home,
-            &config.exec_temp_dir,
-        ] {
-            std::fs::create_dir_all(directory).expect("directory");
-        }
-        // Exactly what `devenv shell` leaves behind: an in-image symlink into the store.
-        std::os::unix::fs::symlink(&store_profile, devenv_root.join(".devenv/profile"))
-            .expect("profile link");
-
-        let profile_bin =
-            workspace_profile_bin(&mount, &devenv_root).expect("an evaluated profile is admitted");
-        // Resolved all the way through: a profile's `bin` is itself a symlink chain inside the
-        // store, and what goes on PATH is the immutable path it finally reaches.
-        assert!(profile_bin.starts_with("/nix/store"));
-        assert_eq!(
-            profile_bin,
-            std::fs::canonicalize(store_profile.join("bin")).expect("resolved profile bin")
-        );
-
-        let path = bootstrap_path(&config, Some(&devenv_root)).expect("bootstrap PATH");
-        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        assert_eq!(
-            entries.get(1),
-            Some(&profile_bin),
-            "the workspace's own toolchain comes before the inherited roots, or an edited \
-             devenv.nix loses to the controller's environment"
-        );
-
-        // And it is genuinely reachable: the store read grants have to cover the resolved profile,
-        // or PATH names a tool the sandbox refuses to exec.
-        let profile =
-            seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).expect("profile");
-        let status = std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", &profile, "--", "/bin/test", "-x"])
-            .arg(&tool)
-            .status_locked()
-            .expect("sandbox-exec");
-        // Asserted here, before the fallback-path mutations below. Deferring it to the end of the
-        // function meant any later panic silently discarded the only runtime check in the file.
-        assert!(
-            status.success(),
-            "a tool on the workspace profile must be executable inside the sandbox"
-        );
-
-        // Native devenv bindings anchor `.devenv` at the allowed repository root. Workspace paths
-        // have no binding, but accepting this fallback keeps a profile evaluated before mounting
-        // usable without weakening the same store-path guard.
-        std::fs::remove_file(devenv_root.join(".devenv/profile")).expect("nested profile");
-        std::fs::create_dir_all(mount.join(".devenv")).expect("root devenv state");
-        std::os::unix::fs::symlink(&store_profile, mount.join(".devenv/profile"))
-            .expect("root profile link");
-        assert_eq!(
-            workspace_profile_bin(&mount, &devenv_root),
-            Some(profile_bin.clone())
-        );
-
         std::fs::remove_dir_all(&root).ok();
     }
 }

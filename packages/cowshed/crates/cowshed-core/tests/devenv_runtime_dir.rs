@@ -968,7 +968,6 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         command: cowshed_core::runtime::supervisor::SpawnCommand::Argv(argv),
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
-        devenv_dir: None,
         policy: SandboxPolicy::render(sandbox.clone()).expect("sandbox policy"),
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
     }
@@ -1300,42 +1299,6 @@ async fn host_controller_shell_activation_does_not_authorize_or_load_an_envrc_ou
             .exists(),
         "an unrelated ancestor envrc must not be approved"
     );
-    std::fs::remove_dir_all(root).expect("remove test workspace");
-}
-
-#[tokio::test]
-async fn configured_missing_devenv_fails_before_command_execution() {
-    let root = scratch("shell-activation-missing");
-    let sandbox = workspace(&root, 41_040);
-    std::fs::write(
-        sandbox.workspace_mount.join(".cowshed.toml"),
-        "[devenv]\ndir = \"tooling/devenv\"\n",
-    )
-    .expect("configured missing devenv");
-    let request = spawn_request(
-        &sandbox,
-        &sandbox.workspace_mount,
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf ran > command-ran".into(),
-        ],
-    );
-    let (events, _) = mpsc::channel(16);
-    let error = match SystemSpawnSink::default().spawn(request, events).await {
-        Ok(mut process) => {
-            process
-                .signal_process_tree(cowshed_core::runtime::supervisor::ProcessSignal::Kill)
-                .expect("stop incorrectly admitted command");
-            panic!("missing configured devenv must reject the spawn");
-        }
-        Err(error) => error,
-    };
-    assert_eq!(
-        error.code,
-        cowshed_core::error::ErrorCode::EnvironmentMissing
-    );
-    assert!(!sandbox.workspace_mount.join("command-ran").exists());
     std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 

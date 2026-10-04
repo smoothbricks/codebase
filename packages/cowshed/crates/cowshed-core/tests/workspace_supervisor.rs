@@ -2877,7 +2877,7 @@ async fn a_land_starts_main_s_declared_warm_step_in_the_background_at_the_landed
 async fn a_main_that_declares_no_warm_step_never_asks_its_supervisor() {
     let (supervisor_config, root) = isolated_config("land-no-warm");
     let main = supervisor_config.workspace_root;
-    for config in [None, Some("[devenv]\ndir = \"tooling/devenv\"\n")] {
+    for config in [None, Some("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n")] {
         if let Some(config) = config {
             std::fs::write(main.join(".cowshed.toml"), config).unwrap();
         }

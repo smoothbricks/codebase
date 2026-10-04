@@ -148,8 +148,8 @@ subscript or an integer variable the shell evaluates a variable's content as an 
 places. The script runs in the workspace's warm exec host with bash defaults (no `errexit`, no `pipefail`); a script
 that does not parse ends `failed` with `failure: "scriptSyntax"`, exit code 2, and the parser's message on stderr, and
 nothing from it runs. `JobInfo` then carries `script` instead of `argv`. Script jobs need the `cowshed` binary as the
-controller (it carries the interpreter) and a workspace that is either configured with an `.envrc` or has no shell
-configuration; a devenv-only project gets `environment-missing`.
+controller (it carries the interpreter); they run under the workspace `.envrc` when it has one and in the plain sandbox
+environment when it does not.
 
 ### Shell redirects and sealed export
 

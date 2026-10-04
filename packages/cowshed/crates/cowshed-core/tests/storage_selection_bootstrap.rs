@@ -102,27 +102,25 @@ fn command_line(operation: &HostOperation) -> Option<String> {
 #[test]
 fn cowshed_config_parser_accepts_only_complete_known_sections() {
     let config = parse_cowshed_config(
-        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n[devenv]\ndir = \"tooling/devenv\"\n",
+        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n[land]\nwarm = [\"tooling/warm-main\"]\n",
     )
     .unwrap();
     assert_eq!(config.substrate().unwrap().pool(), "tank");
-    assert_eq!(config.devenv().unwrap().dir(), Path::new("tooling/devenv"));
+    assert_eq!(config.land().unwrap().warm(), ["tooling/warm-main"]);
 
     let substrate_only =
         parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n").unwrap();
     assert_eq!(substrate_only.substrate().unwrap().pool(), "tank");
-    assert_eq!(substrate_only.devenv(), None);
-
-    let devenv_only = parse_cowshed_config("[devenv]\ndir = \"tooling/devenv\"\n").unwrap();
-    assert_eq!(devenv_only.substrate(), None);
-    assert_eq!(
-        devenv_only.devenv().unwrap().dir(),
-        Path::new("tooling/devenv")
-    );
+    assert_eq!(substrate_only.land(), None);
 
     assert_eq!(
         parse_cowshed_config("[repository]\nname = \"widget\"\n").unwrap_err(),
         ConfigError::UnknownSection("repository".to_owned())
+    );
+    // Cowshed has no devenv backend: a project activates devenv through its own `.envrc`.
+    assert_eq!(
+        parse_cowshed_config("[devenv]\ndir = \"tooling/devenv\"\n").unwrap_err(),
+        ConfigError::UnknownSection("devenv".to_owned())
     );
     let invalid = [
         (
@@ -146,15 +144,7 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
             "unknown [substrate] key",
         ),
         (
-            "[devenv]\ndir = \"tooling/devenv\"\nextra = \"x\"\n",
-            "unknown [devenv] key",
-        ),
-        (
             "[substrate]\nkind = \"zfs\"\nkind = \"zfs\"\npool = \"tank\"\n",
-            "duplicated",
-        ),
-        (
-            "[devenv]\ndir = \"tooling/devenv\"\ndir = \"other\"\n",
             "duplicated",
         ),
         (
@@ -165,7 +155,6 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
             "[substrate]\nkind = \"zfs\"\npool = \"tank\"\n[substrate]\nkind = \"zfs\"\npool = \"tank\"\n",
             "duplicated",
         ),
-        ("[devenv]\n", "missing [devenv] key \"dir\""),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
@@ -211,16 +200,6 @@ pool = "tank"
 }
 
 #[test]
-fn devenv_dir_rejects_absolute_parent_and_empty_paths() {
-    for dir in ["/tmp/devenv", "../devenv", "tooling/../devenv", ""] {
-        assert_eq!(
-            parse_cowshed_config(&format!("[devenv]\ndir = {dir:?}\n")).unwrap_err(),
-            ConfigError::InvalidDevenvDir(dir.to_owned())
-        );
-    }
-}
-
-#[test]
 fn land_warm_is_one_non_empty_argv() {
     let config =
         parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\", \"--all\"] # after land\n")
@@ -230,7 +209,7 @@ fn land_warm_is_one_non_empty_argv() {
         ["tooling/warm-main", "--all"]
     );
     assert_eq!(
-        parse_cowshed_config("[devenv]\ndir = \"x\"\n")
+        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n")
             .unwrap()
             .land(),
         None

@@ -22,10 +22,9 @@ control socket (`SCM_RIGHTS`), forks the argv into a new process group with the 
 environment laid over the activated one, and reports the raw `waitpid` status. Nothing a command does — `cd`, `export`,
 a changed umask — reaches the host or a later command: every command is a fresh process from the same activated
 environment. The host program is staged under `.cowshed/shell-host/`, which every profile denies writes to, so no job
-can replace the parent of later commands. A workspace with no shell configuration gets hosts that skip activation and
-hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those hosts. A
-configured devenv-only project, which has no direnv watch list to judge freshness by, enters `devenv shell` inside each
-job's own child and cannot run script jobs.
+can replace the parent of later commands. A workspace with no `.envrc` above the command's cwd gets hosts that skip
+activation and hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those
+hosts. Cowshed has no other shell backend: a devenv project activates through `use devenv` in its own `.envrc`.
 
 **Script jobs.** Besides a byte-exact argv, a job can be a script: bash-compatible shell text as a template of literal
 `parts` and `values` (`ExecCommand::Script`, 07_api.md). At admission the supervisor binds each value to a shell

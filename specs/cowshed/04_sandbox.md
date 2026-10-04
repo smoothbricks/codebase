@@ -583,15 +583,15 @@ These anchors are trust configuration, not secrets, so they are exported/written
    in a warm exec host (11_shell.md): a process started under the same child profile that approved and evaluated that
    `.envrc` once and forks the command into the job's own process group, with the job's own pipes, the requested cwd,
    the literal argv, and the caller env laid over the activated environment. A host that activates for a job belongs to
-   that job until its command starts, so the activation's output, failure and kill are the job's. A configured
-   devenv-only project enters `devenv shell` inside the job's own child. The supervisor neither evaluates repository
-   shell code nor parses and reconstructs its exported environment; it reads only the watch list direnv recorded, to
-   decide when a host is stale. Failed activation prevents command execution. The child profile's final rule denies
-   every mutation beneath `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor
-   artifact-write authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's
-   artifact-write authority or later jobs, and a read-only job runs only in a host started under the read-only profile.
-   The effective mode is read-only whenever either the request or the configured workspace ceiling is read-only; a
-   read-write request cannot widen a read-only ceiling.
+   that job until its command starts, so the activation's output, failure and kill are the job's. Without a contained
+   `.envrc` the command runs in the plain sandbox environment. The supervisor neither evaluates repository shell code
+   nor parses and reconstructs its exported environment; it reads only the watch list direnv recorded, to decide when a
+   host is stale. Failed activation prevents command execution. The child profile's final rule denies every mutation
+   beneath `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor artifact-write
+   authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's artifact-write
+   authority or later jobs, and a read-only job runs only in a host started under the read-only profile. The effective
+   mode is read-only whenever either the request or the configured workspace ceiling is read-only; a read-write request
+   cannot widen a read-only ceiling.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
@@ -666,9 +666,9 @@ guarantees cowshed owns:
 ### Evaluating an edited `devenv.nix` inside its workspace
 
 A workspace that edits `devenv.nix` must evaluate and activate the edit in that workspace, not first discover its effect
-after landing. Canonical activation owns this: `.envrc` runs the repository's direnv/devenv integration, including shell
-entry hooks and its own cache invalidation. Without a workspace-contained `.envrc`, a configured devenv project runs
-through `devenv shell` for each command.
+after landing. Canonical activation owns this: `.envrc` runs the repository's direnv/devenv integration (`use devenv`),
+including shell entry hooks and its own cache invalidation. Cowshed has no devenv backend of its own; a project with
+`devenv.nix` and no `.envrc` gets the plain sandbox environment.
 
 Cowshed keeps an activated shell alive across commands, and its invalidation is direnv's own watch set, never a snapshot
 of exported variables (11_shell.md). Every input the evaluation read — `.envrc`, its approval, `devenv.nix`,
@@ -679,19 +679,18 @@ command pays a Nix evaluation every time, while replaying exported variables ski
 inputs the evaluation depended on. Cowshed does not substitute `print-dev-env --json` or recreate shell entry behavior
 from exported variables.
 
-The initial sandbox PATH supplies the activation tools from the workspace's private bin, the workspace's own evaluated
-devenv profile, and the store packages of exactly `direnv`, `devenv` and `nix` (with `nix-store` beside it), then the
-platform's developer directory and `/usr/bin:/bin:/usr/sbin:/sbin`. Each package is found through the nearest host Nix
-profile that provides the tool — the user's (`~/.nix-profile`, `~/.local/state/nix/profile`,
-`/etc/profiles/per-user/<user>`, `/nix/var/nix/profiles/per-user/<user>/profile`), the system's
-(`/run/current-system/sw`) or the default profile — and joins PATH only as the `/nix/store` package directory the tool
-resolves to; the profiles themselves, with everything else their user or host installed, never join it. Nothing comes
-from the PATH of whatever started the supervisor. The activated shell then owns PATH and SDK selection, including
-workspace-local executables such as `node_modules/.bin`, so a tool a job needs is the workspace devenv's to declare.
-Cowshed does not require such executables to resolve into `/nix/store` and does not add project-specific PATH
-exceptions. Filesystem and network authority remain enforced by the same child profile, independently of shell
-environment values. The bare-command check contract (02_workspaces.md) remains unchanged: `just verify` runs through
-this activation without a caller-provided wrapper.
+The initial sandbox PATH supplies the activation tools from the workspace's private bin and the store packages of
+exactly `direnv`, `devenv` and `nix` (with `nix-store` beside it), then the platform's developer directory and
+`/usr/bin:/bin:/usr/sbin:/sbin`. Each package is found through the nearest host Nix profile that provides the tool — the
+user's (`~/.nix-profile`, `~/.local/state/nix/profile`, `/etc/profiles/per-user/<user>`,
+`/nix/var/nix/profiles/per-user/<user>/profile`), the system's (`/run/current-system/sw`) or the default profile — and
+joins PATH only as the `/nix/store` package directory the tool resolves to; the profiles themselves, with everything
+else their user or host installed, never join it. Nothing comes from the PATH of whatever started the supervisor. The
+activated shell then owns PATH and SDK selection, including workspace-local executables such as `node_modules/.bin`, so
+a tool a job needs is the workspace devenv's to declare. Cowshed does not require such executables to resolve into
+`/nix/store` and does not add project-specific PATH exceptions. Filesystem and network authority remain enforced by the
+same child profile, independently of shell environment values. The bare-command check contract (02_workspaces.md)
+remains unchanged: `just verify` runs through this activation without a caller-provided wrapper.
 
 Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
 workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the workspace's writable temporary

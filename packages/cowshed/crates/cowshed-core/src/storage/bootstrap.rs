@@ -69,7 +69,6 @@ const MARKER_VERSION: u32 = 1;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CowshedConfig {
     substrate: Option<SubstrateConfig>,
-    devenv: Option<DevenvConfig>,
     land: Option<LandConfig>,
     /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
     /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
@@ -79,10 +78,6 @@ pub struct CowshedConfig {
 impl CowshedConfig {
     pub fn substrate(&self) -> Option<&SubstrateConfig> {
         self.substrate.as_ref()
-    }
-
-    pub fn devenv(&self) -> Option<&DevenvConfig> {
-        self.devenv.as_ref()
     }
 
     pub fn land(&self) -> Option<&LandConfig> {
@@ -105,17 +100,6 @@ impl SubstrateConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DevenvConfig {
-    dir: PathBuf,
-}
-
-impl DevenvConfig {
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-}
-
 /// What `land` does after it moves the target: `[land] warm`, the argv main's workspace runs so
 /// every later clone of main starts warm.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,7 +117,6 @@ impl LandConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigSection {
     Substrate,
-    Devenv,
     Land,
     Sandbox,
 }
@@ -142,7 +125,6 @@ impl ConfigSection {
     const fn name(self) -> &'static str {
         match self {
             Self::Substrate => "substrate",
-            Self::Devenv => "devenv",
             Self::Land => "land",
             Self::Sandbox => "sandbox",
         }
@@ -151,18 +133,15 @@ impl ConfigSection {
 
 /// Parse the complete repository-owned cowshed configuration.
 ///
-/// Only `[substrate]`, `[devenv]`, `[land]` and `[sandbox]` are accepted. Keeping this parser
-/// narrow means a typo never silently disables storage selection, workspace toolchain
-/// evaluation, main's warm step, or a sandbox deny.
+/// Only `[substrate]`, `[land]` and `[sandbox]` are accepted. Keeping this parser narrow means a
+/// typo never silently disables storage selection, main's warm step, or a sandbox deny.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
-    let mut saw_devenv = false;
     let mut saw_land = false;
     let mut saw_sandbox = false;
     let mut kind = None;
     let mut pool = None;
-    let mut devenv_dir = None;
     let mut warm = None;
     let mut sandbox_deny = None;
 
@@ -180,14 +159,12 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 .trim();
             let section = match section {
                 "substrate" => ConfigSection::Substrate,
-                "devenv" => ConfigSection::Devenv,
                 "land" => ConfigSection::Land,
                 "sandbox" => ConfigSection::Sandbox,
                 other => return Err(ConfigError::UnknownSection(other.to_owned())),
             };
             let seen = match section {
                 ConfigSection::Substrate => &mut saw_substrate,
-                ConfigSection::Devenv => &mut saw_devenv,
                 ConfigSection::Land => &mut saw_land,
                 ConfigSection::Sandbox => &mut saw_sandbox,
             };
@@ -216,12 +193,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 parse_toml_string(value, section, line_number)?,
                 section,
                 "pool",
-            )?,
-            (ConfigSection::Devenv, "dir") => set_once(
-                &mut devenv_dir,
-                parse_toml_string(value, section, line_number)?,
-                section,
-                "dir",
             )?,
             (ConfigSection::Land, "warm") => {
                 set_once(&mut warm, parse_argv(value, line_number)?, section, "warm")?;
@@ -260,17 +231,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         None
     };
-    let devenv = if saw_devenv {
-        let dir = devenv_dir.ok_or(ConfigError::MissingKey {
-            section: "devenv",
-            key: "dir",
-        })?;
-        Some(DevenvConfig {
-            dir: validate_devenv_dir(&dir)?,
-        })
-    } else {
-        None
-    };
     let land = if saw_land {
         Some(LandConfig {
             warm: warm.ok_or(ConfigError::MissingKey {
@@ -291,7 +251,6 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     };
     Ok(CowshedConfig {
         substrate,
-        devenv,
         land,
         sandbox_deny,
     })
@@ -341,20 +300,6 @@ fn parse_sandbox_deny(value: &str, line: usize) -> Result<Vec<PathBuf>, ConfigEr
     deny.dedup();
     Ok(deny)
 }
-
-fn validate_devenv_dir(value: &str) -> Result<PathBuf, ConfigError> {
-    let path = PathBuf::from(value);
-    if value.is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ConfigError::InvalidDevenvDir(value.to_owned()));
-    }
-    Ok(path)
-}
-
 fn strip_comment(line: &str) -> &str {
     let mut quoted = false;
     let mut escaped = false;
@@ -414,8 +359,6 @@ pub enum ConfigError {
     InvalidSandboxDeny(String),
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
-    #[error("[devenv] dir must be a non-empty relative path without `..`: {0:?}")]
-    InvalidDevenvDir(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
