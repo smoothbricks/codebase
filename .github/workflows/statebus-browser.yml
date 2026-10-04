@@ -8,6 +8,8 @@ on:
       - 'tsconfig*.json'
       - '.github/workflows/statebus-browser.yml'
       - '.github/actions/setup-devenv/**'
+      - 'tooling/direnv/**'
+      - 'packages/nx-plugin/managed/raw/tooling/direnv/**'
   push:
     branches: [main]
     paths:
@@ -17,6 +19,8 @@ on:
       - 'tsconfig*.json'
       - '.github/workflows/statebus-browser.yml'
       - '.github/actions/setup-devenv/**'
+      - 'tooling/direnv/**'
+      - 'packages/nx-plugin/managed/raw/tooling/direnv/**'
 permissions:
   contents: read
 concurrency:
