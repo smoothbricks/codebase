@@ -176,31 +176,39 @@ every clone automatically). Main and sessions use identical wiring; only the san
   thousands of extents, rising to about 12 µs for maps of millions, on the store volume. A long-used main is slow to
   clone even though the clone call is instant: a one-byte write into a plain `cp -c` clone of a 2.1M-extent image took
   25.7 s with no image attached, a 473k-extent image 4.4 s, an 8,871-extent image 31 ms, and a freshly written
-  256-extent file 5 ms. `new` and `fork` pay it inside attach or mount, whichever writes first; deleting a written clone
-  costs half to all of that again (half at 2.1M extents, about the same at 9k). Fragmentation comes from clones, not
-  from the format: an image takes rewrites in place until a clone or checkpoint shares its blocks, after which every
-  block it rewrites moves to a new run. Under the fixed churn of "Format measurements" below, three rounds moved a fresh
-  image from 468 to 655 extents with no clone held and from 385 to 8,871 with four clones held — about 4,000 extents a
-  round once the volume reuses space earlier rounds freed — and SPARSE fragments the same way (583 → 888 and 593 →
-  9,441). The same three rounds run inside a clone left the source at its 356 extents, untouched (the clone itself went
-  to 8,699). What keeps `new` fast is therefore where writes land: every write into main while anything shares its
-  blocks is paid again by every later clone, and a write inside a workspace costs main nothing. Build churn is most of
-  main's writes, which is why build state lives on build volumes that are replaced at each land rather than in main's
-  image (16_build_volumes.md "Why two volumes"). `doctor` counts main's extents with one `F_LOG2PHYS_EXT` query per
-  contiguous run (2.1M extents read in 2.6 s) and reports them as `main-extents`, a warning naming `cowshed defrag main`
-  once the predicted first-write cost reaches the 1 s cold-`new` budget (08_testing.md). `defrag` is the one remedy: it
-  detaches the workspace exactly as `resize` does — a busy volume refuses before the image is touched — copies the
-  image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
-  `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes after each following
-  write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s
-  it, renames it over the image, syncs the directory, and verifies the result by attaching it before restoring the mount
-  state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to
-  579). Nothing rewrites an attached image: the attachment holds an exclusive lock on the file (another `O_SHLOCK` or
-  `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and `diskutil image create from` refuse it as well.
-  The copy needs, and keeps, free space equal to the image's allocated bytes while earlier clones and checkpoints still
-  share the old blocks; the verb refuses before detaching when the store volume lacks it. Nothing enumerates
-  `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it
-  until then. Mains are never detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
+  256-extent file 5 ms. `new` and `fork` pay it in their own `first-write` step, before the clone is attached. Those
+  figures are a quiet host's; host load multiplies them, and the map copy is not over when the write returns. At load
+  averages of 60–120 on 18 cores, `first-write` measured 31–59 µs per extent on a 154k-extent main (4.8–9.1 s) and 56–96
+  µs on a 1.13M-extent main (62–109 s). After each 1.13M-extent first write, the next metadata operation on the APFS
+  container blocked for 35–43 s, whatever volume or directory it named. A file create probing an unrelated
+  `/private/tmp` directory stalled 43.1 s in the same window as the clone's next step, which creates its image-lease
+  file: the lease file's birth time fell 34.6 s into that step's 35 s, so no holder existed to contend with. A
+  fragmented main therefore stalls every process on the host, not only the clone. The 154k-extent main showed no such
+  stall: the probe's worst create took 0.35 s. Deleting a written clone costs half to all of that again (half at 2.1M
+  extents, about the same at 9k). Fragmentation comes from clones, not from the format: an image takes rewrites in place
+  until a clone or checkpoint shares its blocks, after which every block it rewrites moves to a new run. Under the fixed
+  churn of "Format measurements" below, three rounds moved a fresh image from 468 to 655 extents with no clone held and
+  from 385 to 8,871 with four clones held — about 4,000 extents a round once the volume reuses space earlier rounds
+  freed — and SPARSE fragments the same way (583 → 888 and 593 → 9,441). The same three rounds run inside a clone left
+  the source at its 356 extents, untouched (the clone itself went to 8,699). What keeps `new` fast is therefore where
+  writes land: every write into main while anything shares its blocks is paid again by every later clone, and a write
+  inside a workspace costs main nothing. Build churn is most of main's writes, which is why build state lives on build
+  volumes that are replaced at each land rather than in main's image (16_build_volumes.md "Why two volumes"). `doctor`
+  counts main's extents with one `F_LOG2PHYS_EXT` query per contiguous run (2.1M extents read in 2.6 s) and reports them
+  as `main-extents`, a warning naming `cowshed defrag main` once the predicted first-write cost reaches the 1 s
+  cold-`new` budget (08_testing.md). `defrag` is the one remedy: it detaches the workspace exactly as `resize` does — a
+  busy volume refuses before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into
+  `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would
+  share the old map), punches interior holes after each following write and the trailing hole after sizing the copy
+  (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s it, renames it over the image, syncs the directory,
+  and verifies the result by attaching it before restoring the mount state it found. The copy runs at 3.1–5.4 GB/s on
+  the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an attached image: the
+  attachment holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and
+  `diskutil image resize` and `diskutil image create from` refuse it as well. The copy needs, and keeps, free space
+  equal to the image's allocated bytes while earlier clones and checkpoints still share the old blocks; the verb refuses
+  before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next
+  `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
+  (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open proves no image driver
   holds the file and excludes attachment until the write is durable. Validate the ASIF v1 `shdw` header, version 1,
   length `0x200`, 4 KiB alignment, and a strictly larger capacity within the header's maximum sector count (`0x38`);

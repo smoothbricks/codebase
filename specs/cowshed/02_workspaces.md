@@ -248,8 +248,9 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
    clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>` — ~235–400 ms typical for a freshly
-   written image. The first write into the clone, in attach or mount, also copies the source image's extent map
-   (01_storage.md, "Clone cost follows extents, not size"), which on a long-used main is tens of seconds until
+   written image. Before the attach, the `first-write` step rewrites the clone's first block with the bytes it holds,
+   which copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a long-used
+   main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
    `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
    unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
