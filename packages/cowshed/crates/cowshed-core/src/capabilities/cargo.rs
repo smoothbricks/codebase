@@ -31,6 +31,7 @@ pub const DETECTOR: Detector = Detector {
     any: &[],
     scope: DetectionScope::Project,
     host_cache_homes: &[&HOME],
+    reached_from: None,
     contribute,
 };
 
@@ -69,6 +70,8 @@ const RUSTUP_HOME: &str = ".rustup";
 /// rustup writes its settings file at install; its presence is the rustup convention.
 const RUSTUP_SETTINGS: &str = "settings.toml";
 const RUSTUP_TOOLCHAINS: &str = "toolchains";
+/// The directories a rustup proxy ensures exist on every dispatch.
+const RUSTUP_STATE_DIRECTORIES: [&str; 3] = ["update-hashes", "downloads", "tmp"];
 /// The commands a cargo project runs: rustup's proxies first, then the host's own installations.
 const PROGRAMS: [&str; 4] = ["cargo", "rustc", "rustdoc", "rustup"];
 
@@ -101,6 +104,13 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             read(rustup_home.join(RUSTUP_TOOLCHAINS), GrantScope::Subtree),
             read(proxies.clone(), GrantScope::Subtree),
         ]);
+        // A proxy ensures rustup's state directories exist before it dispatches, and reads a
+        // directory it cannot stat as missing, then fails creating it ("File exists"). Their
+        // metadata is granted; their contents and every write stay denied.
+        contribution.grants.extend(
+            RUSTUP_STATE_DIRECTORIES
+                .map(|directory| read(rustup_home.join(directory), GrantScope::Literal)),
+        );
     }
     let mut directories = vec![proxies];
     directories.extend(super::host_program_directories(context));
@@ -330,6 +340,9 @@ mod tests {
             read(rustup.join("settings.toml"), GrantScope::Literal),
             read(rustup.join("toolchains"), GrantScope::Subtree),
             read(proxies.clone(), GrantScope::Subtree),
+            read(rustup.join("update-hashes"), GrantScope::Literal),
+            read(rustup.join("downloads"), GrantScope::Literal),
+            read(rustup.join("tmp"), GrantScope::Literal),
         ] {
             assert!(
                 grants.contains(&expected),
