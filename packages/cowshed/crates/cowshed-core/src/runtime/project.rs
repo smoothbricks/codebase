@@ -2899,19 +2899,18 @@ impl NativeProjectRuntimeHost {
         }
     }
 
+    /// Journals `operation` under this process's intent lease and returns the record it
+    /// superseded, for a create or fork refused before its first mutation to put back.
     async fn begin_lifecycle_intent(
         &mut self,
         operation: crate::storage::recovery::LifecycleIntent,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::storage::recovery::LifecycleIntentRecord>> {
         let target = operation.target().clone();
         if !self.claim_intent_lease(&target)? {
             return Err(another_process_is_running(&target));
         }
-        self.update_lifecycle_intents(move |journal| {
-            journal.begin(operation);
-            Ok(())
-        })
-        .await
+        self.update_lifecycle_intents(move |journal| Ok(journal.begin(operation)))
+            .await
     }
     async fn mark_lifecycle_intent_mutating(&mut self, workspace: &WorkspaceName) -> Result<()> {
         let workspace = workspace.clone();
@@ -2965,6 +2964,92 @@ impl NativeProjectRuntimeHost {
         .await
     }
 
+    /// Withdraws an unfinished create or fork of an unpublished `workspace` that never mutated
+    /// anything, putting back `superseded`, the record its intent displaced (`None` forgets the
+    /// name). Returns whether it did; an intent it keeps is recovery's to resume or retire.
+    ///
+    /// Such an intent is the residue of a refusal — no port block left, say — and replaying it
+    /// would create a workspace whose caller was told it failed. It qualifies only while it is
+    /// `Prepared` and nothing durable carries its name: no `PendingFence` image (the staged
+    /// clone's first write is that sidecar) and no slot binding. The phase alone does not
+    /// decide it, for two reasons. Binaries before the `Mutating` mark left every create and
+    /// fork `Prepared`, including ones that crashed mid-clone. And a create marks its intent
+    /// only once its slot is bound, so a crash or journal failure between the two leaves a
+    /// `Prepared` intent whose binding is its evidence.
+    ///
+    /// The verb calls this when it fails, recovery when it finds such an intent unfinished; the
+    /// caller holds the workspace's intent lease either way.
+    async fn discard_unmutated_clone_intent(
+        &mut self,
+        workspace: &WorkspaceName,
+        superseded: Option<crate::storage::recovery::LifecycleIntentRecord>,
+    ) -> Result<bool> {
+        let prepared = self.lifecycle_intents.get(workspace).is_some_and(|record| {
+            record.completion.is_none()
+                && record.phase == crate::storage::recovery::LifecycleIntentPhase::Prepared
+                && matches!(
+                    record.operation,
+                    crate::storage::recovery::LifecycleIntent::Create { .. }
+                        | crate::storage::recovery::LifecycleIntent::Fork { .. }
+                )
+        });
+        if !prepared
+            || self
+                .pending_metadata()
+                .await?
+                .iter()
+                .any(|(_, metadata)| &metadata.workspace == workspace)
+        {
+            return Ok(false);
+        }
+        let layout = self.layout.clone();
+        let named = workspace.clone();
+        let slotted = crate::storage::lifecycle::dispatch_blocking(move || {
+            layout
+                .slot_bindings()
+                .map(|bindings| bindings.slot_of(&named).is_some())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("slot binding task failed: {error}")))?
+        .map_err(native_integrity_error)?;
+        if slotted {
+            return Ok(false);
+        }
+        let target = workspace.clone();
+        if self
+            .update_lifecycle_intents(move |journal| {
+                Ok(journal.discard_prepared_clone_intent(&target, superseded))
+            })
+            .await?
+        {
+            Ok(true)
+        } else {
+            Err(CowshedError::internal(format!(
+                "the prepared lifecycle intent for {workspace} changed under its lease"
+            )))
+        }
+    }
+
+    /// The failure path of `new` and `fork`: a refusal that mutated nothing leaves the journal as
+    /// the verb found it. Best-effort, and said when it fails: the error the caller sees stays
+    /// the verb's own, and recovery discards a leftover intent on the same evidence.
+    async fn withdraw_refused_clone_intent(
+        &mut self,
+        workspace: &WorkspaceName,
+        superseded: Option<crate::storage::recovery::LifecycleIntentRecord>,
+    ) {
+        if let Err(error) = self
+            .discard_unmutated_clone_intent(workspace, superseded)
+            .await
+        {
+            eprintln!(
+                "cowshed: the failed lifecycle intent for {workspace} stays journaled ({}: {}); recovery discards it if nothing durable carries its name",
+                error.code.as_str(),
+                error.message
+            );
+        }
+    }
+
     async fn complete_lifecycle_intent(
         &mut self,
         workspace: &WorkspaceName,
@@ -3008,7 +3093,10 @@ impl NativeProjectRuntimeHost {
     /// Finishes create/fork/adopt work and authorized retire mutations a crash left pending, then
     /// records the exact result so a later start does not repeat it. A prepared retirement has not
     /// mutated anything and is discarded: it may be the residue of a safety refusal, not durable
-    /// authorization to delete on every later command. An unfinished intent whose lease another
+    /// authorization to delete on every later command. So is a prepared create or fork that
+    /// published nothing and left no `PendingFence` image or slot binding: it was refused before
+    /// its first mutation, and replaying it would create a workspace its caller was told failed
+    /// (see [`Self::discard_unmutated_clone_intent`]). An unfinished intent whose lease another
     /// process holds is no residue at all: that process is running the operation right now, and
     /// replaying it here would run it a second time beside the first. Only intents inside this
     /// opening's [`RecoveryScope`] are touched. Reports whether recovery mutated images or mounts,
@@ -3156,7 +3244,13 @@ impl NativeProjectRuntimeHost {
                                 .await?;
                             }
                             Err(error) if error.code == ErrorCode::NotFound => {
-                                self.create(workspace, options).await?;
+                                if self.discard_unmutated_clone_intent(&workspace, None).await? {
+                                    eprintln!(
+                                        "cowshed: discarded the unfinished {verb} of {workspace}: it ended before changing anything, so nothing is left to finish"
+                                    );
+                                } else {
+                                    self.create(workspace, options).await?;
+                                }
                             }
                             Err(error) => return Err(error),
                         }
@@ -3193,7 +3287,13 @@ impl NativeProjectRuntimeHost {
                             .await?;
                         }
                         Err(error) if error.code == ErrorCode::NotFound => {
-                            self.fork(source, destination).await?;
+                            if self.discard_unmutated_clone_intent(&destination, None).await? {
+                                eprintln!(
+                                    "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
+                                );
+                            } else {
+                                self.fork(source, destination).await?;
+                            }
                         }
                         Err(error) => return Err(error),
                     },
@@ -7271,11 +7371,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .lifecycle_intents
             .get(&workspace)
             .is_some_and(|record| record.operation == intent && record.completion.is_none());
-        self.begin_lifecycle_intent(intent).await?;
-        if let Some(slot) = slot {
-            self.bind_slot(&workspace, slot).await?;
-        }
-        async {
+        // The intent precedes every mutation but stays `Prepared` until the verb has something
+        // durable to recover: it turns `Mutating` once the slot is bound, or else just before the
+        // staged clone writes its `PendingFence` sidecar. A failure while still `Prepared` was a
+        // refusal and withdraws the intent; a `Mutating` one stays for recovery to finish.
+        let superseded = self.begin_lifecycle_intent(intent).await?;
+        let outcome = async {
+            if let Some(slot) = slot {
+                self.bind_slot(&workspace, slot).await?;
+                self.mark_lifecycle_intent_mutating(&workspace).await?;
+            }
             let (grants, _reservation) = self.destination_grants(&workspace, resuming).await?;
             let identity = self
                 .operation_identity(
@@ -7313,6 +7418,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             };
             let start = options.revision.as_ref().map(revision_target);
             let destination = workspace.clone();
+            if slot.is_none() {
+                self.mark_lifecycle_intent_mutating(&workspace).await?;
+            }
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
@@ -7374,7 +7482,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             timed_async("new", "supervisor", self.ensure_supervisor(&workspace)).await?;
             timed_async("new", "snapshot", self.snapshot_named(&workspace)).await
         }
-        .await
+        .await;
+        if outcome.is_err() {
+            self.withdraw_refused_clone_intent(&workspace, superseded)
+                .await;
+        }
+        outcome
     }
 
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
@@ -7488,69 +7601,80 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .lifecycle_intents
             .get(&destination)
             .is_some_and(|record| record.operation == intent && record.completion.is_none());
-        self.begin_lifecycle_intent(intent).await?;
-        let (grants, _reservation) = self.destination_grants(&destination, resuming).await?;
-        let identity = self
-            .operation_identity(
-                grants,
-                Some(format!("cowshed/{destination}")),
-                Some(source.clone()),
-                source_is_git_worktree,
+        // `Prepared` until just before the staged clone writes its `PendingFence` sidecar, so a
+        // refusal before it (no port block left, say) withdraws the intent; see `create`.
+        let superseded = self.begin_lifecycle_intent(intent).await?;
+        let outcome = async {
+            let (grants, _reservation) = self.destination_grants(&destination, resuming).await?;
+            let identity = self
+                .operation_identity(
+                    grants,
+                    Some(format!("cowshed/{destination}")),
+                    Some(source.clone()),
+                    source_is_git_worktree,
+                )
+                .await?;
+            let main_mount = self.workspace_mount_path(&main_name())?;
+            let source_mount = self.workspace_mount_path(&source)?;
+            let forked = destination.clone();
+            let plan = self
+                .substrate
+                .plan_fork(
+                    &source_fact.derived.workspace,
+                    crate::storage::lifecycle::Destination {
+                        repo: self.descriptor.repo_id.clone(),
+                        name: destination.clone(),
+                        topology_revision: source_fact.derived.workspace.topology_revision(),
+                        identity,
+                    },
+                )
+                .map_err(native_integrity_error)?;
+            self.mark_lifecycle_intent_mutating(&destination).await?;
+            let receipt = self
+                .substrate
+                .execute_fork_staged(plan, move |stage| async move {
+                    crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
+                    crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
+                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                    repository.restore_inherited_links(&source_mount).await?;
+                    if source_is_git_worktree {
+                        repository
+                            .adopt_as_linked_worktree_resumable(
+                                &forked.to_string(),
+                                &main_mount,
+                                None,
+                                stage.resuming,
+                            )
+                            .await?;
+                    }
+                    repository.ensure_workspace_environment_wiring().await
+                })
+                .await
+                .map_err(native_staged_error)?;
+            self.mark_lifecycle_fence_complete(&destination).await;
+            self.commitments
+                .record(CommitmentDraft::Fork {
+                    repo_id: self.descriptor.repo_id.clone(),
+                    source_incarnation: source_fact.derived.workspace.incarnation().clone(),
+                    destination_incarnation: receipt.workspace.incarnation().clone(),
+                })
+                .await?;
+            self.complete_lifecycle_intent(
+                &destination,
+                crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                    receipt.workspace.incarnation().clone(),
+                ),
             )
             .await?;
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let source_mount = self.workspace_mount_path(&source)?;
-        let forked = destination.clone();
-        let plan = self
-            .substrate
-            .plan_fork(
-                &source_fact.derived.workspace,
-                crate::storage::lifecycle::Destination {
-                    repo: self.descriptor.repo_id.clone(),
-                    name: destination.clone(),
-                    topology_revision: source_fact.derived.workspace.topology_revision(),
-                    identity,
-                },
-            )
-            .map_err(native_integrity_error)?;
-        let receipt = self
-            .substrate
-            .execute_fork_staged(plan, move |stage| async move {
-                crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
-                crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
-                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                repository.restore_inherited_links(&source_mount).await?;
-                if source_is_git_worktree {
-                    repository
-                        .adopt_as_linked_worktree_resumable(
-                            &forked.to_string(),
-                            &main_mount,
-                            None,
-                            stage.resuming,
-                        )
-                        .await?;
-                }
-                repository.ensure_workspace_environment_wiring().await
-            })
-            .await
-            .map_err(native_staged_error)?;
-        self.mark_lifecycle_fence_complete(&destination).await;
-        self.commitments
-            .record(CommitmentDraft::Fork {
-                repo_id: self.descriptor.repo_id.clone(),
-                source_incarnation: source_fact.derived.workspace.incarnation().clone(),
-                destination_incarnation: receipt.workspace.incarnation().clone(),
-            })
-            .await?;
-        self.complete_lifecycle_intent(
-            &destination,
-            crate::storage::recovery::LifecycleIntentCompletion::Workspace(
-                receipt.workspace.incarnation().clone(),
-            ),
-        )
-        .await?;
-        self.ensure_supervisor(&destination).await?;
-        self.snapshot_named(&destination).await
+            self.ensure_supervisor(&destination).await?;
+            self.snapshot_named(&destination).await
+        }
+        .await;
+        if outcome.is_err() {
+            self.withdraw_refused_clone_intent(&destination, superseded)
+                .await;
+        }
+        outcome
     }
 
     /// Renaming is a lifecycle operation for the same reason removal is: the name decides the

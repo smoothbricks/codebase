@@ -288,9 +288,17 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 8. Print the mount path on stdout; guidance and `next:` hints on stderr.
 
 Before the first slot, image, grant-reservation, or Git mutation, `new` and `fork` fsync their complete operation into
-the project lifecycle-intent journal. Startup first reconciles a pending destination against canonical inventory: an
-already-published incarnation becomes the recorded result; an absent destination reruns the operation. Reissuing the
-same call returns that incarnation instead of creating a second workspace or reporting a false conflict.
+the project lifecycle-intent journal. The intent stays `Prepared` until the verb has something durable to recover: it is
+marked `Mutating` once `--slot` is bound, or otherwise immediately before the staged clone writes its `PendingFence`
+sidecar. A port-block claim is not durable: it belongs to the claiming process and lapses with it. A verb that fails
+while its intent is still `Prepared` was refused (no free port block, an occupied slot) and puts back the journal record
+its intent superseded before returning its error, so no later recovery can create a workspace whose caller was told it
+failed. Startup first reconciles a pending destination against canonical inventory: an already-published incarnation
+becomes the recorded result; an absent destination reruns the operation if its intent is `Mutating`, or if a
+`PendingFence` image or a slot binding carries its name. Binaries before the `Mutating` mark journaled every create and
+fork `Prepared`, so those durable facts, not the phase, decide a `Prepared` intent. One with neither mutated nothing;
+startup discards it and names it on stderr instead of rerunning it. Reissuing the same call returns the recorded
+incarnation instead of creating a second workspace or reporting a false conflict.
 
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
 `--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--register` (see "The `main`
@@ -326,7 +334,8 @@ clone in place and names the refusal. `gc` never deletes a `PendingFence` image 
 
 | Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
 | ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Before pending metadata                                          | Intent only                                                    | Re-run create/fork normally.                                                                                                                                                                                |
+| Before the `Mutating` mark                                       | `Prepared` intent only                                         | Nothing durable exists. A failing verb puts back the record its intent superseded; startup discards a leftover one and names it on stderr.                                                                  |
+| After the mark, before pending metadata                          | `Mutating` intent, plus the slot binding with `--slot`         | Re-run create/fork normally. A `Prepared` intent whose slot is bound (an older binary, or a kill between binding and marking) is re-run the same way.                                                       |
 | After sidecar, before complete clone                             | Sidecar only, or a failed clone                                | A clone failure reclaims both artifacts; startup recovery removes a sidecar-only record. No partial payload is admitted as resumable.                                                                       |
 | After clone, before attach                                       | C + `PendingFence`                                             | Reuse the metadata incarnation and original operation identity; never clone over C.                                                                                                                         |
 | After attach, before mount                                       | C + `PendingFence` + unmounted attachment                      | An exact inventory match is detached and settled, then the ordinary verified attach/fsck path repeats before mounting.                                                                                      |

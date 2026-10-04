@@ -280,6 +280,60 @@ fn mutating_retirement_remains_recoverable_after_a_crash() {
 }
 
 #[test]
+fn a_refused_clone_puts_back_the_record_it_superseded() {
+    let name = workspace("created");
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("created", RemoveOptions::default()));
+    journal
+        .complete(
+            &name,
+            LifecycleIntentCompletion::Retire(RemoveReport::default()),
+        )
+        .expect("an earlier lifecycle of the name finished");
+    let earlier = journal.get(&name).cloned();
+
+    let superseded = journal.begin(intent("create"));
+    assert_eq!(superseded, earlier);
+    assert!(journal.discard_prepared_clone_intent(&name, superseded));
+    assert_eq!(
+        journal.get(&name).cloned(),
+        earlier,
+        "a refusal leaves the journal as the verb found it"
+    );
+
+    let fork = intent("fork");
+    let destination = fork.target().clone();
+    let superseded = journal.begin(fork);
+    assert_eq!(superseded, None);
+    assert!(journal.discard_prepared_clone_intent(&destination, superseded));
+    assert!(journal.get(&destination).is_none());
+}
+
+#[test]
+fn only_a_prepared_clone_intent_can_be_withdrawn() {
+    let mut journal = LifecycleIntentJournal::default();
+    let created = workspace("created");
+    journal.begin(intent("create"));
+    journal
+        .mark_mutating(&created)
+        .expect("cross the clone mutation fence");
+    assert!(!journal.discard_prepared_clone_intent(&created, None));
+    assert_eq!(
+        journal.get(&created).map(|record| record.phase),
+        Some(LifecycleIntentPhase::Mutating),
+        "a clone that may have mutated stays recoverable"
+    );
+
+    let removed = workspace("removed");
+    journal.begin(intent("remove"));
+    assert!(
+        !journal.discard_prepared_clone_intent(&removed, None),
+        "retirements have their own discard rule"
+    );
+    assert!(journal.get(&removed).is_some());
+}
+
+#[test]
 fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_authorized() {
     let root = TestRoot::new("pending-refusal");
     let path = root.path().join(LIFECYCLE_INTENTS_FILE);

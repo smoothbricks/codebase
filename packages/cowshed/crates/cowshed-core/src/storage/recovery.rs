@@ -148,8 +148,13 @@ pub struct LifecycleIntentRecord {
     pub operation: LifecycleIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<LifecycleIntentCompletion>,
-    /// `Prepared` means no irreversible mutation has begun. Recovery may discard a prepared
+    /// `Prepared` means no durable mutation has begun. Recovery may discard a prepared
     /// retirement; only `Mutating` retirement records carry enough evidence to resume deletion.
+    /// A create or fork turns `Mutating` just after binding its slot or just before the staged
+    /// clone writes its `PendingFence` sidecar, so a prepared one that left neither and
+    /// published nothing was refused, not interrupted, and recovery discards it rather than
+    /// creating a workspace its caller was told failed. Older binaries never marked create or
+    /// fork, so recovery decides a prepared clone from those durable facts, not from the phase.
     #[serde(default, skip_serializing_if = "LifecycleIntentPhase::is_prepared")]
     pub phase: LifecycleIntentPhase,
     /// Fence sub-step completions for create/fork publications. Absent (`None`) on older
@@ -272,11 +277,14 @@ impl LifecycleIntentJournal {
         self.entries.iter()
     }
 
-    pub fn begin(&mut self, operation: LifecycleIntent) {
+    /// Records `operation` as the workspace's pending intent and returns the record it
+    /// supersedes, which a verb refused before its first mutation puts back with
+    /// [`Self::discard_prepared_clone_intent`].
+    pub fn begin(&mut self, operation: LifecycleIntent) -> Option<LifecycleIntentRecord> {
         self.entries.insert(
             operation.target().clone(),
             LifecycleIntentRecord::pending(operation),
-        );
+        )
     }
     pub fn mark_mutating(&mut self, workspace: &WorkspaceName) -> CowshedResult<()> {
         let record = self.entries.get_mut(workspace).ok_or_else(|| {
@@ -334,6 +342,37 @@ impl LifecycleIntentJournal {
         });
         if discard {
             self.entries.remove(workspace);
+        }
+        discard
+    }
+
+    /// Withdraws a create or fork intent that never crossed its mutation fence, putting back
+    /// `superseded` (the record [`Self::begin`] replaced) or, with none, forgetting the name.
+    ///
+    /// A refusal before the first durable mutation — no port block left, say — is not an
+    /// operation anybody may finish later: replaying it would create a workspace whose caller
+    /// was told it failed. The caller must first establish that nothing durable exists:
+    /// either it is the verb that just refused before marking the intent `Mutating`, or it is
+    /// recovery and found neither the destination, nor a `PendingFence` image, nor a slot
+    /// binding of that name.
+    pub fn discard_prepared_clone_intent(
+        &mut self,
+        workspace: &WorkspaceName,
+        superseded: Option<LifecycleIntentRecord>,
+    ) -> bool {
+        let discard = self.entries.get(workspace).is_some_and(|record| {
+            record.completion.is_none()
+                && record.phase == LifecycleIntentPhase::Prepared
+                && matches!(
+                    record.operation,
+                    LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                )
+        });
+        if discard {
+            match superseded {
+                Some(record) => self.entries.insert(workspace.clone(), record),
+                None => self.entries.remove(workspace),
+            };
         }
         discard
     }
