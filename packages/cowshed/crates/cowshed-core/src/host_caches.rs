@@ -1,32 +1,38 @@
 //! The host's own read-at-build caches, relocated onto the caches volume (03_caches.md,
 //! "Host-level relocation").
 //!
-//! Every sandbox shares these caches through the caches volume; relocating the host's copies makes
-//! the host one more sharer instead of a separate island. For the shared tool homes it is more
-//! than disk: a sandbox uses the host's literal tool path only once every one of the tool's caches
-//! is the shared one ([`crate::sandbox::shared_tool_homes`]), and that literal path is what keeps
-//! a clone's copied `target/` fresh and its `node_modules` links resolving.
+//! Every sandbox of a project that uses a tool shares that tool's caches through the caches
+//! volume; relocating the host's copies makes the host one more sharer instead of a separate
+//! island. For a shared tool home it is more than disk: a sandbox uses the host's literal tool path
+//! only once every one of the tool's caches is the shared one, and that literal path is what
+//! keeps a clone's copied `target/` fresh and its `node_modules` links resolving.
+//!
+//! The caches are the detectors' own descriptors ([`crate::capabilities::Detector`]). Relocating
+//! one is host preparation only: it never enables a capability in any repository.
 
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 
-use crate::fork_lock::{Fenced, Run as _};
-use crate::sandbox::{CARGO_HOME_STATE_FILES, HostCache, RELOCATED_TOOL_CACHES, SHARED_TOOL_HOMES};
+use crate::capabilities::DETECTORS;
+use crate::capabilities::cache::HostCache;
+use crate::fork_lock::Run as _;
 
-/// Every host cache setup relocates: the shared tool homes' links, then the other tools'.
+/// Every host cache setup relocates: each detector's tool homes' links, once each.
 pub fn host_caches(home: &Path, caches: &Path) -> impl Iterator<Item = HostCache> {
-    let tools = SHARED_TOOL_HOMES
+    let mut links: Vec<HostCache> = Vec::new();
+    for tool in DETECTORS
         .into_iter()
-        .flat_map(|tool| tool.links(home, caches))
-        .collect::<Vec<_>>();
-    let relocated = RELOCATED_TOOL_CACHES.map(|(host, shared)| HostCache {
-        host: home.join(host),
-        shared: caches.join(shared),
-    });
-    tools.into_iter().chain(relocated)
+        .flat_map(|detector| detector.host_cache_homes)
+    {
+        for link in tool.links(home, caches) {
+            if !links.contains(&link) {
+                links.push(link);
+            }
+        }
+    }
+    links.into_iter()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,44 +189,9 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Cargo's own package-cache locks, held exclusively while its caches move.
-///
-/// Cargo takes these same `flock`s before it reads or writes `registry` or `git`, so holding
-/// them keeps every cargo process on the host out of the caches for the duration. Fenced: cargo
-/// gets them back as soon as this is dropped, whatever this process is spawning (`fork_lock`).
-pub struct CargoCacheLock {
-    _files: Vec<Fenced<fs::File>>,
-}
-
-/// `Ok(None)` when a cargo process holds a lock right now.
-pub fn try_lock_cargo_caches(cargo_home: &Path) -> io::Result<Option<CargoCacheLock>> {
-    let mut files = Vec::with_capacity(2);
-    for name in &CARGO_HOME_STATE_FILES[..2] {
-        let file = Fenced::new(
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(cargo_home.join(name))?,
-        );
-        // SAFETY: the descriptor is owned by `file`, which outlives the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
-            }
-            return Err(error);
-        }
-        files.push(file);
-    }
-    Ok(Some(CargoCacheLock { _files: files }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::shared_tool_homes;
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -238,8 +209,8 @@ mod tests {
         }
     }
 
-    /// One setup run relocates every shared tool's caches, after which every sandbox is pointed
-    /// at every tool's host path; a populated cache arrives on the caches volume intact.
+    /// One setup run relocates every detector's tool-home caches, after which each of those
+    /// tool homes is shared; a populated cache arrives on the caches volume intact.
     #[test]
     fn relocating_every_host_cache_shares_every_tool_home() {
         let root = scratch("every");
@@ -253,14 +224,15 @@ mod tests {
             let relocation = relocate(cache);
             assert!(relocation.outcome.is_ok(), "{relocation:?}");
         }
-        let shared: Vec<&str> = shared_tool_homes(&home, &caches)
-            .into_iter()
-            .map(|tool| tool.variable)
-            .collect();
-        assert_eq!(
-            shared,
-            ["CARGO_HOME", "BUN_INSTALL_CACHE_DIR", "UV_CACHE_DIR"]
-        );
+        for detector in DETECTORS {
+            for tool in detector.host_cache_homes {
+                assert!(
+                    tool.links(&home, &caches).iter().all(HostCache::is_shared),
+                    "~/{} is not shared after setup",
+                    tool.home
+                );
+            }
+        }
         assert_eq!(
             fs::read(caches.join("bun/install/cache/links/widget@1.0.0/package.json")).unwrap(),
             b"{}"
@@ -359,16 +331,6 @@ mod tests {
 
         assert!(relocate(cache.clone()).outcome.is_err());
         assert_eq!(fs::read_link(&cache.host).unwrap(), root.join("elsewhere"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_held_cargo_lock_is_reported_busy_and_released_on_drop() {
-        let root = scratch("lock");
-        let first = try_lock_cargo_caches(&root).unwrap().expect("unlocked");
-        assert!(try_lock_cargo_caches(&root).unwrap().is_none());
-        drop(first);
-        assert!(try_lock_cargo_caches(&root).unwrap().is_some());
         fs::remove_dir_all(root).unwrap();
     }
 }

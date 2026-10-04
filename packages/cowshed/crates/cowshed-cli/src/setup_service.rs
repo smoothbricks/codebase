@@ -514,7 +514,7 @@ impl HostSetup for NativeHostSetup {
         tokio::task::spawn_blocking(move || {
             let cargo_home = cowshed_core::sandbox::CARGO.host_path(&home);
             let _cargo_lock = if cargo_home.is_dir() {
-                match host_caches::try_lock_cargo_caches(&cargo_home) {
+                match cowshed_core::capabilities::cargo::try_lock_caches(&cargo_home) {
                     Ok(Some(lock)) => Some(lock),
                     Ok(None) => {
                         return Err(CowshedError::conflict(
