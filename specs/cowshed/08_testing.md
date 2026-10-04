@@ -95,8 +95,11 @@ runs report them ignored: an enclosing executed-child profile cannot grant an in
 Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host runner probes actual hard-link
 authority before running and refuses with the same actionable command if an enclosing sandbox denies it; neither a write
 grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique disposable directory under the exact owned
-checkout's `.cowshed/tmp` and removes it afterward. Fixtures use only disposable local data: no launchd calls, installed
-host-service changes, or checkout source mutation.
+checkout's `.cowshed/tmp` and removes it afterward. Unix-socket fixtures use the existing short owned `ScratchRoot` so
+Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures use only disposable local data and never
+change installed host services or checkout source. The descriptor-inheritance proof launches only its unique one-shot
+agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
+exit path.
 
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
 and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the

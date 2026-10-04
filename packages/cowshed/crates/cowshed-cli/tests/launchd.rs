@@ -1300,7 +1300,7 @@ mod descriptor_inheritance {
     }
 
     struct Agent {
-        root: PathBuf,
+        _scratch: scratch_apfs::ScratchRoot,
         target: String,
         loaded: bool,
     }
@@ -1324,12 +1324,6 @@ mod descriptor_inheritance {
                     }
                 }
             }
-            if let Err(error) = fs::remove_dir_all(&self.root) {
-                eprintln!(
-                    "cannot remove descriptor probe {}: {error}",
-                    self.root.display()
-                );
-            }
         }
     }
 
@@ -1345,17 +1339,20 @@ mod descriptor_inheritance {
     #[tokio::test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     async fn host_controller_generated_gateway_plist_gives_a_real_child_10000_descriptors() {
-        let root = scratch("fd");
+        // The host harness deliberately has a long TMPDIR. Use the same short owned root as
+        // native CLI socket fixtures rather than deriving a Unix-socket path from that directory.
+        let scratch = scratch_apfs::ScratchRoot::new("cli-fd").expect("short descriptor fixture");
         let label = format!("dev.cowshed.descriptors.{}", std::process::id());
         // SAFETY: geteuid has no preconditions.
         let domain = format!("gui/{}", unsafe { libc::geteuid() });
         let mut agent = Agent {
-            root: root.clone(),
+            _scratch: scratch,
             target: format!("{domain}/{label}"),
             loaded: false,
         };
+        let root = agent._scratch.path();
         let executable =
-            HostStableExecutable::new(&root, COWSHED_BINARY_NAME).expect("probe program");
+            HostStableExecutable::new(root, COWSHED_BINARY_NAME).expect("probe program");
         let spec = LaunchAgentSpec::gateway(&executable).expect("generated gateway definition");
         fs::create_dir_all(executable.path().parent().expect("binary directory"))
             .expect("binary directory");
