@@ -561,10 +561,12 @@ only its own socket and ledger, so they all run at once, each in a task of its o
 sockets there are; one wedged supervisor holds back its own workspace, never the host's others. Each drain is a
 lifecycle span, `supervisor-recovery drain <socket>`, that reports the answering `pid=` (or `error=`) and ends
 `status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting `supervisors=` up front. The manager takes
-ensures throughout. An ensure of a workspace whose supervisor is still being recovered is refused as a `Conflict`
-carrying `recovering: { supervisors }` (the count left), because a supervisor started then would race the recovery for
-the socket and the ledger; every other ensure is served. Gateway status reports the same count until none is left
-(05_gateway.md "Startup contract").
+ensures from the daemon's first moment. Until the daemon's startup pass has mounted every project and restored its
+sessions, every ensure is refused as a `Conflict` carrying `healing` (05_gateway.md "Startup contract"), because the
+supervisor would run in a workspace that pass may not have mounted yet. After it, an ensure of a workspace whose
+supervisor is still being recovered is refused as a `Conflict` carrying `recovering: { supervisors }` (the count left),
+because a supervisor started then would race the recovery for the socket and the ledger; every other ensure is served.
+Gateway status reports both until they are over.
 
 ## Teardown ordering
 

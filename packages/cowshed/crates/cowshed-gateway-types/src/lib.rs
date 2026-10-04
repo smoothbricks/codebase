@@ -31,4 +31,4 @@ pub use session::{
     WorkspaceEndpoint, WorkspaceSession, WorkspaceToken, is_macos_port_block, is_port_block,
     validate_identifier,
 };
-pub use status::{GatewayStatus, SessionStatus, SupervisorRecovery};
+pub use status::{GatewayStatus, SessionStatus, StartupHeal, SupervisorRecovery};

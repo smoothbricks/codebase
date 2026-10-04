@@ -282,15 +282,23 @@ pub struct SupervisorManager {
     /// The sockets whose supervisors served before this manager started and are not recovered
     /// yet ([`Self::recovery`]). Held only to read or remove, never across an await.
     recovering: std::sync::Mutex<BTreeSet<PathBuf>>,
+    /// The daemon's startup pass: a supervisor runs in a workspace that pass may still be
+    /// mounting, so no ensure is served until it has finished.
+    startup: Arc<crate::StartupHealState>,
 }
 
 impl SupervisorManager {
-    pub fn new(store_root: impl Into<PathBuf>, spawner: Box<dyn SupervisorSpawner>) -> Arc<Self> {
+    pub fn new(
+        store_root: impl Into<PathBuf>,
+        spawner: Box<dyn SupervisorSpawner>,
+        startup: Arc<crate::StartupHealState>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store_root: store_root.into(),
             spawner,
             ensuring: Mutex::default(),
             recovering: std::sync::Mutex::default(),
+            startup,
         })
     }
 
@@ -381,6 +389,9 @@ impl SupervisorManager {
             &authority.repo_id,
             &authority.workspace,
         );
+        if let Some(heal) = self.startup.current() {
+            return Err(CowshedError::healing(heal));
+        }
         // Its recovery owns the socket until it ends: a supervisor started now would race it for
         // the socket and the ledger the old supervisor left.
         if let Some(recovery) = self.recovering_including(&socket) {
@@ -1022,6 +1033,11 @@ mod tests {
             .expect("a supervisor started by hand has nobody to tell");
     }
 
+    /// A daemon whose startup pass has finished.
+    fn healed() -> Arc<crate::StartupHealState> {
+        Arc::new(crate::StartupHealState::healed())
+    }
+
     struct NoSpawner;
 
     impl SupervisorSpawner for NoSpawner {
@@ -1052,7 +1068,7 @@ mod tests {
             .expect("bind the manager");
         let served = tokio::spawn(serve(
             listener,
-            SupervisorManager::new(&store, Box::new(NoSpawner)),
+            SupervisorManager::new(&store, Box::new(NoSpawner), healed()),
         ));
         let mut stream = UnixStream::connect(&socket)
             .await
@@ -1159,7 +1175,7 @@ mod tests {
         let raven =
             supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
         std::fs::write(&raven, b"").expect("raven's socket file");
-        let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), healed());
         let peers = Arc::new(GatedPeers {
             gate: tokio::sync::Semaphore::new(0),
         });
@@ -1197,6 +1213,50 @@ mod tests {
         std::fs::remove_dir_all(store).expect("cleanup");
     }
 
+    /// While the daemon's startup pass still mounts projects or restores sessions, the manager
+    /// answers an ensure with the typed healing refusal, carrying how far the pass has got,
+    /// instead of starting a supervisor in a workspace that may not be mounted yet; once the pass
+    /// is over, the same ensure is no longer refused as healing.
+    #[tokio::test]
+    async fn an_ensure_while_the_startup_pass_heals_is_refused_as_healing() {
+        let authority: WorkspaceAuthoritySnapshot =
+            serde_json::from_value::<AuthorityWire>(serde_json::json!({
+                "repoId": "acme/widget",
+                "workspace": "raven",
+                "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                "grantRevision": 1,
+                "lifecycleRevision": 1,
+            }))
+            .expect("authority")
+            .into();
+        let store = recovery_store("cowshed-healing", &[]);
+        let startup = Arc::new(crate::StartupHealState::mounting(3));
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), Arc::clone(&startup));
+        let listener = supervisor_socket::bind(&manager_socket_path(&store))
+            .await
+            .expect("bind the manager");
+        let served = tokio::spawn(serve(listener, manager));
+
+        let refused = ensure(&store, Path::new("/repo"), &authority)
+            .await
+            .expect_err("the startup pass is still mounting");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert_eq!(
+            refused.healing_source(),
+            Some(cowshed_gateway_types::StartupHeal::Mounting {
+                projects: NonZeroUsize::new(3).expect("three"),
+            })
+        );
+
+        startup.restored();
+        let healed = ensure(&store, Path::new("/repo"), &authority)
+            .await
+            .expect_err("this manager starts no supervisor");
+        assert_eq!(healed.healing_source(), None, "{}", healed.message);
+        served.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
     /// Supervisors of another build whose drains answer only once every one of them is draining.
     struct BarrierPeers {
         all_draining: tokio::sync::Barrier,
@@ -1223,7 +1283,7 @@ mod tests {
     #[tokio::test]
     async fn supervisors_of_another_build_drain_at_once() {
         let store = recovery_store("cowshed-drains", &["first.sock", "second.sock"]);
-        let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), healed());
         manager
             .recovery()
             .start(Arc::new(BarrierPeers {

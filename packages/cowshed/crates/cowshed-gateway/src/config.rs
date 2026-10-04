@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use cowshed_gateway_types::{ConfigError, SupervisorRecovery, WorkspaceSession};
+use cowshed_gateway_types::{ConfigError, StartupHeal, SupervisorRecovery, WorkspaceSession};
 // The workspace data socket only exists on Linux; macOS sessions are TCP port blocks.
 #[cfg(target_os = "linux")]
 use cowshed_gateway_types::{WorkspaceEndpoint, validate_identifier};
@@ -227,10 +227,14 @@ impl Default for MirrorCacheConfig {
     }
 }
 
-/// Where the daemon learns which workspace supervisors its host is still recovering. The daemon
-/// that owns those supervisors is the one process holding both this gateway and their manager, so
-/// it answers; the gateway asks at every status and keeps no copy that could go stale.
-pub trait RecoveryProbe: fmt::Debug + Send + Sync {
+/// Where the gateway learns how far its daemon's startup pass has got: the mounts it still heals
+/// and the workspace supervisors it still recovers. The daemon holding this gateway owns both, so
+/// it answers; the gateway asks at every status and every session change and keeps no copy that
+/// could go stale.
+pub trait StartupProbe: fmt::Debug + Send + Sync {
+    /// While `Some`, every session install or removal is refused: the sessions are restored from
+    /// the mounts this pass heals.
+    fn healing(&self) -> Option<StartupHeal>;
     fn recovering(&self) -> Option<SupervisorRecovery>;
 }
 
@@ -255,9 +259,8 @@ pub struct GatewayConfig {
     /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
     /// whether the daemon is running the same build it is.
     pub executable_sha256: Option<String>,
-    /// What status reports as the supervisors still being recovered; `None` for a gateway that
-    /// owns no supervisors.
-    pub supervisor_recovery: Option<Arc<dyn RecoveryProbe>>,
+    /// What status reports of the daemon's startup pass; `None` for a gateway no daemon owns.
+    pub startup: Option<Arc<dyn StartupProbe>>,
 }
 
 impl Default for GatewayConfig {
@@ -275,7 +278,7 @@ impl Default for GatewayConfig {
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             mirror_cache: MirrorCacheConfig::default(),
             executable_sha256: None,
-            supervisor_recovery: None,
+            startup: None,
         }
     }
 }

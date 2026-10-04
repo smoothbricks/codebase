@@ -3674,6 +3674,19 @@ fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
             path: Some(status.socket.clone()),
         });
     }
+    // It answers, but nothing that needs a workspace is served until its startup pass is over:
+    // a warning, because the pass ends on its own, and the count says how far it has got.
+    if let Some(heal) = status.healing {
+        findings.push(Finding {
+            code: "gateway-starting".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "gateway is still starting, {heal}; commands that need a workspace are refused until it has finished"
+            ),
+            hint: "retry shortly; cowshed gateway status".into(),
+            path: Some(status.socket.clone()),
+        });
+    }
     // Every build reports the same package version, so only the executables' bytes tell a
     // daemon left running an older build apart from this one.
     if let Some(stale) = status.stale_daemon.as_ref() {
@@ -5469,6 +5482,7 @@ mod tests {
             daemon_version: Some("0.1.0".into()),
             active_workspaces: 0,
             drain_cause: None,
+            healing: None,
             recovering: None,
             stale_daemon: Some(cowshed_core::api::StaleDaemonBinary {
                 daemon_sha256: Some("13f1eec0".into()),
@@ -5501,6 +5515,7 @@ mod tests {
             daemon_version: Some("0.1.0".into()),
             active_workspaces: 0,
             drain_cause: Some("audit sink failed, so the gateway fails closed: disk full".into()),
+            healing: None,
             recovering: None,
             stale_daemon: None,
         });
@@ -5522,6 +5537,7 @@ mod tests {
             daemon_version: None,
             active_workspaces: 0,
             drain_cause: None,
+            healing: None,
             recovering: None,
             stale_daemon: None,
         });

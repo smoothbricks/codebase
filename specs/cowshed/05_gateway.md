@@ -267,14 +267,30 @@ mounts are restored. In order:
 
 1. Validate the host store — both dedicated volumes present, mounted, marked, and with canonical flags (01_storage.md).
    A store that fails validation stops here and reports; nothing below can be meaningful without it.
-2. Eagerly heal every recorded project's mounts, in inventory order: main attached and mounted at its checkout path,
-   every other workspace under the mount root (02_workspaces.md).
-3. Then serve. The workspace supervisors still serving from before this daemon started are listed before the control
-   socket binds and recovered only once it is bound, all at once and in the background (11_shell.md "Supervisor
-   recovery"): the control socket and the supervisor manager answer from the first moment, and while any supervisor is
-   still being recovered, status carries `recovering: { supervisors: N }` (never 0; absent once none is left), and
-   `cowshed gateway status` says so. Only a command for one of those workspaces is refused meanwhile, by the typed
-   recovering refusal; every other workspace is served.
+2. Count the recorded projects and list the workspace supervisors still serving from before this daemon, then serve: the
+   control socket and the supervisor manager answer from the first moment. Status answers throughout, and so do the
+   audit, mirror, and simulator requests, none of which reads a workspace mount.
+3. Eagerly heal every recorded project's mounts: every project's main attached and mounted at its checkout path first,
+   then every other workspace under the mount root (02_workspaces.md). Each step is a lifecycle span of its own —
+   `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/<workspace>` — so a slow pass reads
+   as the step that spent the time.
+4. Restore every attached workspace's session into the gateway from what step 3 mounted.
+
+Until step 4 ends, status carries `healing`: `{ mounting: { projects: N } }` with the projects not yet mounted (never 0;
+a project counts once its sessions are mounted), then `restoringSessions`; it is absent once the pass is over, and
+`cowshed gateway status`, `doctor` (`gateway-starting`), and `gateway start`'s wait say so in those words. Everything
+that depends on what the pass restores is refused by type meanwhile, never reported as an absent gateway: a session
+`install` or `remove` on the control socket with failure code `healing`, every command's reconcile with a `Conflict`
+carrying `healing` and the `cowshed gateway status` hint, and every supervisor ensure likewise. Sessions are restored
+from the attachment facts the pass is still changing, so a session installed or removed before it ends would race that
+restore; a supervisor would start in a workspace the pass may not have mounted yet. The supervisors listed in step 2 are
+recovered once the control socket is bound, all at once and in the background, alongside steps 3 and 4 (11_shell.md
+"Supervisor recovery"): while any is still being recovered, status carries `recovering: { supervisors: N }` (never 0;
+absent once none is left), and only a command for one of those workspaces is refused, by the typed recovering refusal.
+
+Serving before the pass ends does not weaken it: the guarantee below is about the checkout path, which no request to the
+gateway makes appear any sooner or later, and answering at once is what lets every client tell "still starting" from
+"not running".
 
 Eager, not heal-on-contact. Adoption's guarantee is that the checkout path is never absent and never dangling, and a
 reboot is the one window that guarantee has to survive as much as the publication transaction does. Without a startup

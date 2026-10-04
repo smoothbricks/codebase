@@ -353,6 +353,12 @@ where
             CowshedError::internal(format!("gateway status failed: {message}"))
         }
     })?;
+    // The daemon restores every attached workspace's session from the mounts its startup pass
+    // heals: until then the attachments this snapshot would read are still moving, and a session
+    // installed now would race that restore.
+    if let Some(heal) = status.healing {
+        return Err(CowshedError::healing(heal));
+    }
     let desired = inventory.project_sessions(repo_id).await?;
     reconcile_against_status_inner(
         control,

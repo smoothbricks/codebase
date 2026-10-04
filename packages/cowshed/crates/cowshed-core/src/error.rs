@@ -72,6 +72,10 @@ pub struct CowshedError {
     /// started it is still recovering; absent from the wire otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovering: Option<cowshed_gateway_types::SupervisorRecovery>,
+    /// Present only on the daemon's refusal of a request that depends on the mounts and sessions
+    /// its startup pass has not finished restoring; absent from the wire otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    healing: Option<cowshed_gateway_types::StartupHeal>,
     #[serde(skip)]
     lifecycle_conflict: Option<crate::storage::lifecycle::Conflict>,
 }
@@ -99,6 +103,7 @@ impl CowshedError {
             hint: hint.into(),
             other_build: None,
             recovering: None,
+            healing: None,
             lifecycle_conflict: None,
         }
     }
@@ -123,6 +128,7 @@ impl CowshedError {
             hint: "refresh workspace state and retry".to_owned(),
             other_build: None,
             recovering: None,
+            healing: None,
             lifecycle_conflict: Some(conflict),
         }
     }
@@ -144,6 +150,7 @@ impl CowshedError {
             hint: "run `cowshed gateway start` from the cowshed you mean to use".to_owned(),
             other_build: Some(Box::new(other)),
             recovering: None,
+            healing: None,
             lifecycle_conflict: None,
         }
     }
@@ -167,6 +174,26 @@ impl CowshedError {
                 .to_owned(),
             other_build: None,
             recovering: Some(recovery),
+            healing: None,
+            lifecycle_conflict: None,
+        }
+    }
+
+    /// The daemon's refusal of a request that depends on the mounts and sessions its startup
+    /// pass is still restoring (05_gateway.md "Startup contract"): a `Conflict` carrying how far
+    /// the pass has got as [`cowshed_gateway_types::StartupHeal`]. The daemon answers its status
+    /// meanwhile, so the refusal names the command that reports progress.
+    pub fn healing(heal: cowshed_gateway_types::StartupHeal) -> Self {
+        Self {
+            code: ErrorCode::Conflict,
+            message: format!(
+                "the cowshed gateway is still starting, {heal}, and this command needs the \
+                 workspaces it is restoring"
+            ),
+            hint: "retry shortly; `cowshed gateway status` reports how far it has got".to_owned(),
+            other_build: None,
+            recovering: None,
+            healing: Some(heal),
             lifecycle_conflict: None,
         }
     }
@@ -276,6 +303,12 @@ impl CowshedError {
     /// still recovering.
     pub const fn recovering_source(&self) -> Option<cowshed_gateway_types::SupervisorRecovery> {
         self.recovering
+    }
+
+    /// How far the daemon's startup pass had got, when this is its refusal of a request that
+    /// depends on what that pass restores.
+    pub const fn healing_source(&self) -> Option<cowshed_gateway_types::StartupHeal> {
+        self.healing
     }
 
     pub const fn exit_code(&self) -> u8 {

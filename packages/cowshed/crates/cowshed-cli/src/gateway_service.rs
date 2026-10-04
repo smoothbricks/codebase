@@ -17,13 +17,13 @@ use cowshed_core::runtime::supervisor_manager::{
 };
 use cowshed_core::runtime::supervisor_socket;
 use cowshed_core::{
-    CowshedError, ErrorCode, NativeGatewayInventory, Result, ValidatedHostStorage,
-    validate_existing_host_storage,
+    CowshedError, ErrorCode, NativeGatewayInventory, Result, StartupHealState,
+    ValidatedHostStorage, validate_existing_host_storage,
 };
 use cowshed_gateway::{
     ArrowAuditConfig, ControlError, ControlFailureCode, Gateway, GatewayConfig,
-    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, RecoveryProbe,
-    SupervisorRecovery, WorkspaceSession,
+    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, StartupHeal,
+    StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -262,12 +262,13 @@ pub async fn reconcile_native_project(
     .await
 }
 
-/// How long `gateway start` waits for the daemon's control socket.
+/// How long `gateway start` waits for the daemon to become healthy.
 ///
-/// Sized for the startup heal rather than for a process start: the daemon attaches, checks, and
-/// mounts every recorded project's images before it serves (05_gateway.md), and a host carrying
-/// several multi-gigabyte mains needs minutes for that pass. Ten seconds timed out mid-heal and
-/// told the user to kickstart a gateway that was working exactly as intended.
+/// Sized for the startup heal rather than for a process start: the daemon answers at once, but
+/// it attaches, checks, and mounts every recorded project's images and restores their sessions
+/// before it serves a workspace (05_gateway.md), and a host carrying several multi-gigabyte mains
+/// needs minutes for that pass. Ten seconds timed out mid-heal and told the user to kickstart a
+/// gateway that was working exactly as intended.
 const START_DEADLINE: Duration = Duration::from_secs(180);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the wait says that it is still waiting, and on what.
@@ -537,45 +538,57 @@ where
     let cli_sha256 = executable_sha256(&source)?;
 
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
-    let mut progress = StartProgress::new(recorded_project_count(&storage).await);
+    let mut progress = StartProgress::new();
     let started = tokio::time::Instant::now();
     let mut restarted = false;
     loop {
-        if let Ok(status) = client.status().await {
-            let reported = cli_status(
-                true,
-                paths.control_socket.clone(),
-                Some(&status),
-                &cli_sha256,
-            );
-            match (&reported.drain_cause, &reported.stale_daemon) {
-                (None, None) => return Ok(reported),
-                // launchd kept the process it already had: the plist did not change, so
-                // activation did not restart it onto the bytes just installed. Restart it once.
-                (None, Some(_)) if !restarted => {
-                    activate_launch_agent(
-                        &mut executor,
-                        uid,
-                        spec.target(),
-                        InstallOutcome::Changed,
-                    )?;
-                    restarted = true;
+        let waiting = match client.status().await {
+            Err(_) => StartWait::ControlSocket,
+            Ok(status) => {
+                let reported = cli_status(
+                    true,
+                    paths.control_socket.clone(),
+                    Some(&status),
+                    &cli_sha256,
+                );
+                match (
+                    &reported.drain_cause,
+                    &reported.stale_daemon,
+                    reported.healing,
+                ) {
+                    (None, None, None) => return Ok(reported),
+                    // It answers, and tells how far its startup pass has got; nothing that
+                    // needs a workspace is served until that pass is over.
+                    (None, None, Some(heal)) => StartWait::Startup(heal),
+                    // launchd kept the process it already had: the plist did not change, so
+                    // activation did not restart it onto the bytes just installed. Restart it
+                    // once.
+                    (None, Some(_), _) if !restarted => {
+                        activate_launch_agent(
+                            &mut executor,
+                            uid,
+                            spec.target(),
+                            InstallOutcome::Changed,
+                        )?;
+                        restarted = true;
+                        StartWait::ControlSocket
+                    }
+                    (None, Some(stale), _) => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "the gateway still runs a different cowshed binary after a restart (daemon sha256 {}, cli sha256 {})",
+                                stale.daemon_sha256.as_deref().unwrap_or("unreported"),
+                                stale.cli_sha256
+                            ),
+                            STALE_DAEMON_REMEDY,
+                        ));
+                    }
+                    // A draining daemon exits once its in-flight work ends and launchd restarts
+                    // it; it is not healthy until then.
+                    (Some(_), _, _) => StartWait::Drain,
                 }
-                (None, Some(stale)) => {
-                    return Err(CowshedError::conflict(
-                        format!(
-                            "the gateway still runs a different cowshed binary after a restart (daemon sha256 {}, cli sha256 {})",
-                            stale.daemon_sha256.as_deref().unwrap_or("unreported"),
-                            stale.cli_sha256
-                        ),
-                        STALE_DAEMON_REMEDY,
-                    ));
-                }
-                // A draining daemon exits once its in-flight work ends and launchd restarts it;
-                // it is not healthy until then.
-                (Some(_), _) => {}
             }
-        }
+        };
         let waited = started.elapsed();
         if waited >= START_DEADLINE {
             return Err(CowshedError::environment_missing(
@@ -586,62 +599,60 @@ where
                 kickstart_hint(uid, GATEWAY_LABEL),
             ));
         }
-        if let Some(line) = progress.line(waited) {
+        if let Some(line) = progress.line(waited, waiting) {
             output.guidance(&line).map_err(output_error)?;
         }
         tokio::time::sleep(START_POLL_INTERVAL).await;
     }
 }
 
-/// How many projects the startup heal has to work through, or `None` when the store cannot say.
-///
-/// Counted from the store rather than asked of the gateway, because the gateway is precisely what
-/// is not answering yet. A count that cannot be taken is not an error: it costs the wait its
-/// number, and a wait that reports nothing at all is the defect being fixed.
-async fn recorded_project_count(storage: &ValidatedHostStorage) -> Option<usize> {
-    NativeGatewayInventory::new(storage.clone())
-        .adopted_projects()
-        .await
-        .ok()
-        .map(|projects| projects.len())
+/// What `gateway start` is still waiting for, as the last poll found it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartWait {
+    /// Nothing answers the control socket yet.
+    ControlSocket,
+    /// The daemon answers while its startup pass still mounts projects or restores sessions.
+    Startup(StartupHeal),
+    /// The daemon answers while it drains; launchd restarts it once it exits.
+    Drain,
 }
 
 /// The wait's own reporting, at most one line per [`START_PROGRESS_INTERVAL`].
 ///
-/// A first start after a reboot mounts every recorded project before the control socket answers,
-/// which is minutes of silence on a host with several multi-gigabyte mains — long enough that the
-/// only available conclusion is that cowshed has hung. So the wait says what it is waiting for and
-/// how long it has waited.
+/// A first start after a reboot mounts every recorded project before its workspaces are served,
+/// which is minutes on a host with several multi-gigabyte mains — long enough that a silent wait
+/// leaves only the conclusion that cowshed has hung. So the wait says what it is waiting for, in
+/// the daemon's own count, and how long it has waited.
 struct StartProgress {
-    projects: Option<usize>,
     next: Duration,
 }
 
 impl StartProgress {
-    const fn new(projects: Option<usize>) -> Self {
+    const fn new() -> Self {
         Self {
-            projects,
             next: START_PROGRESS_INTERVAL,
         }
     }
 
-    /// The line to emit after waiting `waited`, or `None` while the last one is still current.
-    fn line(&mut self, waited: Duration) -> Option<String> {
+    /// The line to emit after waiting `waited` on `waiting`, or `None` while the last one is
+    /// still current.
+    fn line(&mut self, waited: Duration, waiting: StartWait) -> Option<String> {
         if waited < self.next {
             return None;
         }
         // Anchored to `waited` rather than advanced by one interval: a poll that returns late —
-        // a heal saturating the disk — then reports once instead of flushing a backlog of lines
+        // a mount saturating the disk — then reports once instead of flushing a backlog of lines
         // for intervals that have already passed.
         self.next = waited + START_PROGRESS_INTERVAL;
         Some(format!(
             "waited {}s for the gateway: {}",
             waited.as_secs(),
-            match self.projects {
-                None => String::from("mounting adopted projects…"),
-                Some(0) => String::from("no adopted projects to mount"),
-                Some(1) => String::from("mounting 1 adopted project…"),
-                Some(count) => format!("mounting {count} adopted projects…"),
+            match waiting {
+                StartWait::ControlSocket => String::from("its control socket does not answer yet…"),
+                StartWait::Startup(heal) => format!("{heal}…"),
+                StartWait::Drain => {
+                    String::from("the running gateway is draining before launchd restarts it…")
+                }
             }
         ))
     }
@@ -752,13 +763,22 @@ async fn run_daemon() -> Result<()> {
     let paths = GatewayPaths::from_storage(&storage);
     ensure_private_directory(&paths.mirror_cache)?;
     ensure_private_directory(&paths.telemetry)?;
-    // Startup contract (05_gateway.md): validated store, then heal every project's mounts, then
-    // serve. The gateway is RunAtLoad, so this pass is what closes the reboot window in which a
-    // checkout path would otherwise dangle until something touched it.
-    heal_recorded_projects(&storage).await;
-    heal_sccache_daemon().await;
     let store_root = storage.store().to_path_buf();
-    let inventory = NativeSessionInventory::new(storage);
+    // Startup contract (05_gateway.md): validated store, then serve at once while every
+    // recorded project's mounts are healed and the attached workspaces' sessions restored from
+    // them. The gateway is RunAtLoad, so this pass is what closes the reboot window in which a
+    // checkout path would otherwise dangle until something touched it. The projects are counted
+    // before the control socket binds, so its first status already says how many are left, and
+    // every request that depends on what the pass restores is refused by type until it is over.
+    let heal_inventory = NativeGatewayInventory::new(storage.clone());
+    let repositories = heal_inventory
+        .recorded_projects()
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("cowshed: could not list adopted projects at gateway startup: {error}");
+            Vec::new()
+        });
+    let heal = Arc::new(StartupHealState::mounting(repositories.len()));
     // The git credential helper is this same binary, which launchd started from the host-stable
     // path: a helper spawned by the daemon has to keep resolving for as long as the daemon runs.
     // Workspace supervisors are this binary too, for the same reason.
@@ -766,18 +786,22 @@ async fn run_daemon() -> Result<()> {
     // Own the host's workspace supervisors (11_shell.md "Supervisor"). The ones still serving
     // from before this daemon are listed before the control socket binds, so its first status
     // already counts them, and recovered only once this daemon holds that socket: a second
-    // daemon that fails to start never drains the first one's supervisors.
+    // daemon that fails to start never drains the first one's supervisors, nor heals a mount.
     let manager = SupervisorManager::new(
         &store_root,
         Box::new(ProgramSpawner::new(
             executable.clone(),
             vec![crate::workspace_supervisor::VERB.into()],
         )),
+        Arc::clone(&heal),
     );
     let recovery = manager.recovery();
     let config = GatewayConfig {
         executable_sha256: Some(executable_sha256(&executable)?),
-        supervisor_recovery: Some(Arc::new(ManagerRecovery(Arc::clone(&manager)))),
+        startup: Some(Arc::new(DaemonStartup {
+            heal: Arc::clone(&heal),
+            manager: Arc::clone(&manager),
+        })),
         ..paths.config(effective_uid(), executable)
     };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
@@ -789,9 +813,14 @@ async fn run_daemon() -> Result<()> {
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
     let handle = OwnedGateway::new(gateway.handle());
+    let inventory = NativeSessionInventory::new(storage);
     let started = async {
+        serve_supervisors(&store_root, manager).await?;
+        heal_recorded_projects(&heal_inventory, repositories, &heal).await;
+        heal_sccache_daemon().await;
         install_all_sessions(&inventory, &handle).await?;
-        serve_supervisors(&store_root, manager).await
+        heal.restored();
+        Ok::<(), CowshedError>(())
     }
     .await;
     if let Err(primary) = started {
@@ -807,27 +836,37 @@ async fn run_daemon() -> Result<()> {
     drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
 }
 
-/// What the daemon's supervisor manager has left to recover, as the gateway's status reports
-/// it. Like [`ControlSocket`], this lands in the composition root, the one place holding both.
-struct ManagerRecovery(Arc<SupervisorManager>);
+/// The daemon's startup pass, as the gateway's status and its session changes see it: the
+/// mounts it still heals and the supervisors it still recovers. Like [`ControlSocket`], this
+/// lands in the composition root, the one place holding the gateway and both halves.
+struct DaemonStartup {
+    heal: Arc<StartupHealState>,
+    manager: Arc<SupervisorManager>,
+}
 
-impl std::fmt::Debug for ManagerRecovery {
+impl std::fmt::Debug for DaemonStartup {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_tuple("ManagerRecovery")
-            .field(&self.0.recovering())
+            .debug_struct("DaemonStartup")
+            .field("healing", &self.healing())
+            .field("recovering", &self.recovering())
             .finish()
     }
 }
 
-impl RecoveryProbe for ManagerRecovery {
+impl StartupProbe for DaemonStartup {
+    fn healing(&self) -> Option<StartupHeal> {
+        self.heal.current()
+    }
+
     fn recovering(&self) -> Option<SupervisorRecovery> {
-        self.0.recovering()
+        self.manager.recovering()
     }
 }
 
-/// Take ensures on the manager socket, while the supervisors from before this daemon are still
-/// being recovered: only their own workspaces are refused meanwhile.
+/// Take ensures on the manager socket from the daemon's first moment: an ensure is refused by
+/// type while the startup pass still heals, and for a workspace whose supervisor from before
+/// this daemon is still being recovered.
 async fn serve_supervisors(store_root: &Path, manager: Arc<SupervisorManager>) -> Result<()> {
     let listener =
         supervisor_socket::bind(&supervisor_manager::manager_socket_path(store_root)).await?;
@@ -842,37 +881,34 @@ async fn serve_supervisors(store_root: &Path, manager: Arc<SupervisorManager>) -
     Ok(())
 }
 
-/// Heal every recorded project, mains before sessions, reporting rather than raising.
+/// Heal every one of `repositories`, mains before sessions, counting each one down in `heal` and
+/// reporting rather than raising.
 ///
 /// A project that cannot be healed is a finding for `cowshed doctor`; it must never stop the
 /// gateway from serving the healthy ones (05_gateway.md). Mains are logged apart from sessions
 /// because they are not equally load-bearing: an unmounted main is the user's own checkout missing
 /// from their shell and editor, which is why `doctor` reports it as critical and this line carries
 /// the remedy with it.
-async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
-    let inventory = NativeGatewayInventory::new(storage.clone());
-    match inventory.heal_all().await {
-        Ok(outcomes) => {
-            for outcome in outcomes {
-                if let Err(error) = &outcome.main {
-                    eprintln!(
-                        "cowshed: {}: main checkout is not mounted after gateway startup: {error}",
-                        outcome.repo_id
-                    );
-                    eprintln!("next: cowshed doctor");
-                }
-                for session in &outcome.sessions {
-                    if let Err(error) = &session.mount {
-                        eprintln!(
-                            "cowshed: could not mount {}/{} at gateway startup: {error}",
-                            outcome.repo_id, session.workspace
-                        );
-                    }
-                }
-            }
+async fn heal_recorded_projects(
+    inventory: &NativeGatewayInventory,
+    repositories: Vec<RepoId>,
+    heal: &StartupHealState,
+) {
+    for outcome in inventory.heal(repositories, heal).await {
+        if let Err(error) = &outcome.main {
+            eprintln!(
+                "cowshed: {}: main checkout is not mounted after gateway startup: {error}",
+                outcome.repo_id
+            );
+            eprintln!("next: cowshed doctor");
         }
-        Err(error) => {
-            eprintln!("cowshed: could not list adopted projects at gateway startup: {error}");
+        for session in &outcome.sessions {
+            if let Err(error) = &session.mount {
+                eprintln!(
+                    "cowshed: could not mount {}/{} at gateway startup: {error}",
+                    outcome.repo_id, session.workspace
+                );
+            }
         }
     }
 }
@@ -912,8 +948,8 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 /// What `gateway status` reports, from launchd's answer, the daemon's own answer, and the digest
-/// of this CLI's executable. A daemon that answers is healthy only when it is not draining and
-/// runs the same bytes as the CLI asking.
+/// of this CLI's executable. A daemon that answers is healthy only when it is not draining, has
+/// finished its startup pass, and runs the same bytes as the CLI asking.
 fn cli_status(
     installed: bool,
     socket: PathBuf,
@@ -935,6 +971,7 @@ fn cli_status(
                     .unwrap_or_else(|| "the daemon reports draining without a cause".to_owned())
             })
         }),
+        healing: status.and_then(|status| status.healing),
         recovering: status.and_then(|status| status.recovering),
         stale_daemon: status.and_then(|status| {
             (status.executable_sha256.as_deref() != Some(cli_sha256)).then(|| StaleDaemonBinary {
@@ -986,6 +1023,11 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             "gateway runs a different cowshed binary than this CLI (daemon sha256 {}, cli sha256 {}); replace it: {STALE_DAEMON_REMEDY}",
             stale.daemon_sha256.as_deref().unwrap_or("unreported"),
             stale.cli_sha256
+        )
+    } else if let Some(heal) = &status.healing {
+        format!(
+            "gateway answers at {} but is still starting: {heal}; a command that needs a workspace is refused until it has finished",
+            status.socket.display(),
         )
     } else if let Some(recovery) = &status.recovering {
         format!(
@@ -1771,6 +1813,7 @@ mod tests {
             draining,
             drain_cause: cause.map(str::to_owned),
             executable_sha256: sha256.map(str::to_owned),
+            healing: None,
             recovering: None,
             sessions: Vec::new(),
             active: 0,
@@ -1826,16 +1869,16 @@ mod tests {
         assert_eq!((silent.drain_cause, silent.stale_daemon), (None, None));
     }
 
-    /// The daemon's control socket and the supervisor recovery it reports, composed as
-    /// `run_daemon` composes them, with every supervisor of another build draining only as the
-    /// test lets it.
+    /// The daemon's control socket and the startup pass it reports — mounts still healing,
+    /// supervisors still recovering — composed as `run_daemon` composes them, with each pass held
+    /// where the test wants it.
     #[cfg(target_os = "macos")]
-    mod recovery {
+    mod startup {
         use std::num::NonZeroUsize;
 
         use cowshed_core::metadata::WorkspaceName;
         use cowshed_core::runtime::supervisor_manager::{
-            Draining, SupervisorPeers, SupervisorSpawner,
+            Draining, Recovery, SupervisorPeers, SupervisorSpawner,
         };
         use cowshed_core::runtime::supervisor_socket::Hello;
         use cowshed_gateway::{
@@ -1923,37 +1966,55 @@ mod tests {
             }
         }
 
+        /// An inventory a refused reconcile never reaches.
+        struct UnreadInventory;
+
+        #[async_trait]
+        impl SessionInventory for UnreadInventory {
+            async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+                Err(CowshedError::internal("the inventory was read"))
+            }
+
+            async fn project_sessions(&self, _: &RepoId) -> Result<Vec<WorkspaceSession>> {
+                Err(CowshedError::internal("the inventory was read"))
+            }
+        }
+
         fn private_directory(path: &Path) {
             fs::create_dir(path).expect("a fixture directory");
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))
                 .expect("a private fixture directory");
         }
 
-        /// The control socket answers while supervisors of another build from before the daemon
-        /// still drain, and its status counts them; `gateway status` says so instead of calling
-        /// the gateway unavailable, and once they are drained the count is gone.
-        #[tokio::test]
-        async fn the_control_socket_counts_supervisors_still_draining() {
+        /// A daemon's gateway, its supervisor manager, and the supervisors it found, composed
+        /// as `run_daemon` composes them, under `/tmp/<name>-<pid>` with `sockets` under `run`.
+        struct Daemon {
+            root: PathBuf,
+            socket: PathBuf,
+            gateway: Gateway,
+            recovery: Recovery,
+        }
+
+        async fn daemon(name: &str, sockets: &[&str], heal: Arc<StartupHealState>) -> Daemon {
             // `/tmp`, not TMPDIR: the gateway socket's path has to fit in `sun_path`.
-            let root = PathBuf::from(format!("/tmp/csrecover-{}", std::process::id()));
+            let root = PathBuf::from(format!("/tmp/{name}-{}", std::process::id()));
             private_directory(&root);
             let store = root.join("store");
             fs::create_dir_all(store.join("run")).expect("run directory");
-            for socket in ["first.sock", "second.sock"] {
+            for socket in sockets {
                 fs::write(store.join("run").join(socket), b"").expect("a socket file");
             }
             let cache = root.join("cache");
             private_directory(&cache);
             let socket = root.join("gateway.sock");
-
-            let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+            let manager = SupervisorManager::new(&store, Box::new(NoSpawner), Arc::clone(&heal));
             let recovery = manager.recovery();
             let gateway = Gateway::start(
                 GatewayConfig {
                     control_socket: Some(socket.clone()),
                     mirror_cache: MirrorCacheConfig::new(cache),
-                    supervisor_recovery: Some(Arc::new(ManagerRecovery(Arc::clone(&manager)))),
-                    // The CLI asking runs the same bytes, so only the recovery is left to report.
+                    startup: Some(Arc::new(DaemonStartup { heal, manager })),
+                    // The CLI asking runs the same bytes, so only the startup pass is reported.
                     executable_sha256: Some("aa".into()),
                     ..GatewayConfig::default()
                 },
@@ -1963,27 +2024,58 @@ mod tests {
             )
             .await
             .expect("start the gateway");
+            Daemon {
+                root,
+                socket,
+                gateway,
+                recovery,
+            }
+        }
+
+        /// What `gateway status` prints for the daemon's answer.
+        fn rendered(socket: &Path, status: &GatewayStatus) -> String {
+            let mut output = Output::new(Vec::new(), Vec::new(), false);
+            emit_gateway_status(
+                &mut output,
+                false,
+                cli_status(true, socket.to_path_buf(), Some(status), "aa"),
+            )
+            .expect("render");
+            String::from_utf8(output.into_inner().1).expect("utf-8")
+        }
+
+        /// The control socket answers while supervisors of another build from before the daemon
+        /// still drain, and its status counts them; `gateway status` says so instead of calling
+        /// the gateway unavailable, and once they are drained the count is gone.
+        #[tokio::test]
+        async fn the_control_socket_counts_supervisors_still_draining() {
+            let daemon = daemon(
+                "csrecover",
+                &["first.sock", "second.sock"],
+                Arc::new(StartupHealState::healed()),
+            )
+            .await;
             let peers = Arc::new(GatedPeers {
                 gate: tokio::sync::Semaphore::new(0),
             });
             let gated: Arc<GatedPeers> = Arc::clone(&peers);
-            let recovered = recovery.start(gated);
-            let client = GatewayControlClient::new(socket.clone()).expect("a control client");
+            let recovered = daemon.recovery.start(gated);
+            let client =
+                GatewayControlClient::new(daemon.socket.clone()).expect("a control client");
 
             let draining = client.status().await.expect("status while draining");
             let two = SupervisorRecovery {
                 supervisors: NonZeroUsize::new(2).expect("two"),
             };
             assert_eq!(draining.recovering, Some(two));
-            let reported = cli_status(true, socket.clone(), Some(&draining), "aa");
-            assert_eq!(reported.recovering, Some(two));
-            let mut output = Output::new(Vec::new(), Vec::new(), false);
-            emit_gateway_status(&mut output, false, reported).expect("render");
-            let (_, stderr) = output.into_inner();
-            let rendered = String::from_utf8(stderr).expect("utf-8");
+            assert_eq!(
+                cli_status(true, daemon.socket.clone(), Some(&draining), "aa").recovering,
+                Some(two)
+            );
+            let text = rendered(&daemon.socket, &draining);
             assert!(
-                rendered.contains("still recovering 2 workspace supervisors"),
-                "{rendered}"
+                text.contains("still recovering 2 workspace supervisors"),
+                "{text}"
             );
 
             peers.gate.add_permits(2);
@@ -1991,8 +2083,71 @@ mod tests {
             let drained = client.status().await.expect("status once drained");
             assert_eq!(drained.recovering, None);
 
-            gateway.drain().await.expect("drain the gateway");
-            fs::remove_dir_all(&root).expect("cleanup");
+            daemon.gateway.drain().await.expect("drain the gateway");
+            fs::remove_dir_all(&daemon.root).expect("cleanup");
+        }
+
+        /// The control socket answers from the first moment, while the startup pass still mounts
+        /// projects: status says how many are left, `gateway status` says the gateway is still
+        /// starting, and every session change — over the socket or through a command's reconcile
+        /// — is refused by type until the pass has restored the sessions; then it is served.
+        #[tokio::test]
+        async fn the_control_socket_answers_while_the_startup_pass_mounts() {
+            let heal = Arc::new(StartupHealState::mounting(2));
+            let daemon = daemon("csheal", &[], Arc::clone(&heal)).await;
+            let client =
+                GatewayControlClient::new(daemon.socket.clone()).expect("a control client");
+            let mounting = StartupHeal::Mounting {
+                projects: NonZeroUsize::new(2).expect("two"),
+            };
+
+            let starting = client.status().await.expect("status while mounting");
+            assert_eq!(starting.healing, Some(mounting));
+            let text = rendered(&daemon.socket, &starting);
+            assert!(
+                text.contains("still starting: mounting 2 adopted projects"),
+                "{text}"
+            );
+            assert!(
+                matches!(
+                    client.remove("pnone.wnone", 1).await,
+                    Err(ControlError::Rejected {
+                        code: ControlFailureCode::Healing,
+                        ..
+                    })
+                ),
+                "a session change waits for the restore"
+            );
+            let repo = RepoId::parse("acme/widget").expect("repo");
+            let control = ControlSocket::at(daemon.socket.clone()).expect("control socket");
+            let refused = reconcile_project(&control, &UnreadInventory, &repo, effective_uid())
+                .await
+                .expect_err("a command's reconcile is refused while the gateway is starting");
+            assert_eq!(
+                refused.healing_source(),
+                Some(mounting),
+                "{}",
+                refused.message
+            );
+
+            heal.restored();
+            assert_eq!(
+                client.status().await.expect("status once healed").healing,
+                None
+            );
+            assert!(
+                matches!(
+                    client.remove("pnone.wnone", 1).await,
+                    Err(ControlError::Rejected {
+                        code: ControlFailureCode::NotInstalled,
+                        ..
+                    })
+                ),
+                "the session change now reaches the gateway"
+            );
+
+            daemon.gateway.drain().await.expect("drain the gateway");
+            fs::remove_dir_all(&daemon.root).expect("cleanup");
         }
     }
 
@@ -2019,28 +2174,37 @@ mod tests {
         );
     }
 
+    fn mounting(projects: usize) -> StartWait {
+        StartWait::Startup(StartupHeal::Mounting {
+            projects: std::num::NonZeroUsize::new(projects).expect("non-zero"),
+        })
+    }
+
     /// The wait stays quiet until an interval has passed, then speaks once per interval and names
-    /// what the gateway is doing — a heal of several multi-gigabyte images, not a hung process.
+    /// what the gateway says it is doing — mounting several multi-gigabyte images, not hanging.
     #[test]
     fn the_start_wait_reports_once_per_interval_with_the_project_count() {
-        let mut progress = StartProgress::new(Some(7));
+        let mut progress = StartProgress::new();
 
-        assert_eq!(progress.line(Duration::from_secs(0)), None);
+        assert_eq!(progress.line(Duration::from_secs(0), mounting(7)), None);
         assert_eq!(
-            progress.line(START_PROGRESS_INTERVAL - Duration::from_millis(1)),
+            progress.line(
+                START_PROGRESS_INTERVAL - Duration::from_millis(1),
+                mounting(7)
+            ),
             None
         );
         assert_eq!(
-            progress.line(START_PROGRESS_INTERVAL),
+            progress.line(START_PROGRESS_INTERVAL, mounting(7)),
             Some(String::from(
                 "waited 5s for the gateway: mounting 7 adopted projects…"
             ))
         );
-        assert_eq!(progress.line(START_PROGRESS_INTERVAL), None);
+        assert_eq!(progress.line(START_PROGRESS_INTERVAL, mounting(7)), None);
         assert_eq!(
-            progress.line(START_PROGRESS_INTERVAL * 2),
+            progress.line(START_PROGRESS_INTERVAL * 2, mounting(6)),
             Some(String::from(
-                "waited 10s for the gateway: mounting 7 adopted projects…"
+                "waited 10s for the gateway: mounting 6 adopted projects…"
             ))
         );
     }
@@ -2049,43 +2213,47 @@ mod tests {
     /// rather than one line for every interval that elapsed while it was blocked.
     #[test]
     fn a_late_poll_reports_the_observed_wait_once() {
-        let mut progress = StartProgress::new(Some(2));
+        let mut progress = StartProgress::new();
 
         assert_eq!(
-            progress.line(Duration::from_secs(90)),
+            progress.line(Duration::from_secs(90), mounting(2)),
             Some(String::from(
                 "waited 90s for the gateway: mounting 2 adopted projects…"
             ))
         );
-        assert_eq!(progress.line(Duration::from_secs(93)), None);
+        assert_eq!(progress.line(Duration::from_secs(93), mounting(2)), None);
         assert_eq!(
-            progress.line(Duration::from_secs(95)),
+            progress.line(Duration::from_secs(95), mounting(2)),
             Some(String::from(
                 "waited 95s for the gateway: mounting 2 adopted projects…"
             ))
         );
     }
 
-    /// The count is evidence, so the line never claims projects it did not count: an uncountable
-    /// store says so, an empty one says so, and one project is not "1 projects".
+    /// Every line says what the daemon reported, in its own count: one project is not
+    /// "1 projects", and a daemon that does not answer yet is not claimed to be mounting.
     #[test]
-    fn the_start_wait_never_overstates_what_it_counted() {
-        for (projects, expected) in [
+    fn the_start_wait_says_what_the_daemon_reported() {
+        for (waiting, expected) in [
             (
-                None,
-                "waited 5s for the gateway: mounting adopted projects…",
+                StartWait::ControlSocket,
+                "waited 5s for the gateway: its control socket does not answer yet…",
             ),
             (
-                Some(0),
-                "waited 5s for the gateway: no adopted projects to mount",
-            ),
-            (
-                Some(1),
+                mounting(1),
                 "waited 5s for the gateway: mounting 1 adopted project…",
+            ),
+            (
+                StartWait::Startup(StartupHeal::RestoringSessions),
+                "waited 5s for the gateway: restoring workspace sessions…",
+            ),
+            (
+                StartWait::Drain,
+                "waited 5s for the gateway: the running gateway is draining before launchd restarts it…",
             ),
         ] {
             assert_eq!(
-                StartProgress::new(projects).line(START_PROGRESS_INTERVAL),
+                StartProgress::new().line(START_PROGRESS_INTERVAL, waiting),
                 Some(String::from(expected))
             );
         }
@@ -2096,9 +2264,15 @@ mod tests {
     /// mounted, and the line has to say that.
     #[test]
     fn the_start_wait_never_speaks_of_healing() {
-        for projects in [None, Some(0), Some(1), Some(4)] {
-            let line = StartProgress::new(projects)
-                .line(START_PROGRESS_INTERVAL)
+        for waiting in [
+            StartWait::ControlSocket,
+            mounting(1),
+            mounting(4),
+            StartWait::Startup(StartupHeal::RestoringSessions),
+            StartWait::Drain,
+        ] {
+            let line = StartProgress::new()
+                .line(START_PROGRESS_INTERVAL, waiting)
                 .expect("a line once the interval has passed");
             for jargon in ["heal", "unhealable", "reclaim", "provision", "incarnation"] {
                 assert!(!line.contains(jargon), "{line} leaks {jargon}");

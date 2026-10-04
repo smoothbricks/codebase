@@ -292,10 +292,13 @@ impl Gateway {
                 match ControlRuntime::start(
                     path,
                     config.authorized_control_uid,
-                    handle.clone(),
-                    repo_mirror.clone(),
-                    sim_broker.clone(),
-                    audit_tail.clone(),
+                    crate::control::ControlServices {
+                        handle: handle.clone(),
+                        repo_mirror: repo_mirror.clone(),
+                        sim_broker: sim_broker.clone(),
+                        audit_tail: audit_tail.clone(),
+                        startup: config.startup.clone(),
+                    },
                     config.control_tcp.as_ref(),
                 )
                 .await
@@ -1671,9 +1674,14 @@ impl Actor {
                 None => "the gateway is shutting down".to_owned(),
             }),
             executable_sha256: self.config.executable_sha256.clone(),
+            healing: self
+                .config
+                .startup
+                .as_ref()
+                .and_then(|probe| probe.healing()),
             recovering: self
                 .config
-                .supervisor_recovery
+                .startup
                 .as_ref()
                 .and_then(|probe| probe.recovering()),
             sessions,
@@ -1978,10 +1986,7 @@ impl ControlRuntime {
     async fn start(
         path: &Path,
         authorized_uid: u32,
-        handle: GatewayHandle,
-        repo_mirror: RepoMirrorHandle,
-        sim_broker: SimBrokerHandle,
-        audit_tail: Option<AuditTailHandle>,
+        services: crate::control::ControlServices,
         tcp: Option<&ControlTcpConfig>,
     ) -> Result<Self, GatewayError> {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
@@ -2046,12 +2051,6 @@ impl ControlRuntime {
             None
         };
 
-        let services = crate::control::ControlServices {
-            handle,
-            repo_mirror,
-            sim_broker,
-            audit_tail,
-        };
         let capacity = 1024;
         let (stop, stopped) = watch::channel(false);
         let unix_services = services.clone();

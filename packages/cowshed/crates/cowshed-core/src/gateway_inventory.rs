@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cowshed_gateway_types::StartupHeal;
 use thiserror::Error;
 
 use crate::apfs::SystemCommandRunner;
@@ -35,6 +36,59 @@ use crate::workspace_credentials::{
 
 pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
+/// The span every startup heal step reports under.
+const HEAL_SCOPE: &str = "startup-heal";
+
+/// How far the daemon's startup pass has got, as the requests it answers meanwhile see it
+/// (05_gateway.md "Startup contract"). It only moves forward: fewer projects left to mount, then
+/// restoring sessions, then done.
+#[derive(Debug)]
+pub struct StartupHealState(std::sync::Mutex<Option<StartupHeal>>);
+
+impl StartupHealState {
+    /// A pass with `projects` recorded projects to mount; with none, it only restores sessions.
+    pub fn mounting(projects: usize) -> Self {
+        Self(std::sync::Mutex::new(Some(
+            match std::num::NonZeroUsize::new(projects) {
+                Some(projects) => StartupHeal::Mounting { projects },
+                None => StartupHeal::RestoringSessions,
+            },
+        )))
+    }
+
+    /// No pass in flight: everything a daemon serves is already healed.
+    pub fn healed() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    pub fn current(&self) -> Option<StartupHeal> {
+        *self.lock()
+    }
+
+    /// One more project is mounted, or reported as unmountable. [`NativeGatewayInventory::heal`]
+    /// calls this once per project it was given, which is the count [`Self::mounting`] started
+    /// from, so it never runs past `Mounting`.
+    fn project_mounted(&self) {
+        let mut state = self.lock();
+        if let Some(StartupHeal::Mounting { projects }) = *state {
+            *state = Some(match std::num::NonZeroUsize::new(projects.get() - 1) {
+                Some(projects) => StartupHeal::Mounting { projects },
+                None => StartupHeal::RestoringSessions,
+            });
+        }
+    }
+
+    /// The sessions are restored from what the pass mounted: the pass is over.
+    pub fn restored(&self) {
+        *self.lock() = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<StartupHeal>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// Complete controller-authoritative input for installing one gateway workspace session.
 pub struct GatewaySessionFact {
@@ -564,25 +618,47 @@ impl NativeGatewayInventory {
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
-    /// Attach and mount every recorded project's workspaces, mains before sessions.
+    /// The recorded projects a startup heal works through, in inventory order.
     ///
-    /// This runs at gateway startup, before serving, because the gateway is `RunAtLoad` and a
-    /// reboot is the one window adoption's "the checkout path is never absent and never dangling"
-    /// guarantee cannot defend on its own. Healing on contact would leave a dangling symlink — or,
-    /// under direct mount, a bare stub directory — visible in the user's shell, editor, and Finder
-    /// until something happened to touch it.
+    /// Taken apart from [`Self::heal`] so the daemon knows how many there are before it answers
+    /// anyone: its first status already says how many it is still mounting.
+    pub async fn recorded_projects(&self) -> Result<Vec<RepoId>, GatewayInventoryError> {
+        let store = self.storage.store().to_owned();
+        crate::timing::timed_async(HEAL_SCOPE, "discover", async move {
+            crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
+                .await
+                .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+        })
+        .await
+    }
+
+    /// Attach and mount every one of `repositories`' workspaces, mains before sessions, telling
+    /// `progress` as each project is done.
+    ///
+    /// This runs at gateway startup because the gateway is `RunAtLoad` and a reboot is the one
+    /// window adoption's "the checkout path is never absent and never dangling" guarantee cannot
+    /// defend on its own. Healing on contact would leave a dangling symlink — or, under direct
+    /// mount, a bare stub directory — visible in the user's shell, editor, and Finder until
+    /// something happened to touch it.
     ///
     /// Mains go first across every project, not per project in inventory order: a main is the
     /// user's own checkout and is always-mounted (02_workspaces.md), so no project's session
     /// mount — which may attach, fsck, and mount a multi-gigabyte image — is allowed to stand
-    /// between another project's checkout and the gateway serving.
+    /// between another project's checkout and its mount. A project is done once its sessions
+    /// are, so `progress` counts down in the session pass.
+    ///
+    /// Every step is a lifecycle span of its own (`startup-heal open|mount <repo>[/<workspace>]`),
+    /// so a slow heal reads as the step that spent the time.
     ///
     /// Failures are per-project and returned rather than raised: one project whose store or image
     /// cannot be healed must not cost every other project its gateway. A project that cannot even
     /// be opened reports that error as its main outcome, because an unopenable project is exactly a
     /// project whose main is unreachable.
-    pub async fn heal_all(&self) -> Result<Vec<ProjectHealOutcome>, GatewayInventoryError> {
-        let store = self.storage.store().to_owned();
+    pub async fn heal(
+        &self,
+        repositories: Vec<RepoId>,
+        progress: &StartupHealState,
+    ) -> Vec<ProjectHealOutcome> {
         // Deferred-first: images whose disk child hit the deadline on the last pass heal
         // before the rest, so a deferred workspace is retried first rather than in
         // inventory order. Empty most passes, in which case every order below is untouched.
@@ -599,13 +675,14 @@ impl NativeGatewayInventory {
                 .iter()
                 .any(|candidate| candidate.as_path() == paths.image())
         };
-        let repositories =
-            crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
-                .await
-                .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))??;
         let mut opened = Vec::with_capacity(repositories.len());
         for repo in repositories {
-            let project = self.open_project(&repo).await;
+            let project = crate::timing::timed_async(
+                HEAL_SCOPE,
+                format!("open {repo}"),
+                self.open_project(&repo),
+            )
+            .await;
             opened.push((repo, project));
         }
         let mut healed_mains = Vec::with_capacity(opened.len());
@@ -622,7 +699,14 @@ impl NativeGatewayInventory {
             let (project, main) = match project {
                 Ok(project) => {
                     let main = match &project.main {
-                        Some(main) => project.mounts.mount(main).await,
+                        Some(main) => {
+                            crate::timing::timed_async(
+                                HEAL_SCOPE,
+                                format!("mount {repo_id}/{}", main.name()),
+                                project.mounts.mount(main),
+                            )
+                            .await
+                        }
                         None => Err(GatewayInventoryError::MissingMainWorkspace(repo_id.clone())),
                     };
                     (Some(project), main)
@@ -648,7 +732,12 @@ impl NativeGatewayInventory {
                 for workspace in ordered {
                     sessions.push(SessionHealOutcome {
                         workspace: workspace.name().clone(),
-                        mount: project.mounts.mount(workspace).await,
+                        mount: crate::timing::timed_async(
+                            HEAL_SCOPE,
+                            format!("mount {}/{}", healed.repo_id, workspace.name()),
+                            project.mounts.mount(workspace),
+                        )
+                        .await,
                     });
                 }
             }
@@ -657,8 +746,9 @@ impl NativeGatewayInventory {
                 main: healed.main,
                 sessions,
             });
+            progress.project_mounted();
         }
-        Ok(outcomes)
+        outcomes
     }
 
     /// Open one project's mount side and split its workspaces by class.
@@ -1215,7 +1305,7 @@ fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
 
 /// Enumerate the projects in the store, skipping everything that is not one.
 ///
-/// Discovery is per-entry isolated for the same reason healing is (see `heal_all`): the store root
+/// Discovery is per-entry isolated for the same reason healing is (see `heal`): the store root
 /// is a mount point with neighbours cowshed does not own and cannot read, and an entry that cannot
 /// be inspected is evidence that it is not a project — not grounds to fail the pass. Raising here
 /// took down the entire gateway inventory over one root-owned system directory, which left launchd
@@ -2697,6 +2787,14 @@ mod tests {
         unopenable: BTreeSet<RepoId>,
         refused: BTreeSet<String>,
         order: Arc<Mutex<Vec<String>>>,
+        gate: Option<MountGate>,
+    }
+
+    /// Holds every mount until the test lets it through, saying which mount is waiting.
+    #[derive(Clone)]
+    struct MountGate {
+        permits: Arc<tokio::sync::Semaphore>,
+        waiting: tokio::sync::mpsc::UnboundedSender<String>,
     }
 
     impl FakeHealSource {
@@ -2706,6 +2804,7 @@ mod tests {
                 unopenable: BTreeSet::new(),
                 refused: BTreeSet::new(),
                 order: Arc::new(Mutex::new(Vec::new())),
+                gate: None,
             }
         }
 
@@ -2716,6 +2815,11 @@ mod tests {
 
         fn refusing(mut self, workspace: &str) -> Self {
             self.refused.insert(workspace.to_owned());
+            self
+        }
+
+        fn gated(mut self, gate: MountGate) -> Self {
+            self.gate = Some(gate);
             self
         }
     }
@@ -2737,6 +2841,7 @@ mod tests {
                 workspaces: self.projects.get(repo).cloned().unwrap_or_default(),
                 refused: self.refused.clone(),
                 order: Arc::clone(&self.order),
+                gate: self.gate.clone(),
             }))
         }
     }
@@ -2745,6 +2850,7 @@ mod tests {
         workspaces: Vec<LifecycleWorkspace>,
         refused: BTreeSet<String>,
         order: Arc<Mutex<Vec<String>>>,
+        gate: Option<MountGate>,
     }
 
     #[async_trait]
@@ -2758,6 +2864,14 @@ mod tests {
             workspace: &LifecycleWorkspace,
         ) -> Result<PathBuf, GatewayInventoryError> {
             let key = format!("{}/{}", workspace.repo(), workspace.name());
+            if let Some(gate) = &self.gate {
+                gate.waiting.send(key.clone()).expect("the test listens");
+                gate.permits
+                    .acquire()
+                    .await
+                    .expect("the gate opens")
+                    .forget();
+            }
             self.order.lock().expect("mount order").push(key.clone());
             if self.refused.contains(&key) {
                 return Err(GatewayInventoryError::InvalidMetadata {
@@ -2787,6 +2901,85 @@ mod tests {
         .expect("workspace")
     }
 
+    /// Heal every recorded project as the daemon does, and check the pass counted each one.
+    async fn heal_recorded(inventory: &NativeGatewayInventory) -> Vec<ProjectHealOutcome> {
+        let repositories = inventory
+            .recorded_projects()
+            .await
+            .expect("recorded projects");
+        let progress = StartupHealState::mounting(repositories.len());
+        let outcomes = inventory.heal(repositories, &progress).await;
+        assert_eq!(
+            progress.current(),
+            Some(StartupHeal::RestoringSessions),
+            "every project was counted as mounted"
+        );
+        outcomes
+    }
+
+    /// While a mount is held, the pass says how many projects it still has to mount: a project
+    /// counts as mounted only once its sessions are, so the count holds through the mains and
+    /// drops as each project's sessions finish, then turns to restoring sessions.
+    #[tokio::test]
+    async fn the_startup_heal_counts_down_the_projects_it_still_mounts() {
+        let fixture = Fixture::new("heal-progress");
+        let alpha = RepoId::parse("acme/alpha").expect("repo alpha");
+        let beta = RepoId::parse("acme/beta").expect("repo beta");
+        fixture.bind(&alpha);
+        fixture.bind(&beta);
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let (waiting, mut mounts) = tokio::sync::mpsc::unbounded_channel();
+        let heal = Arc::new(
+            FakeHealSource::new(BTreeMap::from([
+                (alpha.clone(), vec![heal_workspace(&alpha, "main")]),
+                (
+                    beta.clone(),
+                    vec![
+                        heal_workspace(&beta, "main"),
+                        heal_workspace(&beta, "raven"),
+                    ],
+                ),
+            ]))
+            .gated(MountGate {
+                permits: Arc::clone(&permits),
+                waiting,
+            }),
+        );
+        let inventory = NativeGatewayInventory::with_heal_source(
+            fixture.storage.clone(),
+            heal as Arc<dyn HealSource>,
+        );
+        let repositories = inventory
+            .recorded_projects()
+            .await
+            .expect("recorded projects");
+        let progress = Arc::new(StartupHealState::mounting(repositories.len()));
+        let mounting = |projects| {
+            Some(StartupHeal::Mounting {
+                projects: std::num::NonZeroUsize::new(projects).expect("non-zero"),
+            })
+        };
+        let healing = tokio::spawn({
+            let progress = Arc::clone(&progress);
+            async move { inventory.heal(repositories, &progress).await }
+        });
+
+        for (held, left) in [
+            ("acme/alpha/main", 2),
+            ("acme/beta/main", 2),
+            ("acme/beta/raven", 1),
+        ] {
+            assert_eq!(mounts.recv().await.as_deref(), Some(held));
+            assert_eq!(progress.current(), mounting(left), "while {held} is held");
+            permits.add_permits(1);
+        }
+        let outcomes = healing.await.expect("the heal ends");
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(progress.current(), Some(StartupHeal::RestoringSessions));
+        progress.restored();
+        assert_eq!(progress.current(), None);
+    }
+
     /// Every project's main is mounted before any project's session.
     ///
     /// Mains are always-mounted, so the checkout a user sees must not wait behind another
@@ -2812,7 +3005,7 @@ mod tests {
             heal as Arc<dyn HealSource>,
         );
 
-        let outcomes = inventory.heal_all().await.expect("eager heal");
+        let outcomes = heal_recorded(&inventory).await;
 
         assert_eq!(
             *order.lock().expect("mount order"),
@@ -2867,7 +3060,7 @@ mod tests {
             heal as Arc<dyn HealSource>,
         );
 
-        let outcomes = inventory.heal_all().await.expect("eager heal");
+        let outcomes = heal_recorded(&inventory).await;
 
         assert_eq!(
             *order.lock().expect("mount order"),
@@ -2916,7 +3109,7 @@ mod tests {
             heal as Arc<dyn HealSource>,
         );
 
-        let outcomes = inventory.heal_all().await.expect("eager heal");
+        let outcomes = heal_recorded(&inventory).await;
 
         assert!(matches!(
             &outcomes[0].main,

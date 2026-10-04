@@ -56,6 +56,7 @@ fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
         draining: false,
         drain_cause: None,
         executable_sha256: None,
+        healing: None,
         recovering: None,
         sessions,
         active: 0,
@@ -240,6 +241,42 @@ async fn absent_gateway_is_exit_five_and_guides_the_install() {
     // where this error is reached from first. `launchctl kickstart` fails there
     // with "service not found".
     assert_eq!(error.hint, "cowshed gateway start");
+}
+
+/// A gateway still mounting the projects it restores sessions from answers status, and every
+/// command that needs those sessions is refused by type, with how far the pass has got and the
+/// command that reports it — never as an absent gateway, and before it touches the inventory or
+/// changes a session.
+#[tokio::test]
+async fn a_gateway_still_healing_refuses_reconcile_by_type() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let mounting = cowshed_gateway_types::StartupHeal::Mounting {
+        projects: std::num::NonZeroUsize::new(4).expect("four"),
+    };
+    let control = FakeControl {
+        status: Mutex::new(Some(Ok(GatewayStatus {
+            healing: Some(mounting),
+            ..status(Vec::new())
+        }))),
+        ..FakeControl::default()
+    };
+    let error = reconcile_project(&control, &untouched_host(), &repo, 501)
+        .await
+        .expect_err("a healing gateway refuses");
+    assert_eq!(error.healing_source(), Some(mounting));
+    assert_eq!(error.exit_code(), 4, "{}", error.message);
+    assert!(
+        error.message.contains("mounting 4 adopted projects"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.hint.contains("cowshed gateway status"),
+        "{}",
+        error.hint
+    );
+    assert!(control.installs.lock().expect("install lock").is_empty());
+    assert!(control.removes.lock().expect("remove lock").is_empty());
 }
 
 #[tokio::test]

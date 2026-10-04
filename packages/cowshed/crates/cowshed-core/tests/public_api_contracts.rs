@@ -866,6 +866,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         daemon_version: Some("1.3.0".into()),
         active_workspaces: 2,
         drain_cause: None,
+        healing: None,
         recovering: None,
         stale_daemon: None,
     };
@@ -878,7 +879,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         recovering: Some(cowshed_gateway_types::SupervisorRecovery {
             supervisors: std::num::NonZeroUsize::new(3).expect("three"),
         }),
-        ..status
+        ..status.clone()
     };
     assert_eq!(
         serde_json::to_value(recovering).unwrap()["recovering"],
@@ -891,6 +892,34 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         }))
         .is_err(),
         "a recovery with nothing left to recover is no recovery"
+    );
+    // A daemon still in its startup pass says where it is: how many projects it still mounts,
+    // never 0, or that it is restoring sessions.
+    let mounting = GatewayStatus {
+        healing: Some(cowshed_gateway_types::StartupHeal::Mounting {
+            projects: std::num::NonZeroUsize::new(2).expect("two"),
+        }),
+        ..status.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(mounting).unwrap()["healing"],
+        json!({"mounting":{"projects":2}})
+    );
+    let restoring = GatewayStatus {
+        healing: Some(cowshed_gateway_types::StartupHeal::RestoringSessions),
+        ..status
+    };
+    assert_eq!(
+        serde_json::to_value(restoring).unwrap()["healing"],
+        json!("restoringSessions")
+    );
+    assert!(
+        serde_json::from_value::<GatewayStatus>(json!({
+            "installed":true,"running":true,"socket":"/s","cliVersion":"1.4.0",
+            "activeWorkspaces":0,"healing":{"mounting":{"projects":0}}
+        }))
+        .is_err(),
+        "a pass with no project left to mount is restoring sessions, not mounting none"
     );
     let unmeasured: GatewayStatus = serde_json::from_value(json!({
         "installed":false,

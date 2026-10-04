@@ -115,16 +115,20 @@ followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAli
 `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
 `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
 already-loaded/not-loaded states idempotently. A plist this run rewrote is booted out and bootstrapped again rather than
-kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits for
-the authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes
-its plist; the installed binary stays, as host state rather than agent state.
+kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits until
+the daemon reports itself healthy — answering, not draining, and done starting — saying every few seconds what it is
+waiting on in the daemon's own count. `cowshed gateway stop` boots out the agent and removes its plist; the installed
+binary stays, as host state rather than agent state.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
 `/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an
-authorization prompt. After the store is mounted at the canonical path it starts the gateway and restores all canonical
-attached sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials.
-Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before
-exit.
+authorization prompt. After the store is mounted at the canonical path it answers its control socket at once, then
+mounts every adopted project (mains first) and restores all canonical attached sessions from repository bindings,
+mount/incarnation facts, grants, and validated workspace credentials. Until that pass ends, `cowshed gateway status`
+says the gateway is still starting and how many projects it still mounts (`healing` in `--json`), and every command that
+needs a workspace is refused with that progress and a retry hint rather than reported as a missing gateway. Each step of
+the pass is logged as a `startup-heal` span. Detached and retired workspaces are never installed. SIGTERM and SIGINT
+stop admissions and drain the gateway before exit.
 
 The workspace supervisors still running from before the daemon started — those of another cowshed build are asked to
 drain — are recovered all at once in the background while the daemon already serves. Until each is recovered,

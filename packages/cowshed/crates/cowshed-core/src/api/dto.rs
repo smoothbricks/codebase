@@ -3060,6 +3060,11 @@ pub struct GatewayStatus {
     /// gateway is not healthy while this is present, however promptly its socket answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_cause: Option<String>,
+    /// How far the answering daemon's startup pass has got while it still mounts projects and
+    /// restores their sessions. Its socket answers, but every command that needs a workspace is
+    /// refused until this is gone, so the gateway is not healthy yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healing: Option<cowshed_gateway_types::StartupHeal>,
     /// The workspace supervisors from before the answering daemon started that it is still
     /// recovering. It serves meanwhile; only a command for one of their workspaces is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]

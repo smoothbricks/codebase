@@ -3,6 +3,7 @@ use std::{
     fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,7 +24,7 @@ use cowshed_gateway_types::{
 
 use crate::{
     actor::{GatewayError, GatewayHandle},
-    config::CONTROL_TCP_ADDR,
+    config::{CONTROL_TCP_ADDR, StartupProbe},
     interfaces::AuditEvent,
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
     sim_broker::{
@@ -368,6 +369,9 @@ pub enum ControlFailureCode {
     AddressInUse,
     NotAdmitted,
     BrokerRejected,
+    /// The daemon's startup pass has not restored its sessions yet: a session change now would
+    /// race that restore. Retry once status reports no `healing`.
+    Healing,
     Rejected,
 }
 
@@ -590,6 +594,21 @@ pub(crate) struct ControlServices {
     pub repo_mirror: RepoMirrorHandle,
     pub sim_broker: SimBrokerHandle,
     pub audit_tail: Option<AuditTailHandle>,
+    pub startup: Option<Arc<dyn StartupProbe>>,
+}
+
+impl ControlServices {
+    /// The refusal of a session install or removal while the startup pass still heals mounts and
+    /// restores sessions from them; `None` once it has finished.
+    fn healing(&self) -> Option<ControlResponse> {
+        self.startup.as_ref()?.healing()?;
+        Some(failure(
+            ControlFailureCode::Healing,
+            "the gateway has not finished mounting its projects and restoring their sessions \
+             since it started; session changes are refused until it has"
+                .to_owned(),
+        ))
+    }
 }
 
 impl fmt::Debug for ControlServices {
@@ -600,6 +619,7 @@ impl fmt::Debug for ControlServices {
             .field("repo_mirror", &self.repo_mirror)
             .field("sim_broker", &self.sim_broker)
             .field("audit_tail", &self.audit_tail)
+            .field("startup", &self.startup)
             .finish()
     }
 }
@@ -771,12 +791,13 @@ async fn dispatch(
             None,
         ),
         ControlRequest::Install { session } => (
-            match session.into_session() {
-                Ok(session) => match services.handle.install(session).await {
+            match (services.healing(), session.into_session()) {
+                (Some(refused), _) => refused,
+                (None, Ok(session)) => match services.handle.install(session).await {
                     Ok(()) => success(),
                     Err(error) => rejected(error),
                 },
-                Err(error) => invalid_session(error.to_string()),
+                (None, Err(error)) => invalid_session(error.to_string()),
             },
             None,
         ),
@@ -784,13 +805,16 @@ async fn dispatch(
             workspace_id,
             expected_revision,
         } => (
-            match services
-                .handle
-                .remove(workspace_id, expected_revision)
-                .await
-            {
-                Ok(()) => success(),
-                Err(error) => rejected(error),
+            match services.healing() {
+                Some(refused) => refused,
+                None => match services
+                    .handle
+                    .remove(workspace_id, expected_revision)
+                    .await
+                {
+                    Ok(()) => success(),
+                    Err(error) => rejected(error),
+                },
             },
             None,
         ),

@@ -2547,6 +2547,11 @@ fn manager_store() -> PathBuf {
     ))
 }
 
+/// A daemon whose startup pass has finished, so the manager serves ensures.
+fn healed() -> std::sync::Arc<cowshed_core::StartupHealState> {
+    std::sync::Arc::new(cowshed_core::StartupHealState::healed())
+}
+
 #[tokio::test]
 async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
     use cowshed_core::runtime::supervisor_manager::SupervisorManager;
@@ -2561,6 +2566,7 @@ async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
             child: &["sleep", "30"],
             spawned: std::sync::Arc::clone(&spawned),
         }),
+        healed(),
     );
     let project = PathBuf::from("/nonexistent/project");
     let needed = authority();
@@ -2593,6 +2599,7 @@ async fn the_manager_reports_a_supervisor_that_exits_before_serving() {
             child: &["sh", "-c", "exit 3"],
             spawned: std::sync::Arc::default(),
         }),
+        healed(),
     );
     let refused = manager
         .ensure(&PathBuf::from("/nonexistent/project"), &authority())
@@ -2628,6 +2635,7 @@ async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
             "/bin/sh",
             vec!["-c".into(), script.into(), "sh".into()],
         )),
+        healed(),
     );
     let refused = manager
         .ensure(&PathBuf::from("/nonexistent/project"), &authority())
@@ -2683,6 +2691,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
             child: &["sleep", "30"],
             spawned: std::sync::Arc::clone(&spawned),
         }),
+        healed(),
     );
     let ensured = manager
         .ensure(&PathBuf::from("/nonexistent/project"), &newer)

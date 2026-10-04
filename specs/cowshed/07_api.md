@@ -690,9 +690,11 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
   `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired }`;
   `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
-- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, recovering?, staleDaemon? }`;
-  `recovering = { supervisors }` counts the workspace supervisors from before the daemon started that it is still
-  recovering, never 0 (11_shell.md "Supervisor recovery").
+- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon? }`;
+  `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
+  projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is over
+  (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before the
+  daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
