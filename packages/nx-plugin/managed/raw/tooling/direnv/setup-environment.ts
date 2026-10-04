@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
@@ -127,6 +128,10 @@ const POST_COMMIT_BLOCK = [
 // Declared above the bootstrap block for the same hoisting reason as above.
 const { values: flags } = parseArgs({ options: { python: { type: 'string' } } });
 
+// The Nx plugin's test for a Cargo workspace root manifest (CARGO_WORKSPACE_PATTERN), which
+// cargoFetchInputs applies during the bootstrap block; declared above it for the same reason.
+const CARGO_WORKSPACE = /^\s*\[workspace\]/m;
+
 // Go to project root
 process.chdir(projectRoot);
 
@@ -136,7 +141,9 @@ try {
   // and package resolution/Typia transforms are not available yet.
   const bunInputs = bunInstallInputs();
   const uvInputs = uvSyncInputs();
-  recordInstallInputs([...bunInputs, ...uvInputs]);
+  const cargo = cargoFetchInputs(bunInputs);
+  recordInstallInputs([...bunInputs, ...uvInputs, ...cargo.inputs]);
+  const cargoFetches = cargo.workspaces.map(cargoFetcher);
   // A CI runner is GitHub Actions or Forgejo Actions, which mirrors every FORGEJO_*
   // variable as GITHUB_*. Not `CI`: agent harnesses set CI=true on every command
   // they run, and this branch installs unconditionally.
@@ -184,6 +191,9 @@ try {
       if (uv !== null) {
         await uv.install({ quiet: false });
       }
+      for (const fetch of cargoFetches) {
+        await fetch.install({ quiet: false });
+      }
     });
   } else {
     // A local secret-resolution or install failure (a provider that is not
@@ -196,7 +206,9 @@ try {
     const uv = uvInstaller(uvInputs, { locked: false });
     const bun = bunInstaller(bunInputs);
     const installError = await withInstallLock(async () => {
-      const pending = (uv === null ? [bun] : [bun, uv]).filter((installer) => !installer.isCurrent());
+      const pending = [bun, ...(uv === null ? [] : [uv]), ...cargoFetches].filter(
+        (installer) => !installer.isCurrent(),
+      );
       const error = await installLocalDependencies(pending);
       if (!pending.includes(bun)) {
         reportDeveloperLinks(projectRoot);
@@ -434,6 +446,41 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
 }
 
 /**
+ * `cargo fetch --locked` for one Cargo workspace. The Nx plugin infers every
+ * project's Cargo closure from locked, offline `cargo metadata`, which Cargo
+ * can answer only when the packages Cargo.lock pins are already in
+ * CARGO_HOME; without them the project graph refuses, and the graph's own
+ * `cargo-fetch` target can never run. This establishes that precondition the
+ * way `bun install` establishes node_modules.
+ *
+ * What it installs lives in CARGO_HOME, so the stamp lives there too, named
+ * by the digest of the workspace's Cargo.lock, manifest and Cargo
+ * configuration: replacing CARGO_HOME takes the stamps with it, and a
+ * copy-on-write clone of this checkout sharing that CARGO_HOME enters
+ * fetched. `--locked` makes a stale Cargo.lock fail here, in Cargo's words,
+ * rather than fetch a graph the lockfile does not name.
+ */
+function cargoFetcher(workspace: string): Installer {
+  const manifest = path.posix.join(workspace, 'Cargo.toml');
+  const cargo = Bun.which('cargo');
+  const identity = ['cargo fetch --locked', cargo === null ? 'cargo not on PATH' : realpathSync(cargo)];
+  const digest = inputsDigest(identity, cargoWorkspaceInputs(workspace));
+  const cargoHome = path.resolve(process.env.CARGO_HOME ?? path.join(homedir(), '.cargo'));
+  const stampPath = path.join(cargoHome, 'smoo-fetched', digest);
+  return {
+    isCurrent: () => readInstallStamp(stampPath)?.inputs === digest,
+    install: async ({ quiet }) => {
+      await runSetupCommand(
+        `cargo fetch --locked --manifest-path ${manifest}`,
+        $`cargo fetch --locked --manifest-path ${manifest}`,
+        { quiet },
+      );
+      writeInstallStamp(stampPath, { inputs: digest });
+    },
+  };
+}
+
+/**
  * Rewrite every `.pth` line in the environment's site-packages that names a
  * directory inside this checkout as a path relative to that site-packages,
  * which is how Python's `site` resolves a relative line. Every other line — an
@@ -500,6 +547,36 @@ function uvSyncInputs(): string[] {
     ...stringList(field(workspace, 'exclude')).map((pattern) => `!${pattern}`),
   ];
   return [...new Set(['pyproject.toml', 'uv.lock', ...workspaceFiles(patterns, 'pyproject.toml')])].sort();
+}
+
+/**
+ * The Cargo workspaces the Nx plugin resolves — a project directory (the root
+ * or a workspace member, found by its package.json) whose Cargo.toml declares
+ * `[workspace]` — and what their fetch reads. Every project directory's
+ * Cargo.toml is an input whether or not it exists, so adding a Cargo
+ * workspace is itself a change.
+ */
+function cargoFetchInputs(bunInputs: readonly string[]): { workspaces: string[]; inputs: string[] } {
+  const workspaces: string[] = [];
+  const inputs: string[] = [];
+  for (const projectManifest of bunInputs.filter((input) => path.posix.basename(input) === 'package.json')) {
+    const directory = path.posix.dirname(projectManifest);
+    const manifest = path.posix.join(directory, 'Cargo.toml');
+    inputs.push(manifest);
+    const content = readFileIfPresent(path.join(projectRoot, manifest));
+    if (content !== null && CARGO_WORKSPACE.test(content.toString('utf8'))) {
+      workspaces.push(directory);
+      inputs.push(...cargoWorkspaceInputs(directory));
+    }
+  }
+  return { workspaces: workspaces.sort(), inputs: [...new Set(inputs)].sort() };
+}
+
+/** What `cargo fetch --locked` reads for the workspace at `directory`, relative to the project root. */
+function cargoWorkspaceInputs(directory: string): string[] {
+  return ['Cargo.toml', 'Cargo.lock', '.cargo/config', '.cargo/config.toml'].map((file) =>
+    path.posix.join(directory, file),
+  );
 }
 
 /**

@@ -211,6 +211,13 @@ inference with `CargoMetadataError`, including the manifest path and Cargo's cau
 missing from Nx's file index, or another closure Nx cannot express precisely, fails with `CargoClosureInputError`.
 Neither condition falls back to a whole-workspace runtime hash or silently reuses an older closure.
 
+Resolution therefore needs the packages `Cargo.lock` pins already in `CARGO_HOME`, before any task can run: the graph's
+own `cargo-fetch` target cannot supply them. The managed shell entry (`tooling/direnv/setup-environment.ts`) runs
+`cargo fetch --locked` for every project whose `Cargo.toml` declares `[workspace]`, once per change to that workspace's
+`Cargo.toml`, `Cargo.lock` or `.cargo/config[.toml]`, with its stamp in `CARGO_HOME/smoo-fetched`. In CI a failed fetch
+fails the shell; locally it prints Cargo's cause, loads the shell, and retries on the next entry, while graph inference
+keeps refusing with that same cause.
+
 In-workspace members follow Nx's file semantics, which differ from the command's own walk in two places: a symlinked
 directory inside a package is not followed, and manifests and Cargo configuration above the Nx root (a
 `~/.cargo/config.toml` above a checkout in the home directory) are machine-local and not hashed, as for every other

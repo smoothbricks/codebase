@@ -13,7 +13,8 @@ import { keepDeveloperLinks } from './developer-links.js';
  * build a repository the way smoo manages one and run the script in it the way
  * the managed devenv prologue does, counting what actually ran: provider
  * commands for declared secrets, `bun install` (through the root `prepare`
- * lifecycle it triggers) and `uv sync` (through a recording `uv` on PATH).
+ * lifecycle it triggers), `uv sync` (through a recording `uv` on PATH) and
+ * `cargo fetch` (through a recording `cargo` on PATH).
  * No shell entry runs an install meant to replace developer links, so those
  * cases call `keepDeveloperLinks` directly, in a repository an entry installed.
  */
@@ -56,6 +57,10 @@ interface Repository {
   readonly count: (name: string) => number;
   /** The argument vectors the recording `uv` received, one per run. */
   readonly uvRuns: () => string[][];
+  /** The argument vectors the recording `cargo` received, one per run. */
+  readonly cargoRuns: () => string[][];
+  /** The CARGO_HOME every shell entry of this repository runs with. */
+  readonly cargoHome: string;
   /**
    * Each `git config` invocation that writes, as a `begin <pid>` and an `end <pid>` line
    * around the write, in the order they happened across every shell entry.
@@ -77,7 +82,7 @@ interface RepositoryOptions {
  * hooks they link, a `.npmrc` that interpolates one declared variable, and a
  * fake TypeScript API package so the script's post-install pin check finds
  * what it looks for. Nothing here is a stub of the code under test — only of
- * the repository it runs in and of the `uv` binary a Python shell provides.
+ * the repository it runs in and of the `uv` and `cargo` binaries its shell provides.
  */
 async function withManagedRepository(
   options: RepositoryOptions,
@@ -165,6 +170,23 @@ async function withManagedRepository(
       ].join('\n'),
     );
     await chmod(join(bin, 'uv'), 0o755);
+    // cargo reduced to what setup-environment.ts can observe: it records its argv and,
+    // while the checkout holds `cargo-fails`, refuses the way a fetch without a
+    // registry does.
+    await writeFile(
+      join(bin, 'cargo'),
+      [
+        '#!/usr/bin/env bash',
+        `printf '%s\\n' "$*" >> ${JSON.stringify(join(ledgers, 'cargo'))}`,
+        'if [ -f cargo-fails ]; then',
+        "  echo 'error: failed to download from `https://index.crates.io/config.json`' >&2",
+        '  exit 101',
+        'fi',
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    await chmod(join(bin, 'cargo'), 0o755);
     // git as found on PATH, recording each `git config` that writes around the real run. A
     // write is any `git config` without a read option.
     const realGit = Bun.which('git');
@@ -214,6 +236,8 @@ function repository(root: string, ledgers: string, bin: string): Repository {
     startShell: (options = {}) => startShell(root, state, bin, options),
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
+    cargoRuns: () => lines('cargo').map((line) => line.split(' ')),
+    cargoHome: join(dirname(bin), 'cargo-home'),
     gitConfigWrites: () => lines('git-config-writes'),
   };
 }
@@ -256,6 +280,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
     env: {
       PATH: `${bin}:${process.env['PATH'] ?? ''}`,
       HOME: process.env['HOME'],
+      CARGO_HOME: join(dirname(bin), 'cargo-home'),
       DEVENV_ROOT: join(root, 'tooling', 'direnv'),
       DEVENV_STATE: state,
       ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
@@ -859,6 +884,119 @@ describe('what shell entry syncs for a uv project', () => {
       expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
       expect(uvRuns().map(([verb]) => verb)).toEqual(['venv', 'sync']);
     });
+  });
+});
+
+describe('what shell entry fetches for a Cargo workspace', () => {
+  // The Nx plugin resolves a Cargo workspace wherever a project's Cargo.toml declares
+  // `[workspace]`: here the root and one member. Another member's plain package and the
+  // root workspace's crate are not workspaces of their own.
+  const CARGO_PROJECT = {
+    'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+    'Cargo.lock': 'version = 4\n',
+    'crates/core/Cargo.toml': '[package]\nname = "core"\n',
+    'packages/native/package.json': JSON.stringify({ name: 'native', version: '0.0.0' }),
+    'packages/native/Cargo.toml': '[workspace]\nmembers = ["."]\n\n[package]\nname = "native"\n',
+    'packages/native/Cargo.lock': 'version = 4\n',
+    'packages/plain/package.json': JSON.stringify({ name: 'plain', version: '0.0.0' }),
+    'packages/plain/Cargo.toml': '[package]\nname = "plain"\n',
+  };
+  const fetch = (manifest: string) => ['fetch', '--locked', '--manifest-path', manifest];
+
+  it("fetches each workspace's locked packages once per change to what the fetch reads", async () => {
+    await withManagedRepository(
+      { workspaces: ['packages/*'], files: CARGO_PROJECT },
+      async ({ root, enterShell: enter, cargoRuns }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter()).toEqual(HEALTHY);
+        expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+
+        await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
+        expect(await enter()).toEqual(HEALTHY);
+        // Adding Cargo configuration changes what the fetch reads as much as editing it does.
+        await mkdir(join(root, 'packages/native/.cargo'));
+        await edit(join(root, 'packages/native/.cargo/config.toml'), '[net]\noffline = false\n');
+        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter()).toEqual(HEALTHY);
+        expect(cargoRuns().slice(2)).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+      },
+    );
+  });
+
+  it('fetches again into a CARGO_HOME that does not hold them, and not for a copied checkout sharing one', async () => {
+    await withManagedRepository({ files: CARGO_PROJECT }, async (original) => {
+      expect(await original.enterShell()).toEqual(HEALTHY);
+      expect(original.cargoRuns()).toEqual([fetch('Cargo.toml')]);
+
+      const clone = join(dirname(original.root), 'clone');
+      await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
+      const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
+      expect(await copied.enterShell()).toEqual(HEALTHY);
+      expect(copied.cargoRuns()).toEqual([fetch('Cargo.toml')]);
+
+      await rm(original.cargoHome, { recursive: true, force: true });
+      expect(await original.enterShell()).toEqual(HEALTHY);
+      expect(original.cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
+    });
+  });
+
+  it("loads the shell when the fetch fails, naming Cargo's cause, and fetches again on the next entry", async () => {
+    await withManagedRepository(
+      { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
+      async ({ root, enterShell: enter, cargoRuns }) => {
+        const failed = await enter();
+        expect(failed.exitCode).toBe(0);
+        expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
+        expect(failed.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
+        expect((await enter()).exitCode).toBe(0);
+        expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
+
+        await rm(join(root, 'cargo-fails'));
+        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter()).toEqual(HEALTHY);
+        expect(cargoRuns()).toHaveLength(3);
+      },
+    );
+  });
+
+  it('fails a CI entry whose fetch fails', async () => {
+    await withManagedRepository(
+      { files: { ...CARGO_PROJECT, 'cargo-fails': '', '.gitignore': 'node_modules\ntooling/direnv/.devenv\n' } },
+      async ({ root, enterShell: enter, cargoRuns }) => {
+        // The frozen install needs a lockfile; `bun install` writes it as a commit would carry it.
+        const install = Bun.spawn({ cmd: ['bun', 'install'], cwd: root, stdout: 'ignore', stderr: 'pipe' });
+        const [stderr, exitCode] = await Promise.all([new Response(install.stderr).text(), install.exited]);
+        if (exitCode !== 0) throw new Error(`bun install failed: ${stderr}`);
+
+        const entry = await enter({ ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } });
+        expect(entry.exitCode).toBe(1);
+        expect(entry.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
+        expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+      },
+    );
+  });
+
+  it('records what each fetch reads where the managed envrc watches it, a Cargo.toml it may add included', async () => {
+    await withManagedRepository(
+      { workspaces: ['packages/*'], files: CARGO_PROJECT },
+      async ({ root, state, enterShell: enter }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        const recorded = readFileSync(join(state, 'install-inputs'), 'utf8').trimEnd().split('\n');
+        expect(recorded).toEqual(
+          expect.arrayContaining(
+            [
+              'Cargo.toml',
+              'Cargo.lock',
+              '.cargo/config.toml',
+              'packages/native/Cargo.lock',
+              'packages/native/.cargo/config.toml',
+              'packages/plain/Cargo.toml',
+            ].map((file) => join(root, file)),
+          ),
+        );
+        expect(recorded).not.toContain(join(root, 'packages/plain/Cargo.lock'));
+      },
+    );
   });
 });
 
