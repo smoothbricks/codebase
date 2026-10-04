@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
 import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -30,7 +30,7 @@ interface ShellEntry {
   readonly stderr: string;
 }
 
-interface EntryOptions {
+type EntryOptions = {
   /** devenv's UV_PROJECT_ENVIRONMENT; present only in a shell that enables uv. */
   readonly uvProjectEnvironment?: string;
   /** The interpreter the managed module passes for a uv project. */
@@ -40,7 +40,21 @@ interface EntryOptions {
    * install, which runs no provider command and so needs every declared secret supplied.
    */
   readonly ciSecrets?: Readonly<Record<string, string>>;
-}
+} & (
+  | {
+      /** The CARGO_HOME this entry runs with, instead of the repository's own. */
+      readonly cargoHome?: string;
+      readonly home?: never;
+    }
+  | {
+      /**
+       * A private HOME and neither CARGO_HOME nor XDG_CACHE_HOME in the environment, so Cargo's
+       * home and smoo's cache both fall back under it, as on a developer machine.
+       */
+      readonly home: string;
+      readonly cargoHome?: never;
+    }
+);
 
 /** A shell entry still running, with its output piped for `finished`. */
 type ShellProcess = Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
@@ -61,6 +75,8 @@ interface Repository {
   readonly cargoRuns: () => string[][];
   /** The CARGO_HOME every shell entry of this repository runs with. */
   readonly cargoHome: string;
+  /** The XDG_CACHE_HOME every shell entry of this repository runs with: private, so a stamp has one place to be. */
+  readonly xdgCache: string;
   /**
    * Each `git config` invocation that writes, as a `begin <pid>` and an `end <pid>` line
    * around the write, in the order they happened across every shell entry.
@@ -171,17 +187,22 @@ async function withManagedRepository(
     );
     await chmod(join(bin, 'uv'), 0o755);
     // cargo reduced to what setup-environment.ts can observe: it records its argv and,
-    // while the checkout holds `cargo-fails`, refuses the way a fetch without a
-    // registry does.
+    // while the checkout holds `cargo-fails`, refuses the way a fetch without a registry does.
+    // A fetch that succeeds leaves what Cargo itself writes in its home — the package-cache
+    // lock and the registry — and nothing else, creating the home if it was not there.
     await writeFile(
       join(bin, 'cargo'),
       [
         '#!/usr/bin/env bash',
+        'set -e',
         `printf '%s\\n' "$*" >> ${JSON.stringify(join(ledgers, 'cargo'))}`,
         'if [ -f cargo-fails ]; then',
         "  echo 'error: failed to download from `https://index.crates.io/config.json`' >&2",
         '  exit 101',
         'fi',
+        'home="${CARGO_HOME:-$HOME/.cargo}"',
+        'mkdir -p "$home/registry/cache"',
+        ': >> "$home/.package-cache"',
         'exit 0',
         '',
       ].join('\n'),
@@ -238,6 +259,7 @@ function repository(root: string, ledgers: string, bin: string): Repository {
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
     cargoRuns: () => lines('cargo').map((line) => line.split(' ')),
     cargoHome: join(dirname(bin), 'cargo-home'),
+    xdgCache: join(dirname(bin), 'xdg-cache'),
     gitConfigWrites: () => lines('git-config-writes'),
   };
 }
@@ -279,8 +301,13 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
     cwd: root,
     env: {
       PATH: `${bin}:${process.env['PATH'] ?? ''}`,
-      HOME: process.env['HOME'],
-      CARGO_HOME: join(dirname(bin), 'cargo-home'),
+      ...(options.home === undefined
+        ? {
+            HOME: process.env['HOME'],
+            CARGO_HOME: options.cargoHome ?? join(dirname(bin), 'cargo-home'),
+            XDG_CACHE_HOME: join(dirname(bin), 'xdg-cache'),
+          }
+        : { HOME: options.home }),
       DEVENV_ROOT: join(root, 'tooling', 'direnv'),
       DEVENV_STATE: state,
       ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
@@ -902,14 +929,22 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     'packages/plain/Cargo.toml': '[package]\nname = "plain"\n',
   };
   const fetch = (manifest: string) => ['fetch', '--locked', '--manifest-path', manifest];
+  /** What Cargo itself writes at the root of CARGO_HOME: cowshed's STATE_FILES, the exact files it grants a sandbox. */
+  const CARGO_STATE_FILES = ['.package-cache', '.package-cache-mutate', '.global-cache', '.global-cache-journal'];
+  /** The stamps shell entry left in the private XDG cache: smoo's only record of a fetch. */
+  const stamps = (xdgCache: string) => {
+    const directory = join(xdgCache, 'smoo', 'cargo-fetched');
+    return existsSync(directory) ? readdirSync(directory) : [];
+  };
 
   it("fetches each workspace's locked packages once per change to what the fetch reads", async () => {
     await withManagedRepository(
       { workspaces: ['packages/*'], files: CARGO_PROJECT },
-      async ({ root, enterShell: enter, cargoRuns }) => {
+      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
         expect(await enter()).toEqual(HEALTHY);
         expect(await enter()).toEqual(HEALTHY);
         expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+        expect(stamps(xdgCache)).toHaveLength(2);
 
         await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
         expect(await enter()).toEqual(HEALTHY);
@@ -940,21 +975,87 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     });
   });
 
+  it('fetches again into a recreated CARGO_HOME and into another one, each keeping its own stamp', async () => {
+    await withManagedRepository({ files: CARGO_PROJECT }, async ({ cargoHome, enterShell: enter, cargoRuns }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      // Another CARGO_HOME holds none of what the first one fetched.
+      expect(await enter({ cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
+      expect(cargoRuns()).toHaveLength(2);
+      // Neither fetch spoiled the other's stamp.
+      expect(await enter()).toEqual(HEALTHY);
+      expect(await enter({ cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
+      expect(cargoRuns()).toHaveLength(2);
+
+      // The same path, deleted and created again: a stamp outside CARGO_HOME survives it, so what
+      // it promises must not.
+      await rm(cargoHome, { recursive: true });
+      await mkdir(cargoHome);
+      expect(await enter()).toEqual(HEALTHY);
+      expect(cargoRuns()).toHaveLength(3);
+      expect(await enter()).toEqual(HEALTHY);
+      expect(cargoRuns()).toHaveLength(3);
+    });
+  });
+
+  it('keeps its stamp in the private XDG cache, entering a CARGO_HOME that is writable only where Cargo writes', async () => {
+    await withManagedRepository(
+      { files: CARGO_PROJECT },
+      async ({ cargoHome, xdgCache, enterShell: enter, cargoRuns }) => {
+        // CARGO_HOME as a cowshed sandbox grants it: Cargo's state files and its `registry` and
+        // `git` caches are writable, and nothing else — no entry may be created at its root.
+        await mkdir(join(cargoHome, 'registry'), { recursive: true });
+        await mkdir(join(cargoHome, 'git'));
+        for (const file of CARGO_STATE_FILES) {
+          await writeFile(join(cargoHome, file), '');
+        }
+        await chmod(cargoHome, 0o555);
+        try {
+          // The fixture is only a model of the grant when the root really refuses a new entry.
+          await expect(writeFile(join(cargoHome, 'smoo-fetched'), '')).rejects.toThrow('EACCES');
+
+          expect(await enter()).toEqual(HEALTHY);
+          expect(await enter()).toEqual(HEALTHY);
+          expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+          expect(readdirSync(cargoHome).sort()).toEqual([...CARGO_STATE_FILES, 'git', 'registry'].sort());
+          expect(stamps(xdgCache)).toHaveLength(1);
+        } finally {
+          await chmod(cargoHome, 0o755);
+        }
+      },
+    );
+  });
+
+  it('falls back to ~/.cache/smoo without XDG_CACHE_HOME, leaving ~/.cargo to Cargo', async () => {
+    await withManagedRepository({ files: CARGO_PROJECT }, async ({ root, enterShell: enter, cargoRuns }) => {
+      const home = join(dirname(root), 'home');
+      await mkdir(home);
+      expect(await enter({ home })).toEqual(HEALTHY);
+      expect(await enter({ home })).toEqual(HEALTHY);
+      expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+      expect(readdirSync(join(home, '.cargo')).sort()).toEqual(['.package-cache', 'registry']);
+      expect(readdirSync(join(home, '.cache', 'smoo'))).toEqual(['cargo-fetched']);
+      expect(readdirSync(join(home, '.cache', 'smoo', 'cargo-fetched'))).toHaveLength(1);
+    });
+  });
+
   it("loads the shell when the fetch fails, naming Cargo's cause, and fetches again on the next entry", async () => {
     await withManagedRepository(
       { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
-      async ({ root, enterShell: enter, cargoRuns }) => {
+      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
         const failed = await enter();
         expect(failed.exitCode).toBe(0);
         expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
         expect(failed.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
         expect((await enter()).exitCode).toBe(0);
         expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
+        // A fetch that failed promised nothing: no stamp, not even the directory for one.
+        expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
 
         await rm(join(root, 'cargo-fails'));
         expect(await enter()).toEqual(HEALTHY);
         expect(await enter()).toEqual(HEALTHY);
         expect(cargoRuns()).toHaveLength(3);
+        expect(stamps(xdgCache)).toHaveLength(1);
       },
     );
   });
@@ -962,7 +1063,7 @@ describe('what shell entry fetches for a Cargo workspace', () => {
   it('fails a CI entry whose fetch fails', async () => {
     await withManagedRepository(
       { files: { ...CARGO_PROJECT, 'cargo-fails': '', '.gitignore': 'node_modules\ntooling/direnv/.devenv\n' } },
-      async ({ root, enterShell: enter, cargoRuns }) => {
+      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
         // The frozen install needs a lockfile; `bun install` writes it as a commit would carry it.
         const install = Bun.spawn({ cmd: ['bun', 'install'], cwd: root, stdout: 'ignore', stderr: 'pipe' });
         const [stderr, exitCode] = await Promise.all([new Response(install.stderr).text(), install.exited]);
@@ -972,6 +1073,7 @@ describe('what shell entry fetches for a Cargo workspace', () => {
         expect(entry.exitCode).toBe(1);
         expect(entry.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
         expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+        expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
       },
     );
   });

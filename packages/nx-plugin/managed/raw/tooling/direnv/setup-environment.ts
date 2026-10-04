@@ -453,29 +453,54 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
  * `cargo-fetch` target can never run. This establishes that precondition the
  * way `bun install` establishes node_modules.
  *
- * What it installs lives in CARGO_HOME, so the stamp lives there too, named
- * by the digest of the workspace's Cargo.lock, manifest and Cargo
- * configuration: replacing CARGO_HOME takes the stamps with it, and a
- * copy-on-write clone of this checkout sharing that CARGO_HOME enters
- * fetched. `--locked` makes a stale Cargo.lock fail here, in Cargo's words,
- * rather than fetch a graph the lockfile does not name.
+ * What it installs lives in CARGO_HOME, but the stamp cannot: a sandboxed
+ * shell may write only Cargo's own paths there (its state files and the
+ * `registry` and `git` caches), so a stamp directory fails the entry with
+ * EPERM. It lives in smoo's user cache instead — `$XDG_CACHE_HOME/smoo`, or
+ * `~/.cache/smoo` when the variable is unset, empty or not absolute, as the XDG
+ * base directory rule has it; a cowshed sandbox owns XDG_CACHE_HOME — named by
+ * the digest of the Cargo binary, the CARGO_HOME path, and the workspace's
+ * Cargo.lock, manifest and Cargo configuration.
+ *
+ * A stamp outside CARGO_HOME no longer dies with it, and a stamp that outlived
+ * its packages would promise ones that are gone. So it also records which
+ * directory CARGO_HOME named when the fetch finished — device, inode and
+ * creation time, so a directory deleted and created again at the same path is
+ * another one — and counts only while CARGO_HOME names that directory: a
+ * recreated CARGO_HOME, or another one, fetches again. A copy-on-write clone of
+ * this checkout sharing that CARGO_HOME enters fetched. `--locked` makes a
+ * stale Cargo.lock fail here, in Cargo's words, rather than fetch a graph the
+ * lockfile does not name.
  */
 function cargoFetcher(workspace: string): Installer {
   const manifest = path.posix.join(workspace, 'Cargo.toml');
   const cargo = Bun.which('cargo');
-  const identity = ['cargo fetch --locked', cargo === null ? 'cargo not on PATH' : realpathSync(cargo)];
-  const digest = inputsDigest(identity, cargoWorkspaceInputs(workspace));
   const cargoHome = path.resolve(process.env.CARGO_HOME ?? path.join(homedir(), '.cargo'));
-  const stampPath = path.join(cargoHome, 'smoo-fetched', digest);
+  const identity = ['cargo fetch --locked', cargo === null ? 'cargo not on PATH' : realpathSync(cargo), cargoHome];
+  const digest = inputsDigest(identity, cargoWorkspaceInputs(workspace));
+  const cacheHome = process.env.XDG_CACHE_HOME;
+  const stampPath = path.join(
+    cacheHome !== undefined && path.isAbsolute(cacheHome) ? cacheHome : path.join(homedir(), '.cache'),
+    'smoo',
+    'cargo-fetched',
+    digest,
+  );
+  // What a stamp promises: these inputs were fetched into the directory CARGO_HOME names now.
+  // A CARGO_HOME with nothing at it is an identity of its own.
+  const fetched = () => {
+    const home = statSync(cargoHome, { bigint: true, throwIfNoEntry: false });
+    return inputsDigest([digest, home === undefined ? 'absent' : `${home.dev}:${home.ino}:${home.birthtimeNs}`], []);
+  };
   return {
-    isCurrent: () => readInstallStamp(stampPath)?.inputs === digest,
+    isCurrent: () => readInstallStamp(stampPath)?.inputs === fetched(),
     install: async ({ quiet }) => {
       await runSetupCommand(
         `cargo fetch --locked --manifest-path ${manifest}`,
         $`cargo fetch --locked --manifest-path ${manifest}`,
         { quiet },
       );
-      writeInstallStamp(stampPath, { inputs: digest });
+      // After the fetch, not before: the fetch may be what created CARGO_HOME.
+      writeInstallStamp(stampPath, { inputs: fetched() });
     },
   };
 }
