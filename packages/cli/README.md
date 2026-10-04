@@ -421,17 +421,19 @@ nothing when nothing changed:
   `tooling/direnv/inherited-devenv.ts` can reuse that export in the new checkout. It checks the exact contents and
   executable bits of `tooling/direnv` and local `path:` inputs, devenv's watched inputs, the toolchain and the emitted
   task graph before relocating paths to this checkout. The export is evaluated after devenv proves its merged enterShell
-  hook is disabled, with the checkout's live network routing (proxy variables, `NO_PROXY`, CA files, `NIX_CONFIG`'s
-  `ssl-cert-file`) and Nix's client fetcher cache but no other caller credential. Nix's shared evaluation cache is
-  disabled for this evaluation; an export that embeds a proxy value or its userinfo is never published, and the
-  destination checkout keeps its own routing. The original hook executes only when direnv imports it in the destination
-  checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to in-place evaluation.
-  `NX_SOCKET_DIR` is shell output computed for the current workspace, never an evaluator input or a recorded relocation
-  path. A caller's socket from another checkout cannot become authority for the inherited shell. A writable cache shared
-  by siblings is never a source of shell code; successful reuse drains the complete export (including shells larger than
-  64 KiB) and reports reuse without printing the origin checkout path or credentials. To verify the full physical path
-  (host-origin Nix evaluation, scratch APFS adoption/COW clone, dedicated Gateway/ActorBridge sandbox entry, and
-  poisoned symlink fallback) on macOS, run
+  hook is disabled, with exactly the inputs a cowshed workspace child is handed: the bootstrap `PATH`, the private
+  `HOME`/`TMPDIR`/XDG roots (Nix's client fetcher cache is `$XDG_CACHE_HOME/nix`) and the live network routing (proxy
+  variables, `NO_PROXY`, CA files, `NIX_CONFIG`'s `ssl-cert-file`). No login identity, locale, terminal, Xcode selection
+  or other caller credential reaches it, so an origin evaluated from a host shell matches a clone. Nix's shared
+  evaluation cache is disabled for this evaluation; an export that embeds a proxy value or its userinfo is never
+  published, and the destination checkout keeps its own routing. The original hook executes only when direnv imports it
+  in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
+  in-place evaluation. `NX_SOCKET_DIR` is shell output computed for the current workspace, never an evaluator input or a
+  recorded relocation path. A caller's socket from another checkout cannot become authority for the inherited shell. A
+  writable cache shared by siblings is never a source of shell code; successful reuse drains the complete export
+  (including shells larger than 64 KiB) and reports reuse without printing the origin checkout path or credentials. To
+  verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone, dedicated
+  Gateway/ActorBridge sandbox entry, and poisoned symlink fallback) on macOS, run
   `cargo test -p cowshed-cli --test command_dispatch real_apfs_first_shell_reuses_private_origin_artifact_without_exposing_origin -- --ignored --nocapture`.
   This explicit smoke exceeds nextest's normal 30-second per-test limit; ordinary tests keep that limit.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file

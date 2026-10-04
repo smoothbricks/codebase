@@ -155,8 +155,9 @@ impl Fixture {
         )
         .expect("public cache key");
         // Nix's client cache, resolved as nix resolves it for this caller. The fresh host
-        // home is the shell's own, but this machine-wide fetch index is not: without it the
-        // origin evaluation downloads every locked input the machine already fetched.
+        // home is the shell's own, but this machine-wide fetch index is not: the shell's
+        // private XDG cache links its `nix` to it, as cowshed shares one across workspaces,
+        // or the origin evaluation downloads every locked input the machine already fetched.
         let nix_cache = match (
             std::env::var_os("NIX_CACHE_HOME"),
             std::env::var_os("XDG_CACHE_HOME"),
@@ -167,13 +168,16 @@ impl Fixture {
                 PathBuf::from(std::env::var_os("HOME").expect("caller HOME")).join(".cache/nix")
             }
         };
+        let cache = self._scratch.path().join("host-cache");
+        fs::create_dir_all(&cache).expect("host cache");
+        std::os::unix::fs::symlink(&nix_cache, cache.join("nix")).expect("shared nix cache");
         let result = Command::new("bun")
             .arg(directory.join("inherited-devenv.ts"))
             .arg(&self.checkout)
             .arg("direnv-export")
             .current_dir(&directory)
             .env("HOME", &home)
-            .env("NIX_CACHE_HOME", &nix_cache)
+            .env("XDG_CACHE_HOME", &cache)
             .env("PRIVATE_CREDENTIAL", "origin-only-secret-sentinel")
             .env_remove("COWSHED_PORT_BASE")
             .output()

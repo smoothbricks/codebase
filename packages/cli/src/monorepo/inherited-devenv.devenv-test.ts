@@ -39,9 +39,10 @@ for (const name of [
 const callerHome = process.env.HOME;
 if (!callerHome) throw new Error('the real devenv fixture needs the caller HOME that locates its Nix cache');
 // Nix's client cache, resolved as nix resolves it for the caller. Each fixture
-// HOME is fresh, but this machine-wide fetch index (cowshed shares one across
-// workspaces) is not checkout state: without it every first entry downloads the
-// locked nixpkgs tarball from GitHub again.
+// gets a private XDG_CACHE_HOME whose `nix` links to this machine-wide fetch
+// index, exactly as cowshed shares one across workspaces: it is not checkout
+// state, and without it every first entry downloads the locked nixpkgs tarball
+// from GitHub again.
 const nixCache = process.env.NIX_CACHE_HOME ?? join(process.env.XDG_CACHE_HOME ?? join(callerHome, '.cache'), 'nix');
 
 function lock(): string {
@@ -72,10 +73,17 @@ function workspace(scratch: string, name: string, nix: string): Workspace {
     TMPDIR: join(scratch, `tmp-${name}`),
     XDG_RUNTIME_DIR: join(scratch, `run-${name}`),
     XDG_DATA_HOME: join(root, '.data'),
-    NIX_CACHE_HOME: nixCache,
+    XDG_CACHE_HOME: join(root, '.cache'),
   };
-  for (const directory of [env.HOME, env.TMPDIR, env.XDG_RUNTIME_DIR, join(env.XDG_DATA_HOME, 'devenv')])
+  for (const directory of [
+    env.HOME,
+    env.TMPDIR,
+    env.XDG_RUNTIME_DIR,
+    env.XDG_CACHE_HOME,
+    join(env.XDG_DATA_HOME, 'devenv'),
+  ])
     mkdirSync(directory, { recursive: true });
+  symlinkSync(nixCache, join(env.XDG_CACHE_HOME, 'nix'));
   writeFileSync(
     join(env.XDG_DATA_HOME, 'devenv', 'cachix_trusted_keys.json'),
     '{"devenv":"devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw="}\n',

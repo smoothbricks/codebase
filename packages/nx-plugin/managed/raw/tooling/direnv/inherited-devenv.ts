@@ -22,6 +22,9 @@ import path from 'node:path';
 
 const DEVENV_DIR = 'tooling/direnv';
 const ARTIFACT = 'inherited-shell.json';
+// Every path a cowshed workspace child is handed that an export can embed. Each
+// is the sandbox's own (its private HOME, TMPDIR, XDG roots, direnv config), so
+// a clone relocates the origin's value to its own.
 const ENV_PATHS = [
   'HOME',
   'TMPDIR',
@@ -30,19 +33,21 @@ const ENV_PATHS = [
   'XDG_CACHE_HOME',
   'XDG_DATA_HOME',
   'XDG_STATE_HOME',
-  'DEVENV_HOME',
   'DIRENV_CONFIG',
 ] as const;
-// The evaluator fetches the lock's inputs itself, so it runs with this
-// workspace's live routing: the proxy endpoint (a cowshed workspace's userinfo is
-// its own gateway token), its exclusions, the CA files, and the one NIX_CONFIG
-// setting that is pure transport (`ssl-cert-file`, which outranks nix.conf). Nix's
-// client cache comes along so a locked input already fetched on this machine is
-// not downloaded again. No other caller credential, gateway token, NIX_CONFIG
-// line (`access-tokens`, `impure-env`, …) or ambient impure override reaches it.
-// Routing belongs to the evaluating checkout only: an export that embeds any
-// proxy value or its userinfo is never published. A live shell still runs with
-// its exact caller env.
+// The evaluator sees exactly what a cowshed workspace child is handed and the
+// evaluation needs, so an origin evaluated from a host shell and a clone agree:
+// the bootstrap PATH, the private roots, and the live routing the evaluator
+// fetches the lock's inputs with — the proxy endpoint (a cowshed workspace's
+// userinfo is its own gateway token), its exclusions, the CA files, and the one
+// NIX_CONFIG setting that is pure transport (`ssl-cert-file`, which outranks
+// nix.conf). Nix's client cache is `$XDG_CACHE_HOME/nix`, which cowshed shares
+// across workspaces. No login identity, locale, terminal, Xcode selection,
+// other caller credential, gateway token, NIX_CONFIG line (`access-tokens`,
+// `impure-env`, …) or ambient impure override reaches it: a tool the shell
+// needs is the devenv's to declare. Routing belongs to the evaluating checkout
+// only: an export that embeds any proxy value or its userinfo is never
+// published. A live shell still runs with its exact caller env.
 const EVALUATOR_ENV = [
   'PATH',
   'HOME',
@@ -52,27 +57,16 @@ const EVALUATOR_ENV = [
   'XDG_CACHE_HOME',
   'XDG_DATA_HOME',
   'XDG_STATE_HOME',
-  'NIX_CACHE_HOME',
-  'DEVENV_HOME',
   'DIRENV_CONFIG',
-  'USER',
-  'LOGNAME',
-  'SHELL',
-  'LANG',
-  'LC_ALL',
-  'LC_CTYPE',
-  'TERM',
   'NIX_SSL_CERT_FILE',
   'SSL_CERT_FILE',
   'NODE_EXTRA_CA_CERTS',
   'GIT_SSL_CAINFO',
-  'DEVELOPER_DIR',
-  'SDKROOT',
   'NO_PROXY',
   'no_proxy',
 ] as const;
-/** curl and reqwest read these; a value may carry credentials as URL userinfo. */
-const PROXY_ENV = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'] as const;
+/** cowshed's proxy endpoint; a value may carry credentials as URL userinfo. */
+const PROXY_ENV = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'] as const;
 
 type Watch = { readonly scope: 'root' | 'home' | 'runtime' | 'tmp' | 'store'; readonly relative: string };
 type Entry = {

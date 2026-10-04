@@ -64,7 +64,6 @@ const workspaceEnv: Record<string, string> = {
   PATH: '/nix/store/devenv/bin',
   HOME: '/workspace/.cowshed/home',
   XDG_CACHE_HOME: '/workspace/.cowshed/cache',
-  NIX_CACHE_HOME: '/private/cowshed/caches/nix/cache',
   HTTP_PROXY: gateway,
   HTTPS_PROXY: gateway,
   http_proxy: gateway,
@@ -88,7 +87,6 @@ describe('inherited devenv evaluator routing', () => {
       PATH: '/nix/store/devenv/bin',
       HOME: '/workspace/.cowshed/home',
       XDG_CACHE_HOME: '/workspace/.cowshed/cache',
-      NIX_CACHE_HOME: '/private/cowshed/caches/nix/cache',
       HTTP_PROXY: gateway,
       HTTPS_PROXY: gateway,
       http_proxy: gateway,
@@ -112,6 +110,29 @@ describe('inherited devenv evaluator routing', () => {
     expect(evaluator).not.toHaveProperty('NX_SOCKET_DIR');
   });
 
+  it('receives nothing a workspace child is not handed', async () => {
+    const [stuffed, handed] = await Promise.all([
+      produce({
+        ...workspaceEnv,
+        USER: 'caller',
+        LOGNAME: 'caller',
+        SHELL: '/caller/bin/zsh',
+        LANG: 'caller.UTF-8',
+        LC_ALL: 'caller.UTF-8',
+        TERM: 'caller-term',
+        DEVELOPER_DIR: '/Applications/Caller.app/Contents/Developer',
+        SDKROOT: '/caller/sdk',
+        DEVENV_HOME: '/caller/.local/share/devenv',
+        NIX_CACHE_HOME: '/caller/.cache/nix',
+        ALL_PROXY: 'http://caller-proxy.invalid:3128',
+        VIRTUAL_ENV: '/caller/venv',
+        CARGO_HOME: '/caller/.cargo',
+      }),
+      produce(workspaceEnv),
+    ]);
+    expect(stuffed.evaluator).toEqual(handed.evaluator);
+  });
+
   it('passes no NIX_CONFIG when the caller pins no CA file', async () => {
     const { evaluator } = await produce({ PATH: '/bin', NIX_CONFIG: 'access-tokens = github.com=caller-access-token' });
     expect(evaluator).toEqual({ PATH: '/bin' });
@@ -119,7 +140,7 @@ describe('inherited devenv evaluator routing', () => {
 
   it('finds the proxy credential in a would-be artifact however it is spelled', async () => {
     const encoded = 'http://user:p%40ss@proxy.example.net:8080';
-    const { embedded } = await produce({ ...workspaceEnv, ALL_PROXY: encoded }, [
+    const { embedded } = await produce({ ...workspaceEnv, https_proxy: encoded }, [
       `export CAPTURED=${gateway}`,
       `export CAPTURED=cowshed:${token}`,
       `export CAPTURED=${token}`,
