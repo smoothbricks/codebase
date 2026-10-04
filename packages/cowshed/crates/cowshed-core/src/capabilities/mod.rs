@@ -23,6 +23,7 @@ mod pnpm;
 mod uv;
 mod zig;
 mod gradle;
+mod nix;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -241,7 +242,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 10] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR, &npm::DETECTOR, &pnpm::DETECTOR, &uv::DETECTOR, &zig::DETECTOR, &gradle::DETECTOR];
+pub static DETECTORS: [&Detector; 11] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR, &npm::DETECTOR, &pnpm::DETECTOR, &uv::DETECTOR, &zig::DETECTOR, &gradle::DETECTOR, &nix::DETECTOR];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
