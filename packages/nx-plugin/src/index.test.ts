@@ -13,7 +13,7 @@ import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
-import { createNodesV2, createNodesV2ForPlatform } from './index.js';
+import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
 useFixtureCargoHome();
@@ -1346,6 +1346,43 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     } finally {
       await workspace.cleanup();
     }
+  });
+
+  // Without an `externalDependencies` input Nx keys a task whose executor is
+  // not an `@nx/` one on every package in the lockfile, so a lockfile-only
+  // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*
+  // runner and the archive re-keyed on a one-integrity bun.lock edit). Here
+  // the plugin is this repository's workspace project, which Nx refuses as an
+  // external dependency, so each target names none.
+  it('keys every cached cargo target on the npm packages it runs, not the lockfile', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeCargoIdentityFixture(workspace);
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      const cached = cachedCargoTargets(targets);
+      expect(cached.length).toBeGreaterThan(0);
+      for (const [name, target] of cached) {
+        const named = (target.inputs ?? []).filter(
+          (input) => typeof input === 'object' && 'externalDependencies' in input,
+        );
+        expect([name, named]).toEqual([name, [{ externalDependencies: [] }]]);
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('names the installed plugin for a cargo target that runs its executor or files, and nothing for cargo alone', () => {
+    const plugin = 'node_modules/.bun/@smoothbricks+nx-plugin@0.4.26/node_modules/@smoothbricks/nx-plugin';
+    const runner = { executor: '@smoothbricks/nx-plugin:bounded-exec' };
+    const archive = `cargo --frozen nextest archive --workspace --tool-config-file "smoo:$PWD/${plugin}/nextest.toml"`;
+    const clippy = 'cargo --frozen clippy --workspace --all-targets -- -D warnings';
+    expect(cargoCommandNpmPackages(runner, 'cargo --frozen nextest run', true)).toEqual(['@smoothbricks/nx-plugin']);
+    expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, archive, true)).toEqual([
+      '@smoothbricks/nx-plugin',
+    ]);
+    expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, clippy, true)).toEqual([]);
+    expect(cargoCommandNpmPackages(runner, archive, false)).toEqual([]);
   });
 
   // The property that decides whether Rust can ever use a shared cache. A cargo

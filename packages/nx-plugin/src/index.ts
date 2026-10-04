@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -718,9 +718,15 @@ function createCargoCrossTestTargets(
 ): Record<string, TargetConfiguration> {
   const { target: triple, cargo } = crossTarget;
   const archiveFile = cargoCrossTestArchiveFile(triple);
+  const archiveCommand = sequence([
+    `mkdir -p ${posix.dirname(archiveFile)}`,
+    `cargo-nextest nextest archive --workspace --target ${triple} --frozen ` +
+      `--archive-file ${archiveFile} --user-config-file none ${toolConfig}`,
+  ]);
+  const archiveExecutor = 'nx:run-commands';
   return {
     [cargoCrossTestArchiveTargetName(triple)]: {
-      executor: 'nx:run-commands',
+      executor: archiveExecutor,
       cache: true,
       // The toolchain inputs every cached cargo target carries, plus the
       // declared driver's own bytes. Those toolchain inputs are attached
@@ -732,21 +738,18 @@ function createCargoCrossTestTargets(
       // must never hash equal to the same sources built under another. The
       // declared driver is hashed by its own bytes; nothing samples the shell
       // that supplies it, which is why this hash is the same bare and inside
-      // the cross profile.
+      // the cross profile. For the same reason it names its npm packages here.
       inputs: [
         ...archiveInputs,
         ...CARGO_TOOLCHAIN_PIN_INPUTS,
         ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
         cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
+        { externalDependencies: cargoCommandNpmPackages({ executor: archiveExecutor }, archiveCommand) },
       ],
       outputs: [`{projectRoot}/${archiveFile}`],
       dependsOn: [CARGO_FETCH_TARGET],
       options: {
-        command: sequence([
-          `mkdir -p ${posix.dirname(archiveFile)}`,
-          `cargo-nextest nextest archive --workspace --target ${triple} --frozen ` +
-            `--archive-file ${archiveFile} --user-config-file none ${toolConfig}`,
-        ]),
+        command: archiveCommand,
         cwd: projectRoot,
         // `CARGO` is cargo's own driver variable and the only seam nextest
         // offers: it shells out to `$CARGO metadata` and
@@ -791,6 +794,35 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 }
 
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
+
+const PLUGIN_PACKAGE = '@smoothbricks/nx-plugin';
+/**
+ * Whether this plugin runs as an installed npm package. Inside the repository
+ * that develops it, it is a workspace project, and Nx refuses a workspace
+ * project named as an `externalDependencies` entry.
+ */
+const PLUGIN_IS_INSTALLED = fileURLToPath(new URL('..', import.meta.url))
+  .split(sep)
+  .includes('node_modules');
+
+/**
+ * The npm packages a cached cargo target runs, for its `externalDependencies`.
+ * Cargo runs none. A target this plugin's executor runs, or whose command reads
+ * the installed plugin's files (the nextest tool config, the archive
+ * extractor), runs the plugin. Without the input Nx keys every task whose
+ * executor is not an `@nx/` one on every package in the lockfile, so a
+ * lockfile-only commit re-ran every cargo verdict.
+ */
+export function cargoCommandNpmPackages(
+  target: TargetConfiguration,
+  commandText: string,
+  installed = PLUGIN_IS_INSTALLED,
+): string[] {
+  const runsPlugin =
+    target.executor?.startsWith(`${PLUGIN_PACKAGE}:`) === true ||
+    commandText.includes(`node_modules/${PLUGIN_PACKAGE}/`);
+  return installed && runsPlugin ? [PLUGIN_PACKAGE] : [];
+}
 
 /**
  * How far the versionless manifest treatment reaches in this workspace.
@@ -1515,6 +1547,8 @@ async function createProjectTargets(
 
   // Cache verdicts and dedicated artifacts, never Cargo's shared mutable build
   // directories. Resolve tool versions from the command's actual directory.
+  // Name the npm packages the command runs (cargoCommandNpmPackages) unless
+  // the target already does.
   for (const [name, target] of Object.entries(targets)) {
     const text = targetCommandText(target);
     if (!text.includes(CARGO_FROZEN_PREFIX)) continue;
@@ -1526,10 +1560,13 @@ async function createProjectTargets(
       : text.includes('nextest ')
         ? ' && cargo nextest --version'
         : '';
+    const inputs = target.inputs ?? CARGO_INPUTS;
+    const namesPackages = inputs.some((input) => typeof input === 'object' && 'externalDependencies' in input);
     target.inputs = [
-      ...(target.inputs ?? CARGO_INPUTS),
+      ...inputs,
       ...CARGO_TOOLCHAIN_PIN_INPUTS,
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
+      ...(namesPackages ? [] : [{ externalDependencies: cargoCommandNpmPackages(target, text) }]),
     ];
   }
 

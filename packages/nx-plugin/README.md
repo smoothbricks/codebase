@@ -119,6 +119,18 @@ build-script reads or custom environment variables that Cargo metadata cannot na
 A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
 in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it.
 
+Every cached cargo target names the npm packages its command runs as `externalDependencies`: none for cargo itself, and
+`@smoothbricks/nx-plugin` for a target that runs its executor or reads its installed files (the nextest tool config, the
+archive extractor). Without that input Nx keys a task whose executor is not an `@nx/` one on every package in the
+lockfile, so a lockfile-only commit re-ran every cargo verdict. Inside this repository the plugin is a workspace
+project, which Nx refuses as an external dependency, so the list is empty here.
+
+No input declaration removes a project's own configuration from a task's key. Nx 23.2.1 adds `ProjectConfiguration` to
+every task (`hash_planner.rs` `gather_self_inputs`), and `hash_project_config.rs` hashes the executor, outputs, options,
+configurations and parallelism of every target in the project, plus its tags and named inputs (not `inputs`,
+`dependsOn`, `cache` or `//`). An edit to one target's command therefore re-keys every target of that project, including
+each inferred `cargo-test-*` runner. Only the project a target lives in decides that sensitivity.
+
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
 access may consequently wait on Cargo's package-cache lock, which Cargo arbitrates itself; Nx adds no ordering for it.
