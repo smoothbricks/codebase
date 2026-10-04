@@ -723,7 +723,7 @@ A sandboxed Nx keeps Nx's own daemon default: a caller's `NX_DAEMON` never reach
 that cannot reach that socket starts a daemon of its own, which overwrites the record and so retires the daemon it
 replaced (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
 
-One Nx state per checkout. Every read-write job of an Nx project (`nx.json`, 15_capabilities.md) gets
+One Nx state per checkout. Every job of an Nx project (`nx.json`, 15_capabilities.md), read-write or read-only, gets
 `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` naming the checkout's own `<project>/.nx/workspace-data` and
 `<project>/.nx/cache` — the directories a host shell's Nx uses — and a caller's values never pass. The two move
 together: once either is configured, Nx keeps its task database in the workspace-data directory, and the database's rows
@@ -732,10 +732,11 @@ directories of its own would own a second cache beside the checkout's: a build t
 other cold, and every clone inherits both half-warm. So host shells, sandboxed jobs and land checks of one checkout
 share one record, one daemon, one task database and one cache, and a clone inherits that state warm through its build
 volume (16_build_volumes.md). A read-only job keeps the source tree read-only but gets read-write on its checkout's
-build volume, so it reads and writes the same cache and task database; it runs without a daemon, because the checkout's
-daemon executes plugin code with the read-write boundary and a read-only client must never reach it. daemon that can
-write the workspace. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the workspace, or the
-capability's override directory.
+build volume and the same socket directory, so it shares the record, daemon, task database and cache like any other job.
+Reaching the read-write daemon grants a read-only job nothing: the daemon computes the project graph, hashes and records
+task history from the checked-in plugins, which any read-write job would run anyway, and tasks themselves execute in the
+client under the client's own boundary. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the
+workspace, or the capability's override directory.
 
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
 the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree; a host shell of a cowshed checkout reaches the same
