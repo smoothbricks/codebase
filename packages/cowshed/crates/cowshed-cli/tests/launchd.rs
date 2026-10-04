@@ -16,6 +16,17 @@ use cowshed_cli::launchd::{
 };
 use cowshed_core::metadata::ImageCapacity;
 
+#[cfg(target_os = "macos")]
+use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+#[cfg(target_os = "macos")]
+use cowshed_core::storage::apfs::ApfsSubstrateConfig;
+#[cfg(target_os = "macos")]
+use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+
+#[cfg(target_os = "macos")]
+#[path = "../../cowshed-core/tests/support/scratch_apfs.rs"]
+mod scratch_apfs;
+
 const HOME: &str = "/Users/cowshed-test";
 /// The only path shape a cowshed LaunchAgent can name: on the volume that carries the plist.
 const EXECUTABLE: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed";
