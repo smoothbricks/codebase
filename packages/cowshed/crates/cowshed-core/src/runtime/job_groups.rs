@@ -1368,11 +1368,15 @@ mod tests {
 
         let mut stranger = job_group();
         let stranger_pgid = i32::try_from(stranger.id()).unwrap();
+        let stranger_leader = leader(stranger.id());
+        // The job was born before the stranger that took its pid. Linux counts birth in clock
+        // ticks, so a job killed and replaced within one tick shares the stranger's birth there;
+        // a job that truly held this pid earlier was then born at least one tick sooner.
         let reused = GroupLeader {
             pgid: stranger_pgid,
-            birth: first_seen.birth,
+            birth: first_seen.birth.min(stranger_leader.birth - 1),
         };
-        assert_ne!(reused, leader(stranger.id()));
+        assert_ne!(reused, stranger_leader);
         let ledger = scratch();
         record(&ledger, &[(5, reused)], &[]).unwrap();
         record(&ledger, &[(5, reused)], &[]).unwrap();
