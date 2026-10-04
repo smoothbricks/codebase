@@ -1797,3 +1797,68 @@ exit 0"#
         "denied paths stay where they are"
     );
 }
+
+/// A repository's `.envrc` may run `bun` before any shell it evaluates puts bun on PATH — a
+/// managed shell's own bootstrap script does. A Bun project's sandbox therefore reaches the
+/// host's bun by name from its first activation step, while the host's install directory stays
+/// beneath the HOME read deny.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_bun_project_runs_bun_before_its_envrc_evaluates() {
+    let root = scratch("bun-before-envrc");
+    let home = root.join("home");
+    let mount_root = home.join("Dev/.cowshed");
+    let main = root.join("checkouts/widget");
+    let raven = mount_root.join("acme/widget/raven");
+    let bun = home.join(".bun/bin/bun");
+    std::fs::create_dir_all(bun.parent().expect("bun bin")).expect("bun install");
+    std::fs::write(&bun, "#!/bin/sh\nprintf 'fixture-bun %s' \"$*\"\n").expect("bun program");
+    std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    std::fs::create_dir_all(&main).expect("main checkout");
+    std::fs::create_dir_all(raven.join(".cowshed/bin")).expect("private bin");
+    for (file, contents) in [
+        ("package.json", "{}\n"),
+        ("bun.lock", "{}\n"),
+        (".envrc", "export BUN_BEFORE_SHELL=\"$(bun --version)\"\n"),
+    ] {
+        std::fs::write(raven.join(file), contents).expect("bun project fixture");
+    }
+    let direnv = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
+        .map(|directory| directory.join("direnv"))
+        .find(|candidate| candidate.is_file())
+        .expect("required runtime tool `direnv` is not on PATH");
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(direnv).expect("resolve direnv"),
+        raven.join(".cowshed/bin/direnv"),
+    )
+    .expect("direnv in the workspace bin");
+    let sandbox = production_workspace(
+        &root,
+        &home,
+        &mount_root,
+        &main,
+        raven.clone(),
+        42_560,
+        Vec::new(),
+        &[],
+    );
+
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        &raven,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$BUN_BEFORE_SHELL\"".into(),
+        ],
+    )
+    .await;
+    std::fs::remove_dir_all(&root).expect("remove bun-before-envrc fixture");
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "activation runs bun: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&stdout), "fixture-bun --version");
+}

@@ -53,4 +53,40 @@ mod tests {
         fixture.files(&["bun.lock"]);
         assert!(DETECTOR.detect(&fixture.context()).unwrap().is_none());
     }
+
+    /// A repository's `.envrc` may run `bun` before any shell it evaluates puts bun on PATH, so
+    /// a Bun project bootstraps the host's own bun as the `bun` command, granted as the literal
+    /// program it probed beneath HOME and the file it resolves to.
+    #[test]
+    fn a_bun_project_bootstraps_the_host_bun_before_its_shell_evaluates() {
+        use super::super::{BootstrapProgram, CapabilityGrant, GrantAccess, GrantScope};
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new();
+        fixture.files(&["package.json", "bun.lock"]);
+        let installed = fixture.home.join(".bun/bin/bun");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let contribution = DETECTOR
+            .detect(&fixture.context())
+            .unwrap()
+            .expect("bun project");
+        // `node` is bootstrapped too, from whatever the host itself installs.
+        assert_eq!(
+            contribution
+                .bootstrap_programs
+                .iter()
+                .find(|program| program.name == "bun"),
+            Some(&BootstrapProgram {
+                name: "bun",
+                target: installed.clone(),
+            })
+        );
+        assert!(contribution.grants.contains(&CapabilityGrant {
+            path: installed,
+            scope: GrantScope::Literal,
+            access: GrantAccess::Read,
+        }));
+    }
 }
