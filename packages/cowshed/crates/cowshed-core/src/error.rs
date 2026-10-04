@@ -82,9 +82,17 @@ pub struct CowshedError {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "fence_of_this_build"
+        deserialize_with = "known_to_this_build"
     )]
     fence: Option<Box<FenceRefusal>>,
+    /// Present only on a refusal that is safe to retry unchanged, naming why. Absent from the
+    /// wire otherwise, like `otherBuild`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_to_this_build"
+    )]
+    retry: Option<Retry>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
@@ -106,16 +114,26 @@ pub struct OtherBuild {
     pub caller: Option<crate::runtime::supervisor_socket::BuildId>,
 }
 
-/// The fence, or none when it names a reason this build does not know: version skew between a
-/// controller and its client costs the typed reason, never the code, message and hint.
-fn fence_of_this_build<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<Box<FenceRefusal>>, D::Error>
+/// The structured source, or none when it names a reason this build does not know: version skew
+/// between a controller and its client costs the typed reason, never the code, message and hint.
+fn known_to_this_build<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     Ok(Option::<serde_json::Value>::deserialize(deserializer)?
-        .and_then(|fence| serde_json::from_value(fence).ok()))
+        .and_then(|source| serde_json::from_value(source).ok()))
+}
+
+/// Why a `Conflict` is safe to retry unchanged: the call planned against state a concurrent
+/// operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
+/// other repair is needed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "camelCase")]
+pub enum Retry {
+    /// Garbage collection found the store changed between its plan and its execution (another
+    /// process reclaiming or retiring an image) and collected nothing.
+    GcPlanStale,
 }
 
 /// The most paths a [`FenceRefusal`] names; `total` still counts every one.
@@ -202,6 +220,7 @@ impl CowshedError {
             recovering: None,
             healing: None,
             fence: None,
+            retry: None,
             lifecycle_conflict: None,
         }
     }
@@ -228,6 +247,7 @@ impl CowshedError {
             recovering: None,
             healing: None,
             fence: None,
+            retry: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -251,6 +271,7 @@ impl CowshedError {
             recovering: None,
             healing: None,
             fence: None,
+            retry: None,
             lifecycle_conflict: None,
         }
     }
@@ -276,6 +297,7 @@ impl CowshedError {
             recovering: Some(recovery),
             healing: None,
             fence: None,
+            retry: None,
             lifecycle_conflict: None,
         }
     }
@@ -296,6 +318,7 @@ impl CowshedError {
             recovering: None,
             healing: Some(heal),
             fence: None,
+            retry: None,
             lifecycle_conflict: None,
         }
     }
@@ -309,6 +332,14 @@ impl CowshedError {
     ) -> Self {
         Self {
             fence: Some(Box::new(fence)),
+            ..Self::conflict(message, hint)
+        }
+    }
+
+    /// A refusal safe to retry unchanged: always a `Conflict`, naming why as [`Retry`].
+    pub fn retryable(retry: Retry, message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            retry: Some(retry),
             ..Self::conflict(message, hint)
         }
     }
@@ -429,6 +460,11 @@ impl CowshedError {
     /// The fence and what it observed, when this is a rebase's or land's fence refusal.
     pub fn fence_source(&self) -> Option<&FenceRefusal> {
         self.fence.as_deref()
+    }
+
+    /// Why retrying unchanged is the remedy, when this refusal is one a retry resolves.
+    pub fn retry_source(&self) -> Option<Retry> {
+        self.retry
     }
 
     pub const fn exit_code(&self) -> u8 {

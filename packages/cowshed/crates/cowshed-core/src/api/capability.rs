@@ -3,8 +3,9 @@ use super::dto::{
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionResult, RunSandboxMode,
-    SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RevisionResult, RunSandboxMode, SealedJob, StdinSource, StepReport,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1754,6 +1755,22 @@ impl Coordinator {
         call_typed(
             &self.runtime,
             "coordinator.gc",
+            json!({ "repoId": self.project.repo_id, "options": options }),
+        )
+        .await
+    }
+
+    /// Remove the adopted project end to end: every session workspace, the collection of their
+    /// images, the abandon bundles (under `abandon`), and main's restore, which unbinds it. A
+    /// refusal leaves the rest for the next call; a store that changed under the collection is
+    /// `Conflict` with [`crate::error::Retry::GcPlanStale`], resolved by calling again.
+    pub async fn remove_project(
+        &self,
+        options: RemoveProjectOptions,
+    ) -> Result<RemoveProjectReport> {
+        call_typed(
+            &self.runtime,
+            "coordinator.removeProject",
             json!({ "repoId": self.project.repo_id, "options": options }),
         )
         .await

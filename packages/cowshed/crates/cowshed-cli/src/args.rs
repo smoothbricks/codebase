@@ -394,6 +394,9 @@ pub struct RemoveArgs {
     pub force: bool,
     pub restore: bool,
     pub abandon: bool,
+    /// With `main --restore`: remove the whole project first (every session, its images, and
+    /// under `abandon` its abandon bundles) — `Coordinator::remove_project`.
+    pub purge: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachArgs {
@@ -780,6 +783,7 @@ fn cli_command() -> ClapCommand {
             flag("force"),
             flag("restore"),
             flag("abandon"),
+            flag("purge"),
         ]))
         .subcommand(
             leaf("attach")
@@ -2334,6 +2338,10 @@ const REMOVE: CommandSpec = CommandSpec {
             spelling: "--abandon",
             meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
         },
+        Opt {
+            spelling: "--purge",
+            meaning: "main --restore only: remove the whole project in one call — every session workspace (listed or never published, under the --force and --abandon given), the collection of their images, and with --abandon the abandon bundles in sessions/.trash, which are then the only copy of those commits — and then restore main. A store another process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in --json); run the same command again",
+        },
     ],
 };
 
@@ -2355,11 +2363,19 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE,
         ));
     }
+    let purge = flagged(matches, "purge");
+    if purge && !restore {
+        return Err(UsageError::new(
+            "--purge removes the whole project and needs main --restore",
+            USAGE,
+        ));
+    }
     Ok(Command::Remove(RemoveArgs {
         workspace,
         force: flagged(matches, "force"),
         restore,
         abandon,
+        purge,
     }))
 }
 
@@ -3945,7 +3961,7 @@ mod tests {
         // Usage text is where the flags are documented deliberately.
         assert_eq!(
             error.hint,
-            "cowshed rm <ws> [--force] [--restore] [--abandon]"
+            "cowshed rm <ws> [--force] [--restore] [--abandon] [--purge]"
         );
         let Command::Remove(discard) = parse_args(["rm", "main", "--restore", "--abandon"])
             .unwrap()
@@ -3954,6 +3970,18 @@ mod tests {
             panic!("expected remove")
         };
         assert!(discard.restore && discard.abandon && !discard.force);
+        // `--purge` removes the whole project, so it rides only on main's restore and carries the
+        // session authorizations it is given, never more.
+        let Command::Remove(purge) =
+            parse_args(["rm", "main", "--restore", "--purge", "--force", "--abandon"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected remove")
+        };
+        assert!(purge.purge && purge.restore && purge.force && purge.abandon);
+        assert!(parse_args(["rm", "main", "--purge"]).is_err());
+        assert!(parse_args(["rm", "raven", "--purge"]).is_err());
     }
 
     /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on

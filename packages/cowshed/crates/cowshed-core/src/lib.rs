@@ -61,7 +61,9 @@ mod blank_image;
 #[path = "../tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
-pub use error::{CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result};
+pub use error::{
+    CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result, Retry,
+};
 pub use gateway_inventory::{
     AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,
     ProjectHealOutcome, SessionHealOutcome, StartupHealState, UnreachableMain,

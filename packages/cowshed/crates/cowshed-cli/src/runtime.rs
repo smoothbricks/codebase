@@ -18,10 +18,11 @@ use cowshed_core::api::{
     ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions,
     GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
-    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, Reseed,
-    ReseedResult, ResizeResult, ResizeVolume, RevisionResult, RevisionTarget, RunSandboxMode,
-    SccacheStatus, StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, Reseed, ReseedResult, ResizeResult, ResizeVolume,
+    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -116,6 +117,10 @@ pub trait CliService: Send {
     }
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport>;
+    async fn remove_project(
+        &mut self,
+        options: RemoveProjectOptions,
+    ) -> Result<RemoveProjectReport>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn resize(
@@ -601,6 +606,13 @@ impl CliService for ActorBridge {
 
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport> {
         self.coordinator()?.destroy(workspace, options).await
+    }
+
+    async fn remove_project(
+        &mut self,
+        options: RemoveProjectOptions,
+    ) -> Result<RemoveProjectReport> {
+        self.coordinator()?.remove_project(options).await
     }
 
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo> {
@@ -1287,6 +1299,37 @@ where
                     .hint(&format!(
                         "cowshed exec {} -- <retry your command>",
                         workspace
+                    ))
+                    .map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        Command::Remove(args) if args.purge => {
+            let report = service
+                .remove_project(RemoveProjectOptions {
+                    force: args.force,
+                    abandon: args.abandon,
+                })
+                .await?;
+            service.reconcile_gateway().await?;
+            if json {
+                output.success(report.clone()).map_err(output_error)?;
+            }
+            for removed in &report.removed {
+                output
+                    .guidance(&format!("removed {}", removed.workspace))
+                    .map_err(output_error)?;
+            }
+            for bundle in &report.deleted_bundles {
+                output
+                    .guidance(&format!("deleted abandon bundle {}", bundle.display()))
+                    .map_err(output_error)?;
+            }
+            if let Some(abandoned) = report.restored.abandoned.as_ref() {
+                output
+                    .guidance(&format!(
+                        "main's unpreserved commits bundled to {}",
+                        abandoned.bundle.display()
                     ))
                     .map_err(output_error)?;
             }
@@ -5770,6 +5813,7 @@ mod tests {
             force: false,
             restore: false,
             abandon: false,
+            purge: false,
         }))
         .expect_err("a removal's scope is its name");
         assert_eq!(invalid.code, ErrorCode::Usage);

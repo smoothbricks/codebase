@@ -562,6 +562,7 @@ capability_methods! {
     "coordinator.assignSlot"
     "coordinator.destroy"
     "coordinator.gc"
+    "coordinator.removeProject"
     "coordinator.repoMirror"
     "coordinator.setCheckpointQuota"
     "coordinator.doctor"

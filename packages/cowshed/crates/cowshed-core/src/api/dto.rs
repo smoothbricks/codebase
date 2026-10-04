@@ -2596,6 +2596,17 @@ pub struct GcOptions {
     pub dry_run: bool,
 }
 
+/// Authorization for removing a whole adopted project (`Coordinator::remove_project`). `force` and
+/// `abandon` mean for every session workspace what they mean for one (`RemoveOptions`); `abandon`
+/// also authorizes deleting the abandon bundles in the project's trash, which are then the only
+/// copy of those commits, and bundling main's unpreserved commits into the restored checkout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveProjectOptions {
+    pub force: bool,
+    pub abandon: bool,
+}
+
 /// The workspace a unit lands into, or rebases onto, with the incarnation it had when it was
 /// resolved: a lane base, or main.
 ///
@@ -3031,6 +3042,25 @@ pub struct RemoveReport {
     pub abandoned: Option<AbandonedWork>,
 }
 
+/// One session workspace a project removal retired, with what its removal destroyed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemovedWorkspace {
+    pub workspace: WorkspaceName,
+    pub report: RemoveReport,
+}
+
+/// What removing a project did, in order: the session workspaces it retired, the collection
+/// that reclaimed their images, the abandon bundles it deleted, and main's restore.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveProjectReport {
+    pub removed: Vec<RemovedWorkspace>,
+    pub collected: GcReport,
+    pub deleted_bundles: Vec<PathBuf>,
+    pub restored: RemoveReport,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MirrorInfo {
@@ -3244,6 +3274,7 @@ result_bodies!(
     PushReport,
     LandReport,
     RemoveReport,
+    RemoveProjectReport,
     GrantSet,
     ProjectGrants,
     GatewayStatus,

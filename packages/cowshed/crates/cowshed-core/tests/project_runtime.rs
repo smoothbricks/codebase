@@ -12,9 +12,9 @@ use cowshed_core::api::dto::{
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveReport, Reseed, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState,
-    WorkspaceTarget,
+    PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, Reseed, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, StdinSource,
+    StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -27,7 +27,7 @@ use cowshed_core::runtime::{
 };
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::timing::{timed, timed_async};
-use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result};
+use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -52,6 +52,8 @@ enum Event {
     Detach(WorkspaceName),
     AtomicCheckoutRestore(PathBuf),
     RemoveBinding,
+    SettleReclaims,
+    Gc,
     Exec {
         workspace: WorkspaceName,
         mount: PathBuf,
@@ -96,6 +98,10 @@ struct FakeRemoval {
     restore_swapped: bool,
     fail_after_detach_once: bool,
     fail_after_swap_once: bool,
+    /// Clones a create never published: listed by `unpublished_workspaces`, retired by `remove`.
+    unpublished: std::collections::BTreeSet<WorkspaceName>,
+    /// The next collection finds its plan stale.
+    gc_stale_once: bool,
 }
 
 impl Default for FakeRemoval {
@@ -110,6 +116,8 @@ impl Default for FakeRemoval {
             restore_swapped: false,
             fail_after_detach_once: false,
             fail_after_swap_once: false,
+            unpublished: std::collections::BTreeSet::new(),
+            gc_stale_once: false,
         }
     }
 }
@@ -222,6 +230,10 @@ struct FakeHost {
     held_job: Option<Arc<HeldJob>>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
+    /// Background reclaims `remove` started, for `settle_reclaims`.
+    reclaims: Vec<tokio::task::JoinHandle<()>>,
+    /// Abandon bundles removals left in the trash, for `delete_abandon_bundles`.
+    bundles: Vec<PathBuf>,
 }
 
 impl FakeHost {
@@ -263,6 +275,8 @@ impl FakeHost {
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
             create_gate: None,
+            reclaims: Vec::new(),
+            bundles: Vec::new(),
         }
     }
 
@@ -842,6 +856,10 @@ impl ProjectRuntimeHost for FakeHost {
                 "remove the session without restore",
             ));
         }
+        if self.removal.unpublished.remove(&workspace) {
+            self.events.send(Event::Retire(workspace)).ok();
+            return Ok(RemoveReport::default());
+        }
         let index = self
             .state
             .workspaces
@@ -943,6 +961,12 @@ impl ProjectRuntimeHost for FakeHost {
                         "4".repeat(40)
                     )),
                 });
+                self.bundles.push(
+                    abandoned
+                        .as_ref()
+                        .map(|work| work.bundle.clone())
+                        .expect("just abandoned"),
+                );
                 self.events.send(Event::Bundle(workspace.clone())).ok();
             }
         }
@@ -955,7 +979,7 @@ impl ProjectRuntimeHost for FakeHost {
         }
         let events = self.events.clone();
         let reclaim_gate = self.reclaim_gate.clone();
-        std::mem::drop(tokio::spawn(async move {
+        self.reclaims.push(tokio::spawn(async move {
             if let Some(gate) = reclaim_gate {
                 gate.notified().await;
             }
@@ -965,6 +989,14 @@ impl ProjectRuntimeHost for FakeHost {
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
+        self.events.send(Event::Gc).ok();
+        if std::mem::take(&mut self.removal.gc_stale_once) {
+            return Err(CowshedError::retryable(
+                Retry::GcPlanStale,
+                "garbage-collection plan became stale",
+                "retry",
+            ));
+        }
         Ok(GcReport {
             examined: u64::try_from(self.state.workspaces.len()).expect("test length"),
             reclaimed: 0,
@@ -975,6 +1007,24 @@ impl ProjectRuntimeHost for FakeHost {
             candidates: Vec::new(),
             deferred: Vec::new(),
         })
+    }
+
+    async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>> {
+        Ok(self.removal.unpublished.iter().cloned().collect())
+    }
+
+    async fn settle_reclaims(&mut self) -> Result<()> {
+        self.events.send(Event::SettleReclaims).ok();
+        for reclaim in std::mem::take(&mut self.reclaims) {
+            reclaim
+                .await
+                .map_err(|error| CowshedError::internal(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
+        Ok(std::mem::take(&mut self.bundles))
     }
 
     async fn grant(
@@ -3092,4 +3142,173 @@ async fn production_open_modes_return_typed_environment_error_off_macos() {
         Err(error) => error,
     };
     assert_eq!(existing_error.code, ErrorCode::EnvironmentMissing);
+}
+
+async fn remove_project(
+    router: &RouterHandle,
+    repo: &RepoId,
+    options: RemoveProjectOptions,
+) -> Result<RemoveProjectReport> {
+    route(
+        router,
+        coordinator(repo.clone()),
+        "coordinator.removeProject",
+        json!({ "repoId": repo, "options": options }),
+    )
+    .await
+    .map(|value| serde_json::from_value(value).expect("project removal report"))
+}
+
+/// Removing a project retires every session, listed or never published, then waits for its own
+/// background reclaims before collecting: a collection that raced them would plan against images
+/// still being reclaimed and find its plan stale.
+#[tokio::test]
+async fn removing_a_project_settles_its_reclaims_before_collecting_then_restores_main() {
+    let root = test_root();
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.reclaim_gate = Some(Arc::clone(&gate));
+    let unsafe_name = WorkspaceName::new("unsafe").expect("name");
+    let stray = WorkspaceName::new("stray").expect("name");
+    host.removal.unlanded.insert(unsafe_name.clone());
+    host.removal.unpublished.insert(stray.clone());
+    let runtime = ProjectRuntime::start(host).await.expect("runtime");
+    let router = runtime.router();
+    let repo = runtime.descriptor().repo_id.clone();
+    adopt(&router, &repo).await;
+    for name in ["landed", "unsafe"] {
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.create",
+            json!({ "repoId": repo, "workspace": name, "options": CreateOptions::default() }),
+        )
+        .await
+        .expect("create");
+    }
+    while receiver.try_recv().is_ok() {}
+
+    let removal = tokio::spawn({
+        let router = router.clone();
+        let repo = repo.clone();
+        async move {
+            remove_project(
+                &router,
+                &repo,
+                RemoveProjectOptions {
+                    force: false,
+                    abandon: true,
+                },
+            )
+            .await
+        }
+    });
+    let landed = WorkspaceName::new("landed").expect("name");
+    let mut retired = Vec::new();
+    loop {
+        match receiver.recv().await.expect("event") {
+            Event::Retire(name) => retired.push(name),
+            Event::SettleReclaims => break,
+            Event::Gc => panic!("collected before settling the reclaims it started"),
+            _ => {}
+        }
+    }
+    assert_eq!(retired, [landed.clone(), stray, unsafe_name.clone()]);
+    // Two image reclaims are held at the gate; the collection must wait for both.
+    gate.notify_one();
+    gate.notify_one();
+    let mut reclaimed = Vec::new();
+    loop {
+        match receiver.recv().await.expect("event") {
+            Event::Reclaim(name) => reclaimed.push(name),
+            Event::Gc => break,
+            _ => {}
+        }
+    }
+    reclaimed.sort();
+    assert_eq!(reclaimed, [landed.clone(), unsafe_name.clone()]);
+    gate.notify_one();
+
+    let report = removal.await.expect("join").expect("project removal");
+    let removed: Vec<_> = report
+        .removed
+        .iter()
+        .map(|removed| removed.workspace.as_str())
+        .collect();
+    assert_eq!(removed, ["landed", "stray", "unsafe"]);
+    let abandoned = report.removed[2]
+        .report
+        .abandoned
+        .as_ref()
+        .expect("unsafe abandoned");
+    assert_eq!(
+        report.deleted_bundles,
+        std::slice::from_ref(&abandoned.bundle)
+    );
+    let listed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list after removal");
+    assert!(
+        listed.as_array().expect("workspaces").is_empty(),
+        "main was restored: {listed}"
+    );
+}
+
+/// A collection that finds its plan stale is a typed retryable refusal, and the same call
+/// finishes the removal: nothing it already did is repeated or refused.
+#[tokio::test]
+async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_removal() {
+    let removal = FakeRemoval {
+        gc_stale_once: true,
+        ..FakeRemoval::default()
+    };
+    let root = test_root();
+    let (_runtime, router, repo, _events) =
+        start_with_removal(&root, false, false, Vec::new(), removal).await;
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "landed", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+
+    let stale = remove_project(&router, &repo, RemoveProjectOptions::default())
+        .await
+        .expect_err("the first collection is stale");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+    assert_eq!(stale.retry_source(), Some(Retry::GcPlanStale));
+    let listed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list");
+    assert_eq!(
+        listed.as_array().expect("workspaces").len(),
+        1,
+        "main is not restored yet"
+    );
+
+    let report = remove_project(&router, &repo, RemoveProjectOptions::default())
+        .await
+        .expect("the retry finishes");
+    assert!(
+        report.removed.is_empty(),
+        "the session went on the first call"
+    );
+    assert!(
+        report.deleted_bundles.is_empty(),
+        "no bundles without abandon"
+    );
 }

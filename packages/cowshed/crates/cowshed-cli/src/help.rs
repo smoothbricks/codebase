@@ -268,7 +268,7 @@ fn render_command_map() -> String {
     let column = grammars
         .iter()
         .map(String::len)
-        .filter(|width| width + 2 + widest_summary <= WIDTH)
+        .filter(|width| 2 + width + 2 + widest_summary <= WIDTH)
         .max()
         .unwrap_or(0)
         + 2;

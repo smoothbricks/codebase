@@ -21,9 +21,9 @@ use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    RevisionResult, RunSandboxMode, SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
-    WorkspaceTarget,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, RemovedWorkspace, RevisionResult, RunSandboxMode, SealedJob,
+    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -171,6 +171,14 @@ pub trait ProjectRuntimeHost: Send + 'static {
         options: RemoveOptions,
     ) -> Result<RemoveReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    /// The session workspaces a listing does not show: clones whose create or fork never
+    /// published them. `remove` retires them like any other.
+    async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
+    /// Wait for every image reclamation this host started in the background, so a collection
+    /// that follows plans against a settled store instead of racing it.
+    async fn settle_reclaims(&mut self) -> Result<()>;
+    /// Delete every `rm --abandon` bundle in the project's trash, answering the paths deleted.
+    async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>>;
     async fn grant(
         &mut self,
         workspace: WorkspaceName,
@@ -848,6 +856,7 @@ impl ProjectActor {
             "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
             "coordinator.destroy" => self.coordinator_destroy(request).await,
             "coordinator.gc" => self.coordinator_gc(request).await,
+            "coordinator.removeProject" => self.coordinator_remove_project(request).await,
             "coordinator.repoMirror" => self.coordinator_repo_mirror(request).await,
             "coordinator.setCheckpointQuota" => self.coordinator_checkpoint_quota(request).await,
             "coordinator.doctor" => self.coordinator_doctor(request).await,
@@ -1190,6 +1199,17 @@ impl ProjectActor {
         json_response(self.host.gc(params.options).await?)
     }
 
+    async fn coordinator_remove_project(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: OptionsParams<RemoveProjectOptions> =
+            decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        json_response(remove_project(self.host.as_mut(), params.options).await?)
+    }
+
     async fn coordinator_repo_mirror(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
         let params: MirrorParams = decode_params(request.params(), request.method())?;
@@ -1494,6 +1514,63 @@ impl ProjectActor {
         }
         Ok(())
     }
+}
+
+/// Remove an adopted project end to end: retire every session workspace, listed or never
+/// published; wait for their images' reclamation; collect; delete the abandon bundles the
+/// removals left (only under `abandon`, which is what authorized them); then restore main, which
+/// unbinds the project. Every step is idempotent, so a refusal at any step leaves the rest for
+/// the same call to finish — and a stale collection says so as [`crate::error::Retry`].
+async fn remove_project(
+    host: &mut dyn ProjectRuntimeHost,
+    options: RemoveProjectOptions,
+) -> Result<RemoveProjectReport> {
+    let mut sessions: std::collections::BTreeSet<WorkspaceName> = host
+        .snapshots()
+        .await?
+        .into_iter()
+        .map(|snapshot| snapshot.info.workspace)
+        .filter(|workspace| !workspace.is_main())
+        .collect();
+    sessions.extend(
+        host.unpublished_workspaces()
+            .await?
+            .into_iter()
+            .filter(|workspace| !workspace.is_main()),
+    );
+    let session_removal = RemoveOptions {
+        force: options.force,
+        restore: false,
+        abandon: options.abandon,
+    };
+    let mut removed = Vec::with_capacity(sessions.len());
+    for workspace in sessions {
+        let report = host.remove(workspace.clone(), session_removal).await?;
+        removed.push(RemovedWorkspace { workspace, report });
+    }
+    host.settle_reclaims().await?;
+    let collected = host.gc(GcOptions::default()).await?;
+    let deleted_bundles = if options.abandon {
+        host.delete_abandon_bundles().await?
+    } else {
+        Vec::new()
+    };
+    let restored = host
+        .remove(
+            WorkspaceName::main(),
+            RemoveOptions {
+                force: false,
+                restore: true,
+                abandon: options.abandon,
+            },
+        )
+        .await?;
+    Ok(RemoveProjectReport {
+        removed,
+        collected,
+        deleted_bundles,
+        restored,
+    })
 }
 
 fn require_coordinator(authority: &ConnectionAuthority) -> Result<()> {
@@ -1904,6 +1981,9 @@ struct NativeProjectRuntimeHost {
     binding_remote_validation: BindingRemoteValidation,
     /// Which unfinished lifecycle intents this opening replays; see [`RecoveryScope`].
     recovery_scope: RecoveryScope,
+    /// The image reclamations this host started in the background and has not yet seen finish:
+    /// what `settle_reclaims` waits for. Finished ones are dropped as new ones start.
+    reclaims: Vec<JoinHandle<()>>,
 }
 
 /// Who runs a workspace's supervisor.
@@ -2911,6 +2991,7 @@ impl NativeProjectRuntimeHost {
             intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
             recovery_scope,
+            reclaims: Vec::new(),
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -4985,10 +5066,7 @@ impl NativeProjectRuntimeHost {
                     let (report, retired) = self
                         .retire_pending_workspace(&workspace, options, origin, metadata)
                         .await?;
-                    let substrate = self.substrate.clone();
-                    std::mem::drop(tokio::spawn(async move {
-                        let _ = substrate.reclaim(retired).await;
-                    }));
+                    self.reclaim_in_background(retired);
                     return Ok(report);
                 }
                 // An unfinished create or fork that left no clone — refused after binding its
@@ -6604,7 +6682,7 @@ impl NativeProjectRuntimeHost {
 
     async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
         use super::supervisor::CommitmentSink;
-        use crate::storage::lifecycle::{LifecyclePlanner, Substrate};
+        use crate::storage::lifecycle::LifecyclePlanner;
 
         let plan = self
             .substrate
@@ -6630,13 +6708,21 @@ impl NativeProjectRuntimeHost {
         // workspace to take the slot mounts at exactly the same absolute path, which is the whole
         // point of a slot.
         self.release_slot(current.derived.workspace.name()).await?;
+        self.reclaim_in_background(retired);
+        Ok(())
+    }
+
+    /// Reclaim a retired image without holding up the verb that retired it. Best-effort by
+    /// design: an interrupted reclamation leaves trash for the next idempotent gc pass, and
+    /// `settle_reclaims` is how a caller that collects next waits for this one first.
+    fn reclaim_in_background(&mut self, retired: crate::storage::lifecycle::RetiredRef) {
+        use crate::storage::lifecycle::Substrate;
+
         let substrate = self.substrate.clone();
-        std::mem::drop(tokio::spawn(async move {
-            // Retirement removed the canonical image from discovery. Reclamation is deliberately
-            // best-effort here: an interrupted task leaves trash for the next idempotent gc pass.
+        self.reclaims.retain(|reclaim| !reclaim.is_finished());
+        self.reclaims.push(tokio::spawn(async move {
             let _ = substrate.reclaim(retired).await;
         }));
-        Ok(())
     }
 
     async fn retire_restored_main(&mut self, current: NativeWorkspace) -> Result<()> {
@@ -9283,6 +9369,78 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .chain(build.deferred.into_iter().map(Into::into))
                 .collect(),
         })
+    }
+
+    async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>> {
+        Ok(self
+            .pending_metadata()
+            .await?
+            .into_iter()
+            .map(|(_, metadata)| metadata.workspace)
+            .filter(|workspace| !workspace.is_main())
+            .collect())
+    }
+
+    async fn settle_reclaims(&mut self) -> Result<()> {
+        for reclaim in std::mem::take(&mut self.reclaims) {
+            reclaim.await.map_err(|error| {
+                CowshedError::internal(format!("image reclamation task failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
+        let trash = self
+            .layout
+            .project()
+            .sessions
+            .join(crate::storage::recovery::TRASH_NAMESPACE);
+        crate::storage::lifecycle::dispatch_blocking(move || -> Result<Vec<PathBuf>> {
+            let unreadable = |error: std::io::Error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot read the project's trash {}: {error}",
+                        trash.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )
+            };
+            let entries = match std::fs::read_dir(&trash) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(unreadable(error)),
+            };
+            let mut bundles = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(unreadable)?;
+                let path = entry.path();
+                if entry.file_type().map_err(unreadable)?.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "bundle")
+                {
+                    bundles.push(path);
+                }
+            }
+            bundles.sort();
+            for bundle in &bundles {
+                std::fs::remove_file(bundle).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot delete the abandon bundle {}: {error}",
+                            bundle.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    )
+                })?;
+            }
+            Ok(bundles)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("abandon bundle task failed: {error}")))?
     }
 
     // Port capacity is a grant, but never a revocation or a silently shrinking allocation.
@@ -14427,9 +14585,11 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
             CowshedError::lifecycle_conflict(error)
         }
-        crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::conflict(
-            "garbage-collection plan became stale",
-            "preview garbage collection again and retry",
+        crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::retryable(
+            crate::error::Retry::GcPlanStale,
+            "garbage-collection plan became stale: an image was reclaimed or retired between the \
+             plan and its execution, and nothing was collected",
+            "retry: garbage collection plans again from the store as it is now",
         ),
         crate::storage::apfs::ApfsStorageError::PendingPublication(path) => CowshedError::conflict(
             format!("restore publication is pending at {}", path.display()),

@@ -470,6 +470,11 @@ impl Coordinator {
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
+    // Remove the adopted project end to end (`cowshed rm main --restore --purge`, 02_workspaces.md): every session
+    // workspace, listed or never published, under opts' force/abandon; wait for their reclamation; gc; under abandon
+    // delete the trash's abandon bundles; restore main. A stale gc plan is `Conflict` with `Retry::GcPlanStale`
+    // (`retry_source()`, wire `"retry": {"reason": "gcPlanStale"}`): call again, nothing done is repeated.
+    pub async fn remove_project(&self, opts: RemoveProjectOptions) -> Result<RemoveProjectReport, CowshedError>;
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;
     pub async fn set_checkpoint_quota(&self, ws: &str, quota: CheckpointQuota) -> Result<(), CowshedError>;
     pub async fn doctor(&self) -> Result<DoctorReport, CowshedError>;

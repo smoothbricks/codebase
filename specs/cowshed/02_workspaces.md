@@ -880,6 +880,14 @@ unpublished before retirement does not invalidate that recovery fact.
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).
 
+`cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
+one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
+then it waits for the background reclamation those removals started, so its collection plans against a settled store;
+collects; with `--abandon` deletes the abandon bundles in `sessions/.trash` (then the only copy of those commits); and
+restores main. Each step is idempotent, so a refusal leaves the rest to the same command. A collection that still finds
+the store changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the
+same command finishes the removal; callers never sleep and retry `gc` themselves.
+
 ## `cowshed attach` / `cowshed detach`
 
 Explicit attachment lifecycle for long-lived workspaces: `detach` first stops admissions and drains the supervisor and
