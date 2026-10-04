@@ -242,10 +242,18 @@ export function createDefineOp<Ctx extends OpContext>(
     // skipFrames=3: Error -> extractMetadataFromStack -> defineOpImpl -> caller
     const baseMetadata = metadata?.package_file ? DEFAULT_METADATA : extractMetadataFromStack(3);
     // Use name from: 1) explicit metadata.name (transformer), 2) defineOp('name', fn), 3) baseMetadata
-    const finalMetadata: OpMetadata = {
+    const merged = {
       ...baseMetadata,
       ...metadata,
       name: metadata?.name ?? name,
+    };
+    // The pre-encoded dictionary entries are re-derived from the merged strings: a caller
+    // that overrides `package_name` without its `package_name_entry` would otherwise keep the
+    // base's entry, and Arrow conversion (which builds its dictionary from the entries) would
+    // write the base's string for every row.
+    const finalMetadata: OpMetadata = {
+      ...merged,
+      ...createOpMetadata(merged.name, merged.package_name, merged.package_file, merged.git_sha, merged.line),
     };
 
     // Use the Op class which handles all span/buffer management:

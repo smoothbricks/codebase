@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { Op } from '../op.js';
 import { createOpMetadata } from '../opContext/defineOp.js';
@@ -124,6 +125,28 @@ describe('Op Metadata', () => {
       // Runtime name should be used since metadata.name wasn't provided
       expect(myOp.metadata.name).toBe('runtime-name');
       expect(myOp.metadata.package_name).toBe('@my/package');
+    });
+
+    it('writes partial metadata strings to Arrow, not the defaults they override', async () => {
+      const ctx = defineOpContext({ logSchema: testSchema });
+      const { defineOp } = ctx;
+
+      // The shape a hand-written Op states: strings only, no pre-encoded dictionary entries.
+      const partialOp = defineOp('partial-op', (ctx) => ctx.ok('done'), {
+        package_name: '@my/package',
+        package_file: 'src/ops.ts',
+      });
+
+      const tracer = new TestTracer(ctx, createTestTracerOptions());
+      await tracer.trace('partial-root', partialOp);
+      const [root] = tracer.rootBuffers;
+      if (root === undefined) throw new Error('the traced root was not retained');
+
+      const table = convertSpanTreeToArrowTable(root);
+      const packages = new Set(table.getChild('package_name')?.toArray());
+      const files = new Set(table.getChild('package_file')?.toArray());
+      expect(packages).toEqual(new Set(['@my/package']));
+      expect(files).toEqual(new Set(['src/ops.ts']));
     });
   });
 
