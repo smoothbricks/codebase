@@ -63,7 +63,10 @@ export async function withPackWorkspace(
     );
     await writeFile(
       join(root, 'nx.json'),
-      manifestText({ targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } } }),
+      manifestText({
+        cacheDirectory: '.nx/cache',
+        targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      }),
     );
     await writePackWorkspacePackage(root, {
       name: '@priv.test/alpha',

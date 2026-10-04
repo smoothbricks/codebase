@@ -93,6 +93,7 @@ describe('publishable closure classification', () => {
  */
 describe('release pack artifacts', () => {
   it('packs the runtime closure into a verifiable manifest without contacting a registry or moving a ref', async () => {
+    let fixtureCacheRun = '';
     await withPrivateNpmFixture(async (fixture) => {
       await withPackWorkspace(async (root) => {
         const output = join(root, 'artifacts');
@@ -101,6 +102,8 @@ describe('release pack artifacts', () => {
         const statusBefore = await gitOutput(root, ['status', '--porcelain', '--untracked-files=no']);
 
         await releasePack(root, { projects: 'alpha', output });
+        fixtureCacheRun = join(root, '.nx/cache/run.json');
+        expect(await Bun.file(fixtureCacheRun).exists()).toBe(true);
 
         const manifest = await readManifest(output);
         expect(manifest.schemaVersion).toBe(1);
@@ -132,6 +135,7 @@ describe('release pack artifacts', () => {
         expect(await gitOutput(root, ['status', '--porcelain', '--untracked-files=no'])).toBe(statusBefore);
       });
     });
+    expect(await Bun.file(fixtureCacheRun).exists()).toBe(false);
   });
 
   it('refuses a nonempty output directory instead of mixing releases', async () => {
