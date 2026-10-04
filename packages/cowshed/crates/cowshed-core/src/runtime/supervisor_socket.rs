@@ -596,38 +596,17 @@ fn occupant(path: &Path) -> io::Result<Occupant> {
     }
 }
 
-/// Rename `from` to `to` in one step the kernel performs whole: Darwin's `renamex_np`, Linux's
-/// `renameat2`.
+/// Rename `from` to `to` in one step the kernel performs whole, refusing an existing `to`:
+/// [`crate::fsio::rename_noreplace`] against the working directory, which `from` and `to` resolve
+/// from when relative. On Linux that is the `renameat2` system call itself, not glibc's wrapper,
+/// which glibc only gained in 2.28 and the published arm64 Linux CLI does not link against.
 fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let native = |path: &Path| {
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     };
-    let (from, to) = (native(from)?, native(to)?);
-    #[cfg(target_os = "macos")]
-    let renamed = {
-        // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
-        unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) }
-    };
-    #[cfg(target_os = "linux")]
-    let renamed = {
-        // SAFETY: both are NUL-terminated paths that outlive the call, which only reads them.
-        unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        }
-    };
-    if renamed == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    crate::fsio::rename_noreplace(libc::AT_FDCWD, &native(from)?, &native(to)?)
 }
 
 fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
