@@ -8314,7 +8314,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .execute_restore_staged(
                 plan,
-                |_| async { Ok::<_, CowshedError>(()) },
                 move |fence| async move {
                     commitments
                         .record(CommitmentDraft::Restore {
@@ -13301,21 +13300,14 @@ fn native_retire_error(
 
 #[cfg(target_os = "macos")]
 fn native_restore_error(
-    error: crate::storage::apfs::RestoreExecutionError<CowshedError, CowshedError>,
+    error: crate::storage::apfs::RestoreExecutionError<CowshedError>,
 ) -> CowshedError {
     match error {
         crate::storage::apfs::RestoreExecutionError::Storage(error) => native_storage_error(error),
         crate::storage::apfs::RestoreExecutionError::Activation { source: error, .. } => {
             native_storage_error(*error)
         }
-        crate::storage::apfs::RestoreExecutionError::Prepare(error)
-        | crate::storage::apfs::RestoreExecutionError::Fence { source: error, .. } => error,
-        crate::storage::apfs::RestoreExecutionError::PrepareCleanup { prepare, cleanup } => {
-            CowshedError::integrity(
-                format!("{prepare}; cleanup also failed: {cleanup}"),
-                "cowshed doctor --json",
-            )
-        }
+        crate::storage::apfs::RestoreExecutionError::Fence { source: error, .. } => error,
     }
 }
 

@@ -14,7 +14,7 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingAdoption, PublicationError, RestoreStage, ResumableClone,
+    MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
     RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
@@ -1674,7 +1674,6 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
         .execute_restore_staged(
             plan,
             |_| async { Ok::<(), &'static str>(()) },
-            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect_err("staging metadata failure");
@@ -1720,7 +1719,6 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
         .execute_restore_staged(
             plan,
             |_| async { Ok::<(), &'static str>(()) },
-            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect_err("canonical marker failure");
@@ -1764,7 +1762,6 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
     substrate
         .execute_restore_staged(
             plan,
-            |_| async { Ok::<(), &'static str>(()) },
             |_| async { Ok::<(), &'static str>(()) },
         )
         .await
@@ -1854,7 +1851,6 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
             substrate
                 .plan_restore(&source, &checkpoint, RestoreMode::Replace, identity())
                 .expect("restore plan"),
-            |_| async { Ok::<(), &'static str>(()) },
             |_| async { Ok::<(), &'static str>(()) },
         )
         .await
@@ -2054,7 +2050,6 @@ async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identiti
             substrate
                 .plan_restore(&original, &checkpoint, RestoreMode::Replace, identity())
                 .expect("first restore plan"),
-            |_| async { Ok::<(), &'static str>(()) },
             move |fence| async move {
                 assert_eq!(fence.pending.source_checkpoint, "retained-origin");
                 assert_eq!(fence.pending.source_incarnation, expected_source);
@@ -2088,7 +2083,6 @@ async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identiti
                     identity(),
                 )
                 .expect("second restore plan"),
-            |_| async { Ok::<(), &'static str>(()) },
             move |fence| async move {
                 assert_eq!(fence.pending.source_checkpoint, "retained-origin");
                 assert_eq!(fence.pending.source_incarnation, expected_source);
@@ -2439,60 +2433,6 @@ async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
 }
 
 #[tokio::test]
-async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
-    for mode in [RestoreMode::Replace, RestoreMode::VerifyOnly] {
-        let host = FakeHost::default();
-        let current = workspace("raven", 7);
-        host.seed(&current);
-        let substrate = substrate(host.clone(), CountingLane::default());
-        let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-            current.clone(),
-            CheckpointLabel::new("ready").expect("label"),
-            Revision::new(8),
-            true,
-        );
-        let plan = substrate
-            .plan_restore(&current, &checkpoint, mode, identity())
-            .expect("restore plan");
-        let entered = Arc::new(AtomicBool::new(false));
-        let callback_entered = Arc::clone(&entered);
-        let task = tokio::spawn(async move {
-            substrate
-                .execute_restore_staged(
-                    plan,
-                    move |stage| async move {
-                        assert_eq!(
-                            matches!(stage, RestoreStage::Replace(_)),
-                            mode == RestoreMode::Replace
-                        );
-                        callback_entered.store(true, Ordering::SeqCst);
-                        std::future::pending::<Result<(), &'static str>>().await
-                    },
-                    |_| async { Ok::<(), &'static str>(()) },
-                )
-                .await
-        });
-
-        abort_at_callback(task, entered).await;
-
-        assert_no_orphan_stage(&host);
-        assert_eq!(
-            host.list(&repo()).expect("post-cancel listing"),
-            vec![StorageFact {
-                workspace: current,
-                volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
-            }]
-        );
-        let events = host.events();
-        assert!(events.contains(&"detach:Release".to_owned()));
-        if mode == RestoreMode::Replace {
-            assert!(events.contains(&"idempotent-reclaim".to_owned()));
-        }
-        assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
-    }
-}
-
-#[tokio::test]
 async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
     let host = FakeHost::default();
     let current = workspace("raven", 7);
@@ -2517,7 +2457,6 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
             substrate
                 .execute_restore_staged(
                     plan,
-                    |_| async { Ok::<(), &'static str>(()) },
                     move |fence| async move {
                         *callback_workspace.lock().expect("pending workspace") =
                             Some(fence.pending.workspace);

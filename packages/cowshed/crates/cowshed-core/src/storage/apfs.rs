@@ -183,18 +183,6 @@ pub type AdoptStage = WorkspaceStage;
 pub type CreateStage = WorkspaceStage;
 pub type ForkStage = WorkspaceStage;
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RestoreStage {
-    Verify {
-        workspace: LifecycleWorkspace,
-        label: CheckpointLabel,
-        revision: Revision,
-        image: PathBuf,
-        mount_point: PathBuf,
-    },
-    Replace(WorkspaceStage),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointStage {
     pub checkpoint: CheckpointRef,
     pub image: PathBuf,
@@ -266,19 +254,9 @@ pub enum StagedExecutionError<E> {
 }
 
 #[derive(Debug, Error)]
-pub enum RestoreExecutionError<P, F> {
+pub enum RestoreExecutionError<F> {
     #[error("restore staging failed: {0}")]
     Storage(#[source] ApfsStorageError),
-    #[error("restore prepare callback failed: {0}")]
-    Prepare(P),
-    #[error(
-        "restore prepare callback failed and cleanup also failed: prepare={prepare}; cleanup={cleanup}"
-    )]
-    PrepareCleanup {
-        prepare: P,
-        #[source]
-        cleanup: ApfsStorageError,
-    },
     #[error("restore fence failed with a pending forward-only publication: {source}")]
     Fence {
         source: F,
@@ -306,7 +284,7 @@ impl<F> From<ApfsStorageError> for RetireExecutionError<F> {
     }
 }
 
-impl<P, F> From<ApfsStorageError> for RestoreExecutionError<P, F> {
+impl<F> From<ApfsStorageError> for RestoreExecutionError<F> {
     fn from(error: ApfsStorageError) -> Self {
         Self::Storage(error)
     }
@@ -1307,23 +1285,16 @@ where
             .map_err(Into::into)
     }
 
-    pub async fn execute_restore_staged<
-        Prepare,
-        PrepareFut,
-        PrepareError,
-        Fence,
-        FenceFut,
-        FenceError,
-    >(
+    /// Restore `plan`'s checkpoint, then publish a replacement through `fence` before it becomes
+    /// discoverable. Staging and the swap run as one lane step, as a checkpoint does, so nothing
+    /// observes a half-prepared restore; a fence failure is forward-only and names the pending
+    /// publication for the caller or startup recovery to finish.
+    pub async fn execute_restore_staged<Fence, FenceFut, FenceError>(
         &self,
         plan: RestorePlan,
-        prepare: Prepare,
         fence: Fence,
-    ) -> Result<RestoreReceipt, RestoreExecutionError<PrepareError, FenceError>>
+    ) -> Result<RestoreReceipt, RestoreExecutionError<FenceError>>
     where
-        Prepare: FnOnce(RestoreStage) -> PrepareFut + Send,
-        PrepareFut: Future<Output = Result<(), PrepareError>> + Send,
-        PrepareError: Send,
         Fence: FnOnce(RestoreFence) -> FenceFut + Send,
         FenceFut: Future<Output = Result<(), FenceError>> + Send,
         FenceError: Send,
@@ -1346,7 +1317,7 @@ where
         let incarnations = Arc::clone(&self.incarnations);
         let expected = plan.expected().to_vec();
         let operation = plan.operation().clone();
-        let prepared = self
+        let committed = self
             .lane
             .dispatch(move || {
                 let Operation::Restore {
@@ -1360,7 +1331,7 @@ where
                         "staged restore executor requires a restore operation",
                     ));
                 };
-                prepare_restore_stage(
+                let prepared = prepare_restore_stage(
                     host.as_ref(),
                     &config,
                     &expected,
@@ -1371,40 +1342,9 @@ where
                         identity,
                     },
                     incarnations.as_ref(),
-                )
+                )?;
+                commit_prepared_restore(host.as_ref(), &config, prepared)
             })
-            .await?;
-        let prepared = StagedCallbackGuard::new(
-            Arc::clone(&self.host),
-            prepared,
-            abort_prepared_restore::<H>,
-        );
-
-        let stage = match prepared.get() {
-            PreparedRestore::Verify(prepared) => prepared.stage.clone(),
-            PreparedRestore::Replace(prepared) => RestoreStage::Replace(prepared.stage.clone()),
-        };
-        if let Err(prepare_error) = prepare(stage).await {
-            let prepared = prepared.into_prepared();
-            let host = Arc::clone(&self.host);
-            let cleanup = self
-                .lane
-                .dispatch(move || abort_prepared_restore(host.as_ref(), prepared))
-                .await;
-            return Err(match cleanup {
-                Ok(()) => RestoreExecutionError::Prepare(prepare_error),
-                Err(cleanup) => RestoreExecutionError::PrepareCleanup {
-                    prepare: prepare_error,
-                    cleanup,
-                },
-            });
-        }
-        let prepared = prepared.into_prepared();
-        let host = Arc::clone(&self.host);
-        let config = Arc::clone(&self.config);
-        let committed = self
-            .lane
-            .dispatch(move || commit_prepared_restore(host.as_ref(), &config, prepared))
             .await?;
         let CommittedRestore::Pending(pending) = committed else {
             let CommittedRestore::Verified(receipt) = committed else {
@@ -2026,7 +1966,6 @@ struct PreparedCheckpoint {
 }
 
 struct PreparedVerifyRestore<A> {
-    stage: RestoreStage,
     attachment: A,
     receipt: RestoreReceipt,
 }
@@ -2796,13 +2735,6 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         }
         let previous_incarnation = current.incarnation().clone();
         return Ok(PreparedRestore::Verify(PreparedVerifyRestore {
-            stage: RestoreStage::Verify {
-                workspace: current.clone(),
-                label: label.clone(),
-                revision: checkpoint_expected_revision(expected, workspace_name, label)?,
-                image: checkpoint_image,
-                mount_point,
-            },
             attachment,
             receipt: RestoreReceipt {
                 previous_incarnation,
@@ -2897,23 +2829,6 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         previous_incarnation,
         source_checkpoint: label.to_string(),
     }))
-}
-
-fn abort_prepared_restore<H: ApfsExecutionHost>(
-    host: &H,
-    prepared: PreparedRestore<H::Attachment>,
-) -> Result<(), ApfsStorageError> {
-    match prepared {
-        PreparedRestore::Verify(prepared) => {
-            host.detach(prepared.attachment, DetachIntent::Release)
-        }
-        PreparedRestore::Replace(prepared) => detach_and_reclaim(
-            host,
-            prepared.attachment,
-            &prepared.staged_image,
-            "restore staging detach",
-        ),
-    }
 }
 
 fn commit_prepared_restore<H: ApfsExecutionHost>(
@@ -3210,27 +3125,6 @@ fn expected_revision(expected: &[LifecycleFact]) -> Result<u64, ApfsStorageError
         })
         .ok_or(ApfsStorageError::InvalidPlan(
             "workspace revision expectation is missing",
-        ))
-}
-
-fn checkpoint_expected_revision(
-    expected: &[LifecycleFact],
-    workspace: &WorkspaceName,
-    label: &CheckpointLabel,
-) -> Result<Revision, ApfsStorageError> {
-    expected
-        .iter()
-        .find_map(|fact| match fact {
-            LifecycleFact::Checkpoint {
-                workspace: expected_workspace,
-                label: expected_label,
-                revision,
-                ..
-            } if expected_workspace == workspace && expected_label == label => Some(*revision),
-            _ => None,
-        })
-        .ok_or(ApfsStorageError::InvalidPlan(
-            "checkpoint revision expectation is missing",
         ))
 }
 

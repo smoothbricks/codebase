@@ -121,23 +121,12 @@ where
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send;
 
-    pub async fn execute_restore_staged<
-        Prepare,
-        PrepareFut,
-        PrepareError,
-        Fence,
-        FenceFut,
-        FenceError,
-    >(
+    pub async fn execute_restore_staged<Fence, FenceFut, FenceError>(
         &self,
         plan: RestorePlan,
-        prepare: Prepare,
         fence: Fence,
-    ) -> Result<RestoreReceipt, RestoreExecutionError<PrepareError, FenceError>>
+    ) -> Result<RestoreReceipt, RestoreExecutionError<FenceError>>
     where
-        Prepare: FnOnce(RestoreStage) -> PrepareFut + Send,
-        PrepareFut: Future<Output = Result<(), PrepareError>> + Send,
-        PrepareError: Send,
         Fence: FnOnce(RestoreFence) -> FenceFut + Send,
         FenceFut: Future<Output = Result<(), FenceError>> + Send,
         FenceError: Send;
@@ -159,14 +148,14 @@ The executor contract is:
   `CheckpointManifestRecord` and its `barrier_id`, and return success only when that barrier is durable. Only then may
   the executor clone and verify the image and publish its checkpoint fact. Callback failure or cancellation therefore
   leaves no checkpoint snapshot whose filesystem state outruns its artifact manifest.
-- **Restore has a preparation callback and a publication fence.** `prepare(RestoreStage)` validates and initializes a
-  private replacement (or validates `RestoreStage::Verify`) before it can be published. For a replacement, the executor
-  then swaps images and persists `PendingPublicationFact`, calls `fence(RestoreFence)`, and only after the fence
-  succeeds activates restored metadata and returns `RestoreReceipt`. The fence is where the controller durably commits
-  the incarnation/token/gateway/supervisor handoff; neither the old nor new incarnation may be admitted across that
-  barrier. Verification-only restore returns after `prepare` and performs no publication fence.
-- **Cancellation follows the same transaction boundaries as errors.** Dropping a future while an adopt/create/fork or
-  restore preparation callback is pending synchronously detaches its private attachment and reclaims any cloned staging
+- **Restore has a publication fence.** The executor stages, mints and validates a private replacement (or mounts and
+  validates the checkpoint read-only for a verification-only restore) and, for a replacement, swaps images and persists
+  `PendingPublicationFact` in one blocking-lane step, so no caller observes a half-prepared restore. It then calls
+  `fence(RestoreFence)` and only after the fence succeeds activates restored metadata and returns `RestoreReceipt`. The
+  fence is where the controller durably commits the incarnation/token/gateway/supervisor handoff; neither the old nor
+  new incarnation may be admitted across that barrier. Verification-only restore detaches and returns without a fence.
+- **Cancellation follows the same transaction boundaries as errors.** Dropping a future while an adopt/create/fork
+  initialization callback is pending synchronously detaches its private attachment and reclaims any cloned staging
   image before the lifecycle lock is released. Dropping a checkpoint future while its pre-clone barrier is pending
   creates no image. Once restore has persisted `PendingPublicationFact`, rollback across the incarnation fence is
   forbidden: a fence error, activation error, cancellation, or crash retains the typed pending fact, and the next

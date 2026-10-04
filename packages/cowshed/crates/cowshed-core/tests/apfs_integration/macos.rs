@@ -289,7 +289,6 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .execute_restore_staged(
                 restore_plan,
                 |_| async { Ok::<(), &'static str>(()) },
-                |_| async { Ok::<(), &'static str>(()) },
             )
             .await
             .map_err(|error| std::io::Error::other(format!("restore: {error}")))?
