@@ -19,6 +19,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["pyproject.toml", "uv.lock"],
     contribute,
     host_cache_homes: &[&UV_HOME],
+    reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

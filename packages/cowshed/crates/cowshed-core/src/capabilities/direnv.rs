@@ -10,6 +10,7 @@ pub const DETECTOR: Detector = Detector {
     all: &[".envrc"],
     any: &[],
     host_cache_homes: &[],
+    reached_from: None,
     contribute,
 };
 

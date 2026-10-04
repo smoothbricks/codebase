@@ -34,6 +34,7 @@ pub const DETECTOR: Detector = Detector {
     any: &[],
     scope: DetectionScope::Project,
     host_cache_homes: &[],
+    reached_from: None,
     contribute,
 };
 

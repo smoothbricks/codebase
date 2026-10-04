@@ -14,6 +14,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["flake.nix", "devenv.nix"],
     contribute,
     host_cache_homes: &[&CACHE_HOME, &STATE_HOME],
+    reached_from: Some(reached_through_envrc),
 };
 pub static CACHE_HOME: SharedToolHome = SharedToolHome {
     variable: None,
@@ -28,6 +29,125 @@ pub static STATE_HOME: SharedToolHome = SharedToolHome {
     linked_from_checkouts: false,
 };
 pub const DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+
+/// The files that make a directory a Nix project.
+const NIX_FILES: [&str; 3] = ["flake.nix", "devenv.nix", "devenv.yaml"];
+/// How many shell files one `.envrc` chain may read before detection stops following it.
+const ENVRC_CHAIN_BOUND: usize = 16;
+
+/// A project whose `.envrc` drives Nix may keep its Nix files elsewhere in the repository —
+/// `cd tooling/devenv` then `. envrc.sh`, where the sourced file says `use devenv`. The chain is
+/// read, never run: a direnv `use flake`, `use nix` or `use devenv` (or its `use_*` function)
+/// in any file it reaches is the convention, and so is a Nix file in a directory it `cd`s into or
+/// sources from. Only literal arguments are followed — a word with an expansion or quote inside
+/// names nothing detection can know — each file once, at most [`ENVRC_CHAIN_BOUND`] files, and
+/// never outside the workspace: an escaping path is not followed, not an error.
+fn reached_through_envrc(workspace: &Path, directory: &Path) -> Result<bool> {
+    let mut pending = vec![(directory.join(".envrc"), directory.to_path_buf())];
+    let mut read = std::collections::BTreeSet::new();
+    while let Some((file, mut cwd)) = pending.pop() {
+        if read.len() == ENVRC_CHAIN_BOUND {
+            break;
+        }
+        let Some(file) = contained(workspace, &file)? else {
+            continue;
+        };
+        if !file.is_file() || !read.insert(file.clone()) {
+            continue;
+        }
+        let source = std::fs::read(&file).map_err(|error| super::detection_error(&file, error))?;
+        for line in String::from_utf8_lossy(&source).lines() {
+            let code = line.split('#').next().unwrap_or_default();
+            let words: Vec<&str> = code.split_whitespace().collect();
+            match words.as_slice() {
+                ["use", "flake" | "nix" | "devenv", ..]
+                | ["use_flake" | "use_nix" | "use_devenv", ..] => return Ok(true),
+                ["cd", target] => {
+                    let Some(target) = literal(target) else {
+                        continue;
+                    };
+                    cwd = cwd.join(target);
+                    if nix_files_in(workspace, &cwd)? {
+                        return Ok(true);
+                    }
+                }
+                ["." | "source", target, ..] => {
+                    if let Some(target) = literal(target) {
+                        pending.push((cwd.join(target), cwd.clone()));
+                    }
+                }
+                ["source_env" | "source_env_if_exists", target, ..] => {
+                    let Some(target) = literal(target) else {
+                        continue;
+                    };
+                    let target = cwd.join(target);
+                    // direnv sources a directory's `.envrc` and runs a file from its own directory.
+                    let (file, home) = if target.is_dir() {
+                        (target.join(".envrc"), target)
+                    } else {
+                        let parent = target.parent().unwrap_or(&cwd).to_path_buf();
+                        (target, parent)
+                    };
+                    if nix_files_in(workspace, &home)? {
+                        return Ok(true);
+                    }
+                    pending.push((file, home));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// A shell word that names one path as written: unquoted, or wholly single- or double-quoted,
+/// with no expansion, substitution or home reference inside.
+fn literal(word: &str) -> Option<&str> {
+    let unquoted = ['\'', '"']
+        .into_iter()
+        .find_map(|quote| word.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(word);
+    (!unquoted.is_empty() && !unquoted.contains(['$', '`', '~', '\'', '"', '\\', '*', '?']))
+        .then_some(unquoted)
+}
+
+/// `path` resolved inside `workspace`, or `None` when it lies or resolves outside it. A path
+/// that does not exist resolves lexically.
+fn contained(workspace: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    let mut lexical = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            std::path::Component::CurDir => {}
+            component => lexical.push(component),
+        }
+    }
+    if !lexical.starts_with(workspace) {
+        return Ok(None);
+    }
+    match std::fs::canonicalize(&lexical) {
+        Ok(resolved) => Ok(resolved.starts_with(workspace).then_some(resolved)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(lexical)),
+        Err(error) => Err(super::detection_error(&lexical, error)),
+    }
+}
+
+/// Whether `directory`, inside the workspace, holds one of [`NIX_FILES`].
+fn nix_files_in(workspace: &Path, directory: &Path) -> Result<bool> {
+    let Some(directory) = contained(workspace, directory)? else {
+        return Ok(false);
+    };
+    for name in NIX_FILES {
+        if let Some(file) = contained(workspace, &directory.join(name))?
+            && file.is_file()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = CapabilityContribution::default();
@@ -110,6 +230,100 @@ mod tests {
     #[test]
     fn devenv_enables_nix() {
         assert_switch(&DETECTOR, &["devenv.nix"]);
+    }
+
+    fn write(fixture: &Fixture, file: &str, contents: &str) {
+        let path = fixture.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn detected(fixture: &Fixture) -> bool {
+        DETECTOR.detect(&fixture.context()).unwrap().is_some()
+    }
+
+    /// direnv's own Nix directives, in either spelling, make an `.envrc` project a Nix one.
+    #[test]
+    fn an_envrc_using_nix_enables_nix_without_a_root_nix_file() {
+        for envrc in [
+            "use flake\n",
+            "use nix shell.nix\n",
+            "  use devenv # in place\n",
+            "use_flake .#dev\n",
+        ] {
+            let fixture = Fixture::new();
+            write(&fixture, ".envrc", envrc);
+            assert!(detected(&fixture), "{envrc:?}");
+        }
+    }
+
+    /// The managed-shell shape: the `.envrc` changes into a nested directory and sources a file
+    /// there, and the Nix directive or files live only in that directory.
+    #[test]
+    fn a_nested_shell_the_envrc_enters_or_sources_enables_nix() {
+        let sourced = Fixture::new();
+        write(
+            &sourced,
+            ".envrc",
+            "export A=1\ncd tooling/shell\n. envrc.sh\n",
+        );
+        write(&sourced, "tooling/shell/envrc.sh", "use devenv\n");
+        assert!(detected(&sourced), "a directive in a sourced file");
+
+        let entered = Fixture::new();
+        write(&entered, ".envrc", "cd 'tooling/shell'\n");
+        write(&entered, "tooling/shell/devenv.nix", "{ }\n");
+        assert!(detected(&entered), "a Nix file where the envrc cds");
+
+        let source_env = Fixture::new();
+        write(&source_env, ".envrc", "source_env nix/.envrc-shell\n");
+        write(&source_env, "nix/flake.nix", "{ }\n");
+        assert!(detected(&source_env), "a Nix file beside a source_env file");
+    }
+
+    /// A plain `.envrc`, a variable path, a source cycle and a path out of the workspace reach no
+    /// Nix convention, and none of them is an error.
+    #[test]
+    fn an_envrc_that_reaches_no_nix_convention_enables_nothing() {
+        let plain = Fixture::new();
+        write(
+            &plain,
+            ".envrc",
+            "export UNIX_SOCKET=1 # nix mentioned in passing\n",
+        );
+        assert!(!detected(&plain));
+
+        let variable = Fixture::new();
+        write(
+            &variable,
+            ".envrc",
+            "cd \"$TOOLS\"\n. \"$TOOLS/envrc.sh\"\n",
+        );
+        write(&variable, "envrc.sh", "use devenv\n");
+        assert!(!detected(&variable));
+
+        let cycle = Fixture::new();
+        write(&cycle, ".envrc", ". a.sh\n");
+        write(&cycle, "a.sh", ". b.sh\n");
+        write(&cycle, "b.sh", ". a.sh\n. .envrc\n");
+        assert!(!detected(&cycle));
+
+        let outside = Fixture::new();
+        write(
+            &outside,
+            "workspace/.envrc",
+            "cd ../elsewhere\n. ../elsewhere/envrc.sh\n",
+        );
+        write(&outside, "elsewhere/flake.nix", "{ }\n");
+        write(&outside, "elsewhere/envrc.sh", "use flake\n");
+        let workspace = outside.root.join("workspace");
+        let context = DetectionContext {
+            workspace_root: &workspace,
+            project_root: &workspace,
+            command_cwd: &workspace,
+            ..outside.context()
+        };
+        assert!(DETECTOR.detect(&context).unwrap().is_none());
     }
     #[test]
     fn the_daemon_entry_must_resolve_to_a_socket() {

@@ -19,6 +19,7 @@ pub const DETECTOR: Detector = Detector {
     any: &[],
     contribute,
     host_cache_homes: &[&ZIG_HOME],
+    reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

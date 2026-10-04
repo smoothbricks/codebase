@@ -191,6 +191,9 @@ pub struct Detector {
     pub any: &'static [&'static str],
     pub contribute: fn(&DetectionContext<'_>) -> Result<CapabilityContribution>,
     pub host_cache_homes: &'static [&'static SharedToolHome],
+    /// A convention another project file reaches when none of `any` is in the directory
+    /// itself: given the workspace and the directory, whether that file leads to the convention.
+    pub reached_from: Option<fn(&Path, &Path) -> Result<bool>>,
 }
 
 impl Detector {
@@ -239,7 +242,10 @@ impl Detector {
                 return Ok(true);
             }
         }
-        Ok(false)
+        match self.reached_from {
+            Some(reached) => reached(workspace, directory),
+            None => Ok(false),
+        }
     }
 }
 

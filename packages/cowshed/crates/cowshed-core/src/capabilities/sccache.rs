@@ -13,6 +13,7 @@ pub const DETECTOR: Detector = Detector {
     any: &[],
     contribute,
     host_cache_homes: &[],
+    reached_from: None,
 };
 
 pub fn server_socket() -> PathBuf {

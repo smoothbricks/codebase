@@ -19,6 +19,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["bun.lock", "bun.lockb"],
     contribute,
     host_cache_homes: &[&BUN_HOME],
+    reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

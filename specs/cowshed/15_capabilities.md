@@ -34,12 +34,19 @@ mean absence; other filesystem errors report the path and failure.
 | uv       | `pyproject.toml` or `uv.lock`                                                  | uv cache and platform certificate opt-in                                                                            |
 | Zig      | `build.zig`                                                                    | Zig global cache                                                                                                    |
 | Gradle   | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts` | Gradle cache, not host credentials or configuration                                                                 |
-| Nix      | `flake.nix` or `devenv.nix`                                                    | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables |
+| Nix      | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)         | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables |
 | sccache  | cargo convention and an installed host compiler-cache client                   | Compiler wrapper, exact host daemon socket and cache-client settings                                                |
 
 A Nix/devenv convention does not activate a shell. Projects that want devenv activation use their own `.envrc` with
 direnv's `use devenv`. There is no built-in devenv shell backend or `[devenv]` configuration. No detector recognizes a
 repository name, a managed-repository marker or a project-specific compiler cache.
+
+A project may keep its Nix files away from its root and reach them from its `.envrc`, for example with
+`cd tooling/shell` and then `. envrc.sh`. The Nix convention therefore also holds when the `.envrc` chain reaches Nix.
+That means a direnv `use flake`, `use nix` or `use devenv` (or the `use_*` function) in any file the chain sources, or a
+`flake.nix`, `devenv.nix` or `devenv.yaml` in a directory the chain `cd`s into or sources from. The chain is read and
+never run. Detection follows only literal `cd`, `.`, `source`, `source_env` and `source_env_if_exists` arguments, reads
+each file once and at most 16 files in all, and never follows a path out of the workspace.
 
 ## One contribution contract
 

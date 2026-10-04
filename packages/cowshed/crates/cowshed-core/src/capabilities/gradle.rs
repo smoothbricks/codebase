@@ -27,6 +27,7 @@ pub const DETECTOR: Detector = Detector {
     ],
     contribute,
     host_cache_homes: &[&GRADLE_HOME],
+    reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
