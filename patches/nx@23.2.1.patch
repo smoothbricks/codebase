@@ -210,6 +210,101 @@ index b1c143e..43d3f13 100644
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
+diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
+index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff917bf214bb 100644
+--- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js
++++ b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
+@@ -11,6 +11,7 @@ const crypto_1 = require("crypto");
+ const net_1 = require("net");
+ const path = require("path");
+ const logger_1 = require("../../../daemon/logger");
++const is_on_daemon_1 = require("../../../daemon/is-on-daemon");
+ const sandbox_socket_hint_1 = require("../../../daemon/sandbox-socket-hint");
+ const socket_refused_exit_code_1 = require("../../../utils/socket-refused-exit-code");
+ const socket_utils_1 = require("../../../daemon/socket-utils");
+@@ -210,7 +211,7 @@ class IsolatedPlugin {
+         this.include = loadResult.include;
+         this.exclude = loadResult.exclude;
+         const registeredHooks = hooks(loadResult.createNodesPattern && 'createNodes', loadResult.hasCreateDependencies && 'createDependencies', loadResult.hasCreateMetadata && 'createMetadata', loadResult.hasPreTasksExecution && 'preTasksExecution', loadResult.hasPostTasksExecution && 'postTasksExecution');
+-        this.lifecycle = new plugin_lifecycle_manager_1.PluginLifecycleManager(registeredHooks);
++        this.lifecycle = new plugin_lifecycle_manager_1.PluginLifecycleManager(registeredHooks, (0, is_on_daemon_1.isOnDaemon)());
+         const shutdown = (hookName) => this.shutdownIfInactive(hookName);
+         const wrap = (hook, hookFn) => this.lifecycle.wrapHook(hook, async (...args) => {
+             await this.ensureAlive();
+diff --git a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
+index 3a6df86646a11f371525fca978edf0fc318bf848..1e73ad21751964e3c6839e44eb43488677a9cec3 100644
+--- a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
++++ b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
+@@ -20,6 +20,10 @@ export type Hook = (typeof HOOKS_BY_PHASE)[Phase][number];
+  * Shutdown occurs when:
+  * 1. All phase sessions complete (ref count reaches 0)
+  * 2. No later phases have registered hooks
++ * 3. The worker is not resident: a host that recomputes the graph for every
++ *    file change (the daemon) keeps a worker with graph hooks alive, because
++ *    the next change calls those hooks again and a restart costs a process
++ *    spawn plus a plugin load each time
+  */
+ export declare class PluginLifecycleManager {
+     /** Phases where this plugin has at least one registered hook */
+@@ -28,7 +32,9 @@ export declare class PluginLifecycleManager {
+     private readonly phaseSessionCount;
+     /** Ordered list of registered phases (derived from HOOKS_BY_PHASE key order, narrowed to registered phases) */
+     private readonly registeredPhaseOrder;
+-    constructor(registeredHooks: Iterable<Hook>);
++    /** Whether this worker outlives its phases (see class doc, rule 3) */
++    private readonly resident;
++    constructor(registeredHooks: Iterable<Hook>, recomputesGraph?: boolean);
+     wrapHook<TArgs extends unknown[], TReturn>(hook: Hook, fn: (...args: TArgs) => Promise<TReturn>, shutdown: () => Promise<void> | void): (...args: TArgs) => Promise<TReturn>;
+     /**
+      * Called when entering a hook. Increments phase session count if this
+diff --git a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
+index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9a96f673a 100644
+--- a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
++++ b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
+@@ -28,9 +28,13 @@ const PHASE_ORDER = keys(HOOKS_BY_PHASE);
+  * Shutdown occurs when:
+  * 1. All phase sessions complete (ref count reaches 0)
+  * 2. No later phases have registered hooks
++ * 3. The worker is not resident: a host that recomputes the graph for every
++ *    file change (the daemon) keeps a worker with graph hooks alive, because
++ *    the next change calls those hooks again and a restart costs a process
++ *    spawn plus a plugin load each time
+  */
+ class PluginLifecycleManager {
+-    constructor(registeredHooks) {
++    constructor(registeredHooks, recomputesGraph = false) {
+         /** Phases where this plugin has at least one registered hook */
+         this.registeredPhases = {};
+         /** Number of active "phase sessions" (callers between first and last hook) */
+@@ -51,6 +55,8 @@ class PluginLifecycleManager {
+         for (const phase of this.registeredPhaseOrder) {
+             this.phaseSessionCount[phase] = 0;
+         }
++        /** Whether this worker outlives its phases (see class doc, rule 3) */
++        this.resident = recomputesGraph && this.registeredPhases['graph'] !== undefined;
+     }
+     wrapHook(hook, fn, shutdown) {
+         return async (...args) => {
+@@ -109,8 +115,8 @@ class PluginLifecycleManager {
+         // Can only shut down if no more active sessions in this phase
+         if (newCount > 0)
+             return false;
+-        // Can only shut down if this is the last registered phase
+-        return this.isLastRegisteredPhase(phase);
++        // Can only shut down a non-resident worker after its last registered phase
++        return !this.resident && this.isLastRegisteredPhase(phase);
+     }
+     /**
+      * Returns true if the worker should shut down immediately after construction.
+@@ -173,7 +179,7 @@ class PluginLifecycleManager {
+         if (newCount > 0) {
+             return false;
+         }
+-        return this.isLastRegisteredPhase(phase);
++        return !this.resident && this.isLastRegisteredPhase(phase);
+     }
+     /**
+      * Returns the current session count for a phase. Useful for testing.
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
 index 4a34ba2..c08789f 100644
 --- a/dist/src/tasks-runner/cache.js
