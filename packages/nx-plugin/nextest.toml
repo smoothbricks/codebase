@@ -49,25 +49,3 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
 slow-timeout = { period = "60s", terminate-after = 1 }
-
-# The real-APFS command-dispatch tests drive a whole cowshed lifecycle through the
-# CLI the same way: adopt a checkout onto a fresh ASIF image, open workspaces, and
-# (checked land) start a gateway and land through it. That is several attaches,
-# formats and detaches per test, which is the same irreducible floor as above.
-#
-# Measured: all five together take 4.4-6.3s on an idle developer host, but on the
-# hosted macos-latest arm64 runner the Publish workflow uses, the four simpler ones
-# take 26.9-27.8s and checked land passed 30s in two consecutive runs (Publish runs
-# 37133456276 and 37169899755: its detach alone took 5.9s, canonical init 5.1s).
-# Every phase is uniformly about five times slower there; no single step stalls.
-# The 30s default therefore fails the runner that tests the arm64 macOS release.
-#
-# 60s is twice the 30s bound checked land overran there while its siblings needed
-# up to 27.8s, and it stays bounded for the same reason as above. Re-derive it from
-# those runs' timings if the dispatch fixtures or the runner class change.
-#
-# Matched by test name only: this file is every Cargo workspace's nextest layer,
-# and a `binary_id(...)` naming a binary a workspace lacks is a nextest error there.
-[[profile.default.overrides]]
-filter = 'test(/^macos::real_apfs_(dispatch|checked_land)_/)'
-slow-timeout = { period = "60s", terminate-after = 1 }
