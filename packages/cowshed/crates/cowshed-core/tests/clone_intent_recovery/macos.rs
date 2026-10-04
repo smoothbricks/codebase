@@ -9,9 +9,11 @@ use cowshed_core::apfs::{
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
+use cowshed_core::metadata::{
+    DetachedWorkspaceMetadata, ImageCapacity, PortBlock, PublicationState, WorkspaceName,
+};
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
+use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::ApfsSubstrateConfig;
 use cowshed_core::storage::apfs::native::{
@@ -299,6 +301,37 @@ impl Fixture {
         })
         .expect("journal the unreplayable create");
     }
+
+    /// Stands at `workspace`'s supervisor socket until a lifecycle verb asks who serves it, which
+    /// the verb does only once the workspace's image is published. At that moment it does what a
+    /// gateway reconcile in another process does to install the workspace's session: bind the
+    /// base port of the published block. Then it lets go of the socket, so the verb serves its
+    /// own supervisor there.
+    fn gateway_at_hello(&self, workspace: &str) -> GatewayAtHello {
+        let workspace = name(workspace);
+        let socket = supervisor_socket::socket_path(self.storage.store(), &self.repo, &workspace);
+        fs::create_dir_all(socket.parent().expect("socket directory")).expect("run directory");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("stand at the socket");
+        let image = self
+            .layout()
+            .canonical_image(&workspace)
+            .expect("image path")
+            .image()
+            .to_path_buf();
+        GatewayAtHello(tokio::spawn(async move {
+            let (hello, _) = listener.accept().await.expect("the verb's hello");
+            let published = DetachedWorkspaceMetadata::read_for_image(&image).expect("sidecar");
+            assert_eq!(published.publication_state, PublicationState::Active);
+            let block = published.grants.port_block.expect("a port block");
+            let installed =
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, block.base()))
+                    .map(drop)
+                    .map_err(|error| error.kind());
+            drop(listener);
+            drop(hello);
+            installed
+        }))
+    }
 }
 
 /// Reservation markers this test holds on behalf of an imaginary concurrent creator.
@@ -309,6 +342,15 @@ impl PortClaims {
         for marker in &self.0 {
             fs::remove_file(marker).expect("release port reservation marker");
         }
+    }
+}
+
+/// What binding the published block's gateway port answered, at the verb's hello.
+struct GatewayAtHello(tokio::task::JoinHandle<std::result::Result<(), std::io::ErrorKind>>);
+
+impl GatewayAtHello {
+    async fn installed(self) -> std::result::Result<(), std::io::ErrorKind> {
+        self.0.await.expect("the gateway stand-in")
     }
 }
 
@@ -648,4 +690,46 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
         .expect("the name is free again");
     assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
     next.shutdown().await.expect("stop the creating runtime");
+}
+
+/// The kernel claim on a new workspace's port block lasts until its image publication is
+/// complete and no longer (05_gateway.md): from then on the image owns the block, and another
+/// process's gateway reconcile installing the workspace's session must find its base port
+/// free, not move the workspace to another block at a new grant revision.
+#[tokio::test]
+async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
+    let fixture = Fixture::new("published-create");
+    let runtime = fixture.adopt().await;
+    let gateway = fixture.gateway_at_hello("published");
+
+    fixture
+        .create(&runtime, "published", CreateOptions::default())
+        .await
+        .expect("create");
+    assert_eq!(gateway.installed().await, Ok(()));
+    runtime.shutdown().await.expect("stop the runtime");
+}
+
+#[tokio::test]
+async fn a_forked_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
+    let fixture = Fixture::new("published-fork");
+    let runtime = fixture.adopt().await;
+    let gateway = fixture.gateway_at_hello("published");
+
+    fixture
+        .fork(&runtime, "main", "published")
+        .await
+        .expect("fork");
+    assert_eq!(gateway.installed().await, Ok(()));
+    runtime.shutdown().await.expect("stop the runtime");
+}
+
+#[tokio::test]
+async fn an_adopted_mains_port_block_is_free_for_its_gateway_session_once_published() {
+    let fixture = Fixture::new("published-adopt");
+    let gateway = fixture.gateway_at_hello("main");
+
+    let runtime = fixture.adopt().await;
+    assert_eq!(gateway.installed().await, Ok(()));
+    runtime.shutdown().await.expect("stop the runtime");
 }

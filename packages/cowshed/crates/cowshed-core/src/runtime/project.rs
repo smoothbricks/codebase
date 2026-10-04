@@ -7805,6 +7805,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_staged_error)?;
+        // Published, main's image owns its block: the kernel claim ends here, before anything
+        // that lets another process's gateway reconcile install main's session on the block.
+        drop(reservation);
         self.conclude_adoption(&receipt.workspace).await
     }
 
@@ -7895,7 +7898,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 self.bind_slot(&workspace, slot).await?;
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
-            let (grants, _reservation) = self.destination_grants(&workspace, resuming).await?;
+            let (grants, reservation) = self.destination_grants(&workspace, resuming).await?;
             let identity = self
                 .operation_identity(
                     grants,
@@ -8007,6 +8010,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 })
                 .await
                 .map_err(native_staged_error)?;
+            // Published, the image owns its block: the kernel claim ends with publication, or a
+            // gateway reconcile in another process installing the workspace's session finds the
+            // block's base port taken and moves the workspace to another block (05_gateway.md).
+            drop(reservation);
             self.mark_lifecycle_fence_complete(&workspace).await;
             if options.register {
                 self.register_workspace_in_main(&workspace).await?;
@@ -8158,7 +8165,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // refusal before it (no port block left, say) withdraws the intent; see `create`.
         let superseded = self.begin_lifecycle_intent(intent).await?;
         let outcome = async {
-            let (grants, _reservation) = self.destination_grants(&destination, resuming).await?;
+            let (grants, reservation) = self.destination_grants(&destination, resuming).await?;
             let identity = self
                 .operation_identity(
                     grants,
@@ -8224,6 +8231,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 })
                 .await
                 .map_err(native_staged_error)?;
+            // Published, the image owns its block; see `create`.
+            drop(reservation);
             self.mark_lifecycle_fence_complete(&destination).await;
             self.commitments
                 .record(CommitmentDraft::Fork {
