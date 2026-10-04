@@ -5,6 +5,7 @@ use std::process::Command;
 use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions};
 use cowshed_core::api::server::ConnectionAuthority;
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
@@ -253,7 +254,7 @@ fn git(directory: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output()
+        .output_locked()
         .expect("git process");
     assert!(
         output.status.success(),
