@@ -293,7 +293,7 @@ ending before its fixture is released prints the fixture's daemon log into the r
 records graph, hashing, and daemon-request phases without changing deadlines, retries, or daemon selection; it does not
 cancel a timed-out test body or claim to repair a stall.
 
-Release fixtures declare `cacheDirectory: ".nx/cache"` in their own `nx.json`, keeping the task cache and native
+Nx-backed CLI fixtures declare `cacheDirectory: ".nx/cache"` in their own `nx.json`, keeping the task cache and native
 workspace-data database under the temporary workspace even when caller environment overrides are cleared. Their teardown
 stops the fixture daemon and removes that workspace; it must not leave one `~/.nx/<repoKey>` per fixture run.
 

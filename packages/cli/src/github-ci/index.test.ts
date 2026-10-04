@@ -277,6 +277,7 @@ describe('collected Nx outputs', () => {
   });
 
   it('runs test for projects selected by platform target ownership', async () => {
+    let fixtureCacheRun = '';
     await withNxRunManyFixture(async ({ root }) => {
       await writeFile(join(root, 'packages/app/test-target.ts'), "await Bun.write('test-ran.txt', 'tested');\n");
       await writeFile(join(root, 'packages/app/build-target.ts'), "throw new Error('build must not run here');\n");
@@ -285,11 +286,14 @@ describe('collected Nx outputs', () => {
         targets: 'test',
         projectsWithTargets: '*-macos,*-ios',
       });
+      fixtureCacheRun = join(root, '.nx/cache/run.json');
+      expect(await Bun.file(fixtureCacheRun).exists()).toBe(true);
       expect(expanded.runs.map((run) => run.projects.map((project) => project.project))).toEqual([['app']]);
 
       await expect(readFile(join(root, 'test-ran.txt'), 'utf8')).resolves.toBe('tested');
       await expect(readFile(join(root, 'build-ran.txt'), 'utf8')).rejects.toThrow();
     });
+    expect(await Bun.file(fixtureCacheRun).exists()).toBe(false);
   });
 
   it('applies an empty manifest after artifact transport omits its empty workspace directory', async () => {
@@ -815,7 +819,7 @@ async function withNxRunManyFixture(
       join(root, 'package.json'),
       JSON.stringify({ name: '@fixture/root', private: true, workspaces: ['packages/*'] }),
     );
-    await writeFile(join(root, 'nx.json'), '{}');
+    await writeFile(join(root, 'nx.json'), JSON.stringify({ cacheDirectory: '.nx/cache' }));
     await writeFile(
       join(root, 'packages/app/package.json'),
       JSON.stringify({
