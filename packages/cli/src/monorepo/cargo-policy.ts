@@ -79,11 +79,6 @@ interface LoadedConfig {
   config: CargoConfig;
 }
 
-interface EffectiveProfile {
-  incremental: boolean;
-  debug: boolean | number | string;
-}
-
 const validateCargoManifest = typia.createValidate<CargoManifest>();
 const validateCargoConfig = typia.createValidate<CargoConfig>();
 const validateRustToolchainFile = typia.createValidate<RustToolchainFile>();
@@ -142,17 +137,6 @@ const ABSOLUTE_PATH = /\/(?:[A-Za-z0-9._~+@%,-]+(?:\/[A-Za-z0-9._~+@%,-]*)*)/g;
 const CARGO_INCREMENTAL_ASSIGNMENT = /\bCARGO_INCREMENTAL\s*(?:=|:=|:)/;
 const MANIFEST_DIRECTORY_MACRO = /(?<![\w])(?:option_)?env!\(\s*"CARGO_MANIFEST_DIR"\s*\)/g;
 const CARGO_POLICY_IGNORE_MARKER = '# smoo-cargo-policy: ignore';
-const BUILTIN_PROFILES: Record<string, EffectiveProfile> = {
-  dev: { incremental: true, debug: 2 },
-  test: { incremental: true, debug: 2 },
-  release: { incremental: false, debug: 0 },
-  bench: { incremental: false, debug: 0 },
-};
-
-const BUILTIN_INHERITS: Record<string, string> = {
-  test: 'dev',
-  bench: 'release',
-};
 
 function report(path: string, message: string): number {
   console.error(`${path}: ${message}`);
@@ -497,34 +481,6 @@ function isWorkspaceMember(manifest: LoadedManifest, workspaceRoots: LoadedManif
   return workspaceRoots.some((workspaceRoot) => workspaceContains(workspaceRoot, manifest));
 }
 
-function resolveProfile(manifest: CargoManifest, name: string): EffectiveProfile {
-  const resolving = new Set<string>();
-
-  function visit(profileName: string): EffectiveProfile {
-    if (resolving.has(profileName)) {
-      return BUILTIN_PROFILES[profileName] ?? { incremental: true, debug: 2 };
-    }
-    resolving.add(profileName);
-    const profile = manifest.profile?.[profileName];
-    const inheritedName = profile?.inherits ?? BUILTIN_INHERITS[profileName];
-    const inherited = inheritedName
-      ? visit(inheritedName)
-      : (BUILTIN_PROFILES[profileName] ?? { incremental: true, debug: 2 });
-    const effective = {
-      incremental: profile?.incremental ?? inherited.incremental,
-      debug: profile?.debug ?? inherited.debug,
-    };
-    resolving.delete(profileName);
-    return effective;
-  }
-
-  return visit(name);
-}
-
-function carriesDebuginfo(debug: EffectiveProfile['debug']): boolean {
-  return debug !== 0 && debug !== false && debug !== 'none';
-}
-
 function reportManifestPolicy(manifests: LoadedManifest[], workspaceRoots: LoadedManifest[]): number {
   let failures = 0;
   for (const loaded of manifests) {
@@ -535,15 +491,6 @@ function reportManifestPolicy(manifests: LoadedManifest[], workspaceRoots: Loade
           loaded.path,
           'contains [profile.*] settings in a workspace member, but Cargo ignores profile tables outside the effective workspace root. Fix it by moving the profile table to the workspace root.',
         );
-      }
-      for (const profileName of Object.keys(manifest.profile)) {
-        const effective = resolveProfile(manifest, profileName);
-        if (effective.incremental === false && carriesDebuginfo(effective.debug)) {
-          failures += report(
-            loaded.path,
-            `profile ${profileName} is cacheable (effective incremental = false) but carries debuginfo (effective debug = ${String(effective.debug)}). A workspace can hit a sibling's artifact and inherit the sibling's absolute source paths in debuginfo and panic output; fix it with debug = 0 or leave the profile incremental.`,
-          );
-        }
       }
     }
   }

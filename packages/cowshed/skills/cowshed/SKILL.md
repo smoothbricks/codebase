@@ -92,8 +92,6 @@ direnv users need nothing extra.
   it unset: workspace crates stay incremental while their dependencies use the shared host cache.
 - Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
   compiled, and the `target/` a new workspace clones from main is warm for both.
-- A non-incremental profile (`release`, gate builds) is shared across workspaces, so it carries `debug = 0`; a profile
-  with debuginfo stays incremental.
 - Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
   workspace runs the test binaries it cloned from main and a baked path reads main's files. Read it at run time with
   `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.

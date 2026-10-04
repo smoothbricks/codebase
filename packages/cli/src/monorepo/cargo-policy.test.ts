@@ -102,31 +102,6 @@ describe('Cargo cache policy', () => {
     expect(standalone.messages).toEqual([]);
   });
 
-  it('flags an explicitly cacheable profile that carries debuginfo', async () => {
-    const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = []\n\n[profile.cache]\nincremental = false\ndebug = 1\n',
-    });
-    expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('profile cache is cacheable');
-    expect(result.messages[0]).toContain('absolute source paths');
-  });
-
-  it('resolves a non-incremental inherited profile before checking debuginfo', async () => {
-    const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = []\n\n[profile.cache]\ninherits = "release"\ndebug = 1\n',
-    });
-    expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('profile cache');
-  });
-
-  it('allows path-neutral and incremental profiles', async () => {
-    const result = await check({
-      'Cargo.toml':
-        '[workspace]\nmembers = []\n\n[profile.no-debug]\nincremental = false\ndebug = 0\n\n[profile.dev-symbols]\nincremental = true\ndebug = 2\n',
-    });
-    expect(result.failures).toBe(0);
-  });
-
   it('rejects CARGO_INCREMENTAL in a Justfile', async () => {
     const result = await check({ Justfile: 'set export CARGO_INCREMENTAL := "1"\n' });
     expect(result.failures).toBe(1);
