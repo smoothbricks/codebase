@@ -5469,6 +5469,7 @@ mod tests {
             daemon_version: Some("0.1.0".into()),
             active_workspaces: 0,
             drain_cause: None,
+            recovering: None,
             stale_daemon: Some(cowshed_core::api::StaleDaemonBinary {
                 daemon_sha256: Some("13f1eec0".into()),
                 cli_sha256: "b4223cd0".into(),
@@ -5500,6 +5501,7 @@ mod tests {
             daemon_version: Some("0.1.0".into()),
             active_workspaces: 0,
             drain_cause: Some("audit sink failed, so the gateway fails closed: disk full".into()),
+            recovering: None,
             stale_daemon: None,
         });
         let draining = findings
@@ -5520,6 +5522,7 @@ mod tests {
             daemon_version: None,
             active_workspaces: 0,
             drain_cause: None,
+            recovering: None,
             stale_daemon: None,
         });
         assert_eq!(gateway[0].code, "gateway-down");

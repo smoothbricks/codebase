@@ -866,11 +866,31 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         daemon_version: Some("1.3.0".into()),
         active_workspaces: 2,
         drain_cause: None,
+        recovering: None,
         stale_daemon: None,
     };
     assert_eq!(
-        serde_json::to_value(status).unwrap(),
+        serde_json::to_value(&status).unwrap(),
         json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","activeWorkspaces":2})
+    );
+    // A daemon still recovering the supervisors from before it started says how many, never 0.
+    let recovering = GatewayStatus {
+        recovering: Some(cowshed_gateway_types::SupervisorRecovery {
+            supervisors: std::num::NonZeroUsize::new(3).expect("three"),
+        }),
+        ..status
+    };
+    assert_eq!(
+        serde_json::to_value(recovering).unwrap()["recovering"],
+        json!({"supervisors":3})
+    );
+    assert!(
+        serde_json::from_value::<GatewayStatus>(json!({
+            "installed":true,"running":true,"socket":"/s","cliVersion":"1.4.0",
+            "activeWorkspaces":0,"recovering":{"supervisors":0}
+        }))
+        .is_err(),
+        "a recovery with nothing left to recover is no recovery"
     );
     let unmeasured: GatewayStatus = serde_json::from_value(json!({
         "installed":false,

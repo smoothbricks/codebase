@@ -126,6 +126,12 @@ attached sessions from repository bindings, mount/incarnation facts, grants, and
 Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before
 exit.
 
+The workspace supervisors still running from before the daemon started — those of another cowshed build are asked to
+drain — are recovered all at once in the background while the daemon already serves. Until each is recovered,
+`cowshed gateway status` reports how many are left (`recovering: { supervisors }` in `--json`), and a command for one of
+their workspaces is refused with that count and a retry hint rather than reported as a missing gateway; every other
+workspace is served. Each drain is logged as a `supervisor-recovery drain <socket>` span naming the pid that answered.
+
 An audit failure closes the gateway: it cuts in-flight streams, refuses every new session, reports `draining` with the
 failure as its cause, and exits once its drain completes, so `KeepAlive` restarts it instead of leaving a daemon that
 answers its control socket while serving nothing. `cowshed gateway status` and `doctor` call the gateway healthy only

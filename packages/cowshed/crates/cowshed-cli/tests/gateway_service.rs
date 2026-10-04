@@ -262,6 +262,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             daemon_version: Some("1.3.0".into()),
             active_workspaces: 2,
             drain_cause: None,
+            recovering: None,
             stale_daemon: None,
         },
     )
@@ -309,6 +310,7 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 daemon_version: daemon_version.map(str::to_owned),
                 active_workspaces: 0,
                 drain_cause: None,
+                recovering: None,
                 stale_daemon: None,
             },
         )

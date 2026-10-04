@@ -12,19 +12,25 @@ use cowshed_core::api::Coordinator;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::repository::RepoId;
+use cowshed_core::runtime::supervisor_manager::{
+    self, ProgramSpawner, SocketPeers, SupervisorManager,
+};
+use cowshed_core::runtime::supervisor_socket;
 use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, ValidatedHostStorage,
     validate_existing_host_storage,
 };
 use cowshed_gateway::{
     ArrowAuditConfig, ControlError, ControlFailureCode, Gateway, GatewayConfig,
-    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, WorkspaceSession,
+    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, RecoveryProbe,
+    SupervisorRecovery, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::{self, Read as _, Write};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
@@ -757,9 +763,21 @@ async fn run_daemon() -> Result<()> {
     // path: a helper spawned by the daemon has to keep resolving for as long as the daemon runs.
     // Workspace supervisors are this binary too, for the same reason.
     let executable = running_executable()?;
-    let supervisor_program = executable.clone();
+    // Own the host's workspace supervisors (11_shell.md "Supervisor"). The ones still serving
+    // from before this daemon are listed before the control socket binds, so its first status
+    // already counts them, and recovered only once this daemon holds that socket: a second
+    // daemon that fails to start never drains the first one's supervisors.
+    let manager = SupervisorManager::new(
+        &store_root,
+        Box::new(ProgramSpawner::new(
+            executable.clone(),
+            vec![crate::workspace_supervisor::VERB.into()],
+        )),
+    );
+    let recovery = manager.recovery();
     let config = GatewayConfig {
         executable_sha256: Some(executable_sha256(&executable)?),
+        supervisor_recovery: Some(Arc::new(ManagerRecovery(Arc::clone(&manager)))),
         ..paths.config(effective_uid(), executable)
     };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
@@ -767,10 +785,13 @@ async fn run_daemon() -> Result<()> {
     let gateway = Gateway::start_host(config, telemetry)
         .await
         .map_err(|error| CowshedError::internal(format!("could not start gateway: {error}")))?;
+    // Detached and concurrent: each recovery reports its own span, status counts what is left,
+    // and nothing below waits for it.
+    drop(recovery.start(Arc::new(SocketPeers)));
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         install_all_sessions(&inventory, &handle).await?;
-        start_supervisor_manager(&store_root, supervisor_program).await
+        serve_supervisors(&store_root, manager).await
     }
     .await;
     if let Err(primary) = started {
@@ -786,18 +807,28 @@ async fn run_daemon() -> Result<()> {
     drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
 }
 
-/// Own the host's workspace supervisors (11_shell.md "Supervisor"): find the ones still serving
-/// from before this daemon started, then take ensures on the manager socket.
-async fn start_supervisor_manager(store_root: &Path, program: PathBuf) -> Result<()> {
-    use cowshed_core::runtime::{supervisor_manager, supervisor_socket};
-    let manager = supervisor_manager::SupervisorManager::new(
-        store_root,
-        Box::new(supervisor_manager::ProgramSpawner::new(
-            program,
-            vec![crate::workspace_supervisor::VERB.into()],
-        )),
-    );
-    manager.adopt_running().await;
+/// What the daemon's supervisor manager has left to recover, as the gateway's status reports
+/// it. Like [`ControlSocket`], this lands in the composition root, the one place holding both.
+struct ManagerRecovery(Arc<SupervisorManager>);
+
+impl std::fmt::Debug for ManagerRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ManagerRecovery")
+            .field(&self.0.recovering())
+            .finish()
+    }
+}
+
+impl RecoveryProbe for ManagerRecovery {
+    fn recovering(&self) -> Option<SupervisorRecovery> {
+        self.0.recovering()
+    }
+}
+
+/// Take ensures on the manager socket, while the supervisors from before this daemon are still
+/// being recovered: only their own workspaces are refused meanwhile.
+async fn serve_supervisors(store_root: &Path, manager: Arc<SupervisorManager>) -> Result<()> {
     let listener =
         supervisor_socket::bind(&supervisor_manager::manager_socket_path(store_root)).await?;
     tokio::spawn(async move {
@@ -904,6 +935,7 @@ fn cli_status(
                     .unwrap_or_else(|| "the daemon reports draining without a cause".to_owned())
             })
         }),
+        recovering: status.and_then(|status| status.recovering),
         stale_daemon: status.and_then(|status| {
             (status.executable_sha256.as_deref() != Some(cli_sha256)).then(|| StaleDaemonBinary {
                 daemon_sha256: status.executable_sha256.clone(),
@@ -954,6 +986,12 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             "gateway runs a different cowshed binary than this CLI (daemon sha256 {}, cli sha256 {}); replace it: {STALE_DAEMON_REMEDY}",
             stale.daemon_sha256.as_deref().unwrap_or("unreported"),
             stale.cli_sha256
+        )
+    } else if let Some(recovery) = &status.recovering {
+        format!(
+            "gateway serves at {}, and is still recovering {} workspace supervisors from before it started; a command for one of their workspaces is refused until its supervisor is recovered",
+            status.socket.display(),
+            recovery.supervisors
         )
     } else if status.running {
         format!(
@@ -1733,6 +1771,7 @@ mod tests {
             draining,
             drain_cause: cause.map(str::to_owned),
             executable_sha256: sha256.map(str::to_owned),
+            recovering: None,
             sessions: Vec::new(),
             active: 0,
             queued: 0,
@@ -1785,6 +1824,176 @@ mod tests {
         let silent = cli_status(true, socket.clone(), None, "aa");
         assert!(!silent.running);
         assert_eq!((silent.drain_cause, silent.stale_daemon), (None, None));
+    }
+
+    /// The daemon's control socket and the supervisor recovery it reports, composed as
+    /// `run_daemon` composes them, with every supervisor of another build draining only as the
+    /// test lets it.
+    #[cfg(target_os = "macos")]
+    mod recovery {
+        use std::num::NonZeroUsize;
+
+        use cowshed_core::metadata::WorkspaceName;
+        use cowshed_core::runtime::supervisor_manager::{
+            Draining, SupervisorPeers, SupervisorSpawner,
+        };
+        use cowshed_core::runtime::supervisor_socket::Hello;
+        use cowshed_gateway::{
+            AuditError, AuditEvent, AuditSink, AuthorizedTarget, CanonicalTarget, ConnectError,
+            CredentialError, CredentialProvider, CredentialQuery, CredentialRecord,
+            UpstreamConnection, UpstreamConnector, UpstreamHealth,
+        };
+
+        use super::*;
+
+        struct NoCredentials;
+
+        #[async_trait]
+        impl CredentialProvider for NoCredentials {
+            async fn lookup(
+                &self,
+                _: &CredentialQuery,
+            ) -> std::result::Result<Option<CredentialRecord>, CredentialError> {
+                Ok(None)
+            }
+        }
+
+        struct NoConnector;
+
+        #[async_trait]
+        impl UpstreamConnector for NoConnector {
+            async fn health(&self, _: &CanonicalTarget) -> UpstreamHealth {
+                UpstreamHealth::Unknown
+            }
+
+            async fn connect(
+                &self,
+                _: &AuthorizedTarget,
+            ) -> std::result::Result<UpstreamConnection, ConnectError> {
+                Err(ConnectError::NoAddresses)
+            }
+        }
+
+        struct DiscardAudit;
+
+        #[async_trait]
+        impl AuditSink for DiscardAudit {
+            async fn record(&self, _: AuditEvent) -> std::result::Result<(), AuditError> {
+                Ok(())
+            }
+
+            async fn flush(&self) -> std::result::Result<(), AuditError> {
+                Ok(())
+            }
+        }
+
+        struct NoSpawner;
+
+        impl SupervisorSpawner for NoSpawner {
+            fn spawn(
+                &self,
+                _: &Path,
+                _: &WorkspaceName,
+                _: io::PipeWriter,
+            ) -> io::Result<tokio::process::Child> {
+                Err(io::Error::other("this manager starts no supervisor"))
+            }
+        }
+
+        /// Supervisors of another build whose drains answer only as the test opens `gate`.
+        struct GatedPeers {
+            gate: tokio::sync::Semaphore,
+        }
+
+        #[async_trait]
+        impl SupervisorPeers for GatedPeers {
+            async fn hello_if_present(&self, socket: &Path) -> Result<Option<Hello>> {
+                Err(CowshedError::conflict(
+                    format!("{} is served by another build", socket.display()),
+                    "let it drain",
+                ))
+            }
+
+            async fn drain(&self, _: &Path) -> Result<Draining> {
+                self.gate.acquire().await.expect("the gate opens").forget();
+                Ok(Draining {
+                    pid: 4242,
+                    exit: Box::new(|| Ok(())),
+                })
+            }
+        }
+
+        fn private_directory(path: &Path) {
+            fs::create_dir(path).expect("a fixture directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("a private fixture directory");
+        }
+
+        /// The control socket answers while supervisors of another build from before the daemon
+        /// still drain, and its status counts them; `gateway status` says so instead of calling
+        /// the gateway unavailable, and once they are drained the count is gone.
+        #[tokio::test]
+        async fn the_control_socket_counts_supervisors_still_draining() {
+            // `/tmp`, not TMPDIR: the gateway socket's path has to fit in `sun_path`.
+            let root = PathBuf::from(format!("/tmp/csrecover-{}", std::process::id()));
+            private_directory(&root);
+            let store = root.join("store");
+            fs::create_dir_all(store.join("run")).expect("run directory");
+            for socket in ["first.sock", "second.sock"] {
+                fs::write(store.join("run").join(socket), b"").expect("a socket file");
+            }
+            let cache = root.join("cache");
+            private_directory(&cache);
+            let socket = root.join("gateway.sock");
+
+            let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+            let recovery = manager.recovery();
+            let gateway = Gateway::start(
+                GatewayConfig {
+                    control_socket: Some(socket.clone()),
+                    mirror_cache: MirrorCacheConfig::new(cache),
+                    supervisor_recovery: Some(Arc::new(ManagerRecovery(Arc::clone(&manager)))),
+                    // The CLI asking runs the same bytes, so only the recovery is left to report.
+                    executable_sha256: Some("aa".into()),
+                    ..GatewayConfig::default()
+                },
+                Arc::new(NoCredentials),
+                Arc::new(NoConnector),
+                Arc::new(DiscardAudit),
+            )
+            .await
+            .expect("start the gateway");
+            let peers = Arc::new(GatedPeers {
+                gate: tokio::sync::Semaphore::new(0),
+            });
+            let gated: Arc<GatedPeers> = Arc::clone(&peers);
+            let recovered = recovery.start(gated);
+            let client = GatewayControlClient::new(socket.clone()).expect("a control client");
+
+            let draining = client.status().await.expect("status while draining");
+            let two = SupervisorRecovery {
+                supervisors: NonZeroUsize::new(2).expect("two"),
+            };
+            assert_eq!(draining.recovering, Some(two));
+            let reported = cli_status(true, socket.clone(), Some(&draining), "aa");
+            assert_eq!(reported.recovering, Some(two));
+            let mut output = Output::new(Vec::new(), Vec::new(), false);
+            emit_gateway_status(&mut output, false, reported).expect("render");
+            let (_, stderr) = output.into_inner();
+            let rendered = String::from_utf8(stderr).expect("utf-8");
+            assert!(
+                rendered.contains("still recovering 2 workspace supervisors"),
+                "{rendered}"
+            );
+
+            peers.gate.add_permits(2);
+            recovered.await.expect("the recovery ends");
+            let drained = client.status().await.expect("status once drained");
+            assert_eq!(drained.recovering, None);
+
+            gateway.drain().await.expect("drain the gateway");
+            fs::remove_dir_all(&root).expect("cleanup");
+        }
     }
 
     /// The guidance for an unavailable gateway has to work on a host where the

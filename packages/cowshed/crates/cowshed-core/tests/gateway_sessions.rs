@@ -56,6 +56,7 @@ fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
         draining: false,
         drain_cause: None,
         executable_sha256: None,
+        recovering: None,
         sessions,
         active: 0,
         queued: 0,

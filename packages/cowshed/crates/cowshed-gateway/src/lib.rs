@@ -27,7 +27,7 @@ pub use cache::{
 };
 pub use config::{
     CONTROL_TCP_ADDR, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
-    MirrorCacheConfig,
+    MirrorCacheConfig, RecoveryProbe,
 };
 pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
 /// The control-plane data model is re-exported at this root so `cowshed_gateway::WorkspaceSession`
@@ -35,8 +35,8 @@ pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
 pub use cowshed_gateway_types::{
     CanonicalHost, CanonicalTarget, ConfigError, EgressGrant, EgressMode, GatewayStatus,
     HostPattern, InvalidRepoId, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorProtocol, MirrorRoute,
-    NEW_PORT_BLOCK_SIZE, PolicyError, ResolvedMirrorRoute, SessionStatus, TOKEN_BYTES,
-    TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
+    NEW_PORT_BLOCK_SIZE, PolicyError, ResolvedMirrorRoute, SessionStatus, SupervisorRecovery,
+    TOKEN_BYTES, TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
     WorkspaceToken, is_macos_port_block, normalize_path, validate_repo_id,
 };
 pub use interfaces::{

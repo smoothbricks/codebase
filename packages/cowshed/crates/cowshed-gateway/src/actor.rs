@@ -1671,6 +1671,11 @@ impl Actor {
                 None => "the gateway is shutting down".to_owned(),
             }),
             executable_sha256: self.config.executable_sha256.clone(),
+            recovering: self
+                .config
+                .supervisor_recovery
+                .as_ref()
+                .and_then(|probe| probe.recovering()),
             sessions,
             active: self.global_active.total(),
             queued: self.global_queued,

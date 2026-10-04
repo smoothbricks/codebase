@@ -1,11 +1,13 @@
 use std::{
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
-use cowshed_gateway_types::{ConfigError, WorkspaceSession};
+use cowshed_gateway_types::{ConfigError, SupervisorRecovery, WorkspaceSession};
 // The workspace data socket only exists on Linux; macOS sessions are TCP port blocks.
 #[cfg(target_os = "linux")]
 use cowshed_gateway_types::{WorkspaceEndpoint, validate_identifier};
@@ -225,6 +227,13 @@ impl Default for MirrorCacheConfig {
     }
 }
 
+/// Where the daemon learns which workspace supervisors its host is still recovering. The daemon
+/// that owns those supervisors is the one process holding both this gateway and their manager, so
+/// it answers; the gateway asks at every status and keeps no copy that could go stale.
+pub trait RecoveryProbe: fmt::Debug + Send + Sync {
+    fn recovering(&self) -> Option<SupervisorRecovery>;
+}
+
 /// Host daemon configuration. Runtime protocol limits are deliberately not configurable.
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -246,6 +255,9 @@ pub struct GatewayConfig {
     /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
     /// whether the daemon is running the same build it is.
     pub executable_sha256: Option<String>,
+    /// What status reports as the supervisors still being recovered; `None` for a gateway that
+    /// owns no supervisors.
+    pub supervisor_recovery: Option<Arc<dyn RecoveryProbe>>,
 }
 
 impl Default for GatewayConfig {
@@ -263,6 +275,7 @@ impl Default for GatewayConfig {
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             mirror_cache: MirrorCacheConfig::default(),
             executable_sha256: None,
+            supervisor_recovery: None,
         }
     }
 }

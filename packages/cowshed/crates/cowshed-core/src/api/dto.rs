@@ -3060,6 +3060,10 @@ pub struct GatewayStatus {
     /// gateway is not healthy while this is present, however promptly its socket answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_cause: Option<String>,
+    /// The workspace supervisors from before the answering daemon started that it is still
+    /// recovering. It serves meanwhile; only a command for one of their workspaces is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovering: Option<cowshed_gateway_types::SupervisorRecovery>,
     /// Present when the answering daemon runs other bytes than this CLI. Both report version
     /// 0.1.0 across every build, so only the executables' contents can tell them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]

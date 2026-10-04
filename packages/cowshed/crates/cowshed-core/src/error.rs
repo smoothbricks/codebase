@@ -68,6 +68,10 @@ pub struct CowshedError {
         skip_serializing_if = "Option::is_none"
     )]
     other_build: Option<Box<OtherBuild>>,
+    /// Present only on the daemon's refusal of a workspace whose supervisor from before it
+    /// started it is still recovering; absent from the wire otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovering: Option<cowshed_gateway_types::SupervisorRecovery>,
     #[serde(skip)]
     lifecycle_conflict: Option<crate::storage::lifecycle::Conflict>,
 }
@@ -94,6 +98,7 @@ impl CowshedError {
             message: message.into(),
             hint: hint.into(),
             other_build: None,
+            recovering: None,
             lifecycle_conflict: None,
         }
     }
@@ -117,6 +122,7 @@ impl CowshedError {
             message: conflict.to_string(),
             hint: "refresh workspace state and retry".to_owned(),
             other_build: None,
+            recovering: None,
             lifecycle_conflict: Some(conflict),
         }
     }
@@ -137,6 +143,30 @@ impl CowshedError {
             message,
             hint: "run `cowshed gateway start` from the cowshed you mean to use".to_owned(),
             other_build: Some(Box::new(other)),
+            recovering: None,
+            lifecycle_conflict: None,
+        }
+    }
+
+    /// The daemon's refusal of `workspace` while it is still recovering the supervisor that
+    /// served it before the daemon started: a `Conflict` carrying how many supervisors are left
+    /// as [`cowshed_gateway_types::SupervisorRecovery`]. Every other workspace is served.
+    pub fn recovering(
+        recovery: cowshed_gateway_types::SupervisorRecovery,
+        workspace: &crate::metadata::WorkspaceName,
+    ) -> Self {
+        Self {
+            code: ErrorCode::Conflict,
+            message: format!(
+                "the cowshed daemon is still recovering workspace {workspace}'s supervisor from \
+                 before it started ({} supervisors left to recover)",
+                recovery.supervisors
+            ),
+            hint: "retry shortly; `cowshed gateway status` reports how many supervisors are left \
+                   to recover"
+                .to_owned(),
+            other_build: None,
+            recovering: Some(recovery),
             lifecycle_conflict: None,
         }
     }
@@ -240,6 +270,12 @@ impl CowshedError {
     /// The two builds, when this is the daemon's refusal of another build's request.
     pub fn other_build_source(&self) -> Option<&OtherBuild> {
         self.other_build.as_deref()
+    }
+
+    /// What the daemon had left to recover, when this is its refusal of a workspace it was
+    /// still recovering.
+    pub const fn recovering_source(&self) -> Option<cowshed_gateway_types::SupervisorRecovery> {
+        self.recovering
     }
 
     pub const fn exit_code(&self) -> u8 {

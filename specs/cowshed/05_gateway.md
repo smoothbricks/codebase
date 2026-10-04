@@ -269,7 +269,12 @@ mounts are restored. In order:
    A store that fails validation stops here and reports; nothing below can be meaningful without it.
 2. Eagerly heal every recorded project's mounts, in inventory order: main attached and mounted at its checkout path,
    every other workspace under the mount root (02_workspaces.md).
-3. Then serve.
+3. Then serve. The workspace supervisors still serving from before this daemon started are listed before the control
+   socket binds and recovered only once it is bound, all at once and in the background (11_shell.md "Supervisor
+   recovery"): the control socket and the supervisor manager answer from the first moment, and while any supervisor is
+   still being recovered, status carries `recovering: { supervisors: N }` (never 0; absent once none is left), and
+   `cowshed gateway status` says so. Only a command for one of those workspaces is refused meanwhile, by the typed
+   recovering refusal; every other workspace is served.
 
 Eager, not heal-on-contact. Adoption's guarantee is that the checkout path is never absent and never dangling, and a
 reboot is the one window that guarantee has to survive as much as the publication transaction does. Without a startup

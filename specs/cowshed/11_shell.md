@@ -554,6 +554,18 @@ it again; unresolved group evidence is retained. The jobs' records remain unterm
 them. `exec` does not replace another build as a side effect: its refusal names the lifecycle step that owns the
 cutover.
 
+**Recovering at daemon start.** The manager lists every supervisor socket under `<store>/run` before the daemon's
+control socket binds, and recovers them once it is bound: asks each who serves it, drains each of another build, watches
+each of its own build, and ends the jobs a positively absent one left (the group ledger, above). Each recovery reaches
+only its own socket and ledger, so they all run at once, each in a task of its own, with nothing bounding them but the
+sockets there are; one wedged supervisor holds back its own workspace, never the host's others. Each drain is a
+lifecycle span, `supervisor-recovery drain <socket>`, that reports the answering `pid=` (or `error=`) and ends
+`status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting `supervisors=` up front. The manager takes
+ensures throughout. An ensure of a workspace whose supervisor is still being recovered is refused as a `Conflict`
+carrying `recovering: { supervisors }` (the count left), because a supervisor started then would race the recovery for
+the socket and the ledger; every other ensure is served. Gateway status reports the same count until none is left
+(05_gateway.md "Startup contract").
+
 ## Teardown ordering
 
 `cowshed rm` / `cowshed detach` must stop the supervisor **before** unmounting or destroying the substrate, because live

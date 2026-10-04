@@ -129,16 +129,17 @@ pub fn timed<T, E: fmt::Display>(
 /// Run one asynchronous step inside a span labelled `<scope> <step>`, reported to the call's
 /// [`StepSink`] when the call asked for its steps.
 ///
-/// The label is two static parts rather than formatted arguments because formatted arguments
-/// borrow what they format and cannot be held across the await.
+/// The step is owned rather than formatted arguments because formatted arguments borrow what
+/// they format and cannot be held across the await; a static step costs no allocation.
 pub async fn timed_async<T, E: fmt::Display>(
     scope: &'static str,
-    step: &'static str,
+    step: impl Into<Cow<'static, str>>,
     work: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
+    let step = step.into();
     eprintln!("cowshed: {scope} {step} start");
     let started = Instant::now();
-    let result = match OpenStep::start(scope, || step.to_owned()) {
+    let result = match OpenStep::start(scope, || (*step).to_owned()) {
         Some(open) => {
             let result = STEPS.scope(open.inside(), work).await;
             open.end(&result);

@@ -9,19 +9,27 @@
 //!
 //! Ensures of one workspace are serialized: two controllers asking at once get the same
 //! supervisor, never two allocators.
+//!
+//! The supervisors found serving at startup are recovered all at once and in the background
+//! ([`SupervisorManager::recovery`]): the manager takes ensures throughout, refusing by type only
+//! the workspaces whose supervisor it is still recovering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::io::{self, Write as _};
+use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use cowshed_gateway_types::SupervisorRecovery;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::supervisor::WorkspaceAuthoritySnapshot;
 use super::supervisor_socket::{
@@ -30,6 +38,7 @@ use super::supervisor_socket::{
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::fork_lock::Spawn as _;
 use crate::metadata::WorkspaceName;
+use crate::timing;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
 const START_BOUND: Duration = Duration::from_secs(180);
@@ -43,6 +52,8 @@ const START_REPORT_LIMIT: u64 = 64 * 1024;
 /// How long an exited supervisor's report may take to reach end of file. Its only writer is
 /// gone, so only a descriptor leaked to a process it started could hold the pipe open.
 const START_REPORT_BOUND: Duration = Duration::from_secs(2);
+/// The span every startup recovery step reports under.
+const RECOVERY_SCOPE: &str = "supervisor-recovery";
 
 /// Where the host's manager listens.
 pub fn manager_socket_path(store_root: &Path) -> PathBuf {
@@ -224,11 +235,53 @@ pub fn serves(served: &WorkspaceAuthoritySnapshot, needed: &WorkspaceAuthoritySn
         && served.grant_revision == needed.grant_revision
 }
 
+/// How recovery reaches the supervisors that served before the manager started: over their
+/// sockets in the daemon ([`SocketPeers`]), under a test's control in tests.
+#[async_trait::async_trait]
+pub trait SupervisorPeers: Send + Sync + 'static {
+    /// Who serves `socket`, as [`supervisor_socket::hello_if_present`] answers it.
+    async fn hello_if_present(&self, socket: &Path) -> Result<Option<supervisor_socket::Hello>>;
+    /// Ask the supervisor of another build serving `socket` to drain, as
+    /// [`supervisor_socket::drain`] does.
+    async fn drain(&self, socket: &Path) -> Result<Draining>;
+}
+
+/// A supervisor of another build that answered `drain`: it admits nothing more and retires once
+/// its running jobs end.
+pub struct Draining {
+    /// The process that answered.
+    pub pid: u32,
+    /// Blocks until that process has exited.
+    pub exit: Box<dyn FnOnce() -> io::Result<()> + Send>,
+}
+
+/// Production: the supervisors' own sockets.
+#[derive(Clone, Copy, Debug)]
+pub struct SocketPeers;
+
+#[async_trait::async_trait]
+impl SupervisorPeers for SocketPeers {
+    async fn hello_if_present(&self, socket: &Path) -> Result<Option<supervisor_socket::Hello>> {
+        supervisor_socket::hello_if_present(socket).await
+    }
+
+    async fn drain(&self, socket: &Path) -> Result<Draining> {
+        let drained = supervisor_socket::drain(socket).await?;
+        Ok(Draining {
+            pid: drained.pid(),
+            exit: Box::new(move || drained.exit.wait()),
+        })
+    }
+}
+
 pub struct SupervisorManager {
     store_root: PathBuf,
     spawner: Box<dyn SupervisorSpawner>,
     /// One lock per workspace socket: ensures of one workspace run one at a time.
     ensuring: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
+    /// The sockets whose supervisors served before this manager started and are not recovered
+    /// yet ([`Self::recovery`]). Held only to read or remove, never across an await.
+    recovering: std::sync::Mutex<BTreeSet<PathBuf>>,
 }
 
 impl SupervisorManager {
@@ -237,52 +290,83 @@ impl SupervisorManager {
             store_root: store_root.into(),
             spawner,
             ensuring: Mutex::default(),
+            recovering: std::sync::Mutex::default(),
         })
     }
 
-    /// Watch every supervisor still serving from before this manager started.
-    pub async fn adopt_running(&self) {
-        let run = self.store_root.join("run");
-        let Ok(entries) = std::fs::read_dir(&run) else {
-            return;
+    /// The supervisors still serving from before this manager started, listed: from now on
+    /// [`Self::recovering`] counts every one of them and [`Self::ensure`] refuses each one's
+    /// workspace until it is recovered. Nothing reaches them until [`Recovery::start`], so a
+    /// daemon lists them before it answers anyone and starts recovering them only once it has
+    /// claimed the host.
+    pub fn recovery(self: &Arc<Self>) -> Recovery {
+        let manager_socket = manager_socket_path(&self.store_root);
+        let sockets: BTreeSet<PathBuf> = std::fs::read_dir(self.store_root.join("run"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                *path != manager_socket
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "sock")
+            })
+            .collect();
+        self.recovering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone_from(&sockets);
+        Recovery {
+            manager: Arc::clone(self),
+            sockets,
+        }
+    }
+
+    /// How many supervisors from before this manager started it has not recovered yet.
+    pub fn recovering(&self) -> Option<SupervisorRecovery> {
+        let recovering = self
+            .recovering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        NonZeroUsize::new(recovering.len()).map(|supervisors| SupervisorRecovery { supervisors })
+    }
+
+    /// [`Self::recovering`], when the supervisor of `socket` is one it has not recovered yet.
+    fn recovering_including(&self, socket: &Path) -> Option<SupervisorRecovery> {
+        let recovering = self
+            .recovering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !recovering.contains(socket) {
+            return None;
+        }
+        NonZeroUsize::new(recovering.len()).map(|supervisors| SupervisorRecovery { supervisors })
+    }
+
+    /// Recover the supervisor that served `socket` before this manager started. Its workspace
+    /// is refused until this ends, however it ends.
+    async fn recover_one(self: Arc<Self>, peers: Arc<dyn SupervisorPeers>, socket: PathBuf) {
+        let _recovered = Recovered {
+            manager: &self,
+            socket: &socket,
         };
-        let manager = manager_socket_path(&self.store_root);
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == manager || path.extension().is_none_or(|extension| extension != "sock") {
-                continue;
+        match peers.hello_if_present(&socket).await {
+            Ok(Some(hello)) => watch_pid(hello.pid, socket.clone()),
+            // A supervisor of another cowshed build: let it finish its jobs and retire, so the
+            // next command for its workspace gets one of this build.
+            Err(error) if error.code == ErrorCode::Conflict => {
+                drain_other_build(&*peers, &socket).await;
             }
-            match supervisor_socket::hello_if_present(&path).await {
-                Ok(Some(hello)) => watch_pid(hello.pid, path),
-                // A supervisor of another cowshed build: let it finish its jobs and retire, so
-                // the next command for its workspace gets one of this build.
-                Err(error) if error.code == ErrorCode::Conflict => {
-                    match supervisor_socket::drain(&path).await {
-                        Ok(drained) => {
-                            let pid = drained.pid();
-                            eprintln!(
-                                "cowshed: draining workspace supervisor {} (pid {pid}) of another cowshed build",
-                                path.display()
-                            );
-                            recover_after_exit(pid, path, move || drained.exit.wait());
-                        }
-                        Err(error) => eprintln!(
-                            "cowshed: cannot drain workspace supervisor {}: {}",
-                            path.display(),
-                            error.message
-                        ),
-                    }
-                }
-                // Only a positively absent listener authorizes lost-supervisor recovery. A
-                // wedged live peer or an unknown protocol outcome retains its jobs and ledger.
-                Ok(None) => end_lost_jobs(path, super::job_groups::Writer::Any).await,
-                Err(error) => eprintln!(
-                    "cowshed: cannot determine whether workspace supervisor {} stopped; its \
-                     jobs and ledger are retained: {}",
-                    path.display(),
-                    error.message
-                ),
-            }
+            // Only a positively absent listener authorizes lost-supervisor recovery. A wedged
+            // live peer or an unknown protocol outcome retains its jobs and ledger.
+            Ok(None) => end_lost_jobs(socket.clone(), super::job_groups::Writer::Any).await,
+            Err(error) => eprintln!(
+                "cowshed: cannot determine whether workspace supervisor {} stopped; its jobs and \
+                 ledger are retained: {}",
+                socket.display(),
+                error.message
+            ),
         }
     }
 
@@ -297,6 +381,11 @@ impl SupervisorManager {
             &authority.repo_id,
             &authority.workspace,
         );
+        // Its recovery owns the socket until it ends: a supervisor started now would race it for
+        // the socket and the ledger the old supervisor left.
+        if let Some(recovery) = self.recovering_including(&socket) {
+            return Err(CowshedError::recovering(recovery, &authority.workspace));
+        }
         let lock = Arc::clone(
             self.ensuring
                 .lock()
@@ -383,6 +472,91 @@ impl SupervisorManager {
             }
             tokio::time::sleep(START_POLL).await;
         }
+    }
+}
+
+/// The supervisors a manager found serving from before it started, not yet being recovered
+/// ([`SupervisorManager::recovery`]).
+#[must_use = "start the recovery, or its workspaces stay refused"]
+pub struct Recovery {
+    manager: Arc<SupervisorManager>,
+    sockets: BTreeSet<PathBuf>,
+}
+
+impl Recovery {
+    /// Recover every listed supervisor, each in a task of its own, and return at once; the
+    /// handle resolves when every one is recovered. Each recovery reaches only its own socket
+    /// and its own ledger, so they all run at once: a wedged supervisor holds back its own
+    /// workspace, never the host's others.
+    pub fn start(self, peers: Arc<dyn SupervisorPeers>) -> JoinHandle<()> {
+        let Self { manager, sockets } = self;
+        tokio::spawn(async move {
+            let supervisors = sockets.len();
+            let Ok(()) = timing::timed_async(RECOVERY_SCOPE, "startup", async move {
+                timing::attribute(
+                    RECOVERY_SCOPE,
+                    format_args!("startup"),
+                    "supervisors",
+                    supervisors,
+                );
+                let mut recoveries = JoinSet::new();
+                for socket in sockets {
+                    recoveries.spawn(Arc::clone(&manager).recover_one(Arc::clone(&peers), socket));
+                }
+                while let Some(recovered) = recoveries.join_next().await {
+                    if let Err(error) = recovered {
+                        eprintln!("cowshed: recovering a workspace supervisor failed: {error}");
+                    }
+                }
+                Ok::<(), Infallible>(())
+            })
+            .await;
+        })
+    }
+}
+
+/// Takes a socket out of [`SupervisorManager::recovering`] when its recovery ends, however it
+/// ends: a recovery that panicked must not leave its workspace refused for the daemon's life.
+struct Recovered<'a> {
+    manager: &'a SupervisorManager,
+    socket: &'a Path,
+}
+
+impl Drop for Recovered<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .recovering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(self.socket);
+    }
+}
+
+/// Ask the supervisor of another build serving `socket` to drain, in a span of its own that
+/// names the socket and reports the pid that answered, or why none did; once that process
+/// exits, end any job it left running.
+async fn drain_other_build(peers: &dyn SupervisorPeers, socket: &Path) {
+    let step = format!("drain {}", socket.display());
+    let drained = timing::timed_async(RECOVERY_SCOPE, step.clone(), async {
+        let drained = peers.drain(socket).await;
+        match &drained {
+            Ok(draining) => {
+                timing::attribute(RECOVERY_SCOPE, format_args!("{step}"), "pid", draining.pid);
+            }
+            Err(error) => {
+                timing::attribute(
+                    RECOVERY_SCOPE,
+                    format_args!("{step}"),
+                    "error",
+                    &error.message,
+                );
+            }
+        }
+        drained
+    })
+    .await;
+    if let Ok(Draining { pid, exit }) = drained {
+        recover_after_exit(pid, socket.to_path_buf(), exit);
     }
 }
 
@@ -912,6 +1086,152 @@ mod tests {
             })
         );
         served.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// A fresh store with a `run` directory holding a socket file for each of `sockets`. Unix
+    /// socket paths are short; the per-user temporary directory is not.
+    fn recovery_store(prefix: &str, sockets: &[&str]) -> PathBuf {
+        let store = PathBuf::from("/tmp").join(format!(
+            "{prefix}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        for socket in sockets {
+            std::fs::write(store.join("run").join(socket), b"").expect("a socket file");
+        }
+        store
+    }
+
+    /// Every socket is served by another build, so recovery asks each to drain.
+    fn another_build(socket: &Path) -> Result<Option<supervisor_socket::Hello>> {
+        Err(CowshedError::conflict(
+            format!("{} is served by another build", socket.display()),
+            "let it drain",
+        ))
+    }
+
+    /// A drained supervisor that has already exited and left no ledger.
+    fn drained() -> Draining {
+        Draining {
+            pid: 4242,
+            exit: Box::new(|| Ok(())),
+        }
+    }
+
+    /// Supervisors of another build whose drains answer only as the test opens `gate`.
+    struct GatedPeers {
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl SupervisorPeers for GatedPeers {
+        async fn hello_if_present(
+            &self,
+            socket: &Path,
+        ) -> Result<Option<supervisor_socket::Hello>> {
+            another_build(socket)
+        }
+
+        async fn drain(&self, _: &Path) -> Result<Draining> {
+            self.gate.acquire().await.expect("the gate opens").forget();
+            Ok(drained())
+        }
+    }
+
+    /// While a supervisor from before the manager started still drains, the manager refuses an
+    /// ensure of its workspace by type, carrying how many supervisors are left, rather than start
+    /// a second supervisor that would race the recovery for the socket; once it is recovered,
+    /// the same ensure is no longer refused as recovering.
+    #[tokio::test]
+    async fn an_ensure_of_a_workspace_still_draining_is_refused_as_recovering() {
+        let authority: WorkspaceAuthoritySnapshot =
+            serde_json::from_value::<AuthorityWire>(serde_json::json!({
+                "repoId": "acme/widget",
+                "workspace": "raven",
+                "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                "grantRevision": 1,
+                "lifecycleRevision": 1,
+            }))
+            .expect("authority")
+            .into();
+        let store = recovery_store("cowshed-recovering", &["other.sock"]);
+        let raven =
+            supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
+        std::fs::write(&raven, b"").expect("raven's socket file");
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+        let peers = Arc::new(GatedPeers {
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let gated: Arc<GatedPeers> = Arc::clone(&peers);
+        let recovered = manager.recovery().start(gated);
+        let listener = supervisor_socket::bind(&manager_socket_path(&store))
+            .await
+            .expect("bind the manager");
+        let served = tokio::spawn(serve(listener, Arc::clone(&manager)));
+
+        let two = SupervisorRecovery {
+            supervisors: NonZeroUsize::new(2).expect("two"),
+        };
+        assert_eq!(manager.recovering(), Some(two));
+        let refused = ensure(&store, Path::new("/repo"), &authority)
+            .await
+            .expect_err("raven's supervisor is still draining");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert_eq!(refused.recovering_source(), Some(two));
+        assert!(refused.message.contains("raven"), "{}", refused.message);
+
+        peers.gate.add_permits(2);
+        recovered.await.expect("the recovery ends");
+        assert_eq!(manager.recovering(), None);
+        let unrecovered = ensure(&store, Path::new("/repo"), &authority)
+            .await
+            .expect_err("this manager starts no supervisor");
+        assert_eq!(
+            unrecovered.recovering_source(),
+            None,
+            "{}",
+            unrecovered.message
+        );
+        served.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// Supervisors of another build whose drains answer only once every one of them is draining.
+    struct BarrierPeers {
+        all_draining: tokio::sync::Barrier,
+    }
+
+    #[async_trait::async_trait]
+    impl SupervisorPeers for BarrierPeers {
+        async fn hello_if_present(
+            &self,
+            socket: &Path,
+        ) -> Result<Option<supervisor_socket::Hello>> {
+            another_build(socket)
+        }
+
+        async fn drain(&self, _: &Path) -> Result<Draining> {
+            self.all_draining.wait().await;
+            Ok(drained())
+        }
+    }
+
+    /// Supervisors of another build are drained at once, not one after another: neither drain
+    /// answers until both are in flight, so a recovery that waited for one before asking the
+    /// next would never end.
+    #[tokio::test]
+    async fn supervisors_of_another_build_drain_at_once() {
+        let store = recovery_store("cowshed-drains", &["first.sock", "second.sock"]);
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner));
+        manager
+            .recovery()
+            .start(Arc::new(BarrierPeers {
+                all_draining: tokio::sync::Barrier::new(2),
+            }))
+            .await
+            .expect("both drains reach the barrier");
+        assert_eq!(manager.recovering(), None);
         std::fs::remove_dir_all(store).expect("cleanup");
     }
 
