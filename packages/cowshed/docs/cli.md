@@ -1056,10 +1056,11 @@ Two more variables are in that plist because sccache reads them once, at server 
 - `SCCACHE_BASEDIRS` — **plural**; set to the store root. With the patched binary it also participates in Rust key
   normalization; the per-request cwd from `SCCACHE_BASEDIR_CWD` is what makes workspace paths interchangeable.
 
-The agent is launchd `ProcessType` **Standard**, not Background. Background is Darwin background QoS: sccache hashes
-every miss and runs rustc as its own child, both at the agent's priority, while every wrapped `sccache rustc` client
-stays interactive. That turns the shared daemon into a niced compile queue. The gateway agent is Standard for the same
-reason: its supervisor manager starts every workspace supervisor, and so every shell host and `cowshed exec` job, and a
+The agent is launchd `ProcessType` **Interactive**. Background is Darwin background QoS (PRI 4) and Standard is the
+utility band (PRI 20); both throttle the agent's IO behind the host's. sccache hashes every miss and runs rustc as its
+own child, both at the agent's priority, while every wrapped `sccache rustc` client stays interactive (PRI 31), so
+either clamp turns the shared daemon into a niced compile queue. The gateway agent is Interactive for the same reason:
+its supervisor manager starts every workspace supervisor, and so every shell host and `cowshed exec` job, and a
 descendant cannot leave its agent's QoS band.
 
 `status` reports launchd and socket health without starting anything, and surfaces the daemon's own `--show-stats`

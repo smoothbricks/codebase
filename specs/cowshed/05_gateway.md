@@ -10,12 +10,15 @@ the data plane only as an intercepted fetch (Egress modes, below).
 
 ## Placement and identity
 
-On macOS the gateway runs as the `dev.cowshed.gateway` LaunchAgent at launchd `ProcessType` **Standard**, never
-Background. The type is the QoS band of the agent and every descendant, and a descendant cannot leave it; the daemon's
-supervisor manager starts every workspace supervisor, which starts every shell host and job. Under Background all of
-them ran at priority 4 with throttled I/O: on a host at load 80 a fresh workspace's supervisor took 115 s to answer and
-its first `cowshed exec` spent 537 s inside `direnv export json`. The sccache LaunchAgent is Standard for the same
-reason (launchd.rs `PROCESS_TYPE`).
+On macOS the gateway runs as the `dev.cowshed.gateway` LaunchAgent at launchd `ProcessType` **Interactive**, the one
+type that runs at parity with the host's own processes (PRI 31). The type is the QoS band of the agent and every
+descendant, and a descendant cannot leave it; the daemon's supervisor manager starts every workspace supervisor, which
+starts every shell host and job. Background runs them at priority 4 and Standard at priority 20 (the utility band), and
+both throttle their I/O behind the host's. Under Background on a host at load 80 a fresh workspace's supervisor took 115
+s to answer and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility clamp at load 10–47
+the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index took 34.5 s and 54.5 s where the same cold
+run unclamped took 2.4 s and 2.7 s. The sccache LaunchAgent is Interactive for the same reason (launchd.rs
+`PROCESS_TYPE`).
 
 The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the finite kernel-sized value `245760` and
 `HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful

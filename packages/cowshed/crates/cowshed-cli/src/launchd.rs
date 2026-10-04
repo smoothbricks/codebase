@@ -200,20 +200,24 @@ pub enum ServiceLifecycle {
     RunAtLoad,
 }
 
-/// launchd `ProcessType` of every cowshed agent: Standard.
+/// launchd `ProcessType` of every cowshed agent: Interactive.
 ///
 /// The type is the QoS band the agent *and every descendant* runs in, and a descendant cannot
 /// leave it: launchd applies Background as the process's apptype, so `setpriority(
 /// PRIO_DARWIN_PROCESS, 0, 0)` in a child reports success and changes nothing (probed on macOS 26
 /// with a Background agent: PRI 4 before and after, in the agent and in its children).
 ///
-/// Neither agent may be Background. sccache hashes every miss and runs rustc as its own child;
-/// the gateway's supervisor manager starts every workspace supervisor, which starts every shell
-/// host and every `cowshed exec` job. Under Background all of them ran at PRI 4 with throttled
-/// IO while the host's interactive processes ran at PRI 31: on a host at load 80 a shell loop
-/// that takes 0.7 s took 1–30 s, a fresh workspace's supervisor took 115 s to answer, and its
-/// first `cowshed exec` spent 537 s inside `direnv export json`.
-const PROCESS_TYPE: &str = "Standard";
+/// Only Interactive runs at parity with the host's own processes. sccache hashes every miss and
+/// runs rustc as its own child; the gateway's supervisor manager starts every workspace
+/// supervisor, which starts every shell host and every `cowshed exec` job. Probed with a test
+/// agent on macOS 26: Background runs it and its children at PRI 4, Standard at PRI 20 (the
+/// utility band, `taskpolicy -c utility`), Interactive at PRI 31 like a terminal's processes.
+/// Both clamped bands throttle IO behind the host's: under Background on a host at load 80 a
+/// shell loop that takes 0.7 s took 1–30 s, a fresh workspace's supervisor took 115 s to answer,
+/// and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility clamp
+/// at load 10–47 the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index
+/// took 34.5 s and 54.5 s where the same cold run unclamped took 2.4 s and 2.7 s.
+const PROCESS_TYPE: &str = "Interactive";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentSpec {
@@ -333,11 +337,11 @@ impl LaunchAgentSpec {
     /// `-C metadata` is a hash it never sees — the stable slot mount is what does that. It is set
     /// to the store root so every path the daemon does relativize is store-relative.
     ///
-    /// Standard QoS (`PROCESS_TYPE`) is load-bearing here too. sccache 0.17 does not use cargo's
-    /// jobserver; it creates its own (`Client::new()` → `num_cpus()` tokens) and `acquire()`s one
-    /// per miss, so under Background the hasher and those rustc children would run at PRI 4 while
-    /// every wrapped `sccache rustc` client stays at PRI 31, and the host's compile fleet would
-    /// wait on a niced queue instead of hitting a cache.
+    /// Interactive QoS (`PROCESS_TYPE`) is load-bearing here too. sccache 0.17 does not use
+    /// cargo's jobserver; it creates its own (`Client::new()` → `num_cpus()` tokens) and
+    /// `acquire()`s one per miss, so under Background (PRI 4) or Standard (PRI 20) the hasher and
+    /// those rustc children would run below every wrapped `sccache rustc` client at PRI 31, and
+    /// the host's compile fleet would wait on a niced queue instead of hitting a cache.
     ///
     /// All source-verified against sccache 0.17.
     pub fn sccache(
