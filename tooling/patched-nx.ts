@@ -42,16 +42,6 @@ const UPSTREAM = [
   ['nrwl/nx#37271', 'keep daemon plugin workers with graph hooks alive between graphs'],
   ['nrwl/nx#37272', 'resolve typescript and release version actions from the workspace root'],
 ] as const;
-/**
- * Repairs the patch carries that no upstream change proposes. Each stays until Nx can share one cache
- * directory between checkouts on its own.
- */
-const CARRIED = [
-  'share one cache directory between checkouts that each keep their own task database: an entry published ' +
-    'there (`<hash>.complete`, written under an O_EXCL `<hash>.lock` once its outputs are complete) is ' +
-    'adopted on a local miss, and a directory marked `.shared` is pruned by its owner instead of by each ' +
-    'checkout\u2019s bound and age',
-] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
 
@@ -194,10 +184,6 @@ function notes(built: Release): string {
     'It carries these upstream fixes until Nx releases them:',
     '',
     ...UPSTREAM.map(([pr, what]) => `- https://github.com/${pr.replace('#', '/pull/')} (${pr}): ${what}`),
-    '',
-    'and these repairs, which no upstream change proposes yet:',
-    '',
-    ...CARRIED.map((what) => `- ${what}`),
     '',
     'A consumer keeps `nx` at its registry version and sets `overrides.nx` to this asset\u2019s URL; bun.lock pins:',
     '',
