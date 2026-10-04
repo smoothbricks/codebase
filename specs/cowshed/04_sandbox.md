@@ -731,10 +731,11 @@ index exactly one cache directory, so a run restores only artifacts its own data
 directories of its own would own a second cache beside the checkout's: a build that fills one leaves a check reading the
 other cold, and every clone inherits both half-warm. So host shells, sandboxed jobs and land checks of one checkout
 share one record, one daemon, one task database and one cache, and a clone inherits that state warm through its build
-volume (16_build_volumes.md). A read-only job may not write the checkout, and Nx writes its database on every run, so
-its Nx state lives in its exec temp dir: its results reach no other boundary, and a read-only client never reaches a
-daemon that can write the workspace. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the
-workspace, or the capability's override directory.
+volume (16_build_volumes.md). A read-only job keeps the source tree read-only but gets read-write on its checkout's
+build volume, so it reads and writes the same cache and task database; it runs without a daemon, because the checkout's
+daemon executes plugin code with the read-write boundary and a read-only client must never reach it. daemon that can
+write the workspace. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the workspace, or the
+capability's override directory.
 
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
 the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree; a host shell of a cowshed checkout reaches the same

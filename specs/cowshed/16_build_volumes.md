@@ -99,9 +99,9 @@ configuration file ever names a build volume directly.
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
-`.nx/workspace-data`, and an indexer that keeps a per-tree index in the checkout (detected by its own marker, for
-example a code-graph index directory) contributes that directory. A capability that keeps no per-tree incremental state
-contributes none. A project with no build-state capability gets no build volume and pays nothing.
+`.nx/workspace-data`, and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/`
+whole. A capability that keeps no per-tree incremental state contributes none. A project with no build-state capability
+gets no build volume and pays nothing.
 
 ### Targets and seeds
 
@@ -115,9 +115,10 @@ build volume is written by whatever runs there (a developer's build, a reload, t
 mid-write would copy a Cargo unit or an Nx database half-written. A seed has no writer by construction, so its clone is
 consistent without any quiescence protocol.
 
-A target's seed is made when the target is created (a clone of the seed it was forked from) and again at the end of
-every land into it (below), by cloning the build volume the target just adopted, after the landing workspace has
-retired. Each target keeps only its latest seed; a target's seed is deleted when the target retires.
+A target's seed is made when the target is created (a clone of the seed it was forked from) and again during every land
+into it (below), by cloning the landing workspace's build volume after that workspace has been quiesced and before the
+target adopts it, so neither side can be writing it. Each target keeps only its latest seed; a target's seed is deleted
+when the target retires.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
@@ -145,7 +146,13 @@ same for main and for an integration workspace; "the target" is whichever one it
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
 3. **Fast-forward the target** under its repository lock (as today).
-4. **Adopt the build volume.** Under the same lock, if the target's current Nx task database has no open file
+4. **Quiesce the landing workspace.** Its supervisor stops the workspace's jobs and its sandboxed Nx daemon, and the
+   landing build volume's Nx task database must have no open file descriptors. If it still does, adoption is **skipped**
+   and reported, as for the target below. The landing volume now has no writer.
+5. **Freeze the seed.** Clone the landing build volume's image as the target's new seed and delete the target's previous
+   seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork of this target
+   starts from exactly what is landing.
+6. **Adopt the build volume.** Under the same lock, if the target's current Nx task database has no open file
    descriptors (one open-file query on one file; rule "The adoption needs the target's Nx database closed"):
    1. stop the target's Nx daemon (`nx daemon --stop` through the target's checkout; it restarts on the next client);
    2. delete `nx/workspace-data/d` in the landing build volume;
@@ -154,18 +161,16 @@ same for main and for an integration workspace; "the target" is whichever one it
       below).
 
    If the database is open, the swap is **skipped** and the land report says so with the holder's pid and command. The
-   target keeps its build volume and builds the landed delta incrementally the next time anything builds there. A
-   skipped swap is never wrong, only slower.
+   target keeps its build volume and builds the landed delta incrementally the next time anything builds there; forks
+   still start from the new seed. A skipped swap is never wrong, only slower.
 
-5. **Check the adoption (2b).** Re-run the landed check in the target, now on the adopted build volume. For Nx it must
+7. **Check the adoption (2b).** Re-run the landed check in the target, now on the adopted build volume. For Nx it must
    be **100% cache hits**. Every miss is a defect in the project's build configuration, not a reason to build: an input
    that differs between checkouts, an output that is not declared, a nondeterministic step. The land report lists each
    missed task with its hash inputs as a typed finding (13_telemetry.md records it), and the land still succeeds,
    because the landed code was already checked. This is a free, continuous lint of the Nx configuration: a coordinator
    turns findings into fix work.
-6. **Reseed the target.** Clone the adopted build volume's image as the target's new seed; delete its previous seed. The
-   next fork of this target starts from exactly what just landed.
-7. **Retire the workspace** (as today). Its build volume is now the target's and does not retire with it.
+8. **Retire the workspace** (as today). Its build volume is now the target's and does not retire with it.
 
 ### Stacks and merge queues
 
@@ -204,7 +209,9 @@ without one is not done.
 ### Every checkout has exactly one Nx state
 
 Host shells, sandboxed jobs, land checks and the daemon of one checkout use one `.nx/cache`, one task database and one
-daemon (04_sandbox.md states the socket and daemon placement). There is never a second, sandbox-private Nx cache.
+daemon (04_sandbox.md states the socket and daemon placement). There is never a second, sandbox-private Nx cache, not
+even for a read-only job: build state is not source, so a read-only job keeps the source tree read-only but reads and
+writes its checkout's build volume like any other job.
 
 - **Why**: Nx's task database indexes exactly one cache directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`,
   `NX_CACHE_DIRECTORY` or `NX_PROJECT_GRAPH_CACHE_DIRECTORY` to something else moves the database with it. A second
@@ -307,7 +314,8 @@ links afterwards, so it reads rows from the old volume and files from the new on
 the new cache lacks, stock Nx reports a hit and restores nothing (measured): the task "succeeds" with its outputs
 missing. A run that started on the old tree and stays entirely on the old volume is correct; only the mix is wrong. The
 land therefore swaps only when no process holds the target's current task database open, and otherwise skips the swap
-(Land step 4). The daemon is stopped at the swap because it also keeps the database open (it records task history).
+(Land step 6). The daemon is stopped at the swap because it also keeps the database open (it records task history). The
+landing workspace is quiesced first (Land step 4) for the same reason on its side.
 
 A run that started on the old tree and stays wholly on the old volume is correct even when it hits; the hazard is only
 the mix.
