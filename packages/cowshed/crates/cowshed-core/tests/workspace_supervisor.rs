@@ -367,6 +367,9 @@ fn config() -> WorkspaceSupervisorConfig {
         std::process::id()
     ));
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    // Capability detection refuses a directory that resolves outside the workspace, and
+    // `/var/folders` resolves into `/private/var`.
+    let workspace_root = std::fs::canonicalize(&workspace_root).expect("canonical workspace root");
     WorkspaceSupervisorConfig {
         authority: authority(),
         owned_repo_ids: OwnedRepoIds::sole(authority().repo_id),
@@ -385,8 +388,7 @@ fn config() -> WorkspaceSupervisorConfig {
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
+            capabilities: Default::default(),
         },
         artifacts: ArtifactConfig {
             combined_output_quota_bytes: 1024,

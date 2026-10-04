@@ -374,16 +374,15 @@ output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-
 warm = ["tooling/warm-main"]  # argv main's supervisor runs after every land (02_workspaces.md "Warm main")
 ```
 
-Workspace environment lives inside the image as `.cowshed/env`: it exports `GOENV` (the workspace's
-`.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN` (controller-minted token), and on macOS `COWSHED_PORT_BASE` and
-`COWSHED_PORT_BLOCK_SIZE` (= the authoritative detached-metadata block base and size) so
-`vite`/`astro`/`metro`/`devenv up` select ports inside the workspace's own block instead of colliding with siblings
-(04_sandbox.md). Block size is not configuration: a block's size is persisted with it, new workspaces get 64 ports, and
-`cowshed grant <ws> --ports <N>` grows it (04_sandbox.md). Linux allocates no port block and emits no port sentinel: dev
-servers bind its private loopback, while ordinary package tools retain their configured `http://127.0.0.1:7644/…` proxy
-and registry URLs through exactly one trusted minimal connector launched inside that namespace. Cowshed publishes
-`.cowshed/env` whenever it mints credentials and whenever it starts the workspace's supervisor; `.envrc` sources it (see
-02_workspaces.md). No CLI verb prints these values on demand.
+Workspace environment lives inside the image as `.cowshed/env`: it exports `COWSHED_WORKSPACE_TOKEN` (controller-minted
+token), and on macOS `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` (= the authoritative detached-metadata block base
+and size) so `vite`/`astro`/`metro`/`devenv up` select ports inside the workspace's own block instead of colliding with
+siblings (04_sandbox.md). Block size is not configuration: a block's size is persisted with it, new workspaces get 64
+ports, and `cowshed grant <ws> --ports <N>` grows it (04_sandbox.md). Linux allocates no port block and emits no port
+sentinel: dev servers bind its private loopback, while ordinary package tools retain their configured
+`http://127.0.0.1:7644/…` proxy and registry URLs through exactly one trusted minimal connector launched inside that
+namespace. Cowshed publishes `.cowshed/env` whenever it mints credentials and whenever it starts the workspace's
+supervisor; `.envrc` sources it (see 02_workspaces.md). No CLI verb prints these values on demand.
 
 ## Tradeoffs
 

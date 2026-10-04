@@ -49,7 +49,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     }
     let mut directories = vec![PathBuf::from(OFFICIAL_INSTALL)];
     directories.extend(super::host_program_directories(context));
-    super::add_bootstrap(&mut contribution, "go", &directories)?;
+    super::add_bootstrap(&mut contribution, context, "go", &directories)?;
     Ok(contribution)
 }
 
@@ -129,14 +129,27 @@ mod tests {
             .expect("go detected");
         assert_eq!(
             contribution.env,
-            BTreeMap::from([("GOCACHE", EnvAction::Unset), ("GOMODCACHE", EnvAction::Unset)])
+            BTreeMap::from([
+                ("GOCACHE", EnvAction::Unset),
+                ("GOMODCACHE", EnvAction::Unset)
+            ])
         );
         assert!(contribution.cache_mounts.is_empty());
-        assert!(
-            contribution
-                .grants
-                .iter()
-                .all(|grant| !grant.path.starts_with(&fixture.root))
-        );
+        // Beneath the host home only the search's literal program probes; nothing in the
+        // workspace.
+        for grant in &contribution.grants {
+            if grant.path.starts_with(&fixture.home) {
+                assert_eq!(
+                    (grant.scope, grant.access),
+                    (
+                        crate::capabilities::GrantScope::Literal,
+                        crate::capabilities::GrantAccess::Read
+                    ),
+                    "{grant:?}"
+                );
+            } else {
+                assert!(!grant.path.starts_with(&fixture.root), "{grant:?}");
+            }
+        }
     }
 }

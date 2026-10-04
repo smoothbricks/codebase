@@ -465,7 +465,6 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         image_path: &Path,
         mount_point: &Path,
-        workspace_mount: &Path,
         private_key_path: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn write_marker(
@@ -539,12 +538,10 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     /// Hand the checkout path over to main's mountpoint.
     ///
-    /// Builds the mountpoint directory with its self-healing stub under a staging sibling,
-    /// exchanges it with the original checkout in one `renameatx_np(RENAME_SWAP)`, and renames the
-    /// displaced original to `pre_cowshed_checkout`. The checkout path transitions straight from
-    /// the user's directory to the mountpoint, so it is never absent. Main is mounted there
-    /// afterwards — it cannot be before, because the mountpoint does not exist until this swap
-    /// creates it — and until it is, the stub inside heals on the next `cd`.
+    /// Builds an empty mountpoint directory under a staging sibling, exchanges it with the
+    /// original checkout in one `renameatx_np(RENAME_SWAP)`, and renames the displaced original
+    /// to `pre_cowshed_checkout`. The checkout path is never absent. Main mounts there afterwards;
+    /// a failed publication is completed explicitly by the controller, not by a repository hook.
     fn vacate_adopted_checkout(
         &self,
         source_checkout: &Path,
@@ -1985,7 +1982,7 @@ struct PreparedReplaceRestore<A> {
 
 enum PreparedRestore<A> {
     Verify(PreparedVerifyRestore<A>),
-    Replace(PreparedReplaceRestore<A>),
+    Replace(Box<PreparedReplaceRestore<A>>),
 }
 fn workspace_lock_path(
     config: &ApfsSubstrateConfig,
@@ -2227,13 +2224,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     })
     .and_then(|()| {
         timed_apfs_step("staging", "creds", || {
-            host.mint_workspace_credentials(
-                &workspace,
-                &image,
-                &staging,
-                &canonical_mount,
-                &companion,
-            )
+            host.mint_workspace_credentials(&workspace, &image, &staging, &companion)
         })
     })
     .and_then(|()| {
@@ -2362,8 +2353,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
     }
     // Only now does the checkout path change hands, in one atomic swap. The mountpoint *is* the
     // checkout path and cannot exist until the swap creates it, so the swap comes first and the
-    // mount follows; the self-healing stub the swap plants covers that window. A failure from
-    // here on leaves a published main that `ApfsSubstrate::finish_adoption` completes.
+    // mount follows. A failure leaves a published main that `ApfsSubstrate::finish_adoption` completes.
     host.vacate_adopted_checkout(&source_checkout, &pre_cowshed_checkout)
         .map_err(PublicationError::into_source)?;
     if let Err(primary) = host
@@ -2519,7 +2509,6 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         host.mint_workspace_credentials(
             &workspace,
             &canonical_image,
-            &canonical_mount,
             &canonical_mount,
             &canonical_companion,
         )
@@ -2796,7 +2785,6 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
                 &replacement,
                 &staged_image,
                 &staging_mount,
-                &canonical_mount,
                 &staged_companion,
             )?;
             host.write_marker(&staging_mount, &replacement, None, identity)?;
@@ -2812,7 +2800,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             detach_and_reclaim(host, attachment, &staged_image, "restore staging detach"),
         );
     }
-    Ok(PreparedRestore::Replace(PreparedReplaceRestore {
+    Ok(PreparedRestore::Replace(Box::new(PreparedReplaceRestore {
         stage: WorkspaceStage {
             workspace: replacement,
             mount_point: staging_mount,
@@ -2828,7 +2816,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         current,
         previous_incarnation,
         source_checkpoint: label.to_string(),
-    }))
+    })))
 }
 
 fn commit_prepared_restore<H: ApfsExecutionHost>(
@@ -2854,7 +2842,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         current,
         previous_incarnation,
         source_checkpoint,
-    } = prepared;
+    } = *prepared;
     if let Err(primary) = host
         .validate_staged_companion(&stage.companion)
         .and_then(|()| {

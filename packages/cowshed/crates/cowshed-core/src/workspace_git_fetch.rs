@@ -12,8 +12,6 @@ use crate::repository::RepositoryBinding;
 use crate::sandbox::SandboxConfig;
 
 pub const WORKSPACE_GIT_FETCH_CONFIG_PATH: &str = ".cowshed/git-fetch.inc";
-pub const CARGO_NET_GIT_FETCH_WITH_CLI_ENV: &str = "CARGO_NET_GIT_FETCH_WITH_CLI";
-pub const CARGO_NET_GIT_FETCH_WITH_CLI_VALUE: &str = "true";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GitFetchMapping {
@@ -144,8 +142,7 @@ pub fn git_fetch_include_env(path: &Path) -> [(&'static str, &std::ffi::OsStr); 
 /// Filter the entire config injection family, not just COUNT. GIT_CONFIG_PARAMETERS is
 /// independently interpreted by Git, and KEY/VALUE entries can survive a later count change.
 pub(crate) fn caller_git_environment_allowed(name: &str) -> bool {
-    name != CARGO_NET_GIT_FETCH_WITH_CLI_ENV
-        && name != "GIT_CONFIG"
+    name != "GIT_CONFIG"
         && !name.starts_with("GIT_CONFIG_")
         && !matches!(
             name,
@@ -673,8 +670,7 @@ mod tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
             git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
+            capabilities: Default::default(),
         }
     }
 

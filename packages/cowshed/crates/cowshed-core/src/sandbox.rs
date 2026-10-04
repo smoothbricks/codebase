@@ -2,6 +2,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::capabilities::{
+    CapabilityGrant, DetectedCapabilities, DetectionContext, GrantAccess, GrantScope,
+};
 pub use crate::metadata::PortBlock;
 use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
 
@@ -47,302 +50,6 @@ pub enum SandboxProfileRole {
     /// readable trees, not the child toolchain's ambient file-read-data permission.
     GitDiscovery,
 }
-
-/// The canonical entry point to a multi-user Nix installation's daemon socket.
-pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
-
-/// The nix daemon socket to admit for this host, if it has one.
-///
-/// Multi-user Nix is a requirement: a sandboxed client never writes `/nix/store` itself, it asks
-/// the daemon, which runs as root *outside* the sandbox. Admitting the socket therefore grants the
-/// ability to ask, not the ability to write — the store is already world-readable through the broad
-/// `file-read-data` allow, and binary-cache substitution is already an accepted trusted-mediator
-/// channel. Without this, in-workspace `nix` and `devenv` evaluation cannot reach the daemon at all.
-///
-/// The canonical entry is conventionally a symlink — on macOS it points into `/var/run` — and
-/// Seatbelt matches `path-literal` against the resolved path, so the link is followed here rather
-/// than admitted as written. Resolving doubles as the check: what gets admitted is whatever the
-/// canonical entry actually reaches, and it has to be a socket, so nothing is admitted by being
-/// named. A host with no daemon yields no grant and the profile is byte-identical to one built
-/// before this existed.
-pub fn nix_daemon_socket() -> Option<PathBuf> {
-    nix_daemon_socket_at(Path::new(NIX_DAEMON_SOCKET))
-}
-
-fn nix_daemon_socket_at(entry: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::FileTypeExt as _;
-
-    let resolved = std::fs::canonicalize(entry).ok()?;
-    let metadata = std::fs::symlink_metadata(&resolved).ok()?;
-    metadata.file_type().is_socket().then_some(resolved)
-}
-
-/// The host-owned sccache server socket beneath the cowshed store root.
-///
-/// The socket is bound by the `dev.cowshed.sccache` LaunchAgent — an sccache
-/// server started by launchd *outside* every sandbox, so it enforces no
-/// workspace's boundary and can serve them all. Clients reach it through
-/// `SCCACHE_SERVER_UDS`; the profile admits exactly this path.
-///
-/// Unlike [`nix_daemon_socket`], the path is admitted without requiring a live
-/// socket: it is a cowshed-owned constant inside the machine-global store, where
-/// the `/private/cowshed` deny leaves sandboxes unable to create, unlink, or bind
-/// anything, so naming the path grants nothing a sandbox could conjure — and it
-/// keeps profiles correct when the daemon is (re)started after a supervisor launched.
-/// The same deny is what makes a client's auto-spawned fallback server fail fast
-/// in-sandbox: binding here needs write-create, which no workspace holds.
-pub fn sccache_server_socket() -> PathBuf {
-    Path::new(STORE_ROOT).join("sccache.sock")
-}
-
-/// The host-owned sccache cache directory beneath the cowshed store root.
-///
-/// One cache for every workspace on the host: cross-generation reuse is the entire point, and a
-/// per-workspace cache would have nothing to reuse. The daemon owns it, but clients export it too
-/// — a client that finds no daemon spawns its own server, and that fallback must land in this cache
-/// rather than sccache's user-default directory.
-pub fn sccache_cache_directory() -> PathBuf {
-    Path::new(CACHES_ROOT).join("sccache")
-}
-
-/// The nix GC root `cowshed setup --sccache` registers for the sccache it builds:
-/// `~/Library/Application Support/dev.cowshed/nix/sccache`, an out-link to the store path.
-///
-/// Under the same support directory as the plists and the host-stable binaries. Whatever launchd
-/// can read an agent definition from, `nix store gc` can read a root from — and keeping cowshed's
-/// only nix root in cowshed's own directory is what makes `setup --uninstall` able to release it.
-pub fn sccache_gc_root(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/dev.cowshed/nix/sccache")
-}
-
-/// The sccache client a sandboxed build wraps rustc with: `bin/sccache` inside the store path
-/// [`sccache_gc_root`] pins, the program the host's `dev.cowshed.sccache` LaunchAgent runs as the
-/// server. `None` when the host pins none — sccache is opt-in — or the pinned path was collected.
-///
-/// It is read through the link on every call, as the LaunchAgent's own plist is derived: the
-/// root is the host's only record of which build is installed. The result is a store path, which
-/// every sandbox can read and execute, and it names the program itself rather than a name for
-/// `PATH` to resolve: a workspace's shell activation owns `PATH`, and a repository shell that
-/// does not ship sccache would leave a bare `sccache` unresolvable.
-pub fn sccache_client(home: &Path) -> Option<PathBuf> {
-    let store_path = std::fs::read_link(sccache_gc_root(home)).ok()?;
-    let program = store_path.join("bin/sccache");
-    (program.is_absolute() && program.is_file()).then_some(program)
-}
-
-/// One host cache path and the directory on the caches volume it belongs in.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostCache {
-    pub host: PathBuf,
-    pub shared: PathBuf,
-}
-
-impl HostCache {
-    /// Whether the host path already resolves to the shared directory.
-    pub fn is_shared(&self) -> bool {
-        matches!(
-            (
-                std::fs::canonicalize(&self.host),
-                std::fs::canonicalize(&self.shared),
-            ),
-            (Ok(host), Ok(shared)) if host == shared
-        )
-    }
-}
-
-/// A tool cache every checkout on the host reaches through ONE literal path: the host's own
-/// default, which links into the caches volume.
-///
-/// Cargo and Bun record where their cache lives, so no other spelling of the same bytes shares
-/// it. Cargo fingerprints a registry or git dependency by the absolute path of its source under
-/// `$CARGO_HOME`: a `$CARGO_HOME` at any other path — a sandbox's private HOME, even one whose
-/// `registry` links to the same bytes — dirties every dependency a clone's copied `target/`
-/// holds. Bun's isolated linker writes `node_modules/.bun/<package>` as absolute symlinks into
-/// its install cache, so main's `node_modules` and every clone's resolve only if each names the
-/// same cache path. A sandboxed child is therefore pointed at the host path through `variable`
-/// once host setup has relocated the tool's caches ([`shared_tool_homes`]); until then it keeps
-/// the tool's private default under the sandbox HOME, and `cowshed doctor` says why.
-#[derive(Debug, Eq, PartialEq)]
-pub struct SharedToolHome {
-    /// The variable that points a sandboxed child at the host path.
-    pub variable: &'static str,
-    /// The tool's own default directory under HOME: the host uses it unconfigured.
-    pub home: &'static str,
-    pub layout: SharedLayout,
-    /// Checkouts hold symlinks into the cache (Bun's isolated linker), so while the host path is
-    /// still a private directory it stays readable to every sandbox: a cloned `node_modules`
-    /// would otherwise resolve to EPERM inside the sandbox while the same tree works on the host.
-    pub linked_from_checkouts: bool,
-}
-
-/// Where a [`SharedToolHome`]'s bytes live on the caches volume.
-#[derive(Debug, Eq, PartialEq)]
-pub enum SharedLayout {
-    /// The host path itself links to this directory under the caches root.
-    Whole(&'static str),
-    /// The host path stays a host directory holding configuration, credentials or binaries that
-    /// never leave it. Only the `(child, directory under the caches root)` links inside it are
-    /// shared, and `state_files` are the only files the tool writes at its root beside them.
-    Split {
-        links: &'static [(&'static str, &'static str)],
-        state_files: &'static [&'static str],
-    },
-}
-
-impl SharedToolHome {
-    /// `<home>/<self.home>`: the literal path the host and every sandbox use.
-    pub fn host_path(&self, home: &Path) -> PathBuf {
-        home.join(self.home)
-    }
-
-    /// Each host link with the shared directory it must resolve to.
-    pub fn links(&self, home: &Path, caches: &Path) -> Vec<HostCache> {
-        let host = self.host_path(home);
-        match &self.layout {
-            SharedLayout::Whole(shared) => vec![HostCache {
-                host,
-                shared: caches.join(shared),
-            }],
-            SharedLayout::Split { links, .. } => links
-                .iter()
-                .map(|(child, shared)| HostCache {
-                    host: host.join(child),
-                    shared: caches.join(shared),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// What cargo itself writes at the root of `$CARGO_HOME` while it resolves and builds: the
-/// package-cache locks, and the global-cache usage database with its rollback journal.
-pub const CARGO_HOME_STATE_FILES: [&str; 4] = [
-    ".package-cache",
-    ".package-cache-mutate",
-    ".global-cache",
-    ".global-cache-journal",
-];
-
-/// Cargo's `registry` (index, fetched `.crate` archives, unpacked sources) and `git` (bare
-/// databases and checkouts of git dependencies). Both are read-at-build caches (03_caches.md,
-/// third layer): cargo writes an entry once per crate or revision and every later build only
-/// reads it. The rest of `~/.cargo` — configuration, credentials, `bin` — stays on the host and
-/// behind the secret denies.
-pub static CARGO: SharedToolHome = SharedToolHome {
-    variable: "CARGO_HOME",
-    home: ".cargo",
-    layout: SharedLayout::Split {
-        links: &[("registry", "cargo/registry"), ("git", "cargo/git")],
-        state_files: &CARGO_HOME_STATE_FILES,
-    },
-    linked_from_checkouts: false,
-};
-
-/// Bun's global install cache. The isolated linker extracts each package once into
-/// `<cache>/links/<name>@<version>-<hash>` and writes `node_modules/.bun/<name>@<version>` as an
-/// absolute symlink to it, so the cache path is part of every checkout's `node_modules`: main's
-/// links and a clone's resolve only if both name the same path, and a sandboxed `bun install`
-/// against any other cache relinks the clone away from main's.
-pub static BUN: SharedToolHome = SharedToolHome {
-    variable: "BUN_INSTALL_CACHE_DIR",
-    home: ".bun/install/cache",
-    layout: SharedLayout::Whole("bun/install/cache"),
-    linked_from_checkouts: true,
-};
-
-/// uv's cache of wheels, source distributions and built packages, shared by the same one-path
-/// rule so every checkout's `uv sync` reads what any one of them fetched or built.
-pub static UV: SharedToolHome = SharedToolHome {
-    variable: "UV_CACHE_DIR",
-    home: ".cache/uv",
-    layout: SharedLayout::Whole("uv"),
-    linked_from_checkouts: false,
-};
-
-/// Every tool home a sandbox shares with the host once its caches are relocated.
-pub static SHARED_TOOL_HOMES: [&SharedToolHome; 3] = [&CARGO, &BUN, &UV];
-
-/// The [`SHARED_TOOL_HOMES`] whose host links all resolve to their shared directories.
-pub fn shared_tool_homes(home: &Path, caches: &Path) -> Vec<&'static SharedToolHome> {
-    SHARED_TOOL_HOMES
-        .into_iter()
-        .filter(|tool| tool.links(home, caches).iter().all(HostCache::is_shared))
-        .collect()
-}
-
-/// A path beneath the host HOME a sandboxed process may read despite the HOME-wide read deny.
-///
-/// The profile denies every read under HOME and admits back only what is named here, plus
-/// the explicit read/write grants, the workspace's own mount and the controller-owned sockets.
-/// Read-only by construction: nothing in this list can grant a write.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HomeRead {
-    /// The path itself — a directory to traverse or a link to resolve — never its contents.
-    Literal(PathBuf),
-    /// The path and everything beneath it.
-    Tree(PathBuf),
-}
-
-impl HomeRead {
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Literal(path) | Self::Tree(path) => path,
-        }
-    }
-}
-
-/// The one place the HOME read allowlist is built: what a toolchain needs from the host HOME.
-///
-/// - A shared tool home ([`shared_tool_homes`]): its host path and each of its links into the
-///   caches volume, as literals. The bytes they resolve to are on the caches volume, outside
-///   HOME; the rest of the host tool home — configuration, credentials, binaries — stays denied.
-/// - A tool cache checkouts link into while it is still a private host directory
-///   ([`SharedToolHome::linked_from_checkouts`]): the whole cache, or a cloned `node_modules`
-///   resolves to EPERM in the sandbox while the same tree works on the host.
-/// - The host user's Nix profile links (`~/.nix-profile`, `~/.local/state/nix/profile`): the
-///   supervisor resolves `direnv`, `devenv` and `nix` through them before any shell exists.
-///   Each is a link into `/nix`, so naming the link admits no HOME bytes.
-/// - The sccache GC root: the supervisor reads it to name the `RUSTC_WRAPPER` store path. A
-///   link into `/nix/store`, likewise.
-pub fn home_read_allowlist(home: &Path, shared: &[&'static SharedToolHome]) -> Vec<HomeRead> {
-    let mut reads = Vec::new();
-    for tool in SHARED_TOOL_HOMES {
-        let host = tool.host_path(home);
-        if shared.contains(&tool) {
-            reads.push(HomeRead::Literal(host.clone()));
-            if let SharedLayout::Split { links, .. } = &tool.layout {
-                reads.extend(
-                    links
-                        .iter()
-                        .map(|(child, _)| HomeRead::Literal(host.join(child))),
-                );
-            }
-        } else if tool.linked_from_checkouts {
-            reads.push(HomeRead::Tree(host));
-        }
-    }
-    reads.extend(
-        [".nix-profile", ".local/state/nix/profile"]
-            .into_iter()
-            .map(|link| HomeRead::Literal(home.join(link))),
-    );
-    reads.push(HomeRead::Literal(sccache_gc_root(home)));
-    reads
-}
-
-/// Tool caches host setup relocates onto the caches volume beside the shared tool homes, as
-/// `(path under HOME, path under the caches root)`; every sandbox shares the second read-write.
-pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
-    (".cache/zig", "zig"),
-    (".gradle/caches", "gradle/caches"),
-    (".cache/nix", "nix/cache"),
-    (".local/state/nix", "nix/state"),
-];
-
-/// Caches shared like the relocated ones but named directly by the tool's own configuration:
-/// Go's module/build caches through its env file and ttsc's compiled plugins through
-/// `TTSC_CACHE_DIR`. The supervisor creates these before a child runs.
-pub const DIRECT_TOOL_CACHES: [&str; 3] = ["go/mod", "go/build", "ttsc"];
 
 /// A symlink beside the workspace mount — `<mount_root>/<org>/<project>/<name>` — that an
 /// operator planted so a relative dependency (`../<name>`) resolves from every workspace of the
@@ -458,30 +165,104 @@ pub struct SandboxConfig {
     /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
     /// baseline.
     pub git_worktree_repository: Option<PathBuf>,
-    /// The tool homes whose caches are the shared ones ([`shared_tool_homes`]); every child uses
-    /// their host paths, and every other tool keeps its private default under the sandbox HOME.
-    pub shared_tool_homes: Vec<&'static SharedToolHome>,
-    /// What the HOME-wide read deny admits back; see [`home_read_allowlist`].
-    pub home_reads: Vec<HomeRead>,
+    /// The project capabilities detected in this workspace for this mode
+    /// ([`SandboxConfig::configure_capabilities`]): every tool-specific grant, cache mount,
+    /// socket and environment entry a child receives comes from here, never from a tool table.
+    pub capabilities: DetectedCapabilities,
 }
 
 impl SandboxConfig {
-    /// Each [`SHARED_TOOL_HOMES`] variable, naming the host path when this sandbox shares the
-    /// tool and `None` when the tool keeps its private default under the sandbox HOME.
-    ///
-    /// The variables are the sandbox's, never the caller's: any other path would defeat the one
-    /// literal path the host and every checkout share.
-    pub fn shared_tool_environment(
+    /// [`Self::configure_capabilities_for`] a command at the workspace root: the snapshot a
+    /// supervisor starts with.
+    pub fn configure_capabilities(&mut self) -> crate::Result<()> {
+        let root = self.workspace_mount.clone();
+        self.configure_capabilities_for(&root)
+    }
+
+    /// [`Self::detect_capabilities_for`] a command in `command_cwd`, adopted by this sandbox.
+    pub fn configure_capabilities_for(&mut self, command_cwd: &Path) -> crate::Result<()> {
+        let capabilities = self.detect_capabilities_for(command_cwd)?;
+        self.allowed_unix_sockets = capabilities.contribution.unix_sockets.clone();
+        self.capabilities = capabilities;
+        Ok(())
+    }
+
+    /// This sandbox with `capabilities` in place of its own: every other field as it is, and the
+    /// sockets the new contribution admits.
+    pub fn with_capabilities(&self, capabilities: DetectedCapabilities) -> Self {
+        Self {
+            home: self.home.clone(),
+            mount_root: self.mount_root.clone(),
+            workspace_mount: self.workspace_mount.clone(),
+            shed_links: self.shed_links.clone(),
+            exec_temp_dir: self.exec_temp_dir.clone(),
+            port_block: self.port_block,
+            retained_port_blocks: self.retained_port_blocks.clone(),
+            mode: self.mode,
+            grants: self.grants.clone(),
+            allowed_unix_sockets: capabilities.contribution.unix_sockets.clone(),
+            additional_denies: self.additional_denies.clone(),
+            git_worktree_repository: self.git_worktree_repository.clone(),
+            capabilities,
+        }
+    }
+
+    /// The workspace's project capabilities for this sandbox's mode, for a command in the
+    /// contained `command_cwd`. Project detectors read the project root whatever the cwd; only a
+    /// command-scoped convention (a shell hook nearest the cwd) depends on it. The private
+    /// environment root and runtime link are the mode's own, so a read-only job's contribution
+    /// never names a read-write job's state.
+    pub fn detect_capabilities_for(
         &self,
-    ) -> impl Iterator<Item = (&'static str, Option<PathBuf>)> + '_ {
-        SHARED_TOOL_HOMES.into_iter().map(|tool| {
-            (
-                tool.variable,
-                self.shared_tool_homes
-                    .contains(&tool)
-                    .then(|| tool.host_path(&self.home)),
-            )
-        })
+        command_cwd: &Path,
+    ) -> crate::Result<DetectedCapabilities> {
+        if !command_cwd.starts_with(&self.workspace_mount) {
+            return Err(crate::CowshedError::sandbox_denied(
+                format!(
+                    "command directory {} is outside workspace {}",
+                    command_cwd.display(),
+                    self.workspace_mount.display()
+                ),
+                "run the command from inside the workspace",
+            ));
+        }
+        let environment_root = match self.mode {
+            RunSandboxMode::ReadOnly => self.exec_temp_dir.clone(),
+            RunSandboxMode::ReadWrite => self.workspace_mount.join(".cowshed"),
+        };
+        let runtime_dir = sandbox_runtime_link(self);
+        let workspace_ca = self
+            .workspace_mount
+            .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
+        let trust_bundle = environment_root.join(
+            crate::workspace_clients::TRUST_BUNDLE_NAME
+                .to_str()
+                .expect("the bundle name is ASCII"),
+        );
+        let has_workspace_ca = match std::fs::symlink_metadata(&workspace_ca) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(crate::CowshedError::integrity(
+                    format!(
+                        "cannot inspect workspace CA {}: {error}",
+                        workspace_ca.display()
+                    ),
+                    "reattach the workspace to mint fresh credentials",
+                ));
+            }
+        };
+        let context = DetectionContext {
+            workspace_root: &self.workspace_mount,
+            project_root: &self.workspace_mount,
+            home: &self.home,
+            command_cwd,
+            caches_root: Path::new(CACHES_ROOT),
+            environment_root: &environment_root,
+            runtime_dir: &runtime_dir,
+            trust_bundle: has_workspace_ca.then_some(trust_bundle.as_path()),
+        };
+        crate::capabilities::detect_for_workspace(&context)
     }
 }
 
@@ -526,7 +307,6 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         workspace_mount: mount,
         exec_temp_dir,
     } = workspace;
-    let shared_tool_homes = shared_tool_homes(home, Path::new(CACHES_ROOT));
     // Main's checkout lives at the operator's own path, outside the mount root, so the
     // sibling-mount deny never reaches it: it is denied by name, exactly like a sibling. Main
     // itself runs in its own mount and keeps it.
@@ -537,7 +317,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
     let mut deny: Vec<PathBuf> = grants.deny.iter().chain(repository_deny).cloned().collect();
     deny.sort();
     deny.dedup();
-    Ok(SandboxConfig {
+    let mut config = SandboxConfig {
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
         exec_temp_dir,
@@ -567,18 +347,16 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
                 })
                 .collect(),
         },
-        // The supervisor is the trusted tier of the same workspace; it gets the same daemon reach
-        // as the children it launches, or an in-workspace evaluation would depend on which tier ran
-        // it. The sccache server socket rides along for the same reason.
-        allowed_unix_sockets: nix_daemon_socket()
-            .into_iter()
-            .chain([sccache_server_socket()])
-            .collect(),
+        allowed_unix_sockets: Vec::new(),
         additional_denies,
         git_worktree_repository,
-        home_reads: home_read_allowlist(home, &shared_tool_homes),
-        shared_tool_homes,
-    })
+        capabilities: DetectedCapabilities::default(),
+    };
+    // The supervisor is the trusted tier of the same workspace; it gets the same capability
+    // sockets as the children it launches, or an in-workspace evaluation would depend on which
+    // tier ran it.
+    config.configure_capabilities()?;
+    Ok(config)
 }
 
 /// Read-only jobs keep writable process state within the existing exec-temp carve-back.
@@ -592,7 +370,7 @@ pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
 /// A short socket namespace per workspace and mode. Distinct links prevent a
 /// read-only launch from retargeting a running read-write job's Unix sockets.
 /// macOS caps Unix socket paths at 104 bytes; the full mount path leaves no
-/// room for devenv's per-session socket suffix.
+/// room for a tool's per-session socket name.
 pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
     let suffix = match sandbox.mode {
         RunSandboxMode::ReadOnly => "-ro",
@@ -701,22 +479,37 @@ fn validated_sandbox_paths(
             });
         }
     }
-    // A HOME read only ever narrows the HOME-wide deny: it stays strictly beneath HOME and
-    // never inside a protected path. One that encloses a secret is harmless — the secret denies
-    // are the profile's last word — so only containment is refused.
-    for read in &config.home_reads {
-        let path = read.path();
-        validate_path(path)?;
-        if path == config.home || !path.starts_with(&config.home) {
+    let contribution = &config.capabilities.contribution;
+    for grant in &contribution.grants {
+        validate_path(&grant.path)?;
+        // A grant beneath HOME only ever narrows the HOME-wide read deny: HOME itself is never
+        // granted, or the deny would be undone wholesale.
+        if grant.path == config.home {
             return Err(SandboxError::InvalidPath {
-                path: path.to_path_buf(),
-                reason: "home read must be strictly beneath HOME",
+                path: grant.path.clone(),
+                reason: "a capability grant beneath HOME must be strictly beneath it",
             });
         }
-        if let Some(deny) = hard_denies.iter().find(|deny| path.starts_with(deny)) {
+        // A grant is refused only at or under a hard deny. Beside or above one it stays legal —
+        // the literal `~/.cargo` a shared cargo home needs sits beside the denied
+        // `~/.cargo/config.toml` — because every hard deny is emitted after every grant.
+        if let Some(deny) = hard_denies
+            .iter()
+            .find(|deny| grant.path.starts_with(deny.as_ref()))
+        {
             return Err(SandboxError::GrantIntersectsDeny {
-                grant: path.to_path_buf(),
+                grant: grant.path.clone(),
                 deny: deny.as_ref().to_path_buf(),
+            });
+        }
+    }
+    let caches = Path::new(CACHES_ROOT);
+    for mount in &contribution.cache_mounts {
+        validate_path(&mount.source)?;
+        if mount.source == caches || !mount.source.starts_with(caches) {
+            return Err(SandboxError::InvalidPath {
+                path: mount.source.clone(),
+                reason: "a capability cache mount must lie beneath the caches root",
             });
         }
     }
@@ -758,8 +551,8 @@ pub fn seatbelt_profile(
         push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
         // The broad allow is for system paths. Nothing under HOME is readable unless a later
         // rule names it: an explicit grant, the workspace's own mount, the exec temp dir, an
-        // allowed socket, or the toolchain allowlist ([`home_read_allowlist`]). Every one of
-        // those follows here, so last-match-wins carves each back.
+        // allowed socket, or a detected capability's grant. Every one of those follows here,
+        // so last-match-wins carves each back.
         push_subpath_rule(&mut profile, "deny file-read*", &config.home)?;
     } else {
         // Git's isolated global configuration is the empty device, not user HOME.
@@ -774,25 +567,6 @@ pub fn seatbelt_profile(
         "/System",
         "/bin",
         "/opt",
-        "/nix",
-        // Nix per-user profiles: where nix-darwin and NixOS put a user's installed tools, reached
-        // through a stable store-backed symlink. `sandbox_path` admits these to `PATH`, and without
-        // the matching read grant every tool on them is unrunnable — `file-read-data` on `/` is not
-        // enough, because resolving a path for exec needs `file-read*` metadata on its roots.
-        //
-        // Both spellings are listed for the same reason `/var/select` and `/private/var/select`
-        // both are: Seatbelt matches the *resolved* path, `/etc` is a symlink to `/private/etc`,
-        // and a rule naming only the pretty form silently never matches.
-        "/etc/profiles",
-        "/etc/static/profiles",
-        "/private/etc/profiles",
-        "/private/etc/static/profiles",
-        // Nix's own configuration. Nix clients stat their config files before reading them,
-        // including optional ones (Determinate Nix's `sentry-endpoint`) whose absence must
-        // surface as ENOENT; `file-read-data` alone answers that stat with EPERM, which nix treats
-        // as fatal. Read-only, and only this tree: the rest of `/etc` keeps its metadata denied.
-        "/etc/nix",
-        "/private/etc/nix",
         "/private/var/select",
         "/sbin",
         "/usr",
@@ -926,51 +700,16 @@ pub fn seatbelt_profile(
         push_readable_ancestors(&mut profile, socket)?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", caches)?;
-    for tool in SHARED_TOOL_HOMES {
-        // A child reaches these through the host path's links, and Seatbelt matches the
-        // resolved path.
-        for link in tool.links(&config.home, caches) {
-            push_subpath_rule(&mut profile, "allow file-read* file-write*", &link.shared)?;
-        }
-        // At the root of a split home the tool writes its own state files. Nothing else in the
-        // host tool home is writable; what it may read is in `home_reads`.
-        if config.shared_tool_homes.contains(&tool)
-            && let SharedLayout::Split { state_files, .. } = &tool.layout
-        {
-            for file in *state_files {
-                push_literal_rule(
-                    &mut profile,
-                    "allow file-read* file-write*",
-                    &tool.host_path(&config.home).join(file),
-                )?;
-            }
-        }
+    // Every tool-specific authority is a detected capability's contribution (15_capabilities.md):
+    // its shared caches read-write — Seatbelt matches the resolved path a host link reaches —
+    // and its exact grants. Configuration, credentials and binaries a tool keeps beside them
+    // stay hard denies, which follow every grant below.
+    let contribution = &config.capabilities.contribution;
+    for mount in &contribution.cache_mounts {
+        push_subpath_rule(&mut profile, "allow file-read* file-write*", &mount.source)?;
     }
-    // The HOME read allowlist. Its entries' ancestors get metadata only: enough to resolve and
-    // `realpath` through them, never to list `~` or `~/Library/Application Support`.
-    for read in &config.home_reads {
-        match read {
-            HomeRead::Literal(path) => push_literal_rule(&mut profile, "allow file-read*", path)?,
-            HomeRead::Tree(path) => push_subpath_rule(&mut profile, "allow file-read*", path)?,
-        }
-        for ancestor in read.path().ancestors().skip(1) {
-            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
-        }
-    }
-    // sccache is deliberately absent: every disk-cache read and write happens inside the
-    // host-owned sccache daemon (source-verified for sccache 0.16 — DiskCache is instantiated
-    // only in the server), which workspaces reach over the allowed unix socket. Sandboxes keep
-    // read through the caches-wide allow above; the store stays daemon-write-only.
-    for suffix in RELOCATED_TOOL_CACHES
-        .map(|(_, shared)| shared)
-        .into_iter()
-        .chain(DIRECT_TOOL_CACHES)
-    {
-        push_subpath_rule(
-            &mut profile,
-            "allow file-read* file-write*",
-            &caches.join(suffix),
-        )?;
+    for grant in &contribution.grants {
+        push_capability_grant(&mut profile, &config.home, grant)?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
@@ -1138,7 +877,6 @@ fn hard_denies<'a>(
         Cow::Owned(home.join(".cargo/config")),
         Cow::Owned(home.join(".cargo/credentials.toml")),
         Cow::Owned(home.join(".cargo/credentials")),
-        Cow::Owned(home.join(".cargo/bin")),
         Cow::Owned(home.join(".gradle/gradle.properties")),
         Cow::Owned(home.join("go")),
         Cow::Owned(home.join("Library/Keychains")),
@@ -1195,6 +933,34 @@ fn sbpl_path(path: &Path) -> Result<String, SandboxError> {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\""))
+}
+
+/// One capability grant. Every grant makes its path and ancestors resolvable; a read-write
+/// literal is a file the tool itself writes, and a subtree extends the grant to everything
+/// beneath its root. An ancestor beneath HOME gets metadata only: enough to resolve and
+/// `realpath` through it, never to list `~` or `~/Library/Application Support`, which the
+/// HOME-wide read deny keeps closed.
+fn push_capability_grant(
+    profile: &mut String,
+    home: &Path,
+    grant: &CapabilityGrant,
+) -> Result<(), SandboxError> {
+    for ancestor in grant.path.ancestors().skip(1) {
+        let operation = if ancestor.starts_with(home) {
+            "allow file-read-metadata"
+        } else {
+            "allow file-read*"
+        };
+        push_literal_rule(profile, operation, ancestor)?;
+    }
+    let operation = match grant.access {
+        GrantAccess::Read => "allow file-read*",
+        GrantAccess::ReadWrite => "allow file-read* file-write*",
+    };
+    match grant.scope {
+        GrantScope::Literal => push_literal_rule(profile, operation, &grant.path),
+        GrantScope::Subtree => push_subpath_rule(profile, operation, &grant.path),
+    }
 }
 
 fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), SandboxError> {
@@ -1300,8 +1066,7 @@ mod tests {
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             additional_denies: vec![],
             git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
+            capabilities: DetectedCapabilities::default(),
         }
     }
 
@@ -1420,13 +1185,35 @@ mod tests {
     }
 
     /// Reads under HOME deny by default: the deny follows the broad system read and precedes
-    /// every carve-back — an explicit grant, the workspace's own mount, the toolchain allowlist —
-    /// so last-match-wins admits each of those and nothing else.
+    /// every carve-back — an explicit grant, the workspace's own mount, a detected capability's
+    /// grant — so last-match-wins admits each of those and nothing else. The capability grants
+    /// here have the detectors' shapes: Bun's still-unshared install cache, a bootstrap probe
+    /// through the Nix profile link, and the sccache GC root.
     #[test]
     fn home_reads_deny_by_default_and_every_carve_back_follows_the_deny() {
-        let mut config = config(RunSandboxMode::ReadWrite);
+        let home = Path::new("/Users/tester");
+        let sccache_root = crate::capabilities::sccache::gc_root(home);
+        let mut config = with_contribution(
+            vec![
+                grant(
+                    "/Users/tester/.bun/install/cache",
+                    GrantScope::Subtree,
+                    GrantAccess::Read,
+                ),
+                grant(
+                    "/Users/tester/.nix-profile/bin/direnv",
+                    GrantScope::Literal,
+                    GrantAccess::Read,
+                ),
+                CapabilityGrant {
+                    path: sccache_root.clone(),
+                    scope: GrantScope::Literal,
+                    access: GrantAccess::Read,
+                },
+            ],
+            &[],
+        );
         config.grants.read = vec![PathBuf::from("/Users/tester/Dev/sibling")];
-        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         let broad = profile
             .find("(allow file-read-data (subpath \"/\"))")
@@ -1439,7 +1226,8 @@ mod tests {
             "(allow file-read* (subpath \"/Users/tester/Dev/sibling\"))",
             "(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))",
             "(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))",
-            "(allow file-read* (literal \"/Users/tester/.nix-profile\"))",
+            "(allow file-read-metadata (literal \"/Users/tester/.nix-profile\"))",
+            "(allow file-read* (literal \"/Users/tester/.nix-profile/bin/direnv\"))",
             "(allow file-read* (literal \"/Users/tester/Library/Application Support/dev.cowshed/nix/sccache\"))",
         ] {
             let at = profile
@@ -1447,44 +1235,64 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {carve_back}"));
             assert!(home_deny < at, "{carve_back} must follow the HOME deny");
         }
-        // The sccache root's ancestors resolve but do not list.
-        assert!(profile.contains(
-            "(allow file-read-metadata (literal \"/Users/tester/Library/Application Support\"))"
-        ));
-        assert!(!profile.contains(
-            "(allow file-read* (literal \"/Users/tester/Library/Application Support\"))"
-        ));
+        // A capability grant's ancestors beneath HOME resolve but do not list.
+        for ancestor in [
+            "/Users/tester/Library/Application Support",
+            "/Users/tester/.nix-profile",
+            "/Users/tester/.bun",
+            "/Users/tester/.bun/install",
+        ] {
+            assert!(profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{ancestor}\"))"
+            )));
+            assert!(
+                !profile.contains(&format!("(allow file-read* (literal \"{ancestor}\"))")),
+                "{ancestor} must not be listable"
+            );
+        }
         // Controller-only Git discovery never had the broad read, so it needs no HOME deny.
         let discovery = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).unwrap();
         assert!(!discovery.contains("(allow file-read-data (subpath \"/\"))"));
     }
 
+    /// A capability grant only ever narrows the HOME-wide deny: HOME itself is refused, and so is
+    /// a grant inside a protected path. One that encloses a secret is harmless — the secret
+    /// denies are the profile's last word — and one outside HOME (the Nix store) is the
+    /// detector's to make.
     #[test]
     fn home_reads_stay_strictly_beneath_home_and_outside_protected_paths() {
         for (read, expected) in [
             (
-                HomeRead::Literal(PathBuf::from("/opt/tool")),
-                Err(SandboxError::InvalidPath {
-                    path: PathBuf::from("/opt/tool"),
-                    reason: "home read must be strictly beneath HOME",
-                }),
-            ),
-            (
-                HomeRead::Tree(PathBuf::from("/Users/tester")),
+                grant("/Users/tester", GrantScope::Subtree, GrantAccess::Read),
                 Err(SandboxError::InvalidPath {
                     path: PathBuf::from("/Users/tester"),
-                    reason: "home read must be strictly beneath HOME",
+                    reason: "a capability grant beneath HOME must be strictly beneath it",
                 }),
             ),
             (
-                HomeRead::Tree(PathBuf::from("/Users/tester/.ssh/keys")),
+                grant("/Users/tester", GrantScope::Literal, GrantAccess::Read),
+                Err(SandboxError::InvalidPath {
+                    path: PathBuf::from("/Users/tester"),
+                    reason: "a capability grant beneath HOME must be strictly beneath it",
+                }),
+            ),
+            (
+                grant(
+                    "/Users/tester/.ssh/keys",
+                    GrantScope::Subtree,
+                    GrantAccess::Read,
+                ),
                 Err(SandboxError::GrantIntersectsDeny {
                     grant: PathBuf::from("/Users/tester/.ssh/keys"),
                     deny: PathBuf::from("/Users/tester/.ssh"),
                 }),
             ),
             (
-                HomeRead::Tree(PathBuf::from("/Users/tester/.cowshed/mnt/acme")),
+                grant(
+                    "/Users/tester/.cowshed/mnt/acme",
+                    GrantScope::Subtree,
+                    GrantAccess::Read,
+                ),
                 Err(SandboxError::GrantIntersectsDeny {
                     grant: PathBuf::from("/Users/tester/.cowshed/mnt/acme"),
                     deny: PathBuf::from("/Users/tester/.cowshed/mnt"),
@@ -1492,12 +1300,19 @@ mod tests {
             ),
             // Enclosing a secret is harmless: the secret denies are the profile's last word.
             (
-                HomeRead::Tree(PathBuf::from("/Users/tester/.cargo")),
+                grant(
+                    "/Users/tester/.cargo",
+                    GrantScope::Subtree,
+                    GrantAccess::Read,
+                ),
+                Ok(()),
+            ),
+            (
+                grant("/nix/store", GrantScope::Subtree, GrantAccess::Read),
                 Ok(()),
             ),
         ] {
-            let mut config = config(RunSandboxMode::ReadWrite);
-            config.home_reads = vec![read];
+            let config = with_contribution(vec![read], &[]);
             assert_eq!(validate_sandbox_config(&config), expected);
         }
     }
@@ -1815,298 +1630,203 @@ mod tests {
         assert!(!standalone.contains("/Users/tester/.cowshed/mnt/acme/widget/main/.git"));
     }
 
-    /// The host-owned sccache daemon contract, stated as what the profile says:
-    /// the store is readable but never shed-writable, and the server socket is
-    /// reachable even though it lives under the store-wide deny.
+    /// A host service socket under the store-wide deny — a capability's daemon socket, for one —
+    /// stays connectable: SBPL is last-match-wins, so the ancestor literals that make the
+    /// connect's path resolution work are emitted after the store deny.
     #[test]
-    fn sccache_store_is_daemon_write_only_and_its_socket_outlives_the_store_deny() {
+    fn an_admitted_socket_under_the_store_deny_stays_connectable() {
         let mut with_socket = config(RunSandboxMode::ReadWrite);
-        let socket = sccache_server_socket();
-        assert_eq!(socket, PathBuf::from("/private/cowshed/store/sccache.sock"));
+        let socket = PathBuf::from("/private/cowshed/store/daemon.sock");
         with_socket.allowed_unix_sockets.push(socket.clone());
         let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild).unwrap();
-
-        // Daemon-only writes: caches-wide read stays, the write carve-back is gone.
-        assert!(profile.contains("(allow file-read* (subpath \"/private/cowshed/caches\"))"));
-        assert!(!profile.contains(
-            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/sccache\"))"
-        ));
-
         assert!(profile.contains(
-            "(allow network-outbound (remote unix-socket (path-literal \"/private/cowshed/store/sccache.sock\")))"
+            "(allow network-outbound (remote unix-socket (path-literal \"/private/cowshed/store/daemon.sock\")))"
         ));
-        // SBPL is last-match-wins: the ancestor literals that make the connect's
-        // path resolution work must be emitted after the store-wide deny.
         let store_deny = profile
             .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
             .unwrap();
         let socket_literal = profile
-            .rfind("(allow file-read* (literal \"/private/cowshed/store/sccache.sock\"))")
+            .rfind("(allow file-read* (literal \"/private/cowshed/store/daemon.sock\"))")
             .expect("socket path literal");
         assert!(store_deny < socket_literal);
     }
 
-    /// With shared caches, a child builds against the host `$CARGO_HOME`: the caches are shared
-    /// read-write, and at the root it may write cargo's locks and usage database and nothing else.
-    /// Configuration, credentials and binaries stay denied, after every grant.
-    #[test]
-    fn a_shared_cargo_home_grants_its_caches_and_state_files_only() {
-        let mut config = config(RunSandboxMode::ReadWrite);
-        config.shared_tool_homes = vec![&CARGO];
-        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+    fn grant(path: &str, scope: GrantScope, access: GrantAccess) -> CapabilityGrant {
+        CapabilityGrant {
+            path: PathBuf::from(path),
+            scope,
+            access,
+        }
+    }
 
-        for directory in ["registry", "git"] {
+    fn with_contribution(grants: Vec<CapabilityGrant>, cache_mounts: &[&str]) -> SandboxConfig {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.capabilities.contribution.grants = grants;
+        config.capabilities.contribution.cache_mounts = cache_mounts
+            .iter()
+            .map(|source| crate::capabilities::CacheMount {
+                source: PathBuf::from(source),
+                private_target: None,
+            })
+            .collect();
+        config
+    }
+
+    /// A plain repository detects no capability, and its profile names no tool: no shared cache
+    /// is writable and nothing in a host tool home is readable by grant.
+    #[test]
+    fn without_capabilities_no_tool_cache_or_tool_home_is_granted() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        assert!(profile.contains("(allow file-read* (subpath \"/private/cowshed/caches\"))"));
+        assert!(
+            !profile.contains("(allow file-read* file-write* (subpath \"/private/cowshed/caches/")
+        );
+        let allows: Vec<&str> = profile
+            .lines()
+            .filter(|line| line.starts_with("(allow"))
+            .collect();
+        for home in [".cargo", ".bun", ".cache", ".rustup", ".gradle", "go"] {
+            let named = format!("\"/Users/tester/{home}");
             assert!(
-                profile.contains(&format!(
-                    "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/{directory}\"))"
-                )),
-                "{directory} is not shared read-write"
+                !allows.iter().any(|line| line.contains(&named)),
+                "{home} is granted without a capability"
             );
-            assert!(profile.contains(&format!(
-                "(allow file-read* (literal \"/Users/tester/.cargo/{directory}\"))"
-            )));
         }
-        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
-        for file in CARGO_HOME_STATE_FILES {
-            assert!(profile.contains(&format!(
-                "(allow file-read* file-write* (literal \"/Users/tester/.cargo/{file}\"))"
-            )));
-        }
-        assert!(!profile.contains("(subpath \"/Users/tester/.cargo\")"));
-        for denied in [
-            "config.toml",
-            "config",
-            "credentials.toml",
-            "credentials",
-            "bin",
+    }
+
+    /// A capability's cache mounts are shared read-write and its grants are emitted exactly as
+    /// contributed — a literal as a literal with its ancestors, a subtree as a subtree — and every
+    /// secret deny still follows them.
+    #[test]
+    fn a_contribution_is_emitted_exactly_and_the_secret_denies_follow_it() {
+        let config = with_contribution(
+            vec![
+                grant(
+                    "/Users/tester/.cargo",
+                    GrantScope::Literal,
+                    GrantAccess::Read,
+                ),
+                grant(
+                    "/Users/tester/.cargo/registry",
+                    GrantScope::Literal,
+                    GrantAccess::Read,
+                ),
+                grant(
+                    "/Users/tester/.cargo/.package-cache",
+                    GrantScope::Literal,
+                    GrantAccess::ReadWrite,
+                ),
+                grant(
+                    "/Users/tester/.cargo/bin",
+                    GrantScope::Subtree,
+                    GrantAccess::Read,
+                ),
+            ],
+            &["/private/cowshed/caches/cargo/registry"],
+        );
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(profile.contains(
+            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/registry\"))"
+        ));
+        assert!(!profile.contains("(subpath \"/private/cowshed/caches/cargo/git\")"));
+        for literal in [
+            "/Users/tester",
+            "/Users/tester/.cargo",
+            "/Users/tester/.cargo/registry",
         ] {
+            assert!(profile.contains(&format!("(allow file-read* (literal \"{literal}\"))")));
+        }
+        assert!(profile.contains(
+            "(allow file-read* file-write* (literal \"/Users/tester/.cargo/.package-cache\"))"
+        ));
+        assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/.cargo/bin\"))"));
+        assert!(!profile.contains("(subpath \"/Users/tester/.cargo\")"));
+        let last_grant = profile
+            .rfind("(literal \"/Users/tester/.cargo/.package-cache\")")
+            .unwrap();
+        for denied in ["config.toml", "config", "credentials.toml", "credentials"] {
             let path = format!("/Users/tester/.cargo/{denied}");
             let deny = profile
                 .rfind(&format!(
                     "(deny file-read* file-write* (literal \"{path}\") (subpath \"{path}\"))"
                 ))
                 .unwrap_or_else(|| panic!("{denied} must stay denied"));
-            let last_grant = profile
-                .rfind("(allow file-read* file-write* (literal \"/Users/tester/.cargo/")
-                .unwrap();
             assert!(last_grant < deny, "{denied} deny must outlive the grants");
         }
     }
 
-    /// Without shared caches `$CARGO_HOME` stays in the private HOME and nothing in the host's is
-    /// granted.
+    /// A grant collides only with a deny at or above it: a tool home beside or above its denied
+    /// configuration stays legal (the denies follow every grant), and a grant on or under a
+    /// denied path is refused.
     #[test]
-    fn an_unshared_cargo_home_grants_nothing_in_the_host_cargo_home() {
-        let profile = seatbelt_profile(
-            &config(RunSandboxMode::ReadWrite),
-            SandboxProfileRole::ExecutedChild,
-        )
-        .unwrap();
-        assert!(!profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
-        assert!(
-            !profile.contains("(allow file-read* file-write* (literal \"/Users/tester/.cargo/")
-        );
-    }
-
-    fn scratch_home(label: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-shared-{label}-{}-{}",
-            std::process::id(),
-            NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let caches = root.join("caches");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&caches).unwrap();
-        (root, home, caches)
-    }
-
-    /// What a child of a sandbox built for this host gets for every shared tool variable.
-    fn exported(
-        home: &Path,
-        caches: &Path,
-    ) -> std::collections::BTreeMap<&'static str, Option<PathBuf>> {
-        let mut config = config(RunSandboxMode::ReadWrite);
-        config.home = home.to_path_buf();
-        config.shared_tool_homes = shared_tool_homes(home, caches);
-        config.shared_tool_environment().collect()
-    }
-
-    /// Only a `$CARGO_HOME` whose `registry` and `git` both resolve to the shared caches is shared.
-    #[test]
-    fn the_host_cargo_home_is_shared_only_when_both_caches_resolve_to_the_shared_ones() {
-        let (root, home, caches) = scratch_home("cargo");
-        let cargo_home = home.join(".cargo");
-        fs::create_dir_all(&cargo_home).unwrap();
-        for directory in ["registry", "git"] {
-            fs::create_dir_all(caches.join("cargo").join(directory)).unwrap();
-        }
-
-        // An unrelocated host: real directories are private caches, not the shared ones.
-        fs::create_dir_all(cargo_home.join("registry")).unwrap();
-        std::os::unix::fs::symlink(caches.join("cargo/git"), cargo_home.join("git")).unwrap();
-        assert_eq!(exported(&home, &caches).get("CARGO_HOME"), Some(&None));
-
-        // A link that resolves anywhere else is not sharing either.
-        fs::remove_dir(cargo_home.join("registry")).unwrap();
-        std::os::unix::fs::symlink(root.join("elsewhere"), cargo_home.join("registry")).unwrap();
-        assert_eq!(exported(&home, &caches).get("CARGO_HOME"), Some(&None));
-
-        fs::remove_file(cargo_home.join("registry")).unwrap();
-        std::os::unix::fs::symlink(caches.join("cargo/registry"), cargo_home.join("registry"))
-            .unwrap();
-        assert_eq!(
-            exported(&home, &caches).get("CARGO_HOME"),
-            Some(&Some(cargo_home))
-        );
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A child is pointed at Bun's and uv's host cache paths only once each path is the link into
-    /// the caches volume; before, each tool keeps its private default. Each tool is decided on its
-    /// own links.
-    #[test]
-    fn bun_and_uv_are_exported_only_once_their_host_caches_are_the_shared_ones() {
-        let (root, home, caches) = scratch_home("bun-uv");
-        fs::create_dir_all(caches.join("bun/install/cache")).unwrap();
-        fs::create_dir_all(caches.join("uv")).unwrap();
-
-        // An unrelocated host: Bun's cache is a real host directory, uv has none yet.
-        fs::create_dir_all(home.join(".bun/install/cache")).unwrap();
-        let unshared = exported(&home, &caches);
-        assert_eq!(unshared.get("BUN_INSTALL_CACHE_DIR"), Some(&None));
-        assert_eq!(unshared.get("UV_CACHE_DIR"), Some(&None));
-
-        fs::remove_dir(home.join(".bun/install/cache")).unwrap();
-        std::os::unix::fs::symlink(
-            caches.join("bun/install/cache"),
-            home.join(".bun/install/cache"),
-        )
-        .unwrap();
-        let bun_only = exported(&home, &caches);
-        assert_eq!(
-            bun_only.get("BUN_INSTALL_CACHE_DIR"),
-            Some(&Some(home.join(".bun/install/cache")))
-        );
-        assert_eq!(bun_only.get("UV_CACHE_DIR"), Some(&None));
-
-        fs::create_dir_all(home.join(".cache")).unwrap();
-        std::os::unix::fs::symlink(caches.join("uv"), home.join(".cache/uv")).unwrap();
-        let both = exported(&home, &caches);
-        assert_eq!(
-            both.get("UV_CACHE_DIR"),
-            Some(&Some(home.join(".cache/uv")))
-        );
-        // Each tool is decided on its own links: cargo's are not relocated here.
-        assert_eq!(both.get("CARGO_HOME"), Some(&None));
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A shared cache that is the whole host path grants the link as a literal and its ancestors
-    /// metadata only: the child resolves through them into the shared directory, and nothing
-    /// else in the host tool home — `~/.bun/bin`, the rest of `~/.cache` — is granted. The secret
-    /// denies still follow every one of those grants.
-    #[test]
-    fn a_shared_cache_home_grants_its_link_and_ancestors_and_nothing_else() {
-        let mut config = config(RunSandboxMode::ReadWrite);
-        config.shared_tool_homes = SHARED_TOOL_HOMES.to_vec();
-        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        let secret = profile
-            .find("(deny file-read* file-write* (literal \"/Users/tester/.ssh\")")
-            .expect("secret deny");
-        for link in [
-            "/Users/tester/.bun/install/cache",
-            "/Users/tester/.cache/uv",
+    fn capability_grants_never_reach_a_hard_deny() {
+        for allowed in [
+            grant(
+                "/Users/tester/.cargo",
+                GrantScope::Literal,
+                GrantAccess::Read,
+            ),
+            grant(
+                "/Users/tester/.cargo",
+                GrantScope::Subtree,
+                GrantAccess::Read,
+            ),
+            grant(
+                "/Users/tester/.cargo/bin",
+                GrantScope::Subtree,
+                GrantAccess::Read,
+            ),
         ] {
-            let grants = std::iter::once(format!("(allow file-read* (literal \"{link}\"))")).chain(
-                Path::new(link).ancestors().skip(1).map(|ancestor| {
-                    format!(
-                        "(allow file-read-metadata (literal \"{}\"))",
-                        ancestor.display()
-                    )
-                }),
-            );
-            for grant in grants {
-                let last = profile
-                    .rfind(&grant)
-                    .unwrap_or_else(|| panic!("missing {grant}"));
-                assert!(last < secret, "the secret denies must follow {grant}");
-            }
-            assert!(
-                !profile.contains(&format!("(subpath \"{link}\")")),
-                "{link} is a link; nothing is granted under its own spelling"
-            );
+            let config = with_contribution(vec![allowed.clone()], &[]);
+            validate_sandbox_config(&config).unwrap_or_else(|error| panic!("{allowed:?}: {error}"));
         }
-        for home in ["/Users/tester/.bun", "/Users/tester/.cache"] {
-            assert!(!profile.contains(&format!("(subpath \"{home}\")")));
-        }
-    }
-
-    /// Every shared cache directory on the caches volume is sandbox-writable, whether the host
-    /// reaches it through a relocated link or a tool's own configuration; the sccache store stays
-    /// daemon-write-only.
-    #[test]
-    fn every_shared_cache_directory_is_writable_and_the_sccache_store_is_not() {
-        let profile = seatbelt_profile(
-            &config(RunSandboxMode::ReadWrite),
-            SandboxProfileRole::ExecutedChild,
-        )
-        .unwrap();
-        for directory in [
-            "cargo/registry",
-            "cargo/git",
-            "bun/install/cache",
-            "uv",
-            "ttsc",
-            "go/mod",
-            "go/build",
-            "zig",
-            "gradle/caches",
-            "nix/cache",
-            "nix/state",
+        for (refused, deny) in [
+            (
+                grant(
+                    "/Users/tester/.cargo/credentials.toml",
+                    GrantScope::Literal,
+                    GrantAccess::Read,
+                ),
+                "/Users/tester/.cargo/credentials.toml",
+            ),
+            (
+                grant(
+                    "/Users/tester/.ssh/id_ed25519",
+                    GrantScope::Literal,
+                    GrantAccess::Read,
+                ),
+                "/Users/tester/.ssh",
+            ),
         ] {
-            assert!(
-                profile.contains(&format!(
-                    "(allow file-read* file-write* (subpath \"/private/cowshed/caches/{directory}\"))"
-                )),
-                "{directory} is not sandbox-writable"
+            let config = with_contribution(vec![refused.clone()], &[]);
+            assert_eq!(
+                validate_sandbox_config(&config),
+                Err(SandboxError::GrantIntersectsDeny {
+                    grant: refused.path.clone(),
+                    deny: PathBuf::from(deny),
+                })
             );
         }
-        assert!(!profile.contains(
-            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/sccache\"))"
-        ));
-        assert!(!profile.contains(
-            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/devenv\"))"
-        ));
     }
 
-    /// Until the host's Bun cache is relocated, main's `node_modules` links into the host
-    /// directory itself, and a clone carries the same links: the cache stays readable, no wider
-    /// than the cache (`~/.bun/bin` stays as it was). An unshared uv cache is private and grants
-    /// nothing on the host.
+    /// Cache mounts are controller-owned exceptions under the caches root, never elsewhere and
+    /// never the whole root.
     #[test]
-    fn an_unshared_bun_cache_stays_readable_for_the_links_checkouts_hold() {
-        let mut config = config(RunSandboxMode::ReadWrite);
-        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        assert!(
-            profile.contains("(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))")
-        );
-        assert!(!profile.contains(
-            "(allow file-read* file-write* (subpath \"/Users/tester/.bun/install/cache\"))"
-        ));
-        assert!(profile.contains("(allow file-read-metadata (literal \"/Users/tester/.bun\"))"));
-        assert!(
-            profile.contains("(allow file-read-metadata (literal \"/Users/tester/.bun/install\"))")
-        );
-        assert!(!profile.contains("(allow file-read* (literal \"/Users/tester/.bun\"))"));
-        assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.bun\"))"));
-        assert!(!profile.contains("\"/Users/tester/.cache"));
+    fn capability_cache_mounts_stay_beneath_the_caches_root() {
+        for source in ["/Users/tester/.cache", "/private/cowshed/caches"] {
+            let config = with_contribution(Vec::new(), &[source]);
+            assert!(
+                matches!(
+                    validate_sandbox_config(&config),
+                    Err(SandboxError::InvalidPath { ref path, .. }) if path == Path::new(source)
+                ),
+                "{source} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -2151,41 +1871,6 @@ mod tests {
         let secret_deny = profile.rfind("/Users/tester/.ssh").unwrap();
         assert!(store_deny < mount_parent);
         assert!(mount_parent < secret_deny);
-    }
-
-    #[test]
-    fn nix_config_metadata_is_readable_without_widening_etc() {
-        for role in [
-            SandboxProfileRole::TrustedSupervisor,
-            SandboxProfileRole::ExecutedChild,
-            SandboxProfileRole::GitDiscovery,
-        ] {
-            let profile = seatbelt_profile(&config(RunSandboxMode::ReadWrite), role).unwrap();
-            for root in ["/etc/nix", "/private/etc/nix"] {
-                for operation in ["file-read*", "file-read-data"] {
-                    let rule =
-                        format!("(allow {operation} (literal \"{root}\") (subpath \"{root}\"))");
-                    assert!(profile.contains(&rule), "{role:?} lacks {rule}");
-                }
-            }
-            for ancestor in ["/etc", "/private/etc"] {
-                assert!(
-                    profile.contains(&format!("(allow file-read* (literal \"{ancestor}\"))")),
-                    "{role:?} must traverse {ancestor}"
-                );
-                assert!(
-                    !profile.contains(&format!("(subpath \"{ancestor}\")")),
-                    "{role:?} must not read all of {ancestor}"
-                );
-            }
-            assert!(
-                profile
-                    .lines()
-                    .filter(|line| line.contains("file-write"))
-                    .all(|line| !line.contains("/etc")),
-                "{role:?} must not grant writes under /etc"
-            );
-        }
     }
 
     #[test]
@@ -2284,52 +1969,22 @@ mod tests {
             );
         }
     }
+
+    /// An admitted socket reaches the profile as an outbound rule with its directory traversable,
+    /// or connecting fails on path resolution before the outbound rule is consulted.
     #[test]
-    fn the_daemon_socket_is_admitted_only_by_resolving_to_a_real_socket() {
-        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
-        // Bind through the admitted short runtime spelling; canonicalizing it first
-        // expands a cowshed mount beyond sockaddr_un's path limit.
-        let root = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("cs-s-{}-{sequence}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-
-        // A path that is not a socket is not admitted by being named, and neither is a missing one.
-        let regular = root.join("not-a-socket");
-        fs::write(&regular, b"").unwrap();
-        assert_eq!(nix_daemon_socket_at(&regular), None);
-        assert_eq!(nix_daemon_socket_at(&root.join("absent")), None);
-
-        // A symlink to a real socket is admitted as its resolved target, because that is what
-        // Seatbelt's `path-literal` matches against.
-        let listener = root.join("real.socket");
-        let _server = std::os::unix::net::UnixListener::bind(&listener).unwrap();
-        let listener = fs::canonicalize(listener).unwrap();
-        let link = root.join("link-to-socket");
-        std::os::unix::fs::symlink(&listener, &link).unwrap();
-        assert_eq!(nix_daemon_socket_at(&link), Some(listener.clone()));
-
-        // The admitted path reaches the profile with its ancestors traversable, or connecting
-        // fails on path resolution before the outbound rule is consulted. The profile names the
-        // resolved socket, so its directory is the resolved parent, not the runtime alias.
-        let resolved_directory = listener.parent().expect("resolved socket directory");
+    fn an_admitted_socket_is_connectable_and_its_directory_traversable() {
+        let socket = PathBuf::from("/private/var/run/daemon-socket/socket");
         let mut config = config(RunSandboxMode::ReadWrite);
-        config.allowed_unix_sockets = vec![listener.clone()];
+        config.allowed_unix_sockets = vec![socket.clone()];
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        assert!(profile.contains(&format!(
-            "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
-            listener.display()
-        )));
+        assert!(profile.contains(
+            "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/daemon-socket/socket\")))"
+        ));
         assert!(
-            profile.contains(&format!(
-                "(allow file-read* (literal \"{}\"))",
-                resolved_directory.display()
-            )),
+            profile.contains("(allow file-read* (literal \"/private/var/run/daemon-socket\"))"),
             "the socket's own directory must be traversable"
         );
-
-        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -2552,135 +2207,5 @@ mod tests {
             "fstat on a write-only /dev/null stdout: {}",
             String::from_utf8_lossy(&fstat.stderr)
         );
-    }
-
-    /// Nix stats its configuration files before reading them, optional ones included: a Nix
-    /// command in a workspace died on `/etc/nix/sentry-endpoint` because the stat came back
-    /// EPERM instead of ENOENT. Probes the host's real Nix config read-only; the only write
-    /// attempt opens an existing file for append and writes nothing.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    fn host_controller_nix_config_metadata_is_readable_and_nothing_else_in_etc() {
-        fn stderr(output: &std::process::Output) -> String {
-            String::from_utf8_lossy(&output.stderr).into_owned()
-        }
-        let nix_conf = Path::new("/etc/nix/nix.conf");
-        let sentry = Path::new("/etc/nix/sentry-endpoint");
-        let unrelated = Path::new("/etc/hosts");
-        assert!(
-            nix_conf.is_file(),
-            "the host must have a Nix config at {}",
-            nix_conf.display()
-        );
-        assert!(
-            unrelated.is_file(),
-            "the host must have {}",
-            unrelated.display()
-        );
-        let host_config = fs::read(nix_conf).unwrap();
-        let host_modified = fs::metadata(nix_conf).unwrap().modified().unwrap();
-
-        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
-        let absent = PathBuf::from(format!(
-            "/etc/nix/cowshed-absent-{}-{sequence}",
-            std::process::id()
-        ));
-        assert!(
-            !absent.exists(),
-            "{} must not exist on the host",
-            absent.display()
-        );
-        let root_alias = std::env::temp_dir().join(format!(
-            "cowshed-nix-config-test-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root_alias).unwrap();
-        let root = fs::canonicalize(&root_alias).unwrap();
-        let mut config = config(RunSandboxMode::ReadWrite);
-        config.home = root.join("home");
-        config.workspace_mount = root.join("workspace");
-        config.exec_temp_dir = root.join("tmp");
-        config.allowed_unix_sockets.clear();
-        for directory in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
-            fs::create_dir_all(directory).unwrap();
-        }
-
-        let mut failures = Vec::new();
-        for role in [
-            SandboxProfileRole::TrustedSupervisor,
-            SandboxProfileRole::ExecutedChild,
-        ] {
-            let profile = seatbelt_profile(&config, role).unwrap();
-            let run = |program: &str, args: &[&std::ffi::OsStr]| {
-                std::process::Command::new("/usr/bin/sandbox-exec")
-                    .args(["-p", &profile, "--", program])
-                    .args(args)
-                    .current_dir(&config.workspace_mount)
-                    .stdin(Stdio::null())
-                    .output_locked()
-                    .unwrap()
-            };
-            let stat = |path: &Path| run("/usr/bin/stat", &[path.as_os_str()]);
-            let config_stat = stat(nix_conf);
-            if !config_stat.status.success() {
-                failures.push(format!("{role:?}: stat nix.conf: {}", stderr(&config_stat)));
-            }
-            let config_read = run("/bin/cat", &[nix_conf.as_os_str()]);
-            if !config_read.status.success() || config_read.stdout != host_config {
-                failures.push(format!("{role:?}: read nix.conf: {}", stderr(&config_read)));
-            }
-            let sentry_stat = stat(sentry);
-            let sentry_ok = if sentry.exists() {
-                sentry_stat.status.success()
-            } else {
-                !sentry_stat.status.success()
-                    && stderr(&sentry_stat).contains("No such file or directory")
-            };
-            if !sentry_ok {
-                failures.push(format!(
-                    "{role:?}: stat sentry-endpoint: {}",
-                    stderr(&sentry_stat)
-                ));
-            }
-            let absent_stat = stat(&absent);
-            if absent_stat.status.success()
-                || !stderr(&absent_stat).contains("No such file or directory")
-            {
-                failures.push(format!(
-                    "{role:?}: a missing Nix config file must be ENOENT: {}",
-                    stderr(&absent_stat)
-                ));
-            }
-            let unrelated_stat = stat(unrelated);
-            if unrelated_stat.status.success()
-                || !stderr(&unrelated_stat).contains("Operation not permitted")
-            {
-                failures.push(format!(
-                    "{role:?}: metadata outside /etc/nix must stay denied: {}",
-                    stderr(&unrelated_stat)
-                ));
-            }
-            let append = run(
-                "/bin/sh",
-                &[
-                    std::ffi::OsStr::new("-c"),
-                    std::ffi::OsStr::new(": >> \"$1\""),
-                    std::ffi::OsStr::new("sh"),
-                    nix_conf.as_os_str(),
-                ],
-            );
-            if append.status.success() {
-                failures.push(format!("{role:?}: nix.conf must not open for writing"));
-            }
-        }
-
-        fs::remove_dir_all(&root).unwrap();
-        assert_eq!(fs::read(nix_conf).unwrap(), host_config);
-        assert_eq!(
-            fs::metadata(nix_conf).unwrap().modified().unwrap(),
-            host_modified
-        );
-        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

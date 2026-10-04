@@ -7282,6 +7282,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         let binding = self.descriptor.binding.clone();
         let binding_path = self.layout.project().repository_binding.clone();
+        let home = &self.home;
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
@@ -7294,7 +7295,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 timed_async(
                     "adopt",
                     "daemons",
-                    crate::inherited_daemons::macos::discard_in(&stage.mount_point),
+                    crate::inherited_daemons::macos::discard_in(
+                        &stage.mount_point,
+                        crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                    ),
                 )
                 .await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
@@ -7430,6 +7434,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             if slot.is_none() {
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
+            let home = &self.home;
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
@@ -7445,7 +7450,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     timed_async(
                         "new",
                         "daemons",
-                        crate::inherited_daemons::macos::discard_in(&stage.mount_point),
+                        crate::inherited_daemons::macos::discard_in(
+                            &stage.mount_point,
+                            crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                        ),
                     )
                     .await?;
                     crate::git::GitRepository::from_root(&stage.mount_point)
@@ -7639,11 +7647,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 )
                 .map_err(native_integrity_error)?;
             self.mark_lifecycle_intent_mutating(&destination).await?;
+            let home = &self.home;
             let receipt = self
                 .substrate
                 .execute_fork_staged(plan, move |stage| async move {
                     crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
-                    crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
+                    crate::inherited_daemons::macos::discard_in(
+                        &stage.mount_point,
+                        crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                    )
+                    .await?;
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                     repository.restore_inherited_links(&source_mount).await?;
                     if source_is_git_worktree {
@@ -8312,21 +8325,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let mut commitments = self.commitments.clone();
         let result = self
             .substrate
-            .execute_restore_staged(
-                plan,
-                move |fence| async move {
-                    commitments
-                        .record(CommitmentDraft::Restore {
-                            repo_id: fence.pending.workspace.repo().clone(),
-                            source_checkpoint: fence.pending.source_checkpoint,
-                            source_incarnation: fence.pending.source_incarnation,
-                            replaced_incarnation: fence.pending.replaced_incarnation,
-                            destination_incarnation: fence.pending.workspace.incarnation().clone(),
-                        })
-                        .await
-                        .map(|_| ())
-                },
-            )
+            .execute_restore_staged(plan, move |fence| async move {
+                commitments
+                    .record(CommitmentDraft::Restore {
+                        repo_id: fence.pending.workspace.repo().clone(),
+                        source_checkpoint: fence.pending.source_checkpoint,
+                        source_incarnation: fence.pending.source_incarnation,
+                        replaced_incarnation: fence.pending.replaced_incarnation,
+                        destination_incarnation: fence.pending.workspace.incarnation().clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            })
             .await;
         drop(stopped);
         match result {
@@ -8584,7 +8594,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .map_err(native_integrity_error)?;
                     if replacement_block.is_some() {
                         crate::workspace_credentials::publish_workspace_environment(
-                            &config.workspace_mount,
                             &config.workspace_mount,
                             current.metadata.platform,
                             published.port_block,
@@ -11424,6 +11433,9 @@ mod removal_supervisor_tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&root).expect("create workspace");
+        // Capability detection refuses a directory that resolves outside the workspace, and
+        // `/var/folders` resolves into `/private/var`.
+        let root = std::fs::canonicalize(&root).expect("canonical workspace");
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
             workspace_root: root.clone(),
@@ -12344,8 +12356,7 @@ mod grant_unit_tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
+            capabilities: Default::default(),
         }
     }
 

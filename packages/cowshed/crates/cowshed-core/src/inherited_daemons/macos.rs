@@ -1,16 +1,12 @@
 //! Drop the daemon rendezvous state a new tree inherited from the tree that produced it.
 //!
 //! A workspace is materialized by cloning one image, so a build daemon's private directory
-//! arrives byte-identical — including the file that says *where that daemon is*. Nx writes
-//! `server-process.json` naming the pid and socket of the server that owns the workspace it was
-//! started in — under `.nx/workspace-data/d` for a host shell, and under the private
-//! environment's `.cowshed/cache/nx/workspace-data/d` for a read-write sandboxed job. A clone
-//! that carries it points every `nx` invocation in the new tree at the daemon still serving the
-//! old one: a host client is answered about a workspace root that is not the caller's, and a
-//! sandboxed client, refused the other workspace's socket, runs its command without a daemon
-//! under a permission warning while the daemon it starts replaces the record. Neither names the
-//! copied file, and the same directory is where that daemon's log accumulates: 563MB of it in
-//! one repository measured here, cloned into every workspace.
+//! arrives byte-identical — including the file that says *where that daemon is*. Nx, for one,
+//! writes `server-process.json` naming the pid and socket of the server that owns the workspace
+//! it was started in; a clone that carries it points every client in the new tree at the daemon
+//! still serving the old one, and the same directory is where that daemon's log accumulates. The
+//! directories come from the detected capabilities' `daemon_isolation.discard_at_mint`
+//! (15_capabilities.md): this module knows no tool, only how to drop a named directory safely.
 //!
 //! This is the same class of repair as an inherited Git remote or an escaping symlink
 //! ([`crate::inherited_links`]) and it runs in the same place, at mint, where nothing in the
@@ -20,41 +16,49 @@
 //!
 //! The rule is deliberately narrow, and narrower than "clear the caches". A cache is exactly
 //! what a copy-on-write workspace is for: the project graph, file map and hash databases beside
-//! this directory are warm, correct at any path, and re-earning them costs the seconds the
-//! clone exists to save. Only the daemon's own rendezvous directory goes.
+//! these directories are warm, correct at any path, and re-earning them costs the seconds the
+//! clone exists to save. Only the daemons' own rendezvous directories go.
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{CowshedError, Result};
 
-/// Repository-relative directories whose contents name a *running daemon* rather than data.
-///
-/// One entry per daemon that rendezvouses through a file in the tree. Anything a fresh daemon
-/// regenerates from the tree belongs here; anything that would have to be recomputed from
-/// sources does not.
-const INHERITED_DAEMON_STATE: &[&str] =
-    &[".nx/workspace-data/d", ".cowshed/cache/nx/workspace-data/d"];
-
-/// Discard every inherited daemon rendezvous directory in `tree_root`.
+/// Discard every named inherited daemon rendezvous directory in `tree_root`. Each state is
+/// workspace-relative and names at least one plain component; anything else is refused before
+/// the tree is touched.
 ///
 /// Idempotent: an entry that is absent — a tree that never ran the daemon, or one already
 /// minted — is the state this establishes, so it is not a finding and not an error. Nothing is
 /// reported on success because nothing consumes a report; what a caller needs to know is whether
 /// the tree is now clean, and that is the `Ok`.
-fn discard(tree_root: &Path) -> Result<()> {
-    for state in INHERITED_DAEMON_STATE {
+fn discard(tree_root: &Path, states: &[PathBuf]) -> Result<()> {
+    if let Some(state) = states.iter().find(|state| {
+        state.as_os_str().is_empty()
+            || !state
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    }) {
+        return Err(CowshedError::integrity(
+            format!(
+                "inherited daemon state {} is not a plain workspace-relative path",
+                state.display()
+            ),
+            "repair the capability contribution that names it",
+        ));
+    }
+    for state in states {
         discard_one(tree_root, state)?;
     }
     Ok(())
 }
 
 /// [`discard`] for the async mint path. The walk is a handful of `lstat` calls plus one
-/// removal, but the removal can be a large directory, so it does not run on the reactor.
-pub(crate) async fn discard_in(tree_root: &Path) -> Result<()> {
+/// removal per state, but a removal can be a large directory, so it does not run on the reactor.
+pub(crate) async fn discard_in(tree_root: &Path, states: Vec<PathBuf>) -> Result<()> {
     let root = tree_root.to_path_buf();
-    tokio::task::spawn_blocking(move || discard(&root))
+    tokio::task::spawn_blocking(move || discard(&root, &states))
         .await
         .map_err(|source| {
             CowshedError::integrity(
@@ -64,9 +68,9 @@ pub(crate) async fn discard_in(tree_root: &Path) -> Result<()> {
         })?
 }
 
-fn discard_one(tree_root: &Path, state: &str) -> Result<()> {
+fn discard_one(tree_root: &Path, state: &Path) -> Result<()> {
     let mut path = tree_root.to_path_buf();
-    let mut components = Path::new(state).components().peekable();
+    let mut components = state.components().peekable();
     while let Some(component) = components.next() {
         path.push(component);
         // Top-down, one component at a time, because `symlink_metadata` declines to follow only
@@ -91,8 +95,9 @@ fn discard_one(tree_root: &Path, state: &str) -> Result<()> {
                 // Removing anything under here would delete from whatever tree the link names.
                 return Err(CowshedError::integrity(
                     format!(
-                        "{} is a symlink, so the inherited daemon state {state} cannot be dropped without writing outside this workspace",
-                        path.display()
+                        "{} is a symlink, so the inherited daemon state {} cannot be dropped without writing outside this workspace",
+                        path.display(),
+                        state.display()
                     ),
                     "replace the symlink with a real directory in the source checkout, then retry",
                 ));
@@ -113,14 +118,14 @@ fn discard_one(tree_root: &Path, state: &str) -> Result<()> {
         // rather than removed: deleting a file to satisfy a guess is the failure being avoided.
         return Err(CowshedError::integrity(
             format!(
-                "{} is a file, not the daemon directory the inherited state {state} names",
-                path.display()
+                "{} is a file, not the daemon directory the inherited state {} names",
+                path.display(),
+                state.display()
             ),
             "move or remove that file in the source checkout if it is not wanted, then retry",
         ));
     }
-    // Only an entry naming no component at all, which the table has none of and a test holds it
-    // to. Nothing was named, so nothing is owed.
+    // Only an entry naming no component at all, which `discard` refuses before it gets here.
     Ok(())
 }
 
@@ -145,6 +150,15 @@ fn unlink(path: &Path, directory: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The Nx capability's rendezvous directories (`capabilities::nx`): the host shell's and the
+    /// sandbox's private environment's.
+    fn nx_states() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from(".nx/workspace-data/d"),
+            PathBuf::from(".cowshed/cache/nx/workspace-data/d"),
+        ]
+    }
 
     fn tree(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -190,7 +204,7 @@ mod tests {
         let root = tree("scope");
         nx_workspace(&root);
 
-        discard(&root).expect("discard inherited daemon state");
+        discard(&root, &nx_states()).expect("discard inherited daemon state");
 
         for gone in [".nx/workspace-data/d", ".cowshed/cache/nx/workspace-data/d"] {
             assert!(
@@ -222,14 +236,14 @@ mod tests {
         let root = tree("absent");
         fs::create_dir_all(root.join(".nx/cache")).expect("cache only");
 
-        discard(&root).expect("an absent entry is not a failure");
+        discard(&root, &nx_states()).expect("an absent entry is not a failure");
         assert!(root.join(".nx/cache").is_dir());
 
         // And again on a tree that has just been cleaned: minting is retried after a crash.
         let cleaned = tree("cleaned");
         nx_workspace(&cleaned);
-        discard(&cleaned).expect("first mint");
-        discard(&cleaned).expect("retried mint");
+        discard(&cleaned, &nx_states()).expect("first mint");
+        discard(&cleaned, &nx_states()).expect("retried mint");
         assert!(!cleaned.join(".nx/workspace-data/d").exists());
         assert!(cleaned.join(".nx/workspace-data/file-map.json").exists());
 
@@ -246,7 +260,7 @@ mod tests {
         let entry = root.join(".nx/workspace-data/d");
         fs::write(&entry, b"someone's file").expect("regular file at the entry");
 
-        let error = discard(&root).expect_err("a regular file must refuse");
+        let error = discard(&root, &nx_states()).expect_err("a regular file must refuse");
         assert_eq!(error.code.as_str(), "integrity");
         assert!(
             error.message.contains("is a file"),
@@ -273,7 +287,7 @@ mod tests {
             .expect("outside server process");
         std::os::unix::fs::symlink(&outside, root.join(".nx")).expect("symlinked .nx");
 
-        let error = discard(&root).expect_err("an escaping ancestor must refuse");
+        let error = discard(&root, &nx_states()).expect_err("an escaping ancestor must refuse");
         assert_eq!(error.code.as_str(), "integrity");
         assert!(
             error.message.contains(".nx") && error.message.contains("symlink"),
@@ -302,7 +316,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join(".nx/workspace-data/d"))
             .expect("symlinked entry");
 
-        discard(&root).expect("discard the link");
+        discard(&root, &nx_states()).expect("discard the link");
         assert!(
             fs::symlink_metadata(root.join(".nx/workspace-data/d")).is_err(),
             "the link must be gone"
@@ -316,25 +330,23 @@ mod tests {
         fs::remove_dir_all(&outside).ok();
     }
 
-    /// The walk's leaf handling is derived from the table, so an entry that named nothing would
-    /// silently do nothing. There is no such entry, and this is what keeps it that way.
+    /// A contributed state that names nothing, climbs or re-roots is refused before anything in
+    /// the tree is touched: the walk would otherwise silently do nothing or leave the workspace.
     #[test]
-    fn every_table_entry_names_a_relative_path() {
-        for state in INHERITED_DAEMON_STATE {
-            let path = Path::new(state);
+    fn a_state_that_is_not_plain_and_relative_is_refused_before_the_walk() {
+        let root = tree("invalid-state");
+        nx_workspace(&root);
+        for state in ["", "/tmp/elsewhere", "../sibling/d", ".nx/../d"] {
+            let mut states = nx_states();
+            states.push(PathBuf::from(state));
+            let error = discard(&root, &states).expect_err("an invalid state must refuse");
+            assert_eq!(error.code.as_str(), "integrity", "{state:?}");
             assert!(
-                path.components().count() > 0,
-                "{state} must name at least one component"
-            );
-            assert!(
-                path.is_relative(),
-                "{state} must be repository-relative, never absolute"
-            );
-            assert!(
-                path.components()
-                    .all(|component| matches!(component, std::path::Component::Normal(_))),
-                "{state} must not climb or re-root"
+                root.join(".nx/workspace-data/d/server-process.json")
+                    .exists(),
+                "{state:?} was refused only after the walk touched the tree"
             );
         }
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -904,13 +904,12 @@ at login by a launchd agent; Linux uses its platform service/controller lifecycl
 ## Workspace environment: `.cowshed/env`, optionally sourced by direnv
 
 Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
-`.cowshed/env` exports `GOENV` (pointing at the workspace's `.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN`
-(controller-minted, read from `.cowshed/token`), and on macOS `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` from
-detached metadata's exact `portBlock`. Linux has no port block and omits both lines. One function derives the file from
-the image's published token and the workspace's recorded platform and block, and it is the file's only writer: create,
-fork and restore publish it as they mint, and every supervisor start publishes it again, so values are always current —
-a workspace minted before a variable existed gains it on its next start. Nothing is derived from cwd, guessed from a
-slot, or trusted from a marker alone.
+`.cowshed/env` exports `COWSHED_WORKSPACE_TOKEN` (controller-minted, read from `.cowshed/token`), and on macOS
+`COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` from detached metadata's exact `portBlock`. Linux has no port block
+and omits both lines. One function derives the file from the image's published token and the workspace's recorded
+platform and block, and it is the file's only writer: create, fork and restore publish it as they mint, and every
+supervisor start publishes it again, so values are always current — a workspace minted before a variable existed gains
+it on its next start. Nothing is derived from cwd, guessed from a slot, or trusted from a marker alone.
 
 Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
 new, fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration

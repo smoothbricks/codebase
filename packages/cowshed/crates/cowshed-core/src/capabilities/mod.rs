@@ -10,21 +10,21 @@ use std::path::{Component, Path, PathBuf};
 use crate::{CowshedError, Result};
 use cache::{HostCache, SharedLayout, SharedToolHome};
 
+mod bun;
 pub mod cache;
+pub mod cargo;
+mod direnv;
+pub mod go;
+mod gradle;
 mod installations;
 mod javascript;
-mod direnv;
-pub mod nx;
-pub mod cargo;
-pub mod go;
-mod bun;
+mod nix;
 mod npm;
+pub mod nx;
 mod pnpm;
+pub mod sccache;
 mod uv;
 mod zig;
-mod gradle;
-mod nix;
-pub mod sccache;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -243,7 +243,20 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 12] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR, &npm::DETECTOR, &pnpm::DETECTOR, &uv::DETECTOR, &zig::DETECTOR, &gradle::DETECTOR, &nix::DETECTOR, &sccache::DETECTOR];
+pub static DETECTORS: [&Detector; 12] = [
+    &direnv::DETECTOR,
+    &nx::DETECTOR,
+    &cargo::DETECTOR,
+    &go::DETECTOR,
+    &bun::DETECTOR,
+    &npm::DETECTOR,
+    &pnpm::DETECTOR,
+    &uv::DETECTOR,
+    &zig::DETECTOR,
+    &gradle::DETECTOR,
+    &nix::DETECTOR,
+    &sccache::DETECTOR,
+];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
@@ -299,6 +312,13 @@ pub fn detect(
             result.active.push(detector.id);
         }
     }
+    installations::contribute_linked_program_reads(
+        &mut result.contribution,
+        &[
+            context.environment_root.join("tools/bin"),
+            context.workspace_root.join(".cowshed/bin"),
+        ],
+    )?;
     normalize(&mut result.contribution);
     Ok(result)
 }
@@ -647,11 +667,29 @@ pub fn bootstrap_program(name: &str, candidates: &[PathBuf]) -> Result<Option<Pa
     Ok(None)
 }
 
+/// Bootstrap `name` from the first of `directories` that installs it.
+///
+/// The supervisor repeats this search inside its own sandbox, beneath the HOME-wide read deny,
+/// so every candidate beneath HOME is granted as the literal program path it probes: the
+/// sandboxed search then sees exactly what the host's saw — the program, a link it resolves
+/// through, or its absence — and no HOME directory becomes listable.
 pub fn add_bootstrap(
     contribution: &mut CapabilityContribution,
+    context: &DetectionContext<'_>,
     name: &'static str,
     directories: &[PathBuf],
 ) -> Result<()> {
+    contribution.grants.extend(
+        directories
+            .iter()
+            .map(|directory| directory.join(name))
+            .filter(|candidate| candidate.starts_with(context.home))
+            .map(|path| CapabilityGrant {
+                path,
+                scope: GrantScope::Literal,
+                access: GrantAccess::Read,
+            }),
+    );
     if let Some(target) = bootstrap_program(name, directories)? {
         contribution.grants.push(CapabilityGrant {
             path: target.clone(),
@@ -765,6 +803,11 @@ pub mod test_support {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, "").unwrap();
             }
+        }
+    }
+    impl Default for Fixture {
+        fn default() -> Self {
+            Self::new()
         }
     }
     impl Drop for Fixture {

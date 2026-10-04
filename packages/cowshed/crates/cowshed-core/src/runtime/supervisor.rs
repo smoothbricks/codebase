@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::{CStr, OsStr, OsString};
-use std::fs;
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,9 +33,7 @@ use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
 };
 use crate::storage::audit::AuditSinkError;
-use crate::workspace_environment::{
-    GO_ENV, NODE_CA_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV,
-};
+use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
@@ -155,8 +152,7 @@ impl Default for WorkspaceSupervisorConfig {
                 additional_denies: Vec::new(),
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
-                shared_tool_homes: Vec::new(),
-                home_reads: Vec::new(),
+                capabilities: Default::default(),
             },
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),
@@ -239,16 +235,15 @@ pub enum SpawnCommand {
     Script(crate::script::RenderedScript),
 }
 
-/// A workspace's sandbox and the Seatbelt profiles it compiles to, rendered together once — when
-/// a supervisor takes an authority, at start and at each grant advance — and shared by every job
-/// admitted under that authority. A spawn carries this value, so no job renders a profile, and
-/// no spawn can pair a sandbox with a profile rendered from another one.
+/// A matched sandbox and its executed-child profiles. Jobs share the authority snapshot while
+/// its project conventions are unchanged; a spawn refreshes capabilities before choosing its
+/// read-write or read-only profile. No spawn pairs a sandbox with another snapshot's profile.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy(std::sync::Arc<RenderedPolicy>);
 
 #[derive(Debug)]
 struct RenderedPolicy {
-    /// The sandbox the supervisor holds; a job may narrow it, never widen it.
+    /// The current authority grants plus convention-gated project capabilities.
     ceiling: SandboxConfig,
     read_only: SandboxConfig,
     ceiling_child: String,
@@ -259,6 +254,15 @@ impl SandboxPolicy {
     pub fn render(ceiling: SandboxConfig) -> Result<Self> {
         let mut read_only = ceiling.clone();
         read_only.mode = crate::sandbox::RunSandboxMode::ReadOnly;
+        let shell_cwd = ceiling
+            .capabilities
+            .contribution
+            .shell
+            .as_ref()
+            .map_or(ceiling.workspace_mount.as_path(), |shell| {
+                shell.directory.as_path()
+            });
+        read_only.configure_capabilities_for(shell_cwd)?;
         let render = |sandbox: &SandboxConfig, role| {
             seatbelt_profile(sandbox, role).map_err(map_sandbox_error)
         };
@@ -271,6 +275,19 @@ impl SandboxPolicy {
             ceiling,
             read_only,
         })))
+    }
+
+    fn for_cwd(&self, cwd: &Path) -> Result<Self> {
+        let capabilities = {
+            let _span = crate::timing::span("spawn", "capability-detection");
+            self.ceiling().detect_capabilities_for(cwd)?
+        };
+        if capabilities == self.ceiling().capabilities {
+            Ok(self.clone())
+        } else {
+            let _span = crate::timing::span("spawn", "capability-profile");
+            Self::render(self.ceiling().with_capabilities(capabilities))
+        }
     }
 
     pub fn ceiling(&self) -> &SandboxConfig {
@@ -707,160 +724,43 @@ impl CommitmentSink for CommitmentPublisherHandle {
     }
 }
 
-/// Resolve a shell input without letting discovery cross the workspace boundary.
-fn contained_shell_path(workspace_mount: &Path, path: &Path) -> Result<PathBuf> {
-    let resolved = fs::canonicalize(path).map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot resolve shell input {}: {error}", path.display()),
-            "repair the workspace shell configuration and retry",
-        )
-    })?;
-    if !resolved.starts_with(workspace_mount) {
-        return Err(CowshedError::sandbox_denied(
-            format!(
-                "shell input {} escapes workspace {}",
-                path.display(),
-                workspace_mount.display()
-            ),
-            "keep shell configuration inside the workspace",
-        ));
-    }
-    Ok(resolved)
+/// The selected detector supplies the convention; core never discovers a tool by name.
+fn shell_directory(sandbox: &SandboxConfig) -> Option<PathBuf> {
+    sandbox
+        .capabilities
+        .contribution
+        .shell
+        .as_ref()
+        .map(|shell| shell.directory.clone())
 }
 
-fn shell_input_exists(workspace_mount: &Path, path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => contained_shell_path(workspace_mount, path).map(|_| true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(CowshedError::environment_missing(
-            format!("cannot inspect shell input {}: {error}", path.display()),
-            "repair the workspace shell configuration and retry",
-        )),
-    }
-}
-
-/// The directory of the nearest `.envrc` from `cwd` up to the workspace boundary: the shell a
-/// command in `cwd` activates. `None` runs the command in the plain sandbox environment. An
-/// unrelated ancestor's `.envrc` outside the workspace is neither authorized nor evaluated.
-fn envrc_directory(sandbox: &SandboxConfig, cwd: &Path) -> Result<Option<PathBuf>> {
-    for directory in cwd
-        .ancestors()
-        .take_while(|directory| directory.starts_with(&sandbox.workspace_mount))
-    {
-        if shell_input_exists(&sandbox.workspace_mount, &directory.join(".envrc"))? {
-            return Ok(Some(directory.to_path_buf()));
-        }
-    }
-    Ok(None)
-}
-
-/// One-shot activation is part of the executed child: it inherits the same sandbox, pipes and
-/// process group, and its failure is the job's failure. Only the constant script is shell code;
-/// the `.envrc` directory and the complete original argv remain positional arguments, never
-/// interpolated shell code. Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME),
-/// never the user's host trust database, and no workspace code executes until sandbox-exec.
-fn wrap_one_shot(plan: &mut SpawnPlan, envrc_directory: &Path) {
+/// Activation runs inside the executed child, with directory and argv passed positionally.
+fn wrap_one_shot(
+    plan: &mut SpawnPlan,
+    shell: &crate::capabilities::ShellActivation,
+    directory: &Path,
+) {
     let mut activation = vec![
         OsString::from("/bin/sh"),
         OsString::from("-c"),
-        OsString::from(
-            r#"directory=$1; shift; direnv allow "$directory/.envrc" && exec direnv exec "$directory" "$@""#,
-        ),
-        OsString::from("cowshed-direnv"),
-        envrc_directory.as_os_str().to_owned(),
+        OsString::from(shell.script),
+        OsString::from(shell.label),
+        directory.as_os_str().to_owned(),
     ];
     activation.extend(plan.args.drain(3..));
     plan.args.extend(activation);
 }
 
-/// The Nix profiles that belong to the host's user and the host itself rather than to any
-/// shell: where `nix profile`, home-manager, nix-darwin and NixOS install tools. Nearest the
-/// user first. They are searched for [`BOOTSTRAP_TOOLS`] only and never join PATH whole.
-fn host_profile_bins(home: &Path, user: Option<&OsStr>) -> Vec<PathBuf> {
-    let mut profiles = vec![
-        home.join(".nix-profile/bin"),
-        home.join(".local/state/nix/profile/bin"),
-    ];
-    if let Some(user) = user {
-        profiles.push(Path::new("/etc/profiles/per-user").join(user).join("bin"));
-        profiles.push(
-            Path::new("/nix/var/nix/profiles/per-user")
-                .join(user)
-                .join("profile/bin"),
-        );
-    }
-    profiles.push(PathBuf::from("/run/current-system/sw/bin"));
-    profiles.push(PathBuf::from("/nix/var/nix/profiles/default/bin"));
-    profiles
-}
-
-/// What shell activation itself runs before any workspace shell exists: `direnv` loads the
-/// `.envrc`, `devenv` evaluates the workspace, and `nix` (with `nix-store` beside it) is what
-/// devenv and the inherited-shell check drive. Every other tool is the workspace devenv's.
-const BOOTSTRAP_TOOLS: [&str; 3] = ["direnv", "devenv", "nix"];
-
-/// The store package `bin` directory providing each [`BOOTSTRAP_TOOLS`] entry, found through the
-/// nearest host profile that has it. Only that package joins PATH: a profile carries everything
-/// else its user or host installed, which a workspace shell must not see.
-fn bootstrap_tool_bins(host_profiles: &[PathBuf]) -> Vec<PathBuf> {
-    let mut bins = Vec::new();
-    for tool in BOOTSTRAP_TOOLS {
-        let package = host_profiles.iter().find_map(|profile| {
-            let program = fs::canonicalize(profile.join(tool)).ok()?;
-            let bin = program.parent()?;
-            (program.starts_with("/nix/store") && bin.join(tool).is_file())
-                .then(|| bin.to_path_buf())
-        });
-        if let Some(bin) = package
-            && !bins.contains(&bin)
-        {
-            bins.push(bin);
-        }
-    }
-    bins
-}
-
-/// The effective user's login name, from the password database rather than the environment.
-fn effective_user_name() -> Option<OsString> {
-    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-    let mut buffer = vec![0_u8; 4096];
-    let mut found = std::ptr::null_mut();
-    // SAFETY: `entry` and `buffer` are writable for their declared sizes and outlive the call;
-    // on success `found` points into them.
-    let status = unsafe {
-        libc::getpwuid_r(
-            libc::geteuid(),
-            entry.as_mut_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut found,
-        )
-    };
-    if status != 0 || found.is_null() {
-        return None;
-    }
-    // SAFETY: getpwuid_r succeeded, so `pw_name` is a NUL-terminated string inside `buffer`.
-    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
-    Some(OsString::from_vec(name.to_bytes().to_vec()))
-}
-
+/// Tool commands are exact private-bin links; no host profile joins PATH.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
-    bootstrap_path_from(
-        sandbox,
-        &host_profile_bins(&sandbox.home, effective_user_name().as_deref()),
-    )
-}
-
-/// The PATH a child starts from, before its shell activates: the workspace's own tools, the
-/// bootstrap packages, then the platform. Nothing comes from the PATH that started this
-/// process — another checkout's shell or a user's login PATH is not the workspace's.
-fn bootstrap_path_from(sandbox: &SandboxConfig, host_profiles: &[PathBuf]) -> Result<OsString> {
-    let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
-    for bin in bootstrap_tool_bins(host_profiles) {
-        if !paths.contains(&bin) {
-            paths.push(bin);
+    let tools = match sandbox.mode {
+        crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools/bin"),
+        crate::sandbox::RunSandboxMode::ReadWrite => {
+            sandbox.workspace_mount.join(".cowshed/tools/bin")
         }
-    }
+    };
+    let mut paths = vec![tools];
+    paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
         && !paths.contains(&path)
     {
@@ -903,67 +803,93 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
     )
 }
 
-/// The private XDG roots under which Nix keeps client state, each named the same as its shared
-/// directory under `<caches>/nix`: `<root>/<name>/nix` links to `<caches>/nix/<name>`.
-///
-/// Nix keeps its fetcher cache (URL and lock-hash to store path), tarball cache, git cache and
-/// evaluation cache under `$XDG_CACHE_HOME/nix`, and profile and channel state under
-/// `$XDG_STATE_HOME/nix`. cowshed hands every child private XDG roots, so a freshly minted
-/// workspace would start with an EMPTY nix cache and the sandboxed `devenv print-dev-env`
-/// evaluation would re-fetch every flake input the lock names — through the gateway proxy, which
-/// admits nothing without an egress grant. The store paths already exist (the host fetched them),
-/// only the client-side index is missing. Sharing one directory each on the caches volume, which
-/// the executed-child profile carves back read-write, lets every workspace see what any one of
-/// them has fetched; nix serialises access to its sqlite indexes itself.
-const NIX_CLIENT_DIRECTORIES: [&CStr; 2] = [c"cache", c"state"];
-
-/// Create the private `home`, `config`, `data`, `run` and Nix client (`cache`, `state`) roots
-/// under `environment_root`, point each Nix client root's `nix` at its shared directory under
-/// `caches`, and create the [`crate::sandbox::DIRECT_TOOL_CACHES`] there: a child granted writes
-/// inside one of those cannot create its parent, and nothing on the host is relocated for them.
-///
-/// A host without the caches root gets no links and the private directories stand (a CI runner
-/// or a box before `cowshed setup` has no caches volume, and an environment that cannot be
-/// shared must not fail the spawn), a link that already resolves to the shared directory is
-/// kept, a stale link is replaced, and a real directory a workspace already owns is left alone.
-///
-/// Returns the held environment directory, through which the host publishes the rest of the
-/// private environment.
+/// Prepare only generic private roots and the cache/daemon paths contributed by active detectors.
 fn prepare_private_environment(
     environment_root: &Path,
-    caches: &Path,
+    contribution: &crate::capabilities::CapabilityContribution,
 ) -> Result<AnchoredDirectory> {
-    // Keep directory capabilities through link preparation: a running child
-    // may rename these paths, but cannot redirect a host write through a link.
     let environment =
         AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
-    for name in [c"home", c"config", c"data", c"run"] {
+    for name in [c"home", c"config", c"cache", c"data", c"state", c"run"] {
         environment.child(name).map_err(private_environment_error)?;
     }
-    let shared_nix = if caches.is_dir() {
-        for directory in crate::sandbox::DIRECT_TOOL_CACHES {
-            AnchoredDirectory::create(&caches.join(directory))
-                .map_err(private_environment_error)?;
+    let bin = environment
+        .child(c"tools")
+        .and_then(|tools| tools.child(c"bin"))
+        .map_err(private_environment_error)?;
+    let mut programs = Vec::with_capacity(contribution.bootstrap_programs.len());
+    for program in &contribution.bootstrap_programs {
+        if program.name.is_empty() || program.name.contains('/') {
+            return Err(CowshedError::integrity(
+                "capability executable name is invalid",
+                "repair the bootstrap detector",
+            ));
         }
-        Some(
-            AnchoredDirectory::create(caches)
-                .and_then(|caches| caches.child(c"nix"))
-                .map_err(private_environment_error)?,
-        )
-    } else {
-        None
-    };
-    for name in NIX_CLIENT_DIRECTORIES {
-        let private = environment.child(name).map_err(private_environment_error)?;
-        if let Some(shared_nix) = &shared_nix {
-            shared_nix.child(name).map_err(private_environment_error)?;
-            let target = caches.join("nix").join(OsStr::from_bytes(name.to_bytes()));
-            private
-                .ensure_symlink(c"nix", &target)
-                .map_err(private_environment_error)?;
+        let name = std::ffi::CString::new(program.name).map_err(|error| {
+            private_environment_error(io::Error::new(io::ErrorKind::InvalidInput, error))
+        })?;
+        programs.push((name, program.target.as_path()));
+    }
+    bin.reconcile_links(c".links", &programs)
+        .map_err(private_environment_error)?;
+    for mount in &contribution.cache_mounts {
+        AnchoredDirectory::create(&mount.source).map_err(private_environment_error)?;
+        if let Some(target) = &mount.private_target {
+            let relative = target.strip_prefix(environment_root).map_err(|_| {
+                CowshedError::integrity(
+                    "capability cache link escapes the private environment",
+                    "repair the cache detector",
+                )
+            })?;
+            let leaf = relative.file_name().ok_or_else(|| {
+                CowshedError::integrity(
+                    "capability cache link has no filename",
+                    "repair the cache detector",
+                )
+            })?;
+            let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|error| {
+                private_environment_error(io::Error::new(io::ErrorKind::InvalidInput, error))
+            })?;
+            let parent = relative.parent().expect("a relative filename has a parent");
+            if parent.as_os_str().is_empty() {
+                environment
+                    .ensure_symlink(&leaf, &mount.source)
+                    .map_err(private_environment_error)?;
+            } else {
+                private_directory(&environment, parent)
+                    .and_then(|directory| directory.ensure_symlink(&leaf, &mount.source))
+                    .map_err(private_environment_error)?;
+            }
         }
     }
+    for path in &contribution.daemon_isolation.directories {
+        let relative = path.strip_prefix(environment_root).map_err(|_| {
+            CowshedError::integrity(
+                "capability daemon directory escapes the private environment",
+                "repair the daemon detector",
+            )
+        })?;
+        private_directory(&environment, relative).map_err(private_environment_error)?;
+    }
     Ok(environment)
+}
+
+fn private_directory(root: &AnchoredDirectory, relative: &Path) -> io::Result<AnchoredDirectory> {
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory must be a nonempty relative path",
+        ));
+    };
+    let name = std::ffi::CString::new(first.as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let directory = root.child(&name)?;
+    if components.as_path().as_os_str().is_empty() {
+        Ok(directory)
+    } else {
+        private_directory(&directory, components.as_path())
+    }
 }
 
 fn private_environment_error(error: io::Error) -> CowshedError {
@@ -1163,10 +1089,8 @@ pub(super) async fn sandbox_environment(
     let private_data = environment_root.join("data");
     let private_state = environment_root.join("state");
     let private_runtime = sandbox_runtime_dir(sandbox);
-    let environment = prepare_private_environment(
-        environment_root,
-        Path::new(crate::storage::bootstrap::CACHES_ROOT),
-    )?;
+    let environment =
+        prepare_private_environment(environment_root, &sandbox.capabilities.contribution)?;
     // TMPDIR must exist even when read-write environment state lives elsewhere.
     if sandbox.mode == crate::sandbox::RunSandboxMode::ReadWrite {
         AnchoredDirectory::create(&sandbox.exec_temp_dir).map_err(private_environment_error)?;
@@ -1224,7 +1148,6 @@ pub(super) async fn sandbox_environment(
     own("XDG_CACHE_HOME", private_cache.as_os_str());
     own("XDG_DATA_HOME", private_data.as_os_str());
     own("XDG_STATE_HOME", private_state.as_os_str());
-    own("DIRENV_CONFIG", private_config.join("direnv").as_os_str());
     own(
         "GIT_CONFIG_GLOBAL",
         git_identity
@@ -1235,76 +1158,8 @@ pub(super) async fn sandbox_environment(
     own("GIT_CONFIG_NOSYSTEM", OsStr::new("1"));
     own("GIT_ATTR_NOSYSTEM", OsStr::new("1"));
     own("TMPDIR", sandbox.exec_temp_dir.as_os_str());
-    // devenv resolves its runtime directory as `$XDG_RUNTIME_DIR/devenv-<hash>`, falling
-    // back to `/tmp` when the variable is unset, and ignores TMPDIR by design (its runtime
-    // dir must rendezvous across invocations that may carry different TMPDIRs). The child
-    // gets the short `/tmp/cs-<port>` link: the shed's runtime dir under a name that leaves
-    // `sun_path` room for the sockets devenv keeps there.
+    // Short, workspace-owned rendezvous namespace; no host runtime state is inherited.
     own("XDG_RUNTIME_DIR", runtime_link.as_os_str());
-    // Nx ignores XDG_RUNTIME_DIR and otherwise falls back to a world-shared
-    // directory or a private HOME path longer than Unix sockets permit.
-    // Its O_NOFOLLOW admission requires a real leaf below the short alias.
-    own("NX_SOCKET_DIR", runtime_link.join("nx").as_os_str());
-    // Nx's own defaults decide whether its daemon runs, so a caller's NX_DAEMON never reaches
-    // the child. What has to be the sandbox's instead is where that daemon is found. A client
-    // connects only to the socket named by `d/server-process.json` in Nx's workspace-data
-    // directory, and a client that cannot reach that socket starts a daemon of its own, which
-    // overwrites the record and so retires the daemon it replaced. Left in the checkout, the
-    // record is shared with every host shell there: a sandboxed client cannot reach a host
-    // daemon's socket, replaces it, and host clients then send their whole environment to a
-    // daemon inside this sandbox. The workspace-data directory is therefore the sandbox's, in
-    // its private environment, and so is the cache: once either directory is configured Nx puts
-    // its task database in the workspace-data directory, and that database indexes exactly one
-    // cache directory. Both are scoped like the runtime link, per workspace and mode.
-    let nx_state = private_cache.join("nx");
-    own(
-        "NX_WORKSPACE_DATA_DIRECTORY",
-        nx_state.join("workspace-data").as_os_str(),
-    );
-    own("NX_CACHE_DIRECTORY", nx_state.join("cache").as_os_str());
-    own(
-        "NX_WORKSPACE_ROOT_PATH",
-        sandbox.workspace_mount.as_os_str(),
-    );
-    withheld.push("NX_DAEMON");
-    own(GO_ENV, private_cache.join("go/env").as_os_str());
-    // Rust routes through sccache in every workspace of a host that pinned one. Cargo's
-    // `-C metadata` is path-independent for workspace members (cargo >= 1.97, measured), and the
-    // pinned sccache normalizes the residual path-bearing key inputs (cwd, blanket `CARGO_*` env,
-    // argument bytes) against the request cwd when the client sets `SCCACHE_BASEDIR_CWD=1` — so
-    // name-mounted workspaces share entries with each other, not just successive slot tenants.
-    // env-dep values stay unnormalized in the key, so a crate that compiles
-    // `env!("CARGO_MANIFEST_DIR")` into its output still fail-closes across paths.
-    //
-    // The wrapper is the pinned program itself, read through the GC root before every spawn, not
-    // a name for `PATH` to resolve: shell activation owns `PATH`, and a repository shell without
-    // sccache left a bare `sccache` unresolvable, failing every cargo command at its version
-    // probe. A host that pinned none builds without a wrapper — sccache is opt-in — rather than
-    // against a daemon that is not there. Neither variable is the caller's: the Seatbelt profile
-    // admits exactly the host daemon's socket and denies binding it, so a caller that pointed the
-    // wrapper elsewhere would be reaching outside the boundary. rustc-wrapper clients speak to
-    // that host-owned daemon, and a client whose daemon is down fails fast instead of spawning a
-    // wrong-boundary server inside the sandbox.
-    //
-    // `CARGO_INCREMENTAL` is deliberately not the sandbox's, so whatever the caller names arrives
-    // verbatim and an unnamed one stays unset. Cargo then decides per profile, which is the right
-    // decision for both halves of a build at once: workspace crates stay incremental and local,
-    // while dependencies are always non-incremental and so reach sccache without anyone forcing
-    // anything. Forcing 0 cost every interactive build a full recompile — measured on a one-line
-    // edit to a mid-size crate, ~1.7s incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
-    match crate::sandbox::sccache_client(&sandbox.home) {
-        Some(client) => own("RUSTC_WRAPPER", client.as_os_str()),
-        None => withheld.push("RUSTC_WRAPPER"),
-    }
-    own("SCCACHE_BASEDIR_CWD", OsStr::new("1"));
-    own(
-        "SCCACHE_SERVER_UDS",
-        crate::sandbox::sccache_server_socket().as_os_str(),
-    );
-    own(
-        "SCCACHE_DIR",
-        crate::sandbox::sccache_cache_directory().as_os_str(),
-    );
     own(PORT_BASE_ENV, OsStr::new(&port_base));
     own(
         PORT_BLOCK_SIZE_ENV,
@@ -1314,33 +1169,9 @@ pub(super) async fn sandbox_environment(
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         own(name, OsStr::new(&gateway_http));
     }
-    // Node's native HTTP and fetch clients opt in to the proxy environment separately.
-    // Own that opt-in alongside the endpoint so postinstalls cannot bypass workspace egress.
-    own("NODE_USE_ENV_PROXY", OsStr::new("1"));
     own("NO_PROXY", OsStr::new(loopback_no_proxy));
     own("no_proxy", OsStr::new(loopback_no_proxy));
-    // The host and every workspace reach a shared tool home through one literal path (cargo
-    // fingerprints dependencies by it, Bun's isolated linker writes it into `node_modules`), so
-    // the variable names the host path once the tool's caches are shared, and never passes a
-    // caller's value through: without shared caches the tool follows the private HOME.
-    for (variable, host_path) in sandbox.shared_tool_environment() {
-        match host_path {
-            Some(host_path) => own(variable, host_path.as_os_str()),
-            None => withheld.push(variable),
-        }
-    }
-    // Cargo only honors url.insteadOf through the Git CLI, so every child
-    // fetches through it; uv shells out to Git and follows the same include
-    // with no extra wiring. The include points at the managed file
-    // regenerated above, layered over the isolated GLOBAL set just above —
-    // the workspace's own identity file or the empty device, never the
-    // user's or the system's configuration. With no mapping the count is
-    // pinned to zero so caller-supplied GIT_CONFIG_KEY_* entries cannot
-    // smuggle configuration in.
-    own(
-        crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_ENV,
-        OsStr::new(crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_VALUE),
-    );
+    // Core Git policy includes only controller-approved routes and never inherits caller config.
     match &git_fetch_config {
         Some(path) => {
             for (key, value) in crate::workspace_git_fetch::git_fetch_include_env(path) {
@@ -1352,39 +1183,8 @@ pub(super) async fn sandbox_environment(
             withheld.extend(["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]);
         }
     }
-    // Every intercepted HTTPS origin is presented with a leaf this workspace's CA signed, so a
-    // client that does not trust that CA cannot reach the registry at all — measured on the
-    // pinned Bun as `UNABLE_TO_VERIFY_LEAF_SIGNATURE downloading package manifest`. The
-    // certificate is the public half and already travels in the image; only the anchor wiring
-    // was missing.
-    //
-    // NODE_EXTRA_CA_CERTS is additive and belongs to Node and Bun alone, so it can be set
-    // without touching SSL_CERT_FILE — which nix and devenv own for the whole toolchain, and
-    // which is not ours to redirect. Nothing here relaxes verification: the anchor is added, no
-    // check is disabled.
-    //
-    // A caller that set the variable itself keeps it. Node reads exactly one file, so there is
-    // no honest merge; silently replacing an operator's anchor would change what a build was
-    // compiled against without saying so, and the alternative — refusing to spawn — is worse
-    // for a variable that may be entirely unrelated. It is announced instead.
     let mut defaults = BTreeMap::new();
-    let anchor = sandbox
-        .workspace_mount
-        .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
-    if tokio::fs::try_exists(&anchor).await.unwrap_or(false) {
-        defaults.insert(OsString::from(NODE_CA_ENV), anchor.into_os_string());
-    }
-    if caller.contains_key(NODE_CA_ENV) {
-        eprintln!(
-            "cowshed: {NODE_CA_ENV} was supplied by the caller; the workspace gateway CA is not \
-             being added, so an intercepted HTTPS origin may fail to verify"
-        );
-    }
-    // Go's env file and one-file TLS clients' trust bundle live in the private environment
-    // (crate::workspace_clients), republished before every spawn so a moved environment is never
-    // served stale. Neither names a gateway endpoint or carries the token: the Go file names the
-    // public module proxy and the bundle needs only the CA. Registry clients — bun included —
-    // reach their registries through the proxy variables above, with no mirror route.
+    // Publish the public workspace CA plus platform roots before any child runs.
     let anchor = sandbox
         .workspace_mount
         .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
@@ -1415,7 +1215,6 @@ pub(super) async fn sandbox_environment(
         &crate::workspace_clients::ClientWiring {
             workspace_ca: workspace_ca.as_deref(),
             system_bundle: &system_bundle,
-            environment: environment_root,
         },
     )
     .map_err(private_environment_error)?;
@@ -1426,13 +1225,8 @@ pub(super) async fn sandbox_environment(
                 .to_str()
                 .expect("the bundle name is ASCII"),
         );
-        // Same rule as NODE_EXTRA_CA_CERTS above: a caller's own anchor is kept and announced.
-        // The bundle is the platform roots plus the workspace CA, a superset of what the toolchain
-        // would otherwise point SSL_CERT_FILE at, so every client that reads it keeps its trust.
         for name in [
             crate::workspace_clients::GIT_CA_ENV,
-            crate::workspace_clients::CARGO_CA_ENV,
-            crate::workspace_clients::NIX_CA_ENV,
             crate::workspace_clients::SSL_CERT_ENV,
         ] {
             if caller.contains_key(name) {
@@ -1443,19 +1237,26 @@ pub(super) async fn sandbox_environment(
             }
             defaults.insert(OsString::from(name), bundle.clone().into_os_string());
         }
-        // uv ignores SSL_CERT_FILE until told to verify with system certificates; a caller that
-        // sets UV_SYSTEM_CERTS itself keeps its choice.
-        defaults.insert(
-            OsString::from(crate::workspace_clients::UV_SYSTEM_CERTS_ENV),
-            OsString::from("true"),
-        );
-        // A host `nix.conf` that names its own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; only
-        // NIX_CONFIG, applied after every config file, outranks it. A caller's NIX_CONFIG keeps
-        // its lines, with this one last so it is the setting nix applies.
-        appended.insert(
-            OsString::from(crate::workspace_clients::NIX_CONFIG_ENV),
-            format!("ssl-cert-file = {}", bundle.display()),
-        );
+    }
+    for (&name, action) in &sandbox.capabilities.contribution.env {
+        match action {
+            crate::capabilities::EnvAction::Own(value) => {
+                owned.insert(name.into(), value.clone());
+            }
+            crate::capabilities::EnvAction::Unset => withheld.push(name),
+            crate::capabilities::EnvAction::Default(value) => {
+                if caller.contains_key(name) {
+                    eprintln!(
+                        "cowshed: {name} was supplied by the caller; the project capability \
+                         default is not being used"
+                    );
+                }
+                defaults.insert(name.into(), value.clone());
+            }
+            crate::capabilities::EnvAction::Append(value) => {
+                appended.insert(name.into(), value.clone());
+            }
+        }
     }
     Ok(SandboxEnvironment {
         owned,
@@ -1510,10 +1311,12 @@ impl SpawnSink for SystemSpawnSink {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        let (sandbox, profile) = request.policy.child(request.mode);
-        let cwd = crate::exec::contained_cwd(&sandbox.workspace_mount, &request.cwd)
-            .map_err(map_exec_error)?;
-        let envrc_directory = envrc_directory(sandbox, &cwd)?;
+        let cwd =
+            crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
+                .map_err(map_exec_error)?;
+        let policy = request.policy.for_cwd(&cwd)?;
+        let (sandbox, profile) = policy.child(request.mode);
+        let envrc_directory = shell_directory(sandbox);
         let environment = crate::timing::spanned(
             "spawn",
             "environment",
@@ -1558,8 +1361,10 @@ impl SpawnSink for SystemSpawnSink {
         }
         let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
             .map_err(map_exec_error)?;
-        if let Some(directory) = &envrc_directory {
-            wrap_one_shot(&mut plan, directory);
+        if let (Some(directory), Some(shell)) =
+            (&envrc_directory, &sandbox.capabilities.contribution.shell)
+        {
+            wrap_one_shot(&mut plan, shell, directory);
         }
         let mut command = sandboxed_command(&plan, &environment.child(&request.env));
         command
@@ -2102,7 +1907,7 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::AdvanceAuthority {
             expected: self.authority.clone(),
             authority: authority.clone(),
-            sandbox,
+            sandbox: Box::new(sandbox),
             reply,
         })
         .await?;
@@ -2164,7 +1969,7 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
             session: session.cloned(),
-            request,
+            request: Box::new(request),
             background,
             reply,
         })
@@ -2365,7 +2170,6 @@ impl WorkspaceSupervisor {
         // workspace's `.cowshed/env` is brought up to date with its metadata.
         crate::workspace_credentials::publish_workspace_environment(
             &config.sandbox.workspace_mount,
-            &config.sandbox.workspace_mount,
             crate::metadata::Platform::Macos,
             Some(config.sandbox.port_block),
         )
@@ -2443,7 +2247,7 @@ pub(super) enum Command {
     AdvanceAuthority {
         expected: WorkspaceAuthoritySnapshot,
         authority: WorkspaceAuthoritySnapshot,
-        sandbox: SandboxConfig,
+        sandbox: Box<SandboxConfig>,
         reply: oneshot::Sender<Result<()>>,
     },
     OpenSession {
@@ -2464,7 +2268,7 @@ pub(super) enum Command {
     Exec {
         authority: WorkspaceAuthoritySnapshot,
         session: Option<SessionToken>,
-        request: ExecRequest,
+        request: Box<ExecRequest>,
         background: bool,
         reply: oneshot::Sender<Result<JobId>>,
     },
@@ -2791,7 +2595,7 @@ impl SupervisorActor {
                 sandbox,
                 reply,
             } => {
-                let result = self.advance_authority(expected, authority, sandbox);
+                let result = self.advance_authority(expected, authority, *sandbox);
                 let _ = reply.send(result);
             }
             Command::OpenSession {
@@ -2826,7 +2630,7 @@ impl SupervisorActor {
                 reply,
             } => {
                 let result = self
-                    .admit_exec(authority, session, request, background, None)
+                    .admit_exec(authority, session, *request, background, None)
                     .await;
                 let _ = reply.send(result);
             }
@@ -4516,26 +4320,27 @@ mod workspace_toolchain_tests {
     #[cfg(target_os = "macos")]
     use crate::fork_lock::Run as _;
     #[cfg(target_os = "macos")]
-    use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants, nix_daemon_socket};
+    use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 
     // Only macOS tests build a sandbox; on the Linux cross lint the helper would be dead code.
+    // The mount root is a sibling of the fixture's home and stores, as it is on a host: its deny
+    // covers other workspaces, never the host home a capability grants into.
     #[cfg(target_os = "macos")]
     fn sandbox_at(mount: &Path) -> SandboxConfig {
         SandboxConfig {
             home: mount.parent().expect("root").join("home"),
-            mount_root: mount.parent().expect("root").to_path_buf(),
+            mount_root: mount.parent().expect("root").join("mounts"),
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
-            allowed_unix_sockets: nix_daemon_socket().into_iter().collect(),
+            allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
+            capabilities: Default::default(),
         }
     }
 
@@ -4550,14 +4355,15 @@ mod workspace_toolchain_tests {
         root
     }
 
-    /// A child's Go toolchain finds the public module proxy, and every one-file TLS client finds
-    /// a bundle that trusts both the platform roots and the workspace CA — from the files and
-    /// variables the host prepared before the spawn, with no tracked file touched. No registry
-    /// client is wired to a gateway route and the workspace token reaches the child only through
-    /// its proxy variables: the bunfig and netrc an earlier wiring left, token and all, are gone.
+    /// A workspace whose project uses cargo, Go, uv, Nix and Bun gets each tool's wiring from
+    /// its capability, and every one-file TLS client finds a bundle that trusts both the platform
+    /// roots and the workspace CA — from the files and variables the host prepared before the
+    /// spawn, with no tracked file touched. No registry client is wired to a gateway route and
+    /// the workspace token reaches the child only through its proxy variables: the bunfig and
+    /// netrc an earlier wiring left, token and all, are gone.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn a_child_finds_go_and_a_trust_bundle_and_no_retired_registry_wiring() {
+    async fn a_detected_project_gets_its_tools_wiring_and_a_trust_bundle() {
         let root = scratch("clients");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
@@ -4584,8 +4390,21 @@ mod workspace_toolchain_tests {
             "[install]\nregistry = { url = \"http://127.0.0.1:49104/npm/\", token = \"stale-token\" }\n",
         )
         .expect("stale bunfig");
+        for convention in [
+            "Cargo.toml",
+            "go.mod",
+            "uv.lock",
+            "flake.nix",
+            "package.json",
+            "bun.lock",
+        ] {
+            std::fs::write(mount.join(convention), "").expect("project convention");
+        }
         let mut sandbox = sandbox_at(&mount);
         sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
+        sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
         let mut env = BTreeMap::new();
         env.insert(
             "NIX_CONFIG".to_owned(),
@@ -4702,23 +4521,78 @@ mod workspace_toolchain_tests {
             vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
             Some(private.join("config"))
         );
-        // Go sends credentials only over HTTPS, so it cannot authenticate to the loopback mirror:
-        // it fetches from the public proxy through an opaque tunnel, and no token file exists.
-        let go_env = std::fs::read_to_string(private.join("cache/go/env")).expect("go env");
-        assert!(
-            go_env.contains("GOPROXY=https://proxy.golang.org\n"),
-            "{go_env}"
-        );
-        assert!(!go_env.contains("127.0.0.1"), "{go_env}");
+        // Go's caches are named directly; there is no Go env file and no Go policy.
+        assert!(!vars.contains_key("GOENV"));
+        assert!(!private.join("cache/go/env").exists());
+        let caches = Path::new(crate::storage::bootstrap::CACHES_ROOT);
+        if caches.is_dir() {
+            assert_eq!(
+                vars.get("GOMODCACHE").map(PathBuf::from),
+                Some(caches.join("go/mod"))
+            );
+            assert_eq!(
+                vars.get("GOCACHE").map(PathBuf::from),
+                Some(caches.join("go/build"))
+            );
+        }
         assert_eq!(
-            vars.get("GOENV").map(PathBuf::from),
-            Some(private.join("cache/go/env"))
+            vars.get("CARGO_NET_GIT_FETCH_WITH_CLI").map(String::as_str),
+            Some("true")
         );
         assert!(
             !private.join("home/.netrc").exists(),
             "the netrc a previous wiring left, token and all, is gone"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A plain repository gets the core contract and nothing tool-specific: no tool's variables,
+    /// its trust bundle only through the core's Git and OpenSSL anchors.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_plain_repository_gets_no_tool_wiring() {
+        let root = scratch("plain");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(
+            mount.join(".cowshed/ca.pem"),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        std::fs::write(mount.join("README.md"), "plain\n").expect("plain file");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.port_block = crate::metadata::PortBlock::new(49_120, 16).expect("port block");
+        sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
+        assert!(sandbox.capabilities.active.is_empty());
+
+        let environment = sandbox_environment(&sandbox, &BTreeMap::new())
+            .await
+            .expect("environment");
+        let names: Vec<String> = environment
+            .child(&BTreeMap::new())
+            .into_keys()
+            .filter_map(|name| name.into_string().ok())
+            .collect();
+        for prefix in [
+            "NX_", "CARGO_", "RUSTUP_", "GO", "UV_", "NIX_", "NODE_", "BUN_", "NPM_", "PNPM_",
+            "SCCACHE_", "RUSTC_", "ZIG_", "GRADLE_",
+        ] {
+            assert!(
+                !names.iter().any(|name| name.starts_with(prefix)),
+                "a plain repository got {prefix}* wiring: {names:?}"
+            );
+        }
+        let bundle = mount.join(".cowshed/ca-bundle.pem").into_os_string();
+        let child = environment.child(&BTreeMap::new());
+        for core in ["GIT_SSL_CAINFO", "SSL_CERT_FILE"] {
+            assert_eq!(child.get(OsStr::new(core)), Some(&bundle), "{core}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
     /// Every cargo a workspace runs wraps rustc with the sccache the host pinned: the program
@@ -4734,6 +4608,7 @@ mod workspace_toolchain_tests {
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(mount.join("Cargo.toml"), "").expect("cargo project");
         let mut sandbox = sandbox_at(&mount);
         sandbox.port_block = crate::metadata::PortBlock::new(49_072, 16).expect("port block");
         std::fs::create_dir_all(&sandbox.home).expect("home");
@@ -4741,8 +4616,14 @@ mod workspace_toolchain_tests {
             ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
             ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
         ]);
+        // Detection reads the host's pinned client, so each case configures a fresh snapshot,
+        // as a supervisor start does.
         let wiring = async || {
-            let environment = sandbox_environment(&sandbox, &caller)
+            let mut configured = sandbox.clone();
+            configured
+                .configure_capabilities()
+                .expect("detect capabilities");
+            let environment = sandbox_environment(&configured, &caller)
                 .await
                 .expect("environment");
             let child = environment.child(&caller);
@@ -4755,13 +4636,15 @@ mod workspace_toolchain_tests {
             ["RUSTC_WRAPPER", "SCCACHE_BASEDIR_CWD", "CARGO_INCREMENTAL"]
                 .map(|name| child.get(OsStr::new(name)).cloned())
         };
-        let unwrapped = [None, Some(OsString::from("1")), None];
+        // A cargo project on a host with no pinned client builds without a wrapper, and the
+        // caller's wrapper and cwd normalization never reach the child either.
+        let unwrapped = [None, None, None];
         assert_eq!(wiring().await, unwrapped, "no sccache pinned");
 
         let store_path = root.join("store/0000-sccache-cowshed");
         std::fs::create_dir_all(store_path.join("bin")).expect("store path");
         std::fs::write(store_path.join("bin/sccache"), b"").expect("program");
-        let gc_root = crate::sandbox::sccache_gc_root(&sandbox.home);
+        let gc_root = crate::capabilities::sccache::gc_root(&sandbox.home);
         std::fs::create_dir_all(gc_root.parent().expect("parent")).expect("support directory");
         std::os::unix::fs::symlink(&store_path, &gc_root).expect("gc root");
         assert_eq!(
@@ -4942,9 +4825,9 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Only a workspace-contained `.envrc` selects a shell, the nearest one above the command's
-    /// cwd. A `devenv.nix` is not a shell backend, and an `.envrc` above the workspace is never
-    /// the workspace's.
+    /// The nearest workspace-contained `.envrc` above the command's cwd selects the shell, a
+    /// nested one included when the root has none. A `devenv.nix` is not a shell, and an
+    /// `.envrc` above the workspace is never the workspace's.
     #[cfg(target_os = "macos")]
     #[test]
     fn only_the_nearest_contained_envrc_selects_a_shell() {
@@ -4954,76 +4837,172 @@ mod workspace_toolchain_tests {
         std::fs::create_dir_all(&nested).expect("nested project");
         std::fs::write(mount.join("devenv.nix"), "{ ... }: { }\n").expect("devenv.nix");
         std::fs::write(root.join(".envrc"), "exit 1\n").expect("ancestor envrc");
-        let sandbox = sandbox_at(&mount);
+        let mut sandbox = sandbox_at(&mount);
+        let mut selected = |cwd: &Path| {
+            sandbox
+                .configure_capabilities_for(cwd)
+                .expect("detect capabilities");
+            shell_directory(&sandbox)
+        };
 
-        assert_eq!(envrc_directory(&sandbox, &nested).expect("selection"), None);
-
-        std::fs::write(mount.join(".envrc"), "").expect("workspace envrc");
-        assert_eq!(
-            envrc_directory(&sandbox, &nested).expect("selection"),
-            Some(mount.clone())
-        );
+        assert_eq!(selected(&nested), None, "no contained .envrc, no shell");
 
         std::fs::write(nested.join(".envrc"), "").expect("nested envrc");
         assert_eq!(
-            envrc_directory(&sandbox, &nested).expect("selection"),
-            Some(nested.clone())
+            selected(&nested),
+            Some(nested.clone()),
+            "a nested-only .envrc"
         );
+        assert_eq!(selected(&mount), None, "the root has no .envrc of its own");
+
+        std::fs::write(mount.join(".envrc"), "").expect("workspace envrc");
+        assert_eq!(selected(&nested), Some(nested.clone()), "the nearest wins");
+        assert_eq!(selected(&mount), Some(mount.clone()));
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The bootstrap PATH is the workspace's and the bootstrap packages', whatever started the
-    /// supervisor: a profile contributes the store package of each bootstrap tool it provides and
-    /// nothing else it holds, and the PATH of this process — an interactive shell's, another
-    /// checkout's — contributes nothing at all.
+    /// A detected tool reaches PATH as its own command name in the mode's private `tools/bin`,
+    /// linked to the program it resolved to — never a whole install directory, and never by the
+    /// program's file name: npm's installed program is `npm-cli.js`, and a directory of it on
+    /// PATH offers no `npm` at all. The links are exactly the current snapshot's: a tool no
+    /// longer detected leaves PATH. Nothing comes from the PATH that started this process.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn a_profile_contributes_only_its_bootstrap_packages_to_path() {
-        let path_entries =
-            || std::env::split_paths(&std::env::var_os("PATH").expect("PATH")).collect::<Vec<_>>();
-        // Absence fails: cowshed requires Nix, and this repository's own shell is devenv.
-        let (tool, program) = BOOTSTRAP_TOOLS
-            .iter()
-            .find_map(|tool| {
-                path_entries().into_iter().find_map(|entry| {
-                    let program = std::fs::canonicalize(entry.join(tool)).ok()?;
-                    (program.starts_with("/nix/store")
-                        && program.file_name() == Some(OsStr::new(tool)))
-                    .then_some((*tool, program))
-                })
-            })
-            .expect("a bootstrap tool from /nix/store on PATH");
-        let package = program.parent().expect("a package bin").to_path_buf();
-        let root = scratch("profile-packages");
-        let profile = root.join("home/.nix-profile/bin");
-        std::fs::create_dir_all(&profile).expect("profile");
-        std::os::unix::fs::symlink(&program, profile.join(tool)).expect("bootstrap tool link");
-        // The rest of a user's profile: present, resolvable, and none of the workspace's.
-        std::os::unix::fs::symlink("/bin/sh", profile.join("sh")).expect("other tool link");
-        let sandbox = SandboxConfig {
-            home: root.join("home"),
-            mount_root: root.clone(),
-            workspace_mount: root.join("workspace"),
-            exec_temp_dir: root.join("tmp"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
-            retained_port_blocks: Vec::new(),
-            mode: crate::sandbox::RunSandboxMode::ReadWrite,
-            grants: crate::sandbox::SandboxGrants::default(),
-            allowed_unix_sockets: Vec::new(),
-            additional_denies: Vec::new(),
-            shed_links: Vec::new(),
-            git_worktree_repository: None,
-            shared_tool_homes: Vec::new(),
-            home_reads: Vec::new(),
-        };
+    fn a_bootstrap_program_reaches_path_by_its_command_name() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let path = bootstrap_path_from(&sandbox, &[profile]).expect("bootstrap PATH");
-        let mut expected = vec![sandbox.workspace_mount.join(".cowshed/bin"), package];
-        expected.extend(developer_directory().map(|directory| directory.join("usr/bin")));
-        expected.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+        let root = scratch("bootstrap-programs");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(&mount).expect("mount");
+        let target = root.join("host/lib/node_modules/npm/bin/npm-cli.js");
+        std::fs::create_dir_all(target.parent().expect("package bin")).expect("package");
+        std::fs::write(&target, "#!/usr/bin/env node\n").expect("program");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.capabilities.contribution.bootstrap_programs =
+            vec![crate::capabilities::BootstrapProgram {
+                name: "npm",
+                target: target.clone(),
+            }];
+
+        let platform = || {
+            let mut tail: Vec<PathBuf> = developer_directory()
+                .map(|directory| directory.join("usr/bin"))
+                .into_iter()
+                .collect();
+            tail.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+            tail
+        };
+        for (mode, environment_root) in [
+            (RunSandboxMode::ReadWrite, mount.join(".cowshed")),
+            (RunSandboxMode::ReadOnly, sandbox.exec_temp_dir.clone()),
+        ] {
+            sandbox.mode = mode;
+            prepare_private_environment(&environment_root, &sandbox.capabilities.contribution)
+                .expect("prepare");
+            let link = environment_root.join("tools/bin/npm");
+            assert_eq!(std::fs::read_link(&link).expect("command link"), target);
+
+            let path = bootstrap_path(&sandbox).expect("bootstrap PATH");
+            let mut expected = vec![
+                environment_root.join("tools/bin"),
+                mount.join(".cowshed/bin"),
+            ];
+            expected.extend(platform());
+            assert_eq!(
+                std::env::split_paths(&path).collect::<Vec<_>>(),
+                expected,
+                "{mode:?}: the tools bin leads, then the workspace bin, then the platform"
+            );
+
+            prepare_private_environment(
+                &environment_root,
+                &crate::capabilities::CapabilityContribution::default(),
+            )
+            .expect("prepare without tools");
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "{mode:?}: a tool no longer detected leaves PATH"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A spawn re-detects the conventions its command sees: unchanged ones reuse the rendered
+    /// policy itself, a nested-only `.envrc` created after the policy activates for commands
+    /// under it, and deleting it removes the activation again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_policy_follows_the_conventions_a_command_sees() {
+        let root = scratch("policy-conventions");
+        let mount = root.join("workspace");
+        let nested = mount.join("packages/app");
+        std::fs::create_dir_all(&nested).expect("nested project");
+        let mut ceiling = sandbox_at(&mount);
+        ceiling
+            .configure_capabilities()
+            .expect("detect capabilities");
+        let policy = SandboxPolicy::render(ceiling).expect("render");
+
+        let unchanged = policy.for_cwd(&nested).expect("refresh");
+        assert!(
+            std::sync::Arc::ptr_eq(&policy.0, &unchanged.0),
+            "unchanged conventions reuse the policy"
+        );
+
+        std::fs::write(nested.join(".envrc"), "").expect("nested envrc");
+        let activated = policy.for_cwd(&nested).expect("refresh");
+        assert!(!std::sync::Arc::ptr_eq(&policy.0, &activated.0));
+        for mode in [
+            crate::api::dto::RunSandboxMode::ReadWrite,
+            crate::api::dto::RunSandboxMode::ReadOnly,
+        ] {
+            let (sandbox, _) = activated.child(mode);
+            assert_eq!(shell_directory(sandbox), Some(nested.clone()), "{mode:?}");
+        }
+
+        std::fs::remove_file(nested.join(".envrc")).expect("remove envrc");
+        let deactivated = activated.for_cwd(&nested).expect("refresh");
+        assert_eq!(shell_directory(deactivated.ceiling()), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The read-only child's contribution is its own mode's: private tool state lives in the
+    /// exec temp dir, never in the image a read-write job's daemon writes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_only_child_keeps_its_tool_state_in_the_exec_temp_dir() {
+        let root = scratch("policy-read-only");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(&mount).expect("mount");
+        std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
+        let mut ceiling = sandbox_at(&mount);
+        ceiling
+            .configure_capabilities()
+            .expect("detect capabilities");
+        let policy = SandboxPolicy::render(ceiling).expect("render");
+        let state = |mode| {
+            let (sandbox, _) = policy.child(mode);
+            sandbox
+                .capabilities
+                .contribution
+                .env
+                .get("NX_WORKSPACE_DATA_DIRECTORY")
+                .cloned()
+        };
         assert_eq!(
-            std::env::split_paths(&path).collect::<Vec<_>>(),
-            expected,
-            "only {tool}'s package joins PATH, not the rest of its profile nor this process's PATH"
+            state(crate::api::dto::RunSandboxMode::ReadWrite),
+            Some(crate::capabilities::EnvAction::Own(
+                mount.join(".cowshed/cache/nx/workspace-data").into()
+            ))
+        );
+        let exec_temp = policy.ceiling().exec_temp_dir.clone();
+        assert_eq!(
+            state(crate::api::dto::RunSandboxMode::ReadOnly),
+            Some(crate::capabilities::EnvAction::Own(
+                exec_temp.join("cache/nx/workspace-data").into()
+            ))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5135,6 +5114,10 @@ mod lifecycle_commitment_tests {
             "cowshed-restored-supervisor-{}",
             Uuid::new_v4().simple()
         ));
+        // Detection compares resolved paths, and the temp dir resolves through `/var` →
+        // `/private/var`: the fixture's workspace is named by its canonical path.
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let telemetry = root.join("telemetry");
         let workspace_root = root.join("workspace");
         let unintroduced_root = root.join("unintroduced");
@@ -5373,45 +5356,83 @@ mod sandbox_environment_tests {
         );
     }
 
-    /// Nix keeps profile and channel state under `$XDG_STATE_HOME/nix` as it keeps its fetcher
-    /// cache under `$XDG_CACHE_HOME/nix`. Both private roots link into the caches volume, so
-    /// every workspace sees the Nix client state any one of them wrote; a host without the caches
-    /// volume keeps plain private roots and fails nothing.
+    /// A child granted writes inside a shared cache cannot create its parent, so the host
+    /// prepares every contributed cache source before any child runs, links each private target
+    /// to its source, and creates every contributed daemon directory in the private environment.
     #[test]
-    fn the_private_nix_client_roots_link_to_the_shared_ones() {
-        let root = scratch("private-environment");
+    fn contributed_caches_links_and_daemon_directories_exist_before_a_child_runs() {
+        let root = scratch("contributed-environment");
         let environment = root.join("environment");
         let caches = root.join("caches");
-        std::fs::create_dir_all(&caches).unwrap();
-        prepare_private_environment(&environment, &caches).unwrap();
-        for name in ["cache", "state"] {
-            assert_eq!(
-                std::fs::read_link(environment.join(name).join("nix")).ok(),
-                Some(caches.join("nix").join(name)),
-                "{name}/nix"
-            );
-            assert!(caches.join("nix").join(name).is_dir(), "{name}");
-        }
+        let contribution = crate::capabilities::CapabilityContribution {
+            cache_mounts: vec![
+                crate::capabilities::CacheMount {
+                    source: caches.join("go/mod"),
+                    private_target: None,
+                },
+                crate::capabilities::CacheMount {
+                    source: caches.join("nix/state"),
+                    private_target: Some(environment.join("state/nix")),
+                },
+            ],
+            daemon_isolation: crate::capabilities::DaemonIsolation {
+                directories: vec![environment.join("cache/nx/workspace-data")],
+                discard_at_mint: Vec::new(),
+            },
+            ..Default::default()
+        };
+        prepare_private_environment(&environment, &contribution).unwrap();
+        assert!(caches.join("go/mod").is_dir());
+        assert!(caches.join("nix/state").is_dir());
+        assert_eq!(
+            std::fs::read_link(environment.join("state/nix")).ok(),
+            Some(caches.join("nix/state"))
+        );
+        assert!(environment.join("cache/nx/workspace-data").is_dir());
 
-        let bare = root.join("bare");
-        prepare_private_environment(&bare, &root.join("no-caches-volume")).unwrap();
-        for name in ["home", "config", "cache", "data", "state", "run"] {
-            assert!(bare.join(name).is_dir(), "{name}");
-        }
-        assert!(std::fs::symlink_metadata(bare.join("state/nix")).is_err());
+        // A link or daemon directory outside the private environment is refused, never made.
+        let escaping = crate::capabilities::CapabilityContribution {
+            cache_mounts: vec![crate::capabilities::CacheMount {
+                source: caches.join("zig"),
+                private_target: Some(root.join("outside/zig")),
+            }],
+            ..Default::default()
+        };
+        let error = prepare_private_environment(&environment, &escaping)
+            .err()
+            .expect("an escaping cache link is refused");
+        assert_eq!(error.code, crate::error::ErrorCode::Integrity);
+        assert!(!root.join("outside").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A child granted writes inside a directly configured cache cannot create its parent,
-    /// so the host prepares Go and ttsc's directories before any child runs.
+    /// A plain repository's private environment is the generic roots and nothing else: no tool
+    /// cache is created on the caches volume and no tool link appears in the private roots.
     #[test]
-    fn directly_configured_caches_exist_before_a_child_runs() {
-        let root = scratch("direct-caches");
-        let caches = root.join("caches");
-        std::fs::create_dir_all(&caches).unwrap();
-        prepare_private_environment(&root.join("environment"), &caches).unwrap();
-        for directory in ["go/mod", "go/build", "ttsc"] {
-            assert!(caches.join(directory).is_dir(), "{directory}");
+    fn a_plain_contribution_prepares_only_the_generic_roots() {
+        let root = scratch("plain-environment");
+        let environment = root.join("environment");
+        prepare_private_environment(
+            &environment,
+            &crate::capabilities::CapabilityContribution::default(),
+        )
+        .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&environment)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["cache", "config", "data", "home", "run", "state", "tools"]
+        );
+        for name in ["cache", "state", "tools/bin"] {
+            let entries: Vec<String> = std::fs::read_dir(environment.join(name))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|entry| entry != ".links")
+                .collect();
+            assert!(entries.is_empty(), "{name} holds tool state: {entries:?}");
         }
         std::fs::remove_dir_all(root).unwrap();
     }

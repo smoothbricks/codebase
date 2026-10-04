@@ -633,7 +633,6 @@ impl KillWindow {
             &self.main,
             &self.image,
             &self.staging,
-            &self.checkout,
             &PathBuf::from(format!("{}.ca.key", self.image.display())),
         )?;
         host.write_marker(&self.staging, &self.main, None, &self.identity)?;

@@ -44,18 +44,20 @@ const HOST_STATE: &str = ".nx";
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let state = context.environment_root.join("cache/nx");
-    let mut contribution = CapabilityContribution::default();
-    contribution.env = [
-        ("NX_SOCKET_DIR", own(context.runtime_dir.join("nx"))),
-        (
-            "NX_WORKSPACE_DATA_DIRECTORY",
-            own(state.join("workspace-data")),
-        ),
-        ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
-        ("NX_WORKSPACE_ROOT_PATH", own(context.project_root.into())),
-        ("NX_DAEMON", EnvAction::Unset),
-    ]
-    .into();
+    let mut contribution = CapabilityContribution {
+        env: [
+            ("NX_SOCKET_DIR", own(context.runtime_dir.join("nx"))),
+            (
+                "NX_WORKSPACE_DATA_DIRECTORY",
+                own(state.join("workspace-data")),
+            ),
+            ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
+            ("NX_WORKSPACE_ROOT_PATH", own(context.project_root.into())),
+            ("NX_DAEMON", EnvAction::Unset),
+        ]
+        .into(),
+        ..CapabilityContribution::default()
+    };
     contribution.daemon_isolation.directories.extend([
         state.join("workspace-data"),
         state.join("cache"),
@@ -66,7 +68,10 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     discard.push(project.join(HOST_STATE).join(DAEMON_RECORD));
     // The sandbox's record travels in the image only when the private environment does: a
     // read-only job's lives in its exec temp dir and is never cloned.
-    if let Ok(private) = context.environment_root.strip_prefix(context.workspace_root) {
+    if let Ok(private) = context
+        .environment_root
+        .strip_prefix(context.workspace_root)
+    {
         discard.push(private.join("cache/nx").join(DAEMON_RECORD));
     }
     Ok(contribution)
@@ -121,7 +126,10 @@ mod tests {
                     ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
                     ("NX_DAEMON", EnvAction::Unset),
                     ("NX_SOCKET_DIR", own(fixture.runtime.join("nx"))),
-                    ("NX_WORKSPACE_DATA_DIRECTORY", own(state.join("workspace-data"))),
+                    (
+                        "NX_WORKSPACE_DATA_DIRECTORY",
+                        own(state.join("workspace-data"))
+                    ),
                     ("NX_WORKSPACE_ROOT_PATH", own(fixture.root.clone())),
                 ]),
                 daemon_isolation: DaemonIsolation {

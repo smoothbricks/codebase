@@ -259,7 +259,7 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
         [PathBuf::from(".runtime"), PathBuf::from("a/b")]
     );
     assert!(
-        parse_cowshed_config("[devenv]\ndir = \"x\"\n")
+        parse_cowshed_config("[land]\nwarm = [\"x\"]\n")
             .unwrap()
             .sandbox_deny()
             .is_empty()

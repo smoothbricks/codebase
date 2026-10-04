@@ -287,7 +287,6 @@ fn rekey_refuses_a_workspace_that_is_already_keyed() {
     mint_workspace_credentials(
         &workspace,
         &fixture.mount_point,
-        &fixture.mount_point,
         Platform::Macos,
         Some(block),
         &companion,

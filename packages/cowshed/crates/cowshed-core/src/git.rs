@@ -2456,8 +2456,7 @@ fn sandboxed_git_command_with_paths(
         allowed_unix_sockets: Vec::new(),
         additional_denies: Vec::new(),
         git_worktree_repository: None,
-        shared_tool_homes: Vec::new(),
-        home_reads: Vec::new(),
+        capabilities: Default::default(),
     };
     let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).map_err(|error| {
         CowshedError::integrity(

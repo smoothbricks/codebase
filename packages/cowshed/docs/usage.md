@@ -114,8 +114,8 @@ source_env_if_exists .cowshed/env
 This is direnv's standard optional-file loader. It is not needed for `cowshed exec`: the supervisor supplies workspace
 values directly, whether or not the repository uses direnv. Existing repository hooks are cloned unchanged.
 
-The sourced file exports workspace-local `GOENV` and `COWSHED_*` values and is rewritten whenever cowshed rotates the
-workspace token. After a reboot or manual eject, reattach explicitly:
+The sourced file exports workspace-local `COWSHED_*` values and is rewritten whenever cowshed rotates the workspace
+token. After a reboot or manual eject, reattach explicitly:
 
 ```sh
 cowshed attach

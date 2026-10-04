@@ -66,7 +66,12 @@ Each detector returns data through one `CapabilityContribution`:
   core adds both bins and platform system directories; it does not borrow a workspace `.devenv/profile`, an entire login
   PATH or an entire Nix profile. A detector may resolve an individual bootstrap tool through its installation
   conventions. Store-resolved executables receive immutable Nix-store reads; that alone does not grant Nix caches or
-  daemon access.
+  daemon access. The same read-only store grant follows any program link in the mode's `tools/bin` or the workspace's
+  `.cowshed/bin` that targets the store, with or without a Nix project; a host with no store gets none.
+- **HOME probes:** the sandboxed supervisor repeats detection beneath the HOME-wide read deny (04_sandbox.md), so every
+  HOME path a detector inspects is also one it grants read: each bootstrap candidate beneath HOME as its literal program
+  path, rustup's settings file, the compiler-cache GC root. The sandboxed search then sees what the host's saw. These
+  grants are never HOME itself and never a directory listing; their ancestors beneath HOME are metadata-only.
 - **Shell activation:** an optional contained direnv directory. Absence leaves the ordinary sandbox environment and
   supports argv and script jobs.
 

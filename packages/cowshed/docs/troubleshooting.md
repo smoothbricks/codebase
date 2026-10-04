@@ -110,10 +110,9 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   credential problem, not a slow network. 403 means endpoint and credential authenticated but policy denied the
   destination; use the gateway's grant hint. Port 7644 by itself is not workspace identity: the private netns plus
   mounted socket inode selects the workspace.
-- **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug — it means a go invocation ran without
-  the workspace's `GOENV` wiring (an unwrapped spawn, or an editor without direnv integration). Run it through
-  `cowshed exec`/a direnv shell, or fix the editor's direnv plugin; never grant `~/go`. `cowshed doctor` prints the same
-  hint, and checks the host for a stray `~/go` that predates adoption (safe to delete — it is only cache).
+- **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug. In a sandbox Go's caches and `GOPATH`
+  never resolve to the host's `~/go` (a Go project names the shared caches; `GOPATH` defaults under the private `HOME`),
+  so something passed the host path explicitly. Find that setting; never grant `~/go`.
 - **`nix` fails on `/etc/nix/<file>` with "Operation not permitted"**: the sandbox answered a config stat with EPERM
   instead of ENOENT (Determinate Nix probes an optional `sentry-endpoint`). Workspace profiles grant read-only metadata
   on `/etc/nix` — both spellings, since `/etc` resolves to `/private/etc` — and on nothing else in `/etc`, so a cowshed

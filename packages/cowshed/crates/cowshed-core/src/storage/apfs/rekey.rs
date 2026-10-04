@@ -304,7 +304,6 @@ pub fn rekey_workspace(
     crate::workspace_credentials::mint_workspace_credentials(
         &lifecycle,
         mount_point,
-        mount_point,
         republished.platform,
         republished.grants.port_block,
         &companion,

@@ -213,6 +213,133 @@ impl AnchoredDirectory {
         }
     }
 
+    /// Make this directory's controller-owned links exactly `links`: each `(name, target)` is a
+    /// symlink to `target` — whatever stood at `name` before, a regular file or a link elsewhere,
+    /// is replaced, never followed — and each name an earlier call published but `links` omits is
+    /// removed. The owned names are recorded in the private file `manifest`, so nothing else in
+    /// the directory is enumerated or touched.
+    ///
+    /// The manifest never under-records: it is widened to the union of the old and new names
+    /// before any link changes and narrowed to the new names only after every link is in place,
+    /// so a crash at any point leaves a manifest the next call can reconcile from. A manifest
+    /// naming anything but a plain leaf, or an entry that is a directory, is an error; nothing
+    /// is guessed.
+    pub(crate) fn reconcile_links<N: AsRef<CStr>>(
+        &self,
+        manifest: &CStr,
+        links: &[(N, &Path)],
+    ) -> io::Result<()> {
+        validate_directory_leaf(manifest)?;
+        let mut current: Vec<&[u8]> = Vec::with_capacity(links.len());
+        for (name, _) in links {
+            let name = name.as_ref();
+            validate_directory_leaf(name)?;
+            let name = name.to_bytes();
+            if name == manifest.to_bytes() || current.contains(&name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "link {} is the manifest or named twice",
+                        String::from_utf8_lossy(name)
+                    ),
+                ));
+            }
+            current.push(name);
+        }
+        let recorded = self.read_regular_file(manifest)?.unwrap_or_default();
+        let mut prior: Vec<CString> = Vec::new();
+        for entry in recorded
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let name = CString::new(entry).expect("split entries contain no NUL");
+            validate_directory_leaf(&name).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "link manifest names {:?}, which is not one directory entry",
+                        String::from_utf8_lossy(entry)
+                    ),
+                )
+            })?;
+            prior.push(name);
+        }
+        let encode = |names: &mut Vec<&[u8]>| {
+            names.sort_unstable();
+            names.dedup();
+            names
+                .iter()
+                .flat_map(|name| name.iter().copied().chain([0]))
+                .collect::<Vec<u8>>()
+        };
+        let mut union: Vec<&[u8]> = prior.iter().map(|name| name.to_bytes()).collect();
+        union.extend(current.iter().copied());
+        self.publish_file(manifest, &encode(&mut union))?;
+        for name in &prior {
+            if !current.contains(&name.to_bytes()) {
+                self.unlink_entry(name)?;
+            }
+        }
+        for (name, target) in links {
+            self.exact_symlink(name.as_ref(), target)?;
+        }
+        self.publish_file(manifest, &encode(&mut current))?;
+        self.0.sync_all()
+    }
+
+    /// `name` as a symlink to exactly `target`: a matching link is kept, anything else but a
+    /// directory is unlinked (never followed) and the link created anew.
+    fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
+        let mut buffer = [0u8; 4096];
+        // SAFETY: the fd/name are live and the buffer is writable for its full length.
+        let count = unsafe {
+            libc::readlinkat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count >= 0 {
+            let count = usize::try_from(count).expect("non-negative readlink length");
+            if count < buffer.len() && buffer[..count] == *target.as_bytes() {
+                return Ok(());
+            }
+            self.unlink_entry(name)?;
+        } else {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENOENT) => {}
+                // Not a link: a regular file is replaced; a directory refuses the unlink.
+                Some(libc::EINVAL) => self.unlink_entry(name)?,
+                _ => return Err(error),
+            }
+        }
+        // SAFETY: the target and leaf are NUL-terminated; the held parent anchors creation.
+        if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), name.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Unlink the non-directory entry `name`; an absent entry is already gone.
+    fn unlink_entry(&self, name: &CStr) -> io::Result<()> {
+        // SAFETY: unlinkat removes this directory's own entry, not a link target, and refuses a
+        // directory without AT_REMOVEDIR.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     /// The bytes of `name` when it is a regular file; `None` when it is absent or anything else
     /// (a link, a directory, a FIFO), which publication then replaces.
     fn read_regular_file(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
@@ -629,5 +756,116 @@ mod tests {
             "failed publish removes its temp: {residue:?}"
         );
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    fn reconcile_fixture(label: &str) -> (PathBuf, PathBuf, AnchoredDirectory) {
+        let temporary = std::env::temp_dir().join(format!("fsio-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let bin = root.join("bin");
+        let directory = AnchoredDirectory::create(&bin).unwrap();
+        (root, bin, directory)
+    }
+
+    /// The links are exactly the current set: a name an earlier call published and this one
+    /// omits is removed, and nothing the manifest never named is touched.
+    #[test]
+    fn reconciled_links_are_exactly_the_current_set() {
+        let (root, bin, directory) = reconcile_fixture("reconcile");
+        let (npm, node) = (root.join("npm-cli.js"), root.join("node"));
+        fs::write(bin.join("unowned"), b"someone else's").unwrap();
+        directory
+            .reconcile_links(c".links", &[(c"npm", &npm), (c"node", &node)])
+            .unwrap();
+        assert_eq!(fs::read_link(bin.join("npm")).unwrap(), npm);
+        assert_eq!(fs::read_link(bin.join("node")).unwrap(), node);
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"node\0npm\0");
+
+        directory
+            .reconcile_links(c".links", &[(c"node", &node)])
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(bin.join("npm")).is_err(),
+            "a stale link stays on PATH"
+        );
+        assert_eq!(fs::read_link(bin.join("node")).unwrap(), node);
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"node\0");
+        assert_eq!(fs::read(bin.join("unowned")).unwrap(), b"someone else's");
+
+        directory.reconcile_links::<&CStr>(c".links", &[]).unwrap();
+        assert!(fs::symlink_metadata(bin.join("node")).is_err());
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whatever a child planted at an owned name — a regular file, a link outside — is replaced
+    /// by the exact link and never followed; a directory there is refused, not removed.
+    #[test]
+    fn planted_entries_are_replaced_without_redirecting_outside() {
+        let (root, bin, directory) = reconcile_fixture("planted");
+        let target = root.join("program");
+        let outside = root.join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::write(bin.join("npm"), b"planted file").unwrap();
+        std::os::unix::fs::symlink(&outside, bin.join("node")).unwrap();
+        directory
+            .reconcile_links(c".links", &[(c"npm", &target), (c"node", &target)])
+            .unwrap();
+        for name in ["npm", "node"] {
+            assert_eq!(fs::read_link(bin.join(name)).unwrap(), target, "{name}");
+        }
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+
+        // A stale owned name that became a link outside: the link goes, its target stays.
+        fs::remove_file(bin.join("npm")).unwrap();
+        std::os::unix::fs::symlink(&outside, bin.join("npm")).unwrap();
+        directory
+            .reconcile_links(c".links", &[(c"node", &target)])
+            .unwrap();
+        assert!(fs::symlink_metadata(bin.join("npm")).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+
+        fs::create_dir(bin.join("bun")).unwrap();
+        assert!(
+            directory
+                .reconcile_links(c".links", &[(c"bun", &target)])
+                .is_err()
+        );
+        assert!(bin.join("bun").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A manifest naming anything but one directory entry is refused before any link changes,
+    /// as are duplicate names and a link named like the manifest.
+    #[test]
+    fn an_invalid_manifest_or_link_set_is_refused_before_any_change() {
+        let (root, bin, directory) = reconcile_fixture("invalid");
+        let target = root.join("program");
+        let outside = root.join("victim");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::write(bin.join(".links"), b"../victim\0").unwrap();
+        let error = directory
+            .reconcile_links(c".links", &[(c"npm", &target)])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        assert!(fs::symlink_metadata(bin.join("npm")).is_err());
+
+        fs::remove_file(bin.join(".links")).unwrap();
+        for links in [
+            vec![(c"npm", target.as_path()), (c"npm", target.as_path())],
+            vec![(c".links", target.as_path())],
+            vec![(c"../npm", target.as_path())],
+        ] {
+            assert_eq!(
+                directory
+                    .reconcile_links(c".links", &links)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(fs::symlink_metadata(bin.join("npm")).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -142,10 +142,11 @@ under another incarnation is refused with `Conflict` naming its pid. A superviso
 a report pipe the manager hands it (named by `COWSHED_SUPERVISOR_REPORT_FD`, close-on-exec in the supervisor so no job
 inherits it), and the ensure — so the command that needed the workspace — fails with that error and its code, not with a
 pointer to the daemon's log. The supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository
-hooks; it reads only the watch list an activation reports. It compiles the deterministic inner child profile first, then
-starts every exec host, one-shot command, and descendant beneath that restriction; each command runs in its job's own
-process group. The child profile denies writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never
-adds authority (04_sandbox.md).
+hooks; it reads only the watch list an activation reports. Before a spawn it refreshes the convention-gated capability
+snapshot (15_capabilities.md) and compiles the matching child profile if that snapshot changed. Every exec host,
+one-shot command and descendant starts beneath that restriction, in its job's own process group. The child profile
+denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the private
+exec-temp roots.
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.

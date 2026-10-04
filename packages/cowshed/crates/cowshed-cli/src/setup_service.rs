@@ -17,13 +17,6 @@
 //! prompt and `--force` is the answer.
 
 use crate::args::SetupArgs;
-use crate::gateway_service::{
-    ServiceBinaryRefresh, canonical_home, gateway_launch_agent, output_error,
-    remove_host_stable_executable, remove_launch_agent,
-};
-use crate::launchd::RemovalOutcome;
-use crate::output::Output;
-use crate::probe::{GitIdentityGap, probe_project};
 use crate::capabilities::sccache::client_config::{
     self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore,
 };
@@ -31,11 +24,18 @@ use crate::capabilities::sccache::nix::{self, BuildOutcome, BuildRefusal};
 use crate::capabilities::sccache::service::{
     derived_capacity, remove_stale_socket, sccache_launch_agent, start_service,
 };
+use crate::gateway_service::{
+    ServiceBinaryRefresh, canonical_home, gateway_launch_agent, output_error,
+    remove_host_stable_executable, remove_launch_agent,
+};
+use crate::launchd::RemovalOutcome;
+use crate::output::Output;
+use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
+use cowshed_core::capabilities::sccache::cache_directory;
 use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
-use cowshed_core::capabilities::sccache::cache_directory;
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,

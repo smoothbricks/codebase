@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, DetectionScope,
-    Detector, EnvAction,
-    GrantAccess, GrantScope,
+    Detector, EnvAction, GrantAccess, GrantScope,
 };
 use crate::fork_lock::Fenced;
 use crate::{CowshedError, Result};
@@ -86,14 +85,19 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     }
     let rustup_home = context.home.join(RUSTUP_HOME);
     let proxies = context.home.join(RUSTUP_PROXIES);
-    if is_file(&rustup_home.join(RUSTUP_SETTINGS))? {
+    let settings = rustup_home.join(RUSTUP_SETTINGS);
+    // The sandboxed supervisor repeats this probe beneath the HOME-wide read deny: the settings
+    // file is granted whether or not it exists, so its absence reads as absence there too.
+    contribution
+        .grants
+        .push(read(settings.clone(), GrantScope::Literal));
+    if is_file(&settings)? {
         contribution.env.insert(
             RUSTUP_HOME_ENV,
             EnvAction::Own(rustup_home.clone().into_os_string()),
         );
         contribution.grants.extend([
             read(rustup_home.clone(), GrantScope::Literal),
-            read(rustup_home.join(RUSTUP_SETTINGS), GrantScope::Literal),
             read(rustup_home.join(RUSTUP_TOOLCHAINS), GrantScope::Subtree),
             read(proxies.clone(), GrantScope::Subtree),
         ]);
@@ -101,7 +105,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     let mut directories = vec![proxies];
     directories.extend(super::host_program_directories(context));
     for program in PROGRAMS {
-        super::add_bootstrap(&mut contribution, program, &directories)?;
+        super::add_bootstrap(&mut contribution, context, program, &directories)?;
     }
     Ok(contribution)
 }
@@ -178,14 +182,36 @@ mod tests {
             .collect()
     }
 
+    /// What the sandboxed supervisor's repeat of the search probes beneath HOME: rustup's
+    /// settings file and each program's literal candidate path, nothing listable.
+    fn probes(home: &Path) -> Vec<CapabilityGrant> {
+        let mut probes = vec![read(
+            home.join(RUSTUP_HOME).join(RUSTUP_SETTINGS),
+            GrantScope::Literal,
+        )];
+        for program in PROGRAMS {
+            for directory in [
+                RUSTUP_PROXIES,
+                ".nix-profile/bin",
+                ".local/state/nix/profile/bin",
+            ] {
+                probes.push(read(
+                    home.join(directory).join(program),
+                    GrantScope::Literal,
+                ));
+            }
+        }
+        probes
+    }
+
     #[test]
     fn cargo_toml_switches_cargo_on_and_off() {
         assert_switch(&DETECTOR, &["Cargo.toml"]);
     }
 
     /// Without relocated caches cargo keeps its private default, so `CARGO_HOME` is the
-    /// sandbox's to leave unset and no part of the host's `~/.cargo` is granted. A plain host
-    /// (no rustup) adds no toolchain authority either.
+    /// sandbox's to leave unset and no part of the host's `~/.cargo` is granted beyond the exact
+    /// program paths its search probes. A plain host (no rustup) adds no toolchain authority.
     #[test]
     fn an_unshared_cargo_home_and_no_rustup_grant_nothing_on_the_host() {
         let fixture = Fixture::new();
@@ -201,10 +227,9 @@ mod tests {
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
             ])
         );
-        assert!(
-            home_grants(&contribution, &fixture.home).is_empty(),
-            "{:?}",
-            contribution.grants
+        assert_eq!(
+            home_grants(&contribution, &fixture.home),
+            probes(&fixture.home)
         );
         // The caches volume exists, so the shared directories are prepared and granted for
         // when setup relocates the host links; nothing names the host path.
@@ -264,6 +289,7 @@ mod tests {
             scope: GrantScope::Literal,
             access: GrantAccess::ReadWrite,
         }));
+        expected.extend(probes(&fixture.home));
         assert_eq!(home_grants(&contribution, &fixture.home), expected);
     }
 
@@ -280,8 +306,11 @@ mod tests {
         let proxies = fixture.home.join(".cargo/bin");
         fs::create_dir_all(rustup.join("toolchains/stable-aarch64-apple-darwin/bin"))
             .expect("toolchain");
-        fs::write(rustup.join("settings.toml"), "default_toolchain = \"stable\"\n")
-            .expect("rustup settings");
+        fs::write(
+            rustup.join("settings.toml"),
+            "default_toolchain = \"stable\"\n",
+        )
+        .expect("rustup settings");
         fs::create_dir_all(&proxies).expect("proxy directory");
         let cargo = proxies.join("cargo");
         fs::write(&cargo, "").expect("cargo proxy");
@@ -302,7 +331,10 @@ mod tests {
             read(rustup.join("toolchains"), GrantScope::Subtree),
             read(proxies.clone(), GrantScope::Subtree),
         ] {
-            assert!(grants.contains(&expected), "{expected:?} missing from {grants:?}");
+            assert!(
+                grants.contains(&expected),
+                "{expected:?} missing from {grants:?}"
+            );
         }
         assert!(grants.iter().all(|grant| grant.access == GrantAccess::Read));
         assert!(

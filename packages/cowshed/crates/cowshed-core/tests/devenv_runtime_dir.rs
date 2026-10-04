@@ -76,8 +76,11 @@ fn scratch(label: &str) -> PathBuf {
     std::fs::canonicalize(&alias).expect("canonical scratch root")
 }
 
+/// The host HOME is never under the mount root on a host, and a detector's HOME probes are
+/// refused under a hard deny, so the fixture's mount root is a directory of its own beside it.
 fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
-    let mount = root.join("workspace");
+    let mount_root = root.join("mounts");
+    let mount = mount_root.join("workspace");
     let private = mount.join(".cowshed");
     std::fs::create_dir_all(private.join("bin")).expect("private bin");
     std::fs::write(
@@ -91,7 +94,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
     std::fs::create_dir_all(&exec_temp_dir).expect("exec temp dir");
     SandboxConfig {
         home,
-        mount_root: root.to_path_buf(),
+        mount_root,
         workspace_mount: mount,
         exec_temp_dir,
         port_block: PortBlock::new(port_base, 16).expect("port block"),
@@ -102,8 +105,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         additional_denies: Vec::new(),
         shed_links: Vec::new(),
         git_worktree_repository: None,
-        shared_tool_homes: Vec::new(),
-        home_reads: Vec::new(),
+        capabilities: Default::default(),
     }
 }
 
@@ -245,6 +247,11 @@ async fn host_controller_nx_runtime_directory_supports_real_unix_socket_roundtri
         let root = scratch("nx-socket");
         let mut sandbox = workspace(&root, 41_056);
         sandbox.mode = mode;
+        // Nx's socket namespace is the Nx capability's: the fixture is an Nx project.
+        std::fs::write(sandbox.workspace_mount.join("nx.json"), "{}").expect("nx.json");
+        sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
         install_real_tool(&sandbox, "node");
         let script = r#"
 const net = require('node:net');
@@ -440,38 +447,48 @@ async fn host_controller_private_environment_symlinks_cannot_redirect_host_prepa
     }
 }
 
-/// Every child gets a private `XDG_STATE_HOME` beside its other XDG roots, and Nix's state under
-/// it is the shared directory on the caches volume, as its cache under `XDG_CACHE_HOME` is.
+/// Every child gets a private `XDG_STATE_HOME` beside its other XDG roots. Nix's state under it
+/// is the shared directory on the caches volume only for a Nix project, as its cache under
+/// `XDG_CACHE_HOME` is; a project without the Nix convention gets no link there.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_children_get_a_private_state_home_sharing_nix_state() {
-    let root = scratch("state-home");
-    let sandbox = workspace(&root, 41_088);
-    let mount = sandbox.workspace_mount.clone();
-    let (exit, stdout, stderr) = run_in_sandbox(
-        &sandbox,
-        &mount,
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf '%s\\n' \"$XDG_STATE_HOME\" && if [ -L \"$XDG_STATE_HOME/nix\" ]; then /usr/bin/readlink \"$XDG_STATE_HOME/nix\"; fi"
-                .into(),
-        ],
-    )
-    .await;
-    assert_eq!(
-        exit,
-        ExitStatus::Exited { code: 0 },
-        "{}",
-        String::from_utf8_lossy(&stderr)
-    );
     let caches = Path::new(cowshed_core::storage::bootstrap::CACHES_ROOT);
-    let mut expected = format!("{}\n", mount.join(".cowshed/state").display());
-    if caches.is_dir() {
-        expected.push_str(&format!("{}\n", caches.join("nix/state").display()));
+    for nix_project in [false, true] {
+        let root = scratch("state-home");
+        let sandbox = workspace(&root, 41_088);
+        let mount = sandbox.workspace_mount.clone();
+        if nix_project {
+            std::fs::write(mount.join("flake.nix"), "{ outputs = _: { }; }\n").expect("flake");
+        }
+        let (exit, stdout, stderr) = run_in_sandbox(
+            &sandbox,
+            &mount,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s\\n' \"$XDG_STATE_HOME\" && if [ -L \"$XDG_STATE_HOME/nix\" ]; then /usr/bin/readlink \"$XDG_STATE_HOME/nix\"; fi"
+                    .into(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            exit,
+            ExitStatus::Exited { code: 0 },
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let mut expected = format!("{}\n", mount.join(".cowshed/state").display());
+        if nix_project && caches.is_dir() {
+            expected.push_str(&format!("{}\n", caches.join("nix/state").display()));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "nix project: {nix_project}"
+        );
+        std::fs::remove_dir_all(root).expect("remove test workspace");
     }
-    assert_eq!(String::from_utf8_lossy(&stdout), expected);
-    std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
 #[tokio::test]
@@ -1316,14 +1333,24 @@ async fn host_controller_native_file_watching_observes_allowed_updates_without_p
     .canonicalize()
     .expect("Nx test dependencies");
     sandbox.grants.read.push(modules.clone());
-    // Bun may link this declared platform dependency into its host cache.
-    // Grant its resolved package, not the whole host cache or user home.
+    // Bun may link the Nx package and its declared platform dependency into its host cache,
+    // which only a Bun project's sandbox reads. Grant each resolved package, not the whole host
+    // cache or user home: Nx's with the `node_modules` beside it, whose links name its
+    // dependencies, and the native binding's.
+    let nx = modules
+        .join("nx")
+        .canonicalize()
+        .expect("canonical Nx package");
+    sandbox
+        .grants
+        .read
+        .push(nx.parent().expect("Nx's node_modules").to_path_buf());
     let resolved = std::process::Command::new("node")
         .args([
             "-p",
             "require.resolve(`@nx/nx-${process.platform}-${process.arch}`, { paths: [process.argv[1]] })",
         ])
-        .arg(modules.join("nx").canonicalize().expect("canonical Nx package")).output_locked()
+        .arg(&nx).output_locked()
         .expect("resolve the native watcher dependency");
     assert!(
         resolved.status.success(),
@@ -1574,8 +1601,9 @@ async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_all
 
 /// The HOME read deny leaves a real toolchain working, against the host's real HOME: shell
 /// activation loads the workspace's own `.envrc-local`, cargo builds and runs a crate (through
-/// the host's shared cargo home and sccache when it has them), and bun runs a module graph. A
-/// tool that needed anything under HOME beyond the allowlist would fail here.
+/// the host's shared cargo home and sccache when it has them), and bun runs a module graph. The
+/// workspace is a direnv and cargo project, so its HOME reads are exactly what those detectors
+/// contribute; a tool that needed anything under HOME beyond them would fail here.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
@@ -1596,7 +1624,7 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
     let main = root.join("main");
     std::fs::create_dir_all(&main).expect("main checkout");
     let mount_root = root.join("mounts");
-    let sandbox = production_workspace(
+    let mut sandbox = production_workspace(
         &root,
         &home,
         &mount_root,
@@ -1618,14 +1646,14 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
         "export COWSHED_LOCAL_OVERRIDE=workspace\n",
     )
     .expect("workspace envrc-local");
-    std::fs::create_dir_all(mount.join("probe/src")).expect("probe crate");
     std::fs::write(
-        mount.join("probe/Cargo.toml"),
+        mount.join("Cargo.toml"),
         "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
     )
     .expect("probe manifest");
+    std::fs::create_dir_all(mount.join("src")).expect("probe crate");
     std::fs::write(
-        mount.join("probe/src/main.rs"),
+        mount.join("src/main.rs"),
         "fn main() { println!(\"cargo-built\"); }\n",
     )
     .expect("probe source");
@@ -1639,6 +1667,10 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
         "import { greeting } from './lib.ts';\nconsole.log(greeting);\n",
     )
     .expect("bun entry");
+    sandbox
+        .configure_capabilities()
+        .expect("detect the direnv and cargo capabilities");
+    let mount = &sandbox.workspace_mount;
     // What the supervisor resolves through HOME before any shell exists — bootstrap tools
     // through the user's Nix profile links, `RUSTC_WRAPPER` through the sccache GC root — must
     // resolve under the same deny, to what the unsandboxed host resolves. A host without one
@@ -1646,7 +1678,7 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
     let resolved: Vec<(PathBuf, PathBuf)> = [
         home.join(".nix-profile"),
         home.join(".local/state/nix/profile"),
-        cowshed_core::sandbox::sccache_gc_root(&home),
+        cowshed_core::capabilities::sccache::gc_root(&home),
     ]
     .into_iter()
     .filter_map(|link| {
@@ -1663,7 +1695,7 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
             "-c".into(),
             r#"set -e; PATH="$1:$2:$PATH"; export PATH; shift 2
 printf '%s\n' "$COWSHED_LOCAL_OVERRIDE"
-cd probe && cargo build --offline --quiet && ./target/debug/probe && cd ..
+cargo build --offline --quiet && ./target/debug/probe
 bun run main.ts
 for link in "$@"; do /bin/realpath "$link"; done"#
                 .into(),

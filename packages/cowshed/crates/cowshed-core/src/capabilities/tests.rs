@@ -13,26 +13,61 @@ fn a_plain_repository_has_no_tool_authority() {
 #[test]
 fn an_override_cannot_enable_an_absent_convention() {
     let fixture = Fixture::new();
-    let overrides = BTreeMap::from([(CapabilityId::Nx, CapabilityOverride {
-        disabled: false, directory: Some(PathBuf::from("frontend")),
-    })]);
-    assert!(detect(&fixture.context(), &overrides).unwrap().active.is_empty());
+    let overrides = BTreeMap::from([(
+        CapabilityId::Nx,
+        CapabilityOverride {
+            disabled: false,
+            directory: Some(PathBuf::from("frontend")),
+        },
+    )]);
+    assert!(
+        detect(&fixture.context(), &overrides)
+            .unwrap()
+            .active
+            .is_empty()
+    );
     fixture.files(&["nx.json"]);
-    assert!(detect(&fixture.context(), &overrides).unwrap().active.is_empty());
+    assert!(
+        detect(&fixture.context(), &overrides)
+            .unwrap()
+            .active
+            .is_empty()
+    );
     fixture.files(&["frontend/nx.json"]);
     let detected = detect(&fixture.context(), &overrides).unwrap();
     assert_eq!(detected.active, [CapabilityId::Nx]);
-    assert_eq!(detected.contribution.env.get("NX_WORKSPACE_ROOT_PATH"),
-        Some(&EnvAction::Own(fixture.root.join("frontend").into_os_string())));
-    assert!(detected.contribution.daemon_isolation.discard_at_mint.contains(&PathBuf::from("frontend/.nx/workspace-data/d")));
+    assert_eq!(
+        detected.contribution.env.get("NX_WORKSPACE_ROOT_PATH"),
+        Some(&EnvAction::Own(
+            fixture.root.join("frontend").into_os_string()
+        ))
+    );
+    assert!(
+        detected
+            .contribution
+            .daemon_isolation
+            .discard_at_mint
+            .contains(&PathBuf::from("frontend/.nx/workspace-data/d"))
+    );
 }
 
 #[test]
 fn a_disabled_capability_does_not_inspect_its_convention() {
     let fixture = Fixture::new();
     std::os::unix::fs::symlink("/etc/hosts", fixture.root.join("nx.json")).unwrap();
-    let overrides = BTreeMap::from([(CapabilityId::Nx, CapabilityOverride { disabled: true, directory: None })]);
-    assert!(detect(&fixture.context(), &overrides).unwrap().active.is_empty());
+    let overrides = BTreeMap::from([(
+        CapabilityId::Nx,
+        CapabilityOverride {
+            disabled: true,
+            directory: None,
+        },
+    )]);
+    assert!(
+        detect(&fixture.context(), &overrides)
+            .unwrap()
+            .active
+            .is_empty()
+    );
     assert!(detect(&fixture.context(), &BTreeMap::new()).is_err());
 }
 
@@ -43,12 +78,31 @@ fn conventions_and_override_directories_cannot_escape_the_workspace() {
     assert!(detect(&fixture.context(), &BTreeMap::new()).is_err());
     fs::remove_file(fixture.root.join("nx.json")).unwrap();
     std::os::unix::fs::symlink("/etc", fixture.root.join("outside")).unwrap();
-    let overrides = BTreeMap::from([(CapabilityId::Nx, CapabilityOverride { disabled: false, directory: Some(PathBuf::from("outside")) })]);
+    let overrides = BTreeMap::from([(
+        CapabilityId::Nx,
+        CapabilityOverride {
+            disabled: false,
+            directory: Some(PathBuf::from("outside")),
+        },
+    )]);
     assert!(detect(&fixture.context(), &overrides).is_err());
-    for invalid in ["", "/tmp", "../outside", "a/../b", "./a", "a//b", "a/./b", "a/", "a\0b"] {
+    for invalid in [
+        "",
+        "/tmp",
+        "../outside",
+        "a/../b",
+        "./a",
+        "a//b",
+        "a/./b",
+        "a/",
+        "a\0b",
+    ] {
         assert!(validate_override_directory(invalid).is_err(), "{invalid:?}");
     }
-    assert_eq!(validate_override_directory("tools/project").unwrap(), Path::new("tools/project"));
+    assert_eq!(
+        validate_override_directory("tools/project").unwrap(),
+        Path::new("tools/project")
+    );
 }
 
 #[test]

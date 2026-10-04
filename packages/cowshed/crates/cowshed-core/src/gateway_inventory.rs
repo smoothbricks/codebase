@@ -1897,7 +1897,6 @@ mod tests {
                 mint_workspace_credentials(
                     &workspace,
                     &mount,
-                    &mount,
                     Platform::Macos,
                     Some(port_block),
                     image.ca_private_key(),

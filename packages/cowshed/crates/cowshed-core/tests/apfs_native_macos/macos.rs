@@ -647,7 +647,6 @@ fn mint_credentials(
     mint_workspace_credentials(
         workspace,
         image_mount,
-        image_mount,
         Platform::Macos,
         Some(PortBlock::new(40_960, 16).expect("port block")),
         private_key_path,

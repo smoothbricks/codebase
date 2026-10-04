@@ -87,7 +87,6 @@ pub enum WorkspaceCredentialError {
 pub fn mint_workspace_credentials(
     workspace: &LifecycleWorkspace,
     mount_point: &Path,
-    workspace_mount: &Path,
     platform: Platform,
     port_block: Option<PortBlock>,
     private_key_path: &Path,
@@ -127,12 +126,8 @@ pub fn mint_workspace_credentials(
     publish_asset(private_key_path, private_key.as_bytes())?;
     publish_asset(&certificate_path, certificate_pem.as_bytes())?;
     publish_asset(&token_path, token.as_bytes())?;
-    publish_workspace_environment(mount_point, workspace_mount, platform, port_block)?;
-    publish_minted_client_wiring(
-        &credential_directory,
-        workspace_mount,
-        certificate_pem.as_bytes(),
-    )?;
+    publish_workspace_environment(mount_point, platform, port_block)?;
+    publish_minted_client_wiring(&credential_directory, certificate_pem.as_bytes())?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
     // A certificate minted a line above carries the current identity, so the tightest possible
@@ -151,7 +146,6 @@ pub fn mint_workspace_credentials(
 /// metadata — a workspace minted before a variable existed gains it on its next start.
 pub fn publish_workspace_environment(
     mount_point: &Path,
-    workspace_mount: &Path,
     platform: Platform,
     port_block: Option<PortBlock>,
 ) -> Result<(), WorkspaceCredentialError> {
@@ -163,7 +157,7 @@ pub fn publish_workspace_environment(
         TOKEN_ENCODED_BYTES as u64,
         "workspace token",
     )?;
-    write_workspace_environment(mount_point, workspace_mount, &token, platform, port_block)?;
+    write_workspace_environment(mount_point, &token, platform, port_block)?;
     Ok(())
 }
 
@@ -277,14 +271,12 @@ fn credential_subject(
     )
 }
 
-/// The Go and trust wiring a minted workspace starts with, in its private environment
-/// (`.cowshed/`), as the child will see it under the canonical mount. Every exec republishes it;
-/// minting it here means a new, adopted, or forked workspace never exists without it. It carries
-/// no endpoint and no token, so it needs neither the platform nor the port block, which
-/// `publish_workspace_environment` has already validated.
+/// The trust bundle a minted workspace starts with, in its private environment (`.cowshed/`).
+/// Every exec republishes it; minting it here means a new, adopted, or forked workspace never
+/// exists without it. It carries no endpoint and no token, so it needs neither the platform nor
+/// the port block, which `publish_workspace_environment` has already validated.
 fn publish_minted_client_wiring(
     credential_directory: &Path,
-    workspace_mount: &Path,
     workspace_ca: &[u8],
 ) -> Result<(), WorkspaceCredentialError> {
     let system_bundle = crate::workspace_clients::system_trust_bundle().map_err(|source| {
@@ -311,16 +303,9 @@ fn publish_minted_client_wiring(
         &crate::workspace_clients::ClientWiring {
             workspace_ca: Some(workspace_ca),
             system_bundle: &system_bundle,
-            environment: &workspace_mount.join(CREDENTIAL_DIRECTORY),
         },
     )
-    .map_err(|source| {
-        io_failure(
-            "publishing Go and trust wiring",
-            credential_directory,
-            source,
-        )
-    })
+    .map_err(|source| io_failure("publishing the trust bundle", credential_directory, source))
 }
 
 fn ensure_credential_directory(mount_point: &Path) -> Result<PathBuf, WorkspaceCredentialError> {
@@ -545,9 +530,7 @@ fn invalid(kind: &'static str, path: &Path) -> WorkspaceCredentialError {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use crate::workspace_environment::{
-        GO_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV,
-    };
+    use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
 
     use super::*;
     use crate::metadata::WorkspaceRole;
@@ -578,7 +561,6 @@ mod tests {
         mint_workspace_credentials(
             workspace,
             mount,
-            mount,
             Platform::Macos,
             Some(PortBlock::new(40_960, 16).expect("port block")),
             private_key,
@@ -599,7 +581,6 @@ mod tests {
         let root = test_root("environment-rotation");
         let image_mount = root.join("image");
         fs::create_dir(&image_mount).expect("image mount");
-        let canonical_mount = Path::new("/Users/test/.cowshed/mnt/acme/widget/raven");
         let key_path = root.join("raven.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
         let port_block = crate::metadata::PortBlock::new(40_960, 16).expect("port block");
@@ -607,7 +588,6 @@ mod tests {
         mint_workspace_credentials(
             &workspace,
             &image_mount,
-            canonical_mount,
             crate::metadata::Platform::Macos,
             Some(port_block),
             &key_path,
@@ -620,14 +600,13 @@ mod tests {
         assert_eq!(
             first_environment,
             format!(
-                "export {GO_ENV}=/Users/test/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env\nexport {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
+                "export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
             )
         );
 
         mint_workspace_credentials(
             &workspace,
             &image_mount,
-            canonical_mount,
             crate::metadata::Platform::Macos,
             Some(port_block),
             &key_path,
@@ -656,32 +635,26 @@ mod tests {
         let root = test_root("environment-refresh");
         let image_mount = root.join("image");
         fs::create_dir(&image_mount).expect("image mount");
-        let canonical_mount = Path::new("/Users/test/.cowshed/mnt/acme/widget/raven");
         let key_path = root.join("raven.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
         let port_block = crate::metadata::PortBlock::new(40_976, 16).expect("live block");
         mint_workspace_credentials(
             &workspace,
             &image_mount,
-            canonical_mount,
             crate::metadata::Platform::Macos,
             Some(port_block),
             &key_path,
         )
         .expect("mint");
         let token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
-        let go_env = format!("{}/.cowshed/cache/go/env", canonical_mount.display());
         fs::write(
             image_mount.join(".cowshed/env"),
-            format!(
-                "export {GO_ENV}={go_env}\nexport {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\n"
-            ),
+            format!("export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\n"),
         )
         .expect("environment from before the block size was exported");
 
         publish_workspace_environment(
             &image_mount,
-            canonical_mount,
             crate::metadata::Platform::Macos,
             Some(port_block),
         )
@@ -689,7 +662,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
             format!(
-                "export {GO_ENV}={go_env}\nexport {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
+                "export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
             )
         );
         assert_eq!(
@@ -709,7 +682,6 @@ mod tests {
         mint_workspace_credentials(
             &workspace("00112233445566778899aabbccddeeff"),
             &image_mount,
-            Path::new("/home/test/.cowshed/mnt/acme/widget/raven"),
             crate::metadata::Platform::Linux,
             None,
             &key_path,
@@ -717,7 +689,7 @@ mod tests {
         .expect("mint Linux credentials");
         let environment =
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
-        assert_eq!(environment.lines().count(), 2);
+        assert_eq!(environment.lines().count(), 1);
         assert!(!environment.contains("COWSHED_PORT_BASE"));
         assert!(!environment.contains("COWSHED_PORT_BLOCK_SIZE"));
 

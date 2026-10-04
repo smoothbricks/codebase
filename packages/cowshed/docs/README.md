@@ -109,16 +109,16 @@ rules, start with [usage.md](usage.md).
 
 ## Where things live
 
-| What                                                                               | Where                                                                                  |
-| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Images (main + workspaces + checkpoints)                                           | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)       |
-| Workspace mounts                                                                   | `<mount-root>/<owner>/<repo>/<workspace>`                                              |
-| Adopted main mount                                                                 | its original `<project-root>`                                                          |
-| Trusted project policy                                                             | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied) |
-| Repository binding                                                                 | `/private/cowshed/store/<owner>/<repo>/repository.json`                                |
-| Shared writable build caches (Cargo, Bun, uv, sccache, zig, Gradle, Go, ttsc, Nix) | exact tool subdirectories under `/private/cowshed/caches`                              |
-| Gateway registry and repository mirrors                                            | `/private/cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only)     |
-| Host cache directories (Cargo, Bun, uv, zig, Gradle, Nix)                          | symlinks into `/private/cowshed/caches` (`cowshed setup --imperative-host-setup`)      |
+| What                                                                                                      | Where                                                                                  |
+| --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Images (main + workspaces + checkpoints)                                                                  | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)       |
+| Workspace mounts                                                                                          | `<mount-root>/<owner>/<repo>/<workspace>`                                              |
+| Adopted main mount                                                                                        | its original `<project-root>`                                                          |
+| Trusted project policy                                                                                    | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied) |
+| Repository binding                                                                                        | `/private/cowshed/store/<owner>/<repo>/repository.json`                                |
+| Shared writable build caches of detected tools (Cargo, Bun, npm, pnpm, uv, sccache, zig, Gradle, Go, Nix) | exact tool subdirectories under `/private/cowshed/caches`                              |
+| Gateway registry and repository mirrors                                                                   | `/private/cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only)     |
+| Host cache directories (Cargo, Bun, npm, pnpm, uv, zig, Gradle, Nix)                                      | symlinks into `/private/cowshed/caches` (`cowshed setup --imperative-host-setup`)      |
 
 Before adoption, cowshed derives a stable lowercase `owner/repo` identity from configured remotes when the choice is
 unambiguous. The binding is recorded and revalidated whenever the project opens. Moving the checkout does not change the
@@ -139,10 +139,11 @@ shared tool caches below keep what cargo and Go download. On macOS each workspac
 `portBlock.base` as their proxy; on Linux, where no port block exists, proxy-aware clients — Bun, Cargo, Go and git —
 use `http://127.0.0.1:7644` inside their private netns. A trusted per-workspace connector forwards those bytes only to
 the mounted per-workspace Unix gateway socket, which remains the primary endpoint identity. Shared caches live under
-`/private/cowshed/caches`: Cargo uses distinct writable `cargo/{registry,git}` directories; Bun's global install cache
-is `bun/install/cache`; uv's is `uv`; Go uses `go/{mod,build}` and ttsc `ttsc`; Nix uses `nix/{cache,state}`; sccache,
-zig, and Gradle have named roots. `cowshed setup --imperative-host-setup` moves the host's own caches there and links
-them back, and from then on every sandbox uses the host's own paths — `CARGO_HOME=~/.cargo`,
+`/private/cowshed/caches`, and a sandbox writes only those of the tools its project uses (15_capabilities.md): Cargo
+uses distinct writable `cargo/{registry,git}` directories; Bun's global install cache is `bun/install/cache`; npm's is
+`npm` and pnpm's `pnpm/store`; uv's is `uv`; Go uses `go/{mod,build}`; Nix uses `nix/{cache,state}`; sccache, zig, and
+Gradle have named roots. `cowshed setup --imperative-host-setup` moves the host's own caches there and links them back,
+and from then on every sandbox uses the host's own paths — `CARGO_HOME=~/.cargo`,
 `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`, `UV_CACHE_DIR=~/.cache/uv`. One literal path is what makes sharing work:
 cargo fingerprints a dependency by the absolute path of its source under `$CARGO_HOME`, so a clone's copied `target/`
 stays fresh only against the same path, and Bun's isolated linker writes its cache path into every `node_modules/.bun`
@@ -185,7 +186,7 @@ workspace sits at a different path.
 | `dev` stays incremental                                                     | An edit rebuilds only what it touched in your own crates, whose incremental state stays in the workspace, while their dependencies are ordinary units the cache shares. Cargo turns incremental off for your own crates whenever `CI` is set, whatever the profile says, so a host shell that exports `CI` (agent harnesses do) builds different units than a sandbox child, which never inherits it: warm main through `cowshed exec main --`. |
 | No compile-time checkout path, tests included: `env!("CARGO_MANIFEST_DIR")` | Cargo does not fingerprint where the checkout lives, so a workspace runs the units it cloned from main as they are: a baked path makes a test read main's files, not the workspace's. Read `CARGO_MANIFEST_DIR` at run time (cargo and nextest set it for every test) and name compiled-in files relative to their source.                                                                                                                      |
 | Nothing machine-specific above the build directory in `.cargo/config.toml`  | An absolute `linker`, `rustflags` entry, `[env]` value, or `target-dir` outside the checkout pins the key to one machine.                                                                                                                                                                                                                                                                                                                       |
-| One toolchain, owned by devenv                                              | A different compiler is a different cache. `rust-toolchain.toml` does not do this here — nix's cargo ignores it, so it silently disagrees with the shell.                                                                                                                                                                                                                                                                                       |
+| One toolchain for every checkout                                            | A different compiler is a different cache. Pin it once in the project's own environment, and make sure every shell and sandbox resolves the same `rustc`: a `rust-toolchain.toml` that one toolchain honours and another ignores silently splits the cache.                                                                                                                                                                                     |
 | Do not point cargo at a shared external `target/`                           | It undoes the isolation the clone gave you and serialises builds.                                                                                                                                                                                                                                                                                                                                                                               |
 | `-C target-cpu=native` ties the cache to one CPU class                      | Fine for a single host; it means the store cannot be shared with a different machine generation.                                                                                                                                                                                                                                                                                                                                                |
 
@@ -193,9 +194,6 @@ Two things you do not need to set: `trim-paths` and `--remap-path-prefix`. The b
 unit it shares across checkouts with the checkout root remapped away, and stores a unit whose output still names its
 checkout (a proc macro that reads `CARGO_MANIFEST_DIR`, say) for that checkout alone. Setting either yourself puts the
 checkout path into the key, so the reuse disappears.
-
-`smoo monorepo check` enforces the `CARGO_INCREMENTAL`, compiled-in checkout path and config rules above, and the
-managed devenv module supplies the environment they assume.
 
 ### The same rules for other toolchains
 
@@ -205,16 +203,16 @@ Ask three questions of any build cache before sharing it between workspaces:
 2. Is a reused artifact still correct at a different path?
 3. Does one process own the store and its size cap?
 
-| Toolchain           | How it lands                                                                                                                                                                                                                                                                                         |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. A smoo-managed shell points both at `/private/cowshed/caches/go/{build,mod}` whenever that root exists.                                                                    |
-| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries in `/private/cowshed/caches/ttsc`, outside `node_modules` so installs stay lean. A smoo-managed shell sets it on the host and in every sandbox alike; without the caches root it stays in the checkout's `.cache/ttsc`.                         |
-| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                                 |
-| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A smoo-managed shell keeps the project environment free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose store path names no checkout — so a clone enters with the environment it copied. |
-| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                                    |
-| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                                                                                                                                                         |
-| Nx                  | Each sandboxed job gets its own Nx workspace-data directory and cache, together, under the private `XDG_CACHE_HOME`, per workspace and mode, so a clone inherits main's read-write hits through the image and no host client finds a sandboxed daemon.                                               |
-| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                        |
+| Toolchain           | How it lands                                                                                                                                                                                                                                                                                    |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. In a Go project (`go.mod` or `go.work`) every sandboxed job names both under `/private/cowshed/caches/go/{build,mod}` whenever that root exists.                      |
+| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries, outside `node_modules` so installs stay lean. Cowshed has no ttsc capability, so a sandbox writes no shared ttsc root: keep the cache inside the checkout (`.cache/ttsc`), where every clone inherits main's warm copy through the image. |
+| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                            |
+| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A clone enters with the environment it copied only if that environment is free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose path names no checkout.                              |
+| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                               |
+| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                                                                                                                                                    |
+| Nx                  | In an Nx project (`nx.json`) each sandboxed job gets its own Nx workspace-data directory and cache, together, under the private `XDG_CACHE_HOME`, per workspace and mode, so a clone inherits main's read-write hits through the image and no host client finds a sandboxed daemon.             |
+| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                   |
 
 ## Documentation
 

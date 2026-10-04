@@ -1492,7 +1492,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             request,
             background,
             reply,
-        } => forward_exec(path, authority, session, request, background, reply).await,
+        } => forward_exec(path, authority, session, *request, background, reply).await,
         Command::Warm {
             authority,
             argv,

@@ -3886,7 +3886,6 @@ where
         workspace: &LifecycleWorkspace,
         image_path: &Path,
         mount_point: &Path,
-        workspace_mount: &Path,
         private_key_path: &Path,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image_path)?;
@@ -3906,7 +3905,6 @@ where
         mint_workspace_credentials(
             workspace,
             mount_point,
-            workspace_mount,
             metadata.platform,
             metadata.grants.port_block,
             private_key_path,

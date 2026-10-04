@@ -14,8 +14,8 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
-    RetireExecutionError, volume_key,
+    MetadataPolicy, PendingAdoption, PublicationError, ResumableClone, RetireExecutionError,
+    volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
@@ -417,7 +417,6 @@ impl ApfsExecutionHost for FakeHost {
     fn mint_workspace_credentials(
         &self,
         _: &LifecycleWorkspace,
-        _: &Path,
         _: &Path,
         _: &Path,
         private_key_path: &Path,
@@ -1671,10 +1670,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     host.clear_events();
 
     substrate
-        .execute_restore_staged(
-            plan,
-            |_| async { Ok::<(), &'static str>(()) },
-        )
+        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect_err("staging metadata failure");
 
@@ -1716,10 +1712,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
     host.clear_events();
 
     substrate
-        .execute_restore_staged(
-            plan,
-            |_| async { Ok::<(), &'static str>(()) },
-        )
+        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect_err("canonical marker failure");
 
@@ -1760,10 +1753,7 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
     host.clear_events();
 
     substrate
-        .execute_restore_staged(
-            plan,
-            |_| async { Ok::<(), &'static str>(()) },
-        )
+        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect_err("restored metadata publication failure");
 
@@ -2455,15 +2445,12 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
         let substrate = substrate.clone();
         tokio::spawn(async move {
             substrate
-                .execute_restore_staged(
-                    plan,
-                    move |fence| async move {
-                        *callback_workspace.lock().expect("pending workspace") =
-                            Some(fence.pending.workspace);
-                        callback_entered.store(true, Ordering::SeqCst);
-                        std::future::pending::<Result<(), &'static str>>().await
-                    },
-                )
+                .execute_restore_staged(plan, move |fence| async move {
+                    *callback_workspace.lock().expect("pending workspace") =
+                        Some(fence.pending.workspace);
+                    callback_entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<Result<(), &'static str>>().await
+                })
                 .await
         })
     };

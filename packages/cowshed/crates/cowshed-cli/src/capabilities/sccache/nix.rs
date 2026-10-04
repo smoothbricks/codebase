@@ -35,8 +35,8 @@
 use crate::gateway_service::launchd_error;
 use crate::launchd::{SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram};
 use cowshed_core::api::{Finding, FindingSeverity};
-use cowshed_core::fork_lock::Run as _;
 use cowshed_core::capabilities::sccache::gc_root;
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::{CowshedError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;

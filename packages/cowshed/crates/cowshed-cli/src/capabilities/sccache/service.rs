@@ -8,6 +8,7 @@
 //! enforces no workspace's Seatbelt boundary and can serve them all
 //! (cowshed_core::capabilities::sccache::server_socket documents the client side).
 
+use super::nix;
 use crate::args::SccacheCommand;
 use crate::gateway_service::{
     activate_launch_agent, canonical_home, effective_uid, inspect_install_state, launchd_error,
@@ -19,11 +20,10 @@ use crate::launchd::{
     SCCACHE_LABEL, StoreBackedProgram, kickstart_hint, plan_install,
 };
 use crate::output::Output;
-use super::nix;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
+use cowshed_core::capabilities::sccache::{cache_directory, gc_root, server_socket};
 use cowshed_core::fork_lock::RunAsync as _;
 use cowshed_core::metadata::ImageCapacity;
-use cowshed_core::capabilities::sccache::{cache_directory, gc_root, server_socket};
 use cowshed_core::storage::bootstrap::ValidatedHostStorage;
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use std::fs;
@@ -450,11 +450,7 @@ pub(crate) fn control_target(home: &Path) -> Result<LaunchAgentTarget> {
 /// released. Removing the root first would leave a `KeepAlive` agent respawning a store path the
 /// next collection is entitled to delete.
 pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, PathBuf, PathBuf)> {
-    Ok((
-        control_target(home)?,
-        gc_root(home),
-        server_socket(),
-    ))
+    Ok((control_target(home)?, gc_root(home), server_socket()))
 }
 
 /// The sccache this host installed, named by its own nix GC root.
@@ -535,10 +531,7 @@ mod tests {
 
         let program = installed_program(&home).expect("the rooted sccache resolves");
         assert_eq!(program.program(), store.join("bin").join("sccache"));
-        assert_eq!(
-            program.gc_root(),
-            gc_root(&home)
-        );
+        assert_eq!(program.gc_root(), gc_root(&home));
         assert!(
             program.program().starts_with(&store),
             "the program must live inside the store path the root pins; got {}",
@@ -574,11 +567,9 @@ mod tests {
         let error = installed_program(&home).expect_err("no root means no installed sccache");
         assert_eq!(error.code.as_str(), "environment-missing");
         assert!(
-            error.message.contains(
-                &gc_root(&home)
-                    .display()
-                    .to_string()
-            ),
+            error
+                .message
+                .contains(&gc_root(&home).display().to_string()),
             "the error must name the root it looked for; got {}",
             error.message
         );
