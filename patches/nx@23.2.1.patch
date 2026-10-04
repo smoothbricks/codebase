@@ -1,5 +1,28 @@
+diff --git a/SHARED-CACHE.md b/SHARED-CACHE.md
+new file mode 100644
+index 0000000..730586e
+--- /dev/null
++++ b/SHARED-CACHE.md
+@@ -0,0 +1,17 @@
++# Shared cache directory (patched Nx)
++
++This Nx carries the shared-cache repair from `patches/nx@23.2.1.patch` (smoothbricks/codebase). Its presence is how a
++tool that prepares a cache directory for several checkouts tells that this Nx can share one.
++
++A cache directory holding a `.shared` file is shared by checkouts that each keep their own task database
++(`workspace-data`). In such a directory:
++
++- An entry is `<hash>/` (the task's outputs) plus `terminalOutputs/<hash>`, as in every Nx cache.
++- An entry is **published** once `<hash>.complete` exists. It holds the task's exit code and is renamed into place
++  after the outputs and terminal output are complete. A published entry is never rewritten.
++- A writer holds `<hash>.lock` (created with `O_EXCL`) while it stores an entry. A hash that is locked or already
++  published is left to its writer; a lock older than ten minutes belongs to a writer that died and is taken over.
++- A checkout whose own database has no row for a hash adopts a published entry: it records the row and restores the
++  entry like any local hit. A row whose `<hash>/` is gone is a miss, never a hit that restores nothing.
++- Nx neither bounds nor ages the directory: each checkout's rows age on their own, so its bound would delete entries
++  other checkouts still name. The directory's owner prunes it, removing `<hash>.complete` before `<hash>/`.
 diff --git a/dist/src/command-line/release/version/version-actions.js b/dist/src/command-line/release/version/version-actions.js
-index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d5160b97bc32 100644
+index 006c077..2ac4a02 100644
 --- a/dist/src/command-line/release/version/version-actions.js
 +++ b/dist/src/command-line/release/version/version-actions.js
 @@ -5,13 +5,14 @@ exports.resolveVersionActionsForProject = resolveVersionActionsForProject;
@@ -231,7 +254,7 @@ index b1c143e..43d3f13 100644
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
 diff --git a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
-index 81a6ebea371390c69fc2c3ab3da95d7dbec13a37..5746704ac8457eddfcedfbcd171504f3e36082e1 100644
+index 81a6ebe..5746704 100644
 --- a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
 +++ b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
 @@ -2,6 +2,7 @@
@@ -252,7 +275,7 @@ index 81a6ebea371390c69fc2c3ab3da95d7dbec13a37..5746704ac8457eddfcedfbcd171504f3
          }
          catch { }
 diff --git a/dist/src/plugins/js/utils/register.js b/dist/src/plugins/js/utils/register.js
-index 151dfb805f179c65391587b379033fd53257d909..ae75a76b87d7974a5e1866e5ecbbf758e26533ca 100644
+index 151dfb8..ae75a76 100644
 --- a/dist/src/plugins/js/utils/register.js
 +++ b/dist/src/plugins/js/utils/register.js
 @@ -25,6 +25,7 @@ exports.getTsNodeCompilerOptions = getTsNodeCompilerOptions;
@@ -282,7 +305,7 @@ index 151dfb805f179c65391587b379033fd53257d909..ae75a76b87d7974a5e1866e5ecbbf758
      const flagMap = {
          module: 'ModuleKind',
 diff --git a/dist/src/plugins/js/utils/typescript.js b/dist/src/plugins/js/utils/typescript.js
-index f756066cc6009478b6e16136d8ba4b5a5614c63c..7b0f3b4b5b270650f2ac0a1c28259e84f1c04811 100644
+index f756066..7b0f3b4 100644
 --- a/dist/src/plugins/js/utils/typescript.js
 +++ b/dist/src/plugins/js/utils/typescript.js
 @@ -10,6 +10,7 @@ exports.getRootTsConfigCustomConditions = getRootTsConfigCustomConditions;
@@ -312,7 +335,7 @@ index f756066cc6009478b6e16136d8ba4b5a5614c63c..7b0f3b4b5b270650f2ac0a1c28259e84
      // We only care about options, so we don't need to scan source files, and thus
      // `readDirectory` is stubbed for performance.
 diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
-index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff917bf214bb 100644
+index 0764858..d7079a7 100644
 --- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 +++ b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 @@ -11,6 +11,7 @@ const crypto_1 = require("crypto");
@@ -333,7 +356,7 @@ index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff91
          const wrap = (hook, hookFn) => this.lifecycle.wrapHook(hook, async (...args) => {
              await this.ensureAlive();
 diff --git a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
-index 3a6df86646a11f371525fca978edf0fc318bf848..1e73ad21751964e3c6839e44eb43488677a9cec3 100644
+index 3a6df86..1e73ad2 100644
 --- a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
 +++ b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
 @@ -20,6 +20,10 @@ export type Hook = (typeof HOOKS_BY_PHASE)[Phase][number];
@@ -359,7 +382,7 @@ index 3a6df86646a11f371525fca978edf0fc318bf848..1e73ad21751964e3c6839e44eb434886
      /**
       * Called when entering a hook. Increments phase session count if this
 diff --git a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
-index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9a96f673a 100644
+index 3659fdd..92e6700 100644
 --- a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
 +++ b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.js
 @@ -28,9 +28,13 @@ const PHASE_ORDER = keys(HOOKS_BY_PHASE);
@@ -407,10 +430,200 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      /**
       * Returns the current session count for a phase. Useful for testing.
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 4a34ba2..c08789f 100644
+index 4a34ba2..7040719 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
-@@ -549,7 +549,29 @@ function resolveMaxCacheSize(nxJson) {
+@@ -58,7 +58,10 @@ class DbCache {
+     constructor(options) {
+         this.options = options;
+         this.nxJson = (0, nx_json_1.readNxJson)();
+-        this.cache = new native_1.NxCache(workspace_root_1.workspaceRoot, cache_directory_1.cacheDir, (0, db_connection_1.getDbConnection)(), undefined, resolveMaxCacheSize(this.nxJson));
++        // A shared directory is pruned by its owner, never by one checkout's database: each
++        // checkout's rows age on their own, so its bound would delete entries others still name.
++        this.shared = (0, node_fs_1.existsSync)((0, path_1.join)(cache_directory_1.cacheDir, SHARED_MARKER));
++        this.cache = new native_1.NxCache(workspace_root_1.workspaceRoot, cache_directory_1.cacheDir, (0, db_connection_1.getDbConnection)(), undefined, this.shared ? 0 : resolveMaxCacheSize(this.nxJson));
+         this.isVerbose = process.env.NX_VERBOSE_LOGGING === 'true';
+     }
+     async init() {
+@@ -69,7 +72,7 @@ class DbCache {
+         }
+     }
+     async get(task) {
+-        const res = this.cache.get(task.hash);
++        const res = this.localResult(task.hash, this.cache.get(task.hash));
+         if (res) {
+             return {
+                 ...res,
+@@ -115,7 +118,7 @@ class DbCache {
+         const batchResults = this.cache.getBatch(hashes);
+         const remoteMisses = [];
+         for (const [i, task] of tasks.entries()) {
+-            const res = batchResults[i];
++            const res = this.localResult(task.hash, batchResults[i]);
+             if (res) {
+                 results.set(task.hash, {
+                     ...res,
+@@ -148,12 +151,45 @@ class DbCache {
+     getUsedCacheSpace() {
+         return this.cache.getCacheSize();
+     }
++    /**
++     * The local answer for `hash`, given this checkout's own row. A row whose entry is gone is a
++     * miss: restoring it would copy nothing and call the task done. Without a row, a shared
++     * directory may hold an entry another checkout published, which is recorded here and then
++     * answered like any local hit.
++     */
++    localResult(hash, res) {
++        if (res) {
++            return (0, node_fs_1.existsSync)(res.outputsPath) ? res : null;
++        }
++        if (!this.shared) {
++            return null;
++        }
++        const directory = this.cache.cacheDirectory;
++        const code = readPublishedCode(directory, hash);
++        const outputsPath = (0, path_1.join)(directory, hash);
++        if (code === undefined || !(0, node_fs_1.existsSync)(outputsPath)) {
++            return null;
++        }
++        let terminalOutput = '';
++        try {
++            terminalOutput = (0, node_fs_1.readFileSync)(this.cache.getTaskOutputsPath(hash), 'utf8');
++        }
++        catch (e) {
++            if (e?.code !== 'ENOENT') {
++                throw e;
++            }
++        }
++        this.cache.applyRemoteCacheResults(hash, { code, terminalOutput, outputsPath });
++        return this.cache.get(hash);
++    }
+     applyRemoteCacheResults(hash, res, outputs) {
+         return this.cache.applyRemoteCacheResults(hash, res, outputs);
+     }
+     async put(task, terminalOutput, outputs, code) {
+         return tryAndRetry(async () => {
+-            const expandedOutputs = this.cache.put(task.hash, terminalOutput, outputs, code);
++            const expandedOutputs = this.shared
++                ? this.publish(task.hash, terminalOutput, outputs, code)
++                : this.cache.put(task.hash, terminalOutput, outputs, code);
+             // Notify TaskIOService of actual output files
+             (0, task_io_service_1.getTaskIOService)().notifyTaskOutputs(task.id, expandedOutputs);
+             if (this.remoteCache) {
+@@ -161,11 +197,44 @@ class DbCache {
+             }
+         });
+     }
++    /**
++     * Store an entry in a shared directory, where it is immutable once published. The native put
++     * removes the entry's directory before copying into it, so a second writer of the same hash
++     * would empty an entry under its readers: one writer holds `<hash>.lock` (O_EXCL), a hash that
++     * is locked or already published is left to its writer, and `<hash>.complete` (the exit code,
++     * renamed into place) is written only after the outputs and terminal output are complete. A
++     * reader adopts only a published entry.
++     */
++    publish(hash, terminalOutput, outputs, code) {
++        const directory = this.cache.cacheDirectory;
++        const lock = (0, path_1.join)(directory, `${hash}.lock`);
++        const held = acquirePublishLock(lock);
++        if (held === undefined || readPublishedCode(directory, hash) !== undefined) {
++            if (held !== undefined) {
++                (0, node_fs_1.closeSync)(held);
++                (0, node_fs_1.unlinkSync)(lock);
++            }
++            return (0, native_1.expandOutputs)(workspace_root_1.workspaceRoot, outputs);
++        }
++        try {
++            const expandedOutputs = this.cache.put(hash, terminalOutput, outputs, code);
++            const marker = (0, path_1.join)(directory, `${hash}.complete`);
++            const staged = `${marker}.${process.pid}`;
++            (0, node_fs_1.writeFileSync)(staged, `${code}\n`);
++            (0, node_fs_1.renameSync)(staged, marker);
++            return expandedOutputs;
++        }
++        finally {
++            (0, node_fs_1.closeSync)(held);
++            (0, node_fs_1.unlinkSync)(lock);
++        }
++    }
+     copyFilesFromCache(_, cachedResult, outputs) {
+         return tryAndRetry(async () => this.cache.copyFilesFromCache(cachedResult, outputs));
+     }
+     removeOldCacheRecords() {
+-        return this.cache.removeOldCacheRecords();
++        // A shared directory's entries outlive any one checkout's rows; its owner prunes it.
++        return this.shared ? undefined : this.cache.removeOldCacheRecords();
+     }
+     temporaryOutputPath(task) {
+         return this.cache.getTaskOutputsPath(task.hash);
+@@ -538,6 +607,66 @@ function tryAndRetry(fn) {
+     };
+     return _try();
+ }
++/**
++ * Present in a cache directory that several checkouts, each with its own database, share. Its
++ * owner writes it and prunes the directory; Nx then neither bounds nor ages the directory itself.
++ */
++const SHARED_MARKER = '.shared';
++/** A publish lock older than this belongs to a writer that died: a put copies for seconds. */
++const STALE_PUBLISH_LOCK_MS = 10 * 60 * 1000;
++/** The exit code a published entry recorded, or undefined while it is unpublished. */
++function readPublishedCode(directory, hash) {
++    const marker = (0, path_1.join)(directory, `${hash}.complete`);
++    let text;
++    try {
++        text = (0, node_fs_1.readFileSync)(marker, 'utf8');
++    }
++    catch (e) {
++        if (e?.code === 'ENOENT') {
++            return undefined;
++        }
++        throw e;
++    }
++    const code = Number(text.trim());
++    if (!Number.isInteger(code)) {
++        throw new Error(`The shared Nx cache entry marker ${marker} holds ${JSON.stringify(text)}, not an exit code. Remove the marker and its entry ${(0, path_1.join)(directory, hash)}.`);
++    }
++    return code;
++}
++/** The open publish lock, or undefined while another writer holds it. */
++function acquirePublishLock(lock) {
++    try {
++        return (0, node_fs_1.openSync)(lock, 'wx');
++    }
++    catch (e) {
++        if (e?.code !== 'EEXIST') {
++            throw e;
++        }
++    }
++    let age;
++    try {
++        age = Date.now() - (0, node_fs_1.statSync)(lock).mtimeMs;
++    }
++    catch (e) {
++        if (e?.code === 'ENOENT') {
++            return undefined;
++        }
++        throw e;
++    }
++    if (age < STALE_PUBLISH_LOCK_MS) {
++        return undefined;
++    }
++    (0, node_fs_1.rmSync)(lock, { force: true });
++    try {
++        return (0, node_fs_1.openSync)(lock, 'wx');
++    }
++    catch (e) {
++        if (e?.code === 'EEXIST') {
++            return undefined;
++        }
++        throw e;
++    }
++}
+ /**
+  * Resolves the max cache size from environment variable or nx.json configuration
+  * and converts it to a number of bytes.
+@@ -549,7 +678,29 @@ function resolveMaxCacheSize(nxJson) {
      const rawMaxCacheSize = process.env.NX_MAX_CACHE_SIZE ?? nxJson.maxCacheSize;
      return rawMaxCacheSize !== undefined
          ? parseMaxCacheSize(rawMaxCacheSize)
@@ -442,7 +655,7 @@ index 4a34ba2..c08789f 100644
  /**
   * Converts a string representation of a max cache size to a number.
 diff --git a/dist/src/utils/installation-directory.d.ts b/dist/src/utils/installation-directory.d.ts
-index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24adc4adf7a8 100644
+index dc1784e..f830bb5 100644
 --- a/dist/src/utils/installation-directory.d.ts
 +++ b/dist/src/utils/installation-directory.d.ts
 @@ -1,2 +1,10 @@
@@ -457,7 +670,7 @@ index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24ad
 + */
 +export declare function resolveFromWorkspace(specifier: string, root?: string): string;
 diff --git a/dist/src/utils/installation-directory.js b/dist/src/utils/installation-directory.js
-index a6e742172f09e800da486af4716e9747d5ff2304..29f3376dfc5a00f83e90a7a2a7ce1a4eeed1a14e 100644
+index a6e7421..29f3376 100644
 --- a/dist/src/utils/installation-directory.js
 +++ b/dist/src/utils/installation-directory.js
 @@ -2,6 +2,7 @@

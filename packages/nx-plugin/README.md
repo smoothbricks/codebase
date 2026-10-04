@@ -533,6 +533,14 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   and `release version` cannot resolve `@nx/js`'s version actions. The patch resolves both through `getNxRequirePaths`
   (the workspace first), falling back to Nx's own location. See
   [upstream Nx #37272](https://github.com/nrwl/nx/pull/37272).
+- **Checkouts share one cache directory.** Nx's cache directory is indexed by one checkout's task database, so a
+  directory several checkouts share answers each only for what it stored itself, and each checkout's bound and age
+  delete entries the others still name. In a directory holding a `.shared` file the patch publishes an entry under an
+  `O_EXCL` `<hash>.lock` and renames `<hash>.complete` (the exit code) into place once its outputs are complete; a
+  checkout whose database has no row adopts a published entry like any local hit, and Nx leaves pruning to the
+  directory's owner. In every directory a row whose entry is gone is a miss rather than a hit that restores nothing. The
+  patched package's `SHARED-CACHE.md` states the on-disk protocol; cowshed links a checkout's `.nx/cache` to its
+  project's shared directory only when that file is present. No upstream change proposes this yet.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -541,8 +549,8 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker and store-resolution regressions pass; preserve any repair not yet released. When every
-hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution and shared-cache regressions pass; preserve any repair not yet released.
+When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 
