@@ -7,16 +7,20 @@ hooks.
 ## Detection inputs
 
 Detection reads convention files inside the workspace, never an enclosing checkout or the operator's shell environment.
-Its input is the workspace mount, host home, shared-cache root, private environment root, short runtime directory, and
-optional public gateway trust bundle. Paths derive from those inputs; secrets and ambient PATH are not detection inputs.
+Its input is the workspace mount, command cwd, host home, shared-cache root, private environment root, short runtime
+directory, and optional public gateway trust bundle. Paths derive from those inputs; secrets and ambient PATH are not
+detection inputs.
 
-Detectors inspect the workspace root, or the contained relative directory selected by that capability's override.
-Detection is deterministic per workspace rather than per command cwd: a tool invoked through a task runner gets the same
-cache and daemon authority as one invoked directly. There is no recursive walk through dependencies or build trees.
-Direnv shell selection may find the nearest contained `.envrc` for a job's cwd; it does not widen the workspace profile.
-At mint the same detectors inspect the minted tree. A detector may examine file contents to disambiguate a convention;
-it never executes project code during discovery. A convention that resolves outside the workspace is rejected, not
-followed. Missing files mean absence; other filesystem errors report the path and failure.
+Project-scoped detectors inspect the workspace root, or the contained relative directory selected by that capability's
+override. A tool invoked through a task runner gets the same cache and daemon authority as one invoked directly. There
+is no recursive walk through dependencies or build trees. Direnv alone inspects command ancestors inside the workspace
+and selects the nearest `.envrc`; an explicit directory override selects only that directory. Spawn admission refreshes
+the convention snapshot, so adding or removing a convention takes effect without restarting the supervisor. An unchanged
+snapshot reuses its rendered policy; a changed snapshot renders a matched sandbox/profile pair before applying job-mode
+narrowing. Warm-host identity includes the resulting profile, environment and shell directory. At mint the same
+detectors inspect the minted tree. A detector may examine file contents to disambiguate a convention; it never executes
+project code during discovery. A convention that resolves outside the workspace is rejected, not followed. Missing files
+mean absence; other filesystem errors report the path and failure.
 
 | Detector | Convention                                                                     | Contribution                                                                                                        |
 | -------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
@@ -55,9 +59,14 @@ Each detector returns data through one `CapabilityContribution`:
   detector owns the convention-specific paths; the clone implementation only applies the returned paths.
 - **Unix sockets:** canonical, individually admitted host service sockets. No wildcard socket grants or in-sandbox
   host-daemon fallback.
-- **Bootstrap executables:** explicit tool installations needed by a detected capability. The core adds `.cowshed/bin`
-  and platform system directories; it does not borrow a workspace `.devenv/profile`, an entire login PATH or an entire
-  Nix profile. A detector may resolve an individual bootstrap tool through its installation conventions.
+- **Bootstrap executables:** command-name-to-resolved-executable entries needed by a detected capability. Preparation
+  installs exact private `.cowshed/tools/bin/<name>` links (read-only jobs use their exec-temp `tools/bin`) so an
+  executable such as `npm-cli.js` remains reachable as `npm`. The link set is reconciled at preparation; removed
+  capabilities leave no stale program links. The separate `.cowshed/bin` remains the workspace's shim directory. The
+  core adds both bins and platform system directories; it does not borrow a workspace `.devenv/profile`, an entire login
+  PATH or an entire Nix profile. A detector may resolve an individual bootstrap tool through its installation
+  conventions. Store-resolved executables receive immutable Nix-store reads; that alone does not grant Nix caches or
+  daemon access.
 - **Shell activation:** an optional contained direnv directory. Absence leaves the ordinary sandbox environment and
   supports argv and script jobs.
 

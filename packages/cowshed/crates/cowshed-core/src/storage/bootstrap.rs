@@ -73,6 +73,10 @@ pub struct CowshedConfig {
     /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
     /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
     sandbox_deny: Vec<PathBuf>,
+    capabilities: std::collections::BTreeMap<
+        crate::capabilities::CapabilityId,
+        crate::capabilities::CapabilityOverride,
+    >,
 }
 
 impl CowshedConfig {
@@ -86,6 +90,15 @@ impl CowshedConfig {
 
     pub fn sandbox_deny(&self) -> &[PathBuf] {
         &self.sandbox_deny
+    }
+
+    pub fn capabilities(
+        &self,
+    ) -> &std::collections::BTreeMap<
+        crate::capabilities::CapabilityId,
+        crate::capabilities::CapabilityOverride,
+    > {
+        &self.capabilities
     }
 }
 
@@ -119,6 +132,7 @@ enum ConfigSection {
     Substrate,
     Land,
     Sandbox,
+    Capability(crate::capabilities::CapabilityId),
 }
 
 impl ConfigSection {
@@ -127,14 +141,19 @@ impl ConfigSection {
             Self::Substrate => "substrate",
             Self::Land => "land",
             Self::Sandbox => "sandbox",
+            Self::Capability(id) => id.section_name(),
         }
     }
 }
 
-/// Parse the complete repository-owned cowshed configuration.
-///
-/// Only `[substrate]`, `[land]` and `[sandbox]` are accepted. Keeping this parser narrow means a
-/// typo never silently disables storage selection, main's warm step, or a sandbox deny.
+#[derive(Default)]
+struct ParsedCapability {
+    disabled: Option<bool>,
+    directory: Option<PathBuf>,
+}
+
+/// Parse repository-owned storage, landing, sandbox deny and convention-only capability overrides.
+/// Unknown or duplicated settings fail rather than silently changing project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
@@ -144,7 +163,8 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut pool = None;
     let mut warm = None;
     let mut sandbox_deny = None;
-
+    let mut capabilities =
+        std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
     for (index, original) in input.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(original).trim();
@@ -152,26 +172,39 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             continue;
         }
         if line.starts_with('[') {
-            let section = line
+            let name = line
                 .strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
                 .ok_or(ConfigError::MalformedLine { line: line_number })?
                 .trim();
-            let section = match section {
+            let section = match name {
                 "substrate" => ConfigSection::Substrate,
                 "land" => ConfigSection::Land,
                 "sandbox" => ConfigSection::Sandbox,
-                other => return Err(ConfigError::UnknownSection(other.to_owned())),
+                other => {
+                    let id = other
+                        .strip_prefix("capabilities.")
+                        .and_then(crate::capabilities::CapabilityId::parse)
+                        .ok_or_else(|| ConfigError::UnknownSection(other.to_owned()))?;
+                    if capabilities
+                        .insert(id, ParsedCapability::default())
+                        .is_some()
+                    {
+                        return Err(ConfigError::DuplicateSection(id.section_name()));
+                    }
+                    ConfigSection::Capability(id)
+                }
             };
+            // A capability section is deduplicated by its insertion above.
             let seen = match section {
-                ConfigSection::Substrate => &mut saw_substrate,
-                ConfigSection::Land => &mut saw_land,
-                ConfigSection::Sandbox => &mut saw_sandbox,
+                ConfigSection::Substrate => Some(&mut saw_substrate),
+                ConfigSection::Land => Some(&mut saw_land),
+                ConfigSection::Sandbox => Some(&mut saw_sandbox),
+                ConfigSection::Capability(_) => None,
             };
-            if *seen {
+            if seen.is_some_and(|seen| std::mem::replace(seen, true)) {
                 return Err(ConfigError::DuplicateSection(section.name()));
             }
-            *seen = true;
             current = Some(section);
             continue;
         }
@@ -203,6 +236,47 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                     parse_sandbox_deny(value, line_number)?,
                     section,
                     "deny",
+                )?;
+            }
+            (ConfigSection::Capability(id), "disabled") => {
+                let disabled = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(ConfigError::ExpectedBoolean {
+                            section: section.name(),
+                            line: line_number,
+                        });
+                    }
+                };
+                set_once(
+                    &mut capabilities
+                        .get_mut(&id)
+                        .expect("section records its capability")
+                        .disabled,
+                    disabled,
+                    section,
+                    "disabled",
+                )?;
+            }
+            (ConfigSection::Capability(id), "directory") => {
+                let value = parse_toml_string(value, section, line_number)?;
+                let directory =
+                    crate::capabilities::validate_override_directory(&value).map_err(|reason| {
+                        ConfigError::InvalidCapabilityDirectory {
+                            section: section.name(),
+                            line: line_number,
+                            reason,
+                        }
+                    })?;
+                set_once(
+                    &mut capabilities
+                        .get_mut(&id)
+                        .expect("section records its capability")
+                        .directory,
+                    directory,
+                    section,
+                    "directory",
                 )?;
             }
             (_, other) => {
@@ -249,10 +323,23 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         Vec::new()
     };
+    let capabilities = capabilities
+        .into_iter()
+        .map(|(id, parsed)| {
+            (
+                id,
+                crate::capabilities::CapabilityOverride {
+                    disabled: parsed.disabled.unwrap_or(false),
+                    directory: parsed.directory,
+                },
+            )
+        })
+        .collect();
     Ok(CowshedConfig {
         substrate,
         land,
         sandbox_deny,
+        capabilities,
     })
 }
 
@@ -300,6 +387,7 @@ fn parse_sandbox_deny(value: &str, line: usize) -> Result<Vec<PathBuf>, ConfigEr
     deny.dedup();
     Ok(deny)
 }
+
 fn strip_comment(line: &str) -> &str {
     let mut quoted = false;
     let mut escaped = false;
@@ -357,6 +445,14 @@ pub enum ConfigError {
         "[sandbox] deny entries must be non-empty workspace-relative paths without `.` or `..`: {0:?}"
     )]
     InvalidSandboxDeny(String),
+    #[error("[{section}] value at line {line} must be true or false")]
+    ExpectedBoolean { section: &'static str, line: usize },
+    #[error("[{section}] directory at line {line}: {reason}")]
+    InvalidCapabilityDirectory {
+        section: &'static str,
+        line: usize,
+        reason: &'static str,
+    },
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
 }

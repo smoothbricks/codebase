@@ -289,6 +289,43 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
 }
 
 #[test]
+fn capability_overrides_are_strict_convention_overrides() {
+    use cowshed_core::capabilities::CapabilityId;
+    for id in CapabilityId::ALL {
+        let config = parse_cowshed_config(&format!(
+            "[{}]\ndisabled = true\ndirectory = \"tools/project\"\n",
+            id.section_name(),
+        ))
+        .unwrap();
+        let override_ = config.capabilities().get(&id).unwrap();
+        assert!(override_.disabled);
+        assert_eq!(
+            override_.directory.as_deref(),
+            Some(Path::new("tools/project"))
+        );
+    }
+    let config = parse_cowshed_config("[capabilities.nx]\n").unwrap();
+    let override_ = config.capabilities().get(&CapabilityId::Nx).unwrap();
+    assert!(!override_.disabled);
+    assert!(override_.directory.is_none());
+    for source in [
+        "[capabilities.missing]\n",
+        "[capabilities.nx]\nenabled = true\n",
+        "[capabilities.nx]\ndisabled = \"true\"\n",
+        "[capabilities.nx]\ndisabled = 1\n",
+        "[capabilities.nx]\ndisabled = false\ndisabled = true\n",
+        "[capabilities.nx]\ndirectory = \"tools\"\ndirectory = \"other\"\n",
+        "[capabilities.nx]\n[capabilities.nx]\n",
+        "[capabilities.nx]\ndirectory = \"../outside\"\n",
+        "[capabilities.nx]\ndirectory = \"/outside\"\n",
+        "[capabilities.nx]\ndirectory = \"\"\n",
+        "[capabilities.nx]\ndirectory = \"a//b\"\n",
+    ] {
+        assert!(parse_cowshed_config(source).is_err(), "{source:?}");
+    }
+}
+
+#[test]
 fn selection_matrix_uses_evidence_without_guessing() {
     let apfs = select_substrate(apfs_evidence(), None).unwrap();
     assert!(matches!(

@@ -2,6 +2,7 @@
 
 pub mod apfs;
 pub mod api;
+pub mod capabilities;
 pub mod checkout;
 pub mod copy;
 mod device;
