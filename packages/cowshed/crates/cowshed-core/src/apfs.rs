@@ -4620,7 +4620,7 @@ mod tests {
         let steps = backend.runner().steps();
         assert_eq!(
             argv(commands(&steps).last().unwrap()),
-            ["detach", "/dev/disk8"]
+            ["detach", "-verbose", "/dev/disk8"]
         );
     }
 
