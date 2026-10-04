@@ -2,10 +2,10 @@
 //! Git CLI, and the workspace trust bundle.
 //!
 //! Cargo fingerprints a registry or git dependency by the absolute path of its source under
-//! `$CARGO_HOME`, so a sandbox reaches the host's own `~/.cargo` once host setup has relocated its
-//! `registry` and `git` onto the caches volume; any other spelling of the same bytes dirties every
-//! dependency a clone's copied `target/` holds. Until then cargo keeps its private default under
-//! the sandbox HOME. Configuration, credentials and the rest of `~/.cargo` stay host-owned.
+//! `$CARGO_HOME`, so every sandbox builds against the host's own `~/.cargo`, whose `registry` and
+//! `git` are shared read-write where they are; any other spelling of the same bytes dirties every
+//! dependency a clone's copied `target/` holds. Configuration, credentials and the rest of
+//! `~/.cargo` stay host-owned.
 //!
 //! A host whose toolchain is rustup's gets it read-only: the proxies in `~/.cargo/bin`, and the
 //! settings and toolchains under `~/.rustup`, reached through an owned `RUSTUP_HOME` because the
@@ -31,7 +31,6 @@ pub const DETECTOR: Detector = Detector {
     all: &[],
     any: &["Cargo.toml"],
     scope: DetectionScope::Project,
-    host_cache_homes: &[&HOME],
     reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
     contribute,
 };
@@ -52,10 +51,9 @@ pub static HOME: SharedToolHome = SharedToolHome {
     variable: Some("CARGO_HOME"),
     home: ".cargo",
     layout: SharedLayout::Split {
-        links: &[("registry", "cargo/registry"), ("git", "cargo/git")],
+        caches: &["registry", "git"],
         state_files: &STATE_FILES,
     },
-    linked_from_checkouts: false,
 };
 
 /// Cargo honors `url.insteadOf` only through the Git CLI, which is where the workspace's fetch
@@ -77,7 +75,8 @@ const RUSTUP_STATE_DIRECTORIES: [&str; 3] = ["update-hashes", "downloads", "tmp"
 const PROGRAMS: [&str; 4] = ["cargo", "rustc", "rustdoc", "rustup"];
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
-    let mut contribution = super::shared_tool_contribution(context, &HOME)?;
+    let mut contribution = CapabilityContribution::default();
+    super::add_shared_tool_home(&mut contribution, context.home, &HOME);
     // Build state follows the tracked tree's Cargo config, never a caller shell's target dir.
     contribution
         .env
@@ -183,7 +182,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::capabilities::CacheMount;
+    use crate::capabilities::SharedCache;
     use crate::capabilities::test_support::{Fixture, assert_switch};
 
     /// The grants a contribution makes in the fixture's host home: host toolchains a test
@@ -224,60 +223,16 @@ mod tests {
         assert_switch(&DETECTOR, &["Cargo.toml"]);
     }
 
-    /// Without relocated caches cargo keeps its private default, so `CARGO_HOME` is the
-    /// sandbox's to leave unset and no part of the host's `~/.cargo` is granted beyond the exact
-    /// program paths its search probes. A plain host (no rustup) adds no toolchain authority.
+    /// Every child builds against the host's literal `~/.cargo`: its `registry` and `git` are
+    /// shared read-write where they are, the root is a literal read, and cargo's own root state
+    /// files are the only other writes. Beneath HOME nothing else is granted beyond the exact
+    /// program paths the search probes; a plain host (no rustup) adds no toolchain authority, and
+    /// the workspace trust bundle is a default a caller may replace.
     #[test]
-    fn an_unshared_cargo_home_and_no_rustup_grant_nothing_on_the_host() {
-        let fixture = Fixture::new();
-        fixture.files(&["Cargo.toml"]);
-        let contribution = DETECTOR
-            .detect(&fixture.context())
-            .expect("detection")
-            .expect("cargo detected");
-        assert_eq!(
-            contribution.env,
-            BTreeMap::from([
-                ("CARGO_HOME", EnvAction::Unset),
-                ("CARGO_TARGET_DIR", EnvAction::Unset),
-                (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
-            ])
-        );
-        assert_eq!(
-            home_grants(&contribution, &fixture.home),
-            probes(&fixture.home)
-        );
-        // The caches volume exists, so the shared directories are prepared and granted for
-        // when setup relocates the host links; nothing names the host path.
-        assert_eq!(
-            contribution.cache_mounts,
-            vec![
-                CacheMount {
-                    source: fixture.caches.join("cargo/registry"),
-                    private_target: None,
-                },
-                CacheMount {
-                    source: fixture.caches.join("cargo/git"),
-                    private_target: None,
-                },
-            ]
-        );
-    }
-
-    /// Once both host links resolve to the caches volume, every child builds against the host's
-    /// literal `~/.cargo`, reading its links and writing only cargo's own root state files; the
-    /// workspace trust bundle is a default a caller may replace.
-    #[test]
-    fn a_shared_cargo_home_is_the_host_path_with_exact_state_file_grants() {
+    fn cargo_home_is_the_host_path_with_exact_cache_and_state_file_grants() {
         let fixture = Fixture::new();
         fixture.files(&["Cargo.toml"]);
         let cargo_home = fixture.home.join(".cargo");
-        fs::create_dir_all(&cargo_home).expect("host cargo home");
-        for (link, shared) in [("registry", "cargo/registry"), ("git", "cargo/git")] {
-            let target = fixture.caches.join(shared);
-            fs::create_dir_all(&target).expect("shared cache");
-            std::os::unix::fs::symlink(&target, cargo_home.join(link)).expect("host link");
-        }
         let bundle = fixture.root.join(".cowshed/ca-bundle.pem");
         let context = DetectionContext {
             trust_bundle: Some(&bundle),
@@ -296,11 +251,20 @@ mod tests {
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
             ])
         );
-        let mut expected = vec![
-            read(cargo_home.clone(), GrantScope::Literal),
-            read(cargo_home.join("registry"), GrantScope::Literal),
-            read(cargo_home.join("git"), GrantScope::Literal),
-        ];
+        assert_eq!(
+            contribution.shared_caches,
+            vec![
+                SharedCache {
+                    path: cargo_home.join("registry"),
+                    private_link: None,
+                },
+                SharedCache {
+                    path: cargo_home.join("git"),
+                    private_link: None,
+                },
+            ]
+        );
+        let mut expected = vec![read(cargo_home.clone(), GrantScope::Literal)];
         expected.extend(STATE_FILES.map(|file| CapabilityGrant {
             path: cargo_home.join(file),
             scope: GrantScope::Literal,
@@ -356,7 +320,12 @@ mod tests {
                 "{expected:?} missing from {grants:?}"
             );
         }
-        assert!(grants.iter().all(|grant| grant.access == GrantAccess::Read));
+        assert!(
+            grants
+                .iter()
+                .filter(|grant| grant.path.starts_with(&rustup) || grant.path.starts_with(&proxies))
+                .all(|grant| grant.access == GrantAccess::Read)
+        );
         assert!(
             contribution
                 .bootstrap_programs

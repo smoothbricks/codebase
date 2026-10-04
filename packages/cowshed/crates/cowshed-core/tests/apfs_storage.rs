@@ -1075,7 +1075,7 @@ fn workspace(name: &str, revision: u64) -> LifecycleWorkspace {
 
 fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, CountingLane> {
     ApfsSubstrate::with_lane_and_incarnations(
-        ApfsSubstrateConfig::new("/store", "/store/caches", "/project"),
+        ApfsSubstrateConfig::new("/store", "/project"),
         host,
         lane,
         FixedIncarnations::default(),
@@ -1222,10 +1222,6 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
             .await
             .expect("mount state"),
         MountState::Mounted { mount_id: 1 }
-    );
-    assert_eq!(
-        substrate.caches_root().await.expect("caches"),
-        PathBuf::from("/store/caches")
     );
 }
 
@@ -1572,7 +1568,7 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         let host = FakeHost::default();
         let lane = CountingLane::default();
         let substrate = ApfsSubstrate::with_lane_and_incarnations(
-            ApfsSubstrateConfig::new("/store", "/store/caches", checkout_path),
+            ApfsSubstrateConfig::new("/store", checkout_path),
             host.clone(),
             lane.clone(),
             FixedIncarnations::default(),

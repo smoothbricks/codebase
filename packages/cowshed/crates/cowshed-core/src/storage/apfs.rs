@@ -33,7 +33,6 @@ use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApfsSubstrateConfig {
     pub store_root: PathBuf,
-    pub caches_root: PathBuf,
     /// The adopted checkout's path — the place in the user's source tree that adoption took over,
     /// and main's mountpoint.
     pub checkout_path: PathBuf,
@@ -41,14 +40,9 @@ pub struct ApfsSubstrateConfig {
 }
 
 impl ApfsSubstrateConfig {
-    pub fn new(
-        store_root: impl Into<PathBuf>,
-        caches_root: impl Into<PathBuf>,
-        checkout_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(store_root: impl Into<PathBuf>, checkout_path: impl Into<PathBuf>) -> Self {
         Self {
             store_root: store_root.into(),
-            caches_root: caches_root.into(),
             checkout_path: checkout_path.into(),
             capacity: DEFAULT_IMAGE_CAPACITY,
         }
@@ -58,7 +52,7 @@ impl ApfsSubstrateConfig {
     ///
     /// The checkout path is the only field a live project can change — that is what `cowshed mv
     /// main` does, and what `cowshed attach` converges onto after a checkout is respelt. Everything
-    /// else (store root, caches root, capacity) is fixed for the project's lifetime.
+    /// else (store root, capacity) is fixed for the project's lifetime.
     ///
     /// It is a whole-config clone rather than a mutable field because the config is shared by
     /// value: `ApfsSubstrate` holds it behind an `Arc` that every clone of the substrate shares,
@@ -1773,10 +1767,6 @@ where
         .await
     }
 
-    async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
-        Ok(self.config.caches_root.clone())
-    }
-
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_read(move |host, config| {
@@ -3333,7 +3323,6 @@ mod tests {
     fn every_mutating_operation_maps_to_its_exact_canonical_lock_set() {
         let config = ApfsSubstrateConfig::new(
             "/tmp/cowshed-lock-table/store",
-            "/tmp/cowshed-lock-table/caches",
             "/tmp/cowshed-lock-table/main",
         );
         let repo = RepoId::parse("acme/widget").expect("repo");
@@ -3428,7 +3417,7 @@ mod tests {
         let counter = root.join("grant-revision");
         std::fs::write(&counter, "0").expect("initial revision");
         let lock = store.join("sessions/raven.asif.lock");
-        let config = ApfsSubstrateConfig::new(&store, root.join("caches"), root.join("checkout"));
+        let config = ApfsSubstrateConfig::new(&store, root.join("checkout"));
         let host =
             native::MacOsApfsExecutionHost::new(crate::apfs::SystemCommandRunner, config.clone())
                 .expect("native host");

@@ -2778,11 +2778,7 @@ impl NativeProjectRuntimeHost {
                 )
             })?;
         }
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            storage.store(),
-            storage.caches(),
-            &git_root,
-        );
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(storage.store(), &git_root);
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
             crate::apfs::SystemCommandRunner,
             config.clone(),
@@ -3946,7 +3942,8 @@ impl NativeProjectRuntimeHost {
                 Discovered::Changed {
                     paths: discovery.paths,
                     fingerprint,
-                    capacity: main_cowshed_config(&main_mount)?.build_capacity(),
+                    capacity: crate::storage::bootstrap::main_cowshed_config(&main_mount)?
+                        .build_capacity(),
                 },
                 discovery.findings,
             )
@@ -9833,19 +9830,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn repo_mirror(&mut self, workspace: WorkspaceName, url: Url) -> Result<MirrorInfo> {
-        use crate::storage::lifecycle::Substrate;
         self.validate_binding().await?;
         self.current(&workspace).await?;
-        let root = self
-            .substrate
-            .caches_root()
-            .await
-            .map_err(native_storage_error)?
-            .join("mirrors")
-            .join(
-                crate::repository::encode_component(url.as_str())
-                    .map_err(native_integrity_error)?,
-            );
+        let root = crate::host_dirs::repo_mirrors(&self.home).join(
+            crate::repository::encode_component(url.as_str()).map_err(native_integrity_error)?,
+        );
         if tokio::fs::try_exists(&root).await.map_err(|error| {
             CowshedError::environment_missing(error.to_string(), "check cache permissions")
         })? {
@@ -13171,6 +13160,7 @@ mod grant_unit_tests {
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: Default::default(),
         }
     }
@@ -13279,33 +13269,6 @@ mod grant_unit_tests {
             effective.deny,
             [PathBuf::from(".env"), PathBuf::from(".runtime")]
         );
-    }
-
-    /// Main's `.cowshed.toml` is the only source of `[sandbox] deny`: an absent file declares
-    /// nothing, and an invalid one refuses rather than run without the deny.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn main_cowshed_config_reads_sandbox_denies_and_refuses_an_invalid_file() {
-        let main = std::env::temp_dir().join(format!(
-            "cowshed-main-config-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&main).unwrap();
-        let absent = main_cowshed_config(&main).unwrap();
-        std::fs::write(
-            main.join(".cowshed.toml"),
-            "[sandbox]\n# runtime secrets live here\ndeny = [\".runtime\"]\n",
-        )
-        .unwrap();
-        let declared = main_cowshed_config(&main).unwrap();
-        std::fs::write(main.join(".cowshed.toml"), "[sandbox]\ndeny = [\"../x\"]\n").unwrap();
-        let invalid = main_cowshed_config(&main).expect_err("escaping deny refused");
-        std::fs::remove_dir_all(&main).unwrap();
-
-        assert!(absent.sandbox_deny().is_empty());
-        assert_eq!(declared.sandbox_deny(), [PathBuf::from(".runtime")]);
-        assert_eq!(invalid.code.as_str(), "usage");
     }
 
     /// A host has one egress rule: its mode and ports are that rule. Granting a
@@ -13525,7 +13488,7 @@ fn supervisor_sandbox(
     main_mount: PathBuf,
     build_volume_mount: Option<PathBuf>,
 ) -> Result<crate::sandbox::SandboxConfig> {
-    let repository = main_cowshed_config(&main_mount)?;
+    let repository = crate::storage::bootstrap::main_cowshed_config(&main_mount)?;
     crate::sandbox::workspace_sandbox(crate::sandbox::WorkspaceSandbox {
         home,
         mount_root: &layout.project().host_mount_root,
@@ -13534,38 +13497,13 @@ fn supervisor_sandbox(
         telemetry_root,
         grants,
         repository_deny: repository.sandbox_deny(),
+        repository_caches: repository.caches_home(),
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
         build_volume_mount,
         workspace_mount: mount,
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)
             .map_err(native_integrity_error)?,
-    })
-}
-
-/// Main's `.cowshed.toml`, the only copy whose `[sandbox]` section is trusted: main's checkout
-/// is the operator's, while a workspace's copy is the agent's to edit. A missing file declares
-/// nothing; an unreadable or invalid one refuses the launch rather than drop a deny.
-#[cfg(target_os = "macos")]
-fn main_cowshed_config(main_mount: &Path) -> Result<crate::storage::bootstrap::CowshedConfig> {
-    let path = main_mount.join(".cowshed.toml");
-    let input = match std::fs::read_to_string(&path) {
-        Ok(input) => input,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(crate::storage::bootstrap::CowshedConfig::default());
-        }
-        Err(error) => {
-            return Err(CowshedError::environment_missing(
-                format!("cannot read {}: {error}", path.display()),
-                "make main's .cowshed.toml readable, then retry",
-            ));
-        }
-    };
-    crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
-        CowshedError::usage(
-            format!("invalid {}: {error}", path.display()),
-            "fix main's .cowshed.toml, then retry",
-        )
     })
 }
 
@@ -13982,11 +13920,7 @@ mod retired_recovery_tests {
         }
         .write_for_image(&image)
         .unwrap();
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            &root,
-            root.join("caches"),
-            root.join("checkout"),
-        );
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(&root, root.join("checkout"));
         let mut commitments = super::super::supervisor::CommitmentPublisher::open(
             root.join("telemetry"),
             crate::storage::audit::ContinuityAudit::Off,
@@ -14046,11 +13980,7 @@ mod retired_recovery_tests {
         let companion = crate::metadata::append_suffix(&image, ".ca.key");
         std::fs::write(&image, b"retired image").unwrap();
         std::fs::write(&companion, b"retired CA key").unwrap();
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            &root,
-            root.join("caches"),
-            root.join("checkout"),
-        );
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(&root, root.join("checkout"));
         let mut commitments = super::super::supervisor::CommitmentPublisher::open(
             root.join("telemetry"),
             crate::storage::audit::ContinuityAudit::Off,
@@ -17111,9 +17041,8 @@ mod port_reservation_tests {
     }
 
     fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {
-        let roots = CanonicalRoots::at(root.join("store"), root.join("caches"));
+        let roots = CanonicalRoots::at(root.join("store"));
         std::fs::create_dir_all(roots.store()).expect("store");
-        std::fs::create_dir_all(roots.caches()).expect("caches");
         let repo = RepoId::parse("acme/widget").expect("repo");
         let layout = StorageLayout::new(roots.store(), &repo).expect("layout");
         std::fs::create_dir_all(&layout.project().project_root).expect("project");

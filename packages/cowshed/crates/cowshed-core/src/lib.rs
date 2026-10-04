@@ -3,6 +3,7 @@
 pub mod apfs;
 pub mod api;
 pub mod build_volume;
+pub mod caches_retirement;
 pub mod capabilities;
 pub mod checkout;
 pub mod copy;
@@ -15,7 +16,7 @@ mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
-pub mod host_caches;
+pub mod host_dirs;
 pub mod host_load;
 mod inherited_daemons;
 #[cfg(target_os = "macos")]

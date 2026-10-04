@@ -388,6 +388,7 @@ fn config() -> WorkspaceSupervisorConfig {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: Default::default(),
         },
         build_volume_layout: None,

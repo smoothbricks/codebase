@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{CowshedError, Result};
-use cache::{HostCache, SharedLayout, SharedToolHome};
+use cache::{SharedLayout, SharedToolHome};
 
 mod build_state;
 pub use build_state::{BuildStatePath, RelPath};
@@ -19,22 +19,22 @@ pub use build_state_discovery::{
     BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
     CargoRunner, JobCargo, discover_build_state, tracked_manifest_fingerprint,
 };
-mod bun;
+pub mod bun;
 pub mod cache;
 pub mod cargo;
 mod codegraph;
 mod direnv;
 pub mod go;
-mod gradle;
+pub mod gradle;
 mod installations;
 mod javascript;
-mod nix;
-mod npm;
+pub mod nix;
+pub mod npm;
 pub mod nx;
-mod pnpm;
+pub mod pnpm;
 pub mod sccache;
-mod uv;
-mod zig;
+pub mod uv;
+pub mod zig;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -122,7 +122,10 @@ pub struct DetectionContext<'a> {
     pub project_root: &'a Path,
     pub command_cwd: &'a Path,
     pub home: &'a Path,
-    pub caches_root: &'a Path,
+    /// `[caches] home` from main's `.cowshed.toml`: HOME-relative cache directories the
+    /// repository's own tooling places, shared read-write into every sandbox of the project and
+    /// linked from the private HOME. Never a workspace's copy of the file.
+    pub repository_caches: &'a [PathBuf],
     pub environment_root: &'a Path,
     pub runtime_dir: &'a Path,
     pub trust_bundle: Option<&'a Path>,
@@ -154,10 +157,13 @@ pub struct CapabilityGrant {
     pub access: GrantAccess,
 }
 
+/// A host cache directory every sandbox of a detecting project writes: created by the supervisor
+/// before a child runs, granted read-write as a subtree, and linked from `private_link` inside
+/// the private environment when the tool finds it there rather than through a variable.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct CacheMount {
-    pub source: PathBuf,
-    pub private_target: Option<PathBuf>,
+pub struct SharedCache {
+    pub path: PathBuf,
+    pub private_link: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -183,7 +189,7 @@ pub struct BootstrapProgram {
 pub struct CapabilityContribution {
     pub env: BTreeMap<&'static str, EnvAction>,
     pub grants: Vec<CapabilityGrant>,
-    pub cache_mounts: Vec<CacheMount>,
+    pub shared_caches: Vec<SharedCache>,
     /// Checkout-relative tool paths and their destinations relative to the build volume.
     pub build_state: Vec<BuildStatePath>,
     pub daemon_isolation: DaemonIsolation,
@@ -219,7 +225,6 @@ pub struct Detector {
     /// At least one of these files must exist; an empty list adds no condition.
     pub any: &'static [&'static str],
     pub contribute: fn(&DetectionContext<'_>) -> Result<CapabilityContribution>,
-    pub host_cache_homes: &'static [&'static SharedToolHome],
     /// A convention reached through another project file or a tracked nested manifest.
     pub reached_from: Option<ReachedConvention>,
 }
@@ -395,6 +400,20 @@ fn detect_with(
             context.workspace_root.join(".cowshed/bin"),
         ],
     )?;
+    // A repository-placed cache is found through `$HOME/<path>`: the private HOME links to the
+    // host's own directory, so the host and every sandbox reach the same bytes.
+    result
+        .contribution
+        .shared_caches
+        .extend(
+            context
+                .repository_caches
+                .iter()
+                .map(|relative| SharedCache {
+                    path: context.home.join(relative),
+                    private_link: Some(context.environment_root.join("home").join(relative)),
+                }),
+        );
     normalize(&mut result.contribution);
     Ok(result)
 }
@@ -477,10 +496,10 @@ fn merge(
             output.env.insert(name, action);
         }
     }
-    for mount in &contribution.cache_mounts {
-        if let Some(target) = &mount.private_target {
-            for prior in &output.cache_mounts {
-                if prior.private_target.as_ref() == Some(target) && prior.source != mount.source {
+    for cache in &contribution.shared_caches {
+        if let Some(target) = &cache.private_link {
+            for prior in &output.shared_caches {
+                if prior.private_link.as_ref() == Some(target) && prior.path != cache.path {
                     let previous = owners
                         .get(&ContributionKey::CacheTarget(target.clone()))
                         .expect("every cache target records its owner");
@@ -522,7 +541,7 @@ fn merge(
         output.shell = Some(shell);
     }
     output.grants.extend(contribution.grants);
-    output.cache_mounts.extend(contribution.cache_mounts);
+    output.shared_caches.extend(contribution.shared_caches);
     merge_build_state(&mut output.build_state, contribution.build_state)?;
     output
         .daemon_isolation
@@ -579,8 +598,8 @@ fn normalize(contribution: &mut CapabilityContribution) {
             index += 1;
         }
     }
-    contribution.cache_mounts.sort();
-    contribution.cache_mounts.dedup();
+    contribution.shared_caches.sort();
+    contribution.shared_caches.dedup();
     contribution.build_state.sort();
     contribution.build_state.dedup();
     contribution.daemon_isolation.directories.sort();
@@ -745,66 +764,47 @@ pub fn validate_override_directory(value: &str) -> std::result::Result<PathBuf, 
     Ok(path.to_owned())
 }
 
-/// Reuse the host's exact cache spelling: for every tool once its links reach the shared cache
-/// volume, and for a cache checkouts link into from the start — any other spelling rewrites every
-/// link a `bun install` writes, so before relocation the sandbox reads the host cache instead of
-/// filling a private one.
-pub fn shared_tool_contribution(
-    context: &DetectionContext<'_>,
+/// Share `tool`'s cache directories where the host keeps them and point a child at that path.
+///
+/// The cache directories are read-write subtrees the supervisor creates; a split tool's root is a
+/// literal read and its root state files read-write literals, so configuration, credentials and
+/// binaries beside the caches stay under the HOME read deny. The variable is owned: a caller's own
+/// value would name a second cache, or another checkout's.
+pub fn add_shared_tool_home(
+    contribution: &mut CapabilityContribution,
+    home: &Path,
     tool: &'static SharedToolHome,
-) -> Result<CapabilityContribution> {
-    let mut contribution = CapabilityContribution::default();
-    let links = tool.links(context.home, context.caches_root);
-    let shared = links.iter().all(HostCache::is_shared);
-    let host = tool.host_path(context.home);
+) {
+    let host = tool.host_path(home);
     if let Some(variable) = tool.variable {
-        contribution.env.insert(
-            variable,
-            if shared || tool.linked_from_checkouts {
-                EnvAction::Own(host.clone().into_os_string())
-            } else {
-                EnvAction::Unset
-            },
-        );
-    }
-    if context.caches_root.is_dir() {
         contribution
-            .cache_mounts
-            .extend(links.iter().map(|link| CacheMount {
-                source: link.shared.clone(),
-                private_target: None,
-            }));
+            .env
+            .insert(variable, EnvAction::Own(host.clone().into_os_string()));
     }
-    if shared {
+    if let SharedLayout::Split { state_files, .. } = tool.layout {
         contribution.grants.push(CapabilityGrant {
             path: host.clone(),
             scope: GrantScope::Literal,
             access: GrantAccess::Read,
         });
-        if let SharedLayout::Split { links, state_files } = tool.layout {
-            contribution
-                .grants
-                .extend(links.iter().map(|(child, _)| CapabilityGrant {
-                    path: host.join(child),
-                    scope: GrantScope::Literal,
-                    access: GrantAccess::Read,
-                }));
-            contribution
-                .grants
-                .extend(state_files.iter().map(|file| CapabilityGrant {
-                    path: host.join(file),
-                    scope: GrantScope::Literal,
-                    access: GrantAccess::ReadWrite,
-                }));
-        }
-    } else if tool.linked_from_checkouts {
-        contribution.grants.push(CapabilityGrant {
-            path: host,
-            scope: GrantScope::Subtree,
-            access: GrantAccess::Read,
-        });
+        contribution
+            .grants
+            .extend(state_files.iter().map(|file| CapabilityGrant {
+                path: host.join(file),
+                scope: GrantScope::Literal,
+                access: GrantAccess::ReadWrite,
+            }));
     }
-    Ok(contribution)
+    contribution
+        .shared_caches
+        .extend(
+            tool.cache_directories(home)
+                .into_iter()
+                .map(|path| SharedCache {
+                    path,
+                    private_link: None,
+                }),
+        );
 }
 
 /// Find an individual installed program without inheriting the supervisor's PATH.
@@ -919,7 +919,6 @@ pub mod test_support {
     pub struct Fixture {
         pub root: PathBuf,
         pub home: PathBuf,
-        pub caches: PathBuf,
         pub environment: PathBuf,
         pub runtime: PathBuf,
     }
@@ -929,16 +928,12 @@ pub mod test_support {
             fs::create_dir_all(&root).unwrap();
             let root = root.canonicalize().unwrap();
             let home = root.join("host-home");
-            let caches = root.join("host-caches");
             let environment = root.join(".cowshed");
             let runtime = environment.join("run");
-            for path in [&home, &caches] {
-                fs::create_dir_all(path).unwrap();
-            }
+            fs::create_dir_all(&home).unwrap();
             Self {
                 root,
                 home,
-                caches,
                 environment,
                 runtime,
             }
@@ -949,7 +944,7 @@ pub mod test_support {
                 project_root: &self.root,
                 command_cwd: &self.root,
                 home: &self.home,
-                caches_root: &self.caches,
+                repository_caches: &[],
                 environment_root: &self.environment,
                 runtime_dir: &self.runtime,
                 trust_bundle: None,
@@ -998,7 +993,7 @@ pub fn mint_daemon_states(workspace: &Path, home: &Path) -> Result<Vec<PathBuf>>
         project_root: workspace,
         command_cwd: workspace,
         home,
-        caches_root: Path::new(crate::storage::bootstrap::CACHES_ROOT),
+        repository_caches: &[],
         environment_root: &private,
         runtime_dir: &runtime,
         trust_bundle: None,

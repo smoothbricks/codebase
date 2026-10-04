@@ -276,19 +276,14 @@ async fn absent_volumes_collapse_into_one_explicit_provisioning_batch() {
     let batches: Vec<_> = provision_receiver.try_iter().collect();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].0, "disk3");
-    assert_eq!(batches[0].1.len(), 2);
+    // The store alone: the retired caches volume is never created.
+    assert_eq!(batches[0].1.len(), 1);
     assert_eq!(batches[0].1[0].name(), "cowshed.store");
     assert_eq!(
         batches[0].1[0].mountpoint(),
         Path::new("/private/cowshed/store")
     );
     assert!(matches!(batches[0].1[0].kind(), ApfsProvisionKind::Create));
-    assert_eq!(batches[0].1[1].name(), "cowshed.caches");
-    assert_eq!(
-        batches[0].1[1].mountpoint(),
-        Path::new("/private/cowshed/caches")
-    );
-    assert!(matches!(batches[0].1[1].kind(), ApfsProvisionKind::Create));
 }
 
 #[tokio::test]
@@ -307,10 +302,7 @@ async fn existing_only_missing_volumes_rejects_before_dispatch_with_setup_hint()
     match error {
         NativeBootstrapError::StorageSetupRequired { actions, hint } => {
             assert_eq!(hint, "cowshed setup");
-            assert_eq!(
-                actions,
-                ["create APFS volumes cowshed.store, cowshed.caches"]
-            );
+            assert_eq!(actions, ["create APFS volumes cowshed.store"]);
         }
         error => panic!("unexpected error: {error}"),
     }

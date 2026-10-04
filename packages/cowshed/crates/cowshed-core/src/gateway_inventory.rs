@@ -316,7 +316,7 @@ fn project_substrate_config(
     storage: &ValidatedHostStorage,
     checkout_path: PathBuf,
 ) -> ApfsSubstrateConfig {
-    ApfsSubstrateConfig::new(storage.store(), storage.caches(), checkout_path)
+    ApfsSubstrateConfig::new(storage.store(), checkout_path)
 }
 
 /// One project's mount side, opened once and mounting nothing on its own.
@@ -1855,9 +1855,8 @@ mod tests {
             ));
             let home = root.join("home");
             fs::create_dir_all(&home).expect("fixture home");
-            let roots = CanonicalRoots::at(root.join("store"), root.join("caches"));
+            let roots = CanonicalRoots::at(root.join("store"));
             fs::create_dir_all(roots.store()).expect("fixture store");
-            fs::create_dir_all(roots.caches()).expect("fixture caches");
             fs::create_dir_all(roots.telemetry()).expect("fixture telemetry");
             Self {
                 root,

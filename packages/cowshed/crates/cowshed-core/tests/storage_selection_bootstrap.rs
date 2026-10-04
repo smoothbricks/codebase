@@ -280,6 +280,88 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
     }
 }
 
+/// `[caches] home` reuses `[sandbox] deny`'s parsing: a one-line array of HOME-relative paths of
+/// plain components, normalized, sorted and deduplicated; an empty, absolute or escaping entry is
+/// refused, and so is a section without its key.
+#[test]
+fn caches_home_is_an_array_of_home_relative_paths() {
+    let config = parse_cowshed_config(
+        "[caches]\n# the TypeScript plugin cache\nhome = [\".cache/ttsc\", \"Library/Caches/./tool\", \".cache/ttsc\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.caches_home(),
+        [
+            PathBuf::from(".cache/ttsc"),
+            PathBuf::from("Library/Caches/tool")
+        ]
+    );
+    assert!(config.sandbox_deny().is_empty());
+    assert!(
+        parse_cowshed_config("[sandbox]\ndeny = [\".runtime\"]\n")
+            .unwrap()
+            .caches_home()
+            .is_empty()
+    );
+    assert!(
+        parse_cowshed_config("[caches]\nhome = []\n")
+            .unwrap()
+            .caches_home()
+            .is_empty()
+    );
+
+    let invalid = [
+        ("[caches]\n", "missing [caches] key \"home\""),
+        (
+            "[caches]\nhome = \".cache/ttsc\"\n",
+            "[caches] home at line 2 must be an array of quoted paths",
+        ),
+        ("[caches]\nhome = [7]\n", "array of quoted paths"),
+        ("[caches]\nhome = [\"\"]\n", "HOME-relative"),
+        ("[caches]\nhome = [\"/etc\"]\n", "HOME-relative"),
+        ("[caches]\nhome = [\"..\"]\n", "HOME-relative"),
+        ("[caches]\nhome = [\"../other-user\"]\n", "HOME-relative"),
+        (
+            "[caches]\nhome = [\".cache/../../escape\"]\n",
+            "HOME-relative",
+        ),
+        ("[caches]\nhome = [\"a\"]\nhome = [\"b\"]\n", "duplicated"),
+        ("[caches]\n[caches]\n", "duplicated"),
+        ("[caches]\nshared = [\"a\"]\n", "unknown [caches] key"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
+/// Main's `.cowshed.toml` is the only source of `[sandbox] deny` and `[caches] home`: an absent
+/// file declares nothing, and an invalid one refuses rather than run without the deny.
+#[test]
+fn main_cowshed_config_reads_main_and_refuses_an_invalid_file() {
+    let main = std::env::temp_dir().join(format!(
+        "cowshed-main-config-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&main).unwrap();
+    let absent = main_cowshed_config(&main).unwrap();
+    std::fs::write(
+        main.join(".cowshed.toml"),
+        "[sandbox]\n# runtime secrets live here\ndeny = [\".runtime\"]\n[caches]\nhome = [\".cache/ttsc\"]\n",
+    )
+    .unwrap();
+    let declared = main_cowshed_config(&main).unwrap();
+    std::fs::write(main.join(".cowshed.toml"), "[caches]\nhome = [\"../x\"]\n").unwrap();
+    let invalid = main_cowshed_config(&main).expect_err("escaping cache refused");
+    std::fs::remove_dir_all(&main).unwrap();
+
+    assert!(absent.sandbox_deny().is_empty() && absent.caches_home().is_empty());
+    assert_eq!(declared.sandbox_deny(), [PathBuf::from(".runtime")]);
+    assert_eq!(declared.caches_home(), [PathBuf::from(".cache/ttsc")]);
+    assert_eq!(invalid.code.as_str(), "usage");
+}
+
 #[test]
 fn capability_overrides_are_strict_convention_overrides() {
     use cowshed_core::capabilities::CapabilityId;
@@ -435,41 +517,29 @@ fn explicit_zfs_is_exact_and_conflicting_evidence_is_ambiguous() {
     );
 }
 
+/// A fresh APFS host gets the store alone: the caches volume is retired and never created.
 #[test]
 fn apfs_plan_has_exact_roots_commands_markers_and_store_first_order() {
     let selected = select_substrate(apfs_evidence(), None).unwrap();
     let plan = plan_bootstrap(selected, Path::new("/Users/alice"), absent_apfs_storage()).unwrap();
     assert_eq!(plan.home(), Path::new("/Users/alice"));
     assert_eq!(plan.roots().store(), Path::new("/private/cowshed/store"));
-    assert_eq!(plan.roots().caches(), Path::new("/private/cowshed/caches"));
 
     assert!(matches!(
         &plan.operations()[0],
         HostOperation::GuardMountpoint { path, role: VolumeRole::Store, substrate: SubstrateKind::Apfs }
             if path == Path::new("/private/cowshed/store")
     ));
-    assert!(matches!(
-        &plan.operations()[1],
-        HostOperation::GuardMountpoint { path, role: VolumeRole::Caches, substrate: SubstrateKind::Apfs }
-            if path == Path::new("/private/cowshed/caches")
-    ));
-    let HostOperation::ProvisionApfsVolumes { container, volumes } = &plan.operations()[2] else {
+    let HostOperation::ProvisionApfsVolumes { container, volumes } = &plan.operations()[1] else {
         panic!("absent APFS storage must use one provisioning batch");
     };
-    assert_eq!(plan.operations().len(), 3);
+    assert_eq!(plan.operations().len(), 2);
     assert_eq!(container, "disk3");
-    assert_eq!(volumes.len(), 2);
+    assert_eq!(volumes.len(), 1);
     assert_eq!(volumes[0].name(), APFS_STORE_VOLUME);
     assert_eq!(volumes[0].mountpoint(), Path::new("/private/cowshed/store"));
     assert_eq!(volumes[0].role(), VolumeRole::Store);
     assert!(matches!(volumes[0].kind(), ApfsProvisionKind::Create));
-    assert_eq!(volumes[1].name(), APFS_CACHES_VOLUME);
-    assert_eq!(
-        volumes[1].mountpoint(),
-        Path::new("/private/cowshed/caches")
-    );
-    assert_eq!(volumes[1].role(), VolumeRole::Caches);
-    assert!(matches!(volumes[1].kind(), ApfsProvisionKind::Create));
 }
 
 #[test]
@@ -496,25 +566,18 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed",
             "/usr/sbin/zfs create -o mountpoint=/private/cowshed/store tank/cowshed/store",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=store tank/cowshed/store",
-            "/usr/sbin/zfs create -o mountpoint=/private/cowshed/caches tank/cowshed/caches",
-            "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=caches tank/cowshed/caches",
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed/projects",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=projects tank/cowshed/projects",
         ]
     );
     assert!(commands.iter().all(|command| !command.contains("zpool")));
+    // The caches dataset is retired: a fresh pool never gets one.
+    assert!(commands.iter().all(|command| !command.contains("caches")));
 
     let store_marker = plan
         .operations()
         .iter()
         .position(|operation| matches!(operation, HostOperation::WriteMarkerAtomic { marker, .. } if marker.role() == VolumeRole::Store))
-        .unwrap();
-    let cache_create = plan
-        .operations()
-        .iter()
-        .position(|operation| {
-            command_line(operation).is_some_and(|command| command.ends_with("tank/cowshed/caches"))
-        })
         .unwrap();
     let projects_create = plan
         .operations()
@@ -525,7 +588,7 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
             })
         })
         .unwrap();
-    assert!(store_marker < cache_create && cache_create < projects_create);
+    assert!(store_marker < projects_create);
 }
 #[test]
 fn create_or_heal_uses_only_exact_existing_storage_evidence() {
@@ -545,7 +608,7 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
         })
         .collect();
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].len(), 2);
+    assert_eq!(batches[0].len(), 1);
 
     let repeated = plan_bootstrap(
         apfs.clone(),
@@ -900,12 +963,13 @@ proptest! {
             })
             .flatten()
             .collect();
+        // Only the store is ever created; a retired caches volume is at most mounted again.
         prop_assert_eq!(
             provisioned
                 .iter()
                 .filter(|volume| matches!(volume.kind(), ApfsProvisionKind::Create))
                 .count(),
-            usize::from(store_state == 0) + usize::from(caches_state == 0)
+            usize::from(store_state == 0)
         );
         let commands: Vec<_> = first.operations().iter().filter_map(command_line).collect();
         prop_assert_eq!(

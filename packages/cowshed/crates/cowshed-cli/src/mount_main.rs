@@ -184,11 +184,7 @@ impl MainMountBackend for NativeMainMountBackend {
         resolved: &ResolvedMainMount,
         intent: MountIntent,
     ) -> Result<PathBuf> {
-        let config = ApfsSubstrateConfig::new(
-            self.storage.store(),
-            self.storage.caches(),
-            &resolved.checkout_path,
-        );
+        let config = ApfsSubstrateConfig::new(self.storage.store(), &resolved.checkout_path);
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
             .map_err(storage_error)?;
         let substrate = ApfsSubstrate::new(config, host);

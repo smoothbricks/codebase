@@ -48,8 +48,7 @@ impl Fixture {
         let scratch = ScratchRoot::new(label).expect("scratch APFS root");
         let checkout = scratch.path().join("checkout");
         let store = scratch.path().join("store");
-        let caches = scratch.path().join("caches");
-        for path in [&checkout, &store, &caches] {
+        for path in [&checkout, &store] {
             fs::create_dir_all(path).expect("fixture directory");
         }
         // Adoption mints main from the store's blank template: the run's, seeded here.
@@ -63,10 +62,8 @@ impl Fixture {
         .expect("workspace hooks ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
-        let storage = ValidatedHostStorage::new(
-            scratch.path().to_path_buf(),
-            CanonicalRoots::at(store, caches),
-        );
+        let storage =
+            ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
         Self {
             _scratch: scratch,
             checkout,

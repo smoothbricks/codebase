@@ -53,6 +53,15 @@ impl HostSetupPlan {
     }
 }
 
+/// Whether a setup run deletes the retired caches volume (03_caches.md, "Retiring the caches
+/// volume", step 4). Only `cowshed setup --retire-caches-volume` asks: a plain setup keeps an
+/// existing volume mounted and pinned and never escalates for its retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CachesVolume {
+    Keep,
+    Retire,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum HostAction {
@@ -89,11 +98,18 @@ pub enum HostAction {
     InstallMountService {
         label: String,
     },
+    /// Delete the retired caches volume, which holds nothing but its marker. Its `/etc/fstab` pin
+    /// and its mount-service entry go with it, rewritten without it in the same session.
+    DeleteVolume {
+        name: String,
+        uuid: String,
+        mounted_at: PathBuf,
+    },
 }
 
 impl HostAction {
     fn is_non_destructive(&self) -> bool {
-        !matches!(self, Self::CreateVolume { .. })
+        !matches!(self, Self::CreateVolume { .. } | Self::DeleteVolume { .. })
     }
 }
 
@@ -373,6 +389,8 @@ pub enum NativeBootstrapError {
     },
     #[error("native bootstrap evidence blocking lane closed without a result")]
     EvidenceLaneClosed,
+    #[error("{0}")]
+    CachesVolumeNotRetirable(String),
     #[error(transparent)]
     Selection(#[from] SelectionError),
     #[error(transparent)]

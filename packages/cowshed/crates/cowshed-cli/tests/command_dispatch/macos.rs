@@ -65,19 +65,16 @@ impl Fixture {
         let scratch = ScratchRoot::new("cli").expect("scratch APFS root");
         let checkout = scratch.path().join("checkout");
         let store = scratch.path().join("store");
-        let caches = scratch.path().join("caches");
         let granted = scratch.path().join("granted");
-        for path in [&store, &caches, &granted] {
+        for path in [&store, &granted] {
             fs::create_dir_all(path).expect("fixture directory");
         }
         // Main and build volumes are minted from the store's blank template: the run's, seeded
         // here, at the 1 GiB test cap both `adopt --capacity` and `.cowshed.toml` ask for.
         blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
         clone_tree(&checkout_template(project), &checkout);
-        let storage = ValidatedHostStorage::new(
-            scratch.path().to_path_buf(),
-            CanonicalRoots::at(store, caches),
-        );
+        let storage =
+            ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
         if let Project::Build {
             rust: Some(rust), ..
         } = project
@@ -113,7 +110,7 @@ impl Fixture {
         .expect("reopen persisted project runtime")
     }
     async fn start_gateway(&mut self) {
-        let cache = self.storage.caches().join("mirror");
+        let cache = cowshed_core::host_dirs::gateway_mirror(self.storage.home());
         let audit_root = self.storage.telemetry().join("gateway");
         fs::create_dir_all(&cache).expect("gateway mirror cache");
         fs::create_dir_all(&audit_root).expect("gateway audit directory");

@@ -1,68 +1,39 @@
 //! Host tool caches a capability shares with every checkout on the host.
 //!
-//! A shared tool home is reached through ONE literal path: the host's own default, which host
-//! setup links into the caches volume. Cargo and Bun record where their cache lives, so no other
-//! spelling of the same bytes shares it. Cargo fingerprints a registry or git dependency by the
-//! absolute path of its source under `$CARGO_HOME`: a `$CARGO_HOME` at any other path — a
-//! sandbox's private HOME, even one whose `registry` links to the same bytes — dirties every
-//! dependency a clone's copied `target/` holds. Bun's isolated linker writes
-//! `node_modules/.bun/<package>` as absolute symlinks into its install cache, so main's
-//! `node_modules` and every clone's resolve only if each names the same cache path. A sandboxed
-//! child of a project that uses the tool is therefore pointed at the host path once host setup
-//! has relocated the tool's caches; until then it keeps the tool's private default under the
-//! sandbox HOME, and `cowshed doctor` says why. A cache checkouts link into is the exception:
-//! a private store would rewrite every link the child's `bun install` writes, so the child is
-//! pointed at the host path from the start and reads it until relocation makes it writable.
+//! A shared tool home is reached through ONE literal path: the tool's own default in the host
+//! HOME, the directory the host's own tools already use unconfigured. Cargo and Bun record where
+//! their cache lives, so no other spelling of the same bytes shares it. Cargo fingerprints a
+//! registry or git dependency by the absolute path of its source under `$CARGO_HOME`: a
+//! `$CARGO_HOME` at any other path — a sandbox's private HOME, even one whose `registry` links to
+//! the same bytes — dirties every dependency a clone's copied `target/` holds. Bun's isolated
+//! linker writes `node_modules/.bun/<package>` as absolute symlinks into its install cache, so
+//! main's `node_modules` and every clone's resolve only if each names the same cache path. A
+//! sandboxed child of a project that uses the tool is therefore pointed at the host path, and the
+//! HOME read deny is carved back for exactly the tool's cache directories (03_caches.md).
 
 use std::path::{Path, PathBuf};
-
-/// One host cache path and the directory on the caches volume it belongs in.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostCache {
-    pub host: PathBuf,
-    pub shared: PathBuf,
-}
-
-impl HostCache {
-    /// Whether the host path already resolves to the shared directory.
-    pub fn is_shared(&self) -> bool {
-        matches!(
-            (
-                std::fs::canonicalize(&self.host),
-                std::fs::canonicalize(&self.shared),
-            ),
-            (Ok(host), Ok(shared)) if host == shared
-        )
-    }
-}
 
 /// A tool cache every checkout on the host reaches through the host's own default path.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SharedToolHome {
     /// The variable that points a sandboxed child at the host path, for a tool that reads one; a
-    /// cache reached only through the host link (Nix's client state) names none.
+    /// cache reached only through a private link (Nix's client state, Gradle's caches) names none.
     pub variable: Option<&'static str>,
     /// The tool's own default directory under HOME: the host uses it unconfigured.
     pub home: &'static str,
     pub layout: SharedLayout,
-    /// Checkouts hold symlinks into the cache (Bun's isolated linker), so the sandboxed tool is
-    /// pointed at the host path even while it is still a private directory, and that directory
-    /// stays readable to every sandbox: a cloned `node_modules` would otherwise resolve to EPERM
-    /// inside the sandbox while the same tree works on the host, and an install into a private
-    /// store would relink every package to a path no other checkout has.
-    pub linked_from_checkouts: bool,
 }
 
-/// Where a [`SharedToolHome`]'s bytes live on the caches volume.
+/// Which parts of a [`SharedToolHome`] a sandbox may write.
 #[derive(Debug, Eq, PartialEq)]
 pub enum SharedLayout {
-    /// The host path itself links to this directory under the caches root.
-    Whole(&'static str),
-    /// The host path stays a host directory holding configuration, credentials or binaries that
-    /// never leave it. Only the `(child, directory under the caches root)` links inside it are
-    /// shared, and `state_files` are the only files the tool writes at its root beside them.
+    /// The tool's directory is itself the cache, shared read-write whole.
+    Whole,
+    /// The tool's directory stays host-owned, holding configuration, credentials or binaries that
+    /// never become writable. Only `caches` beneath it are shared read-write, and `state_files`
+    /// are the only files the tool writes at its root beside them.
     Split {
-        links: &'static [(&'static str, &'static str)],
+        caches: &'static [&'static str],
         state_files: &'static [&'static str],
     },
 }
@@ -73,21 +44,14 @@ impl SharedToolHome {
         home.join(self.home)
     }
 
-    /// Each host link with the shared directory it must resolve to.
-    pub fn links(&self, home: &Path, caches: &Path) -> Vec<HostCache> {
+    /// Every cache directory the tool writes, at its host path.
+    pub fn cache_directories(&self, home: &Path) -> Vec<PathBuf> {
         let host = self.host_path(home);
         match &self.layout {
-            SharedLayout::Whole(shared) => vec![HostCache {
-                host,
-                shared: caches.join(shared),
-            }],
-            SharedLayout::Split { links, .. } => links
-                .iter()
-                .map(|(child, shared)| HostCache {
-                    host: host.join(child),
-                    shared: caches.join(shared),
-                })
-                .collect(),
+            SharedLayout::Whole => vec![host],
+            SharedLayout::Split { caches, .. } => {
+                caches.iter().map(|cache| host.join(cache)).collect()
+            }
         }
     }
 }

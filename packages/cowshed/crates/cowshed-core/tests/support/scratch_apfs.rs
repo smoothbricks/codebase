@@ -181,11 +181,9 @@ fn process_is_gone(pid: i32) -> bool {
 fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
     let attached = SystemCommandRunner.attached_disk_images()?;
     let root = Path::new("/private/tmp");
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(root, root, root),
-    )
-    .map_err(std::io::Error::other)?;
+    let host =
+        MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(root, root))
+            .map_err(std::io::Error::other)?;
     let mut first_error = None;
     for image in attached
         .iter()

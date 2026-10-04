@@ -1,15 +1,14 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    host_program_directories, shared_tool_contribution,
+    add_shared_tool_home, host_program_directories,
 };
 use crate::Result;
 
 pub static ZIG_HOME: SharedToolHome = SharedToolHome {
     variable: Some("ZIG_GLOBAL_CACHE_DIR"),
     home: ".cache/zig",
-    layout: SharedLayout::Whole("zig"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
 
 pub const DETECTOR: Detector = Detector {
@@ -19,12 +18,12 @@ pub const DETECTOR: Detector = Detector {
     all: &["build.zig"],
     any: &[],
     contribute,
-    host_cache_homes: &[&ZIG_HOME],
     reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
-    let mut contribution = shared_tool_contribution(context, &ZIG_HOME)?;
+    let mut contribution = CapabilityContribution::default();
+    add_shared_tool_home(&mut contribution, context.home, &ZIG_HOME);
     add_bootstrap(
         &mut contribution,
         context,

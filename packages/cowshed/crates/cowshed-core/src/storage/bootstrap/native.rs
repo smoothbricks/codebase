@@ -11,10 +11,10 @@ mod linux;
 mod macos;
 
 pub use shared::{
-    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, SystemBootstrapHost,
-    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
-    execute_native_bootstrap_plan,
+    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
+    SystemBootstrapHost, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
+    VolumeOutcome, VolumeState, execute_native_bootstrap_plan,
 };
 
 #[cfg(target_os = "macos")]

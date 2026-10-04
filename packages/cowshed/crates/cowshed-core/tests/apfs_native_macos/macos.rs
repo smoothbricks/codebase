@@ -253,11 +253,7 @@ impl Fixture {
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(
-            &self.root,
-            self.root.join("caches"),
-            self.root.join("mount"),
-        )
+        ApfsSubstrateConfig::new(&self.root, self.root.join("mount"))
     }
 }
 
@@ -308,11 +304,7 @@ impl RealFixture {
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(
-            self.root(),
-            self.root().join("caches"),
-            self.root().join("mount"),
-        )
+        ApfsSubstrateConfig::new(self.root(), self.root().join("mount"))
     }
 
     /// A fresh production host. Each one starts with an empty mount registry, so a second one is
@@ -519,7 +511,7 @@ fn native_host(
 fn native_host_at(root: &Path) -> MacOsApfsExecutionHost<RecordingRunner> {
     MacOsApfsExecutionHost::with_recovery_sources(
         RecordingRunner::default(),
-        ApfsSubstrateConfig::new(root, root.join("caches"), root.join("mount")),
+        ApfsSubstrateConfig::new(root, root.join("mount")),
         SystemKernelMountSource,
         ByteRecoveryMarkers,
     )
@@ -2386,11 +2378,7 @@ fn native_volume_rename_crosses_the_backend_boundary() {
 fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
     let fixture = Fixture::new("gc-store");
     let missing_root = fixture.root.join("missing-store");
-    let config = ApfsSubstrateConfig::new(
-        &missing_root,
-        missing_root.join("caches"),
-        fixture.root.join("mount"),
-    );
+    let config = ApfsSubstrateConfig::new(&missing_root, fixture.root.join("mount"));
     let host =
         MacOsApfsExecutionHost::new(RecordingRunner::default(), config.clone()).expect("host");
     assert_eq!(

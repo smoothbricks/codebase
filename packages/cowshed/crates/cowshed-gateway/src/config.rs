@@ -249,8 +249,9 @@ pub struct GatewayConfig {
     pub git_helper_executable: Option<PathBuf>,
     /// Authoritative private directory for Linux workspace data sockets.
     pub data_socket_root: Option<PathBuf>,
-    /// Canonical root of the dedicated host cache volume in production.
-    pub production_cache_volume: Option<PathBuf>,
+    /// cowshed's user cache directory in production (`~/Library/Caches/dev.cowshed`, Linux
+    /// `$XDG_CACHE_HOME/cowshed`); the mirror cache must be exactly its `mirror`.
+    pub production_cache_dir: Option<PathBuf>,
     pub authorized_control_uid: u32,
     pub limits: GatewayLimits,
     pub timeouts: GatewayTimeouts,
@@ -271,7 +272,7 @@ impl Default for GatewayConfig {
             simulator_drop_root: None,
             git_helper_executable: None,
             data_socket_root: None,
-            production_cache_volume: None,
+            production_cache_dir: None,
             authorized_control_uid: unsafe { libc::geteuid() },
             limits: GatewayLimits::default(),
             timeouts: GatewayTimeouts::default(),
@@ -322,11 +323,11 @@ impl GatewayConfig {
         if control.file_name().and_then(|name| name.to_str()) != Some("gateway.sock") {
             return Err(ConfigError::InvalidProductionCacheRoot);
         }
-        let cache_volume = self
-            .production_cache_volume
+        let cache_dir = self
+            .production_cache_dir
             .as_deref()
             .ok_or(ConfigError::InvalidProductionCacheRoot)?;
-        let expected = cache_volume.join("mirror");
+        let expected = cache_dir.join("mirror");
         let canonical_expected = std::fs::canonicalize(&expected)
             .map_err(|_| ConfigError::InvalidProductionCacheRoot)?;
         let canonical_configured = std::fs::canonicalize(&self.mirror_cache.cache_root)

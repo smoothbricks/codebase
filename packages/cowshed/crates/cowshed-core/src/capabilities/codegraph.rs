@@ -13,7 +13,6 @@ pub const DETECTOR: Detector = Detector {
     scope: DetectionScope::Project,
     all: &[".codegraph"],
     any: &[],
-    host_cache_homes: &[],
     reached_from: None,
     contribute,
 };
@@ -54,7 +53,7 @@ mod tests {
         assert!(
             detected.env.is_empty()
                 && detected.grants.is_empty()
-                && detected.cache_mounts.is_empty()
+                && detected.shared_caches.is_empty()
         );
         std::fs::remove_dir(fixture.root.join(".codegraph")).unwrap();
         assert!(DETECTOR.detect(&fixture.context()).unwrap().is_none());

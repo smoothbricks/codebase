@@ -224,10 +224,9 @@ pub struct SetupArgs {
     /// Build the patched sccache from cowshed's own nix flake, root the result, and start its
     /// LaunchAgent. Opt-in because not every cowshed user writes Rust and it requires nix.
     pub sccache: bool,
-    /// Relocate the host's own read-at-build caches onto the caches volume. Opt-in because it
-    /// moves directories out of the user's home, which only a host no declarative manager owns may
-    /// have done imperatively.
-    pub imperative_host_setup: bool,
+    /// Delete the retired caches volume inside setup's one authorization, once the migration has
+    /// left it holding nothing but its marker. A plain setup never escalates for it.
+    pub retire_caches_volume: bool,
 }
 
 /// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
@@ -699,7 +698,7 @@ fn cli_command() -> ClapCommand {
             flag("uninstall"),
             flag("force"),
             flag("sccache"),
-            flag("imperative-host-setup"),
+            flag("retire-caches-volume"),
             value("mount-root"),
         ]))
         .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
@@ -1675,13 +1674,15 @@ const SETUP: CommandSpec = CommandSpec {
     trailing: "",
     summary: "create or repair host storage",
     about: &[
-        "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are created; existing volumes are never deleted. Detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
+        "Brings this host's store volume to its canonical state and pins it in `/etc/fstab`: an absent store is created; no volume is ever deleted unasked. A detached or mis-mounted one is remounted where it belongs, its marker is validated, and the fstab line that survives a reboot is written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
+        "On a host that still has the retired `cowshed.caches` volume, setup moves everything it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to cowshed's cache directory, sccache's store to sccache's default, a repository's cache to the `[caches] home` path its main declares — merging where both sides hold a cache and naming, with its size, anything it cannot place. That migration needs no authorization. Once the volume holds nothing but its marker, setup names `cowshed setup --retire-caches-volume` as the attended step that deletes it.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
         "Setup also reconciles the installed host-service binaries with the build running the repair: the gateway copy under the support directory is byte-compared against the invoking build, and a stale copy is reinstalled through the same atomic plan `gateway start` uses and the agent is kickstarted, so the running daemon picks the new bytes up. A service left running a binary from before this build is host drift a repair ends — setup never reports such a host as set up. Run setup from a release build — the platform `cli-*` target's `production` configuration (`nx run cowshed:cli-arm64-macos:production` on Apple silicon) or `cargo build --release -p cowshed-cli`; `nx run cowshed:build` builds a debug one, and a debug build is refused as the supervised binary.",
         "After successful storage repair, setup refreshes every adopted main's build state through the same path jobs use. It announces rebuild-only migration before discarding contributed incremental directories, protects tracked source files, and links an empty build volume for the next build to repopulate. No build state is copied. One refusing project does not hide later projects: each is reported on stderr, then setup exits with the first typed failure and a count. Uninstall never migrates build state.",
         "`--mount-root <dir>` sets the host session workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`. The root can change only while every session workspace is detached; mains stay mounted directly at their checkout paths.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
         "`--sccache` builds the patched sccache from the flake this package ships at `nix/sccache`, registers a nix GC root for the result under cowshed's support directory, and starts a LaunchAgent running that exact store path. It is opt-in: not every cowshed user writes Rust, and it needs nix. A host without nix is told so and the rest of the run still repairs storage. The plist names the resolved `/nix/store` path rather than the GC root symlink, so a rebuild is a plist change — and therefore an explicit restart — instead of a different binary appearing under a loaded agent.",
+        "`--retire-caches-volume` deletes the retired caches volume, removes its `/etc/fstab` pin and drops it from the storage mount service, inside the same single authorization. It refuses while the volume holds anything but its marker.",
     ],
     options: &[
         Opt {
@@ -1701,8 +1702,8 @@ const SETUP: CommandSpec = CommandSpec {
             meaning: "build the patched sccache from the shipped nix flake, root it, and run it as a LaunchAgent (requires nix)",
         },
         Opt {
-            spelling: "--imperative-host-setup",
-            meaning: "move the host's cargo, zig, gradle and nix caches onto the caches volume and link them back (hosts no declarative manager owns)",
+            spelling: "--retire-caches-volume",
+            meaning: "delete the retired caches volume once setup has moved everything it held (one administrator authorization)",
         },
     ],
 };
@@ -1724,7 +1725,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         None => None,
     };
     let sccache = flagged(matches, "sccache");
-    let imperative_host_setup = flagged(matches, "imperative-host-setup");
+    let retire_caches_volume = flagged(matches, "retire-caches-volume");
     if mount_root.is_some() && (uninstall || force) {
         return Err(UsageError::new(
             "--mount-root cannot be combined with --uninstall",
@@ -1737,9 +1738,9 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
             USAGE,
         ));
     }
-    if imperative_host_setup && (uninstall || force) {
+    if retire_caches_volume && (uninstall || force) {
         return Err(UsageError::new(
-            "--imperative-host-setup relocates the host caches; --uninstall leaves them alone",
+            "--retire-caches-volume repairs a host; --uninstall tears it down",
             USAGE,
         ));
     }
@@ -1754,7 +1755,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         force,
         mount_root,
         sccache,
-        imperative_host_setup,
+        retire_caches_volume,
     }))
 }
 
@@ -3503,7 +3504,7 @@ mod tests {
             force: false,
             mount_root: None,
             sccache: false,
-            imperative_host_setup: false,
+            retire_caches_volume: false,
         };
         assert_eq!(
             parse_args(["setup"]).unwrap().command,
@@ -3525,7 +3526,7 @@ mod tests {
                 force: false,
                 mount_root: None,
                 sccache: false,
-                imperative_host_setup: false,
+                retire_caches_volume: false,
             })
         );
         assert_eq!(
@@ -3537,7 +3538,7 @@ mod tests {
                 force: true,
                 mount_root: None,
                 sccache: false,
-                imperative_host_setup: false,
+                retire_caches_volume: false,
             })
         );
 
@@ -3550,7 +3551,7 @@ mod tests {
                 force: false,
                 mount_root: None,
                 sccache: true,
-                imperative_host_setup: false,
+                retire_caches_volume: false,
             })
         );
         let error = parse_args(["setup", "--sccache", "--uninstall"]).unwrap_err();
@@ -3559,20 +3560,20 @@ mod tests {
             "--sccache installs sccache; --uninstall removes it"
         );
 
-        // Relocating the host caches is opt-in too, and never part of a teardown.
+        // Deleting the retired caches volume is opt-in too, and never part of a teardown.
         assert_eq!(
-            parse_args(["setup", "--imperative-host-setup"])
+            parse_args(["setup", "--retire-caches-volume"])
                 .unwrap()
                 .command,
             Command::Setup(SetupArgs {
-                imperative_host_setup: true,
+                retire_caches_volume: true,
                 ..REPAIR
             })
         );
-        let error = parse_args(["setup", "--imperative-host-setup", "--uninstall"]).unwrap_err();
+        let error = parse_args(["setup", "--retire-caches-volume", "--uninstall"]).unwrap_err();
         assert_eq!(
             error.message,
-            "--imperative-host-setup relocates the host caches; --uninstall leaves them alone"
+            "--retire-caches-volume repairs a host; --uninstall tears it down"
         );
 
         let Command::Setup(configured) =

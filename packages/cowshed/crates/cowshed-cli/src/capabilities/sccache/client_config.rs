@@ -102,12 +102,11 @@ pub enum ConfigOutcome {
     Written(ConfigChange),
     /// The file is somebody else's and was left exactly as it was found.
     Refused(ConfigConflict),
-    /// There was no shared store to point at, so nothing was written.
+    /// The daemon's size cap could not be derived, so nothing was written.
     ///
-    /// A host whose caches volume is absent or unmounted would otherwise get a config naming a
-    /// directory that resolves onto the boot disk under the empty mountpoint — a fourth orphaned
-    /// store, created by the command whose job is to prevent them.
-    NoSharedStore {
+    /// The cap derives from the store volume. A config with any other cap would let a store-less
+    /// client that starts a server of its own evict the shared cache down to that bound.
+    NoCapacity {
         reason: String,
     },
 }
@@ -508,7 +507,7 @@ mod tests {
 
     fn store() -> SharedStore {
         SharedStore::new(
-            PathBuf::from("/private/cowshed/caches/sccache"),
+            PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
             ImageCapacity::from_gibibytes(200),
         )
     }
@@ -527,7 +526,10 @@ mod tests {
         let (change, contents) = written(None);
         assert_eq!(change, ConfigChange::Created);
         assert!(contents.starts_with(OWNERSHIP_MARKER));
-        assert!(contents.contains("[cache.disk]\ndir = \"/private/cowshed/caches/sccache\"\n"));
+        assert!(
+            contents
+                .contains("[cache.disk]\ndir = \"/Users/dev/Library/Caches/Mozilla.sccache\"\n")
+        );
         assert!(contents.contains("size = 214748364800"));
         assert!(directs_to(&contents, &store()));
     }
@@ -612,7 +614,8 @@ mod tests {
     /// leaves it — including its author's own cap.
     #[test]
     fn a_hand_written_config_that_already_points_at_the_store_is_left_alone() {
-        let existing = "[cache.disk]\ndir = \"/private/cowshed/caches/sccache\"\nsize = \"12g\"\n";
+        let existing =
+            "[cache.disk]\ndir = \"/Users/dev/Library/Caches/Mozilla.sccache\"\nsize = \"12g\"\n";
         assert_eq!(plan(Some(existing), &store()), ConfigPlan::AlreadyCurrent);
     }
 
@@ -671,7 +674,7 @@ mod tests {
     #[test]
     fn a_stale_cap_in_cowsheds_own_block_is_refreshed() {
         let stale = render_block(&SharedStore::new(
-            PathBuf::from("/private/cowshed/caches/sccache"),
+            PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
             ImageCapacity::from_gibibytes(40),
         ));
         let (change, contents) = written(Some(&stale));
@@ -709,7 +712,7 @@ mod tests {
         let stale = format!(
             "{existing}\n{}",
             render_block(&SharedStore::new(
-                PathBuf::from("/private/cowshed/caches/sccache"),
+                PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
                 ImageCapacity::from_gibibytes(40),
             ))
         );

@@ -22,13 +22,14 @@ use cowshed_cli::setup_service::{
 };
 use cowshed_core::AdoptedProject;
 use cowshed_core::build_volume::BuildStateRefresh;
-use cowshed_core::capabilities::cache::HostCache;
-use cowshed_core::host_caches::{HostCacheRelocation, Relocation};
+use cowshed_core::caches_retirement::{
+    CacheOutcome, Leftover, LeftoverReason, Merge, Owner, Placement, RetirementReport,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
-    VolumeOutcome, VolumeRole, VolumeState,
+    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
+    UninstallServiceOutcome, VolumeOutcome, VolumeRole, VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
 use std::path::PathBuf;
@@ -59,10 +60,12 @@ struct FakeHost {
     /// What `setup --sccache` found, so the opt-in rows and the non-zero exit are provable without
     /// nix, a flake, or launchd.
     sccache_install: SccacheInstall,
-    /// What `setup --imperative-host-setup` did to each host cache, so the rows and the exit are
-    /// provable without moving anything out of a real home.
-    relocations: Vec<HostCacheRelocation>,
     build_state: Vec<ProjectBuildState>,
+    /// What steps 1–3 of the caches retirement did, so the rows and the exit are provable
+    /// without moving anything out of a real home.
+    retirement: Option<RetirementReport>,
+    /// The caches-volume mode setup planned and executed with.
+    caches_volume: Option<CachesVolume>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -130,7 +133,7 @@ impl Default for FakeHost {
                 path: PathBuf::from(
                     "/Users/dev/Library/Application Support/Mozilla.sccache/config",
                 ),
-                store: PathBuf::from("/private/cowshed/caches/sccache"),
+                store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
                 outcome: ConfigOutcome::AlreadyCurrent,
             },
             execute_error: None,
@@ -142,20 +145,23 @@ impl Default for FakeHost {
                     "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
                 ),
             },
-            relocations: Vec::new(),
             build_state: Vec::new(),
+            retirement: None,
+            caches_volume: None,
         }
     }
 }
 
 #[async_trait]
 impl HostSetup for FakeHost {
-    async fn plan(&mut self) -> Result<HostSetupPlan> {
+    async fn plan(&mut self, caches_volume: CachesVolume) -> Result<HostSetupPlan> {
+        self.caches_volume = Some(caches_volume);
         self.events.push(String::from("plan"));
         Ok(self.plan.clone())
     }
 
-    async fn execute(&mut self) -> Result<HostSetupReport> {
+    async fn execute(&mut self, caches_volume: CachesVolume) -> Result<HostSetupReport> {
+        assert_eq!(self.caches_volume, Some(caches_volume));
         self.events.push(String::from("execute"));
         match self.execute_error.take() {
             Some(error) => Err(error),
@@ -234,9 +240,9 @@ impl HostSetup for FakeHost {
         Ok(self.sccache_install.clone())
     }
 
-    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
-        self.events.push(String::from("relocate-host-caches"));
-        Ok(self.relocations.clone())
+    async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>> {
+        self.events.push(String::from("retire-caches-volume"));
+        Ok(self.retirement.clone())
     }
 
     async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
@@ -254,28 +260,28 @@ const REPAIR: SetupArgs = SetupArgs {
     force: false,
     mount_root: None,
     sccache: false,
-    imperative_host_setup: false,
+    retire_caches_volume: false,
 };
 const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
     mount_root: None,
     sccache: true,
-    imperative_host_setup: false,
+    retire_caches_volume: false,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
     mount_root: None,
     sccache: false,
-    imperative_host_setup: false,
+    retire_caches_volume: false,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
     mount_root: None,
     sccache: false,
-    imperative_host_setup: false,
+    retire_caches_volume: false,
 };
 
 struct Streams {
@@ -433,7 +439,7 @@ async fn a_partial_run_reports_each_action_and_refuses_to_claim_success() {
     );
     assert_eq!(error.hint, "cowshed doctor");
     // The census is never taken: there is no healthy host to inventory.
-    assert_eq!(host.events, ["plan", "execute"]);
+    assert_eq!(host.events, ["retire-caches-volume", "plan", "execute"]);
 }
 
 /// `--json` cannot answer `ok:true` over a failure. The frozen envelope has no partial state, so
@@ -581,13 +587,14 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
         "cowshed: cowshed.store (store): mounted at its canonical path -> already-current\n\
          cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: everything already set up\n\
          next: cowshed adopt\n"
     );
     assert_eq!(
         host.events,
         [
+            "retire-caches-volume",
             "plan",
             "execute",
             "unmounted-mains",
@@ -595,6 +602,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "configure-sccache-client",
             "refresh-services",
             "build-state-projects",
+            "retire-caches-volume",
             "census"
         ]
     );
@@ -672,7 +680,7 @@ async fn a_written_sccache_config_names_the_file_and_the_store_it_points_at() {
     let mut host = FakeHost {
         sccache: ConfigReport {
             path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/private/cowshed/caches/sccache"),
+            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
             outcome: ConfigOutcome::Written(ConfigChange::Created),
         },
         ..FakeHost::default()
@@ -683,7 +691,7 @@ async fn a_written_sccache_config_names_the_file_and_the_store_it_points_at() {
     assert_eq!(streams.exit, 0);
     let written = streams
         .stderr
-        .find("cowshed: wrote /Users/dev/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /private/cowshed/caches/sccache\n")
+        .find("cowshed: wrote /Users/dev/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /Users/dev/Library/Caches/Mozilla.sccache\n")
         .expect("the file and the store it now names");
     // Before the status line, which is a claim about the whole host and is the last thing read.
     let status = streams
@@ -701,9 +709,9 @@ async fn a_foreign_sccache_config_is_named_and_left_alone_without_failing_setup(
     let mut host = FakeHost {
         sccache: ConfigReport {
             path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/private/cowshed/caches/sccache"),
+            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
             outcome: ConfigOutcome::Refused(ConfigConflict::ForeignDirectory {
-                found: String::from("/Users/dev/Library/Caches/Mozilla.sccache"),
+                found: String::from("/Volumes/scratch/sccache"),
             }),
         },
         ..FakeHost::default()
@@ -716,7 +724,7 @@ async fn a_foreign_sccache_config_is_named_and_left_alone_without_failing_setup(
         "a file cowshed declines to overwrite is not a failed setup"
     );
     assert!(streams.stderr.contains(
-        "cowshed: left /Users/dev/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to /Users/dev/Library/Caches/Mozilla.sccache; a store-less sccache client will not share /private/cowshed/caches/sccache until cache.disk.dir names it\n"
+        "cowshed: left /Users/dev/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to /Volumes/scratch/sccache; a store-less sccache client will not share /Users/dev/Library/Caches/Mozilla.sccache until cache.disk.dir names it\n"
     ));
 }
 
@@ -727,7 +735,7 @@ async fn an_appended_block_promises_the_rest_of_the_file_was_untouched() {
     let mut host = FakeHost {
         sccache: ConfigReport {
             path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/private/cowshed/caches/sccache"),
+            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
             outcome: ConfigOutcome::Written(ConfigChange::Appended),
         },
         ..FakeHost::default()
@@ -736,21 +744,21 @@ async fn an_appended_block_promises_the_rest_of_the_file_was_untouched() {
     let streams = run(&mut host, REPAIR, false, false).await;
 
     assert!(streams.stderr.contains(
-        "cowshed: added cowshed's [cache.disk] block to /Users/dev/Library/Application Support/Mozilla.sccache/config, naming /private/cowshed/caches/sccache; every other setting in that file was left exactly as it was\n"
+        "cowshed: added cowshed's [cache.disk] block to /Users/dev/Library/Application Support/Mozilla.sccache/config, naming /Users/dev/Library/Caches/Mozilla.sccache; every other setting in that file was left exactly as it was\n"
     ));
 }
 
-/// A host with no mounted caches volume gets no config at all: a file naming a directory beneath
-/// an empty mountpoint would resolve onto the boot disk and become a fourth orphaned cache —
-/// created by the command whose whole job is to prevent them.
+/// A host whose store cannot be validated gets no config at all: the daemon's cap derives from
+/// the store, and a config naming any other cap would let a store-less client evict the shared
+/// cache down to it.
 #[tokio::test]
-async fn no_config_is_written_when_there_is_no_shared_store_to_name() {
+async fn no_config_is_written_when_the_daemon_cap_cannot_be_derived() {
     let mut host = FakeHost {
         sccache: ConfigReport {
             path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/private/cowshed/caches/sccache"),
-            outcome: ConfigOutcome::NoSharedStore {
-                reason: String::from("cowshed.caches is not mounted"),
+            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
+            outcome: ConfigOutcome::NoCapacity {
+                reason: String::from("cowshed.store is not mounted"),
             },
         },
         ..FakeHost::default()
@@ -759,7 +767,7 @@ async fn no_config_is_written_when_there_is_no_shared_store_to_name() {
     let streams = run(&mut host, REPAIR, false, false).await;
 
     assert!(streams.stderr.contains(
-        "cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config not written: /private/cowshed/caches/sccache is not available (cowshed.caches is not mounted), and a config naming a cache that is not there would create a fourth one\n"
+        "cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config not written: the cache cap it must share with the sccache daemon derives from the store, which is not available (cowshed.store is not mounted)\n"
     ));
 }
 
@@ -805,7 +813,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
          cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /private/cowshed/store so it mounts at every boot\n\
          cowshed: cowshed.store (store): absent -> created\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
          next: cowshed adopt\n"
     );
@@ -824,6 +832,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
     assert_eq!(
         host.events,
         [
+            "retire-caches-volume",
             "plan",
             "execute",
             "unmounted-mains",
@@ -831,6 +840,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "configure-sccache-client",
             "refresh-services",
             "build-state-projects",
+            "retire-caches-volume",
             "census"
         ]
     );
@@ -883,7 +893,7 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
          cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/dev/.cowshed so it mounts at every boot\n\
          cowshed: cowshed.store (store): present but not mounted -> mounted\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
          next: cowshed adopt\n"
     );
@@ -1059,7 +1069,7 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
          cowshed: cowshed.caches exists (UUID 1D6F0E1A-0000-4000-8000-00000000BBBB, 2.0 TB) and is mounted at /Volumes/cowshed.caches; it will be remounted at /private/cowshed/caches\n\
          cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up\n\
          next: cowshed adopt\n"
     );
@@ -1110,7 +1120,7 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
          cowshed: cowshed.caches (caches): found outside this host's container (container disk4, device disk4s8) -> reported\n\
          cowshed: data is safe on disk4s8; cowshed left it untouched\n\
          cowshed: /etc/fstab not pinned: no cowshed volume in the home container\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is partially set up: 2 volumes live outside this host's container and left untouched\n\
          next: cowshed adopt\n"
     );
@@ -1167,7 +1177,7 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          next: cowshed adopt\n"
     );
 }
@@ -1245,7 +1255,7 @@ async fn a_declined_authorization_is_policy_denied_and_exits_six() {
     assert!(!error.message.contains("-60006"));
     // The announcement still happened: the caller was told a dialog was coming before it came,
     // which is the whole point of gathering the plan first.
-    assert_eq!(host.events, ["plan", "execute"]);
+    assert_eq!(host.events, ["retire-caches-volume", "plan", "execute"]);
 }
 
 /// Teardown escalates too — it edits a root-owned file — so a decline there is the same answer.
@@ -1605,7 +1615,7 @@ async fn setup_mount_root_prints_the_configured_path() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
-        imperative_host_setup: false,
+        retire_caches_volume: false,
     };
     let streams = run(&mut host, args, false, false).await;
     assert_eq!(streams.exit, 0);
@@ -1632,7 +1642,7 @@ async fn setup_mount_root_json_is_empty_success() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
-        imperative_host_setup: false,
+        retire_caches_volume: false,
     };
     let streams = run(&mut host, args, true, false).await;
     assert_eq!(streams.exit, 0);
@@ -1653,7 +1663,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
-        imperative_host_setup: false,
+        retire_caches_volume: false,
     };
     let error = refusal(&mut host, args).await;
     assert_eq!(error.code, ErrorCode::Conflict);
@@ -1770,7 +1780,7 @@ async fn an_unmounted_main_downgrades_both_healthy_status_lines() {
         streams.stderr,
         "cowshed: cowshed.store (store): mounted at its canonical path -> already-current\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
+         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: everything already set up, but 1 main workspace is not mounted: acme/api\n\
          next: cowshed gateway start\n"
     );
@@ -1866,7 +1876,7 @@ async fn a_failed_run_never_observes_or_mentions_main_mounts() {
     assert!(!streams.stderr.contains("next: cowshed gateway start"));
     assert_eq!(
         host.events,
-        ["plan", "execute"],
+        ["retire-caches-volume", "plan", "execute"],
         "a failed run asks nothing further of the host"
     );
 }
@@ -1900,6 +1910,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
     assert_eq!(
         host.events,
         [
+            "retire-caches-volume",
             "plan",
             "execute",
             "unmounted-mains",
@@ -1907,6 +1918,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "configure-sccache-client",
             "refresh-services",
             "build-state-projects",
+            "retire-caches-volume",
             "census"
         ]
     );
@@ -2051,50 +2063,123 @@ async fn a_rooted_build_whose_daemon_never_answered_points_at_launchd() {
     );
 }
 
-/// Relocation is opt-in, runs only onto volumes that came up, names every cache it touched or left,
-/// and a cache left in place fails the run: a scripted setup reading exit 0 would believe the host
-/// shares a cache it does not.
-#[tokio::test]
-async fn a_host_cache_left_in_place_is_named_and_fails_the_run() {
-    let registry = HostCache {
-        host: PathBuf::from("/Users/dev/.cargo/registry"),
-        shared: PathBuf::from("/private/cowshed/caches/cargo/registry"),
-    };
-    let nix = HostCache {
-        host: PathBuf::from("/Users/dev/.cache/nix"),
-        shared: PathBuf::from("/private/cowshed/caches/nix/cache"),
-    };
-    let mut host = FakeHost {
-        relocations: vec![
-            HostCacheRelocation {
-                cache: registry,
-                outcome: Ok(Relocation::Moved),
-            },
-            HostCacheRelocation {
-                cache: nix,
-                outcome: Err(String::from(
-                    "/private/cowshed/caches/nix/cache already holds a cache too",
-                )),
-            },
+fn moved(
+    label: &str,
+    volume: &str,
+    host: &str,
+    merge: Merge,
+    moved: u64,
+    dropped: u64,
+) -> CacheOutcome {
+    CacheOutcome {
+        placement: Placement {
+            label: label.to_owned(),
+            volume: PathBuf::from(volume),
+            host: PathBuf::from(host),
+            merge,
+            owner: Some(Owner::Cargo),
+        },
+        moved_bytes: moved,
+        dropped_bytes: dropped,
+    }
+}
+
+fn retirement(leftovers: Vec<Leftover>) -> RetirementReport {
+    RetirementReport {
+        caches: vec![
+            moved(
+                "cargo registry",
+                "/private/cowshed/caches/cargo/registry",
+                "/Users/dev/.cargo/registry",
+                Merge::ContentAddressed,
+                2_500_000_000,
+                400_000_000,
+            ),
+            moved(
+                "nix fetcher cache",
+                "/private/cowshed/caches/nix/cache",
+                "/Users/dev/.cache/nix",
+                Merge::HostWins,
+                0,
+                14_000_000_000,
+            ),
         ],
+        removed_empty: Vec::new(),
+        leftovers,
+    }
+}
+
+/// Steps 1–3 of the caches retirement run before storage is planned, need no authorization, and
+/// report every cache with its bytes moved and dropped. Leftovers are named with their size, and
+/// `--retire-caches-volume` refuses while any remain: the plan keeps the volume and the run fails.
+#[tokio::test]
+async fn a_retirement_with_leftovers_names_each_and_refuses_the_deletion() {
+    let leftovers = vec![Leftover {
+        path: PathBuf::from("/private/cowshed/caches/ttsc"),
+        bytes: 42_000_000,
+        reason: LeftoverReason::Undeclared,
+    }];
+    let expected = [
+        "cowshed: caches volume: cargo registry -> /Users/dev/.cargo/registry: 2.5 GB moved, 400.0 MB dropped as duplicates\n",
+        "cowshed: caches volume: nix fetcher cache -> /Users/dev/.cache/nix: 0 B moved, 14.0 GB dropped (the host's copy wins)\n",
+        "cowshed: caches volume: left /private/cowshed/caches/ttsc (42.0 MB) in place: no detector names it and no adopted project's main declares a [caches] home path named ttsc\n",
+        "cowshed: caches volume: cowshed setup --retire-caches-volume cannot run until each directory above is placed\n",
+    ];
+
+    let mut plain = FakeHost {
+        retirement: Some(retirement(leftovers.clone())),
         ..FakeHost::default()
     };
-    let args = SetupArgs {
-        imperative_host_setup: true,
-        ..REPAIR
+    let streams = run(&mut plain, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    let rendered = expected.concat();
+    assert!(streams.stderr.contains(&rendered), "{}", streams.stderr);
+    assert_eq!(plain.caches_volume, Some(CachesVolume::Keep));
+    let retire = plain
+        .events
+        .iter()
+        .position(|event| event == "retire-caches-volume")
+        .expect("setup retires the caches volume");
+    let planned = plain
+        .events
+        .iter()
+        .position(|event| event == "plan")
+        .expect("storage is planned");
+    assert!(retire < planned, "{:?}", plain.events);
+
+    let mut attended = FakeHost {
+        retirement: Some(retirement(leftovers)),
+        ..FakeHost::default()
     };
-
-    let (streams, error) = failing_run(&mut host, args, false).await;
-
+    let (streams, error) = failing_run(
+        &mut attended,
+        SetupArgs {
+            retire_caches_volume: true,
+            ..REPAIR
+        },
+        false,
+    )
+    .await;
     assert_eq!(error.code.as_str(), "conflict");
-    assert!(
-        error.hint.contains("cowshed setup --imperative-host-setup"),
-        "{}",
-        error.hint
-    );
+    assert!(streams.stderr.contains(&rendered), "{}", streams.stderr);
+    assert_eq!(attended.caches_volume, Some(CachesVolume::Keep));
+}
+
+/// Once only the marker is left, a plain setup names `--retire-caches-volume` as the attended next
+/// step and never escalates for it; with the flag, the deletion is planned into setup's session.
+#[tokio::test]
+async fn a_completed_retirement_names_the_attended_deletion() {
+    let mut plain = FakeHost {
+        retirement: Some(retirement(Vec::new())),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut plain, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
     assert!(
         streams.stderr.contains(
-            "moved /Users/dev/.cargo/registry to /private/cowshed/caches/cargo/registry and linked it back"
+            "cowshed: caches volume: cargo registry -> /Users/dev/.cargo/registry: 2.5 GB moved, 400.0 MB dropped as duplicates\n\
+             cowshed: caches volume: nix fetcher cache -> /Users/dev/.cache/nix: 0 B moved, 14.0 GB dropped (the host's copy wins)\n\
+             cowshed: caches volume: /private/cowshed/caches holds nothing but its marker; cowshed setup --retire-caches-volume deletes it\n"
         ),
         "{}",
         streams.stderr
@@ -2102,30 +2187,34 @@ async fn a_host_cache_left_in_place_is_named_and_fails_the_run() {
     assert!(
         streams
             .stderr
-            .contains("left /Users/dev/.cache/nix where it is: /private/cowshed/caches/nix/cache already holds a cache too"),
+            .contains("next: cowshed setup --retire-caches-volume"),
         "{}",
         streams.stderr
     );
-    let relocate = host
-        .events
-        .iter()
-        .position(|event| event == "relocate-host-caches")
-        .expect("the opt-in asks the host to relocate");
-    let execute = host
-        .events
-        .iter()
-        .position(|event| event == "execute")
-        .expect("storage is executed");
-    assert!(execute < relocate, "{:?}", host.events);
+    assert_eq!(plain.caches_volume, Some(CachesVolume::Keep));
 
-    let mut default_host = FakeHost::default();
-    run(&mut default_host, REPAIR, false, false).await;
+    let mut attended = FakeHost {
+        retirement: Some(retirement(Vec::new())),
+        ..FakeHost::default()
+    };
+    let streams = run(
+        &mut attended,
+        SetupArgs {
+            retire_caches_volume: true,
+            ..REPAIR
+        },
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(streams.exit, 0);
+    assert_eq!(attended.caches_volume, Some(CachesVolume::Retire));
     assert!(
-        !default_host
-            .events
-            .contains(&String::from("relocate-host-caches")),
-        "a default setup moved host caches: {:?}",
-        default_host.events
+        !streams
+            .stderr
+            .contains("next: cowshed setup --retire-caches-volume"),
+        "{}",
+        streams.stderr
     );
 }
 
@@ -2314,7 +2403,7 @@ async fn build_state_migration_never_runs_after_storage_failure_or_during_uninst
         ..FakeHost::default()
     };
     failing_run(&mut host, REPAIR, false).await;
-    assert_eq!(host.events, ["plan", "execute"]);
+    assert_eq!(host.events, ["retire-caches-volume", "plan", "execute"]);
     host.execute_error = None;
     host.events.clear();
     run(&mut host, UNINSTALL, false, false).await;

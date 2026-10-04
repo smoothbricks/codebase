@@ -961,7 +961,6 @@ pub trait Substrate: LifecyclePlanner {
         &self,
         workspace: &LifecycleWorkspace,
     ) -> Result<DefragmentOutcome, Self::Error>;
-    async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
     async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;
     async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error>;

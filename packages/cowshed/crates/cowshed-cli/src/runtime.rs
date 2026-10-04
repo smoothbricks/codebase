@@ -24,7 +24,6 @@ use cowshed_core::api::{
     WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::host_caches::{self, HostCacheState};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, IMAGE_EXTENSION, ImageCapacity, SlotId, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
@@ -36,8 +35,9 @@ use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
-    CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
-    STORE_ROOT, ValidatedHostStorage, VolumeRole, VolumeState, execute_host_setup, plan_host_setup,
+    CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
+    RETIRED_CACHES_MOUNTPOINT, STORE_ROOT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole,
+    VolumeState, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
@@ -2427,7 +2427,7 @@ async fn attach_project_sessions_from_store(
 ) -> Result<Vec<WorkspaceInfo>> {
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
-    let config = ApfsSubstrateConfig::new(storage.store(), storage.caches(), &project.project_root);
+    let config = ApfsSubstrateConfig::new(storage.store(), &project.project_root);
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(attach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
@@ -2610,7 +2610,7 @@ async fn detach_project_sessions_from_store(
     storage: &ValidatedHostStorage,
     project: &AdoptedProject,
 ) -> Result<usize> {
-    let config = ApfsSubstrateConfig::new(storage.store(), storage.caches(), &project.project_root);
+    let config = ApfsSubstrateConfig::new(storage.store(), &project.project_root);
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(detach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
@@ -3339,11 +3339,11 @@ impl NativeAdoptHostSetup {
 #[async_trait]
 impl AdoptHostSetup for NativeAdoptHostSetup {
     async fn plan(&mut self) -> Result<HostSetupPlan> {
-        plan_host_setup(&self.home).await
+        plan_host_setup(&self.home, CachesVolume::Keep).await
     }
 
     async fn execute(&mut self) -> Result<HostSetupReport> {
-        execute_host_setup(&self.home).await
+        execute_host_setup(&self.home, CachesVolume::Keep).await
     }
 }
 
@@ -3416,6 +3416,14 @@ fn host_action_evidence(action: &HostAction) -> String {
         HostAction::PinFstab { uuid, mount_at } => {
             format!("pin volume {uuid} at {} in /etc/fstab", mount_at.display())
         }
+        HostAction::DeleteVolume {
+            name,
+            uuid,
+            mounted_at,
+        } => format!(
+            "delete the retired {name} ({uuid}) mounted at {}, which holds nothing but its marker",
+            mounted_at.display()
+        ),
         HostAction::InstallMountService { label } => {
             format!(
                 "install system LaunchDaemon {label} to unlock and mount cowshed volumes before login"
@@ -3447,16 +3455,16 @@ fn host_action_evidence(action: &HostAction) -> String {
 /// name the foreign container the way `setup` does). Actions are consulted only to enrich a
 /// message with the uuid and size the state does not carry.
 ///
-/// The expected roots come from [`STORE_ROOT`] and [`CACHES_ROOT`] rather than from literals here:
-/// a second copy of them in the CLI is a copy that can disagree with the volume the planner
-/// actually looked at.
+/// The expected roots come from [`STORE_ROOT`] and [`RETIRED_CACHES_MOUNTPOINT`] rather than from
+/// literals here: a second copy of them in the CLI is a copy that can disagree with the volume
+/// the planner actually looked at.
 fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     let mut findings = Vec::new();
     for volume in &plan.volumes {
         let name = volume.name.as_str();
         let expected = match volume.role {
             VolumeRole::Store => Path::new(STORE_ROOT),
-            VolumeRole::Caches => Path::new(CACHES_ROOT),
+            VolumeRole::Caches => Path::new(RETIRED_CACHES_MOUNTPOINT),
             // No canonical root to compare against on this doctor surface.
             VolumeRole::Projects => continue,
         };
@@ -3623,7 +3631,8 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
             }),
             HostAction::CreateVolume { .. }
             | HostAction::MountExisting { .. }
-            | HostAction::RepairMounted { .. } => {}
+            | HostAction::RepairMounted { .. }
+            | HostAction::DeleteVolume { .. } => {}
         }
     }
     findings
@@ -3820,34 +3829,42 @@ fn sccache_finding(status: &SccacheStatus) -> Finding {
     }
 }
 
-/// Every host cache that does not resolve to its shared directory on the caches volume.
-///
-/// A shared tool home's caches decide more than disk: until all of a tool's are shared, a
-/// sandbox keeps the tool's private default, where cargo rebuilds every dependency a clone's
-/// copied `target/` already holds (it fingerprints dependencies by their absolute source path)
-/// and a sandboxed `bun install` relinks `node_modules` into a cache no other checkout has.
-fn host_cache_findings(home: &Path) -> Vec<Finding> {
-    host_caches::host_caches(home, Path::new(CACHES_ROOT))
-        .filter_map(|cache| {
-            let unshared = format!(
-                "{} is not the shared cache {}",
-                cache.host.display(),
-                cache.shared.display()
-            );
-            let message = match host_caches::inspect(&cache) {
-                HostCacheState::Shared => return None,
-                HostCacheState::Absent | HostCacheState::Movable => unshared,
-                HostCacheState::Conflict(reason) => format!("{unshared}: {reason}"),
-            };
-            Some(Finding {
-                code: "host-cache-unshared".into(),
-                severity: FindingSeverity::Warning,
-                message,
-                hint: "cowshed setup --imperative-host-setup".into(),
-                path: Some(cache.host),
-            })
-        })
-        .collect()
+/// The retired caches volume, while it exists, with the command that finishes its retirement:
+/// `cowshed setup` moves what it still holds, and `cowshed setup --retire-caches-volume` deletes
+/// it once only its marker is left (03_caches.md).
+fn caches_volume_finding() -> Option<Finding> {
+    let volume = Path::new(RETIRED_CACHES_MOUNTPOINT);
+    fs::symlink_metadata(volume.join(VOLUME_MARKER_FILE)).ok()?;
+    let (message, hint) = match cowshed_core::caches_retirement::holds_only_marker(volume) {
+        Ok(true) => (
+            format!(
+                "the retired caches volume at {} holds nothing but its marker",
+                volume.display()
+            ),
+            "cowshed setup --retire-caches-volume",
+        ),
+        Ok(false) => (
+            format!(
+                "the retired caches volume at {} still holds caches that belong in the host HOME",
+                volume.display()
+            ),
+            "cowshed setup, then cowshed setup --retire-caches-volume",
+        ),
+        Err(error) => (
+            format!(
+                "cannot inspect the retired caches volume at {}: {error}",
+                volume.display()
+            ),
+            "cowshed setup, then cowshed setup --retire-caches-volume",
+        ),
+    };
+    Some(Finding {
+        code: "caches-volume".into(),
+        severity: FindingSeverity::Warning,
+        message,
+        hint: hint.into(),
+        path: Some(volume.to_path_buf()),
+    })
 }
 
 /// A saturated kernel vnode table, which stalls every mount, attach and workspace command on
@@ -3916,7 +3933,7 @@ struct HostDiagnosis {
 
 async fn diagnose_host() -> Result<HostDiagnosis> {
     let home = gateway_service::canonical_home()?;
-    let plan = plan_host_setup(&home).await;
+    let plan = plan_host_setup(&home, CachesVolume::Keep).await;
     let mut diagnosis = match plan {
         Ok(plan) => HostDiagnosis {
             storage_ready: plan.actions.is_empty(),
@@ -3937,7 +3954,9 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         diagnosis.findings.extend(retired_mount_layout_findings(
             CanonicalRoots::global().store(),
         ));
-        diagnosis.findings.extend(host_cache_findings(&home));
+    }
+    if let Some(finding) = caches_volume_finding() {
+        diagnosis.findings.push(finding);
     }
     match gateway_service::service_status().await {
         Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),
@@ -5405,7 +5424,10 @@ mod tests {
                 .iter()
                 .map(|finding| finding.path.clone().expect("a path per volume"))
                 .collect::<Vec<_>>(),
-            vec![PathBuf::from(STORE_ROOT), PathBuf::from(CACHES_ROOT)]
+            vec![
+                PathBuf::from(STORE_ROOT),
+                PathBuf::from(RETIRED_CACHES_MOUNTPOINT)
+            ]
         );
         assert_eq!(
             CanonicalRoots::global().store(),

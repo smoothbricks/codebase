@@ -74,11 +74,7 @@ impl Fixture {
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(
-            &self.root,
-            self.root.join("caches"),
-            self.root.join("mount"),
-        )
+        ApfsSubstrateConfig::new(&self.root, self.root.join("mount"))
     }
 
     fn project_root(&self) -> PathBuf {

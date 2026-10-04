@@ -1,7 +1,7 @@
 use super::cache::SharedToolHome;
 use super::{
-    CapabilityContribution, DetectionContext, EnvAction, add_bootstrap, host_program_directories,
-    shared_tool_contribution,
+    CapabilityContribution, DetectionContext, EnvAction, add_bootstrap, add_shared_tool_home,
+    host_program_directories,
 };
 use crate::Result;
 
@@ -9,7 +9,8 @@ pub(super) fn contribute(
     context: &DetectionContext<'_>,
     home: &'static SharedToolHome,
 ) -> Result<CapabilityContribution> {
-    let mut contribution = shared_tool_contribution(context, home)?;
+    let mut contribution = CapabilityContribution::default();
+    add_shared_tool_home(&mut contribution, context.home, home);
     contribution
         .env
         .insert("NODE_USE_ENV_PROXY", EnvAction::Own("1".into()));

@@ -1,7 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CacheMount, CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector,
-    EnvAction, GrantAccess, GrantScope, add_bootstrap, host_program_directories,
+    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
+    GrantAccess, GrantScope, SharedCache, add_bootstrap, host_program_directories,
 };
 use crate::{CowshedError, Result};
 use std::os::unix::fs::FileTypeExt as _;
@@ -14,20 +14,19 @@ pub const DETECTOR: Detector = Detector {
     all: &[],
     any: &["flake.nix", "devenv.nix"],
     contribute,
-    host_cache_homes: &[&CACHE_HOME, &STATE_HOME],
     reached_from: Some(super::ReachedConvention::ProjectFile(reached_through_envrc)),
 };
+/// Nix's client fetcher cache. Not content-addressed: retirement keeps the host's copy.
 pub static CACHE_HOME: SharedToolHome = SharedToolHome {
     variable: None,
     home: ".cache/nix",
-    layout: SharedLayout::Whole("nix/cache"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
+/// Nix's client profile state. Not content-addressed: retirement keeps the host's copy.
 pub static STATE_HOME: SharedToolHome = SharedToolHome {
     variable: None,
     home: ".local/state/nix",
-    layout: SharedLayout::Whole("nix/state"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
 pub const DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
@@ -159,13 +158,12 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             access: GrantAccess::Read,
         });
     }
-    if context.caches_root.is_dir() {
-        for directory in ["cache", "state"] {
-            contribution.cache_mounts.push(CacheMount {
-                source: context.caches_root.join("nix").join(directory),
-                private_target: Some(context.environment_root.join(directory).join("nix")),
-            });
-        }
+    // Nix finds its client state under the private XDG roots, so each links to the host's own.
+    for (tool, private) in [(&CACHE_HOME, "cache"), (&STATE_HOME, "state")] {
+        contribution.shared_caches.push(SharedCache {
+            path: tool.host_path(context.home),
+            private_link: Some(context.environment_root.join(private).join("nix")),
+        });
     }
     if let Some(socket) = daemon_socket_at(Path::new(DAEMON_SOCKET))? {
         contribution.unix_sockets.push(socket);
@@ -343,16 +341,40 @@ mod tests {
         );
     }
 
-    /// A sandbox for the fixture workspace, carrying a Nix project's contribution detected against
-    /// the real caches root, as a supervisor detects it — cache mounts are only ever beneath it.
-    /// The mount root is a sibling directory, so its deny never covers the fixture's host home.
+    /// The private `$XDG_CACHE_HOME/nix` and `$XDG_STATE_HOME/nix` link to the host's own Nix
+    /// client state, which is shared read-write where the host keeps it.
+    #[test]
+    fn nix_client_state_links_to_the_host_paths() {
+        let fixture = Fixture::new();
+        fixture.files(&["devenv.nix"]);
+        let contribution = DETECTOR
+            .detect(&fixture.context())
+            .unwrap()
+            .expect("nix detected");
+        assert_eq!(
+            contribution.shared_caches,
+            vec![
+                SharedCache {
+                    path: fixture.home.join(".cache/nix"),
+                    private_link: Some(fixture.environment.join("cache/nix")),
+                },
+                SharedCache {
+                    path: fixture.home.join(".local/state/nix"),
+                    private_link: Some(fixture.environment.join("state/nix")),
+                },
+            ]
+        );
+    }
+
+    /// A sandbox for the fixture workspace, carrying a Nix project's contribution as a supervisor
+    /// detects it. The mount root is a sibling directory, so its deny never covers the fixture's
+    /// host home.
     fn nix_sandbox(fixture: &Fixture) -> crate::sandbox::SandboxConfig {
         fixture.files(&["flake.nix"]);
-        let context = DetectionContext {
-            caches_root: Path::new(crate::storage::bootstrap::CACHES_ROOT),
-            ..fixture.context()
-        };
-        let contribution = DETECTOR.detect(&context).unwrap().expect("nix detected");
+        let contribution = DETECTOR
+            .detect(&fixture.context())
+            .unwrap()
+            .expect("nix detected");
         crate::sandbox::SandboxConfig {
             home: fixture.home.clone(),
             mount_root: fixture.root.join("mounts"),
@@ -367,6 +389,7 @@ mod tests {
             additional_denies: Vec::new(),
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: super::super::DetectedCapabilities {
                 active: vec![CapabilityId::Nix],
                 contribution,

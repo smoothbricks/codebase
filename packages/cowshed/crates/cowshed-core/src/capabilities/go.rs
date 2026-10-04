@@ -1,17 +1,19 @@
-//! Go (`go.mod`/`go.work` at the selected root, or a tracked nested `go.mod`): shared caches.
+//! Go (`go.mod`/`go.work` at the selected root, or a tracked nested `go.mod`): the host's own
+//! module and build caches.
 //!
-//! Both caches are content-addressed, so every workspace on the host shares one of each, named
-//! directly through `GOMODCACHE` and `GOCACHE`; nothing on the host is relocated for them. A host
-//! without a caches volume leaves both to Go's defaults under the private sandbox HOME. Go's
-//! proxy, checksum database and toolchain policy are the project's, so they are left to Go's own
-//! defaults and the project's environment.
+//! Both caches are content-addressed, so every workspace on the host shares the host's own pair,
+//! named directly through `GOMODCACHE` and `GOCACHE` at Go's defaults: `<home>/go/pkg/mod` and the
+//! user cache directory's `go-build`. The host's own `go` uses the same two directories without
+//! configuration. `GOPATH`, and with it `go install`'s binaries, stays at Go's default under the
+//! private sandbox HOME. Go's proxy, checksum database and toolchain policy are the project's, so
+//! they are left to Go's own defaults and the project's environment.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 
+use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CacheMount, CapabilityContribution, CapabilityId, DetectionContext, DetectionScope, Detector,
-    EnvAction,
+    CapabilityContribution, CapabilityId, DetectionContext, DetectionScope, Detector,
+    add_shared_tool_home,
 };
 use crate::Result;
 
@@ -21,34 +23,35 @@ pub const DETECTOR: Detector = Detector {
     all: &[],
     any: &["go.mod", "go.work"],
     scope: DetectionScope::Project,
-    host_cache_homes: &[],
     reached_from: Some(super::ReachedConvention::TrackedManifest("go.mod")),
     contribute,
 };
 
-/// `(variable, directory under the caches root)` for each shared Go cache.
-const CACHES: [(&str, &str); 2] = [("GOMODCACHE", "go/mod"), ("GOCACHE", "go/build")];
+/// Go's default module cache, `$GOPATH/pkg/mod` with the default `GOPATH` of `~/go`.
+pub static MODULE_HOME: SharedToolHome = SharedToolHome {
+    variable: Some("GOMODCACHE"),
+    home: "go/pkg/mod",
+    layout: SharedLayout::Whole,
+};
+
+#[cfg(target_os = "macos")]
+const BUILD_HOME_PATH: &str = "Library/Caches/go-build";
+#[cfg(not(target_os = "macos"))]
+const BUILD_HOME_PATH: &str = ".cache/go-build";
+/// Go's default build cache, `go-build` in the user cache directory.
+pub static BUILD_HOME: SharedToolHome = SharedToolHome {
+    variable: Some("GOCACHE"),
+    home: BUILD_HOME_PATH,
+    layout: SharedLayout::Whole,
+};
 
 /// The official installer's location; package managers' are in the host program directories.
 const OFFICIAL_INSTALL: &str = "/usr/local/go/bin";
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = CapabilityContribution::default();
-    let shared = context.caches_root.is_dir();
-    for (variable, directory) in CACHES {
-        let source = context.caches_root.join(directory);
-        if shared {
-            contribution
-                .env
-                .insert(variable, EnvAction::Own(OsString::from(&source)));
-            contribution.cache_mounts.push(CacheMount {
-                source,
-                private_target: None,
-            });
-        } else {
-            contribution.env.insert(variable, EnvAction::Unset);
-        }
-    }
+    add_shared_tool_home(&mut contribution, context.home, &MODULE_HOME);
+    add_shared_tool_home(&mut contribution, context.home, &BUILD_HOME);
     let mut directories = vec![PathBuf::from(OFFICIAL_INSTALL)];
     directories.extend(super::host_program_directories(context));
     super::add_bootstrap(&mut contribution, context, "go", &directories)?;
@@ -58,10 +61,10 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::fs;
 
     use super::*;
     use crate::capabilities::test_support::{Fixture, assert_switch};
+    use crate::capabilities::{EnvAction, GrantAccess, GrantScope, SharedCache};
 
     #[test]
     fn go_mod_switches_go_on_and_off() {
@@ -73,84 +76,43 @@ mod tests {
         assert_switch(&DETECTOR, &["go.work"]);
     }
 
-    /// With a caches volume both caches are shared, prepared and granted by their mounts, and no
-    /// Go policy or `GOENV` file is contributed.
+    /// Both caches are the host's own defaults, shared read-write where they are; no Go policy or
+    /// `GOENV` file is contributed, and beneath HOME only the search's literal program probes are
+    /// granted besides them.
     #[test]
-    fn go_names_the_shared_caches_directly() {
+    fn go_names_the_host_caches_directly() {
         let fixture = Fixture::new();
         fixture.files(&["go.mod"]);
         let contribution = DETECTOR
             .detect(&fixture.context())
             .expect("detection")
             .expect("go detected");
+        let module = fixture.home.join("go/pkg/mod");
+        let build = fixture.home.join(BUILD_HOME_PATH);
         assert_eq!(
             contribution.env,
             BTreeMap::from([
-                (
-                    "GOCACHE",
-                    EnvAction::Own(fixture.caches.join("go/build").into())
-                ),
-                (
-                    "GOMODCACHE",
-                    EnvAction::Own(fixture.caches.join("go/mod").into())
-                ),
+                ("GOCACHE", EnvAction::Own(build.clone().into())),
+                ("GOMODCACHE", EnvAction::Own(module.clone().into())),
             ])
         );
         assert_eq!(
-            contribution.cache_mounts,
+            contribution.shared_caches,
             vec![
-                CacheMount {
-                    source: fixture.caches.join("go/mod"),
-                    private_target: None,
+                SharedCache {
+                    path: module,
+                    private_link: None,
                 },
-                CacheMount {
-                    source: fixture.caches.join("go/build"),
-                    private_target: None,
+                SharedCache {
+                    path: build,
+                    private_link: None,
                 },
             ]
         );
-        // Only a host go installation, if the machine has one, is granted (read-only).
-        assert!(
-            contribution
-                .grants
-                .iter()
-                .all(|grant| grant.access == crate::capabilities::GrantAccess::Read)
-        );
-    }
-
-    /// A host with no caches volume keeps Go's private defaults: both variables are the
-    /// sandbox's to unset, and nothing outside the sandbox is mounted.
-    #[test]
-    fn without_a_caches_volume_go_keeps_its_private_defaults() {
-        let fixture = Fixture::new();
-        fixture.files(&["go.work"]);
-        fs::remove_dir(&fixture.caches).expect("no caches volume");
-        let contribution = DETECTOR
-            .detect(&fixture.context())
-            .expect("detection")
-            .expect("go detected");
-        assert_eq!(
-            contribution.env,
-            BTreeMap::from([
-                ("GOCACHE", EnvAction::Unset),
-                ("GOMODCACHE", EnvAction::Unset)
-            ])
-        );
-        assert!(contribution.cache_mounts.is_empty());
-        // Beneath the host home only the search's literal program probes; nothing in the
-        // workspace.
         for grant in &contribution.grants {
+            assert_eq!(grant.access, GrantAccess::Read, "{grant:?}");
             if grant.path.starts_with(&fixture.home) {
-                assert_eq!(
-                    (grant.scope, grant.access),
-                    (
-                        crate::capabilities::GrantScope::Literal,
-                        crate::capabilities::GrantAccess::Read
-                    ),
-                    "{grant:?}"
-                );
-            } else {
-                assert!(!grant.path.starts_with(&fixture.root), "{grant:?}");
+                assert_eq!(grant.scope, GrantScope::Literal, "{grant:?}");
             }
         }
     }

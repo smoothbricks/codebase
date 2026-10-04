@@ -84,7 +84,7 @@ fn host(
     .unwrap();
     let host = MacOsApfsExecutionHost::new(
         SystemCommandRunner,
-        ApfsSubstrateConfig::new(&store, root.join("caches"), root.join("checkout")),
+        ApfsSubstrateConfig::new(&store, root.join("checkout")),
     )
     .unwrap();
     (host, BuildVolumeLayout::new(&project).unwrap())
@@ -105,6 +105,7 @@ fn sandbox(checkout: &Path) -> SandboxConfig {
         shed_links: Vec::new(),
         git_worktree_repository: None,
         build_volume_mount: None,
+        repository_caches: Vec::new(),
         capabilities: Default::default(),
     }
 }

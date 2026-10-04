@@ -671,6 +671,7 @@ mod tests {
             additional_denies: Vec::new(),
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: Default::default(),
         }
     }

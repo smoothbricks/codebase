@@ -110,6 +110,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         shed_links: Vec::new(),
         git_worktree_repository: None,
         build_volume_mount: None,
+        repository_caches: Vec::new(),
         capabilities: Default::default(),
     }
 }
@@ -453,12 +454,12 @@ async fn host_controller_private_environment_symlinks_cannot_redirect_host_prepa
 }
 
 /// Every child gets a private `XDG_STATE_HOME` beside its other XDG roots. Nix's state under it
-/// is the shared directory on the caches volume only for a Nix project, as its cache under
-/// `XDG_CACHE_HOME` is; a project without the Nix convention gets no link there.
+/// links to the host's own `~/.local/state/nix` only for a Nix project, as its cache under
+/// `XDG_CACHE_HOME` links to `~/.cache/nix`; a project without the Nix convention gets no link
+/// there.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_children_get_a_private_state_home_sharing_nix_state() {
-    let caches = Path::new(cowshed_core::storage::bootstrap::CACHES_ROOT);
     for nix_project in [false, true] {
         let root = scratch("state-home");
         let sandbox = workspace(&root, 41_088);
@@ -484,8 +485,11 @@ async fn host_controller_children_get_a_private_state_home_sharing_nix_state() {
             String::from_utf8_lossy(&stderr)
         );
         let mut expected = format!("{}\n", mount.join(".cowshed/state").display());
-        if nix_project && caches.is_dir() {
-            expected.push_str(&format!("{}\n", caches.join("nix/state").display()));
+        if nix_project {
+            expected.push_str(&format!(
+                "{}\n",
+                sandbox.home.join(".local/state/nix").display()
+            ));
         }
         assert_eq!(
             String::from_utf8_lossy(&stdout),
@@ -1574,6 +1578,7 @@ fn production_workspace(
             ..GrantSet::default()
         },
         repository_deny,
+        repository_caches: &[],
         git_worktree_repository: None,
         build_volume_mount: None,
         workspace_mount: mount,
@@ -1947,41 +1952,16 @@ async fn host_controller_a_bun_project_runs_bun_before_its_envrc_evaluates() {
     assert_eq!(String::from_utf8_lossy(&stdout), "fixture-bun --version");
 }
 
-/// Nested modules still need the shared read-at-build caches (15_capabilities.md). Each
-/// operation runs independently so a denied Go cache does not conceal Cargo or Bun failures.
+/// Nested modules still need the shared read-at-build caches (15_capabilities.md), which stay at
+/// the tools' own defaults in the host HOME (03_caches.md). Each operation runs independently so
+/// a denied Go cache does not conceal Cargo or Bun failures.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_caches() {
-    let caches = Path::new(cowshed_core::storage::bootstrap::CACHES_ROOT);
-    assert!(
-        caches.is_dir(),
-        "this host-controller rule requires the installed caches volume"
-    );
     let root = scratch("shared-tool-caches");
     let mut sandbox = workspace(&root, 42_592);
     let _runtime_link = runtime_link::RuntimeLink::reserve(&mut sandbox);
-    // A shared directory this rule finds empty while the host's own cache is not yet relocated
-    // into it is emptied again: left holding the probe's packages, it is the conflict that keeps
-    // host setup from ever relocating the host cache, and every sandbox then misses the shared one.
-    let host_home = std::env::var_os("HOME").expect("host HOME");
-    let mut found_empty = Vec::new();
-    for (host, shared) in [
-        (".cargo/registry", "cargo/registry"),
-        (".cargo/git", "cargo/git"),
-        (".bun/install/cache", "bun/install/cache"),
-    ] {
-        let cache = cowshed_core::capabilities::cache::HostCache {
-            host: Path::new(&host_home).join(host),
-            shared: caches.join(shared),
-        };
-        let host = sandbox.home.join(host);
-        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&cache.shared).unwrap();
-        if !cache.is_shared() && std::fs::read_dir(&cache.shared).unwrap().next().is_none() {
-            found_empty.push(cache.shared.clone());
-        }
-        std::os::unix::fs::symlink(cache.shared, host).unwrap();
-    }
+    std::fs::create_dir_all(sandbox.home.join(".cargo")).unwrap();
     for name in cowshed_core::capabilities::cargo::STATE_FILES {
         std::fs::write(sandbox.home.join(".cargo").join(name), "").unwrap();
     }
@@ -2106,16 +2086,21 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
     sandbox
         .configure_capabilities()
         .expect("detect tool conventions");
+    // The supervisor creates every shared cache before a child runs: a child granted writes
+    // inside one cannot create its parent.
+    for cache in &sandbox.capabilities.contribution.shared_caches {
+        std::fs::create_dir_all(&cache.path).expect("shared cache directory");
+    }
     let mut outcomes = Vec::new();
     for (tool, script) in [
         (
             "go",
             r#"set -eu
-cache="$1/go/build"
+cache="$1/Library/Caches/go-build"
 printf probe > "$cache/cowshed-probe-$$"
 rm "$cache/cowshed-probe-$$"
 test "$GOCACHE" = "$cache"
-test "$GOMODCACHE" = "$1/go/mod"
+test "$GOMODCACHE" = "$1/go/pkg/mod"
 cd packages/go-probe
 go build ./...
 "#,
@@ -2123,14 +2108,14 @@ go build ./...
         (
             "cargo",
             r#"set -eu
-test "$CARGO_HOME" = "$2/.cargo"
+test "$CARGO_HOME" = "$1/.cargo"
 cargo fetch
 "#,
         ),
         (
             "bun",
             r#"set -eu
-test "$BUN_INSTALL_CACHE_DIR" = "$2/.bun/install/cache"
+test "$BUN_INSTALL_CACHE_DIR" = "$1/.bun/install/cache"
 mkdir "$BUN_INSTALL_CACHE_DIR/cowshed-probe-$$"
 rmdir "$BUN_INSTALL_CACHE_DIR/cowshed-probe-$$"
 bun install --ignore-scripts --no-progress
@@ -2146,7 +2131,6 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
                 "-c".into(),
                 script.into(),
                 tool.into(),
-                caches.as_os_str().to_owned(),
                 sandbox.home.as_os_str().to_owned(),
             ],
         )
@@ -2160,10 +2144,6 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
         outcomes.push((tool, result));
     }
     std::fs::remove_dir_all(&root).expect("remove cache fixture");
-    for shared in found_empty {
-        std::fs::remove_dir_all(&shared).expect("empty a shared cache this rule filled");
-        std::fs::create_dir(&shared).expect("restore the empty shared cache");
-    }
     for (tool, (exit, stdout, stderr)) in outcomes {
         assert_eq!(
             exit,

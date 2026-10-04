@@ -153,7 +153,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     let spec = LaunchAgentSpec::sccache(
         &sccache_program(),
         Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
-        Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+        Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
         ImageCapacity::from_gibibytes(40),
         Path::new("/Users/cowshed-test/.cowshed"),
     )
@@ -182,7 +182,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
             ),
             (
                 "SCCACHE_DIR".to_owned(),
-                "/Users/cowshed-test/.cowshed/caches/sccache".to_owned()
+                "/Users/cowshed-test/Library/Caches/Mozilla.sccache".to_owned()
             ),
             ("SCCACHE_CACHE_SIZE".to_owned(), "40g".to_owned()),
             (
@@ -223,7 +223,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "    <key>SCCACHE_SERVER_UDS</key>\n",
         "    <string>/Users/cowshed-test/.cowshed/sccache.sock</string>\n",
         "    <key>SCCACHE_DIR</key>\n",
-        "    <string>/Users/cowshed-test/.cowshed/caches/sccache</string>\n",
+        "    <string>/Users/cowshed-test/Library/Caches/Mozilla.sccache</string>\n",
         "    <key>SCCACHE_CACHE_SIZE</key>\n",
         "    <string>40g</string>\n",
         "    <key>SCCACHE_BASEDIRS</key>\n",
@@ -253,7 +253,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         LaunchAgentSpec::sccache(
             &sccache_program(),
             Path::new("relative.sock"),
-            Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+            Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
             ImageCapacity::from_gibibytes(40),
             Path::new("/Users/cowshed-test/.cowshed"),
         ),
@@ -1024,7 +1024,7 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
         LaunchAgentSpec::sccache(
             &sccache,
             Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
-            Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+            Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
             ImageCapacity::from_gibibytes(40),
             Path::new("/Users/cowshed-test/.cowshed"),
         )

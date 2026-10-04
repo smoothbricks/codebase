@@ -147,13 +147,11 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
     );
     let root = ScratchRoot::new("lifecycle")?;
     let store = root.path().join("store");
-    let caches = store.join("caches");
     let checkout_path = root.path().join("main-mount");
     fs::create_dir_all(&store)?;
-    fs::create_dir_all(&caches)?;
     fs::create_dir_all(&checkout_path)?;
     seed(&store);
-    let config = ApfsSubstrateConfig::new(&store, &caches, &checkout_path)
+    let config = ApfsSubstrateConfig::new(&store, &checkout_path)
         .with_capacity(ImageCapacity::from_gibibytes(1));
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
         Ok(OperationIdentity {
@@ -542,12 +540,11 @@ impl KillWindow {
     fn unseeded(label: &str) -> Result<Self, Box<dyn Error>> {
         let root = ScratchRoot::new(label)?;
         let store = root.path().join("store");
-        let caches = store.join("caches");
         let checkout = root.path().join("checkout");
-        fs::create_dir_all(&caches)?;
+        fs::create_dir_all(&store)?;
         fs::create_dir_all(&checkout)?;
         fs::write(checkout.join("tracked"), b"original source\n")?;
-        let config = ApfsSubstrateConfig::new(&store, &caches, &checkout).with_capacity(CAPACITY);
+        let config = ApfsSubstrateConfig::new(&store, &checkout).with_capacity(CAPACITY);
         let repo = RepoId::parse(&format!("cowshed/kill-{}", std::process::id()))?;
         let layout = StorageLayout::new(&store, &repo)?;
         let image = layout.main_image()?.image().to_owned();

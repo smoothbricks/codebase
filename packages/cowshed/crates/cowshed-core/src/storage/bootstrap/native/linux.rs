@@ -8,9 +8,9 @@ use super::super::{
     MountpointState, ValidatedHostStorage,
 };
 use super::shared::{
-    HostSetupPlan, HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
-    SystemBootstrapHost, UninstallReport, existing_host_storage_error, platform_host_error,
-    setup_execution_error,
+    CachesVolume, HostSetupPlan, HostSetupReport, HostUninstallPlan, NativeBootstrapError,
+    NativeBootstrapMode, SystemBootstrapHost, UninstallReport, existing_host_storage_error,
+    platform_host_error, setup_execution_error,
 };
 use crate::storage::fstab::FstabPin;
 
@@ -68,13 +68,19 @@ pub async fn validate_existing_host_storage(_home: &Path) -> crate::Result<Valid
     ))
 }
 
-pub async fn plan_host_setup(_home: &Path) -> crate::Result<HostSetupPlan> {
+pub async fn plan_host_setup(
+    _home: &Path,
+    _caches_volume: CachesVolume,
+) -> crate::Result<HostSetupPlan> {
     Err(existing_host_storage_error(
         NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
     ))
 }
 
-pub async fn execute_host_setup(_home: &Path) -> crate::Result<HostSetupReport> {
+pub async fn execute_host_setup(
+    _home: &Path,
+    _caches_volume: CachesVolume,
+) -> crate::Result<HostSetupReport> {
     Err(setup_execution_error(
         NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
         "cowshed setup",

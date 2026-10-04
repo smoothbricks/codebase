@@ -249,10 +249,7 @@ impl FakeHost {
                 git_root: root.join("checkout"),
                 storage: cowshed_core::storage::bootstrap::ValidatedHostStorage::new(
                     root.join("home"),
-                    cowshed_core::storage::bootstrap::CanonicalRoots::at(
-                        root.join("store"),
-                        root.join("caches"),
-                    ),
+                    cowshed_core::storage::bootstrap::CanonicalRoots::at(root.join("store")),
                 ),
             },
             state_path: root.join("durable.json"),

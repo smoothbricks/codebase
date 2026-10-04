@@ -12,8 +12,7 @@ const PNPM_HOME_PATH: &str = ".local/share/pnpm/store";
 pub static PNPM_HOME: SharedToolHome = SharedToolHome {
     variable: Some("PNPM_CONFIG_STORE_DIR"),
     home: PNPM_HOME_PATH,
-    layout: SharedLayout::Whole("pnpm/store"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
 
 pub const DETECTOR: Detector = Detector {
@@ -23,7 +22,6 @@ pub const DETECTOR: Detector = Detector {
     all: &["package.json"],
     any: &["pnpm-lock.yaml"],
     contribute,
-    host_cache_homes: &[&PNPM_HOME],
     reached_from: None,
 };
 

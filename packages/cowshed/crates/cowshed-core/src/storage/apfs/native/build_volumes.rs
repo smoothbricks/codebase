@@ -385,7 +385,7 @@ mod tests {
         .unwrap();
         let host = MacOsApfsExecutionHost::new(
             SystemCommandRunner,
-            ApfsSubstrateConfig::new(&store, root.join("caches"), root.join("checkout")),
+            ApfsSubstrateConfig::new(&store, root.join("checkout")),
         )
         .unwrap();
         (host, BuildVolumeLayout::new(&project).unwrap())

@@ -178,9 +178,9 @@ fn conflicting_executables_and_cache_targets_fail_without_order_dependence() {
                         target: PathBuf::from(source),
                     });
                 } else {
-                    contribution.cache_mounts.push(CacheMount {
-                        source: PathBuf::from(source),
-                        private_target: Some(PathBuf::from("cache/tool")),
+                    contribution.shared_caches.push(SharedCache {
+                        path: PathBuf::from(source),
+                        private_link: Some(PathBuf::from("cache/tool")),
                     });
                 }
                 let result = merge(
@@ -260,31 +260,81 @@ fn overlapping_build_state_contributions_are_refused_and_identical_ones_coalesce
     assert_eq!(output.build_state, vec![path("target", "target")]);
 }
 
+/// A shared tool home names the host's own directories: the cache directories as read-write
+/// shared caches, a split root as a literal read beside its state files, and the variable as the
+/// host path a caller's own value cannot replace.
 #[test]
-fn shared_caches_are_not_granted_before_host_links_are_provisioned() {
-    static HOME: SharedToolHome = SharedToolHome {
+fn a_shared_tool_home_is_carved_back_at_the_host_path() {
+    static WHOLE: SharedToolHome = SharedToolHome {
         variable: Some("TEST_CACHE"),
         home: ".test-cache",
-        linked_from_checkouts: false,
-        layout: SharedLayout::Whole("test-cache"),
+        layout: SharedLayout::Whole,
+    };
+    static SPLIT: SharedToolHome = SharedToolHome {
+        variable: None,
+        home: ".tool",
+        layout: SharedLayout::Split {
+            caches: &["cache"],
+            state_files: &[".lock"],
+        },
     };
     let fixture = Fixture::new();
-    let unavailable = fixture.root.join("not-provisioned");
+    let mut contribution = CapabilityContribution::default();
+    add_shared_tool_home(&mut contribution, &fixture.home, &WHOLE);
+    add_shared_tool_home(&mut contribution, &fixture.home, &SPLIT);
+    let whole = fixture.home.join(".test-cache");
+    let split = fixture.home.join(".tool");
+    assert_eq!(
+        contribution.env,
+        BTreeMap::from([("TEST_CACHE", EnvAction::Own(whole.clone().into()))])
+    );
+    assert_eq!(
+        contribution.shared_caches,
+        vec![
+            SharedCache {
+                path: whole,
+                private_link: None,
+            },
+            SharedCache {
+                path: split.join("cache"),
+                private_link: None,
+            },
+        ]
+    );
+    assert_eq!(
+        contribution.grants,
+        vec![
+            CapabilityGrant {
+                path: split.clone(),
+                scope: GrantScope::Literal,
+                access: GrantAccess::Read,
+            },
+            CapabilityGrant {
+                path: split.join(".lock"),
+                scope: GrantScope::Literal,
+                access: GrantAccess::ReadWrite,
+            },
+        ]
+    );
+}
+
+/// `[caches] home` entries from main's configuration are shared where the host keeps them and
+/// linked from the private HOME, so `$HOME/<path>` reaches the same bytes in every sandbox.
+#[test]
+fn repository_caches_are_shared_and_linked_from_the_private_home() {
+    let fixture = Fixture::new();
+    let declared = [PathBuf::from(".cache/ttsc")];
     let context = DetectionContext {
-        caches_root: &unavailable,
+        repository_caches: &declared,
         ..fixture.context()
     };
-    let private = shared_tool_contribution(&context, &HOME).unwrap();
-    assert_eq!(private.env.get("TEST_CACHE"), Some(&EnvAction::Unset));
-    assert!(private.cache_mounts.is_empty() && private.grants.is_empty());
-    let shared = HOME.links(&fixture.home, &fixture.caches).remove(0);
-    fs::create_dir_all(&shared.shared).unwrap();
-    std::os::unix::fs::symlink(&shared.shared, &shared.host).unwrap();
-    let public = shared_tool_contribution(&fixture.context(), &HOME).unwrap();
+    let detected = detect(&context, &BTreeMap::new()).unwrap();
+    assert!(detected.active.is_empty());
     assert_eq!(
-        public.env.get("TEST_CACHE"),
-        Some(&EnvAction::Own(shared.host.into_os_string()))
+        detected.contribution.shared_caches,
+        vec![SharedCache {
+            path: fixture.home.join(".cache/ttsc"),
+            private_link: Some(fixture.environment.join("home/.cache/ttsc")),
+        }]
     );
-    assert_eq!(public.cache_mounts.len(), 1);
-    assert_eq!(public.grants.len(), 1);
 }

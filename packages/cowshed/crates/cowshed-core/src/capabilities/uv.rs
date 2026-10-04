@@ -1,15 +1,14 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, add_bootstrap,
-    host_program_directories, shared_tool_contribution,
+    add_shared_tool_home, host_program_directories,
 };
 use crate::Result;
 
 pub static UV_HOME: SharedToolHome = SharedToolHome {
     variable: Some("UV_CACHE_DIR"),
     home: ".cache/uv",
-    layout: SharedLayout::Whole("uv"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
 
 pub const DETECTOR: Detector = Detector {
@@ -19,12 +18,12 @@ pub const DETECTOR: Detector = Detector {
     all: &[],
     any: &["pyproject.toml", "uv.lock"],
     contribute,
-    host_cache_homes: &[&UV_HOME],
     reached_from: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
-    let mut contribution = shared_tool_contribution(context, &UV_HOME)?;
+    let mut contribution = CapabilityContribution::default();
+    add_shared_tool_home(&mut contribution, context.home, &UV_HOME);
     if context.trust_bundle.is_some() {
         contribution
             .env

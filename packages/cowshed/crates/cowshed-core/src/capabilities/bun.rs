@@ -8,8 +8,7 @@ use crate::Result;
 pub static BUN_HOME: SharedToolHome = SharedToolHome {
     variable: Some("BUN_INSTALL_CACHE_DIR"),
     home: ".bun/install/cache",
-    layout: SharedLayout::Whole("bun/install/cache"),
-    linked_from_checkouts: true,
+    layout: SharedLayout::Whole,
 };
 
 pub const DETECTOR: Detector = Detector {
@@ -19,7 +18,6 @@ pub const DETECTOR: Detector = Detector {
     all: &["package.json"],
     any: &["bun.lock", "bun.lockb"],
     contribute,
-    host_cache_homes: &[&BUN_HOME],
     reached_from: None,
 };
 
@@ -93,53 +91,25 @@ mod tests {
     }
 
     /// Bun's isolated linker writes its cache's path into every `node_modules/.bun` link, so a
-    /// shed's `bun install` names the host's own cache path, the one main's links name: the
-    /// shared cache once host setup has relocated it, and before that the host's still-private
-    /// cache, read-only — never a store under the shed's private HOME or `XDG_CACHE_HOME`.
+    /// shed's `bun install` names the host's own cache path, the one main's links name, shared
+    /// read-write where the host keeps it — never a store under the shed's private HOME or
+    /// `XDG_CACHE_HOME`.
     #[test]
-    fn a_shed_installs_through_the_host_cache_path_that_resolves_to_the_shared_cache() {
-        use super::super::{CapabilityGrant, EnvAction, GrantAccess, GrantScope};
+    fn a_shed_installs_into_the_host_cache_path() {
+        use super::super::{EnvAction, SharedCache};
         let fixture = Fixture::new();
         fixture.files(&["package.json", "bun.lock"]);
-        let link = BUN_HOME.links(&fixture.home, &fixture.caches).remove(0);
-        let host = EnvAction::Own(link.host.clone().into_os_string());
-        std::fs::create_dir_all(&link.host).unwrap();
-
-        let unrelocated = super::super::detect_for_workspace(&fixture.context())
+        let host = fixture.home.join(".bun/install/cache");
+        let contribution = super::super::detect_for_workspace(&fixture.context())
             .unwrap()
             .contribution;
         assert_eq!(
-            unrelocated.env.get("BUN_INSTALL_CACHE_DIR"),
-            Some(&host),
-            "an unrelocated host cache is still the one path main's links name"
+            contribution.env.get("BUN_INSTALL_CACHE_DIR"),
+            Some(&EnvAction::Own(host.clone().into_os_string()))
         );
-        assert!(unrelocated.grants.contains(&CapabilityGrant {
-            path: link.host.clone(),
-            scope: GrantScope::Subtree,
-            access: GrantAccess::Read,
+        assert!(contribution.shared_caches.contains(&SharedCache {
+            path: host,
+            private_link: None,
         }));
-
-        std::fs::remove_dir(&link.host).unwrap();
-        std::fs::create_dir_all(&link.shared).unwrap();
-        std::os::unix::fs::symlink(&link.shared, &link.host).unwrap();
-        let relocated = super::super::detect_for_workspace(&fixture.context())
-            .unwrap()
-            .contribution;
-        let Some(EnvAction::Own(cache)) = relocated.env.get("BUN_INSTALL_CACHE_DIR") else {
-            panic!("a shed's bun is pointed at its install cache: {relocated:?}");
-        };
-        assert_eq!(cache.as_os_str(), link.host.as_os_str());
-        assert_eq!(
-            std::fs::canonicalize(cache).unwrap(),
-            std::fs::canonicalize(&link.shared).unwrap(),
-            "the shed's install cache resolves to the shared cache"
-        );
-        assert!(
-            relocated
-                .cache_mounts
-                .iter()
-                .any(|mount| mount.source == link.shared && mount.private_target.is_none()),
-            "the shared cache is the shed's writable install cache"
-        );
     }
 }

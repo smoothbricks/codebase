@@ -15,10 +15,10 @@ use super::fstab::FstabPin;
 
 pub mod native;
 pub use native::{
-    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
-    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup,
-    plan_host_uninstall,
+    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
+    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
+    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
@@ -29,8 +29,10 @@ pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
 /// Bootstrap volumes cannot follow `$HOME`: doing so gives each user a different view of the
 /// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
 pub const STORE_ROOT: &str = "/private/cowshed/store";
-/// Machine-global rebuildable-cache volume root; see [`STORE_ROOT`] for the `$HOME` invariant.
-pub const CACHES_ROOT: &str = "/private/cowshed/caches";
+/// Where the retired `cowshed.caches` volume (or `<pool>/cowshed/caches` dataset) is mounted on a
+/// host that still has one. Nothing is provisioned there any more: setup moves what it holds into
+/// the host HOME and `setup --retire-caches-volume` deletes it (03_caches.md).
+pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
 /// Where launchd reads the storage mount service from; owned here so the CLI's doctor names the
 /// same file the macOS planner installs.
 pub const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
@@ -72,6 +74,10 @@ pub struct CowshedConfig {
     /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
     /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
     sandbox_deny: Vec<PathBuf>,
+    /// `[caches] home`: HOME-relative cache directories the repository's own tooling places,
+    /// shared into every sandbox of the project. Trusted only from main's checkout, exactly like
+    /// `[sandbox] deny`.
+    caches_home: Vec<PathBuf>,
     capabilities: std::collections::BTreeMap<
         crate::capabilities::CapabilityId,
         crate::capabilities::CapabilityOverride,
@@ -88,6 +94,10 @@ impl CowshedConfig {
 
     pub fn sandbox_deny(&self) -> &[PathBuf] {
         &self.sandbox_deny
+    }
+
+    pub fn caches_home(&self) -> &[PathBuf] {
+        &self.caches_home
     }
 
     pub fn capabilities(
@@ -123,6 +133,7 @@ enum ConfigSection {
     Substrate,
     Sandbox,
     Build,
+    Caches,
     Capability(crate::capabilities::CapabilityId),
 }
 
@@ -132,6 +143,7 @@ impl ConfigSection {
             Self::Substrate => "substrate",
             Self::Sandbox => "sandbox",
             Self::Build => "build",
+            Self::Caches => "caches",
             Self::Capability(id) => id.section_name(),
         }
     }
@@ -143,18 +155,20 @@ struct ParsedCapability {
     directory: Option<PathBuf>,
 }
 
-/// Parse repository-owned storage, sandbox deny, build volume capacity and convention-only
-/// capability overrides. Unknown or duplicated settings fail rather than silently changing
+/// Parse repository-owned storage, sandbox deny, build volume capacity, repository cache and
+/// convention-only capability overrides. Unknown or duplicated settings fail rather than silently changing
 /// project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
     let mut saw_sandbox = false;
     let mut saw_build = false;
+    let mut saw_caches = false;
     let mut kind = None;
     let mut pool = None;
     let mut sandbox_deny = None;
     let mut build_capacity = None;
+    let mut caches_home = None;
     let mut capabilities =
         std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
     for (index, original) in input.lines().enumerate() {
@@ -173,6 +187,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 "substrate" => ConfigSection::Substrate,
                 "sandbox" => ConfigSection::Sandbox,
                 "build" => ConfigSection::Build,
+                "caches" => ConfigSection::Caches,
                 other => {
                     let id = other
                         .strip_prefix("capabilities.")
@@ -192,6 +207,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 ConfigSection::Substrate => Some(&mut saw_substrate),
                 ConfigSection::Sandbox => Some(&mut saw_sandbox),
                 ConfigSection::Build => Some(&mut saw_build),
+                ConfigSection::Caches => Some(&mut saw_caches),
                 ConfigSection::Capability(_) => None,
             };
             if seen.is_some_and(|seen| std::mem::replace(seen, true)) {
@@ -222,7 +238,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             (ConfigSection::Sandbox, "deny") => {
                 set_once(
                     &mut sandbox_deny,
-                    parse_sandbox_deny(value, line_number)?,
+                    parse_relative_paths(value, line_number, section, "deny", "workspace")?,
                     section,
                     "deny",
                 )?;
@@ -236,6 +252,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                     }
                 })?;
                 set_once(&mut build_capacity, capacity, section, "capacity")?;
+            }
+            (ConfigSection::Caches, "home") => {
+                set_once(
+                    &mut caches_home,
+                    parse_relative_paths(value, line_number, section, "home", "HOME")?,
+                    section,
+                    "home",
+                )?;
             }
             (ConfigSection::Capability(id), "disabled") => {
                 let disabled = match value {
@@ -318,6 +342,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             key: "capacity",
         });
     }
+    let caches_home = if saw_caches {
+        caches_home.ok_or(ConfigError::MissingKey {
+            section: "caches",
+            key: "home",
+        })?
+    } else {
+        Vec::new()
+    };
     let capabilities = capabilities
         .into_iter()
         .map(|(id, parsed)| {
@@ -333,8 +365,34 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     Ok(CowshedConfig {
         substrate,
         sandbox_deny,
+        caches_home,
         capabilities,
         build_capacity,
+    })
+}
+
+/// Main's `.cowshed.toml`, the only copy whose `[sandbox]` and `[caches]` sections are trusted:
+/// main's checkout is the operator's, while a workspace's copy is the agent's to edit. A missing
+/// file declares nothing; an unreadable or invalid one refuses rather than drop a deny or a cache.
+pub fn main_cowshed_config(main_mount: &Path) -> crate::Result<CowshedConfig> {
+    let path = main_mount.join(".cowshed.toml");
+    let input = match std::fs::read_to_string(&path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CowshedConfig::default());
+        }
+        Err(error) => {
+            return Err(crate::CowshedError::environment_missing(
+                format!("cannot read {}: {error}", path.display()),
+                "make main's .cowshed.toml readable, then retry",
+            ));
+        }
+    };
+    parse_cowshed_config(&input).map_err(|error| {
+        crate::CowshedError::usage(
+            format!("invalid {}: {error}", path.display()),
+            "fix main's .cowshed.toml, then retry",
+        )
     })
 }
 
@@ -353,12 +411,23 @@ fn set_once<T>(
     Ok(())
 }
 
-/// `[sandbox] deny`: a TOML array of workspace-relative paths on one line, each a non-empty
-/// path of plain components — no root, no `.` or `..` — sorted and deduplicated.
-fn parse_sandbox_deny(value: &str, line: usize) -> Result<Vec<PathBuf>, ConfigError> {
-    let paths = serde_json::from_str::<Vec<String>>(value)
-        .map_err(|_| ConfigError::ExpectedPathArray { line })?;
-    let mut deny = Vec::with_capacity(paths.len());
+/// `[sandbox] deny` and `[caches] home`: a TOML array of paths on one line, each relative to
+/// `base` (the workspace, or HOME) and a non-empty path of plain components — no root, no `.` or
+/// `..` — sorted and deduplicated.
+fn parse_relative_paths(
+    value: &str,
+    line: usize,
+    section: ConfigSection,
+    key: &'static str,
+    base: &'static str,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    let paths =
+        serde_json::from_str::<Vec<String>>(value).map_err(|_| ConfigError::ExpectedPathArray {
+            section: section.name(),
+            key,
+            line,
+        })?;
+    let mut relative_paths = Vec::with_capacity(paths.len());
     for path in paths {
         let relative = Path::new(&path);
         if path.is_empty()
@@ -366,13 +435,18 @@ fn parse_sandbox_deny(value: &str, line: usize) -> Result<Vec<PathBuf>, ConfigEr
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
         {
-            return Err(ConfigError::InvalidSandboxDeny(path));
+            return Err(ConfigError::InvalidRelativePath {
+                section: section.name(),
+                key,
+                base,
+                path,
+            });
         }
-        deny.push(relative.components().collect::<PathBuf>());
+        relative_paths.push(relative.components().collect::<PathBuf>());
     }
-    deny.sort();
-    deny.dedup();
-    Ok(deny)
+    relative_paths.sort();
+    relative_paths.dedup();
+    Ok(relative_paths)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -424,12 +498,21 @@ pub enum ConfigError {
     UnsupportedKind(String),
     #[error("[{section}] value at line {line} must be a quoted string")]
     ExpectedQuotedString { section: &'static str, line: usize },
-    #[error("[sandbox] deny at line {line} must be an array of quoted paths")]
-    ExpectedPathArray { line: usize },
+    #[error("[{section}] {key} at line {line} must be an array of quoted paths")]
+    ExpectedPathArray {
+        section: &'static str,
+        key: &'static str,
+        line: usize,
+    },
     #[error(
-        "[sandbox] deny entries must be non-empty workspace-relative paths without `.` or `..`: {0:?}"
+        "[{section}] {key} entries must be non-empty {base}-relative paths without `.` or `..`: {path:?}"
     )]
-    InvalidSandboxDeny(String),
+    InvalidRelativePath {
+        section: &'static str,
+        key: &'static str,
+        base: &'static str,
+        path: String,
+    },
     #[error("[{section}] value at line {line} must be true or false")]
     ExpectedBoolean { section: &'static str, line: usize },
     #[error("[{section}] directory at line {line}: {reason}")]
@@ -739,36 +822,26 @@ pub enum MountGuardError {
     },
 }
 
-/// The store and cache roots one host serves: the machine-global volumes ([`Self::global`]) in
-/// production, or roots a caller provisioned itself ([`Self::at`]), such as a scratch store of
-/// real APFS images.
+/// The store root one host serves: the machine-global volume ([`Self::global`]) in production, or
+/// a root a caller provisioned itself ([`Self::at`]), such as a scratch store of real APFS images.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
     store: PathBuf,
-    caches: PathBuf,
     telemetry: PathBuf,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        Self::at(PathBuf::from(STORE_ROOT), PathBuf::from(CACHES_ROOT))
+        Self::at(PathBuf::from(STORE_ROOT))
     }
 
-    pub fn at(store: PathBuf, caches: PathBuf) -> Self {
+    pub fn at(store: PathBuf) -> Self {
         let telemetry = store.join("telemetry");
-        Self {
-            store,
-            caches,
-            telemetry,
-        }
+        Self { store, telemetry }
     }
 
     pub fn store(&self) -> &Path {
         &self.store
-    }
-
-    pub fn caches(&self) -> &Path {
-        &self.caches
     }
 
     pub fn telemetry(&self) -> &Path {
@@ -803,10 +876,6 @@ impl ValidatedHostStorage {
 
     pub fn store(&self) -> &Path {
         self.roots.store()
-    }
-
-    pub fn caches(&self) -> &Path {
-        self.roots.caches()
     }
 
     pub fn telemetry(&self) -> &Path {
@@ -1140,23 +1209,24 @@ fn plan_apfs(
         store,
     );
 
-    if !mounted_but_unpublished_at(caches, roots.caches())
-        && !remounting_from_elsewhere(caches, roots.caches())
-    {
-        operations.push(guard(
-            roots.caches(),
+    // The caches volume is retired: never created, and an existing one is kept mounted only
+    // until `setup --retire-caches-volume` deletes it (03_caches.md).
+    if !matches!(caches, ExistingStorage::Absent) {
+        let mountpoint = Path::new(RETIRED_CACHES_MOUNTPOINT);
+        if !mounted_but_unpublished_at(caches, mountpoint)
+            && !remounting_from_elsewhere(caches, mountpoint)
+        {
+            operations.push(guard(mountpoint, VolumeRole::Caches, SubstrateKind::Apfs));
+        }
+        plan_apfs_volume(
+            &mut operations,
+            &mut volumes,
+            mountpoint,
+            APFS_CACHES_VOLUME,
             VolumeRole::Caches,
-            SubstrateKind::Apfs,
-        ));
+            caches,
+        );
     }
-    plan_apfs_volume(
-        &mut operations,
-        &mut volumes,
-        roots.caches(),
-        APFS_CACHES_VOLUME,
-        VolumeRole::Caches,
-        caches,
-    );
 
     if !volumes.is_empty() {
         operations.push(HostOperation::ProvisionApfsVolumes {
@@ -1346,18 +1416,19 @@ fn plan_zfs(
         VolumeRole::Store,
         store_state,
     );
-    operations.push(guard(
-        roots.caches(),
-        VolumeRole::Caches,
-        SubstrateKind::Zfs,
-    ));
-    plan_zfs_mounted_dataset(
-        &mut operations,
-        &caches,
-        roots.caches(),
-        VolumeRole::Caches,
-        caches_state,
-    );
+    // The caches dataset is retired: never created, and an existing one is kept mounted so the
+    // migration can move what it holds (03_caches.md, "Retiring the caches volume").
+    if !matches!(caches_state, ExistingStorage::Absent) {
+        let mountpoint = Path::new(RETIRED_CACHES_MOUNTPOINT);
+        operations.push(guard(mountpoint, VolumeRole::Caches, SubstrateKind::Zfs));
+        plan_zfs_mounted_dataset(
+            &mut operations,
+            &caches,
+            mountpoint,
+            VolumeRole::Caches,
+            caches_state,
+        );
+    }
     if matches!(projects_state, ExistingStorage::Absent) {
         operations.push(command(ZFS, ["create", "-o", "mountpoint=none", &projects]));
         operations.push(zfs_marker(&projects, VolumeRole::Projects));

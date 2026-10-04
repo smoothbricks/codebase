@@ -35,16 +35,19 @@ use async_trait::async_trait;
 use cowshed_core::AdoptedProject;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::build_volume::BuildStateRefresh;
+use cowshed_core::caches_retirement::{
+    self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
+};
 use cowshed_core::capabilities::sccache::cache_directory;
-use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::bootstrap::{
-    CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
-    HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
-    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
-    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, RETIRED_CACHES_MOUNTPOINT, UninstallFstabOutcome,
+    UninstallReport, UninstallServiceOutcome, VOLUME_MARKER_FILE, VolumeOutcome, VolumeState,
+    execute_host_setup, execute_host_uninstall, main_cowshed_config, plan_host_setup,
+    plan_host_uninstall,
 };
 use cowshed_core::storage::host_config::{
     AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
@@ -266,8 +269,8 @@ impl HostArtifactRemoval {
 /// be provable without any of them.
 #[async_trait]
 pub trait HostSetup: Send {
-    async fn plan(&mut self) -> Result<HostSetupPlan>;
-    async fn execute(&mut self) -> Result<HostSetupReport>;
+    async fn plan(&mut self, caches_volume: CachesVolume) -> Result<HostSetupPlan>;
+    async fn execute(&mut self, caches_volume: CachesVolume) -> Result<HostSetupReport>;
     async fn plan_uninstall(&mut self) -> Result<HostUninstallPlan>;
     async fn execute_uninstall(&mut self) -> Result<UninstallReport>;
     /// What the volumes hold right now, for the teardown refusal.
@@ -288,11 +291,10 @@ pub trait HostSetup: Send {
     /// default-provided because there is no honest default: a host that silently answered
     /// "nothing to do" would report a successful install of something it never built.
     async fn install_sccache(&mut self) -> Result<SccacheInstall>;
-    /// Move the host's own read-at-build caches onto the caches volume and link them back.
-    ///
-    /// Called only for `setup --imperative-host-setup`, after the volumes are up; a default run
-    /// never moves anything out of the user's home.
-    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>>;
+    /// Steps 1–3 of retiring the caches volume (03_caches.md): move everything it holds to its
+    /// home in the host HOME, stopping the gateway and the sccache daemon around the moves they
+    /// own. `None` on a host that has no caches volume. Needs no authorization.
+    async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>>;
     /// Enumerate adopted mains before announcing any rebuild-only migration.
     async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>>;
     /// Refresh one adopted main through the same runtime path jobs use.
@@ -322,12 +324,12 @@ impl NativeHostSetup {
 
 #[async_trait]
 impl HostSetup for NativeHostSetup {
-    async fn plan(&mut self) -> Result<HostSetupPlan> {
-        plan_host_setup(&self.home).await
+    async fn plan(&mut self, caches_volume: CachesVolume) -> Result<HostSetupPlan> {
+        plan_host_setup(&self.home, caches_volume).await
     }
 
-    async fn execute(&mut self) -> Result<HostSetupReport> {
-        execute_host_setup(&self.home).await
+    async fn execute(&mut self, caches_volume: CachesVolume) -> Result<HostSetupReport> {
+        execute_host_setup(&self.home, caches_volume).await
     }
 
     async fn plan_uninstall(&mut self) -> Result<HostUninstallPlan> {
@@ -527,22 +529,20 @@ impl HostSetup for NativeHostSetup {
 
     /// Write sccache's own config file, so a build outside every workspace still shares the cache.
     ///
-    /// Gated on validated host storage rather than on the plan: a config naming a directory under
-    /// an unmounted caches volume would resolve onto the boot disk beneath the empty mountpoint —
-    /// a fourth orphaned cache, created by the command whose whole job is to prevent them. The
-    /// destination is the daemon's own [`cache_directory`] and the cap is the daemon's own
-    /// derivation, so the config file and the plist can never name two different stores or two
-    /// different eviction bounds.
+    /// Gated on validated host storage rather than on the plan: the cap is derived from what the
+    /// store holds. The destination is the daemon's own [`cache_directory`] and the cap is the
+    /// daemon's own derivation, so the config file and the plist can never name two different
+    /// stores or two different eviction bounds.
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
         let path = client_config::client_config_path(&self.home);
-        let directory = cache_directory();
+        let directory = cache_directory(&self.home);
         let storage = match validate_existing_host_storage(&self.home).await {
             Ok(storage) => storage,
             Err(error) => {
                 return Ok(ConfigReport {
                     path,
                     store: directory,
-                    outcome: ConfigOutcome::NoSharedStore {
+                    outcome: ConfigOutcome::NoCapacity {
                         reason: error.message,
                     },
                 });
@@ -555,50 +555,65 @@ impl HostSetup for NativeHostSetup {
         client_config::apply(&path, &SharedStore::new(directory, capacity))
     }
 
-    /// Relocate every host cache, holding cargo's own package-cache locks while cargo's move.
-    ///
-    /// On a blocking thread: a move across volumes is a copy of gigabytes. A cargo process that
-    /// holds its lock right now refuses the whole run instead of racing a copy of the caches it
-    /// is writing.
-    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
-        let home = self.home.clone();
-        tokio::task::spawn_blocking(move || {
-            let cargo_home = cowshed_core::capabilities::cargo::HOME.host_path(&home);
-            let _cargo_lock = if cargo_home.is_dir() {
-                match cowshed_core::capabilities::cargo::try_lock_caches(&cargo_home) {
-                    Ok(Some(lock)) => Some(lock),
-                    Ok(None) => {
-                        return Err(CowshedError::conflict(
-                            format!(
-                                "a cargo process holds {}'s package-cache lock",
-                                cargo_home.display()
-                            ),
-                            "let running cargo builds finish, then cowshed setup --imperative-host-setup",
-                        ));
-                    }
-                    Err(error) => {
-                        return Err(CowshedError::internal(format!(
-                            "could not take cargo's package-cache lock in {}: {error}",
-                            cargo_home.display()
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-            Ok(host_caches::host_caches(&home, Path::new(CACHES_ROOT))
-                .map(host_caches::relocate)
-                .collect())
+    /// Plan the moves from what the volume and the host hold, quiesce the writers they touch,
+    /// move, and restart those writers. Cargo's caches move under cargo's own package-cache
+    /// locks, which the executor takes; a cargo process holding them refuses the run.
+    async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>> {
+        let volume = Path::new(RETIRED_CACHES_MOUNTPOINT);
+        if fs::symlink_metadata(volume.join(VOLUME_MARKER_FILE)).is_err() {
+            return Ok(None);
+        }
+        let declared = declared_repository_caches(&self.home).await?;
+        let layout = RetirementLayout::new(&self.home, volume, &declared);
+        let planning = layout.clone();
+        let plan = tokio::task::spawn_blocking(move || {
+            caches_retirement::observe(&planning)
+                .map(|observation| caches_retirement::plan(&planning, &observation))
         })
         .await
-        .map_err(|error| CowshedError::internal(format!("host cache relocation failed: {error}")))?
+        .map_err(|error| CowshedError::internal(format!("caches volume planning failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot inspect the caches volume {}: {error}",
+                    volume.display()
+                ),
+                "cowshed doctor --json",
+            )
+        })?;
+        let owners = plan.owners();
+        let gateway = owners.contains(&Owner::Gateway);
+        let sccache_running = owners.contains(&Owner::Sccache)
+            && crate::capabilities::sccache::service::service_status()
+                .await
+                .is_ok_and(|status| status.running);
+        if gateway {
+            crate::gateway_service::stop_for_host_move()?;
+        }
+        if sccache_running {
+            crate::capabilities::sccache::service::stop_for_host_move()?;
+        }
+        let executed =
+            tokio::task::spawn_blocking(move || caches_retirement::execute(&layout, &plan))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("caches volume retirement failed: {error}"))
+                })?;
+        // Restarted whatever the moves did: a writer left stopped is a host setup broke.
+        if gateway {
+            crate::gateway_service::start_after_host_move().await?;
+        }
+        if sccache_running {
+            start_service(None).await?;
+        }
+        executed.map(Some).map_err(retirement_error)
     }
 
     /// Build the flake, root the result, and start the agent on that store path.
     ///
-    /// Storage first, deliberately: the daemon's cache lives on the caches volume, and starting a
-    /// server over an unmounted mountpoint would grow a cache on the boot disk underneath it. The
-    /// caller only reaches this on a run whose volumes came up, so the failure here is genuinely
+    /// Storage first, deliberately: the daemon listens on a socket in the store volume, and
+    /// starting a server over an unmounted mountpoint would bind it on the boot disk underneath.
+    /// The caller only reaches this on a run whose store came up, so the failure here is genuinely
     /// about nix or launchd rather than about storage.
     async fn install_sccache(&mut self) -> Result<SccacheInstall> {
         let flake = nix::flake_directory()?;
@@ -649,6 +664,40 @@ impl HostSetup for NativeHostSetup {
             .map_err(host_config_error)?;
         let config = execute_mount_root_change(&plan).map_err(host_config_error)?;
         Ok(config.mount_root().to_path_buf())
+    }
+}
+
+/// The `[caches] home` paths every adopted project's main declares, for placing a repository's
+/// cache the volume holds. A host whose storage cannot be read declares nothing, and its
+/// repository caches stay on the volume as named leftovers.
+async fn declared_repository_caches(home: &Path) -> Result<Vec<PathBuf>> {
+    let Ok(storage) = validate_existing_host_storage(home).await else {
+        return Ok(Vec::new());
+    };
+    let Ok(projects) = NativeGatewayInventory::new(storage)
+        .adopted_projects()
+        .await
+    else {
+        return Ok(Vec::new());
+    };
+    let mut declared = Vec::new();
+    for project in projects {
+        declared.extend_from_slice(main_cowshed_config(&project.project_root)?.caches_home());
+    }
+    declared.sort();
+    declared.dedup();
+    Ok(declared)
+}
+
+fn retirement_error(error: RetirementError) -> CowshedError {
+    match error {
+        RetirementError::CargoLockHeld { .. } => CowshedError::conflict(
+            error.to_string(),
+            "let running cargo builds finish, then cowshed setup",
+        ),
+        RetirementError::Step { .. } | RetirementError::Observe(_) => {
+            CowshedError::environment_missing(error.to_string(), "cowshed setup")
+        }
     }
 }
 
@@ -732,14 +781,7 @@ where
     if args.uninstall {
         return uninstall(setup, args.force, json, output).await;
     }
-    repair(
-        setup,
-        args.sccache,
-        args.imperative_host_setup,
-        json,
-        output,
-    )
-    .await
+    repair(setup, args.sccache, args.retire_caches_volume, json, output).await
 }
 
 async fn set_mount_root<S, W, E>(
@@ -794,7 +836,7 @@ fn host_config_error(error: HostConfigError) -> CowshedError {
 async fn repair<S, W, E>(
     setup: &mut S,
     sccache_requested: bool,
-    relocation_requested: bool,
+    retire_requested: bool,
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32>
@@ -803,16 +845,32 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let plan = setup.plan().await?;
+    // Steps 1–3 of the caches retirement run first, while an existing volume is mounted and
+    // without authorization, so `--retire-caches-volume` can plan its deletion into the one
+    // authorization the rest of setup uses. A volume setup first has to mount is retired after.
+    let mut retirement = setup.retire_caches_volume().await?;
+    let retire = retire_requested
+        && retirement
+            .as_ref()
+            .is_none_or(|report| report.leftovers.is_empty());
+    let caches_volume = if retire {
+        CachesVolume::Retire
+    } else {
+        CachesVolume::Keep
+    };
+    let plan = setup.plan(caches_volume).await?;
     announce_setup(&plan, output)?;
-    let report = setup.execute().await.map_err(declined_authorization)?;
+    let report = setup
+        .execute(caches_volume)
+        .await
+        .map_err(declined_authorization)?;
     // A run that stopped partway is a failure, and core reports it as a *successful report
     // carrying a failure* so the progress is not lost with the error. Both halves have to reach
     // the caller: the per-action rows say what happened, and the taxonomy says it did not work.
     // Exiting 0 here would tell every script the host was set up.
     let failure = report.failure().cloned();
     // Observed only on a run that finished. A run that stopped partway has its own headline and its
-    // own remedy, and a main-mount observation on top of a failed caches mount would aim the reader
+    // own remedy, and a main-mount observation on top of a failed store mount would aim the reader
     // at the wrong problem.
     let mains = match &failure {
         Some(_) => None,
@@ -825,8 +883,8 @@ where
         Some(_) => None,
         None => Some(setup.git_identity().await?),
     };
-    // Same reason, one step further: a run that never mounted the caches volume has no shared
-    // cache to point a client at, and writing a config naming one would be the false claim.
+    // Same reason, one step further: the client config carries the daemon's cap, which derives
+    // from the store, and a run that never brought the store up has no cap to write.
     let sccache = match &failure {
         Some(_) => None,
         None => Some(setup.configure_sccache_client().await?),
@@ -863,18 +921,16 @@ where
         services: &services,
         build_state: &build_state,
     };
-    // Opt-in, and last: sccache's daemon caches onto the caches volume, so building and starting it
-    // before the volumes are up would grow a cache on the boot disk under an empty mountpoint. A
+    // Opt-in, and last: sccache's daemon listens in the store volume, so building and starting it
+    // before the store is up would bind its socket on the boot disk under an empty mountpoint. A
     // run that stopped partway never reaches it at all.
     let sccache_install = match (&failure, sccache_requested) {
         (None, true) => setup.install_sccache().await?,
         _ => SccacheInstall::NotRequested,
     };
-    // Opt-in, and only onto volumes that came up: the caches move onto the caches volume.
-    let relocations = match (&failure, relocation_requested) {
-        (None, true) => setup.relocate_host_caches().await?,
-        _ => Vec::new(),
-    };
+    if retirement.is_none() && failure.is_none() && !retire {
+        retirement = setup.retire_caches_volume().await?;
+    }
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
@@ -907,7 +963,8 @@ where
             output,
         )?;
     }
-    emit_host_caches(&relocations, output)?;
+    let retirement_refused =
+        emit_retirement(retirement.as_ref(), retire_requested, retire, output)?;
     if let Some(identity) = &identity {
         emit_git_identity(identity, output)?;
     }
@@ -935,14 +992,10 @@ where
     if let Some(failure) = build_failure {
         return Err(failure);
     }
-    let unrelocated = relocations
-        .iter()
-        .filter(|relocation| relocation.outcome.is_err())
-        .count();
-    if unrelocated > 0 {
+    if retirement_refused {
         return Err(CowshedError::conflict(
-            format!("{unrelocated} host cache(s) were left where they are"),
-            "resolve each cache named above, then cowshed setup --imperative-host-setup",
+            "cowshed setup --retire-caches-volume cannot run until every directory left on the caches volume is placed",
+            "place or remove each directory named above, then cowshed setup --retire-caches-volume",
         ));
     }
     Ok(0)
@@ -988,23 +1041,92 @@ fn emit_git_identity<W: Write, E: Write>(
     Ok(())
 }
 
-/// One line per host cache: where it now resolves, or why it was left alone.
-fn emit_host_caches<W: Write, E: Write>(
-    relocations: &[HostCacheRelocation],
+/// One line per cache the retirement moved, one per directory it left, and the attended next
+/// step. Returns whether `--retire-caches-volume` was asked for and refused.
+fn emit_retirement<W: Write, E: Write>(
+    retirement: Option<&RetirementReport>,
+    retire_requested: bool,
+    retired: bool,
     output: &mut Output<W, E>,
-) -> Result<()> {
-    for relocation in relocations {
-        let host = relocation.cache.host.display();
-        let shared = relocation.cache.shared.display();
-        let line = match &relocation.outcome {
-            Ok(Relocation::AlreadyShared) => format!("{host} already resolves to {shared}"),
-            Ok(Relocation::Linked) => format!("linked {host} to {shared}"),
-            Ok(Relocation::Moved) => format!("moved {host} to {shared} and linked it back"),
-            Err(reason) => format!("left {host} where it is: {reason}"),
-        };
+) -> Result<bool> {
+    let Some(report) = retirement else {
+        return Ok(false);
+    };
+    for line in retirement_lines(report) {
         output.guidance(&line).map_err(output_error)?;
     }
-    Ok(())
+    if !report.leftovers.is_empty() {
+        output
+            .guidance(
+                "caches volume: cowshed setup --retire-caches-volume cannot run until each directory above is placed",
+            )
+            .map_err(output_error)?;
+        return Ok(retire_requested);
+    }
+    if !retired {
+        output
+            .guidance(&format!(
+                "caches volume: {RETIRED_CACHES_MOUNTPOINT} holds nothing but its marker; cowshed setup --retire-caches-volume deletes it"
+            ))
+            .map_err(output_error)?;
+        output
+            .hint("cowshed setup --retire-caches-volume")
+            .map_err(output_error)?;
+    }
+    Ok(false)
+}
+
+/// The words for one retirement report, in the order setup prints them.
+pub fn retirement_lines(report: &RetirementReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for cache in &report.caches {
+        let placement = &cache.placement;
+        let dropped = match placement.merge {
+            Merge::ContentAddressed => {
+                format!(
+                    "{} dropped as duplicates",
+                    decimal_size(cache.dropped_bytes)
+                )
+            }
+            Merge::HostWins => format!(
+                "{} dropped (the host's copy wins)",
+                decimal_size(cache.dropped_bytes)
+            ),
+        };
+        lines.push(format!(
+            "caches volume: {} -> {}: {} moved, {dropped}",
+            placement.label,
+            placement.host.display(),
+            decimal_size(cache.moved_bytes)
+        ));
+    }
+    for leftover in &report.leftovers {
+        let name = leftover
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let reason = match &leftover.reason {
+            LeftoverReason::Undeclared => format!(
+                "no detector names it and no adopted project's main declares a [caches] home path named {name}"
+            ),
+            LeftoverReason::Ambiguous(candidates) => format!(
+                "more than one declared [caches] home path is named {name}: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            LeftoverReason::Conflict(reason) => reason.clone(),
+        };
+        lines.push(format!(
+            "caches volume: left {} ({}) in place: {reason}",
+            leftover.path.display(),
+            decimal_size(leftover.bytes)
+        ));
+    }
+    lines
 }
 
 fn build_state_failure(projects: &[ProjectBuildState]) -> Option<CowshedError> {
@@ -1288,6 +1410,14 @@ fn action_intent(action: &HostAction) -> String {
             "/etc/fstab will pin UUID {uuid} at {} so it mounts at every boot",
             mount_at.display()
         ),
+        HostAction::DeleteVolume {
+            name,
+            uuid,
+            mounted_at,
+        } => format!(
+            "{name} (UUID {uuid}) at {} holds nothing but its marker and will be deleted; its /etc/fstab pin and mount-service entry are rewritten without it",
+            mounted_at.display()
+        ),
         HostAction::InstallMountService { label } => format!(
             "system LaunchDaemon {label} will be installed to unlock and mount cowshed volumes before login"
         ),
@@ -1451,8 +1581,8 @@ fn sccache_client_phrase(report: &ConfigReport) -> String {
         ConfigOutcome::Refused(conflict) => format!(
             "left {path} alone: {conflict}; a store-less sccache client will not share {store} until cache.disk.dir names it"
         ),
-        ConfigOutcome::NoSharedStore { reason } => format!(
-            "{path} not written: {store} is not available ({reason}), and a config naming a cache that is not there would create a fourth one"
+        ConfigOutcome::NoCapacity { reason } => format!(
+            "{path} not written: the cache cap it must share with the sccache daemon derives from the store, which is not available ({reason})"
         ),
     }
 }

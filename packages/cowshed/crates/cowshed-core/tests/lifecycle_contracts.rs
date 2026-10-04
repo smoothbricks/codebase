@@ -268,10 +268,6 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
-        Ok(PathBuf::from("/canonical/caches"))
-    }
-
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error> {
         if workspace == &self.workspace {
             Ok(SubstrateStats {
@@ -316,10 +312,6 @@ async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths()
             .await
             .unwrap(),
         PathBuf::from("/canonical/topic")
-    );
-    assert_eq!(
-        substrate.caches_root().await.unwrap(),
-        PathBuf::from("/canonical/caches")
     );
     assert_eq!(
         substrate.stats(&ws).await.unwrap(),

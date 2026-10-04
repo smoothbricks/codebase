@@ -86,6 +86,7 @@ impl Workspace {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: Default::default(),
         }
     }

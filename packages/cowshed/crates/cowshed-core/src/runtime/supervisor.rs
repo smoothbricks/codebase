@@ -157,6 +157,7 @@ impl Default for WorkspaceSupervisorConfig {
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
                 build_volume_mount: None,
+                repository_caches: Vec::new(),
                 capabilities: Default::default(),
             },
             build_volume_layout: None,
@@ -804,6 +805,9 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
 }
 
 /// Prepare only generic private roots and the cache/daemon paths contributed by active detectors.
+///
+/// Every shared cache directory is created where the host keeps it before any child runs: a
+/// child granted writes inside one cannot create its parent.
 fn prepare_private_environment(
     environment_root: &Path,
     runtime: Option<(&Path, &Path)>,
@@ -833,9 +837,17 @@ fn prepare_private_environment(
     }
     bin.reconcile_links(c".links", &programs)
         .map_err(private_environment_error)?;
-    for mount in &contribution.cache_mounts {
-        AnchoredDirectory::create(&mount.source).map_err(private_environment_error)?;
-        if let Some(target) = &mount.private_target {
+    for cache in &contribution.shared_caches {
+        AnchoredDirectory::create(&cache.path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot prepare shared cache {}: {error}",
+                    cache.path.display()
+                ),
+                "cowshed setup",
+            )
+        })?;
+        if let Some(target) = &cache.private_link {
             let relative = target.strip_prefix(environment_root).map_err(|_| {
                 CowshedError::integrity(
                     "capability cache link escapes the private environment",
@@ -854,11 +866,11 @@ fn prepare_private_environment(
             let parent = relative.parent().expect("a relative filename has a parent");
             if parent.as_os_str().is_empty() {
                 environment
-                    .ensure_symlink(&leaf, &mount.source)
+                    .ensure_symlink(&leaf, &cache.path)
                     .map_err(private_environment_error)?;
             } else {
                 private_directory(&environment, parent)
-                    .and_then(|directory| directory.ensure_symlink(&leaf, &mount.source))
+                    .and_then(|directory| directory.ensure_symlink(&leaf, &cache.path))
                     .map_err(private_environment_error)?;
             }
         }
@@ -4396,6 +4408,7 @@ mod workspace_toolchain_tests {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: Default::default(),
         }
     }
@@ -4577,19 +4590,25 @@ mod workspace_toolchain_tests {
             vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
             Some(private.join("config"))
         );
-        // Go's caches are named directly; there is no Go env file and no Go policy.
+        // Go's caches are named directly at the host's own defaults; there is no Go env file
+        // and no Go policy.
         assert!(!vars.contains_key("GOENV"));
         assert!(!private.join("cache/go/env").exists());
-        let caches = Path::new(crate::storage::bootstrap::CACHES_ROOT);
-        if caches.is_dir() {
-            assert_eq!(
-                vars.get("GOMODCACHE").map(PathBuf::from),
-                Some(caches.join("go/mod"))
-            );
-            assert_eq!(
-                vars.get("GOCACHE").map(PathBuf::from),
-                Some(caches.join("go/build"))
-            );
+        let home = root.join("home");
+        assert_eq!(
+            vars.get("GOMODCACHE").map(PathBuf::from),
+            Some(home.join("go/pkg/mod"))
+        );
+        assert_eq!(
+            vars.get("GOCACHE").map(PathBuf::from),
+            Some(home.join("Library/Caches/go-build"))
+        );
+        assert_eq!(
+            vars.get("CARGO_HOME").map(PathBuf::from),
+            Some(home.join(".cargo"))
+        );
+        for cache in [".cargo/registry", ".cargo/git", "go/pkg/mod", ".cache/uv"] {
+            assert!(home.join(cache).is_dir(), "{cache} is prepared");
         }
         assert_eq!(
             vars.get("CARGO_NET_GIT_FETCH_WITH_CLI").map(String::as_str),
@@ -5482,22 +5501,22 @@ mod sandbox_environment_tests {
     }
 
     /// A child granted writes inside a shared cache cannot create its parent, so the host
-    /// prepares every contributed cache source before any child runs, links each private target
-    /// to its source, and creates every contributed daemon directory in the private environment.
+    /// prepares every contributed cache directory before any child runs, links each private
+    /// target to it, and creates every contributed daemon directory in the private environment.
     #[test]
     fn contributed_caches_links_and_daemon_directories_exist_before_a_child_runs() {
         let root = scratch("contributed-environment");
         let environment = root.join("environment");
-        let caches = root.join("caches");
+        let home = root.join("home");
         let contribution = crate::capabilities::CapabilityContribution {
-            cache_mounts: vec![
-                crate::capabilities::CacheMount {
-                    source: caches.join("go/mod"),
-                    private_target: None,
+            shared_caches: vec![
+                crate::capabilities::SharedCache {
+                    path: home.join("go/pkg/mod"),
+                    private_link: None,
                 },
-                crate::capabilities::CacheMount {
-                    source: caches.join("nix/state"),
-                    private_target: Some(environment.join("state/nix")),
+                crate::capabilities::SharedCache {
+                    path: home.join(".local/state/nix"),
+                    private_link: Some(environment.join("state/nix")),
                 },
             ],
             daemon_isolation: crate::capabilities::DaemonIsolation {
@@ -5507,19 +5526,19 @@ mod sandbox_environment_tests {
             ..Default::default()
         };
         prepare_private_environment(&environment, None, &contribution).unwrap();
-        assert!(caches.join("go/mod").is_dir());
-        assert!(caches.join("nix/state").is_dir());
+        assert!(home.join("go/pkg/mod").is_dir());
+        assert!(home.join(".local/state/nix").is_dir());
         assert_eq!(
             std::fs::read_link(environment.join("state/nix")).ok(),
-            Some(caches.join("nix/state"))
+            Some(home.join(".local/state/nix"))
         );
         assert!(environment.join("run/nx").is_dir());
 
         // A link or daemon directory outside the private environment is refused, never made.
         let escaping = crate::capabilities::CapabilityContribution {
-            cache_mounts: vec![crate::capabilities::CacheMount {
-                source: caches.join("zig"),
-                private_target: Some(root.join("outside/zig")),
+            shared_caches: vec![crate::capabilities::SharedCache {
+                path: home.join(".cache/zig"),
+                private_link: Some(root.join("outside/zig")),
             }],
             ..Default::default()
         };
@@ -5602,7 +5621,7 @@ mod sandbox_environment_tests {
     }
 
     /// A plain repository's private environment is the generic roots and nothing else: no tool
-    /// cache is created on the caches volume and no tool link appears in the private roots.
+    /// cache is created in the host HOME and no tool link appears in the private roots.
     #[test]
     fn a_plain_contribution_prepares_only_the_generic_roots() {
         let root = scratch("plain-environment");

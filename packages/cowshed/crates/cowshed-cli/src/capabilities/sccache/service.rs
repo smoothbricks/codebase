@@ -114,7 +114,7 @@ where
 pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
-    let cache_directory = cache_directory();
+    let cache_directory = cache_directory(&home);
     fs::create_dir_all(&cache_directory).map_err(|error| {
         CowshedError::internal(format!(
             "could not create {}: {error}",
@@ -334,6 +334,11 @@ fn stop_service() -> Result<()> {
     Ok(())
 }
 
+/// Stop the daemon while setup moves its store; setup starts it again afterwards.
+pub(crate) fn stop_for_host_move() -> Result<()> {
+    stop_service()
+}
+
 /// The socket file is the daemon's artifact and cowshed owns its lifecycle: a booted-out server
 /// never unlinks it, and a stale socket only confuses inspection (a fresh server unlinks-then-
 /// rebinds anyway). Removes exactly a socket; anything else at the path is not ours to delete.
@@ -543,7 +548,7 @@ mod tests {
         let spec = LaunchAgentSpec::sccache(
             &program,
             Path::new("/private/cowshed/store/sccache.sock"),
-            Path::new("/private/cowshed/caches/sccache"),
+            Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
             MINIMUM_CAPACITY,
             Path::new(STORE_ROOT),
         )

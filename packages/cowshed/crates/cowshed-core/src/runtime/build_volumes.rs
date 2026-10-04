@@ -1452,11 +1452,7 @@ mod tests {
         let host = Arc::new(
             MacOsApfsExecutionHost::new(
                 SystemCommandRunner,
-                ApfsSubstrateConfig::new(
-                    &store,
-                    root.path().join("caches"),
-                    root.path().join("checkout"),
-                ),
+                ApfsSubstrateConfig::new(&store, root.path().join("checkout")),
             )
             .unwrap(),
         );
@@ -1574,11 +1570,7 @@ mod tests {
             let host = Arc::new(
                 MacOsApfsExecutionHost::new(
                     SystemCommandRunner,
-                    ApfsSubstrateConfig::new(
-                        &store,
-                        root.path().join("caches"),
-                        root.path().join("checkout"),
-                    ),
+                    ApfsSubstrateConfig::new(&store, root.path().join("checkout")),
                 )
                 .unwrap(),
             );

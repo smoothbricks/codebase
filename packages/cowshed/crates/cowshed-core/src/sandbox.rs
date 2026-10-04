@@ -6,7 +6,7 @@ use crate::capabilities::{
     CapabilityGrant, DetectedCapabilities, DetectionContext, GrantAccess, GrantScope,
 };
 pub use crate::metadata::PortBlock;
-use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
+use crate::storage::bootstrap::STORE_ROOT;
 
 fn cowshed_root() -> &'static Path {
     Path::new(STORE_ROOT)
@@ -171,8 +171,12 @@ pub struct SandboxConfig {
     /// from a repository-controlled symlink while rendering policy; the controller resolves
     /// the checkout's current owned volume through its validated project layout.
     pub build_volume_mount: Option<PathBuf>,
+    /// `[caches] home` from main's `.cowshed.toml`: HOME-relative directories the repository's
+    /// own tooling caches into, shared read-write into every sandbox of the project. Never a
+    /// workspace's copy of the file.
+    pub repository_caches: Vec<PathBuf>,
     /// The project capabilities detected in this workspace for this mode
-    /// ([`SandboxConfig::configure_capabilities`]): every tool-specific grant, cache mount,
+    /// ([`SandboxConfig::configure_capabilities`]): every tool-specific grant, shared cache,
     /// socket and environment entry a child receives comes from here, never from a tool table.
     pub capabilities: DetectedCapabilities,
 }
@@ -210,6 +214,7 @@ impl SandboxConfig {
             additional_denies: self.additional_denies.clone(),
             git_worktree_repository: self.git_worktree_repository.clone(),
             build_volume_mount: self.build_volume_mount.clone(),
+            repository_caches: self.repository_caches.clone(),
             capabilities,
         }
     }
@@ -273,7 +278,7 @@ impl SandboxConfig {
             project_root: &self.workspace_mount,
             home: &self.home,
             command_cwd,
-            caches_root: Path::new(CACHES_ROOT),
+            repository_caches: &self.repository_caches,
             environment_root: &environment_root,
             runtime_dir: &runtime_dir,
             trust_bundle: has_workspace_ca.then_some(trust_bundle.as_path()),
@@ -299,6 +304,8 @@ pub struct WorkspaceSandbox<'a> {
     /// `[sandbox] deny` from main's `.cowshed.toml`: workspace-relative paths the operator's
     /// own checkout declares no job may read or write. Never a workspace's copy of the file.
     pub repository_deny: &'a [PathBuf],
+    /// `[caches] home` from main's `.cowshed.toml`, trusted exactly like `repository_deny`.
+    pub repository_caches: &'a [PathBuf],
     /// The `.git` of main's mount, for a git-worktree workspace only.
     pub git_worktree_repository: Option<PathBuf>,
     /// The checkout's current owned build-volume mount, resolved by the controller.
@@ -321,6 +328,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         telemetry_root,
         grants,
         repository_deny,
+        repository_caches,
         git_worktree_repository,
         build_volume_mount,
         workspace_mount: mount,
@@ -370,6 +378,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         additional_denies,
         git_worktree_repository,
         build_volume_mount,
+        repository_caches: repository_caches.to_vec(),
         capabilities: DetectedCapabilities::default(),
     };
     // The supervisor is the trusted tier of the same workspace; it gets the same capability
@@ -580,13 +589,27 @@ fn validated_sandbox_paths(
             });
         }
     }
-    let caches = Path::new(CACHES_ROOT);
-    for mount in &contribution.cache_mounts {
-        validate_path(&mount.source)?;
-        if mount.source == caches || !mount.source.starts_with(caches) {
+    // A shared cache is a read-write subtree of the host HOME: strictly beneath it, and never
+    // reaching into a hard deny or cowshed's own controller state in either direction, or the
+    // write would cover a credential, another workspace or the gateway's mirrors.
+    let controller_state = crate::host_dirs::controller_state(&config.home);
+    for cache in &contribution.shared_caches {
+        validate_path(&cache.path)?;
+        if cache.path == config.home || !cache.path.starts_with(&config.home) {
             return Err(SandboxError::InvalidPath {
-                path: mount.source.clone(),
-                reason: "a capability cache mount must lie beneath the caches root",
+                path: cache.path.clone(),
+                reason: "a shared cache must lie strictly beneath HOME",
+            });
+        }
+        if let Some(deny) = hard_denies
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(controller_state.iter().map(PathBuf::as_path))
+            .find(|deny| paths_intersect(&cache.path, deny))
+        {
+            return Err(SandboxError::GrantIntersectsDeny {
+                grant: cache.path.clone(),
+                deny: deny.to_path_buf(),
             });
         }
     }
@@ -616,7 +639,6 @@ pub fn seatbelt_profile(
     } = validated_sandbox_paths(config)?;
 
     let cowshed = cowshed_root();
-    let caches = Path::new(CACHES_ROOT);
     let mut profile = String::new();
 
     push_line(&mut profile, "(version 1)");
@@ -772,20 +794,21 @@ pub fn seatbelt_profile(
     for socket in &sockets {
         push_readable_ancestors(&mut profile, socket)?;
     }
-    push_subpath_rule(&mut profile, "allow file-read*", caches)?;
     // Every tool-specific authority is a detected capability's contribution (15_capabilities.md):
-    // its shared caches read-write — Seatbelt matches the resolved path a host link reaches —
-    // and its exact grants. Configuration, credentials and binaries a tool keeps beside them
-    // stay hard denies, which follow every grant below.
+    // its shared caches read-write where the host keeps them, their ancestors beneath HOME
+    // metadata only, and its exact grants. Configuration, credentials and binaries a tool keeps
+    // beside them stay hard denies, which follow every grant below.
     let contribution = &config.capabilities.contribution;
-    for mount in &contribution.cache_mounts {
-        // Tools canonicalize new cache paths through these physical ancestors. Their
-        // metadata must not depend on another capability's socket grant; store data
-        // and all sibling subtrees remain denied.
-        for ancestor in mount.source.ancestors().skip(1) {
-            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
-        }
-        push_subpath_rule(&mut profile, "allow file-read* file-write*", &mount.source)?;
+    for cache in &contribution.shared_caches {
+        push_capability_grant(
+            &mut profile,
+            &config.home,
+            &CapabilityGrant {
+                path: cache.path.clone(),
+                scope: GrantScope::Subtree,
+                access: GrantAccess::ReadWrite,
+            },
+        )?;
     }
     for grant in &contribution.grants {
         push_capability_grant(&mut profile, &config.home, grant)?;
@@ -1014,7 +1037,6 @@ fn hard_denies<'a>(
         Cow::Owned(home.join(".cargo/credentials.toml")),
         Cow::Owned(home.join(".cargo/credentials")),
         Cow::Owned(home.join(".gradle/gradle.properties")),
-        Cow::Owned(home.join("go")),
         Cow::Owned(home.join("Library/Keychains")),
     ];
     denies.extend(additional.iter().map(|path| Cow::Borrowed(path.as_path())));
@@ -1238,6 +1260,7 @@ mod tests {
             additional_denies: vec![],
             git_worktree_repository: None,
             build_volume_mount: None,
+            repository_caches: Vec::new(),
             capabilities: DetectedCapabilities::default(),
         }
     }
@@ -1727,6 +1750,7 @@ mod tests {
                 telemetry_root: Path::new("/private/cowshed/store/telemetry"),
                 grants: &grants,
                 repository_deny: &[],
+                repository_caches: &[],
                 git_worktree_repository: None,
                 build_volume_mount: None,
                 workspace_mount: mount.to_path_buf(),
@@ -1828,6 +1852,7 @@ mod tests {
             telemetry_root: Path::new("/private/cowshed/store/telemetry"),
             grants: &grants,
             repository_deny: &[PathBuf::from("c"), PathBuf::from("a")],
+            repository_caches: &[],
             git_worktree_repository: None,
             build_volume_mount: None,
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
@@ -2050,14 +2075,14 @@ mod tests {
         }
     }
 
-    fn with_contribution(grants: Vec<CapabilityGrant>, cache_mounts: &[&str]) -> SandboxConfig {
+    fn with_contribution(grants: Vec<CapabilityGrant>, shared: &[&str]) -> SandboxConfig {
         let mut config = config(RunSandboxMode::ReadWrite);
         config.capabilities.contribution.grants = grants;
-        config.capabilities.contribution.cache_mounts = cache_mounts
+        config.capabilities.contribution.shared_caches = shared
             .iter()
-            .map(|source| crate::capabilities::CacheMount {
-                source: PathBuf::from(source),
-                private_target: None,
+            .map(|path| crate::capabilities::SharedCache {
+                path: PathBuf::from(path),
+                private_link: None,
             })
             .collect();
         config
@@ -2072,10 +2097,6 @@ mod tests {
             SandboxProfileRole::ExecutedChild,
         )
         .unwrap();
-        assert!(profile.contains("(allow file-read* (subpath \"/private/cowshed/caches\"))"));
-        assert!(
-            !profile.contains("(allow file-read* file-write* (subpath \"/private/cowshed/caches/")
-        );
         let allows: Vec<&str> = profile
             .lines()
             .filter(|line| line.starts_with("(allow"))
@@ -2089,20 +2110,15 @@ mod tests {
         }
     }
 
-    /// A capability's cache mounts are shared read-write and its grants are emitted exactly as
-    /// contributed — a literal as a literal with its ancestors, a subtree as a subtree — and every
-    /// secret deny still follows them.
+    /// A capability's shared caches are read-write subtrees with metadata-only ancestors beneath
+    /// HOME, its grants are emitted exactly as contributed — a literal as a literal with its
+    /// ancestors, a subtree as a subtree — and every secret deny still follows them.
     #[test]
     fn a_contribution_is_emitted_exactly_and_the_secret_denies_follow_it() {
         let config = with_contribution(
             vec![
                 grant(
                     "/Users/tester/.cargo",
-                    GrantScope::Literal,
-                    GrantAccess::Read,
-                ),
-                grant(
-                    "/Users/tester/.cargo/registry",
                     GrantScope::Literal,
                     GrantAccess::Read,
                 ),
@@ -2117,18 +2133,15 @@ mod tests {
                     GrantAccess::Read,
                 ),
             ],
-            &["/private/cowshed/caches/cargo/registry"],
+            &["/Users/tester/.cargo/registry"],
         );
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         assert!(profile.contains(
-            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/registry\"))"
+            "(allow file-read* file-write* (subpath \"/Users/tester/.cargo/registry\"))"
         ));
-        assert!(!profile.contains("(subpath \"/private/cowshed/caches/cargo/git\")"));
-        for literal in [
-            "/Users/tester",
-            "/Users/tester/.cargo",
-            "/Users/tester/.cargo/registry",
-        ] {
+        assert!(profile.contains("(allow file-read-metadata (literal \"/Users/tester/.cargo\"))"));
+        assert!(!profile.contains("(subpath \"/Users/tester/.cargo/git\")"));
+        for literal in ["/Users/tester", "/Users/tester/.cargo"] {
             assert!(profile.contains(&format!("(allow file-read* (literal \"{literal}\"))")));
         }
         assert!(profile.contains(
@@ -2204,40 +2217,77 @@ mod tests {
         }
     }
 
-    /// Cache mounts are controller-owned exceptions under the caches root, never elsewhere and
-    /// never the whole root.
+    /// A shared cache is a subtree strictly beneath HOME that reaches into no hard deny and no
+    /// cowshed controller state in either direction: a credential, another workspace, or the
+    /// gateway's mirrors never become writable through one.
     #[test]
-    fn capability_cache_mounts_stay_beneath_the_caches_root() {
-        for source in ["/Users/tester/.cache", "/private/cowshed/caches"] {
-            let config = with_contribution(Vec::new(), &[source]);
+    fn shared_caches_stay_beneath_home_and_clear_every_protected_path() {
+        for allowed in [
+            "/Users/tester/.cargo/registry",
+            "/Users/tester/.cache/ttsc",
+            "/Users/tester/go/pkg/mod",
+        ] {
+            let config = with_contribution(Vec::new(), &[allowed]);
+            validate_sandbox_config(&config).unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        for outside in ["/Users/tester", "/private/tmp/cache"] {
+            let config = with_contribution(Vec::new(), &[outside]);
             assert!(
                 matches!(
                     validate_sandbox_config(&config),
-                    Err(SandboxError::InvalidPath { ref path, .. }) if path == Path::new(source)
+                    Err(SandboxError::InvalidPath { ref path, .. }) if path == Path::new(outside)
                 ),
-                "{source} must be refused"
+                "{outside} must be refused"
+            );
+        }
+        for (refused, deny) in [
+            ("/Users/tester/.cargo", "/Users/tester/.cargo/config"),
+            ("/Users/tester/.ssh/cache", "/Users/tester/.ssh"),
+            ("/Users/tester/.cowshed", "/Users/tester/.cowshed/mnt"),
+            ("/Users/tester/Library", "/Users/tester/Library/Keychains"),
+            (
+                "/Users/tester/Library/Caches",
+                "/Users/tester/Library/Caches/dev.cowshed",
+            ),
+            (
+                "/Users/tester/Library/Application Support/dev.cowshed/nix",
+                "/Users/tester/Library/Application Support/dev.cowshed",
+            ),
+        ] {
+            let config = with_contribution(Vec::new(), &[refused]);
+            assert_eq!(
+                validate_sandbox_config(&config),
+                Err(SandboxError::GrantIntersectsDeny {
+                    grant: PathBuf::from(refused),
+                    deny: PathBuf::from(deny),
+                }),
+                "{refused}"
             );
         }
     }
 
+    /// Cargo/libgit2 canonicalizes a newly fetched git cache path, so a shared cache's ancestors
+    /// beneath HOME resolve after the HOME read deny without an unrelated socket grant: metadata
+    /// only, never a listing of the tool's home.
     #[test]
-    fn capability_cache_paths_are_resolvable_without_reading_the_store() {
-        let config = with_contribution(Vec::new(), &["/private/cowshed/caches/cargo/git"]);
+    fn shared_cache_ancestors_resolve_without_reading_their_home() {
+        let config = with_contribution(Vec::new(), &["/Users/tester/.cargo/git"]);
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         let deny = profile
-            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
-            .unwrap();
+            .find("(deny file-read* (subpath \"/Users/tester\"))")
+            .expect("HOME read deny");
         let metadata = profile
-            .find("(allow file-read-metadata (literal \"/private/cowshed\"))")
+            .rfind("(allow file-read-metadata (literal \"/Users/tester/.cargo\"))")
             .expect("a tool must canonicalize its cache path without an unrelated socket grant");
         assert!(
             metadata > deny,
-            "cache ancestor metadata follows the store deny"
+            "cache ancestor metadata follows the HOME read deny"
         );
-        assert!(!profile.contains("(allow file-read* (literal \"/private/cowshed\"))"));
-        assert!(profile.contains(
-            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/git\"))"
-        ));
+        assert!(!profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
+        assert!(
+            profile
+                .contains("(allow file-read* file-write* (subpath \"/Users/tester/.cargo/git\"))")
+        );
     }
 
     #[test]

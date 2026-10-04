@@ -1659,8 +1659,8 @@ fn git_helper(path: PathBuf, mode: u32) -> PathBuf {
 /// part is what the verdict came from. Idempotent: callers reuse one root across cases.
 fn production_layout(root: &Path, helper: PathBuf) -> GatewayConfig {
     let store = root.join("store");
-    let cache_volume = root.join("caches");
-    let fixed = cache_volume.join("mirror");
+    let cache_dir = root.join("dev.cowshed");
+    let fixed = cache_dir.join("mirror");
     std::fs::create_dir_all(&store).expect("store root");
     std::fs::create_dir_all(&fixed).expect("create fixed cache root");
     #[cfg(unix)]
@@ -1671,7 +1671,7 @@ fn production_layout(root: &Path, helper: PathBuf) -> GatewayConfig {
     }
     GatewayConfig {
         control_socket: Some(store.join("gateway.sock")),
-        production_cache_volume: Some(cache_volume),
+        production_cache_dir: Some(cache_dir),
         git_helper_executable: Some(helper),
         mirror_cache: MirrorCacheConfig::new(fixed),
         ..GatewayConfig::default()
@@ -1679,7 +1679,7 @@ fn production_layout(root: &Path, helper: PathBuf) -> GatewayConfig {
 }
 
 #[test]
-fn production_cache_root_is_fixed_beneath_the_cache_volume() {
+fn production_cache_root_is_fixed_beneath_the_cowshed_cache_directory() {
     let fixture = TestRoot::new();
     let root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
     let mut config = production_layout(&root, git_helper(root.join("git-helper"), 0o700));

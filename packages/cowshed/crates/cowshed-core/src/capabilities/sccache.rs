@@ -2,7 +2,7 @@ use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
     GrantAccess, GrantScope,
 };
-use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
+use crate::storage::bootstrap::STORE_ROOT;
 use crate::{CowshedError, Result};
 use std::path::{Path, PathBuf};
 
@@ -13,15 +13,19 @@ pub const DETECTOR: Detector = Detector {
     all: &[],
     any: &["Cargo.toml"],
     contribute,
-    host_cache_homes: &[],
     reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
 };
 
 pub fn server_socket() -> PathBuf {
     Path::new(STORE_ROOT).join("sccache.sock")
 }
-pub fn cache_directory() -> PathBuf {
-    Path::new(CACHES_ROOT).join("sccache")
+/// sccache's own default disk cache, which the host-owned daemon serves and no sandbox is granted.
+pub fn cache_directory(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let default = "Library/Caches/Mozilla.sccache";
+    #[cfg(not(target_os = "macos"))]
+    let default = ".cache/sccache";
+    home.join(default)
 }
 pub fn gc_root(home: &Path) -> PathBuf {
     home.join("Library/Application Support/dev.cowshed/nix/sccache")
@@ -90,7 +94,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         );
         contribution.env.insert(
             "SCCACHE_DIR",
-            EnvAction::Own(cache_directory().into_os_string()),
+            EnvAction::Own(cache_directory(context.home).into_os_string()),
         );
         contribution.unix_sockets.push(server_socket());
         contribution.grants.push(CapabilityGrant {

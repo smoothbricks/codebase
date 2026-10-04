@@ -21,16 +21,18 @@ use super::super::{
     BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, CanonicalRoots,
     CreatedMountState, DISKUTIL, ExistingStorage, HostCommand, HostCommandFailure,
     HostCommandOutput, HostError, HostOperation, MOUNT_SERVICE_PLIST, MountpointState,
-    StatFsEvidence, SubstrateKind, TokioBlockingLane, VOLUME_MARKER_FILE, ValidatedHostStorage,
-    VolumeMarker, VolumeRole, attest_created_apfs_info, execute_bootstrap_operation,
-    parse_created_apfs_identifier, plan_bootstrap, require_mounted_marker, select_substrate,
+    RETIRED_CACHES_MOUNTPOINT, StatFsEvidence, SubstrateKind, TokioBlockingLane,
+    VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeMarker, VolumeRole, attest_created_apfs_info,
+    execute_bootstrap_operation, parse_created_apfs_identifier, plan_bootstrap,
+    require_mounted_marker, select_substrate,
 };
 use super::shared::{
-    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, PIN_FSTAB_ACTION,
-    SystemBootstrapHost, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
-    VolumeOutcome, VolumeState, execute_native_bootstrap_plan, existing_host_storage_error,
-    platform_host_error, provision_volumes_action, setup_execution_error, write_marker_action,
+    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
+    PIN_FSTAB_ACTION, SystemBootstrapHost, UninstallFstabOutcome, UninstallReport,
+    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_native_bootstrap_plan,
+    existing_host_storage_error, platform_host_error, provision_volumes_action,
+    setup_execution_error, write_marker_action,
 };
 use crate::apfs::{RegisteredApfsContainer, registered_apfs_containers};
 use crate::error::CowshedError;
@@ -602,8 +604,13 @@ fn prepare_setup_snapshot(
     source: &mut impl EvidenceSource,
     home: &Path,
     existing_fstab: &str,
+    caches_volume: CachesVolume,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
-    let gathered = gather_existing_apfs_evidence(source, home)?;
+    let mut gathered = gather_existing_apfs_evidence(source, home)?;
+    let deletion = match caches_volume {
+        CachesVolume::Keep => None,
+        CachesVolume::Retire => retire_caches_volume(source, &mut gathered)?,
+    };
     let selected = select_substrate(gathered.statfs, None)?;
     let mut plan = plan_bootstrap(selected, home, gathered.bootstrap)?;
     let pins = gathered
@@ -639,7 +646,8 @@ fn prepare_setup_snapshot(
         };
         PlannedFstab::Deferred(reason)
     };
-    let actions = build_host_actions(&gathered.volumes, &fstab)?;
+    let mut actions = build_host_actions(&gathered.volumes, &fstab)?;
+    actions.splice(0..0, deletion);
     let volumes = gathered
         .volumes
         .iter()
@@ -657,6 +665,54 @@ fn prepare_setup_snapshot(
         actions,
         classified: gathered.volumes,
     })
+}
+
+/// Take the retired caches volume out of the evidence a setup plans from, so the plan, the fstab
+/// pins and the mount service all describe the host without it, and return the deletion that
+/// goes with them. Refused unless the volume is mounted where it belongs holding nothing but its
+/// marker: only then can setup show that nothing on it is lost. An absent volume is already
+/// retired.
+fn retire_caches_volume(
+    source: &mut impl EvidenceSource,
+    gathered: &mut GatheredEvidence,
+) -> Result<Option<HostAction>, NativeBootstrapError> {
+    let Some(index) = gathered
+        .volumes
+        .iter()
+        .position(|volume| volume.role == VolumeRole::Caches)
+    else {
+        return Ok(None);
+    };
+    let volume = &gathered.volumes[index];
+    if !matches!(volume.storage, ExistingStorage::MountedValid { .. }) {
+        return Err(NativeBootstrapError::CachesVolumeNotRetirable(format!(
+            "{} is not mounted at {}; run cowshed setup to mount it and move what it holds first",
+            volume.name,
+            volume.mountpoint.display()
+        )));
+    }
+    if !source.holds_only_marker(&volume.mountpoint)? {
+        return Err(NativeBootstrapError::CachesVolumeNotRetirable(format!(
+            "{} still holds more than its marker; run cowshed setup to move what it holds first",
+            volume.mountpoint.display()
+        )));
+    }
+    let uuid = volume.volume_uuid.clone().ok_or_else(|| {
+        NativeBootstrapError::MalformedApfsInventory(format!(
+            "{} has no APFS volume UUID",
+            volume.name
+        ))
+    })?;
+    let deletion = HostAction::DeleteVolume {
+        name: volume.name.to_owned(),
+        uuid,
+        mounted_at: volume.mountpoint.clone(),
+    };
+    gathered.volumes.remove(index);
+    if let BootstrapEvidence::Apfs { caches, .. } = &mut gathered.bootstrap {
+        *caches = ExistingStorage::Absent;
+    }
+    Ok(Some(deletion))
 }
 
 fn volume_state(storage: &ExistingStorage) -> VolumeState {
@@ -825,7 +881,9 @@ fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
     snapshot.actions.iter().any(|action| {
         matches!(
             action,
-            HostAction::EncryptVolume { .. } | HostAction::InstallMountService { .. }
+            HostAction::EncryptVolume { .. }
+                | HostAction::InstallMountService { .. }
+                | HostAction::DeleteVolume { .. }
         )
     }) || snapshot
         .plan
@@ -851,7 +909,8 @@ fn action_volume_name(action: &HostAction) -> Option<&str> {
         HostAction::CreateVolume { name, .. }
         | HostAction::MountExisting { name, .. }
         | HostAction::RepairMounted { name, .. }
-        | HostAction::EncryptVolume { name, .. } => Some(name),
+        | HostAction::EncryptVolume { name, .. }
+        | HostAction::DeleteVolume { name, .. } => Some(name),
         HostAction::PinFstab { .. }
         | HostAction::ReclaimStubs { .. }
         | HostAction::InstallMountService { .. } => None,
@@ -1070,6 +1129,80 @@ async fn encrypt_volume(
         .map_err(|error| setup_execution_error(error, "cowshed setup"))
 }
 
+/// Delete the retired caches volume and its now unused System.keychain unlock item.
+///
+/// The marker-only check is repeated here, at the moment of deletion, rather than trusted from
+/// planning: nothing that was not moved may go with the volume.
+fn delete_retired_volume_with(
+    host: &dyn BootstrapHost,
+    name: &str,
+    uuid: &str,
+    mounted_at: &Path,
+) -> Result<(), HostError> {
+    if name != APFS_CACHES_VOLUME {
+        return Err(HostError::new(format!(
+            "refusing to delete unexpected APFS volume {name:?}"
+        )));
+    }
+    Uuid::parse_str(uuid)
+        .map_err(|_| HostError::new(format!("invalid APFS volume UUID {uuid:?}")))?;
+    match crate::caches_retirement::holds_only_marker(mounted_at) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(HostError::new(format!(
+                "{} holds more than its marker; nothing was deleted",
+                mounted_at.display()
+            )));
+        }
+        Err(error) => {
+            return Err(host_io_error(
+                "inspect the caches volume",
+                mounted_at,
+                error,
+            ));
+        }
+    }
+    required_host_command(
+        host,
+        HostCommand::new(DISKUTIL, ["apfs", "deleteVolume", uuid]),
+    )?;
+    // An item that was never created (an unencrypted volume) is already gone.
+    host.run_command(&HostCommand::new(
+        SECURITY,
+        [
+            "delete-generic-password",
+            "-a",
+            name,
+            "-s",
+            name,
+            SYSTEM_KEYCHAIN,
+        ],
+    ))?;
+    Ok(())
+}
+
+async fn delete_retired_volume(
+    host: Arc<dyn BootstrapHost>,
+    name: String,
+    uuid: String,
+    mounted_at: PathBuf,
+) -> Result<(), CowshedError> {
+    tokio::task::spawn_blocking(move || {
+        delete_retired_volume_with(host.as_ref(), &name, &uuid, &mounted_at)
+    })
+    .await
+    .map_err(|error| {
+        setup_execution_error(
+            NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(
+                error.to_string(),
+            )),
+            "cowshed setup --retire-caches-volume",
+        )
+    })?
+    .map_err(NativeBootstrapError::Host)
+    .map_err(|error| setup_execution_error(error, "cowshed setup --retire-caches-volume"))
+}
+
 fn write_mount_service_temporary(contents: &[u8], kind: &str) -> Result<PathBuf, HostError> {
     let path = PathBuf::from(format!(
         "/private/tmp/cowshed-mount-service-{}-{kind}",
@@ -1229,6 +1362,19 @@ async fn execute_snapshot_actions(
             HostAction::EncryptVolume { name, uuid, .. } => {
                 encrypt_volume(Arc::clone(&host), name.clone(), uuid.clone()).await
             }
+            HostAction::DeleteVolume {
+                name,
+                uuid,
+                mounted_at,
+            } => {
+                delete_retired_volume(
+                    Arc::clone(&host),
+                    name.clone(),
+                    uuid.clone(),
+                    mounted_at.clone(),
+                )
+                .await
+            }
             HostAction::PinFstab { .. } => {
                 let pin_indices = (index..outcomes.len())
                     .filter(|candidate| {
@@ -1302,6 +1448,7 @@ async fn execute_snapshot_actions(
 async fn gather_setup_snapshot(
     home: &Path,
     host: Arc<dyn BootstrapHost>,
+    caches_volume: CachesVolume,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
     let home = home.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1309,7 +1456,8 @@ async fn gather_setup_snapshot(
         let mut source = SystemEvidenceSource {
             host: host.as_ref(),
         };
-        let mut snapshot = prepare_setup_snapshot(&mut source, &home, &existing_fstab)?;
+        let mut snapshot =
+            prepare_setup_snapshot(&mut source, &home, &existing_fstab, caches_volume)?;
         add_mount_service_action(&mut snapshot)?;
         Ok(snapshot)
     })
@@ -1319,9 +1467,12 @@ async fn gather_setup_snapshot(
     })?
 }
 
-pub async fn plan_host_setup(home: &Path) -> crate::Result<HostSetupPlan> {
+pub async fn plan_host_setup(
+    home: &Path,
+    caches_volume: CachesVolume,
+) -> crate::Result<HostSetupPlan> {
     {
-        let snapshot = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost))
+        let snapshot = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume)
             .await
             .map_err(existing_host_storage_error)?;
         Ok(HostSetupPlan::new(
@@ -1332,9 +1483,12 @@ pub async fn plan_host_setup(home: &Path) -> crate::Result<HostSetupPlan> {
     }
 }
 
-pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
+pub async fn execute_host_setup(
+    home: &Path,
+    caches_volume: CachesVolume,
+) -> crate::Result<HostSetupReport> {
     {
-        let initial = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost))
+        let initial = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume)
             .await
             .map_err(existing_host_storage_error)?;
         let authorized = setup_requires_authorization(&initial);
@@ -1377,23 +1531,25 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
                 )
             });
         let fstab = if needs_post_evidence {
-            let post = match gather_setup_snapshot(home, Arc::clone(&host)).await {
-                Ok(post) => post,
-                Err(error) => {
-                    let error = setup_execution_error(error, "cowshed setup");
-                    if let Some(last) = action_outcomes.last_mut() {
-                        last.outcome = HostActionResult::Failed {
-                            error: error.clone(),
-                        };
+            // A retired volume is gone by now; the host is re-read as it stands.
+            let post =
+                match gather_setup_snapshot(home, Arc::clone(&host), CachesVolume::Keep).await {
+                    Ok(post) => post,
+                    Err(error) => {
+                        let error = setup_execution_error(error, "cowshed setup");
+                        if let Some(last) = action_outcomes.last_mut() {
+                            last.outcome = HostActionResult::Failed {
+                                error: error.clone(),
+                            };
+                        }
+                        return Ok(HostSetupReport {
+                            action_outcomes,
+                            volumes: initial.volumes,
+                            fstab: FstabOutcome::Skipped(error.message.clone()),
+                            authorized,
+                        });
                     }
-                    return Ok(HostSetupReport {
-                        action_outcomes,
-                        volumes: initial.volumes,
-                        fstab: FstabOutcome::Skipped(error.message.clone()),
-                        authorized,
-                    });
-                }
-            };
+                };
             if post
                 .plan
                 .operations()
@@ -1651,6 +1807,9 @@ trait EvidenceSource {
         volume: &ApfsVolume,
     ) -> Result<bool, NativeBootstrapError>;
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError>;
+    /// Whether the mounted retired caches volume holds nothing but its marker and its
+    /// filesystem's own bookkeeping.
+    fn holds_only_marker(&mut self, mountpoint: &Path) -> Result<bool, NativeBootstrapError>;
     fn invoking_identity(&mut self) -> (u32, u32);
 }
 
@@ -1729,6 +1888,14 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
             .run_command(&command)
             .map(|output| output.succeeded())
             .map_err(NativeBootstrapError::Host)
+    }
+    fn holds_only_marker(&mut self, mountpoint: &Path) -> Result<bool, NativeBootstrapError> {
+        crate::caches_retirement::holds_only_marker(mountpoint).map_err(|source| {
+            NativeBootstrapError::StatFs {
+                path: mountpoint.to_owned(),
+                source,
+            }
+        })
     }
     fn invoking_identity(&mut self) -> (u32, u32) {
         (unsafe { libc::getuid() }, unsafe { libc::getgid() })
@@ -1814,26 +1981,32 @@ fn gather_existing_apfs_evidence(
         roots.store(),
         VolumeRole::Store,
     )?;
+    let retired_caches = Path::new(RETIRED_CACHES_MOUNTPOINT);
     let mut caches = classify_volume(
         source,
         container,
         APFS_CACHES_VOLUME,
-        roots.caches(),
+        retired_caches,
         VolumeRole::Caches,
     )?;
     guard_absent_volume_globally(source, &inventory, APFS_STORE_VOLUME, &mut store)?;
     guard_absent_volume_globally(source, &inventory, APFS_CACHES_VOLUME, &mut caches)?;
 
+    // The retired caches volume is classified, mounted and pinned only while a host still has
+    // one; a host without it never gets one (03_caches.md).
     let classified = [
         (APFS_STORE_VOLUME, VolumeRole::Store, roots.store(), &store),
         (
             APFS_CACHES_VOLUME,
             VolumeRole::Caches,
-            roots.caches(),
+            retired_caches,
             &caches,
         ),
     ]
     .into_iter()
+    .filter(|(_, role, _, classified)| {
+        *role == VolumeRole::Store || !matches!(classified.storage, ExistingStorage::Absent)
+    })
     .map(|(name, role, mountpoint, classified)| {
         let (container_name, volume_uuid, size_bytes) = match &classified.storage {
             ExistingStorage::FoundElsewhere {
@@ -3362,7 +3535,7 @@ mod tests {
     use super::super::shared::mutating_setup_actions;
     use super::*;
     use crate::apfs::RegisteredApfsVolume;
-    use crate::storage::bootstrap::{BlockingJob, CACHES_ROOT, STORE_ROOT};
+    use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT, STORE_ROOT};
     use uuid::Uuid;
 
     #[test]
@@ -3555,7 +3728,7 @@ mod tests {
             },
             FstabPin {
                 volume_uuid: "D4B312DB-9378-4EC5-9B0B-8F244F1B38FA".to_owned(),
-                mountpoint: PathBuf::from(CACHES_ROOT),
+                mountpoint: PathBuf::from(RETIRED_CACHES_MOUNTPOINT),
                 label: APFS_CACHES_VOLUME.to_owned(),
             },
         ]
@@ -3856,6 +4029,7 @@ mod tests {
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
         keychain_items: BTreeMap<&'static str, bool>,
+        caches_hold_only_marker: bool,
         invoking_identity: (u32, u32),
     }
 
@@ -3926,6 +4100,10 @@ mod tests {
             Ok(self.keychain_items.get(label).copied().unwrap_or(false))
         }
 
+        fn holds_only_marker(&mut self, _: &Path) -> Result<bool, NativeBootstrapError> {
+            Ok(self.caches_hold_only_marker)
+        }
+
         fn invoking_identity(&mut self) -> (u32, u32) {
             self.invoking_identity
         }
@@ -3977,6 +4155,7 @@ mod tests {
                 ),
             ]),
             keychain_items: BTreeMap::from([(APFS_STORE_VOLUME, true), (APFS_CACHES_VOLUME, true)]),
+            caches_hold_only_marker: true,
             invoking_identity: (501, 20),
         }
     }
@@ -4514,7 +4693,12 @@ mod tests {
         assert_eq!(evidence.inventory_reads, 1);
         for mut evidence in [empty(), unreadable()] {
             assert!(matches!(
-                prepare_setup_snapshot(&mut evidence, Path::new("/Users/alice"), ""),
+                prepare_setup_snapshot(
+                    &mut evidence,
+                    Path::new("/Users/alice"),
+                    "",
+                    CachesVolume::Keep
+                ),
                 Err(NativeBootstrapError::EmptyApfsInventory
                     | NativeBootstrapError::ApfsRegistry { .. })
             ));
@@ -4905,8 +5089,13 @@ mod tests {
             },
         );
 
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("safe stubs must become a repair plan");
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("safe stubs must become a repair plan");
         assert_eq!(
             snapshot.actions.first(),
             Some(&HostAction::ReclaimStubs {
@@ -5943,8 +6132,13 @@ mod tests {
             ),
         ]));
 
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("cross-container volume must be repairable");
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("cross-container volume must be repairable");
         let plan = &snapshot.plan;
         assert!(plan.operations().iter().any(|operation| matches!(
             operation,
@@ -5973,35 +6167,123 @@ mod tests {
                         && matches!(volume.kind(), ApfsProvisionKind::Create)
                 })
         )));
-        assert!(plan.operations().iter().any(|operation| matches!(
+        // The caches volume is retired: a host without one never gets one.
+        assert!(!plan.operations().iter().any(|operation| matches!(
             operation,
             HostOperation::ProvisionApfsVolumes { volumes, .. }
-                if volumes.iter().any(|volume| {
-                    volume.name() == APFS_CACHES_VOLUME
-                        && matches!(volume.kind(), ApfsProvisionKind::Create)
-                })
+                if volumes.iter().any(|volume| volume.name() == APFS_CACHES_VOLUME)
         )));
-        assert!(snapshot.actions.iter().any(|action| matches!(
+        assert!(!snapshot.actions.iter().any(|action| matches!(
             action,
-            HostAction::CreateVolume { name, container, mount_at }
-                if name == APFS_CACHES_VOLUME
-                    && container == "disk3"
-                    && mount_at == Path::new("/private/cowshed/caches")
+            HostAction::CreateVolume { name, .. } if name == APFS_CACHES_VOLUME
         )));
+        assert!(
+            snapshot
+                .volumes
+                .iter()
+                .all(|volume| volume.name != APFS_CACHES_VOLUME)
+        );
+        let public_plan = HostSetupPlan::new(
+            snapshot.actions.clone(),
+            snapshot.volumes.clone(),
+            setup_requires_authorization(&snapshot),
+        );
+        assert!(public_plan.non_destructive);
+        assert_eq!(source.inventory_reads, 1);
+    }
+
+    /// `--retire-caches-volume` on a host whose caches volume holds only its marker plans the
+    /// deletion first, inside the same authorization, and plans the rest of the host — fstab pins
+    /// and mount service — without the volume. A plain setup keeps it.
+    #[test]
+    fn retiring_the_caches_volume_deletes_it_and_rewrites_the_host_without_it() {
+        let mut keep = healthy_existing_source();
+        let kept =
+            prepare_setup_snapshot(&mut keep, Path::new("/Users/alice"), "", CachesVolume::Keep)
+                .unwrap();
+        assert!(
+            kept.volumes
+                .iter()
+                .any(|volume| volume.name == APFS_CACHES_VOLUME)
+        );
+        assert!(
+            !kept
+                .actions
+                .iter()
+                .any(|action| matches!(action, HostAction::DeleteVolume { .. }))
+        );
+
+        let mut source = healthy_existing_source();
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Retire,
+        )
+        .unwrap();
+        assert!(matches!(
+            snapshot.actions.first(),
+            Some(HostAction::DeleteVolume { name, uuid, mounted_at })
+                if name == APFS_CACHES_VOLUME
+                    && uuid == &volume_uuid("disk3s9")
+                    && mounted_at == Path::new(RETIRED_CACHES_MOUNTPOINT)
+        ));
+        assert!(
+            snapshot
+                .volumes
+                .iter()
+                .all(|volume| volume.name != APFS_CACHES_VOLUME)
+        );
+        assert!(
+            snapshot
+                .classified
+                .iter()
+                .all(|volume| volume.role == VolumeRole::Store)
+        );
+        let PlannedFstab::NeedsPin(pins) = &snapshot.fstab else {
+            panic!("{:?}", snapshot.fstab);
+        };
+        assert!(pins.iter().all(|pin| pin.label == APFS_STORE_VOLUME));
+        assert!(setup_requires_authorization(&snapshot));
         let public_plan = HostSetupPlan::new(
             snapshot.actions.clone(),
             snapshot.volumes.clone(),
             setup_requires_authorization(&snapshot),
         );
         assert!(!public_plan.non_destructive);
-        assert_eq!(source.inventory_reads, 1);
+    }
+
+    /// Anything on the volume besides its marker refuses the retirement before anything is
+    /// planned.
+    #[test]
+    fn retiring_a_caches_volume_that_still_holds_caches_is_refused() {
+        let mut source = healthy_existing_source();
+        source.caches_hold_only_marker = false;
+        let Err(error) = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Retire,
+        ) else {
+            panic!("a caches volume holding caches must not be retired");
+        };
+        assert!(
+            matches!(&error, NativeBootstrapError::CachesVolumeNotRetirable(reason)
+                if reason.contains("more than its marker")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
     async fn valid_manually_created_volumes_are_pinned_without_reprovisioning() {
         let mut source = healthy_existing_source();
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("healthy manually-created volumes plan");
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("healthy manually-created volumes plan");
         assert!(
             !snapshot
                 .plan
@@ -6083,8 +6365,13 @@ mod tests {
                 .mountpoints
                 .insert(path, MountpointState::Mounted { marker: None });
         }
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("two-volume repair snapshot");
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("two-volume repair snapshot");
         assert_eq!(snapshot.actions.len(), 4);
         let host: Arc<dyn BootstrapHost> = Arc::new(PartialProgressHost {
             fail_volume: APFS_CACHES_VOLUME,
@@ -6200,16 +6487,26 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn healthy_host_with_current_fstab_has_zero_mutation_plan() {
         let mut first_source = healthy_existing_source();
-        let first = prepare_setup_snapshot(&mut first_source, Path::new("/Users/alice"), "")
-            .expect("pin plan");
+        let first = prepare_setup_snapshot(
+            &mut first_source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("pin plan");
         let PlannedFstab::NeedsPin(pins) = first.fstab else {
             panic!("empty fstab must need pins");
         };
         let current = build_fstab("", &pins).expect("desired fstab");
 
         let mut source = healthy_existing_source();
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), &current)
-            .expect("healthy setup plan");
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            &current,
+            CachesVolume::Keep,
+        )
+        .expect("healthy setup plan");
         assert_eq!(host_setup_actions(&snapshot), Vec::<HostAction>::new());
         assert!(!setup_requires_authorization(&snapshot));
         assert!(matches!(snapshot.fstab, PlannedFstab::AlreadyCurrent));
@@ -6238,7 +6535,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
         assert_eq!(validated.home(), Path::new("/Users/alice"));
         assert_eq!(validated.store(), Path::new("/private/cowshed/store"));
-        assert_eq!(validated.caches(), Path::new("/private/cowshed/caches"));
         assert_eq!(
             validated.telemetry(),
             Path::new("/private/cowshed/store/telemetry")
@@ -6482,7 +6778,13 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             source.mounted_volumes.remove(path);
         }
 
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "").unwrap();
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .unwrap();
         assert!(matches!(
             &snapshot.actions[0],
             HostAction::MountExisting { name, .. } if name == APFS_STORE_VOLUME
@@ -6504,7 +6806,13 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn filevault_volumes_with_usable_keychain_items_do_not_plan_encryption() {
         let mut source = healthy_existing_source();
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "").unwrap();
+        let snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .unwrap();
         assert!(
             !snapshot
                 .actions
@@ -6517,8 +6825,13 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     fn filevault_volume_without_usable_keychain_item_fails_closed() {
         let mut source = healthy_existing_source();
         source.keychain_items.insert(APFS_STORE_VOLUME, false);
-        let error = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect_err("FileVault without its unlock credential must fail");
+        let error = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect_err("FileVault without its unlock credential must fail");
         assert!(matches!(
             error,
             NativeBootstrapError::MissingVolumeKeychain {
@@ -6531,8 +6844,13 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn filevault_is_attested_only_for_reserved_kernel_records() {
         let mut source = healthy_existing_source();
-        prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("healthy setup plan");
+        prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("healthy setup plan");
         assert_eq!(source.file_vault_queries, ["disk3s8", "disk3s9"]);
 
         let mut silent = healthy_existing_source();
@@ -6540,7 +6858,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             kernel.file_vault.remove("disk3s9");
         }
         assert!(matches!(
-            prepare_setup_snapshot(&mut silent, Path::new("/Users/alice"), ""),
+            prepare_setup_snapshot(&mut silent, Path::new("/Users/alice"), "", CachesVolume::Keep),
             Err(NativeBootstrapError::VolumeFileVaultEvidence { identifier, .. })
                 if identifier == "disk3s9"
         ));

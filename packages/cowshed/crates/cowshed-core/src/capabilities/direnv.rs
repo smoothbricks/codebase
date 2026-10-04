@@ -10,7 +10,6 @@ pub const DETECTOR: Detector = Detector {
     scope: super::DetectionScope::CommandAncestors,
     all: &[".envrc"],
     any: &[],
-    host_cache_homes: &[],
     reached_from: None,
     contribute,
 };

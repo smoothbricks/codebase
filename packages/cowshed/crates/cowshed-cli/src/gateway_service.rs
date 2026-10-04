@@ -278,7 +278,8 @@ const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 pub struct GatewayPaths {
     pub home: PathBuf,
     pub store: PathBuf,
-    pub cache_volume: PathBuf,
+    /// cowshed's user cache directory, which holds the gateway's mirrors (03_caches.md, layer 1).
+    pub cache_dir: PathBuf,
     pub mirror_cache: PathBuf,
     pub telemetry: PathBuf,
     pub control_socket: PathBuf,
@@ -289,8 +290,8 @@ impl GatewayPaths {
         Self {
             home: storage.home().to_path_buf(),
             store: storage.store().to_path_buf(),
-            cache_volume: storage.caches().to_path_buf(),
-            mirror_cache: storage.caches().join("mirror"),
+            cache_dir: cowshed_core::host_dirs::cache_directory(storage.home()),
+            mirror_cache: cowshed_core::host_dirs::gateway_mirror(storage.home()),
             telemetry: storage.telemetry().join("gateway"),
             control_socket: storage.store().join("gateway.sock"),
         }
@@ -302,7 +303,7 @@ impl GatewayPaths {
             control_tcp: None,
             simulator_drop_root: None,
             data_socket_root: None,
-            production_cache_volume: Some(self.cache_volume.clone()),
+            production_cache_dir: Some(self.cache_dir.clone()),
             git_helper_executable: Some(git_helper_executable),
             authorized_control_uid: uid,
             mirror_cache: MirrorCacheConfig::new(self.mirror_cache.clone()),
@@ -731,6 +732,18 @@ fn stop_service(purge: bool) -> Result<RemovalOutcome> {
     Ok(RemovalOutcome::AlreadyAbsent)
 }
 
+/// Stop the gateway while setup moves its mirrors; the installed binary stays.
+pub(crate) fn stop_for_host_move() -> Result<()> {
+    stop_service(false).map(|_| ())
+}
+
+/// Start the gateway again after setup moved its mirrors, saying nothing: setup reports the
+/// move itself, and the gateway's own start output belongs to `cowshed gateway start`.
+pub(crate) async fn start_after_host_move() -> Result<()> {
+    let mut quiet = Output::new(io::sink(), io::sink(), true);
+    start_service(&mut quiet).await.map(|_| ())
+}
+
 pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let home = canonical_home()?;
     let socket = control_socket_path();
@@ -761,6 +774,7 @@ async fn run_daemon() -> Result<()> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
     let paths = GatewayPaths::from_storage(&storage);
+    ensure_private_directory(&paths.cache_dir)?;
     ensure_private_directory(&paths.mirror_cache)?;
     ensure_private_directory(&paths.telemetry)?;
     let store_root = storage.store().to_path_buf();

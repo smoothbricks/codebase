@@ -8,8 +8,7 @@ use crate::Result;
 pub static NPM_HOME: SharedToolHome = SharedToolHome {
     variable: Some("NPM_CONFIG_CACHE"),
     home: ".npm",
-    layout: SharedLayout::Whole("npm"),
-    linked_from_checkouts: false,
+    layout: SharedLayout::Whole,
 };
 
 pub const DETECTOR: Detector = Detector {
@@ -19,7 +18,6 @@ pub const DETECTOR: Detector = Detector {
     all: &["package.json"],
     any: &["package-lock.json", "npm-shrinkwrap.json"],
     contribute,
-    host_cache_homes: &[&NPM_HOME],
     reached_from: None,
 };
 
