@@ -63,6 +63,17 @@ in {
       PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
     })
   ];
+
+  # devenv's Cachix integration adds one substituter, devenv.cachix.org, whose
+  # signing key it fetches from the Cachix API whenever its per-user key file
+  # (cachix_trusted_keys.json) lacks it. That cache holds nothing this shell
+  # pulls: its packages come from devenv-nixpkgs, whose store paths
+  # cache.nixos.org already serves, and the rest are built here. Off, devenv
+  # makes no network call before evaluating, which matters wherever the API is
+  # unreachable (a cowshed sandbox's gateway, an offline host). A host that
+  # wants the cache anyway names it in its own nix.conf.
+  cachix.enable = false;
+
   # sccache is deliberately absent from this shell. It used to export
   # RUSTC_WRAPPER=sccache as a BARE NAME, which PATH then resolved per project —
   # which is precisely how an unpatched binary from one profile came to serve

@@ -439,11 +439,11 @@ nothing when nothing changed:
   `WARNING` naming the path and errno it hit, then `Git hooks and repository config were not applied`; the next entry
   that may write them wires them. `applyWorkspaceGitConfig` from `@smoothbricks/cli/monorepo/git-config`, which shell
   entries managed by older releases call, degrades the same way.
-- Starting the shell contacts no network when the checkout is installed. The managed `.envrc` records the public signing
-  key of devenv's `devenv` binary cache in devenv's home (`cachix_trusted_keys.json`) when that file is absent, so
-  devenv never asks the Cachix API for it; a sandbox's private home starts without one, and its TLS client cannot reach
-  the API through the workspace gateway. The shell exports `NX_USE_LOCAL=true`, so an Nx daemon starting (and
-  `nx configure-ai-agents`, `nx init`) answers from the installed `nx` instead of installing `nx@latest` from the
+- Starting the shell contacts no network when the checkout is installed. The managed module turns devenv's Cachix
+  integration off (`cachix.enable = false`): it only adds devenv's `devenv` binary cache, whose signing key devenv would
+  otherwise ask the Cachix API for, and the shell's packages come from `cache.nixos.org` or are built locally. A host
+  that wants that cache names it in its own `nix.conf`. The shell exports `NX_USE_LOCAL=true`, so an Nx daemon starting
+  (and `nx configure-ai-agents`, `nx init`) answers from the installed `nx` instead of installing `nx@latest` from the
   registry; `nx migrate` then also runs with the installed CLI, and `NX_USE_LOCAL=false` restores the newest one for
   that command. A daemon still asks GitHub for `nrwl/nx-ai-agents-config` when an agent has both rules and Nx's MCP
   configured, to tell whether that configuration is outdated; a cowshed sandbox runs Nx without a daemon.
