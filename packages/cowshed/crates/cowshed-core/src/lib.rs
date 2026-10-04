@@ -13,6 +13,7 @@ mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
 pub mod host_caches;
+pub mod host_load;
 mod inherited_daemons;
 #[cfg(target_os = "macos")]
 mod inherited_git_locks;

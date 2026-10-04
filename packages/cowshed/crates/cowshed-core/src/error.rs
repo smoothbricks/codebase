@@ -205,7 +205,10 @@ impl CowshedError {
                 || error.is::<crate::apfs::CommandRunError>()
                 || matches!(
                     error.downcast_ref::<crate::apfs::ApfsError>(),
-                    Some(crate::apfs::ApfsError::CommandFailed { .. })
+                    Some(
+                        crate::apfs::ApfsError::CommandFailed { .. }
+                            | crate::apfs::ApfsError::DiskImageHelperUnreachable(_)
+                    )
                 );
             cause = error.source();
         }

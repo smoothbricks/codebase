@@ -292,6 +292,14 @@ retried and no unproved device is formatted. Shared owned-image cleanup distingu
 state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
 without deleting the backing file first.
 
+The disk-images framework behind `diskutil image` and `hdiutil` answers through helper daemons over XPC, and under host
+contention it can lose them: a test gate at load average ~350 saw ten concurrent attaches fail at once with exit 1 and
+_"Error: Couldn’t communicate with a helper application."_, while twelve concurrent attaches at load ~125 all succeeded.
+Such a failure is the framework's, not the request's, so it is typed apart from an ordinary command failure
+(`DiskImageHelperUnreachable`) and carries the framework's stderr and the host's `getloadavg` at the failure. It is
+neither retried nor read as a detach dissent; like every child failure it still names a saturated vnode table when one
+is the likelier cause.
+
 Every release rechecks image ownership at the final detach boundary as well as the initial recovery read. Empty
 inventory is already released; a nonempty mapping that no longer contains the recorded device is a typed refusal, never
 successful release or permission to delete its backing file. An APFS image can expose both its physical and synthesized

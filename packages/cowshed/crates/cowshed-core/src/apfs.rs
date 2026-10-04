@@ -4,6 +4,7 @@
 //! as an executable plus an argument vector; this module never invokes a shell.
 
 use crate::fork_lock::{Fenced, Spawn as _};
+use crate::host_load::HostLoad;
 use crate::metadata::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 pub use crate::process::{CommandOutput, ProcessStatus};
 use crate::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
@@ -1022,6 +1023,10 @@ pub enum ApfsError {
         request: CommandRequest,
         output: CommandOutput,
     },
+    /// A disk-image command whose framework could not reach its helper daemon over XPC.
+    /// Boxed: the evidence is rare, and every `Result` carrying this error would otherwise pay
+    /// for it.
+    DiskImageHelperUnreachable(Box<DiskImageHelperFailure>),
     InvalidAttachmentPlist(String),
     /// The attach succeeded but reported no APFS volume at all: the image was never formatted,
     /// or its formatting never finished. Distinct from a malformed report, which proves nothing
@@ -1057,6 +1062,18 @@ pub enum ApfsError {
     ImageNotAttached(PathBuf),
     /// The kernel's disk-image inventory could not be read.
     KernelInventory(io::Error),
+}
+
+/// The framework's failure, not the request's: it was seen striking a burst of concurrent
+/// attaches at once on a host whose load average stood near 350, so the load at the failure is
+/// carried and the report names the host condition the command met.
+#[derive(Debug)]
+pub struct DiskImageHelperFailure {
+    pub operation: &'static str,
+    pub request: CommandRequest,
+    pub output: CommandOutput,
+    /// `getloadavg` when the failure was classified; `None` if the kernel would not say.
+    pub load: Option<HostLoad>,
 }
 
 impl fmt::Display for ApfsError {
@@ -1095,6 +1112,21 @@ impl fmt::Display for ApfsError {
                 &request.args,
                 output,
             ),
+            Self::DiskImageHelperUnreachable(failure) => {
+                f.write_str("the disk-images helper daemon could not be reached over XPC (")?;
+                match &failure.load {
+                    Some(load) => write!(f, "{load}")?,
+                    None => f.write_str("load average unavailable")?,
+                }
+                f.write_str(" at the failure); ")?;
+                fmt_command_failure(
+                    f,
+                    failure.operation,
+                    failure.request.program.as_os_str(),
+                    &failure.request.args,
+                    &failure.output,
+                )
+            }
             Self::InvalidAttachmentPlist(message) => {
                 write!(f, "invalid attachment plist: {message}")
             }
@@ -1506,11 +1538,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             if output.succeeded() {
                 Ok(output)
             } else {
-                Err(ApfsError::CommandFailed {
-                    operation,
-                    request,
-                    output,
-                })
+                Err(command_failed(operation, request, output))
             }
         })
     }
@@ -2288,6 +2316,36 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+/// The disk-images framework's report that its XPC helper never answered, as `diskutil image`
+/// and `hdiutil` print it: "Error: Couldn’t communicate with a helper application." The match
+/// skips the apostrophe, which the framework spells U+2019.
+const DISK_IMAGE_HELPER_UNREACHABLE: &[u8] = b"t communicate with a helper application";
+
+/// A failed command, typed by what failed: a disk-image command whose framework lost its helper
+/// carries the host load at the failure; every other failure is the command's own.
+fn command_failed(
+    operation: &'static str,
+    request: CommandRequest,
+    output: CommandOutput,
+) -> ApfsError {
+    let disk_image_command =
+        request.program == Path::new(DISKUTIL) || request.program == Path::new(HDIUTIL);
+    if disk_image_command && contains_bytes(&output.stderr, DISK_IMAGE_HELPER_UNREACHABLE) {
+        ApfsError::DiskImageHelperUnreachable(Box::new(DiskImageHelperFailure {
+            operation,
+            request,
+            output,
+            load: HostLoad::read(),
+        }))
+    } else {
+        ApfsError::CommandFailed {
+            operation,
+            request,
+            output,
+        }
+    }
 }
 
 /// `diskutil image resize --plist` reports limits in bytes under `current`.
@@ -4608,6 +4666,57 @@ mod tests {
             }
         ));
         assert_eq!(backend.runner().steps().len(), 5);
+    }
+
+    /// The gate failure this type exists for: `diskutil image attach` exiting 1 because the
+    /// framework lost its XPC helper. It must arrive typed, with the framework's own stderr and
+    /// the host load, not as one more generic exit 1 — and an ordinary refusal must not.
+    #[test]
+    fn an_attach_whose_framework_lost_its_helper_is_typed_with_the_host_load() {
+        let helper_lost = "Error: Couldn\u{2019}t communicate with a helper application.\n";
+        let attach = |stderr: &'static str| {
+            let stem = temp_path("asif-helper-lost", "stem").with_extension("");
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+                ok([]),
+                no_images(),
+                failed(1, stderr),
+                no_images(),
+                no_images(),
+            ]));
+            backend
+                .create_staged_image(&CreateImageRequest {
+                    staged_stem: stem,
+                    capacity: capacity("5g"),
+                    volume_name: "main".into(),
+                    owner_uid: 502,
+                    owner_gid: 20,
+                })
+                .unwrap_err()
+        };
+
+        let error = attach(helper_lost);
+        let ApfsError::DiskImageHelperUnreachable(failure) = &error else {
+            panic!("expected the typed helper failure, got {error:?}");
+        };
+        assert_eq!(failure.operation, "attach blank ASIF image");
+        assert!(failure.load.is_some(), "the host load travels with it");
+        assert_eq!(failure.output.stderr, helper_lost.as_bytes());
+        let report = error.to_string();
+        assert!(
+            report.starts_with(
+                "the disk-images helper daemon could not be reached over XPC (loadavg "
+            ),
+            "{report}"
+        );
+        assert!(report.contains("helper application"), "{report}");
+
+        assert!(matches!(
+            attach("attach failed"),
+            ApfsError::CommandFailed {
+                operation: "attach blank ASIF image",
+                ..
+            }
+        ));
     }
 
     #[test]
