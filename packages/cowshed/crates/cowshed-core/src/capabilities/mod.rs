@@ -12,10 +12,12 @@ use cache::{HostCache, SharedLayout, SharedToolHome};
 
 pub mod cache;
 mod installations;
+mod javascript;
 mod direnv;
 pub mod nx;
 pub mod cargo;
 pub mod go;
+mod bun;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CapabilityId {
@@ -234,7 +236,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 4] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR];
+pub static DETECTORS: [&Detector; 5] = [&direnv::DETECTOR, &nx::DETECTOR, &cargo::DETECTOR, &go::DETECTOR, &bun::DETECTOR];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DetectedCapabilities {
