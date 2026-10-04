@@ -634,16 +634,18 @@ inputs the evaluation depended on. Cowshed does not substitute `print-dev-env --
 from exported variables.
 
 The initial sandbox PATH supplies the activation tools from the workspace's private bin, the workspace's own evaluated
-devenv profile, and the host's Nix profiles: the user's (`~/.nix-profile`, `~/.local/state/nix/profile`,
+devenv profile, and the store packages of exactly `direnv`, `devenv` and `nix` (with `nix-store` beside it), then the
+platform's developer directory and `/usr/bin:/bin:/usr/sbin:/sbin`. Each package is found through the nearest host Nix
+profile that provides the tool — the user's (`~/.nix-profile`, `~/.local/state/nix/profile`,
 `/etc/profiles/per-user/<user>`, `/nix/var/nix/profiles/per-user/<user>/profile`), the system's
-(`/run/current-system/sw`) and the default profile, each admitted only when it resolves into `/nix/store`. These are
-found on the host, not on the PATH of whatever started the supervisor: the daemon starts supervisors with launchd's (or
-systemd's) PATH, which names none of them. Admitted entries of an inherited PATH follow. The activated shell then owns
-PATH and SDK selection, including workspace-local executables such as `node_modules/.bin`. Cowshed does not require such
-executables to resolve into `/nix/store` and does not add project-specific PATH exceptions. Filesystem and network
-authority remain enforced by the same child profile, independently of shell environment values. The bare-command check
-contract (02_workspaces.md) remains unchanged: `just verify` runs through this activation without a caller-provided
-wrapper.
+(`/run/current-system/sw`) or the default profile — and joins PATH only as the `/nix/store` package directory the tool
+resolves to; the profiles themselves, with everything else their user or host installed, never join it. Nothing comes
+from the PATH of whatever started the supervisor. The activated shell then owns PATH and SDK selection, including
+workspace-local executables such as `node_modules/.bin`, so a tool a job needs is the workspace devenv's to declare.
+Cowshed does not require such executables to resolve into `/nix/store` and does not add project-specific PATH
+exceptions. Filesystem and network authority remain enforced by the same child profile, independently of shell
+environment values. The bare-command check contract (02_workspaces.md) remains unchanged: `just verify` runs through
+this activation without a caller-provided wrapper.
 
 Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
 workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the workspace's writable temporary

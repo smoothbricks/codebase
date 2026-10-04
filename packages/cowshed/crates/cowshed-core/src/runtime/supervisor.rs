@@ -917,10 +917,8 @@ fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<Pa
 }
 
 /// The Nix profiles that belong to the host's user and the host itself rather than to any
-/// shell: where `nix profile`, home-manager, nix-darwin and NixOS install tools. The daemon
-/// starts workspace supervisors with launchd's (or systemd's) PATH, which names none of them,
-/// so `direnv` and `devenv` are looked up here instead of on whatever PATH started the
-/// supervisor. Nearest the user first.
+/// shell: where `nix profile`, home-manager, nix-darwin and NixOS install tools. Nearest the
+/// user first. They are searched for [`BOOTSTRAP_TOOLS`] only and never join PATH whole.
 fn host_profile_bins(home: &Path, user: Option<&OsStr>) -> Vec<PathBuf> {
     let mut profiles = vec![
         home.join(".nix-profile/bin"),
@@ -937,6 +935,32 @@ fn host_profile_bins(home: &Path, user: Option<&OsStr>) -> Vec<PathBuf> {
     profiles.push(PathBuf::from("/run/current-system/sw/bin"));
     profiles.push(PathBuf::from("/nix/var/nix/profiles/default/bin"));
     profiles
+}
+
+/// What shell activation itself runs before any workspace shell exists: `direnv` loads the
+/// `.envrc`, `devenv` evaluates the workspace, and `nix` (with `nix-store` beside it) is what
+/// devenv and the inherited-shell check drive. Every other tool is the workspace devenv's.
+const BOOTSTRAP_TOOLS: [&str; 3] = ["direnv", "devenv", "nix"];
+
+/// The store package `bin` directory providing each [`BOOTSTRAP_TOOLS`] entry, found through the
+/// nearest host profile that has it. Only that package joins PATH: a profile carries everything
+/// else its user or host installed, which a workspace shell must not see.
+fn bootstrap_tool_bins(host_profiles: &[PathBuf]) -> Vec<PathBuf> {
+    let mut bins = Vec::new();
+    for tool in BOOTSTRAP_TOOLS {
+        let package = host_profiles.iter().find_map(|profile| {
+            let program = fs::canonicalize(profile.join(tool)).ok()?;
+            let bin = program.parent()?;
+            (program.starts_with("/nix/store") && bin.join(tool).is_file())
+                .then(|| bin.to_path_buf())
+        });
+        if let Some(bin) = package
+            && !bins.contains(&bin)
+        {
+            bins.push(bin);
+        }
+    }
+    bins
 }
 
 /// The effective user's login name, from the password database rather than the environment.
@@ -968,15 +992,16 @@ fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<
         sandbox,
         devenv_dir,
         &host_profile_bins(&sandbox.home, effective_user_name().as_deref()),
-        std::env::var_os("PATH").as_deref(),
     )
 }
 
+/// The PATH a child starts from, before its shell activates: the workspace's own tools, the
+/// bootstrap packages, then the platform. Nothing comes from the PATH that started this
+/// process — another checkout's shell or a user's login PATH is not the workspace's.
 fn bootstrap_path_from(
     sandbox: &SandboxConfig,
     devenv_dir: Option<&Path>,
     host_profiles: &[PathBuf],
-    inherited: Option<&OsStr>,
 ) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
     if let Some(profile) = workspace_profile_bin(
@@ -985,73 +1010,32 @@ fn bootstrap_path_from(
     ) {
         paths.push(profile);
     }
-    // A host profile is bootstrap authority only when it resolves to immutable store content.
-    for profile in host_profiles {
-        if let Ok(profile) = fs::canonicalize(profile)
-            && profile.starts_with("/nix/store")
-            && !paths.contains(&profile)
-        {
-            paths.push(profile);
+    for bin in bootstrap_tool_bins(host_profiles) {
+        if !paths.contains(&bin) {
+            paths.push(bin);
         }
     }
-    let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
-        && seen.insert(path.clone())
+        && !paths.contains(&path)
     {
         paths.push(path);
     }
     for fixed in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        let path = PathBuf::from(fixed);
-        seen.insert(path.clone());
-        paths.push(path);
-    }
-    if let Some(inherited) = inherited {
-        for path in std::env::split_paths(inherited) {
-            let admitted = path.is_absolute()
-                && [
-                    Path::new("/nix/store"),
-                    Path::new("/run/current-system"),
-                    // Nix per-user profiles. `/etc/profiles/per-user/<user>/bin` is where
-                    // nix-darwin and NixOS put a user's installed tools — the same immutable
-                    // store-backed class as /nix/store, reached through a stable symlink. Omitting
-                    // it made every nix-installed verify command unrunnable inside a workspace
-                    // while the identical command worked in the user's own shell.
-                    Path::new("/etc/profiles"),
-                    Path::new("/etc/static/profiles"),
-                    Path::new("/opt"),
-                    Path::new("/System"),
-                    Path::new("/Library"),
-                ]
-                .iter()
-                .any(|root| path.starts_with(root));
-            if admitted && seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
+        paths.push(PathBuf::from(fixed));
     }
     std::env::join_paths(paths)
         .map_err(|error| CowshedError::internal(format!("construct sandbox PATH: {error}")))
 }
 
+/// The platform's selected developer directory: a fixed system install, never a value from the
+/// environment that started this process.
 fn developer_directory() -> Option<PathBuf> {
-    let configured = std::env::var_os("DEVELOPER_DIR").map(PathBuf::from);
-    configured
-        .into_iter()
-        .chain([
-            PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
-            PathBuf::from("/Library/Developer/CommandLineTools"),
-        ])
-        .find(|path| {
-            path.is_absolute()
-                && path.is_dir()
-                && [
-                    Path::new("/Applications"),
-                    Path::new("/Library/Developer"),
-                    Path::new("/System"),
-                ]
-                .iter()
-                .any(|root| path.starts_with(root))
-        })
+    [
+        PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+        PathBuf::from("/Library/Developer/CommandLineTools"),
+    ]
+    .into_iter()
+    .find(|path| path.is_dir())
 }
 
 /// The `HTTP_PROXY` value for a workspace's own gateway endpoint.
@@ -1300,8 +1284,12 @@ impl SandboxEnvironment {
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
 ///
-/// Shell activation runs inside the sandbox, after this. The PATH here discovers bootstrap
-/// tools; activation owns PATH from then on.
+/// The description is the whole job contract: every value is derived from the sandbox, the
+/// workspace image and the host's fixed install locations, and `caller` is only the request's
+/// explicit `env`. Nothing is read from this process's own environment, so a supervisor started
+/// from another checkout's shell, a login PATH or a stuffed caller hands its children exactly
+/// what one started by launchd does. Shell activation runs inside the sandbox, after this; the
+/// PATH here discovers bootstrap tools and the workspace shell owns PATH from then on.
 pub(super) async fn sandbox_environment(
     sandbox: &SandboxConfig,
     devenv_dir: Option<&Path>,
@@ -1518,22 +1506,6 @@ pub(super) async fn sandbox_environment(
             own("GIT_CONFIG_COUNT", OsStr::new("0"));
             withheld.extend(["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]);
         }
-    }
-    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
-        if let Some(value) = std::env::var_os(key) {
-            own(key, &value);
-        }
-    }
-    // Mirror, never invent: a workspace shell must see the same toolchain
-    // selection as the host shell that adopted it. xcrun and xcode-select
-    // resolve the system default inside the sandbox on their own (measured),
-    // so an injected Xcode DEVELOPER_DIR adds nothing when the host has none —
-    // and it makes CMake resolve Xcode's SDK for a Nix clang whose sysroot is
-    // the Nix apple-sdk, which fails on the first header (`uint8_t` unknown in
-    // sys/resource.h) while the identical build passes in the host shell.
-    // The developer directory still joins PATH above so its tools are found.
-    if let Some(directory) = std::env::var_os("DEVELOPER_DIR") {
-        own("DEVELOPER_DIR", &directory);
     }
     // Every intercepted HTTPS origin is presented with a leaf this workspace's CA signed, so a
     // client that does not trust that CA cannot reach the registry at all — measured on the
@@ -4969,6 +4941,133 @@ mod workspace_toolchain_tests {
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
+    /// Names the fixture workspace a re-executed probe describes; see
+    /// [`environment_probe_describes_the_job_environment`].
+    #[cfg(target_os = "macos")]
+    const ENVIRONMENT_PROBE: &str = "COWSHED_ENVIRONMENT_PROBE";
+    #[cfg(target_os = "macos")]
+    const ENVIRONMENT_PROBE_LINE: &str = "environment-probe ";
+
+    /// The half of the regression below that runs as a process of its own: the job environment of
+    /// the workspace at `$COWSHED_ENVIRONMENT_PROBE`, computed by whatever environment started
+    /// this process. Run without one, it has nothing to describe.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn environment_probe_describes_the_job_environment() {
+        let Some(mount) = std::env::var_os(ENVIRONMENT_PROBE) else {
+            return;
+        };
+        let mut sandbox = sandbox_at(Path::new(&mount));
+        sandbox.port_block = crate::metadata::PortBlock::new(49_040, 16).expect("port block");
+        let environment = sandbox_environment(&sandbox, None, &BTreeMap::new())
+            .await
+            .expect("environment");
+        for (name, value) in environment.child(&BTreeMap::new()) {
+            println!(
+                "{ENVIRONMENT_PROBE_LINE}{}={}",
+                name.to_string_lossy(),
+                value.to_string_lossy()
+            );
+        }
+    }
+
+    /// A job's environment is cowshed's contract and nothing else: a supervisor started from a
+    /// shell full of another checkout's PATH, Nx, Python and Cargo settings, locale, Xcode
+    /// selection and a home with its own Git and npm configuration hands its children exactly
+    /// what one started with launchd's bare environment does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_supervisor_started_from_a_foreign_shell_hands_children_none_of_it() {
+        let root = scratch("stuffed-shell");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        let foreign_home = root.join("foreign-home");
+        std::fs::create_dir_all(&foreign_home).expect("foreign home");
+        std::fs::write(foreign_home.join(".gitconfig"), "[user]\nname = foreign\n")
+            .expect("foreign gitconfig");
+        std::fs::write(
+            foreign_home.join(".npmrc"),
+            "registry=http://foreign.invalid/\n",
+        )
+        .expect("foreign npmrc");
+        let foreign = foreign_home.to_string_lossy().into_owned();
+        let stuffed = [
+            (
+                "PATH",
+                "/nix/store/0000-foreign-checkout/bin:/etc/profiles/per-user/foreign/bin:\
+                 /opt/foreign/bin:/Library/Foreign/bin:/usr/bin:/bin",
+            ),
+            ("HOME", foreign.as_str()),
+            ("XDG_CONFIG_HOME", foreign.as_str()),
+            ("DIRENV_CONFIG", foreign.as_str()),
+            ("GIT_CONFIG_GLOBAL", foreign.as_str()),
+            ("NPM_CONFIG_USERCONFIG", foreign.as_str()),
+            ("CARGO_HOME", foreign.as_str()),
+            ("VIRTUAL_ENV", foreign.as_str()),
+            ("NX_DAEMON", "true"),
+            ("NX_SOCKET_DIR", foreign.as_str()),
+            ("NX_WORKSPACE_ROOT_PATH", foreign.as_str()),
+            ("NX_CACHE_DIRECTORY", foreign.as_str()),
+            ("LANG", "foreign.UTF-8"),
+            ("LC_ALL", "foreign.UTF-8"),
+            ("TERM", "foreign-term"),
+            ("COLORTERM", "foreign"),
+            (
+                "DEVELOPER_DIR",
+                "/Applications/Foreign.app/Contents/Developer",
+            ),
+            ("NIX_CONFIG", "access-tokens = github.com=foreign"),
+            ("SSL_CERT_FILE", foreign.as_str()),
+        ];
+        let probe = |environment: &[(&str, &str)]| -> Vec<String> {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "runtime::supervisor::workspace_toolchain_tests::environment_probe_describes_the_job_environment",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .envs(environment.iter().copied())
+                .env(ENVIRONMENT_PROBE, &mount)
+                .output()
+                .expect("run the environment probe");
+            assert!(
+                output.status.success(),
+                "environment probe: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("utf-8 probe output")
+                .lines()
+                .filter_map(|line| line.strip_prefix(ENVIRONMENT_PROBE_LINE))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let launchd = probe(&[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]);
+        let foreign_shell = probe(&stuffed);
+        assert!(
+            launchd.iter().any(|line| line.starts_with("HOME=")),
+            "the probe described a job environment: {launchd:?}"
+        );
+        assert_eq!(
+            foreign_shell, launchd,
+            "the starting environment reached the job"
+        );
+        assert!(
+            !foreign_shell
+                .iter()
+                .any(|line| line.contains("foreign") || line.contains("Foreign")),
+            "{foreign_shell:#?}"
+        );
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.port_block = crate::metadata::PortBlock::new(49_040, 16).expect("port block");
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Every spawn of a live workspace finds its link already in place, so it must not scan the
     /// directory the links share (on a busy host `/tmp` holds thousands of entries); only taking
     /// a link sweeps the dangling ones a retired workspace left beside it.
@@ -5074,28 +5173,35 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A supervisor the daemon starts inherits launchd's PATH, which names no Nix profile. The
-    /// user's own profile still puts its tools — `direnv` above all, which every activation
-    /// runs — on the bootstrap PATH, where the old controller found them only because it
-    /// inherited an interactive shell's PATH.
+    /// The bootstrap PATH is the workspace's and the bootstrap packages', whatever started the
+    /// supervisor: a profile contributes the store package of each bootstrap tool it provides and
+    /// nothing else it holds, and the PATH of this process — an interactive shell's, another
+    /// checkout's — contributes nothing at all.
     #[test]
-    fn a_supervisor_started_with_launchds_path_still_finds_the_users_profile_tools() {
-        // Any store `bin` on this test's PATH stands in for the user's profile generation.
+    fn a_profile_contributes_only_its_bootstrap_packages_to_path() {
+        let path_entries =
+            || std::env::split_paths(&std::env::var_os("PATH").expect("PATH")).collect::<Vec<_>>();
         // Absence fails: cowshed requires Nix, and this repository's own shell is devenv.
-        let store_bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
-            .filter_map(|entry| std::fs::canonicalize(entry).ok())
-            .find(|entry| entry.starts_with("/nix/store") && entry.ends_with("bin"))
-            .expect("a /nix/store bin directory on PATH; cowshed requires Nix");
-        let root = scratch("launchd-path");
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).expect("home");
-        std::os::unix::fs::symlink(
-            store_bin.parent().expect("a store path"),
-            home.join(".nix-profile"),
-        )
-        .expect("profile link");
+        let (tool, program) = BOOTSTRAP_TOOLS
+            .iter()
+            .find_map(|tool| {
+                path_entries().into_iter().find_map(|entry| {
+                    let program = std::fs::canonicalize(entry.join(tool)).ok()?;
+                    (program.starts_with("/nix/store")
+                        && program.file_name() == Some(OsStr::new(tool)))
+                    .then_some((*tool, program))
+                })
+            })
+            .expect("a bootstrap tool from /nix/store on PATH");
+        let package = program.parent().expect("a package bin").to_path_buf();
+        let root = scratch("profile-packages");
+        let profile = root.join("home/.nix-profile/bin");
+        std::fs::create_dir_all(&profile).expect("profile");
+        std::os::unix::fs::symlink(&program, profile.join(tool)).expect("bootstrap tool link");
+        // The rest of a user's profile: present, resolvable, and none of the workspace's.
+        std::os::unix::fs::symlink("/bin/sh", profile.join("sh")).expect("other tool link");
         let sandbox = SandboxConfig {
-            home: home.clone(),
+            home: root.join("home"),
             mount_root: root.clone(),
             workspace_mount: root.join("workspace"),
             exec_temp_dir: root.join("tmp"),
@@ -5110,17 +5216,14 @@ mod workspace_toolchain_tests {
             shared_tool_homes: Vec::new(),
         };
 
-        let path = bootstrap_path_from(
-            &sandbox,
-            None,
-            &host_profile_bins(&home, Some(OsStr::new("nobody-in-particular"))),
-            Some(OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
-        )
-        .expect("bootstrap PATH");
-        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        assert!(
-            entries.contains(&store_bin),
-            "the user's profile is on the bootstrap PATH: {entries:?}"
+        let path = bootstrap_path_from(&sandbox, None, &[profile]).expect("bootstrap PATH");
+        let mut expected = vec![sandbox.workspace_mount.join(".cowshed/bin"), package];
+        expected.extend(developer_directory().map(|directory| directory.join("usr/bin")));
+        expected.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            expected,
+            "only {tool}'s package joins PATH, not the rest of its profile nor this process's PATH"
         );
         std::fs::remove_dir_all(&root).ok();
     }

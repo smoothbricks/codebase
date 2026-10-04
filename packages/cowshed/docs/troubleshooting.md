@@ -314,11 +314,12 @@ wrapper. Run `cowshed setup --sccache`; the next command in the workspace uses i
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 
-The workspace supervisor looks for `direnv` (and `devenv`) in the workspace's own devenv profile and in the host's Nix
-profiles — `~/.nix-profile`, `~/.local/state/nix/profile`, `/etc/profiles/per-user/<you>`, `/run/current-system/sw` and
-the default profile — never on your shell's PATH, because the daemon starts supervisors with launchd's. Install `direnv`
-into one of those profiles (`nix profile install nixpkgs#direnv`, or home-manager/nix-darwin), then run the command
-again. The message names the PATH that was searched.
+The workspace supervisor looks for `direnv` (and `devenv` and `nix`) in the workspace's own devenv profile and in the
+host's Nix profiles — `~/.nix-profile`, `~/.local/state/nix/profile`, `/etc/profiles/per-user/<you>`,
+`/run/current-system/sw` and the default profile — never on your shell's PATH, and puts only the store package each one
+resolves to on the job's PATH, never a whole profile. Install `direnv` into one of those profiles
+(`nix profile install nixpkgs#direnv`, or home-manager/nix-darwin), then run the command again. The message names the
+PATH that was searched. A different tool your shell has but a job lacks belongs in the workspace devenv.
 
 ## When cowshed itself misbehaves
 

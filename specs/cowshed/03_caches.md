@@ -180,12 +180,14 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   evaluation-cache key, and its exported hook may embed each path. The origin checkout's `.devenv` lives inside the
   workspace image and travels to a new workspace through cowshed's copy-on-write clone. A smoo-managed shell
   (`tooling/direnv/inherited-devenv.ts`) records a real `devenv direnv-export` in that private `.devenv` with a verified
-  disabled merged hook. Its evaluator fetches inputs through the workspace's live routing — the proxy variables (token
-  as userinfo), `NO_PROXY`, the CA files and the `ssl-cert-file` line of `NIX_CONFIG` — and Nix's client fetcher cache.
-  The evaluator disables Nix's shared evaluation cache so it cannot supply executable shell code, and receives no other
-  credential or `NIX_CONFIG` line. An export that embeds a proxy value or its userinfo is never published, so a clone
-  always routes through its own gateway. Before relocating it in a clone, it checks exact source and local path-input
-  contents, devenv's watched input paths, the toolchain, and the emitted task graph. The graph may not contain writing
+  disabled merged hook. Its evaluator receives exactly what a workspace child is handed and evaluation needs: the
+  bootstrap `PATH`, the private `HOME`, `TMPDIR` and XDG roots (Nix's client fetcher cache is the shared
+  `$XDG_CACHE_HOME/nix`), and the workspace's live routing — the proxy variables (token as userinfo), `NO_PROXY`, the CA
+  files and the `ssl-cert-file` line of `NIX_CONFIG`. The evaluator disables Nix's shared evaluation cache so it cannot
+  supply executable shell code, and receives no login identity, locale, terminal, Xcode selection, other credential or
+  `NIX_CONFIG` line. An export that embeds a proxy value or its userinfo is never published, so a clone always routes
+  through its own gateway. Before relocating it in a clone, it checks exact source and local path-input contents,
+  devenv's watched input paths, the toolchain, and the emitted task graph. The graph may not contain writing
   prerequisites for `devenv:enterShell`. The original merged enterShell hook is not executed during verification; direnv
   imports and runs it in the destination checkout. Missing, changed or unsafe evidence falls back to an in-place
   evaluation. No sibling can update another's private artifact: a shared writable cache, however content-addressed,
@@ -267,7 +269,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     - trust anchors as defaults a caller may override: `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`,
       `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE`, `UV_SYSTEM_CERTS=true`, and an `ssl-cert-file` line appended to `NIX_CONFIG`
       (04_sandbox.md);
-    - the caller's `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `COLORTERM` and `DEVELOPER_DIR`, passed through.
+    - the bootstrap `PATH` (04_sandbox.md).
+
+    That list is the whole job contract; everything else a job sees is what the workspace's own `.envrc`/devenv exports
+    and what the request's explicit `env` names. Nothing is read from the environment of the process that runs the
+    supervisor: no locale, terminal, Xcode selection, login `PATH`, `NX_*`, `VIRTUAL_ENV` or `CARGO_HOME` from another
+    shell reaches a job, and a tool a build needs from the host user's home is declared in the workspace devenv instead.
 
     No registry client receives the workspace token from a file: it travels only as proxy userinfo and as
     `COWSHED_WORKSPACE_TOKEN`, and no file under the private `home`, `config` or `cache` carries it. The cargo `[env]`
