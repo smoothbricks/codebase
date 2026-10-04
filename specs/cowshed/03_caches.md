@@ -245,10 +245,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     - git isolation: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and the fetch-route include as
       `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (02_workspaces.md);
     - each detected capability's contribution (15_capabilities.md): for an Nx project `NX_SOCKET_DIR`,
-      `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` (the sandbox's own Nx daemon record, task database and
-      cache under the private `XDG_CACHE_HOME`, with a caller's `NX_DAEMON` withheld so Nx's own default decides,
-      04_sandbox.md) and `NX_WORKSPACE_ROOT_PATH`; for a cargo project `CARGO_HOME` (above, naming the host's own
-      default path only to undo the private `HOME`), `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host
+      `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` (for a read-write job the checkout's own `.nx`, shared with
+      the checkout's host shells; for a read-only job its exec temp dir; a caller's `NX_DAEMON` withheld so Nx's own
+      default decides, 04_sandbox.md) and `NX_WORKSPACE_ROOT_PATH`; for a cargo project `CARGO_HOME` (above, naming the
+      host's own default path only to undo the private `HOME`), `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host
       `RUSTUP_HOME`; for a Go project `GOMODCACHE` and `GOCACHE`; the other shared tool homes of detected package
       managers and toolchains (`BUN_INSTALL_CACHE_DIR`, `NPM_CONFIG_CACHE`, `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`,
       `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path once its link reaches the caches volume; and for a Gradle

@@ -151,13 +151,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The Nx capability's rendezvous directories (`capabilities::nx`): the host shell's and the
-    /// sandbox's private environment's.
+    /// The Nx capability's rendezvous directory (`capabilities::nx`): one per checkout, shared by
+    /// every boundary.
     fn nx_states() -> Vec<PathBuf> {
-        vec![
-            PathBuf::from(".nx/workspace-data/d"),
-            PathBuf::from(".cowshed/cache/nx/workspace-data/d"),
-        ]
+        vec![PathBuf::from(".nx/workspace-data/d")]
     }
 
     fn tree(label: &str) -> PathBuf {
@@ -184,16 +181,6 @@ mod tests {
         fs::write(root.join(".nx/cache/1234/terminalOutput"), b"cached").expect("cached output");
         fs::create_dir_all(root.join("packages/app/src")).expect("source directory");
         fs::write(root.join("packages/app/src/main.ts"), b"export {};").expect("source file");
-        let sandboxed = root.join(".cowshed/cache/nx");
-        fs::create_dir_all(sandboxed.join("workspace-data/d")).expect("sandbox daemon directory");
-        fs::write(
-            sandboxed.join("workspace-data/d/server-process.json"),
-            b"{\"processId\":4343}",
-        )
-        .expect("sandbox server process");
-        fs::create_dir_all(sandboxed.join("cache/5678")).expect("sandbox task cache");
-        fs::write(sandboxed.join("cache/5678/terminalOutput"), b"cached")
-            .expect("sandbox cached output");
     }
 
     /// The daemon directory goes and nothing else does. The neighbours are the assertion that
@@ -206,17 +193,14 @@ mod tests {
 
         discard(&root, &nx_states()).expect("discard inherited daemon state");
 
-        for gone in [".nx/workspace-data/d", ".cowshed/cache/nx/workspace-data/d"] {
-            assert!(
-                !root.join(gone).exists(),
-                "the daemon rendezvous directory {gone} must be gone"
-            );
-        }
+        assert!(
+            !root.join(".nx/workspace-data/d").exists(),
+            "the daemon rendezvous directory must be gone"
+        );
         for kept in [
             ".nx/workspace-data/file-map.json",
             ".nx/workspace-data/project-graph.db",
             ".nx/cache/1234/terminalOutput",
-            ".cowshed/cache/nx/cache/5678/terminalOutput",
             "packages/app/src/main.ts",
         ] {
             assert!(root.join(kept).exists(), "{kept} must survive the mint");

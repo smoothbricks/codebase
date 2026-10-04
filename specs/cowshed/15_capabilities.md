@@ -25,7 +25,7 @@ mean absence; other filesystem errors report the path and failure.
 | Detector | Convention                                                                     | Contribution                                                                                                        |
 | -------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | direnv   | `.envrc`                                                                       | Contained shell activation, private approval state, bootstrap executable                                            |
-| Nx       | `nx.json`                                                                      | Private workspace data/cache and short daemon socket namespace; discard inherited daemon records                    |
+| Nx       | `nx.json`                                                                      | The checkout's `.nx` (read-only jobs: private), short daemon socket namespace; discard inherited daemon records     |
 | cargo    | `Cargo.toml`                                                                   | Shared registry/git caches and cargo's exact cache-state files; Git fetch and trust settings                        |
 | Go       | `go.mod` or `go.work`                                                          | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                            |
 | Bun      | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings                                                               |

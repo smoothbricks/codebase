@@ -1,6 +1,7 @@
 pub mod commitment_feed;
 pub mod job_groups;
 pub mod land_warm;
+mod nx_daemon;
 pub mod project;
 pub mod shell_host;
 mod shell_job;

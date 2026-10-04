@@ -419,9 +419,35 @@ in {
       # every message from the others ("received a message from a different
       # workspace"), which reads as a hung Nx in a workspace that did nothing
       # wrong. Nx's own diagnostic names this exact cause.
+      #
+      # In a cowshed checkout every boundary shares the checkout's one Nx
+      # daemon record (cowshed specs/cowshed/04_sandbox.md), so the
+      # daemon's socket must be one a sandboxed job and a host shell can both
+      # reach: the real `nx` leaf of the checkout's runtime tree. A socket dir
+      # that already resolves inside this checkout is cowshed's binding for a
+      # job and stays; an inherited one that resolves elsewhere is another
+      # workspace's. The host reaches the leaf through a short link in
+      # DEVENV_RUNTIME: a checkout path is too long for the plugin workers'
+      # Unix sockets ("exceeds the maximum socket length"), and Nx refuses a
+      # symlinked leaf, so only the parent is a link.
       nx_workspace_root="$(cd "$DEVENV_ROOT/../.." >/dev/null 2>&1 && pwd || printf '%s' "$PWD")"
       export NX_WORKSPACE_ROOT_PATH="$nx_workspace_root"
-      export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx-$(printf '%s' "$nx_workspace_root" | cksum | cut -d' ' -f1)"
+      nx_checkout="$(cd "$nx_workspace_root" >/dev/null 2>&1 && pwd -P || printf '%s' "$nx_workspace_root")"
+      nx_inherited="$(cd "''${NX_SOCKET_DIR:-/nonexistent}" >/dev/null 2>&1 && pwd -P || true)"
+      nx_key="$(printf '%s' "$nx_workspace_root" | cksum | cut -d' ' -f1)"
+      case "$nx_inherited/" in
+        "$nx_checkout"/*) ;;
+        *)
+          if [ -d "$nx_workspace_root/.cowshed/run" ]; then
+            ln -sfn "$nx_checkout/.cowshed/run" "$DEVENV_RUNTIME/nxrun-$nx_key"
+            NX_SOCKET_DIR="$DEVENV_RUNTIME/nxrun-$nx_key/nx"
+          else
+            NX_SOCKET_DIR="$DEVENV_RUNTIME/nx-$nx_key"
+          fi
+          ;;
+      esac
+      unset nx_checkout nx_inherited nx_key
+      export NX_SOCKET_DIR
       mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         unset CC CXX

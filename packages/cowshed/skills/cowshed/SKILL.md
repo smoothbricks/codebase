@@ -97,11 +97,11 @@ direnv users need nothing extra.
   `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
 - After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
   inherit the dependency graph.
-- Nx inside a workspace sandbox keeps its normal daemon. In an Nx project its workspace-data directory and cache are the
-  sandbox's own (`NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` under the private `XDG_CACHE_HOME`), so a host
-  shell's daemon is never a sandboxed one; clones inherit main's sandboxed hits through the image. A repository shell
-  that sets either variable keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) and leaves `NX_DAEMON` to
-  Nx's default.
+- Nx inside a workspace sandbox keeps its normal daemon and the checkout's own `.nx`: host shells and read-write jobs of
+  one checkout share one task database, cache and daemon, and clones inherit main's through the image. In a workspace
+  the supervisor keeps that daemon running inside the sandbox, and a host shell's Nx connects to it. A read-only job's
+  Nx state is its exec temp dir's. A repository shell that sets `NX_WORKSPACE_DATA_DIRECTORY` or `NX_CACHE_DIRECTORY`
+  keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) and leaves `NX_DAEMON` to Nx's default.
 - The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
   that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
   `cowshed sccache status` first.

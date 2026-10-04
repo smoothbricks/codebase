@@ -718,30 +718,49 @@ admission rejects a symlink at the leaf, so the alias itself is not its socket d
 enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
 
 A sandboxed Nx keeps Nx's own daemon default: a caller's `NX_DAEMON` never reaches the child, so Nx decides from
-`nx.json` and its own CI and container checks, as it does in a host shell. What the sandbox owns is where that daemon is
-found. A client connects only to the socket named by `d/server-process.json` in Nx's workspace-data directory, never to
-one derived from the socket directory, and a client that cannot reach that socket starts a daemon of its own, which
-overwrites the record and so retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js` and
-`daemon/server/server.js`). Left in the checkout, that record is shared with every host shell there: a sandboxed client
-cannot reach a host daemon's socket and replaces it, and host clients then send their environment, credentials included,
-to a daemon inside the sandbox. Every job of an Nx project (`nx.json`, 15_capabilities.md) therefore gets
-`NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY`, naming `nx/workspace-data` and `nx/cache` under its private
-`XDG_CACHE_HOME`, and a caller's values never pass. They are scoped per workspace and mode like the runtime link: in the
-image for a read-write job, in the exec temp dir for a read-only one, so a read-only client never reaches a daemon that
-can write the workspace. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the workspace, or the
-capability's override directory.
+`nx.json` and its own CI and container checks, as it does in a host shell. A client connects only to the socket named by
+`d/server-process.json` in Nx's workspace-data directory, never to one derived from the socket directory, and a client
+that cannot reach that socket starts a daemon of its own, which overwrites the record and so retires the daemon it
+replaced (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
 
-The two directories move together. Once either is configured, Nx keeps its task database in the workspace-data
-directory; the database's rows index one cache directory, and a database beside another boundary's cache takes hits on
-artifacts it never wrote while either side's eviction deletes what the other's rows name. A sandboxed Nx therefore
-shares its cache and database with the workspace's other sandboxed jobs of the same mode and, through the image, with
-the workspace's clones — not with a host shell. Nx's own default draws the same line: with nothing configured it keeps
-cache and database under `$HOME/.nx`, and the sandbox's `HOME` is private. The daemon itself runs detached, in its own
-process group inside the job's sandbox, and outlives the job that started it; later jobs of the same workspace and mode
-find it through the record. A clone drops the inherited record (02_workspaces.md). A repository shell that exports
-either directory unconditionally replaces the sandbox's, like any export, and puts the sandboxed daemon's record back
-where host clients look; a repository shell that sets them keeps a value already present
-(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+One Nx state per checkout. Every read-write job of an Nx project (`nx.json`, 15_capabilities.md) gets
+`NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` naming the checkout's own `<project>/.nx/workspace-data` and
+`<project>/.nx/cache` — the directories a host shell's Nx uses — and a caller's values never pass. The two move
+together: once either is configured, Nx keeps its task database in the workspace-data directory, and the database's rows
+index exactly one cache directory, so a run restores only artifacts its own database has rows for. A sandbox with
+directories of its own would own a second cache beside the checkout's: a build that fills one leaves a check reading the
+other cold, and every clone inherits both half-warm. So host shells, sandboxed jobs and land checks of one checkout
+share one record, one daemon, one task database and one cache, and a clone inherits that state warm through the image. A
+read-only job may not write the checkout, and Nx writes its database on every run, so its Nx state lives in its exec
+temp dir: its results reach no other boundary, and a read-only client never reaches a daemon that can write the
+workspace. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the workspace, or the capability's
+override directory.
+
+Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
+the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree; a host shell of a cowshed checkout reaches the same
+leaf through a short link (the managed devenv's `NX_SOCKET_DIR`), because the checkout path is too long for Nx's
+plugin-worker sockets and Nx refuses a symlinked leaf. Main's sandboxed jobs therefore connect to main's host daemon
+instead of starting their own and overwriting its record.
+
+A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
+only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting
+one. A workspace's supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it
+probes the record: present, its process alive, its socket accepting. When the probe fails it runs
+`<project>/node_modules/.bin/nx daemon --start` as an ordinary read-write background job, at most one at a time, and
+reports a start that failed on its own stderr; the next probe tries again. The daemon runs detached, in its own process
+group inside that job's sandbox, and a host client in the workspace finds it live through the shared record and connects
+to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout,
+and its daemon is the host's. A clone drops the inherited record (02_workspaces.md). A repository shell that exports
+either directory unconditionally replaces the checkout's, like any export, and splits the state again; a repository
+shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+
+A known, accepted property: a host client that connects to a workspace's daemon sends it the client's environment, as
+every Nx client does with its first message (`getDaemonEnv`, pinned Nx 23.2.1 `daemon/client/daemon-environment.js`).
+The daemon applies that environment to its own process environment, which the workspace's project-graph plugins run
+under, so a host shell's variables reach code inside the workspace's sandbox. This is accepted for now for three
+reasons. A workspace is a clone of main for changing main in parallel. Main's environment holds no long-lived secrets,
+and the credentials it carries today are temporary. Host-side Nx in coder workspaces runs from the pure environment, not
+a login shell's. Revisit this property once real secrets can reach a host shell that runs Nx in a workspace.
 
 Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
 dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write

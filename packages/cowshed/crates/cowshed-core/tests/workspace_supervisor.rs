@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -3085,4 +3085,117 @@ async fn a_served_supervisor_takes_a_warm_step_across_its_socket() {
     complete(&queued, b"", b"", ExitStatus::Exited { code: 0 }).await;
     remote.wait(queued.request.job_id).await.unwrap();
     remote.retire().await.unwrap();
+}
+
+/// Workspace `name`'s supervisor config, in an Nx project no daemon serves.
+fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
+    let (mut supervisor_config, root) = isolated_config(&format!("nx-daemon-{name}"));
+    supervisor_config.authority.workspace = WorkspaceName::new(name).unwrap();
+    supervisor_config.default_cwd = None;
+    std::fs::write(supervisor_config.workspace_root.join("nx.json"), "{}").unwrap();
+    supervisor_config
+        .sandbox
+        .configure_capabilities()
+        .expect("detect capabilities");
+    (supervisor_config, root)
+}
+
+/// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`.
+fn nx_daemon_start(project: &Path) -> Vec<OsString> {
+    vec![
+        project.join("node_modules/.bin/nx").into_os_string(),
+        OsString::from("daemon"),
+        OsString::from("--start"),
+    ]
+}
+
+/// Many of a keeper's probes, on a paused clock that skips the wait.
+const NX_PROBES: Duration = Duration::from_secs(60);
+
+/// A shed's code is unsigned and Nx's daemon runs it, so the daemon a host client connects to is
+/// one the shed's supervisor keeps alive inside the sandbox: a read-write background job of the
+/// project's own `nx`, started with the supervisor, never a second while one runs, and again
+/// once the daemon it started is gone.
+#[tokio::test(start_paused = true)]
+async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
+    let (supervisor_config, root) = nx_project("raven");
+    let project = supervisor_config.workspace_root.clone();
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+
+    let first = h.spawned.recv().await.unwrap();
+    let SpawnCommand::Argv(argv) = &first.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(argv, &nx_daemon_start(&project));
+    assert_eq!(first.request.mode, RunSandboxMode::ReadWrite);
+    assert!(
+        first.request.cwd.as_os_str().is_empty(),
+        "run from the project root"
+    );
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "no second start while the first runs"
+    );
+
+    // The start leaves a live daemon: its record names a running process whose socket accepts.
+    // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
+    let sockets = PathBuf::from("/tmp").join(format!(
+        "cs-nxk-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    std::fs::create_dir_all(&sockets).unwrap();
+    let socket = sockets.join("d.sock");
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let record = project.join(".nx/workspace-data/d/server-process.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    let live = serde_json::json!({
+        "processId": std::process::id(),
+        "socketPath": socket,
+        "nxVersion": "23.2.1",
+    })
+    .to_string();
+    std::fs::write(&record, &live).unwrap();
+    complete(&first, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(first.request.job_id).await.unwrap();
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "a live daemon is not started again"
+    );
+
+    // The daemon exits and takes its record with it: the next probe starts another.
+    std::fs::remove_file(&record).unwrap();
+    let second = tokio::time::timeout(NX_PROBES, h.spawned.recv())
+        .await
+        .expect("the dead daemon is started again")
+        .unwrap();
+    let SpawnCommand::Argv(argv) = &second.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(argv, &nx_daemon_start(&project));
+    assert_eq!(second.request.mode, RunSandboxMode::ReadWrite);
+    assert_ne!(second.request.job_id, first.request.job_id);
+
+    std::fs::write(&record, &live).unwrap();
+    complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(second.request.job_id).await.unwrap();
+    std::fs::remove_dir_all(sockets).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Main is the operator's own checkout and its Nx daemon the host's: its supervisor starts none.
+#[tokio::test(start_paused = true)]
+async fn main_leaves_its_nx_daemon_to_the_host() {
+    let (supervisor_config, root) = nx_project("main");
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "main's supervisor started a job of its own"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }

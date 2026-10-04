@@ -27,7 +27,7 @@ use crate::exec::{
 };
 use crate::fork_lock::Spawn as _;
 use crate::fsio::AnchoredDirectory;
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
@@ -38,6 +38,7 @@ use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
 use crate::runtime::land_warm::{WarmLane, WarmRun, WarmTurn};
+use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
     SealedCheckpointManifest, StreamKind,
@@ -2212,6 +2213,8 @@ impl WorkspaceSupervisor {
             authority: config.authority.clone(),
             commands,
         };
+        let nx_daemon =
+            NxDaemonKeeper::for_role(WorkspaceRole::for_name(&config.authority.workspace));
         let actor = SupervisorActor {
             authority: config.authority,
             workspace_root: config.workspace_root,
@@ -2237,6 +2240,7 @@ impl WorkspaceSupervisor {
             retire_waiters: Vec::new(),
             command_lane_closed: false,
             warm: WarmLane::default(),
+            nx_daemon,
         };
         tokio::spawn(actor.run());
         Ok(handle)
@@ -2514,6 +2518,8 @@ struct SupervisorActor {
     command_lane_closed: bool,
     /// Main's warm step: the one warm job running and the one run waiting behind it.
     warm: WarmLane,
+    /// A shed's keeper of its sandboxed Nx daemon ([`super::nx_daemon`]); main keeps none.
+    nx_daemon: Option<NxDaemonKeeper>,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -2579,6 +2585,13 @@ impl SupervisorActor {
                         Some(event) => self.handle_event(event),
                         None => break,
                     }
+                }
+                () = super::nx_daemon::next_probe(&mut self.nx_daemon),
+                    if self.nx_daemon.is_some()
+                        && self.lifecycle == ActorLifecycle::Running
+                        && !self.command_lane_closed =>
+                {
+                    self.keep_nx_daemon().await;
                 }
             }
             self.finish_ready_jobs().await;
@@ -3262,6 +3275,57 @@ impl SupervisorActor {
                 "cowshed: main's warm run for {} did not start: {}",
                 run.range, error.message
             );
+        }
+    }
+
+    /// One probe of a shed's Nx daemon: nothing while the keeper's start job runs; once it has
+    /// ended, say how it went unless it left the daemon live; start the daemon, inside the
+    /// sandbox, when the probe finds none live. Nobody waits for the start, so a start that is
+    /// refused is said where the supervisor's own failures go, and the next probe tries again.
+    async fn keep_nx_daemon(&mut self) {
+        let Some(keeper) = &mut self.nx_daemon else {
+            return;
+        };
+        if let Some(job_id) = keeper.starting
+            && self.jobs.get(&job_id).is_some_and(|job| !job.terminal())
+        {
+            return;
+        }
+        let ended = keeper.starting.take();
+        let (read_write, _) = self
+            .policy
+            .child(crate::api::dto::RunSandboxMode::ReadWrite);
+        let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let record = crate::capabilities::nx::daemon_record(&project_root);
+        let daemon = super::nx_daemon::probe(&record);
+        if let Some(job_id) = ended {
+            let job = self.jobs.get(&job_id).map(|job| &job.info);
+            super::nx_daemon::report_start(job_id, job, &project_root, daemon);
+        }
+        if daemon == Probe::Live {
+            return;
+        }
+        let authority = self.authority.clone();
+        let started = match super::nx_daemon::start_request(&self.workspace_root, &project_root) {
+            Ok(request) => self.admit_exec(authority, None, request, true, None).await,
+            Err(error) => Err(error),
+        };
+        match started {
+            Ok(job_id) => {
+                if let Some(keeper) = &mut self.nx_daemon {
+                    keeper.starting = Some(job_id);
+                }
+            }
+            Err(error) => eprintln!(
+                "cowshed: the Nx daemon of {} did not start in the sandbox: {}; the next probe in \
+                 {}s tries again",
+                project_root.display(),
+                error.message,
+                PROBE_INTERVAL.as_secs()
+            ),
         }
     }
 
@@ -4968,11 +5032,12 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The read-only child's contribution is its own mode's: private tool state lives in the
-    /// exec temp dir, never in the image a read-write job's daemon writes.
+    /// One Nx state per checkout (04_sandbox.md): a read-write child's Nx state is the
+    /// checkout's own `.nx`, so its runs and every other boundary's fill one cache. Only a
+    /// read-only child, which may not write the checkout, keeps Nx state in its exec temp dir.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_read_only_child_keeps_its_tool_state_in_the_exec_temp_dir() {
+    fn a_read_write_child_shares_the_checkouts_nx_state_and_a_read_only_one_cannot() {
         let root = scratch("policy-read-only");
         let mount = root.join("workspace");
         std::fs::create_dir_all(&mount).expect("mount");
@@ -4982,27 +5047,29 @@ mod workspace_toolchain_tests {
             .configure_capabilities()
             .expect("detect capabilities");
         let policy = SandboxPolicy::render(ceiling).expect("render");
-        let state = |mode| {
+        let state = |mode, name| {
             let (sandbox, _) = policy.child(mode);
-            sandbox
-                .capabilities
-                .contribution
-                .env
-                .get("NX_WORKSPACE_DATA_DIRECTORY")
-                .cloned()
+            sandbox.capabilities.contribution.env.get(name).cloned()
         };
+        let own = |path: std::path::PathBuf| Some(crate::capabilities::EnvAction::Own(path.into()));
+        let read_write = crate::api::dto::RunSandboxMode::ReadWrite;
         assert_eq!(
-            state(crate::api::dto::RunSandboxMode::ReadWrite),
-            Some(crate::capabilities::EnvAction::Own(
-                mount.join(".cowshed/cache/nx/workspace-data").into()
-            ))
+            state(read_write, "NX_WORKSPACE_DATA_DIRECTORY"),
+            own(mount.join(".nx/workspace-data"))
+        );
+        assert_eq!(
+            state(read_write, "NX_CACHE_DIRECTORY"),
+            own(mount.join(".nx/cache"))
         );
         let exec_temp = policy.ceiling().exec_temp_dir.clone();
+        let read_only = crate::api::dto::RunSandboxMode::ReadOnly;
         assert_eq!(
-            state(crate::api::dto::RunSandboxMode::ReadOnly),
-            Some(crate::capabilities::EnvAction::Own(
-                exec_temp.join("cache/nx/workspace-data").into()
-            ))
+            state(read_only, "NX_WORKSPACE_DATA_DIRECTORY"),
+            own(exec_temp.join("cache/nx/workspace-data"))
+        );
+        assert_eq!(
+            state(read_only, "NX_CACHE_DIRECTORY"),
+            own(exec_temp.join("cache/nx/cache"))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5376,7 +5443,7 @@ mod sandbox_environment_tests {
                 },
             ],
             daemon_isolation: crate::capabilities::DaemonIsolation {
-                directories: vec![environment.join("cache/nx/workspace-data")],
+                directories: vec![environment.join("run/nx")],
                 discard_at_mint: Vec::new(),
             },
             ..Default::default()
@@ -5388,7 +5455,7 @@ mod sandbox_environment_tests {
             std::fs::read_link(environment.join("state/nix")).ok(),
             Some(caches.join("nix/state"))
         );
-        assert!(environment.join("cache/nx/workspace-data").is_dir());
+        assert!(environment.join("run/nx").is_dir());
 
         // A link or daemon directory outside the private environment is refused, never made.
         let escaping = crate::capabilities::CapabilityContribution {
