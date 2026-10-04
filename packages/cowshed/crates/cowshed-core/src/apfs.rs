@@ -3035,7 +3035,10 @@ fn project_registered_apfs(
 /// `AppleDiskImageDevice`, whose `DiskImageURL` names the backing store; for APFS the same
 /// snapshot yields every container's `AppleAPFSMedia` and every `AppleAPFSVolume`, grouped by
 /// the media its `AppleAPFSContainer` provider hangs from. A live node's provider links do not
-/// change; a node already detached from the plane is departing and is not reported.
+/// change; a node already detached from the plane is departing and is not reported, and neither
+/// is one the kernel finalizes while the walk holds it: finalizing destroys the entry's port, so
+/// every reference to it becomes a dead name that answers `MACH_SEND_INVALID_DEST` to any call
+/// and nothing at all to a property read. Any other read failure fails the whole inventory.
 #[cfg(target_os = "macos")]
 mod io_registry {
     use super::{
@@ -3057,6 +3060,10 @@ mod io_registry {
     const KERN_SUCCESS: KernReturn = 0;
     /// `kIOReturnNoDevice`: the entry has no provider in the plane.
     const IO_RETURN_NO_DEVICE: KernReturn = 0xE000_02C0_u32 as KernReturn;
+    /// `MACH_SEND_INVALID_DEST`: the call was sent to a dead name. The kernel destroys a registry
+    /// entry's port when it finalizes the terminated entry, so a reference this task still holds
+    /// to it answers this to every call from then on.
+    const MACH_SEND_INVALID_DEST: KernReturn = 0x1000_0003;
     /// `kIOMainPortDefault`.
     const MAIN_PORT_DEFAULT: libc::mach_port_t = 0;
     const SERVICE_PLANE: &CStr = c"IOService";
@@ -3198,6 +3205,41 @@ mod io_registry {
         Ok(MediaSnapshot(Object(iterator)))
     }
 
+    /// Why a read of one held registry entry has no answer.
+    enum Unread {
+        /// The kernel finalized the entry while the walk held it. It left the registry between
+        /// the snapshot and this read: it is departing, exactly like a node already detached from
+        /// the plane, and says nothing about the rest of the inventory.
+        Gone,
+        /// The registry refused, or garbled, a read of an entry that is still registered.
+        Failed(io::Error),
+    }
+
+    impl From<io::Error> for Unread {
+        fn from(error: io::Error) -> Self {
+            Self::Failed(error)
+        }
+    }
+
+    type Read<T> = Result<T, Unread>;
+
+    /// Settle one snapshot node's reading: a node that left the registry mid-read is skipped as
+    /// departing; any other failure fails the whole inventory.
+    fn settle(read: Read<()>) -> io::Result<()> {
+        match read {
+            Ok(()) | Err(Unread::Gone) => Ok(()),
+            Err(Unread::Failed(error)) => Err(error),
+        }
+    }
+
+    fn checked(operation: &str, status: KernReturn) -> Read<()> {
+        match status {
+            KERN_SUCCESS => Ok(()),
+            MACH_SEND_INVALID_DEST => Err(Unread::Gone),
+            status => Err(Unread::Failed(kernel_error(operation, status))),
+        }
+    }
+
     pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
         let keys = Keys {
             bsd_name: key("BSD Name")?,
@@ -3207,36 +3249,7 @@ mod io_registry {
         };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
         for media in registered_media()? {
-            let Some(name) = string_property(&media, &keys.bsd_name, "BSD Name")? else {
-                continue;
-            };
-            let Some(owner) = image_driver_of(&media)? else {
-                continue;
-            };
-            let image = match images.entry(owner.id) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let url = string_property(&owner.driver, &keys.url, "DiskImageURL")?
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "the disk image exposing {name} registers no DiskImageURL"
-                            ))
-                        })?;
-                    entry.insert(AttachedDiskImage {
-                        source: DiskImageSource::from_url(&url),
-                        capacity: None,
-                        media: Vec::new(),
-                    })
-                }
-            };
-            if owner.is_whole {
-                image.capacity = size_property(&media, &keys.size)?.map(ImageCapacity::from_bytes);
-            }
-            let content = string_property(&media, &keys.content, "Content")?.unwrap_or_default();
-            image.media.push(ImageMedia {
-                device: format!("/dev/{name}"),
-                content,
-            });
+            settle(record_image_media(&mut images, &media, &keys))?;
         }
         Ok(images
             .into_values()
@@ -3249,12 +3262,58 @@ mod io_registry {
             .collect())
     }
 
+    /// Record one IOMedia node under the disk image it hangs from, if any. Every read lands
+    /// before anything is recorded, so a node that leaves the registry mid-read leaves no trace.
+    fn record_image_media(
+        images: &mut BTreeMap<u64, AttachedDiskImage>,
+        media: &Object,
+        keys: &Keys,
+    ) -> Read<()> {
+        let Some(name) = string_property(media, &keys.bsd_name, "BSD Name")? else {
+            return Ok(());
+        };
+        let Some(owner) = image_driver_of(media)? else {
+            return Ok(());
+        };
+        let capacity = if owner.is_whole {
+            Some(size_property(media, &keys.size)?.map(ImageCapacity::from_bytes))
+        } else {
+            None
+        };
+        let content = string_property(media, &keys.content, "Content")?.unwrap_or_default();
+        let image = match images.entry(owner.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let Some(url) = string_property(&owner.driver, &keys.url, "DiskImageURL")? else {
+                    return Err(invalid(format!(
+                        "the disk image exposing {name} registers no DiskImageURL"
+                    ))
+                    .into());
+                };
+                entry.insert(AttachedDiskImage {
+                    source: DiskImageSource::from_url(&url),
+                    capacity: None,
+                    media: Vec::new(),
+                })
+            }
+        };
+        if let Some(capacity) = capacity {
+            image.capacity = capacity;
+        }
+        image.media.push(ImageMedia {
+            device: format!("/dev/{name}"),
+            content,
+        });
+        Ok(())
+    }
+
     /// Every APFS container and volume registered at one instant, from the same IOMedia snapshot
     /// [`attached_disk_images`] reads: `AppleAPFSMedia` is a container's synthesized whole disk,
     /// and each `AppleAPFSVolume` hangs from an `AppleAPFSContainer` that hangs from one. A
     /// container whose volumes are all gone, or not yet started, is still reported. A volume
-    /// whose provider chain has already left the plane is departing and is not; any other read
-    /// failure fails the whole inventory, which [`super::project_registered_apfs`] validates.
+    /// whose provider chain has already left the plane, or whose entries the kernel finalizes
+    /// mid-read, is departing and is not; any other read failure fails the whole inventory,
+    /// which [`super::project_registered_apfs`] validates.
     pub(crate) fn registered_apfs_containers() -> io::Result<Vec<RegisteredApfsContainer>> {
         let keys = ApfsKeys {
             bsd_name: key("BSD Name")?,
@@ -3265,23 +3324,36 @@ mod io_registry {
         let mut media: BTreeMap<u64, ApfsMediaFacts> = BTreeMap::new();
         let mut volumes = Vec::new();
         for entry in registered_media()? {
-            if conforms(&entry, c"AppleAPFSMedia") {
-                record_apfs_media(&mut media, &entry, &keys)?;
-            } else if conforms(&entry, c"AppleAPFSVolume") {
-                let identifier = string_property(&entry, &keys.bsd_name, "BSD Name")?;
-                let Some(container_media) = apfs_volume_media(&entry, identifier.as_deref())?
-                else {
-                    continue;
-                };
-                volumes.push(ApfsVolumeFacts {
-                    media: record_apfs_media(&mut media, &container_media, &keys)?,
-                    identifier,
-                    name: string_property(&entry, &keys.full_name, "FullName")?,
-                    uuid: string_property(&entry, &keys.uuid, "UUID")?,
-                });
-            }
+            settle(record_apfs_entry(&mut media, &mut volumes, &entry, &keys))?;
         }
         project_registered_apfs(&media, volumes)
+    }
+
+    /// Record one IOMedia node if it is an APFS container's media or an APFS volume. A volume's
+    /// own reads all land before its container media is recorded.
+    fn record_apfs_entry(
+        media: &mut BTreeMap<u64, ApfsMediaFacts>,
+        volumes: &mut Vec<ApfsVolumeFacts>,
+        entry: &Object,
+        keys: &ApfsKeys,
+    ) -> Read<()> {
+        if conforms(entry, c"AppleAPFSMedia") {
+            record_apfs_media(media, entry, keys)?;
+        } else if conforms(entry, c"AppleAPFSVolume") {
+            let identifier = string_property(entry, &keys.bsd_name, "BSD Name")?;
+            let Some(container_media) = apfs_volume_media(entry, identifier.as_deref())? else {
+                return Ok(());
+            };
+            let name = string_property(entry, &keys.full_name, "FullName")?;
+            let uuid = string_property(entry, &keys.uuid, "UUID")?;
+            volumes.push(ApfsVolumeFacts {
+                media: record_apfs_media(media, &container_media, keys)?,
+                identifier,
+                name,
+                uuid,
+            });
+        }
+        Ok(())
     }
 
     /// Read one `AppleAPFSMedia` once, however many of its volumes reach it, and answer its
@@ -3290,12 +3362,14 @@ mod io_registry {
         media: &mut BTreeMap<u64, ApfsMediaFacts>,
         entry: &Object,
         keys: &ApfsKeys,
-    ) -> io::Result<u64> {
+    ) -> Read<u64> {
         let id = entry_id(entry, "read an APFS container media's registry id")?;
         if let Entry::Vacant(slot) = media.entry(id) {
+            let reference = string_property(entry, &keys.bsd_name, "BSD Name")?;
+            let capacity_bytes = size_property(entry, &keys.size)?;
             slot.insert(ApfsMediaFacts {
-                reference: string_property(entry, &keys.bsd_name, "BSD Name")?,
-                capacity_bytes: size_property(entry, &keys.size)?,
+                reference,
+                capacity_bytes,
             });
         }
         Ok(id)
@@ -3303,28 +3377,34 @@ mod io_registry {
 
     /// The `AppleAPFSMedia` a volume's `AppleAPFSContainer` provider hangs from, or `None` once
     /// either link has left the plane. Any other provider is not APFS and is refused.
-    fn apfs_volume_media(volume: &Object, identifier: Option<&str>) -> io::Result<Option<Object>> {
+    fn apfs_volume_media(volume: &Object, identifier: Option<&str>) -> Read<Option<Object>> {
         let named = identifier.unwrap_or("<unpublished>");
         let Some(container) = provider(volume)? else {
             return Ok(None);
         };
         if !conforms(&container, c"AppleAPFSContainer") {
+            alive(&container)?;
             return Err(invalid(format!(
                 "APFS volume {named} hangs from a provider that is not an AppleAPFSContainer"
-            )));
+            ))
+            .into());
         }
         let Some(media) = provider(&container)? else {
             return Ok(None);
         };
         if !conforms(&media, c"AppleAPFSMedia") {
+            alive(&media)?;
             return Err(invalid(format!(
                 "the AppleAPFSContainer of APFS volume {named} hangs from a provider that is not an AppleAPFSMedia"
-            )));
+            ))
+            .into());
         }
         Ok(Some(media))
     }
 
-    fn image_driver_of(media: &Object) -> io::Result<Option<ImageDriver>> {
+    /// The image driver above `media`, if any. A finalized node answers `false` to
+    /// [`conforms`], and the walk then asks it for its provider, which reports it gone.
+    fn image_driver_of(media: &Object) -> Read<Option<ImageDriver>> {
         let mut intervening_media = 0usize;
         let mut current = provider(media)?;
         while let Some(entry) = current {
@@ -3344,31 +3424,37 @@ mod io_registry {
         Ok(None)
     }
 
-    fn provider(entry: &Object) -> io::Result<Option<Object>> {
+    /// The entry's provider in the service plane, or `None` once it is detached from the plane.
+    fn provider(entry: &Object) -> Read<Option<Object>> {
         let mut parent: IoObject = 0;
-        // SAFETY: `entry` is live, the plane name is NUL-terminated, and `parent` is writable.
+        // SAFETY: `entry` is a registry reference, the plane name is NUL-terminated, and
+        // `parent` is writable.
         match unsafe { IORegistryEntryGetParentEntry(entry.0, SERVICE_PLANE.as_ptr(), &mut parent) }
         {
-            KERN_SUCCESS => Ok(Some(Object(parent))),
             IO_RETURN_NO_DEVICE => Ok(None),
-            status => Err(kernel_error("read a registry provider", status)),
+            // Only a successful call hands back a reference to wrap.
+            status => checked("read a registry provider", status).map(|()| Some(Object(parent))),
         }
     }
 
+    /// Whether the entry is an instance of `class`. IOKit folds every failure into `false`, a
+    /// finalized entry's included; where `false` would be an error, ask [`alive`] first.
     fn conforms(entry: &Object, class: &CStr) -> bool {
-        // SAFETY: `entry` is live and `class` is NUL-terminated.
+        // SAFETY: `entry` is a registry reference and `class` is NUL-terminated.
         unsafe { IOObjectConformsTo(entry.0, class.as_ptr()) != 0 }
     }
 
-    fn entry_id(entry: &Object, operation: &str) -> io::Result<u64> {
+    /// Tell an entry that answered nothing because it left the registry from one still there.
+    fn alive(entry: &Object) -> Read<()> {
+        entry_id(entry, "confirm a registry entry is still registered")?;
+        Ok(())
+    }
+
+    fn entry_id(entry: &Object, operation: &str) -> Read<u64> {
         let mut id = 0u64;
-        // SAFETY: `entry` is a live registry reference and `id` is writable.
+        // SAFETY: `entry` is a registry reference and `id` is writable.
         let status = unsafe { IORegistryEntryGetRegistryEntryID(entry.0, &mut id) };
-        if status == KERN_SUCCESS {
-            Ok(id)
-        } else {
-            Err(kernel_error(operation, status))
-        }
+        checked(operation, status).map(|()| id)
     }
 
     fn key(name: &str) -> io::Result<Cf> {
@@ -3393,24 +3479,29 @@ mod io_registry {
         }
     }
 
-    fn property(entry: &Object, key: &Cf) -> Option<Cf> {
-        // SAFETY: `entry` is live and `key` is a CFString; the answer is +1 or null.
+    /// The entry's `key` property, or `None` when a still-registered entry does not have it.
+    /// IOKit answers null both for an absent property and for any failure, a finalized entry's
+    /// included, so a null answer is resolved through [`alive`].
+    fn property(entry: &Object, key: &Cf) -> Read<Option<Cf>> {
+        // SAFETY: `entry` is a registry reference and `key` is a CFString; the answer is +1 or
+        // null.
         let value = unsafe { IORegistryEntryCreateCFProperty(entry.0, key.0, ptr::null(), 0) };
         // A null answer must never be wrapped: the wrapper releases what it holds.
         if value.is_null() {
-            None
+            alive(entry)?;
+            Ok(None)
         } else {
-            Some(Cf(value))
+            Ok(Some(Cf(value)))
         }
     }
 
-    fn string_property(entry: &Object, key: &Cf, name: &str) -> io::Result<Option<String>> {
-        let Some(value) = property(entry, key) else {
+    fn string_property(entry: &Object, key: &Cf, name: &str) -> Read<Option<String>> {
+        let Some(value) = property(entry, key)? else {
             return Ok(None);
         };
         // SAFETY: `value` is a live CF object.
         if unsafe { CFGetTypeID(value.0) != CFStringGetTypeID() } {
-            return Err(invalid(format!("registry property {name} is not a string")));
+            return Err(invalid(format!("registry property {name} is not a string")).into());
         }
         let range = CfRange {
             location: 0,
@@ -3451,32 +3542,31 @@ mod io_registry {
         if measured != range.length || converted != range.length || used != needed {
             return Err(invalid(format!(
                 "registry property {name} did not convert to UTF-8 whole"
-            )));
+            ))
+            .into());
         }
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))
+        let text = String::from_utf8(bytes)
+            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))?;
+        Ok(Some(text))
     }
 
-    fn size_property(entry: &Object, key: &Cf) -> io::Result<Option<u64>> {
-        let Some(value) = property(entry, key) else {
+    fn size_property(entry: &Object, key: &Cf) -> Read<Option<u64>> {
+        let Some(value) = property(entry, key)? else {
             return Ok(None);
         };
         // SAFETY: `value` is a live CF object.
         if unsafe { CFGetTypeID(value.0) != CFNumberGetTypeID() } {
-            return Err(invalid("registry property Size is not a number"));
+            return Err(invalid("registry property Size is not a number").into());
         }
         let mut size = 0i64;
         // SAFETY: `value` is a live CFNumber and `size` is writable storage for an SInt64.
         if unsafe { CFNumberGetValue(value.0, CF_NUMBER_SINT64_TYPE, (&raw mut size).cast()) } == 0
         {
-            return Err(invalid(
-                "registry property Size is not an exact 64-bit integer",
-            ));
+            return Err(invalid("registry property Size is not an exact 64-bit integer").into());
         }
-        u64::try_from(size)
-            .map(Some)
-            .map_err(|_| invalid("registry property Size is negative"))
+        let size =
+            u64::try_from(size).map_err(|_| invalid("registry property Size is negative"))?;
+        Ok(Some(size))
     }
 
     fn invalid(message: impl Into<String>) -> io::Error {
@@ -3485,6 +3575,92 @@ mod io_registry {
 
     fn kernel_error(operation: &str, status: KernReturn) -> io::Error {
         io::Error::other(format!("{operation}: IOKit returned {status:#010x}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `MACH_PORT_RIGHT_DEAD_NAME`.
+        const DEAD_NAME: libc::c_uint = 4;
+
+        unsafe extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+            fn mach_port_allocate(
+                task: libc::mach_port_t,
+                right: libc::c_uint,
+                name: *mut libc::mach_port_t,
+            ) -> KernReturn;
+        }
+
+        /// A reference to a registry entry the kernel finalized while this task held it.
+        /// Finalizing destroys the entry's port, which turns every send right a task holds to it
+        /// into a dead name; allocating a dead name directly yields that same right without
+        /// racing a real detach, so the vanish lands at a known point instead of by timing.
+        fn finalized_entry() -> Object {
+            let mut name: libc::mach_port_t = 0;
+            // SAFETY: `mach_task_self_` is this task's own port, set before `main`, and `name`
+            // is writable.
+            let status = unsafe { mach_port_allocate(mach_task_self_, DEAD_NAME, &mut name) };
+            assert_eq!(status, KERN_SUCCESS, "allocate a dead name");
+            Object(name)
+        }
+
+        /// The captured failure: an image detaching elsewhere finalized a provider the walk
+        /// was climbing, and `read a registry provider: IOKit returned 0x10000003` failed the
+        /// whole inventory.
+        #[test]
+        fn a_provider_chain_finalized_mid_walk_is_departing_not_an_inventory_failure() {
+            let entry = finalized_entry();
+            assert!(matches!(provider(&entry), Err(Unread::Gone)));
+            assert!(matches!(image_driver_of(&entry), Err(Unread::Gone)));
+            assert!(matches!(apfs_volume_media(&entry, None), Err(Unread::Gone)));
+            assert!(matches!(entry_id(&entry, "read"), Err(Unread::Gone)));
+        }
+
+        /// A finalized entry answers null to every property read; that null must not pass for
+        /// an absent property, which would report a departing image as one with no
+        /// `DiskImageURL`, or a departing container as arriving.
+        #[test]
+        fn a_finalized_entry_has_no_properties_rather_than_absent_ones() {
+            let entry = finalized_entry();
+            let keys = Keys {
+                bsd_name: key("BSD Name").expect("key"),
+                content: key("Content").expect("key"),
+                size: key("Size").expect("key"),
+                url: key("DiskImageURL").expect("key"),
+            };
+            assert!(matches!(
+                string_property(&entry, &keys.url, "DiskImageURL"),
+                Err(Unread::Gone)
+            ));
+            assert!(matches!(
+                size_property(&entry, &keys.size),
+                Err(Unread::Gone)
+            ));
+            let mut images = BTreeMap::new();
+            assert!(matches!(
+                record_image_media(&mut images, &entry, &keys),
+                Err(Unread::Gone)
+            ));
+            assert!(images.is_empty());
+            assert!(settle(record_image_media(&mut images, &entry, &keys)).is_ok());
+        }
+
+        /// The other half of the boundary: a property a still-registered entry does not have is
+        /// absent, not a departure.
+        #[test]
+        fn a_live_entry_keeps_its_absent_properties() {
+            let media = registered_media()
+                .expect("match registered IOMedia")
+                .next()
+                .expect("a host registers at least one IOMedia");
+            let absent = key("cowshed-absent-property").expect("key");
+            assert!(matches!(
+                string_property(&media, &absent, "cowshed-absent-property"),
+                Ok(None)
+            ));
+        }
     }
 }
 
