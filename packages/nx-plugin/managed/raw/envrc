@@ -38,7 +38,12 @@ watch_file tooling/direnv/inherited-devenv.ts
 smoo_inherited_devenv() {
   bun "$project_root/tooling/direnv/inherited-devenv.ts" "$project_root" "$@"
 }
-DEVENV_BIN=smoo_inherited_devenv
+# bun comes from this workspace's own evaluated devenv profile. A checkout
+# entered for the first time has none yet, and neither cowshed nor the host
+# lends one, so devenv then evaluates in place.
+if has bun; then
+  DEVENV_BIN=smoo_inherited_devenv
+fi
 cd tooling/direnv
 . envrc.sh
 unset -f smoo_inherited_devenv
