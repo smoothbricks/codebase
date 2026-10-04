@@ -257,10 +257,12 @@ mod tests {
                 SharedCache {
                     path: cargo_home.join("registry"),
                     private_link: None,
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
                 SharedCache {
                     path: cargo_home.join("git"),
                     private_link: None,
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
             ]
         );

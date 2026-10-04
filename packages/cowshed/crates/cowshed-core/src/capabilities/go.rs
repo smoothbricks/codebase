@@ -102,10 +102,12 @@ mod tests {
                 SharedCache {
                     path: module,
                     private_link: None,
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
                 SharedCache {
                     path: build,
                     private_link: None,
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
             ]
         );

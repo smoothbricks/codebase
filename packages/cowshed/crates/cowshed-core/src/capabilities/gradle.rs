@@ -77,6 +77,7 @@ mod tests {
             vec![SharedCache {
                 path: gradle.join("caches"),
                 private_link: Some(fixture.environment.join("cache/gradle/caches")),
+                access: crate::capabilities::GrantAccess::ReadWrite,
             }]
         );
         assert_eq!(

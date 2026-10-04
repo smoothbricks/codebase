@@ -25,7 +25,7 @@ path and failure.
 
 | Detector  | Convention                                                                     | Contribution                                                                                                        |
 | --------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| direnv    | `.envrc`                                                                       | Contained shell activation, private approval state, bootstrap executable                                            |
+| direnv    | `.envrc`                                                                       | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable         |
 | Nx        | `nx.json`                                                                      | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records  |
 | cargo     | Tracked `Cargo.toml` files                                                     | Distinct workspaces' configured target dirs; shared registry/git caches and exact cache-state files; Git and trust  |
 | Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                            |
@@ -96,16 +96,20 @@ Each detector returns data through one `CapabilityContribution`:
 - **Filesystem grants:** exact paths or subtrees, with read or read/write access. Grants pass through the same
   protected-path validation as the core sandbox. Detection never grants host credentials, binaries' parent homes, a
   sibling workspace or cowshed controller state.
-- **Shared caches:** host cache directories (`SharedCache`), each with an optional private-environment link. A detector
-  names its tool's cache once, as a `SharedToolHome`: the variable that points a child at it, for a tool that reads one;
-  the tool's own default beneath HOME (03_caches.md); and whether that whole directory is the cache or only named
-  subdirectories are, with the root state files the tool writes beside them. `add_shared_tool_home` derives the owned
-  variable, the cache directories, the split root's literal read and the state files' read-write literals from it; no
-  second table owns cache permissions. The supervisor creates every cache directory before a child runs and links it
-  from its private path when the tool finds it there rather than through a variable (Nix's XDG cache and state, Gradle's
-  `caches` under a private `GRADLE_USER_HOME`). The sandbox grants each read-write as a subtree with metadata-only
-  ancestors, and refuses one that is HOME itself, lies outside HOME, or intersects a protected path or cowshed
-  controller state. Only detected capabilities' caches and main's `[caches] home` entries are shared.
+- **Shared caches:** host cache directories (`SharedCache`), each with an access and an optional private-environment
+  link. A detector names its tool's cache once, as a `SharedToolHome`: the variable that points a child at it, for a
+  tool that reads one; the tool's own default beneath HOME (03_caches.md); and whether that whole directory is the cache
+  or only named subdirectories are, with the root state files the tool writes beside them. `add_shared_tool_home`
+  derives the owned variable, the cache directories, the split root's literal read and the state files' read-write
+  literals from it; no second table owns cache permissions. The supervisor creates every cache directory before a child
+  runs and links it from its private path when the tool finds it there rather than through a variable (Nix's XDG cache
+  and state, Gradle's `caches` under a private `GRADLE_USER_HOME`, direnv's `source_url` store); the link replaces an
+  empty private directory and never one that holds anything. The sandbox grants each as a subtree with its access and
+  metadata-only ancestors, and refuses one that is HOME itself, lies outside HOME, or intersects a protected path or
+  cowshed controller state. A cache is read-write unless a host process executes what it holds: direnv's
+  `$XDG_CACHE_HOME/direnv/cas`, which `source_url` trusts by name without rehashing and a host shell sources, is shared
+  read-only, so a sandbox reuses what the host fetched and never plants what the host runs. Only detected capabilities'
+  caches and main's `[caches] home` entries are shared.
 - **Build state:** `BuildStatePath` pairs a normalized checkout-relative tool path with its normalized volume-relative
   destination (16_build_volumes.md). Overlapping contributions fail; identical ones coalesce. The storage implementation
   applies fixed relative links through the checkout's one `.cowshed/build` link.

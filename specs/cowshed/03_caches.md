@@ -154,6 +154,7 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   | Nix      | `~/.cache/nix`, `~/.local/state/nix`                                                       |
   | Go       | `~/go/pkg/mod`, `~/Library/Caches/go-build` (`~/.cache/go-build`)                          |
   | sccache  | none: `~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache`) is daemon-write-only (below) |
+  | direnv   | `~/.cache/direnv/cas`, read-only: `source_url`'s store, which host shells execute          |
 
   The HOME read deny (04_sandbox.md) stays the default; each detector's contribution carves back exactly its tool's
   paths after it: the cache directories read-write, the tool's root and that root's ancestors as literal reads with

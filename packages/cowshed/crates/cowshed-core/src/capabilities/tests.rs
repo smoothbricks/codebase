@@ -181,6 +181,7 @@ fn conflicting_executables_and_cache_targets_fail_without_order_dependence() {
                     contribution.shared_caches.push(SharedCache {
                         path: PathBuf::from(source),
                         private_link: Some(PathBuf::from("cache/tool")),
+                        access: crate::capabilities::GrantAccess::ReadWrite,
                     });
                 }
                 let result = merge(
@@ -294,10 +295,12 @@ fn a_shared_tool_home_is_carved_back_at_the_host_path() {
             SharedCache {
                 path: whole,
                 private_link: None,
+                access: crate::capabilities::GrantAccess::ReadWrite,
             },
             SharedCache {
                 path: split.join("cache"),
                 private_link: None,
+                access: crate::capabilities::GrantAccess::ReadWrite,
             },
         ]
     );
@@ -335,6 +338,7 @@ fn repository_caches_are_shared_and_linked_from_the_private_home() {
         vec![SharedCache {
             path: fixture.home.join(".cache/ttsc"),
             private_link: Some(fixture.environment.join("home/.cache/ttsc")),
+            access: crate::capabilities::GrantAccess::ReadWrite,
         }]
     );
 }

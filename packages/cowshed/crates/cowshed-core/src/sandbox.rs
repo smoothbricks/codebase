@@ -795,7 +795,7 @@ pub fn seatbelt_profile(
         push_readable_ancestors(&mut profile, socket)?;
     }
     // Every tool-specific authority is a detected capability's contribution (15_capabilities.md):
-    // its shared caches read-write where the host keeps them, their ancestors beneath HOME
+    // its shared caches with their access where the host keeps them, their ancestors beneath HOME
     // metadata only, and its exact grants. Configuration, credentials and binaries a tool keeps
     // beside them stay hard denies, which follow every grant below.
     let contribution = &config.capabilities.contribution;
@@ -806,7 +806,7 @@ pub fn seatbelt_profile(
             &CapabilityGrant {
                 path: cache.path.clone(),
                 scope: GrantScope::Subtree,
-                access: GrantAccess::ReadWrite,
+                access: cache.access,
             },
         )?;
     }
@@ -2083,6 +2083,7 @@ mod tests {
             .map(|path| crate::capabilities::SharedCache {
                 path: PathBuf::from(path),
                 private_link: None,
+                access: crate::capabilities::GrantAccess::ReadWrite,
             })
             .collect();
         config

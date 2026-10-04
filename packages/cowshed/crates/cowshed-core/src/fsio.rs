@@ -87,8 +87,9 @@ impl AnchoredDirectory {
         Ok(Self(unsafe { File::from_raw_fd(fd) }))
     }
 
-    /// Keep real private cache entries, preserve matching links, and replace
-    /// stale links without following any mutable parent or destination.
+    /// Keep real private cache entries, preserve matching links, and replace stale links and empty
+    /// directories without following any mutable parent or destination. An empty directory holds
+    /// nothing a link could lose: it is what a tool leaves after a miss it could not fill.
     pub(crate) fn ensure_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
         validate_directory_leaf(name)?;
         let target = CString::new(target.as_os_str().as_bytes())
@@ -121,9 +122,18 @@ impl AnchoredDirectory {
         } else {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINVAL) {
-                return Ok(());
-            }
-            if error.kind() != io::ErrorKind::NotFound {
+                // Not a link. Only an empty directory gives way; anything else is kept.
+                // SAFETY: unlinkat removes this empty directory entry and follows nothing.
+                if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                    != 0
+                {
+                    let error = io::Error::last_os_error();
+                    return match error.raw_os_error() {
+                        Some(libc::ENOTEMPTY | libc::EEXIST | libc::ENOTDIR) => Ok(()),
+                        _ => Err(error),
+                    };
+                }
+            } else if error.kind() != io::ErrorKind::NotFound {
                 return Err(error);
             }
         }
@@ -782,6 +792,31 @@ mod tests {
             );
         }
         assert!(AnchoredDirectory::create(&parent).is_err());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// An empty private directory is what a tool leaves after a cache miss it could not fill; it
+    /// gives way to the shared cache's link. A directory holding anything, or a file, is kept.
+    #[test]
+    fn a_cache_link_replaces_only_an_empty_private_directory() {
+        let temporary = std::env::temp_dir().join(format!("fsio-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        // AnchoredDirectory follows no link, and the temp dir may be reached through one.
+        let temporary = fs::canonicalize(&temporary).unwrap();
+        let directory = AnchoredDirectory::create(&temporary).unwrap();
+        let target = temporary.join("target");
+        fs::create_dir(temporary.join("empty")).unwrap();
+        fs::create_dir(temporary.join("filled")).unwrap();
+        fs::write(temporary.join("filled/entry"), b"kept").unwrap();
+        fs::write(temporary.join("file"), b"kept").unwrap();
+
+        directory.ensure_symlink(c"empty", &target).unwrap();
+        directory.ensure_symlink(c"filled", &target).unwrap();
+        directory.ensure_symlink(c"file", &target).unwrap();
+
+        assert_eq!(fs::read_link(temporary.join("empty")).unwrap(), target);
+        assert_eq!(fs::read(temporary.join("filled/entry")).unwrap(), b"kept");
+        assert_eq!(fs::read(temporary.join("file")).unwrap(), b"kept");
         fs::remove_dir_all(temporary).unwrap();
     }
 

@@ -5513,10 +5513,12 @@ mod sandbox_environment_tests {
                 crate::capabilities::SharedCache {
                     path: home.join("go/pkg/mod"),
                     private_link: None,
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
                 crate::capabilities::SharedCache {
                     path: home.join(".local/state/nix"),
                     private_link: Some(environment.join("state/nix")),
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
             ],
             daemon_isolation: crate::capabilities::DaemonIsolation {
@@ -5539,6 +5541,7 @@ mod sandbox_environment_tests {
             shared_caches: vec![crate::capabilities::SharedCache {
                 path: home.join(".cache/zig"),
                 private_link: Some(root.join("outside/zig")),
+                access: crate::capabilities::GrantAccess::ReadWrite,
             }],
             ..Default::default()
         };

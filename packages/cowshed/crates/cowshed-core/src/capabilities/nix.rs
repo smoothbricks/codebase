@@ -163,6 +163,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         contribution.shared_caches.push(SharedCache {
             path: tool.host_path(context.home),
             private_link: Some(context.environment_root.join(private).join("nix")),
+            access: crate::capabilities::GrantAccess::ReadWrite,
         });
     }
     if let Some(socket) = daemon_socket_at(Path::new(DAEMON_SOCKET))? {
@@ -357,10 +358,12 @@ mod tests {
                 SharedCache {
                     path: fixture.home.join(".cache/nix"),
                     private_link: Some(fixture.environment.join("cache/nix")),
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
                 SharedCache {
                     path: fixture.home.join(".local/state/nix"),
                     private_link: Some(fixture.environment.join("state/nix")),
+                    access: crate::capabilities::GrantAccess::ReadWrite,
                 },
             ]
         );

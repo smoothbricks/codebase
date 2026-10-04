@@ -96,7 +96,7 @@ mod tests {
     /// `XDG_CACHE_HOME`.
     #[test]
     fn a_shed_installs_into_the_host_cache_path() {
-        use super::super::{EnvAction, SharedCache};
+        use super::super::{EnvAction, GrantAccess, SharedCache};
         let fixture = Fixture::new();
         fixture.files(&["package.json", "bun.lock"]);
         let host = fixture.home.join(".bun/install/cache");
@@ -110,6 +110,7 @@ mod tests {
         assert!(contribution.shared_caches.contains(&SharedCache {
             path: host,
             private_link: None,
+            access: GrantAccess::ReadWrite,
         }));
     }
 }

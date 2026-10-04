@@ -157,13 +157,16 @@ pub struct CapabilityGrant {
     pub access: GrantAccess,
 }
 
-/// A host cache directory every sandbox of a detecting project writes: created by the supervisor
-/// before a child runs, granted read-write as a subtree, and linked from `private_link` inside
-/// the private environment when the tool finds it there rather than through a variable.
+/// A host cache directory every sandbox of a detecting project reaches where the host keeps it:
+/// created by the supervisor before a child runs, granted as a subtree with `access`, and linked
+/// from `private_link` inside the private environment when the tool finds it there rather than
+/// through a variable. A cache whose entries a host process executes is shared read-only: a
+/// sandbox may use what the host fetched, never plant what the host will run.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedCache {
     pub path: PathBuf,
     pub private_link: Option<PathBuf>,
+    pub access: GrantAccess,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -412,6 +415,7 @@ fn detect_with(
                 .map(|relative| SharedCache {
                     path: context.home.join(relative),
                     private_link: Some(context.environment_root.join("home").join(relative)),
+                    access: GrantAccess::ReadWrite,
                 }),
         );
     normalize(&mut result.contribution);
@@ -803,6 +807,7 @@ pub fn add_shared_tool_home(
                 .map(|path| SharedCache {
                     path,
                     private_link: None,
+                    access: GrantAccess::ReadWrite,
                 }),
         );
 }
