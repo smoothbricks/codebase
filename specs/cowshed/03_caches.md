@@ -206,23 +206,11 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   nix-darwin hosts a module that still declares a link into the volume is a conflict naming that module option; setup
   never rewrites module-owned paths.
 
-  **Sandboxed shells may inherit devenv evaluations privately.** devenv evaluates a project at its path, and the result
-  really differs per path. The absolute root, its `.devenv`, `TMPDIR` and runtime directory are inputs to its
-  evaluation-cache key, and its exported hook may embed each path. The origin checkout's `.devenv` lives inside the
-  workspace image and travels to a new workspace through cowshed's copy-on-write clone. A smoo-managed shell
-  (`tooling/direnv/inherited-devenv.ts`) records a real `devenv direnv-export` in that private `.devenv` with a verified
-  disabled merged hook. Its evaluator receives exactly what a workspace child is handed and evaluation needs: the
-  bootstrap `PATH`, the private `HOME`, `TMPDIR` and XDG roots (Nix's client fetcher cache is the shared
-  `$XDG_CACHE_HOME/nix`), and the workspace's live routing — the proxy variables (token as userinfo), `NO_PROXY`, the CA
-  files and the `ssl-cert-file` line of `NIX_CONFIG`. The evaluator disables Nix's shared evaluation cache so it cannot
-  supply executable shell code, and receives no login identity, locale, terminal, Xcode selection, other credential or
-  `NIX_CONFIG` line. An export that embeds a proxy value or its userinfo is never published, so a clone always routes
-  through its own gateway. Before relocating it in a clone, it checks exact source and local path-input contents,
-  devenv's watched input paths, the toolchain, and the emitted task graph. The graph may not contain writing
-  prerequisites for `devenv:enterShell`. The original merged enterShell hook is not executed during verification; direnv
-  imports and runs it in the destination checkout. Missing, changed or unsafe evidence falls back to an in-place
-  evaluation. No sibling can update another's private artifact: a shared writable cache, however content-addressed,
-  cannot safely serve executable shell exports.
+  **Sandboxed shells evaluate devenv in place.** devenv evaluates a project at its path, and the result really differs
+  per path. The absolute root, its `.devenv`, `TMPDIR` and runtime directory are inputs to its evaluation-cache key, and
+  its exported hook may embed each path. A clone's copy of its origin's `.devenv` therefore never answers for the clone:
+  each checkout evaluates its own shell, and no shared writable cache, however content-addressed, serves executable
+  shell exports.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a
@@ -282,7 +270,6 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       ships no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned
       none — sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; neither value is the
       caller's;
-    - inherited devenv evaluation artifacts in the checkout's private `.devenv` (no shared cache variable);
     - trust anchors as defaults a caller may override: the core's `GIT_SSL_CAINFO` and `SSL_CERT_FILE`, and each
       detected capability's own — `CARGO_HTTP_CAINFO`, `NODE_EXTRA_CA_CERTS`, `NIX_SSL_CERT_FILE` with an
       `ssl-cert-file` line appended to `NIX_CONFIG`, `UV_SYSTEM_CERTS=true` (04_sandbox.md);

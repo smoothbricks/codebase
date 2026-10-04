@@ -367,10 +367,6 @@ in {
     # a subprocess of either), and one socket dir for two workspaces makes the
     # daemon refuse whichever came second ("received a message from a
     # different workspace"). Nobody supplies this deliberately.
-    #
-    # In a cowshed sandbox an inherited private .devenv can supply the
-    # evaluated shell after its inputs and task graph are checked. The merged
-    # hook still runs only when direnv imports the workspace's own export.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"

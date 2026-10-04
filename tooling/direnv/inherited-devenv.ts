@@ -1,1 +1,0 @@
-../../packages/nx-plugin/managed/raw/tooling/direnv/inherited-devenv.ts
