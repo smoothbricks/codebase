@@ -104,6 +104,14 @@ describe('inherited devenv evaluator routing', () => {
     });
   });
 
+  it('never supplies caller-owned Nx socket output to the shell evaluator', async () => {
+    const { evaluator } = await produce({
+      ...workspaceEnv,
+      NX_SOCKET_DIR: '/another-checkout/.cowshed/runtime/nx-caller',
+    });
+    expect(evaluator).not.toHaveProperty('NX_SOCKET_DIR');
+  });
+
   it('passes no NIX_CONFIG when the caller pins no CA file', async () => {
     const { evaluator } = await produce({ PATH: '/bin', NIX_CONFIG: 'access-tokens = github.com=caller-access-token' });
     expect(evaluator).toEqual({ PATH: '/bin' });

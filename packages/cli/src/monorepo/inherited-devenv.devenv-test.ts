@@ -133,25 +133,41 @@ function shell(
 
 describe('private inherited devenv with real devenv', () => {
   it(
-    'runs a first-entry custom hook only in the checkout, never the inherited origin',
+    'runs a checkout-local first-entry hook and computes its own Nx socket despite inherited caller state',
     () => {
       const scratch = realpathSync(mkdtempSync('/tmp/smoo-inh-'));
       try {
+        const managedShell = readFileSync(join(managedAssetsRoot, 'raw/tooling/direnv/devenv.smoo.nix'), 'utf8');
+        const socketHook = managedShell.match(/(nx_workspace_root=.*?mkdir -p "\$NX_SOCKET_DIR")/s)?.[1];
+        if (!socketHook) throw new Error('the managed shell must compute its workspace-owned Nx socket');
         const main = workspace(
           scratch,
           'main',
           `{ ... }: { enterShell = ''
+        ${socketHook}
         echo entered >> "$DEVENV_ROOT/hook-runs"
       ''; }
 `,
         );
+        const foreignSocket = join(scratch, 'another-checkouts-nx-socket');
+        main.env.NX_SOCKET_DIR = foreignSocket;
         const first = shell(main);
         expect(first.runsBeforeImport).toBe(0);
         expect(readFileSync(join(main.root, 'tooling/direnv/hook-runs'), 'utf8')).toBe('entered\n');
         expect(first.imported.DEVENV_ROOT).toBe(join(main.root, 'tooling/direnv'));
+        const firstSocket = first.imported.NX_SOCKET_DIR;
+        if (!firstSocket) throw new Error('the entered shell did not publish its Nx socket');
+        expect(first.imported.NX_WORKSPACE_ROOT_PATH).toBe(main.root);
+        expect(firstSocket).toStartWith(`${first.imported.DEVENV_RUNTIME}/nx-`);
+        expect(firstSocket).not.toBe(foreignSocket);
+        expect(existsSync(firstSocket)).toBe(true);
         const inherited = join(main.root, 'tooling/direnv/.devenv/inherited-shell.json');
         expect(existsSync(inherited)).toBe(true);
+        const recorded = readFileSync(inherited, 'utf8');
+        expect(recorded).not.toContain(foreignSocket);
+        expect(recorded).not.toContain('"NX_SOCKET_DIR":');
         const next = clone(scratch, main, 'next');
+        next.env.NX_SOCKET_DIR = firstSocket;
         const second = shell(next);
         expect(second.runsBeforeImport).toBe(0);
         expect(second.stderr).toContain('reused this checkout');
@@ -159,6 +175,12 @@ describe('private inherited devenv with real devenv', () => {
         expect(readFileSync(join(next.root, 'tooling/direnv/hook-runs'), 'utf8')).toBe('entered\n');
         expect(second.imported.DEVENV_ROOT).toBe(join(next.root, 'tooling/direnv'));
         expect(second.imported.DEVENV_STATE).toBe(join(next.root, 'tooling/direnv/.devenv/state'));
+        const secondSocket = second.imported.NX_SOCKET_DIR;
+        if (!secondSocket) throw new Error('the inherited shell did not publish its Nx socket');
+        expect(second.imported.NX_WORKSPACE_ROOT_PATH).toBe(next.root);
+        expect(secondSocket).toStartWith(`${second.imported.DEVENV_RUNTIME}/nx-`);
+        expect(secondSocket).not.toBe(firstSocket);
+        expect(existsSync(secondSocket)).toBe(true);
         expect(second.script).not.toContain(main.root);
         writeFileSync(join(next.root, 'tooling/direnv/devenv.nix'), '{ ... }: { env.INPUT_CHANGED = "yes"; }\n');
         expect(shell(next).imported.INPUT_CHANGED).toBe('yes');

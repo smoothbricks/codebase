@@ -32,7 +32,6 @@ const ENV_PATHS = [
   'XDG_STATE_HOME',
   'DEVENV_HOME',
   'DIRENV_CONFIG',
-  'NX_SOCKET_DIR',
 ] as const;
 // The evaluator fetches the lock's inputs itself, so it runs with this
 // workspace's live routing: the proxy endpoint (a cowshed workspace's userinfo is
@@ -56,7 +55,6 @@ const EVALUATOR_ENV = [
   'NIX_CACHE_HOME',
   'DEVENV_HOME',
   'DIRENV_CONFIG',
-  'NX_SOCKET_DIR',
   'USER',
   'LOGNAME',
   'SHELL',
