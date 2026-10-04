@@ -763,12 +763,38 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
+    /* otherBuild, fence: optional structured sources, read through accessors */
+}
+impl CowshedError {
+    pub fn other_build_source(&self) -> Option<&OtherBuild>;
+    pub fn fence_source(&self) -> Option<&FenceRefusal>;
 }
 
 pub enum ErrorCode {
     Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied, Integrity,
 }
+
+/// Why a rebase or land refused at one of its fences, with what the fence observed. `IncarnationMoved` also types
+/// every other exact-incarnation refusal, and `SourceMoved` push's source-head refusal. Wire:
+/// `"fence": { "reason": "<camelCase variant>", ...camelCase fields }`, absent on every other error; a reason this
+/// build does not know decodes as no fence, never as a lost error.
+pub enum FenceRefusal {
+    IncarnationMoved { workspace: WorkspaceName, observed: WorkspaceIncarnation },
+    SourceMoved { observed: GitOid },
+    OntoMoved { observed: GitOid },
+    TargetMoved { observed: Option<GitOid> },          // None: the target branch does not exist
+    NotFastForward { target_head: GitOid },
+    TargetNotCheckedOut { checked_out: Option<String> }, // None: a detached HEAD
+    SourceDirty { paths: Vec<WorkspacePath>, total: u64 },
+    TargetDirty { paths: Vec<WorkspacePath>, total: u64 },
+    ReplayConflicted { rolled_back_to: GitOid },
+}
 ```
+
+Every `FenceRefusal` is a `Conflict` that left the source workspace and the target as they were; the observed value is
+what a caller would otherwise read back from the repositories to decide its next move. The dirty variants name at most
+`MAX_FENCE_PATHS` (64) UTF-8 paths and count all of them in `total`, so the error always fits one frame. `SourceDirty`
+from `land` is `rm`'s reading of work; from `rebase` it is the tracked changes git refuses to rebase over.
 
 The code maps to stable CLI exits `1, 5, 2, 3, 4, 6, 7` respectively; exec-wrapper failures map to
 `100, 104, 101, 102, 103, 105, 106` for the same variants. `hint` is always the actionable next step printed on CLI

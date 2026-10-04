@@ -76,8 +76,19 @@ pub struct CowshedError {
     /// its startup pass has not finished restoring; absent from the wire otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     healing: Option<cowshed_gateway_types::StartupHeal>,
+    /// Present only on a rebase or land refused at one of its fences, carrying the value the
+    /// fence observed, so a caller types the outcome without reading the repositories again.
+    /// Absent from the wire otherwise, like `otherBuild`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "fence_of_this_build"
+    )]
+    fence: Option<Box<FenceRefusal>>,
+    /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
+    /// `Result` in cowshed carries this type.
     #[serde(skip)]
-    lifecycle_conflict: Option<crate::storage::lifecycle::Conflict>,
+    lifecycle_conflict: Option<Box<crate::storage::lifecycle::Conflict>>,
 }
 
 /// The daemon serves only its own build, and refused a request from another (11_shell.md
@@ -95,6 +106,92 @@ pub struct OtherBuild {
     pub caller: Option<crate::runtime::supervisor_socket::BuildId>,
 }
 
+/// The fence, or none when it names a reason this build does not know: version skew between a
+/// controller and its client costs the typed reason, never the code, message and hint.
+fn fence_of_this_build<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<FenceRefusal>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|fence| serde_json::from_value(fence).ok()))
+}
+
+/// The most paths a [`FenceRefusal`] names; `total` still counts every one.
+pub const MAX_FENCE_PATHS: usize = 64;
+
+/// Why a rebase or land refused at one of its fences (02_workspaces.md), with what the fence
+/// observed. Every variant is a `Conflict` that left the source workspace and the target as they
+/// were; the observed value is what a caller would otherwise read back to decide its next move.
+/// `IncarnationMoved` also types every other exact-incarnation refusal, and `SourceMoved` push's
+/// source-head refusal: the same fence, wherever it stands.
+///
+/// Fields are additive like [`OtherBuild`]'s; a reason a later build added decodes as no fence
+/// (`CowshedError::fence_source` answers `None`) rather than losing the whole error.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FenceRefusal {
+    /// `workspace` is no longer the incarnation the caller expected (the source's
+    /// `expected_workspace_incarnation`) or resolved (a lane base passed as `into`).
+    IncarnationMoved {
+        workspace: crate::metadata::WorkspaceName,
+        observed: crate::metadata::WorkspaceIncarnation,
+    },
+    /// The source workspace's head is not the one expected or validated.
+    SourceMoved { observed: crate::api::dto::GitOid },
+    /// The rebase destination resolved to another commit than `expected_onto_head`.
+    OntoMoved { observed: crate::api::dto::GitOid },
+    /// The land target branch is not at `expected_target_head`; `None` when it does not exist.
+    TargetMoved {
+        observed: Option<crate::api::dto::GitOid>,
+    },
+    /// The target branch is at `target_head`, which the source is not based on: rebase first.
+    NotFastForward {
+        target_head: crate::api::dto::GitOid,
+    },
+    /// The target checkout has another branch checked out, or none (`None`: a detached HEAD).
+    TargetNotCheckedOut { checked_out: Option<String> },
+    /// The source workspace holds uncommitted work: up to [`MAX_FENCE_PATHS`] of its paths that
+    /// are UTF-8, and the count of all of them.
+    SourceDirty {
+        paths: Vec<crate::api::dto::WorkspacePath>,
+        total: u64,
+    },
+    /// The target's tree holds uncommitted work the fast-forward would overwrite, read the same
+    /// way as [`Self::SourceDirty`].
+    TargetDirty {
+        paths: Vec<crate::api::dto::WorkspacePath>,
+        total: u64,
+    },
+    /// A replayed commit conflicted; the rebase was rolled back and the workspace is at
+    /// `rolled_back_to`, the head it had before the rebase.
+    ReplayConflicted {
+        rolled_back_to: crate::api::dto::GitOid,
+    },
+}
+
+impl FenceRefusal {
+    /// [`Self::SourceDirty`] or [`Self::TargetDirty`] over the paths a dirty reading answered.
+    pub fn dirty(target: bool, paths: &[std::path::PathBuf]) -> Self {
+        let total = u64::try_from(paths.len()).unwrap_or(u64::MAX);
+        let paths = paths
+            .iter()
+            .filter_map(|path| crate::api::dto::WorkspacePath::new(path.as_path()).ok())
+            .take(MAX_FENCE_PATHS)
+            .collect();
+        if target {
+            Self::TargetDirty { paths, total }
+        } else {
+            Self::SourceDirty { paths, total }
+        }
+    }
+}
+
 impl CowshedError {
     pub fn new(code: ErrorCode, message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
@@ -104,6 +201,7 @@ impl CowshedError {
             other_build: None,
             recovering: None,
             healing: None,
+            fence: None,
             lifecycle_conflict: None,
         }
     }
@@ -129,7 +227,8 @@ impl CowshedError {
             other_build: None,
             recovering: None,
             healing: None,
-            lifecycle_conflict: Some(conflict),
+            fence: None,
+            lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
 
@@ -151,6 +250,7 @@ impl CowshedError {
             other_build: Some(Box::new(other)),
             recovering: None,
             healing: None,
+            fence: None,
             lifecycle_conflict: None,
         }
     }
@@ -175,6 +275,7 @@ impl CowshedError {
             other_build: None,
             recovering: Some(recovery),
             healing: None,
+            fence: None,
             lifecycle_conflict: None,
         }
     }
@@ -194,7 +295,21 @@ impl CowshedError {
             other_build: None,
             recovering: None,
             healing: Some(heal),
+            fence: None,
             lifecycle_conflict: None,
+        }
+    }
+
+    /// A rebase or land refused at one of its fences: always a `Conflict`, carrying the reason
+    /// and the observed value as [`FenceRefusal`].
+    pub fn fence_refusal(
+        fence: FenceRefusal,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            fence: Some(Box::new(fence)),
+            ..Self::conflict(message, hint)
         }
     }
 
@@ -291,7 +406,7 @@ impl CowshedError {
 
     /// The exact stale lifecycle fact, when this error came from `execute_checked`.
     pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
-        self.lifecycle_conflict.as_ref()
+        self.lifecycle_conflict.as_deref()
     }
 
     /// The two builds, when this is the daemon's refusal of another build's request.
@@ -309,6 +424,11 @@ impl CowshedError {
     /// depends on what that pass restores.
     pub const fn healing_source(&self) -> Option<cowshed_gateway_types::StartupHeal> {
         self.healing
+    }
+
+    /// The fence and what it observed, when this is a rebase's or land's fence refusal.
+    pub fn fence_source(&self) -> Option<&FenceRefusal> {
+        self.fence.as_deref()
     }
 
     pub const fn exit_code(&self) -> u8 {
@@ -329,7 +449,7 @@ impl fmt::Display for CowshedError {
 impl std::error::Error for CowshedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.lifecycle_conflict
-            .as_ref()
+            .as_deref()
             .map(|conflict| conflict as &(dyn std::error::Error + 'static))
     }
 }
@@ -369,6 +489,76 @@ mod tests {
             ErrorCode::Conflict.exec_wrapper_exit_code()
         );
         assert_eq!(error.to_string(), "working tree changed");
+    }
+
+    /// The fence crosses the controller socket as data: a consumer reads the reason and the
+    /// observed value from the decoded error, and an error without one carries no `fence` key.
+    #[test]
+    fn a_fence_refusal_round_trips_the_wire_and_an_unfenced_error_has_no_fence_key() {
+        use super::FenceRefusal;
+        let observed = crate::api::dto::GitOid::new("2".repeat(40)).unwrap();
+        let error = CowshedError::fence_refusal(
+            FenceRefusal::NotFastForward {
+                target_head: observed.clone(),
+            },
+            "main is at 2222, which raven is not based on",
+            "cowshed rebase raven",
+        );
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let value = serde_json::to_value(&error).expect("error serializes");
+        assert_eq!(
+            value["fence"],
+            serde_json::json!({ "reason": "notFastForward", "targetHead": observed })
+        );
+        let decoded: CowshedError = serde_json::from_value(value).expect("error decodes");
+        assert_eq!(
+            decoded.fence_source(),
+            Some(&FenceRefusal::NotFastForward {
+                target_head: observed
+            })
+        );
+
+        let unfenced = serde_json::to_value(CowshedError::conflict("stale", "retry")).unwrap();
+        assert!(unfenced.get("fence").is_none(), "{unfenced}");
+        let decoded: CowshedError = serde_json::from_value(unfenced).unwrap();
+        assert_eq!(decoded.fence_source(), None);
+
+        let later: CowshedError = serde_json::from_value(serde_json::json!({
+            "code": "conflict",
+            "message": "a later build's fence",
+            "hint": "retry",
+            "fence": { "reason": "somethingNew", "observed": 1 },
+        }))
+        .expect("a later build's reason still decodes the error");
+        assert_eq!(later.code, ErrorCode::Conflict);
+        assert_eq!(later.message, "a later build's fence");
+        assert_eq!(later.fence_source(), None);
+    }
+
+    /// A dirty tree can hold any number of paths, and the error must still fit one frame: the
+    /// fence names a bounded prefix of the UTF-8 ones and counts all of them.
+    #[test]
+    fn a_dirty_fence_bounds_its_paths_and_counts_every_one() {
+        use super::{FenceRefusal, MAX_FENCE_PATHS};
+        use std::os::unix::ffi::OsStrExt;
+        let mut paths = vec![std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"bad-\xff.txt",
+        ))];
+        paths.extend((0..MAX_FENCE_PATHS + 5).map(|index| format!("dir/{index}.rs").into()));
+        let FenceRefusal::TargetDirty {
+            paths: named,
+            total,
+        } = FenceRefusal::dirty(true, &paths)
+        else {
+            panic!("a target reading is TargetDirty");
+        };
+        assert_eq!(total, u64::try_from(MAX_FENCE_PATHS + 6).unwrap());
+        assert_eq!(named.len(), MAX_FENCE_PATHS);
+        assert_eq!(named[0].as_path(), std::path::Path::new("dir/0.rs"));
+        assert!(matches!(
+            FenceRefusal::dirty(false, &paths[..1]),
+            FenceRefusal::SourceDirty { paths, total: 1 } if paths.is_empty()
+        ));
     }
 
     #[test]

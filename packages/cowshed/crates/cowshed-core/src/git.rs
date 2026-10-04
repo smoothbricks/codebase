@@ -593,22 +593,33 @@ impl GitRepository {
     /// project unremovable and fail every `land` at its retire step. Main still holds every
     /// byte of such a path, so retiring the workspace loses nothing.
     pub async fn is_dirty_by(&self, checkout: Option<&Path>) -> Result<bool> {
+        Ok(!self.dirty_paths_by(checkout).await?.is_empty())
+    }
+
+    /// The paths [`Self::is_dirty_by`] reads as work, in `git status` order: what a refusal names.
+    /// A clean tree costs what `is_dirty_by` always cost; only a dirty one reads past its first
+    /// path.
+    pub async fn dirty_paths_by(&self, checkout: Option<&Path>) -> Result<Vec<PathBuf>> {
         let output = self.porcelain_status("read repository status").await?;
+        let mut work: Vec<PathBuf> = Vec::new();
         let mut untracked: Vec<&[u8]> = Vec::new();
         for (status, path) in porcelain_records(&output.stdout) {
             if is_untracked_junk(status, path) {
                 continue;
             }
-            if status != b"??" {
-                return Ok(true);
+            if status == b"??" {
+                untracked.push(path);
+            } else {
+                work.push(PathBuf::from(OsStr::from_bytes(path)));
             }
-            untracked.push(path);
         }
-        if untracked.is_empty() {
-            return Ok(false);
-        }
-        let Some(checkout) = checkout else {
-            return Ok(true);
+        let Some(checkout) = checkout.filter(|_| !untracked.is_empty()) else {
+            work.extend(
+                untracked
+                    .into_iter()
+                    .map(|path| PathBuf::from(OsStr::from_bytes(path))),
+            );
+            return Ok(work);
         };
         // One check-ignore for every untracked path, not one process per path. It answers in
         // input order, so the ignored paths are a subsequence of `untracked` and one pass
@@ -627,21 +638,38 @@ impl GitRepository {
             .map(|path| PathBuf::from(OsStr::from_bytes(path)))
             .collect();
         if unignored.is_empty() {
-            return Ok(false);
+            return Ok(work);
         }
         let root = self.root.clone();
         let checkout = checkout.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let unheld = tokio::task::spawn_blocking(move || {
             unignored
-                .iter()
-                .any(|relative| !held_by_checkout(&root, &checkout, relative))
+                .into_iter()
+                .filter(|relative| !held_by_checkout(&root, &checkout, relative))
+                .collect::<Vec<_>>()
         })
         .await
         .map_err(|source| {
             CowshedError::internal(format!(
                 "comparing untracked files with main's checkout panicked: {source}"
             ))
-        })
+        })?;
+        work.extend(unheld);
+        Ok(work)
+    }
+
+    /// The tracked paths with staged or unstaged changes: exactly what makes `git rebase` refuse
+    /// to start ("cannot rebase: You have unstaged changes"). Untracked files never block it.
+    pub async fn tracked_change_paths(&self) -> Result<Vec<PathBuf>> {
+        let output = self
+            .run(["status", "--porcelain=v1", "-z", "--untracked-files=no"])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("read tracked changes", &output));
+        }
+        Ok(porcelain_records(&output.stdout)
+            .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+            .collect())
     }
 
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
@@ -3056,6 +3084,18 @@ mod tests {
         // A file main does not have.
         fs::write(root.join("notes.rs"), "fn main() {}\n").expect("new file");
         assert!(git.is_dirty_by(Some(&main)).await.expect("new file"));
+        // What land's refusal names: the tracked change and the file main lacks, never the paths
+        // main holds identically.
+        fs::write(root.join("README"), "edited\n").expect("tracked edit");
+        assert_eq!(
+            git.dirty_paths_by(Some(&main)).await.expect("dirty paths"),
+            [PathBuf::from("README"), PathBuf::from("notes.rs")]
+        );
+        assert_eq!(
+            git.tracked_change_paths().await.expect("tracked changes"),
+            [PathBuf::from("README")],
+            "what blocks a rebase is the tracked change alone"
+        );
 
         fs::remove_dir_all(main).expect("remove main fixture");
         fs::remove_dir_all(root).expect("remove fixture");

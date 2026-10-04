@@ -5707,8 +5707,13 @@ impl NativeProjectRuntimeHost {
         workspace: &NativeWorkspace,
         expected: &WorkspaceIncarnation,
     ) -> Result<()> {
-        if workspace.derived.workspace.incarnation() != expected {
-            return Err(CowshedError::conflict(
+        let observed = workspace.derived.workspace.incarnation();
+        if observed != expected {
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::IncarnationMoved {
+                    workspace: workspace.derived.workspace.name().clone(),
+                    observed: observed.clone(),
+                },
                 "workspace incarnation is stale",
                 "reacquire the worker handle and retry",
             ));
@@ -7209,6 +7214,7 @@ enum NativeAdoptRollbackState {
 #[cfg(all(test, target_os = "macos"))]
 mod rebase_recovery_tests {
     use super::*;
+    use crate::error::FenceRefusal;
     use crate::fork_lock::Run as _;
 
     fn git(root: &Path, args: &[&str]) -> std::process::Output {
@@ -7265,6 +7271,12 @@ mod rebase_recovery_tests {
             "the hint names the fix: {}",
             error.hint
         );
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::TargetNotCheckedOut {
+                checked_out: Some("probe".to_owned())
+            })
+        );
 
         run_git(&root, &["checkout", "--detach"]);
         let error = require_target_checked_out(&root, "main")
@@ -7274,6 +7286,10 @@ mod rebase_recovery_tests {
             error.message.contains("a detached HEAD"),
             "{}",
             error.message
+        );
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::TargetNotCheckedOut { checked_out: None })
         );
         std::fs::remove_dir_all(root).expect("remove fixture repository");
     }
@@ -7308,6 +7324,13 @@ mod rebase_recovery_tests {
             error.hint.contains("rolled back") && error.hint.contains("git rebase main"),
             "the hint names the by-hand replay, not markers the rollback removed: {}",
             error.hint
+        );
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::ReplayConflicted {
+                rolled_back_to: source_head.clone()
+            }),
+            "the fence names the head the rollback restored"
         );
 
         let branch = git(&root, &["symbolic-ref", "--short", "HEAD"]);
@@ -7359,6 +7382,14 @@ mod rebase_recovery_tests {
             error.hint.contains("uncommitted work"),
             "the refusal names the move: {}",
             error.hint
+        );
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::SourceDirty {
+                paths: vec![crate::api::dto::WorkspacePath::new("README.md").unwrap()],
+                total: 1,
+            }),
+            "the fence names the tracked change that blocks the rebase"
         );
 
         let status = git(&root, &["status", "--porcelain"]);
@@ -7515,6 +7546,12 @@ mod rebase_recovery_tests {
         .await
         .expect_err("what arrived is not what was validated");
         assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::SourceMoved {
+                observed: git_oid(&unit).await.expect("unvalidated head")
+            })
+        );
         assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
     }
 
@@ -7554,6 +7591,12 @@ mod rebase_recovery_tests {
         .await
         .expect_err("the second unit is not based on the lane base's tip");
         assert_eq!(behind.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(
+            behind.fence_source(),
+            Some(&FenceRefusal::NotFastForward {
+                target_head: first_head.clone()
+            })
+        );
         assert!(
             behind.hint.contains("cowshed rebase second --into lane"),
             "{}",
@@ -7596,10 +7639,95 @@ mod rebase_recovery_tests {
         let error = require_target_incarnation(&lane, &recreated, &resolved)
             .expect_err("a recreated lane base is another workspace");
         assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::IncarnationMoved {
+                workspace: lane.clone(),
+                observed: recreated.clone(),
+            })
+        );
         assert!(
             error.hint.contains("resolve workspace lane again"),
             "{}",
             error.hint
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_tree_with_work_the_fast_forward_would_overwrite_names_it() {
+        let lane = Lane::new("target-dirty");
+        let unit = lane.unit("unit");
+        commit_file(&unit, "unit\n", "unit rewrites the readme");
+        let unit_head = git_oid(&unit).await.expect("unit head");
+        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+        std::fs::write(lane.lane.join("README.md"), "lane edit\n").expect("dirty the lane base");
+
+        let error = deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &unit,
+            &Lane::name("unit"),
+            "cowshed/unit",
+            &unit_head,
+            "cowshed/lane",
+        )
+        .await
+        .expect_err("the fast-forward would overwrite the lane base's uncommitted edit");
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::TargetDirty {
+                paths: vec![crate::api::dto::WorkspacePath::new("README.md").unwrap()],
+                total: 1,
+            })
+        );
+        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+        assert_eq!(
+            std::fs::read_to_string(lane.lane.join("README.md")).expect("lane readme"),
+            "lane edit\n"
+        );
+    }
+
+    #[test]
+    fn each_head_fence_carries_the_head_it_observed() {
+        let expected = GitOid::new("1".repeat(40)).unwrap();
+        let observed = GitOid::new("2".repeat(40)).unwrap();
+        require_source_head(None, &observed, "land").expect("no expectation");
+        require_source_head(Some(&observed), &observed, "land").expect("as expected");
+        let error =
+            require_source_head(Some(&expected), &observed, "land").expect_err("the source moved");
+        assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::SourceMoved {
+                observed: observed.clone()
+            })
+        );
+
+        require_onto_head(Some(&observed), "main/main", &observed).expect("as expected");
+        let error = require_onto_head(Some(&expected), "main/main", &observed)
+            .expect_err("the destination moved");
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::OntoMoved {
+                observed: observed.clone()
+            })
+        );
+
+        use crate::api::dto::ExpectedRefHead;
+        require_target_head(Some(&ExpectedRefHead::Missing), None).expect("still unborn");
+        let born = require_target_head(Some(&ExpectedRefHead::Missing), Some(&observed))
+            .expect_err("the target was born");
+        assert_eq!(
+            born.fence_source(),
+            Some(&FenceRefusal::TargetMoved {
+                observed: Some(observed.clone())
+            })
+        );
+        let gone = require_target_head(Some(&ExpectedRefHead::Oid(expected)), None)
+            .expect_err("the target branch is gone");
+        assert_eq!(
+            gone.fence_source(),
+            Some(&FenceRefusal::TargetMoved { observed: None })
         );
     }
 
@@ -9529,16 +9657,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let into = self.landing_into(&workspace, into).await?;
         let root = current_snapshot_mount(self, &current)?;
         let source_head = git_oid(&root).await?;
-        if options
-            .expected_source_head
-            .as_ref()
-            .is_some_and(|expected| expected != &source_head)
-        {
-            return Err(CowshedError::conflict(
-                "workspace source head is stale",
-                "refresh the workspace revision and retry rebase",
-            ));
-        }
+        require_source_head(
+            options.expected_source_head.as_ref(),
+            &source_head,
+            "rebase",
+        )?;
         let onto = if !into.name.is_main() {
             // A lane base is its own repository: its branch reaches the unit by a fetch from its
             // mount into a cowshed-owned ref, which is also what keeps it current. `onto` was
@@ -9569,16 +9692,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             )
         };
         let onto_head = git_revision_oid(&root, &onto).await?;
-        if options
-            .expected_onto_head
-            .as_ref()
-            .is_some_and(|expected| expected != &onto_head)
-        {
-            return Err(CowshedError::conflict(
-                "rebase destination head is stale",
-                "refresh the destination revision and retry rebase",
-            ));
-        }
+        require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
         run_git_rebase_atomically(&root, &onto, &source_head).await?;
         git_oid(&root).await
     }
@@ -9600,28 +9714,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let source_mount = current_snapshot_mount(self, &current)?;
         let source_repository = crate::git::GitRepository::from_root(&source_mount);
         let source_head = timed_async("land", "source-head", git_oid(&source_mount)).await?;
-        if options
-            .expected_source_head
-            .as_ref()
-            .is_some_and(|expected| expected != &source_head)
-        {
-            return Err(CowshedError::conflict(
-                "workspace source head is stale",
-                "refresh the workspace revision and retry land",
-            ));
-        }
+        require_source_head(options.expected_source_head.as_ref(), &source_head, "land")?;
         // The check runs in the working tree but only the head commit lands, so uncommitted work
         // would pass validation without landing, and would then refuse the retire after main had
         // already moved. The same reading of "work" as `rm` makes, so land refuses exactly the
         // trees retirement would.
-        if timed_async(
+        let work = timed_async(
             "land",
             "source-dirty",
-            source_repository.is_dirty_by(Some(&self.substrate_config.checkout_path)),
+            source_repository.dirty_paths_by(Some(&self.substrate_config.checkout_path)),
         )
-        .await?
-        {
-            return Err(CowshedError::conflict(
+        .await?;
+        if !work.is_empty() {
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::dirty(false, &work),
                 format!(
                     "workspace {workspace} has uncommitted work, which the check would validate but land would leave behind"
                 ),
@@ -9647,11 +9753,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             git_optional_ref_oid(&into.root, &target_ref),
         )
         .await?;
-        require_expected_ref(
-            options.expected_target_head.as_ref(),
-            previous.as_ref(),
-            "land target",
-        )?;
+        require_target_head(options.expected_target_head.as_ref(), previous.as_ref())?;
         let retire = options.retire;
         let (handle, build_volume) =
             timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
@@ -12283,11 +12385,12 @@ async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Res
     if checked_out.as_deref() == Some(target_branch) {
         return Ok(());
     }
-    let actual = checked_out.map_or_else(
+    let actual = checked_out.as_ref().map_or_else(
         || "a detached HEAD".to_owned(),
         |branch| format!("branch {branch}"),
     );
-    Err(CowshedError::conflict(
+    Err(CowshedError::fence_refusal(
+        crate::error::FenceRefusal::TargetNotCheckedOut { checked_out },
         format!(
             "the checkout at {} has {actual} checked out, not the land target {target_branch}",
             git_root.display()
@@ -12306,7 +12409,8 @@ async fn target_checked_out_branch(root: &Path, target: &WorkspaceName) -> Resul
         .current_branch()
         .await?
         .ok_or_else(|| {
-            CowshedError::conflict(
+            CowshedError::fence_refusal(
+                crate::error::FenceRefusal::TargetNotCheckedOut { checked_out: None },
                 format!("workspace {target} has a detached HEAD, so it has no branch to land on"),
                 format!("check out a branch in workspace {target}, then retry"),
             )
@@ -12347,7 +12451,10 @@ async fn deliver_into(
     .await?;
     let fetched = git_revision_oid(target_root, &preservation_ref).await?;
     if &fetched != source_head {
-        return Err(CowshedError::conflict(
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::SourceMoved {
+                observed: fetched.clone(),
+            },
             format!("workspace {unit} advanced from {source_head} to {fetched} during land"),
             "re-run the check against the new head and retry land",
         ));
@@ -12369,7 +12476,10 @@ async fn deliver_into(
         } else {
             format!(" --into {target}")
         };
-        return Err(CowshedError::conflict(
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::NotFastForward {
+                target_head: tip.clone(),
+            },
             format!(
                 "{target}'s {target_branch} is at {tip}, which workspace {unit} is not based on, so \
                  it cannot fast-forward"
@@ -12377,7 +12487,20 @@ async fn deliver_into(
             format!("cowshed rebase {unit}{into}, re-run the check, then retry land"),
         ));
     }
-    run_git(target_root, ["merge", "--ff-only", source_head.as_str()]).await
+    let merge = invoke_git(target_root, &["merge", "--ff-only", source_head.as_str()]).await?;
+    let Err(refused) = require_git_success("git operation", &merge) else {
+        return Ok(());
+    };
+    // git names the paths in prose; the target's own dirty reading names them as data.
+    if String::from_utf8_lossy(&merge.stderr).contains("would be overwritten") {
+        let work = repository.dirty_paths_by(None).await?;
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::dirty(true, &work),
+            refused.message,
+            refused.hint,
+        ));
+    }
+    Err(refused)
 }
 
 /// Preserve the workspace branch `source_branch` in main's repository at `main_root`, as
@@ -12469,12 +12592,7 @@ async fn install_preserved(
     expected_destination_head: Option<&crate::api::dto::ExpectedRefHead>,
 ) -> Result<PushReport> {
     let source_head = git_revision_oid(main_root, staging_ref).await?;
-    if expected_source_head.is_some_and(|expected| expected != &source_head) {
-        return Err(CowshedError::conflict(
-            "workspace source head is stale",
-            "refresh the workspace revision and retry push",
-        ));
-    }
+    require_source_head(expected_source_head, &source_head, "push")?;
     let previous_destination_head = git_optional_ref_oid(main_root, &destination_ref).await?;
     require_expected_ref(
         expected_destination_head,
@@ -12574,7 +12692,11 @@ fn require_target_incarnation(
     if current == resolved {
         return Ok(());
     }
-    Err(CowshedError::conflict(
+    Err(CowshedError::fence_refusal(
+        crate::error::FenceRefusal::IncarnationMoved {
+            workspace: target.clone(),
+            observed: current.clone(),
+        },
         format!(
             "workspace {target} is incarnation {current}, not the {resolved} this reference was \
              resolved at: it was removed and recreated under the same name"
@@ -12584,6 +12706,53 @@ fn require_target_incarnation(
              unit belongs to"
         ),
     ))
+}
+
+/// Refuse a source workspace whose head is not the one the caller expected `verb` to act on.
+#[cfg(target_os = "macos")]
+fn require_source_head(expected: Option<&GitOid>, observed: &GitOid, verb: &str) -> Result<()> {
+    match expected {
+        Some(expected) if expected != observed => Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::SourceMoved {
+                observed: observed.clone(),
+            },
+            format!("workspace source head is stale: it is {observed}, not {expected}"),
+            format!("refresh the workspace revision and retry {verb}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a rebase whose destination `onto` resolved to another commit than the caller expected.
+#[cfg(target_os = "macos")]
+fn require_onto_head(expected: Option<&GitOid>, onto: &str, observed: &GitOid) -> Result<()> {
+    match expected {
+        Some(expected) if expected != observed => Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::OntoMoved {
+                observed: observed.clone(),
+            },
+            format!("rebase destination head is stale: {onto} is at {observed}, not {expected}"),
+            "refresh the destination revision and retry rebase",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a land whose target branch is not at the head the caller expected.
+#[cfg(target_os = "macos")]
+fn require_target_head(
+    expected: Option<&crate::api::dto::ExpectedRefHead>,
+    observed: Option<&GitOid>,
+) -> Result<()> {
+    require_expected_ref(expected, observed, "land target").map_err(|stale| {
+        CowshedError::fence_refusal(
+            crate::error::FenceRefusal::TargetMoved {
+                observed: observed.cloned(),
+            },
+            stale.message,
+            stale.hint,
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -12670,6 +12839,18 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     let current_head_matches = current_head.status.success()
         && String::from_utf8_lossy(&current_head.stdout).trim_end() == source_head.as_str();
     if !owns_rebase_state && current_ref_matches && current_head_matches {
+        // git refused before touching anything. A dirty tree is the refusal a caller acts on, so
+        // it names the paths that block the rebase.
+        if String::from_utf8_lossy(&output.stderr).contains("cannot rebase: ") {
+            let work = crate::git::GitRepository::from_root(root)
+                .tracked_change_paths()
+                .await?;
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::dirty(false, &work),
+                primary.message,
+                primary.hint,
+            ));
+        }
         return Err(primary);
     }
 
@@ -12710,7 +12891,10 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     }
 
     if failures.is_empty() && replay_conflicted {
-        Err(CowshedError::conflict(
+        Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::ReplayConflicted {
+                rolled_back_to: source_head.clone(),
+            },
             primary.message,
             format!(
                 "the rebase was rolled back and the workspace is as it was: run `git rebase {onto}` inside the workspace, resolve the conflicts git names, and finish that rebase there"

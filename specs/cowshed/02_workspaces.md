@@ -781,6 +781,12 @@ step.
    the moved value. Cowshed never retries against a new base internally; the coordinator decides whether to rebase and
    re-run checks.
 
+   Every rebase and land fence reports its refusal as data as well as prose: the `Conflict` carries a `FenceRefusal`
+   (07_api.md "Errors") naming the fence and what it observed — the moved incarnation, source, destination or target
+   head, the non-fast-forward target tip, the branch the target has checked out, the dirty paths of either tree, or the
+   head a conflicted replay was rolled back to — so a coordinator types the outcome without reading either repository
+   again.
+
 4. **Adopt the build volume and check it**: the target takes the workspace's build volume by renaming its one
    `.cowshed/build` link, re-runs the check on the adopted volume and requires 100% Nx cache hits, reporting every miss
    as a configuration finding, then freezes a new seed for later forks. The target builds nothing the workspace built.
