@@ -23,7 +23,6 @@ popd >/dev/null
 watch_file \
   package.json bun.lock uv.lock Cargo.lock \
   tooling/direnv/repo-path \
-  tooling/direnv/shared-caches.sh \
   tooling/direnv/nx-socket-dir.sh \
   tooling/direnv/apple-developer.sh \
   tooling/direnv/setup-environment.ts \

@@ -132,11 +132,6 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
-    source: 'tooling/direnv/shared-caches.sh',
-    target: 'tooling/direnv/shared-caches.sh',
-  },
-  {
-    kind: 'raw',
     source: 'tooling/direnv/nx-socket-dir.sh',
     target: 'tooling/direnv/nx-socket-dir.sh',
   },

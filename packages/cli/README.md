@@ -421,10 +421,9 @@ nothing when nothing changed:
   CI runs both with `devenv tasks run`, which fails. The managed `.envrc` watches `package.json`, the lockfiles and the
   scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull or a script change.
 - Shell secrets resolve only for an entry that installs; see below.
-- `tooling/direnv/shared-caches.sh` points `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE` at
-  `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
-  sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
-  defaults. A value the caller already exported wins.
+- ttsc caches in the checkout's `.cache/ttsc`, its Go build cache in `.cache/ttsc/go-build`, and `GOFLAGS` carries
+  `-trimpath`. A value the caller already exported wins, so a host or a sandbox that shares these caches across
+  checkouts sets them itself; Go's own caches keep Go's defaults.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
   `.cowshed/env` names a port base uses `/tmp/cs-<port base>/nx`, the literal path cowshed gives its sandboxed jobs, and

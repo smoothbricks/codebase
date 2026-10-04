@@ -397,8 +397,14 @@ in {
     #    use, so a hook and a shell resolve one binary the same way.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
-    # 4. Go and ttsc caches: tooling/direnv/shared-caches.sh places them under
-    #    the machine's shared caches root when it exists and states why.
+    # 4. ttsc caches in the checkout's .cache/ttsc (the path the CI ttsc-plugin
+    #    cache restores), its Go build cache in a directory of its own so
+    #    `ttsc clean` can reclaim it: ttsc never deletes a GOCACHE it did not
+    #    resolve itself, and sharing GOCACHE once left 35G nothing could empty.
+    #    GOFLAGS carries -trimpath, Go's stable way to keep absolute build paths
+    #    out of an artifact. A value the caller exported wins for each. Where Go
+    #    and the machine-wide caches live otherwise is the host's or the
+    #    sandbox's business, not this shell's.
     # 5. Dependencies are installed by the smoo:install and smoo:cargo-fetch
     #    tasks above, which devenv runs before this prologue; the prologue only
     #    activates what they installed.
@@ -461,14 +467,12 @@ in {
     #    nixpkgs xcbuild's `xcrun` are dropped, each one announced, so Xcode's
     #    clang compiles against the licensed SDK and `xcrun` is Apple's.
     #    tooling/direnv/apple-developer.sh does it and states why.
-    # Nx's fallback includes HOME or TMPDIR, either of which can exceed the
-    # Unix socket limit in a checkout. Reuse devenv's short runtime directory,
-    # which is keyed on this checkout's devenv root and so is one per
-    # workspace. Unconditionally: an inherited value is another workspace's
-    # shell (a shed entered from the host, a second repository from the first,
-    # a subprocess of either), and one socket dir for two workspaces makes the
-    # daemon refuse whichever came second ("received a message from a
-    # different workspace"). Nobody supplies this deliberately.
+    # Nx's own socket fallback (under HOME or TMPDIR) can exceed the Unix socket
+    # limit in a checkout, and an inherited NX_SOCKET_DIR may be another
+    # workspace's: tooling/direnv/nx-socket-dir.sh, sourced below, names this
+    # workspace's own, and binds NX_WORKSPACE_ROOT_PATH, which the smoo Nx
+    # wrappers read to decide whether inherited Nx overrides belong to the root
+    # they run.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
@@ -482,7 +486,10 @@ in {
         export TMPDIR="''${TMPDIR:-/tmp}"
       fi
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
-      . "$DEVENV_ROOT/shared-caches.sh" /private/cowshed/caches
+      export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
+      export TTSC_GO_CACHE_DIR="''${TTSC_GO_CACHE_DIR:-$TTSC_CACHE_DIR/go-build}"
+      mkdir -p "$TTSC_GO_CACHE_DIR"
+      export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       ${lib.optionalString uvProject ''
         if [ -f pyproject.toml ]; then
