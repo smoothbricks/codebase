@@ -410,6 +410,9 @@ nothing when nothing changed:
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves
   nothing behind.
+- The managed `.envrc` loads no parent directory's `.envrc`: the shell is built from the checkout's own inputs, so the
+  same commit enters the same shell wherever it is checked out. An environment wanted from outside the checkout belongs
+  in the gitignored `.envrc-local`.
 - The managed `.envrc` watches every one of those inputs (listed in `$DEVENV_STATE/install-inputs`) and the scripts
   shell entry runs, so a shell direnv keeps loaded re-enters exactly when an install has something to do.
 - Shell secrets resolve only for an entry that installs; see below.

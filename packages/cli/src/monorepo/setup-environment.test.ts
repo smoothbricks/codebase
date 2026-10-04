@@ -1199,6 +1199,30 @@ describe('a shell direnv keeps loaded', () => {
     '',
   ].join('\n');
 
+  /** direnv in `root` with a private home, so no host direnv config or approval leaks in. */
+  function isolatedDirenv(root: string) {
+    const home = join(dirname(root), 'home');
+    const base: Record<string, string> = {
+      PATH: process.env['PATH'] ?? '',
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, '.config'),
+      XDG_DATA_HOME: join(home, '.local', 'share'),
+      XDG_CACHE_HOME: join(home, '.cache'),
+      DIRENV_LOG_FORMAT: '',
+    };
+    const direnv = async (args: readonly string[], env: Record<string, string>) => {
+      const proc = Bun.spawn({ cmd: ['direnv', ...args], cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect({ args, exitCode, stderr: exitCode === 0 ? '' : stderr }).toEqual({ args, exitCode: 0, stderr: '' });
+      return stdout;
+    };
+    return { base, direnv };
+  }
+
   it('re-enters exactly when an install input changes', async () => {
     await withManagedRepository(
       {
@@ -1210,26 +1234,7 @@ describe('a shell direnv keeps loaded', () => {
         },
       },
       async ({ root }) => {
-        const home = join(dirname(root), 'home');
-        const base: Record<string, string> = {
-          PATH: process.env['PATH'] ?? '',
-          HOME: home,
-          XDG_CONFIG_HOME: join(home, '.config'),
-          XDG_DATA_HOME: join(home, '.local', 'share'),
-          XDG_CACHE_HOME: join(home, '.cache'),
-          DIRENV_LOG_FORMAT: '',
-        };
-        const direnv = async (args: readonly string[], env: Record<string, string>) => {
-          const proc = Bun.spawn({ cmd: ['direnv', ...args], cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
-          const [stdout, stderr, exitCode] = await Promise.all([
-            new Response(proc.stdout).text(),
-            new Response(proc.stderr).text(),
-            proc.exited,
-          ]);
-          expect({ args, exitCode, stderr: exitCode === 0 ? '' : stderr }).toEqual({ args, exitCode: 0, stderr: '' });
-          return stdout;
-        };
-
+        const { base, direnv } = isolatedDirenv(root);
         await direnv(['allow', root], base);
         // The load a shell pool keeps: every variable the export sets.
         const loaded: Record<string, string> = { ...base };
@@ -1243,6 +1248,25 @@ describe('a shell direnv keeps loaded', () => {
         expect(await direnv(['export', 'json'], loaded)).toBe('');
         await edit(join(root, MEMBER), JSON.stringify({ name: 'member', version: '0.0.1' }));
         expect(await direnv(['export', 'json'], loaded)).not.toBe('');
+      },
+    );
+  });
+
+  it("is built from the checkout alone, never from a parent directory's .envrc", async () => {
+    await withManagedRepository(
+      { files: { 'tooling/direnv/envrc.sh': 'export DEVENV_ROOT="$PWD"\n' } },
+      async ({ root }) => {
+        const { base, direnv } = isolatedDirenv(root);
+        // An approved .envrc one directory up, as a checkout under a projects folder has.
+        const parent = join(dirname(root), '.envrc');
+        await writeFile(parent, 'export SMOO_PARENT_ENVRC=loaded\n');
+        await direnv(['allow', parent], base);
+        await direnv(['allow', root], base);
+
+        const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
+        const variables = new Map(Object.entries(exported ?? {}));
+        expect(variables.get('DEVENV_ROOT')).toBe(join(root, 'tooling', 'direnv'));
+        expect(variables.has('SMOO_PARENT_ENVRC')).toBe(false);
       },
     );
   });
