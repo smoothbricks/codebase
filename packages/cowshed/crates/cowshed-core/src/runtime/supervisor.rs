@@ -156,6 +156,7 @@ impl Default for WorkspaceSupervisorConfig {
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
                 shared_tool_homes: Vec::new(),
+                home_reads: Vec::new(),
             },
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),
@@ -4700,6 +4701,7 @@ mod workspace_toolchain_tests {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         }
     }
 
@@ -5216,6 +5218,7 @@ mod workspace_toolchain_tests {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         };
 
         let path = bootstrap_path_from(&sandbox, None, &[profile]).expect("bootstrap PATH");

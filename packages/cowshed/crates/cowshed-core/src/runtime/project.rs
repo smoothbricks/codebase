@@ -8662,7 +8662,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // Every workspace runs under the project's grants, so the candidate is validated as the
         // one workspace every project has runs: main, with its own grants plus the candidate. The
         // denies that differ between workspaces are their own mounts, which the mount-root deny
-        // covers for all of them alike.
+        // covers for all of them alike, and main's mount, which every other workspace denies by
+        // name: that one is added to main's shape below.
         let main = self.current(&main_name()).await?;
         let main_mount = self.workspace_mount_path(&main_name())?;
         let path = self.layout.project().policy.clone();
@@ -8709,6 +8710,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 main_mount,
             )?;
             validate_grant_sandbox(&config)?;
+            let mut sibling = config;
+            sibling
+                .additional_denies
+                .push(sibling.workspace_mount.clone());
+            validate_grant_sandbox(&sibling)?;
             policy.grants.revision = policy
                 .grants
                 .revision
@@ -12350,6 +12356,7 @@ mod grant_unit_tests {
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         }
     }
 
@@ -12638,9 +12645,10 @@ fn supervisor_sandbox(
         home,
         mount_root: &layout.project().host_mount_root,
         project_root: &layout.project().project_root,
+        main_mount: &main_mount,
         telemetry_root,
         grants,
-        git_worktree_repository: git_worktree_repository(&current.metadata, main_mount),
+        git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
         workspace_mount: mount,
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)

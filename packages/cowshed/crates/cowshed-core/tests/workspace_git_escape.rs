@@ -46,6 +46,7 @@ fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
         additional_denies: Vec::new(),
         git_worktree_repository: None,
         shared_tool_homes: Vec::new(),
+        home_reads: Vec::new(),
     }
 }
 

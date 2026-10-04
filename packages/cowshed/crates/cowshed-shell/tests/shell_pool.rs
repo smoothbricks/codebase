@@ -86,6 +86,7 @@ impl Workspace {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         }
     }
 

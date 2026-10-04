@@ -267,6 +267,66 @@ pub fn shared_tool_homes(home: &Path, caches: &Path) -> Vec<&'static SharedToolH
         .collect()
 }
 
+/// A path beneath the host HOME a sandboxed process may read despite the HOME-wide read deny.
+///
+/// The profile denies every read under HOME and admits back only what is named here, plus
+/// the explicit read/write grants, the workspace's own mount and the controller-owned sockets.
+/// Read-only by construction: nothing in this list can grant a write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HomeRead {
+    /// The path itself — a directory to traverse or a link to resolve — never its contents.
+    Literal(PathBuf),
+    /// The path and everything beneath it.
+    Tree(PathBuf),
+}
+
+impl HomeRead {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Literal(path) | Self::Tree(path) => path,
+        }
+    }
+}
+
+/// The one place the HOME read allowlist is built: what a toolchain needs from the host HOME.
+///
+/// - A shared tool home ([`shared_tool_homes`]): its host path and each of its links into the
+///   caches volume, as literals. The bytes they resolve to are on the caches volume, outside
+///   HOME; the rest of the host tool home — configuration, credentials, binaries — stays denied.
+/// - A tool cache checkouts link into while it is still a private host directory
+///   ([`SharedToolHome::linked_from_checkouts`]): the whole cache, or a cloned `node_modules`
+///   resolves to EPERM in the sandbox while the same tree works on the host.
+/// - The host user's Nix profile links (`~/.nix-profile`, `~/.local/state/nix/profile`): the
+///   supervisor resolves `direnv`, `devenv` and `nix` through them before any shell exists.
+///   Each is a link into `/nix`, so naming the link admits no HOME bytes.
+/// - The sccache GC root: the supervisor reads it to name the `RUSTC_WRAPPER` store path. A
+///   link into `/nix/store`, likewise.
+pub fn home_read_allowlist(home: &Path, shared: &[&'static SharedToolHome]) -> Vec<HomeRead> {
+    let mut reads = Vec::new();
+    for tool in SHARED_TOOL_HOMES {
+        let host = tool.host_path(home);
+        if shared.contains(&tool) {
+            reads.push(HomeRead::Literal(host.clone()));
+            if let SharedLayout::Split { links, .. } = &tool.layout {
+                reads.extend(
+                    links
+                        .iter()
+                        .map(|(child, _)| HomeRead::Literal(host.join(child))),
+                );
+            }
+        } else if tool.linked_from_checkouts {
+            reads.push(HomeRead::Tree(host));
+        }
+    }
+    reads.extend(
+        [".nix-profile", ".local/state/nix/profile"]
+            .into_iter()
+            .map(|link| HomeRead::Literal(home.join(link))),
+    );
+    reads.push(HomeRead::Literal(sccache_gc_root(home)));
+    reads
+}
+
 /// Tool caches host setup relocates onto the caches volume beside the shared tool homes, as
 /// `(path under HOME, path under the caches root)`; every sandbox shares the second read-write.
 pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
@@ -398,6 +458,8 @@ pub struct SandboxConfig {
     /// The tool homes whose caches are the shared ones ([`shared_tool_homes`]); every child uses
     /// their host paths, and every other tool keeps its private default under the sandbox HOME.
     pub shared_tool_homes: Vec<&'static SharedToolHome>,
+    /// What the HOME-wide read deny admits back; see [`home_read_allowlist`].
+    pub home_reads: Vec<HomeRead>,
 }
 
 impl SandboxConfig {
@@ -428,6 +490,8 @@ pub struct WorkspaceSandbox<'a> {
     pub mount_root: &'a Path,
     /// The project root, which no workspace process may read.
     pub project_root: &'a Path,
+    /// Main's canonical mount: the operator's own checkout, which no other workspace may read.
+    pub main_mount: &'a Path,
     /// The telemetry root, which no workspace process may read.
     pub telemetry_root: &'a Path,
     /// The workspace's effective grants: its own and the project's.
@@ -448,12 +512,21 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         home,
         mount_root,
         project_root,
+        main_mount,
         telemetry_root,
         grants,
         git_worktree_repository,
         workspace_mount: mount,
         exec_temp_dir,
     } = workspace;
+    let shared_tool_homes = shared_tool_homes(home, Path::new(CACHES_ROOT));
+    // Main's checkout lives at the operator's own path, outside the mount root, so the
+    // sibling-mount deny never reaches it: it is denied by name, exactly like a sibling. Main
+    // itself runs in its own mount and keeps it.
+    let mut additional_denies = vec![project_root.to_path_buf(), telemetry_root.to_path_buf()];
+    if mount != main_mount {
+        additional_denies.push(main_mount.to_path_buf());
+    }
     Ok(SandboxConfig {
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
@@ -490,9 +563,10 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
             .into_iter()
             .chain([sccache_server_socket()])
             .collect(),
-        additional_denies: vec![project_root.to_path_buf(), telemetry_root.to_path_buf()],
+        additional_denies,
         git_worktree_repository,
-        shared_tool_homes: shared_tool_homes(home, Path::new(CACHES_ROOT)),
+        home_reads: home_read_allowlist(home, &shared_tool_homes),
+        shared_tool_homes,
     })
 }
 
@@ -616,6 +690,25 @@ fn validated_sandbox_paths(
             });
         }
     }
+    // A HOME read only ever narrows the HOME-wide deny: it stays strictly beneath HOME and
+    // never inside a protected path. One that encloses a secret is harmless — the secret denies
+    // are the profile's last word — so only containment is refused.
+    for read in &config.home_reads {
+        let path = read.path();
+        validate_path(path)?;
+        if path == config.home || !path.starts_with(&config.home) {
+            return Err(SandboxError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "home read must be strictly beneath HOME",
+            });
+        }
+        if let Some(deny) = hard_denies.iter().find(|deny| path.starts_with(deny)) {
+            return Err(SandboxError::GrantIntersectsDeny {
+                grant: path.to_path_buf(),
+                deny: deny.as_ref().to_path_buf(),
+            });
+        }
+    }
 
     Ok(ValidatedSandboxPaths {
         hard_denies,
@@ -652,6 +745,11 @@ pub fn seatbelt_profile(
     push_line(&mut profile, "(deny file-link)");
     if role != SandboxProfileRole::GitDiscovery {
         push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
+        // The broad allow is for system paths. Nothing under HOME is readable unless a later
+        // rule names it: an explicit grant, the workspace's own mount, the exec temp dir, an
+        // allowed socket, or the toolchain allowlist ([`home_read_allowlist`]). Every one of
+        // those follows here, so last-match-wins carves each back.
+        push_subpath_rule(&mut profile, "deny file-read*", &config.home)?;
     } else {
         // Git's isolated global configuration is the empty device, not user HOME.
         push_literal_rule(&mut profile, "allow file-read*", Path::new("/dev/null"))?;
@@ -823,27 +921,29 @@ pub fn seatbelt_profile(
         for link in tool.links(&config.home, caches) {
             push_subpath_rule(&mut profile, "allow file-read* file-write*", &link.shared)?;
         }
-        let host = tool.host_path(&config.home);
-        if config.shared_tool_homes.contains(&tool) {
-            // The host path and its links resolve for the tool, and at the root of a split home
-            // the tool writes its own state files. Nothing else in the host tool home is
-            // granted; configuration, credentials and binaries there stay hard denies.
-            push_readable_ancestors(&mut profile, &host)?;
-            if let SharedLayout::Split { links, state_files } = &tool.layout {
-                for (child, _) in *links {
-                    push_literal_rule(&mut profile, "allow file-read*", &host.join(child))?;
-                }
-                for file in *state_files {
-                    push_literal_rule(
-                        &mut profile,
-                        "allow file-read* file-write*",
-                        &host.join(file),
-                    )?;
-                }
+        // At the root of a split home the tool writes its own state files. Nothing else in the
+        // host tool home is writable; what it may read is in `home_reads`.
+        if config.shared_tool_homes.contains(&tool)
+            && let SharedLayout::Split { state_files, .. } = &tool.layout
+        {
+            for file in *state_files {
+                push_literal_rule(
+                    &mut profile,
+                    "allow file-read* file-write*",
+                    &tool.host_path(&config.home).join(file),
+                )?;
             }
-        } else if tool.linked_from_checkouts {
-            push_subpath_rule(&mut profile, "allow file-read*", &host)?;
-            push_readable_ancestors(&mut profile, &host)?;
+        }
+    }
+    // The HOME read allowlist. Its entries' ancestors get metadata only: enough to resolve and
+    // `realpath` through them, never to list `~` or `~/Library/Application Support`.
+    for read in &config.home_reads {
+        match read {
+            HomeRead::Literal(path) => push_literal_rule(&mut profile, "allow file-read*", path)?,
+            HomeRead::Tree(path) => push_subpath_rule(&mut profile, "allow file-read*", path)?,
+        }
+        for ancestor in read.path().ancestors().skip(1) {
+            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
         }
     }
     // sccache is deliberately absent: every disk-cache read and write happens inside the
@@ -1184,6 +1284,7 @@ mod tests {
             additional_denies: vec![],
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         }
     }
 
@@ -1299,6 +1400,143 @@ mod tests {
         assert!(!profile.contains(
             "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/swift\"))"
         ));
+    }
+
+    /// Reads under HOME deny by default: the deny follows the broad system read and precedes
+    /// every carve-back — an explicit grant, the workspace's own mount, the toolchain allowlist —
+    /// so last-match-wins admits each of those and nothing else.
+    #[test]
+    fn home_reads_deny_by_default_and_every_carve_back_follows_the_deny() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.grants.read = vec![PathBuf::from("/Users/tester/Dev/sibling")];
+        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let broad = profile
+            .find("(allow file-read-data (subpath \"/\"))")
+            .unwrap();
+        let home_deny = profile
+            .find("(deny file-read* (subpath \"/Users/tester\"))\n(deny file-read-data (subpath \"/Users/tester\"))\n")
+            .expect("HOME read deny, data reads included");
+        assert!(broad < home_deny);
+        for carve_back in [
+            "(allow file-read* (subpath \"/Users/tester/Dev/sibling\"))",
+            "(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))",
+            "(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))",
+            "(allow file-read* (literal \"/Users/tester/.nix-profile\"))",
+            "(allow file-read* (literal \"/Users/tester/Library/Application Support/dev.cowshed/nix/sccache\"))",
+        ] {
+            let at = profile
+                .find(carve_back)
+                .unwrap_or_else(|| panic!("missing {carve_back}"));
+            assert!(home_deny < at, "{carve_back} must follow the HOME deny");
+        }
+        // The sccache root's ancestors resolve but do not list.
+        assert!(profile.contains(
+            "(allow file-read-metadata (literal \"/Users/tester/Library/Application Support\"))"
+        ));
+        assert!(!profile.contains(
+            "(allow file-read* (literal \"/Users/tester/Library/Application Support\"))"
+        ));
+        // Controller-only Git discovery never had the broad read, so it needs no HOME deny.
+        let discovery = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).unwrap();
+        assert!(!discovery.contains("(allow file-read-data (subpath \"/\"))"));
+    }
+
+    #[test]
+    fn home_reads_stay_strictly_beneath_home_and_outside_protected_paths() {
+        for (read, expected) in [
+            (
+                HomeRead::Literal(PathBuf::from("/opt/tool")),
+                Err(SandboxError::InvalidPath {
+                    path: PathBuf::from("/opt/tool"),
+                    reason: "home read must be strictly beneath HOME",
+                }),
+            ),
+            (
+                HomeRead::Tree(PathBuf::from("/Users/tester")),
+                Err(SandboxError::InvalidPath {
+                    path: PathBuf::from("/Users/tester"),
+                    reason: "home read must be strictly beneath HOME",
+                }),
+            ),
+            (
+                HomeRead::Tree(PathBuf::from("/Users/tester/.ssh/keys")),
+                Err(SandboxError::GrantIntersectsDeny {
+                    grant: PathBuf::from("/Users/tester/.ssh/keys"),
+                    deny: PathBuf::from("/Users/tester/.ssh"),
+                }),
+            ),
+            (
+                HomeRead::Tree(PathBuf::from("/Users/tester/.cowshed/mnt/acme")),
+                Err(SandboxError::GrantIntersectsDeny {
+                    grant: PathBuf::from("/Users/tester/.cowshed/mnt/acme"),
+                    deny: PathBuf::from("/Users/tester/.cowshed/mnt"),
+                }),
+            ),
+            // Enclosing a secret is harmless: the secret denies are the profile's last word.
+            (
+                HomeRead::Tree(PathBuf::from("/Users/tester/.cargo")),
+                Ok(()),
+            ),
+        ] {
+            let mut config = config(RunSandboxMode::ReadWrite);
+            config.home_reads = vec![read];
+            assert_eq!(validate_sandbox_config(&config), expected);
+        }
+    }
+
+    /// Main's checkout sits at the operator's own path, outside the mount root, so the sibling
+    /// deny never reached it. The production builder denies it by name to every other
+    /// workspace, in the same shape as a sibling's deny, and never to main itself.
+    #[test]
+    fn the_workspace_builder_denies_main_to_every_workspace_but_main() {
+        let home = Path::new("/Users/tester");
+        let mount_root = Path::new("/Users/tester/.cowshed/mnt");
+        let main = Path::new("/Users/tester/Dev/widget");
+        let grants = crate::metadata::GrantSet {
+            port_block: Some(PortBlock::new(40_960, 16).unwrap()),
+            ..crate::metadata::GrantSet::default()
+        };
+        let build = |mount: &Path| {
+            workspace_sandbox(WorkspaceSandbox {
+                home,
+                mount_root,
+                project_root: Path::new("/private/cowshed/store/projects/acme"),
+                main_mount: main,
+                telemetry_root: Path::new("/private/cowshed/store/telemetry"),
+                grants: &grants,
+                git_worktree_repository: None,
+                workspace_mount: mount.to_path_buf(),
+                exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
+            })
+            .unwrap()
+        };
+        let main_deny = "(deny file-read* file-write* (literal \"/Users/tester/Dev/widget\") (subpath \"/Users/tester/Dev/widget\"))";
+
+        let raven = build(&mount_root.join("acme/widget/raven"));
+        assert!(raven.additional_denies.contains(&main.to_path_buf()));
+        let profile = seatbelt_profile(&raven, SandboxProfileRole::ExecutedChild).unwrap();
+        let deny = profile.find(main_deny).expect("main denied like a sibling");
+        let own = profile
+            .find("(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/raven\"))")
+            .unwrap();
+        assert!(own < deny, "no workspace carve-back may follow main's deny");
+        // An explicit grant into main is refused rather than silently shadowed.
+        let mut granted = raven.clone();
+        granted.grants.read.push(main.join("docs"));
+        assert_eq!(
+            validate_sandbox_config(&granted),
+            Err(SandboxError::GrantIntersectsDeny {
+                grant: main.join("docs"),
+                deny: main.to_path_buf(),
+            })
+        );
+
+        let itself = build(main);
+        assert!(!itself.additional_denies.contains(&main.to_path_buf()));
+        let profile = seatbelt_profile(&itself, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(!profile.contains(main_deny));
+        assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/Dev/widget\"))"));
     }
 
     #[test]
@@ -1520,6 +1758,7 @@ mod tests {
     fn a_shared_cargo_home_grants_its_caches_and_state_files_only() {
         let mut config = config(RunSandboxMode::ReadWrite);
         config.shared_tool_homes = vec![&CARGO];
+        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
 
         for directory in ["registry", "git"] {
@@ -1672,14 +1911,15 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A shared cache that is the whole host path grants the link and its ancestors as literals:
-    /// the child resolves through them into the shared directory, and nothing else in the host
-    /// tool home — `~/.bun/bin`, the rest of `~/.cache` — is granted. The secret denies still
-    /// follow every one of those grants.
+    /// A shared cache that is the whole host path grants the link as a literal and its ancestors
+    /// metadata only: the child resolves through them into the shared directory, and nothing
+    /// else in the host tool home — `~/.bun/bin`, the rest of `~/.cache` — is granted. The secret
+    /// denies still follow every one of those grants.
     #[test]
     fn a_shared_cache_home_grants_its_link_and_ancestors_and_nothing_else() {
         let mut config = config(RunSandboxMode::ReadWrite);
         config.shared_tool_homes = SHARED_TOOL_HOMES.to_vec();
+        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         let secret = profile
             .find("(deny file-read* file-write* (literal \"/Users/tester/.ssh\")")
@@ -1688,11 +1928,18 @@ mod tests {
             "/Users/tester/.bun/install/cache",
             "/Users/tester/.cache/uv",
         ] {
-            for ancestor in Path::new(link).ancestors() {
-                let grant = format!("(allow file-read* (literal \"{}\"))", ancestor.display());
+            let grants = std::iter::once(format!("(allow file-read* (literal \"{link}\"))")).chain(
+                Path::new(link).ancestors().skip(1).map(|ancestor| {
+                    format!(
+                        "(allow file-read-metadata (literal \"{}\"))",
+                        ancestor.display()
+                    )
+                }),
+            );
+            for grant in grants {
                 let last = profile
                     .rfind(&grant)
-                    .unwrap_or_else(|| panic!("{} is not readable", ancestor.display()));
+                    .unwrap_or_else(|| panic!("missing {grant}"));
                 assert!(last < secret, "the secret denies must follow {grant}");
             }
             assert!(
@@ -1749,19 +1996,20 @@ mod tests {
     /// nothing on the host.
     #[test]
     fn an_unshared_bun_cache_stays_readable_for_the_links_checkouts_hold() {
-        let profile = seatbelt_profile(
-            &config(RunSandboxMode::ReadWrite),
-            SandboxProfileRole::ExecutedChild,
-        )
-        .unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home_reads = home_read_allowlist(&config.home, &config.shared_tool_homes);
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         assert!(
             profile.contains("(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))")
         );
         assert!(!profile.contains(
             "(allow file-read* file-write* (subpath \"/Users/tester/.bun/install/cache\"))"
         ));
-        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun\"))"));
-        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun/install\"))"));
+        assert!(profile.contains("(allow file-read-metadata (literal \"/Users/tester/.bun\"))"));
+        assert!(
+            profile.contains("(allow file-read-metadata (literal \"/Users/tester/.bun/install\"))")
+        );
+        assert!(!profile.contains("(allow file-read* (literal \"/Users/tester/.bun\"))"));
         assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.bun\"))"));
         assert!(!profile.contains("\"/Users/tester/.cache"));
     }

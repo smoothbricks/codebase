@@ -154,10 +154,10 @@ other destinations need egress grants. npm installs use the gateway's verified a
 arrive by `git clone` over an intercepted egress grant for their host, which admits fetch and refuses push. Need a dev
 server? On macOS, bind it to a port from `$COWSHED_PORT_BASE + 1` up — each workspace owns a block of
 `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from the host browser
-container-style and guaranteed not to collide with sibling workspaces. A new block holds 63 service ports; a service
-set that needs more is a grant to negotiate before you launch it — `cowshed grant <ws> --ports <N>` from the trusted
-host — because growing the block is refused while any of the workspace's jobs is running, and the next exec is the
-first to see the larger block. On Linux your loopback is private, so bind the ports you like.
+container-style and guaranteed not to collide with sibling workspaces. A new block holds 63 service ports; a service set
+that needs more is a grant to negotiate before you launch it — `cowshed grant <ws> --ports <N>` from the trusted host —
+because growing the block is refused while any of the workspace's jobs is running, and the next exec is the first to see
+the larger block. On Linux your loopback is private, so bind the ports you like.
 
 **Exit code 6 is not an error to retry — it is a request to negotiate.** When cowshed reports 6 it has authoritative
 evidence of the denial (egress denials always — the gateway logged the decision; filesystem denials when the kernel
@@ -198,8 +198,10 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 
 ## What agents must not expect
 
-- No writes to `$HOME`, no reading `~/.ssh`, `~/.aws`, keychains, or other projects — closed means closed, and
-  `cowshed grant` is the only door.
+- No writes to `$HOME`, and no reads under it either: everything under `$HOME` is unreadable except your own workspace,
+  the shared tool caches and Nix profile links cowshed lists, and paths granted with `--read`/`--write`. Main's checkout
+  is unreadable like any sibling workspace, and so are other projects — closed means closed, and `cowshed grant` is the
+  only door.
 - No direct internet. Public npm HTTPS reads have an anonymous default grant; every other destination needs an egress
   grant. Explicit matching registry grants override the default, including opaque grants. Credentials are injected
   upstream by the gateway — there are no registry tokens inside the workspace to find, and no `.env` files.

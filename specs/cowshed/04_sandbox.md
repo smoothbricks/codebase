@@ -29,8 +29,13 @@ Shape:
 (version 1)
 (deny default)
 
-;; dyld and toolchains need broad read to boot processes.
+;; dyld and toolchains need broad read to boot processes: SYSTEM paths only.
 (allow file-read-data (subpath "/"))
+;; HOME reads deny by default. Every rule below that admits a path under HOME —
+;; a read/write grant, the own mount, the exec temp dir, an allowed socket's
+;; ancestors, the toolchain allowlist — follows this deny and carves back just
+;; that path. Nothing under HOME is readable because it merely exists.
+(deny file-read* file-read-data (subpath "~"))
 (allow process-exec process-fork)
 (allow file-map-executable)
 (allow sysctl-read)
@@ -126,10 +131,19 @@ Shape:
   (subpath "/private/cowshed/caches/go/mod")
   (subpath "/private/cowshed/caches/go/build")
   (subpath "/private/cowshed/caches/ttsc"))
-;; A shared tool home (03_caches.md) is reached through the host's literal path:
-;; once its caches are relocated, literal reads of that path and its ancestors
-;; (plus cargo's registry/git links and read-write literals for cargo's root
-;; state files) — never a subpath of a host tool home.
+;; The HOME read allowlist (`SandboxConfig::home_reads`, built only by
+;; `home_read_allowlist`): typed `HomeRead::Literal` / `HomeRead::Tree` entries,
+;; read-only, strictly beneath HOME, never inside a protected path. Each entry's
+;; ancestors get `file-read-metadata` literals only — resolvable, never listable.
+;;   - a shared tool home (03_caches.md): literal reads of its host path and of
+;;     cargo's registry/git links — never a subpath of a host tool home; cargo's
+;;     root state files get read-write literals outside the allowlist;
+;;   - bun's install cache while it is still a private host directory (Tree);
+;;   - the user's nix profile links ~/.nix-profile and ~/.local/state/nix/profile,
+;;     which the supervisor resolves direnv/devenv/nix through;
+;;   - the sccache GC root, which the supervisor reads to name RUSTC_WRAPPER.
+(allow file-read* file-read-data (literal "~/.nix-profile"))  ;; … one per entry
+(allow file-read-metadata (literal "~") (literal "/Users") (literal "/"))  ;; its ancestors
 (allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
 ;; TMPDIR: the workspace's own directory in its project's store directory,
 ;; <store>/<owner>/<repo>/tmp/<workspace> (01_storage.md). Outside every checkout,
@@ -152,6 +166,8 @@ Shape:
   (literal "~/.gradle/gradle.properties")
   (subpath "~/go")                                     ;; misconfig tripwire, not a secret (see notes)
   (subpath "~/Library/Keychains")
+  (subpath "<project root>") (subpath "<telemetry root>")
+  (subpath "<main's canonical mount>")                 ;; every workspace but main
   … denied paths from policy …)
 ```
 
@@ -210,6 +226,21 @@ Notes:
   designated caches writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the
   old enumerated list: sibling workspace mounts and projects adopted after profile generation are covered without being
   named.
+- **Read policy.** The broad `file-read-data` allow exists for system paths outside HOME (dyld, `/usr`, `/System`,
+  `/Applications`, `/nix/store`, `/opt`, …), which stay readable. Under HOME a read is denied unless a rule names it,
+  and the rules that do are exactly: explicit `read`/`write` grants, the workspace's own mount (and the exact literal
+  ancestors `getcwd` needs), the exec temp dir, allowed sockets' ancestors, and the HOME read allowlist above. The
+  allowlist is built in one place, `home_read_allowlist`, so a capability detector supplies entries there and nowhere
+  else. A workspace's sandbox `HOME`, `XDG_*` directories and runtime dir are inside its own mount, so the deny takes
+  nothing a child's private home holds. Reported leak this closes: a job `cat`ting `~/.omp/agent/agent.db` or
+  `~/Library/Application Support/*` — the broad data allow admitted any file whose metadata was denied.
+- **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the configured mount root,
+  so the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
+  but main now carries main's canonical mount among its policy denies (`file-read* file-write*`, exact and subpath, the
+  shape a sibling's mount gets from the mount-root deny); main keeps its own mount. A grant into main's checkout is
+  refused by validation, and project-wide grants are validated against that non-main shape as well as main's. A
+  git-worktree workspace's `.git` carve-back still follows the deny, narrowed to `.git`. Explicit read grants of another
+  repository's main are unaffected.
 - The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
@@ -217,11 +248,12 @@ Notes:
   precisely because the cache volume is sandbox-writable. Once a shared tool's caches are relocated, a child is pointed
   at the host's literal path — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`,
   `UV_CACHE_DIR=~/.cache/uv` (the one path that keeps cargo's dependency fingerprints and bun's `node_modules/.bun`
-  links equal across checkouts) — and its profile adds exactly: literal reads of that path and its ancestors, of cargo's
-  `registry` and `git` links, and read-write literals for cargo's root state files `.package-cache`,
-  `.package-cache-mutate`, `.global-cache` and `.global-cache-journal`. Nothing else in `~/.cargo`, `~/.bun` or
-  `~/.cache` is granted. Until bun's cache is relocated, `~/.bun/install/cache` stays readable, never writable: a
-  clone's `node_modules` carries main's links into it. The denies above still follow every one of those grants.
+  links equal across checkouts) — and its profile adds exactly: through the HOME read allowlist, literal reads of that
+  path (its ancestors metadata only) and of cargo's `registry` and `git` links; and read-write literals for cargo's root
+  state files `.package-cache`, `.package-cache-mutate`, `.global-cache` and `.global-cache-journal`. Nothing else in
+  `~/.cargo`, `~/.bun` or `~/.cache` is granted. Until bun's cache is relocated, `~/.bun/install/cache` stays readable,
+  never writable: a clone's `node_modules` carries main's links into it. The denies above still follow every one of
+  those grants.
 - The `~/go` deny is a **misconfiguration tripwire, not secret protection**: once the in-image `GOENV` wiring
   (03_caches.md) is in place nothing should ever touch `~/go` — `GOMODCACHE`/`GOCACHE` live on the caches volume,
   `GOPATH`/`GOBIN` in-image. A go invocation that missed the wiring (unwrapped spawn, editor without direnv) would

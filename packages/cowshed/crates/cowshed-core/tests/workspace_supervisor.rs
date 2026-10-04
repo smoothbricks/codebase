@@ -386,6 +386,7 @@ fn config() -> WorkspaceSupervisorConfig {
             shed_links: Vec::new(),
             git_worktree_repository: None,
             shared_tool_homes: Vec::new(),
+            home_reads: Vec::new(),
         },
         artifacts: ArtifactConfig {
             combined_output_quota_bytes: 1024,

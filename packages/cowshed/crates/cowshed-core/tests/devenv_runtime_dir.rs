@@ -16,14 +16,17 @@ use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
 use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::{MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{
+    GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
     ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SandboxPolicy, SpawnSink,
     SystemSpawnSink, WorkspaceAuthoritySnapshot,
 };
 use cowshed_core::sandbox::{
-    RunSandboxMode, SandboxConfig, SandboxGrants, sandbox_runtime_dir, sandbox_runtime_link,
+    RunSandboxMode, SandboxConfig, SandboxGrants, WorkspaceSandbox, sandbox_runtime_dir,
+    sandbox_runtime_link, workspace_sandbox,
 };
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
@@ -100,6 +103,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         shed_links: Vec::new(),
         git_worktree_repository: None,
         shared_tool_homes: Vec::new(),
+        home_reads: Vec::new(),
     }
 }
 
@@ -1458,4 +1462,237 @@ const timer = setInterval(async () => {
     );
     assert!(started, "watcher must start before publishing changes");
     std::fs::remove_dir_all(root).expect("remove watcher fixture");
+}
+
+/// A workspace sandbox built by the production builder, [`workspace_sandbox`], for a mount the
+/// fixture prepares the way `cowshed new` leaves one: private bin and token in place.
+fn production_workspace(
+    root: &Path,
+    home: &Path,
+    mount_root: &Path,
+    main: &Path,
+    mount: PathBuf,
+    port_base: u16,
+) -> SandboxConfig {
+    std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
+    std::fs::write(
+        mount.join(WORKSPACE_TOKEN_PATH),
+        WorkspaceToken::from_bytes([7; 32]).encode(),
+    )
+    .expect("workspace token");
+    let exec_temp_dir = root.join(format!("tmp-{port_base}"));
+    std::fs::create_dir_all(&exec_temp_dir).expect("exec temp dir");
+    workspace_sandbox(WorkspaceSandbox {
+        home,
+        mount_root,
+        project_root: &root.join("project"),
+        main_mount: main,
+        telemetry_root: &root.join("telemetry"),
+        grants: &GrantSet {
+            port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
+            ..GrantSet::default()
+        },
+        git_worktree_repository: None,
+        workspace_mount: mount,
+        exec_temp_dir,
+    })
+    .expect("production workspace sandbox")
+}
+
+/// What `cat` of each path printed, or why it was refused.
+async fn read_outcomes(sandbox: &SandboxConfig, paths: &[&Path]) -> Vec<(PathBuf, String)> {
+    let mut outcomes = Vec::new();
+    for path in paths {
+        let (exit, stdout, stderr) = run_in_sandbox(
+            sandbox,
+            &sandbox.workspace_mount,
+            vec!["/bin/cat".into(), path.as_os_str().to_owned()],
+        )
+        .await;
+        let outcome = match exit {
+            ExitStatus::Exited { code: 0 } => {
+                format!("read {:?}", String::from_utf8_lossy(&stdout))
+            }
+            _ => String::from_utf8_lossy(&stderr).trim().to_owned(),
+        };
+        outcomes.push((path.to_path_buf(), outcome));
+    }
+    outcomes
+}
+
+/// The read leak, closed: a workspace job could `cat` main's checkout — mounted at the
+/// operator's own path, outside the mount root the sibling deny covers, `.cowshed/token`
+/// included — and anything under HOME, because the profile's broad `file-read-data` reached
+/// both. Main's checkout is now denied by name like a sibling and HOME reads deny by default.
+/// Main itself still reads its own checkout. The mount root sits under HOME as on a host; main
+/// sits outside HOME, so its deny is proven on its own rather than by the HOME deny.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_allowlist() {
+    let root = scratch("read-policy");
+    let home = root.join("home");
+    let mount_root = home.join("Dev/.cowshed");
+    let main = root.join("checkouts/widget");
+    let raven = mount_root.join("acme/widget/raven");
+    let agent_db = home.join(".omp/agent/agent.db");
+    let application_support = home.join("Library/Application Support/Fixture/state.json");
+    let main_untracked = main.join("untracked.txt");
+    for (path, contents) in [
+        (&agent_db, "agent-db-sentinel"),
+        (&application_support, "application-support-sentinel"),
+        (&main_untracked, "main-untracked-sentinel"),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture dir");
+        std::fs::write(path, contents).expect("fixture file");
+    }
+    let main_sandbox = production_workspace(&root, &home, &mount_root, &main, main.clone(), 42_496);
+    let sandbox = production_workspace(&root, &home, &mount_root, &main, raven.clone(), 42_512);
+    let own = raven.join("own.txt");
+    std::fs::write(&own, "own-sentinel").expect("own fixture");
+    let main_token = main.join(WORKSPACE_TOKEN_PATH);
+
+    let leaks: Vec<_> = read_outcomes(
+        &sandbox,
+        &[
+            &main_token,
+            &main_untracked,
+            &agent_db,
+            &application_support,
+        ],
+    )
+    .await
+    .into_iter()
+    .filter(|(_, outcome)| !outcome.ends_with("Operation not permitted"))
+    .collect();
+    let own_read = read_outcomes(&sandbox, &[&own]).await;
+    let main_reads_itself = read_outcomes(&main_sandbox, &[&main_untracked]).await;
+    std::fs::remove_dir_all(&root).expect("remove read-policy fixture");
+
+    assert!(
+        leaks.is_empty(),
+        "a workspace job read outside its allowlist: {leaks:#?}"
+    );
+    assert_eq!(
+        own_read[0].1, "read \"own-sentinel\"",
+        "own mount stays readable"
+    );
+    assert_eq!(
+        main_reads_itself[0].1, "read \"main-untracked-sentinel\"",
+        "main's own jobs keep reading main's checkout"
+    );
+}
+
+/// The HOME read deny leaves a real toolchain working, against the host's real HOME: shell
+/// activation loads the workspace's own `.envrc-local`, cargo builds and runs a crate (through
+/// the host's shared cargo home and sccache when it has them), and bun runs a module graph. A
+/// tool that needed anything under HOME beyond the allowlist would fail here.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
+    fn host_tool_bin(name: &str) -> PathBuf {
+        let installed = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("required build tool `{name}` is not on PATH"));
+        std::fs::canonicalize(installed)
+            .expect("resolve build tool")
+            .parent()
+            .expect("tool directory")
+            .to_path_buf()
+    }
+    let home = std::fs::canonicalize(std::env::var_os("HOME").expect("host HOME"))
+        .expect("canonical host HOME");
+    let root = scratch("read-policy-build");
+    let main = root.join("main");
+    std::fs::create_dir_all(&main).expect("main checkout");
+    let mount_root = root.join("mounts");
+    let sandbox = production_workspace(
+        &root,
+        &home,
+        &mount_root,
+        &main,
+        mount_root.join("acme/widget/raven"),
+        42_528,
+    );
+    install_real_tool(&sandbox, "direnv");
+    let mount = &sandbox.workspace_mount;
+    std::fs::write(
+        mount.join(".envrc"),
+        "source_env_if_exists \"$PWD/.envrc-local\"\n",
+    )
+    .expect("workspace envrc");
+    std::fs::write(
+        mount.join(".envrc-local"),
+        "export COWSHED_LOCAL_OVERRIDE=workspace\n",
+    )
+    .expect("workspace envrc-local");
+    std::fs::create_dir_all(mount.join("probe/src")).expect("probe crate");
+    std::fs::write(
+        mount.join("probe/Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("probe manifest");
+    std::fs::write(
+        mount.join("probe/src/main.rs"),
+        "fn main() { println!(\"cargo-built\"); }\n",
+    )
+    .expect("probe source");
+    std::fs::write(
+        mount.join("lib.ts"),
+        "export const greeting: string = 'bun-ran';\n",
+    )
+    .expect("bun module");
+    std::fs::write(
+        mount.join("main.ts"),
+        "import { greeting } from './lib.ts';\nconsole.log(greeting);\n",
+    )
+    .expect("bun entry");
+    // What the supervisor resolves through HOME before any shell exists — bootstrap tools
+    // through the user's Nix profile links, `RUSTC_WRAPPER` through the sccache GC root — must
+    // resolve under the same deny, to what the unsandboxed host resolves. A host without one
+    // of them has nothing to resolve there.
+    let resolved: Vec<(PathBuf, PathBuf)> = [
+        home.join(".nix-profile"),
+        home.join(".local/state/nix/profile"),
+        cowshed_core::sandbox::sccache_gc_root(&home),
+    ]
+    .into_iter()
+    .filter_map(|link| {
+        std::fs::canonicalize(&link)
+            .ok()
+            .map(|target| (link, target))
+    })
+    .collect();
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        mount,
+        [
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"set -e; PATH="$1:$2:$PATH"; export PATH; shift 2
+printf '%s\n' "$COWSHED_LOCAL_OVERRIDE"
+cd probe && cargo build --offline --quiet && ./target/debug/probe && cd ..
+bun run main.ts
+for link in "$@"; do /bin/realpath "$link"; done"#
+                .into(),
+            "build".into(),
+            host_tool_bin("cargo").into_os_string(),
+            host_tool_bin("bun").into_os_string(),
+        ]
+        .into_iter()
+        .chain(resolved.iter().map(|(link, _)| link.as_os_str().to_owned()))
+        .collect(),
+    )
+    .await;
+    std::fs::remove_dir_all(&root).expect("remove build fixture");
+    let mut expected = "workspace\ncargo-built\nbun-ran\n".to_owned();
+    for (_, target) in &resolved {
+        expected.push_str(&format!("{}\n", target.display()));
+    }
+    assert_eq!(
+        (exit, String::from_utf8_lossy(&stdout).into_owned()),
+        (ExitStatus::Exited { code: 0 }, expected),
+        "stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
 }
