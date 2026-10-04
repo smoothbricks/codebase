@@ -1926,16 +1926,37 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf>> {
+    claim_port_block_with(staging, base, |marker| std::fs::read_link(marker))
+}
+
+/// Claims `base`'s grid cell with a symlink naming this process, reclaiming a dead owner's.
+///
+/// Every creator tries the lowest free cell first, so a contended cell's marker comes and goes
+/// between our `symlink` and our look at it: its owner released it (or another claimant reclaimed
+/// a dead one) in that gap. A marker that is gone when read or removed is a released cell, never an
+/// error, and the claim is tried again. `read_owner` reads the marker's link; tests interpose there
+/// to release the cell inside that gap.
+#[cfg(target_os = "macos")]
+fn claim_port_block_with(
+    staging: &Path,
+    base: u16,
+    mut read_owner: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+) -> std::io::Result<Option<PathBuf>> {
     use std::os::unix::fs::symlink;
 
+    let released = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
     std::fs::create_dir_all(staging)?;
     let marker = staging.join(format!("port-{base}.reservation"));
     let owner = std::process::id().to_string();
-    for _ in 0..2 {
+    for _ in 0..3 {
         match symlink(&owner, &marker) {
             Ok(()) => return Ok(Some(marker)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = std::fs::read_link(&marker)?;
+                let existing = match read_owner(&marker) {
+                    Ok(existing) => existing,
+                    Err(error) if released(&error) => continue,
+                    Err(error) => return Err(error),
+                };
                 let existing = existing
                     .to_str()
                     .and_then(|value| value.parse::<u32>().ok())
@@ -1948,7 +1969,11 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
                 if process_is_alive(existing) {
                     return Ok(None);
                 }
-                std::fs::remove_file(&marker)?;
+                match std::fs::remove_file(&marker) {
+                    Ok(()) => {}
+                    Err(error) if released(&error) => {}
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         }
@@ -15765,8 +15790,8 @@ mod binding_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod port_reservation_tests {
     use super::{
-        claim_port_block, reserve_grown_port_grants, reserve_port_grant_replacement,
-        reserve_port_grants,
+        claim_port_block, claim_port_block_with, reserve_grown_port_grants,
+        reserve_port_grant_replacement, reserve_port_grants,
     };
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
@@ -15777,6 +15802,7 @@ mod port_reservation_tests {
     use crate::storage::StorageLayout;
     use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
 
     fn root(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -16352,6 +16378,31 @@ mod port_reservation_tests {
         let marker = root.join("port-40960.reservation");
         symlink(i32::MAX.to_string(), &marker).expect("stale marker");
         assert!(claim_port_block(&root, 40_960).expect("reclaim").is_some());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The cell's owner releases it between this claimant's refused `symlink` and its read of the
+    /// marker -- the window every creator contending for the lowest free cell races through. That
+    /// is a free cell, and the claim takes it rather than failing with the vanished marker's ENOENT.
+    #[test]
+    fn a_marker_released_while_it_is_read_is_claimed() {
+        let root = root("vanishing");
+        let holder = claim_port_block(&root, 40_960)
+            .expect("holder claim")
+            .expect("holder reservation");
+        let mut released = Some(holder);
+        let claimed = claim_port_block_with(&root, 40_960, |marker| {
+            if let Some(holder) = released.take() {
+                std::fs::remove_file(holder).expect("the holder releases its cell");
+            }
+            std::fs::read_link(marker)
+        })
+        .expect("a released cell is no error")
+        .expect("and is claimed");
+        assert_eq!(
+            std::fs::read_link(&claimed).expect("claimed marker"),
+            PathBuf::from(std::process::id().to_string())
+        );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
