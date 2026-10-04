@@ -9,7 +9,7 @@ import { stripVTControlCharacters } from 'node:util';
 import type { Task } from 'nx/src/config/task-graph';
 
 import { signalToCode } from 'nx/src/utils/exit-codes';
-
+import { stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { cliExitOutcome, describeMiss, firstCacheMiss, parseTargetSelector, unvouched } from './ensure-built.js';
 
 function task(overrides: Partial<Task> & Pick<Task, 'id'>): Task {
@@ -163,6 +163,12 @@ const repoRoot = dirname(dirname(packageRoot));
 const binEntry = join(packageRoot, 'src', 'bin', 'smoo-nx-exec.ts');
 const builtBinEntry = join(packageRoot, 'dist', 'bin', 'smoo-nx-exec.js');
 const MARKER = 'EXEC_OK';
+/**
+ * Caller directory overrides are deliberately stripped below. The fixture's
+ * own Nx configuration keeps both its cache and database under its removable
+ * root, even when smoo-nx-exec enters it from another workspace.
+ */
+const FIXTURE_NX_JSON = { useDaemonProcess: true, cacheDirectory: '.nx/cache' };
 /** Nx keys controlled and reported by the fixture rather than inherited from its parent test task. */
 const NX_ENV_KEYS = [
   'NX_WORKSPACE_ROOT_PATH',
@@ -293,7 +299,7 @@ describe('smoo-nx-exec', () => {
     // this package is written against, including node_modules/.bin/nx for the
     // daemon-disabled path.
     await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ useDaemonProcess: true }));
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify(FIXTURE_NX_JSON));
     await writeFile(
       join(workspace, 'packages', 'lib', 'project.json'),
       JSON.stringify({
@@ -372,7 +378,7 @@ describe('smoo-nx-exec', () => {
 
   afterAll(async () => {
     if (workspace) {
-      await nx(workspace, ['daemon', '--stop']);
+      await stopFixtureNxDaemon(workspace);
       await rm(workspace, { recursive: true, force: true });
       await rm(builds(), { force: true });
       await rm(ships(), { force: true });
@@ -402,6 +408,21 @@ describe('smoo-nx-exec', () => {
     expect(run.stdout).not.toContain('nx run');
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
     expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
+  });
+
+  it('owns its cache and database after caller directory overrides are stripped', async () => {
+    const run = await runBin(workspace, [
+      'app:build',
+      '--',
+      process.execPath,
+      '-e',
+      'const nx = require("nx/src/utils/cache-directory"); ' +
+        'console.log(JSON.stringify({ cache: nx.cacheDir, data: nx.sharedDataDirectory(process.cwd(), "workspace-data") }));',
+    ]);
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).toContain(
+      JSON.stringify({ cache: join(workspace, '.nx/cache'), data: join(workspace, '.nx/workspace-data') }),
+    );
   });
 
   it('stays silent through an uncacheable nx:noop aggregate, which has no command to run', async () => {
@@ -684,7 +705,7 @@ describe('smoo-nx-exec signal forwarding', () => {
     expect(initialized.exitCode).toBe(0);
     await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true });
     await symlink(join(repoRoot, 'node_modules', 'nx'), join(workspace, 'node_modules', 'nx'), 'dir');
-    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ useDaemonProcess: true }));
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify(FIXTURE_NX_JSON));
     await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
     await writeFile(
       join(workspace, 'packages', 'app', 'project.json'),
@@ -705,7 +726,7 @@ describe('smoo-nx-exec signal forwarding', () => {
   afterAll(async () => {
     if (workspace) {
       try {
-        await nx(workspace, ['daemon', '--stop']);
+        await stopFixtureNxDaemon(workspace);
       } finally {
         await rm(workspace, { recursive: true, force: true });
       }
@@ -734,7 +755,7 @@ describe('smoo-nx-exec daemon socket', () => {
     const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
     expect(initialized.exitCode).toBe(0);
     await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ useDaemonProcess: true }));
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify(FIXTURE_NX_JSON));
     await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
     await writeFile(
       join(workspace, 'packages', 'app', 'project.json'),
@@ -750,7 +771,7 @@ describe('smoo-nx-exec daemon socket', () => {
   afterAll(async () => {
     try {
       if (workspace) {
-        await nx(workspace, ['daemon', '--stop']);
+        await stopFixtureNxDaemon(workspace);
       }
     } finally {
       await rm(workspace, { recursive: true, force: true });

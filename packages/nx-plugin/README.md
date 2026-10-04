@@ -45,6 +45,11 @@ standard 120-second target deadline stay unchanged. Refresh the portable timing 
 with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data, not a test
 allowlist.
 
+Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
+Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own
+`nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline,
+path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's Cargo home.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:

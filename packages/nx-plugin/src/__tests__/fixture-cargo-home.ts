@@ -9,10 +9,9 @@ import { join } from 'node:path';
  *
  * Use it in files whose Cargo fixtures are offline and path-only. Their Cargo
  * needs nothing from the developer's home, but it still takes that home's
- * package-cache lock, and every Cargo build running elsewhere on the machine
- * holds that lock for as long as it runs. Fixture setup, the code under test
- * and its Nx children would otherwise wait on unrelated builds for as long as
- * the machine is busy.
+ * package-cache lock. Another Cargo command can hold that lock while it runs;
+ * fixture setup, the code under test and its Nx children would otherwise wait
+ * on unrelated work.
  *
  * The home goes into `process.env`, which is how a caller hands Cargo its home:
  * node's `child_process` and the plugin's own Cargo children read it at spawn,
