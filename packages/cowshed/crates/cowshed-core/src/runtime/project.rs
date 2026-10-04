@@ -5888,27 +5888,35 @@ impl NativeProjectRuntimeHost {
             inherited_groups: Vec::new(),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
-        // process already serves it under this authority, its commands go there.
+        // process already serves it under this authority, or under grants published since this
+        // command read them, its commands go there.
         match super::supervisor_socket::hello(&socket).await {
-            Ok(hello) if super::supervisor_manager::serves(&hello.authority, &config.authority) => {
-                let handle = super::supervisor_socket::connect(socket, hello.authority);
-                self.supervisors.insert(name.clone(), handle.clone());
-                return Ok(handle);
-            }
             Ok(hello) => {
-                return Err(CowshedError::conflict(
-                    format!(
-                        "process {} serves workspace {name}'s supervisor under incarnation {} \
-                         and grant revision {}; this command needs incarnation {} and grant \
-                         revision {}",
-                        hello.pid,
-                        hello.authority.workspace_incarnation,
-                        hello.authority.grant_revision,
-                        config.authority.workspace_incarnation,
-                        config.authority.grant_revision,
-                    ),
-                    format!("let that command finish, or run `cowshed detach {name}`, then retry"),
-                ));
+                match super::supervisor_manager::standing(&hello.authority, &config.authority) {
+                    super::supervisor_manager::Standing::Serves => {
+                        let handle = super::supervisor_socket::connect(socket, hello.authority);
+                        self.supervisors.insert(name.clone(), handle.clone());
+                        return Ok(handle);
+                    }
+                    super::supervisor_manager::Standing::Behind
+                    | super::supervisor_manager::Standing::Elsewhere => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "process {} serves workspace {name}'s supervisor under incarnation \
+                             {} and grant revision {}; this command needs incarnation {} and \
+                             grant revision {} or newer",
+                                hello.pid,
+                                hello.authority.workspace_incarnation,
+                                hello.authority.grant_revision,
+                                config.authority.workspace_incarnation,
+                                config.authority.grant_revision,
+                            ),
+                            format!(
+                                "let that command finish, or run `cowshed detach {name}`, then retry"
+                            ),
+                        ));
+                    }
+                }
             }
             // A supervisor of another cowshed build: refused by name.
             Err(error) if error.code == crate::error::ErrorCode::Conflict => return Err(error),

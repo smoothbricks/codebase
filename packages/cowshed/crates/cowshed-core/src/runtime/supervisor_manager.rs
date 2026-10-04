@@ -225,14 +225,37 @@ pub struct Ensured {
     pub authority: WorkspaceAuthoritySnapshot,
 }
 
-/// Whether a supervisor serving `served` can take the commands of a controller that needs
-/// `needed`: the same workspace incarnation under the same grant revision. The lifecycle
-/// revision a supervisor started under is its own; calls name the one it reports.
-pub fn serves(served: &WorkspaceAuthoritySnapshot, needed: &WorkspaceAuthoritySnapshot) -> bool {
-    served.repo_id == needed.repo_id
-        && served.workspace == needed.workspace
-        && served.workspace_incarnation == needed.workspace_incarnation
-        && served.grant_revision == needed.grant_revision
+/// Where a supervisor serving one authority stands with a controller that read another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Standing {
+    /// The same workspace incarnation under the grant revision the controller read or a newer
+    /// one, published between that read and the hello: it takes the controller's commands,
+    /// which name the authority it reports. Grant revisions of one incarnation only grow, so
+    /// the controller never runs under grants older than the ones it read.
+    Serves,
+    /// The same incarnation under grants older than the ones the controller read: it serves
+    /// once it has re-read them.
+    Behind,
+    /// Another workspace or incarnation: it never serves this controller.
+    Elsewhere,
+}
+
+/// How a supervisor serving `served` stands with a controller that read `needed`. The
+/// lifecycle revision a supervisor started under is its own; calls name the one it reports.
+pub fn standing(
+    served: &WorkspaceAuthoritySnapshot,
+    needed: &WorkspaceAuthoritySnapshot,
+) -> Standing {
+    if served.repo_id != needed.repo_id
+        || served.workspace != needed.workspace
+        || served.workspace_incarnation != needed.workspace_incarnation
+    {
+        Standing::Elsewhere
+    } else if served.grant_revision >= needed.grant_revision {
+        Standing::Serves
+    } else {
+        Standing::Behind
+    }
 }
 
 /// How recovery reaches the supervisors that served before the manager started: over their
@@ -406,23 +429,18 @@ impl SupervisorManager {
         );
         let _one_at_a_time = lock.lock().await;
         match supervisor_socket::hello(&socket).await {
-            Ok(hello) if serves(&hello.authority, authority) => {
-                return serving(&socket, &hello, authority);
-            }
-            // A grant change since it started: it re-reads the grants and serves under them,
-            // while the jobs it already runs keep the profile they started under.
-            Ok(hello)
-                if hello.authority.workspace_incarnation == authority.workspace_incarnation
-                    && hello.authority.grant_revision < authority.grant_revision =>
-            {
-                let advanced = supervisor_socket::advance(&socket).await?;
-                let hello = supervisor_socket::Hello {
-                    authority: advanced,
-                    pid: hello.pid,
+            Ok(hello) => {
+                let hello = match standing(&hello.authority, authority) {
+                    Standing::Serves | Standing::Elsewhere => hello,
+                    // A grant change since it started: it re-reads the grants and serves under
+                    // them, while the jobs it already runs keep the profile they started under.
+                    Standing::Behind => supervisor_socket::Hello {
+                        authority: supervisor_socket::advance(&socket).await?,
+                        pid: hello.pid,
+                    },
                 };
                 return serving(&socket, &hello, authority);
             }
-            Ok(hello) => return serving(&socket, &hello, authority),
             Err(error) if error.code == ErrorCode::Conflict => return Err(error),
             Err(_) => {}
         }
@@ -576,29 +594,29 @@ fn serving(
     hello: &supervisor_socket::Hello,
     authority: &WorkspaceAuthoritySnapshot,
 ) -> Result<Ensured> {
-    if serves(&hello.authority, authority) {
-        return Ok(Ensured {
+    match standing(&hello.authority, authority) {
+        Standing::Serves => Ok(Ensured {
             socket: socket.to_path_buf(),
             pid: hello.pid,
             authority: hello.authority.clone(),
-        });
+        }),
+        Standing::Behind | Standing::Elsewhere => Err(CowshedError::conflict(
+            format!(
+                "process {} serves workspace {}'s supervisor under incarnation {} and grant \
+                 revision {}; this command needs incarnation {} and grant revision {} or newer",
+                hello.pid,
+                authority.workspace,
+                hello.authority.workspace_incarnation,
+                hello.authority.grant_revision,
+                authority.workspace_incarnation,
+                authority.grant_revision,
+            ),
+            format!(
+                "let its jobs finish, or run `cowshed detach {}`, then retry",
+                authority.workspace
+            ),
+        )),
     }
-    Err(CowshedError::conflict(
-        format!(
-            "process {} serves workspace {}'s supervisor under incarnation {} and grant revision \
-             {}; this command needs incarnation {} and grant revision {}",
-            hello.pid,
-            authority.workspace,
-            hello.authority.workspace_incarnation,
-            hello.authority.grant_revision,
-            authority.workspace_incarnation,
-            authority.grant_revision,
-        ),
-        format!(
-            "let its jobs finish, or run `cowshed detach {}`, then retry",
-            authority.workspace
-        ),
-    ))
 }
 
 /// How long a lost supervisor's jobs get between TERM and KILL.

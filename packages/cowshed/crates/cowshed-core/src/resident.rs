@@ -67,7 +67,8 @@ pub enum Decline {
     StaleMount,
     /// No supervisor of this build answers the workspace's socket.
     Unserved,
-    /// The supervisor serves another incarnation or grant revision than the records name.
+    /// The supervisor serves another incarnation than the records name, or grants older than
+    /// theirs.
     ServesOtherAuthority,
     /// The build link names a volume that is not this workspace's, or is not mounted: mounting
     /// through the controller resolves it.
@@ -284,8 +285,12 @@ pub async fn resolve(
     let hello = crate::timing::spanned("resident", "hello", probe.hello(&socket))
         .await
         .map_err(|_| Decline::Unserved)?;
-    if !crate::runtime::supervisor_manager::serves(&hello.authority, &needed) {
-        return Err(Decline::ServesOtherAuthority);
+    match crate::runtime::supervisor_manager::standing(&hello.authority, &needed) {
+        crate::runtime::supervisor_manager::Standing::Serves => {}
+        crate::runtime::supervisor_manager::Standing::Behind
+        | crate::runtime::supervisor_manager::Standing::Elsewhere => {
+            return Err(Decline::ServesOtherAuthority);
+        }
     }
     Ok(Resident {
         repo_id: repo,
@@ -649,6 +654,27 @@ mod tests {
         .await
         .err();
         assert_eq!(declined, Some(Decline::ServesOtherAuthority));
+    }
+
+    /// A grant change landing between the read of the records and the hello leaves the
+    /// supervisor ahead of them: it serves grants newer than the ones read, so it is answered
+    /// from, under the authority it reports.
+    #[tokio::test]
+    async fn a_supervisor_ahead_of_the_records_read_is_served_from() {
+        let store = Store::new();
+        let ahead = WorkspaceAuthoritySnapshot {
+            grant_revision: store.current().grant_revision + 1,
+            ..store.current()
+        };
+        let resident = resolve(
+            &store.store,
+            &store.checkout,
+            &raven(),
+            &probe(&store, ahead.clone()),
+        )
+        .await
+        .expect("resident");
+        assert_eq!(resident.authority(), &ahead);
     }
 
     /// Unfinished lifecycle work on the named workspace or on main is the controller's to

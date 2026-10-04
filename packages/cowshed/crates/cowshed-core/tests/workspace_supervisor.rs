@@ -2716,6 +2716,113 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     remote.retire().await.unwrap();
 }
 
+/// A grant change can land between a controller's read of the grants and its ensure — another
+/// process's gateway reconcile moving the workspace's port block, a `grant`, a project-wide
+/// grant — and the supervisor started or advanced since serves the newer revision. The
+/// controller holding the older read is answered by that supervisor, under the authority it
+/// reports, which every call then names: never refused, never served under grants older than
+/// the ones it read, and never given a second allocator.
+#[tokio::test]
+async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor() {
+    use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
+    let mut h = harness(1, 1024, false, false);
+    let store = manager_store();
+    // The controller reads the grants...
+    let read = authority();
+    // ...then the grant change lands and the workspace's supervisor serves its revision.
+    let served = h
+        .handle
+        .advance_authority(
+            read.grant_revision + 1,
+            read.lifecycle_revision,
+            config().sandbox,
+        )
+        .await
+        .unwrap();
+    let path = supervisor_socket::socket_path(&store, &read.repo_id, &read.workspace);
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        served.clone(),
+        None,
+        None,
+    ));
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(InProcessSpawner {
+            store_root: store.clone(),
+            supervisor: None,
+            child: &["sleep", "30"],
+            spawned: std::sync::Arc::clone(&spawned),
+        }),
+        healed(),
+    );
+
+    let ensured = manager
+        .ensure(&PathBuf::from("/nonexistent/project"), &read)
+        .await
+        .unwrap();
+    assert_eq!(&ensured.authority, served.snapshot());
+    assert_eq!(
+        spawned.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no second supervisor"
+    );
+    let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
+    let admitted = remote
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = h.spawned.recv().await.unwrap();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(
+        remote.wait(admitted).await.unwrap().grant_revision,
+        read.grant_revision + 1,
+        "the job runs under the newer grants"
+    );
+    remote.retire().await.unwrap();
+}
+
+/// Revisions of one incarnation only grow, so the newer revision is the only one a stale read
+/// may be answered under: a supervisor of another incarnation is still refused by name.
+#[tokio::test]
+async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
+    use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
+    let h = harness(1, 1024, false, false);
+    let store = manager_store();
+    let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(InProcessSpawner {
+            store_root: store.clone(),
+            supervisor: None,
+            child: &["sleep", "30"],
+            spawned: std::sync::Arc::default(),
+        }),
+        healed(),
+    );
+    let successor = WorkspaceAuthoritySnapshot {
+        workspace_incarnation: WorkspaceIncarnation::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+        grant_revision: authority().grant_revision + 1,
+        ..authority()
+    };
+    let refused = manager
+        .ensure(&PathBuf::from("/nonexistent/project"), &successor)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict, "{}", refused.message);
+    h.handle.retire().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() {
     use cowshed_core::runtime::supervisor_socket;

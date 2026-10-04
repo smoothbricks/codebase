@@ -351,18 +351,18 @@ move. It is not a storage failure.
 ### Resident workspaces
 
 `path <ws>` and `exec <ws> -- …` name one workspace, and when that workspace is mounted and its daemon-owned supervisor
-(11_shell.md) already serves its current authority, every fact they depend on is live. They are answered from that state
-without opening the project controller. The answer reads, fresh on every call, only the records that decide this
-workspace: the in-image marker at the invocation's Git root (which names the project), the named workspace's marker at
-its mount and its active sidecar, the project's policy (whose revision is part of the effective grant revision), slot
-records (which place the mount), and the lifecycle-intent journal. It asks the host two things: whether a filesystem is
-mounted exactly at the mount path, and which authority the supervisor's socket reports. `exec` also asks the gateway
-whether the workspace's session is installed at that revision — exactly the case in which the controller's pre-exec
-reconcile would install nothing for it. The job then runs through the supervisor's socket, relayed as the controller
-path relays it.
+(11_shell.md) already serves its current authority — or a newer grant revision of it, published since the records were
+read — every fact they depend on is live. They are answered from that state without opening the project controller. The
+answer reads, fresh on every call, only the records that decide this workspace: the in-image marker at the invocation's
+Git root (which names the project), the named workspace's marker at its mount and its active sidecar, the project's
+policy (whose revision is part of the effective grant revision), slot records (which place the mount), and the
+lifecycle-intent journal. It asks the host two things: whether a filesystem is mounted exactly at the mount path, and
+which authority the supervisor's socket reports. `exec` also asks the gateway whether the workspace's session is
+installed at that revision — exactly the case in which the controller's pre-exec reconcile would install nothing for it.
+The job then runs through the supervisor's socket, relayed as the controller path relays it.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached,
-unserved, served under an older grant or incarnation, a gateway session not yet at the served revision, a linked
+unserved, served under an older grant or another incarnation, a gateway session not yet at the served revision, a linked
 worktree, or unfinished lifecycle work on the workspace, on `main`, or on the project identity. Git discovery steered by
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted
 `<ws>`, `path --slot`, and `exec --session` always go through the controller. No directory is listed: a project with a

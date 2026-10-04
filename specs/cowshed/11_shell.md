@@ -133,20 +133,24 @@ replaying a supervisor-owned environment in place of its shell entry hooks.
 One supervisor per attached workspace, the workspace's sole job allocator, running as a process of its own:
 `cowshed __workspace-supervisor <project-root> <workspace>`, which serves it on the workspace's socket (Protocol,
 below). The gateway daemon owns these processes through its supervisor manager, listening at `<store>/run/manager.sock`.
-A controller asks the manager to ensure the workspace's supervisor under the incarnation and grant revision it needs,
-and the manager answers with the socket once a supervisor serves it there. It starts one with the daemon's own binary,
-in a session of its own, when nothing answers; ensures of one workspace run one at a time, so two controllers never
-start two allocators. A supervisor therefore outlives the command that first needed it, and the daemon's restarts: the
-manager watches every supervisor it started and, when it starts, finds the ones still serving. A supervisor answering
-under another incarnation is refused with `Conflict` naming its pid. A supervisor that ends before it serves says why on
-a report pipe the manager hands it (named by `COWSHED_SUPERVISOR_REPORT_FD`, close-on-exec in the supervisor so no job
-inherits it), and the ensure — so the command that needed the workspace — fails with that error and its code, not with a
-pointer to the daemon's log. The supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository
-hooks; it reads only the watch list an activation reports. Before a spawn it refreshes the convention-gated capability
-snapshot (15_capabilities.md) and compiles the matching child profile if that snapshot changed. Every exec host,
-one-shot command and descendant starts beneath that restriction, in its job's own process group. The child profile
-denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the private
-exec-temp roots.
+A controller asks the manager to ensure the workspace's supervisor under the incarnation and grant revision it read, and
+the manager answers with the socket once a supervisor serves it there or at a newer grant revision of the same
+incarnation. Grant revisions of one incarnation only grow, so a newer one is a grant change — another process's gateway
+reconcile moving the port block, a `grant` — published between the controller's read and the supervisor's own; the
+controller's calls then name the authority the supervisor reports, and it never runs under grants older than the ones it
+read. A supervisor serving an older revision re-reads the grants before it answers. It starts one with the daemon's own
+binary, in a session of its own, when nothing answers; ensures of one workspace run one at a time, so two controllers
+never start two allocators. A supervisor therefore outlives the command that first needed it, and the daemon's restarts:
+the manager watches every supervisor it started and, when it starts, finds the ones still serving. A supervisor
+answering under another incarnation is refused with `Conflict` naming its pid. A supervisor that ends before it serves
+says why on a report pipe the manager hands it (named by `COWSHED_SUPERVISOR_REPORT_FD`, close-on-exec in the supervisor
+so no job inherits it), and the ensure — so the command that needed the workspace — fails with that error and its code,
+not with a pointer to the daemon's log. The supervisor itself never evaluates `.envrc`, sources shell startup, or runs
+repository hooks; it reads only the watch list an activation reports. Before a spawn it refreshes the convention-gated
+capability snapshot (15_capabilities.md) and compiles the matching child profile if that snapshot changed. Every exec
+host, one-shot command and descendant starts beneath that restriction, in its job's own process group. The child
+profile denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the
+private exec-temp roots.
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.

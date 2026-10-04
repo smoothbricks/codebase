@@ -65,6 +65,9 @@ compare-and-swap revision semantics; workers may observe grants but cannot mutat
 - An effective filesystem grant or revoke changes the supervisor envelope. The old supervisor stops accepting
   submissions and drains; admitted jobs retain the old revision. The controller then relaunches under the new revision
   before accepting the next exec.
+- A command that read the grants just before another change landed is answered by the supervisor already serving the
+  newer revision, under that revision: it never runs under grants older than the ones it read, and never fails because
+  grants moved forward under it.
 - Inner command profiles may narrow the revision-bound envelope and can never widen it.
 - A named session pinned to a stale revision conflicts instead of silently migrating.
 - A no-op, egress-only, or simulator-only mutation does not relaunch the supervisor.
