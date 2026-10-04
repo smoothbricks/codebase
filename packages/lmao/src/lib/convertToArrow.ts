@@ -1345,6 +1345,41 @@ export function convertToLeasedArrowTable(buffer: AnySpanBuffer): ArrowLease {
   });
 }
 
+//#region smoo/lmao!n/arrow-tree-walker-single-batch.span-start
+/**
+ * Convert a span's start row alone — row 0 of its buffer — to an Arrow table.
+ *
+ * A reader sees a span that has not ended by its start row. Converting an open span's
+ * whole buffer would also emit row 1, the completion pre-armed as `span-exception` at
+ * timestamp 0 so that a span abandoned mid-flight still ends: a span in flight would read
+ * as failed at the epoch. This conversion emits row 0 as it reads now, so a host can hand
+ * a span over the moment it opens and its whole buffer ({@link convertToArrowTable}) once
+ * it ends; that later copy of the start row carries the final attribute values. The
+ * table owns its values: later writes to the span do not reach it.
+ *
+ * Takes a JS-heap span buffer. A thread-lane view's rows live in its native row store,
+ * whose streaming flush already emits an open span's start row without its completion.
+ */
+export function convertSpanStartToArrowTable(buffer: AnySpanBuffer): Table {
+  if (isThreadSpanView(buffer)) {
+    throw new TypeError("A thread-lane span view's rows live in its row store; convert them through its provider");
+  }
+  const written = buffer._writeIndex;
+  if (written === 0) return tableFromColumns({});
+  // Every column builder takes a buffer's row count from `_writeIndex`, so bounding it to
+  // the start row for this one synchronous conversion selects row 0 with the builders
+  // every other conversion uses. Nothing writes the span meanwhile — the conversion never
+  // yields, and the schema encoders and masks it calls only read — and the count is
+  // restored before the table returns or the failure propagates.
+  buffer._writeIndex = 1;
+  try {
+    return convertBuffersToTable([buffer]);
+  } finally {
+    buffer._writeIndex = written;
+  }
+}
+//#endregion smoo/lmao!n/arrow-tree-walker-single-batch.span-start
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tree Conversion with Shared Dictionaries
 // ═══════════════════════════════════════════════════════════════════════════════

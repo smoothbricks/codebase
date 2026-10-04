@@ -802,6 +802,17 @@ function convertToRecordBatch(
 
 This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 
+### Span Start Conversion <a id="smoo/lmao!n/arrow-tree-walker-single-batch.span-start"></a>
+
+A reader sees a span that has not ended by its start row. Row 1 of an open span is its completion, pre-armed as
+`span-exception` at timestamp 0 so that a span abandoned mid-flight still ends; converting an open span's whole buffer
+would report it failed at the epoch. `convertSpanStartToArrowTable(buffer)` converts row 0 alone, as it reads at that
+moment, with the same column builders and output schema as `convertToArrowTable`. A host that hands spans over as they
+happen converts the start row when the span opens and the whole buffer when it ends; the later copy of the start row
+carries the final attribute values, as every later copy does in a streaming flush. The table owns its values, and the
+buffer is left as it was. A thread-lane view is refused: its rows live in the native row store, whose streaming flush
+already emits an open span's start row without its completion.
+
 ## Package Separation <a id="smoo/lmao!n/arrow-tree-walker-package-separation"></a>
 
 ### What Lives Where <a id="smoo/lmao!n/arrow-tree-walker-package-separation.what-lives-where"></a>

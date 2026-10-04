@@ -191,6 +191,11 @@ const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
 console.log(table.numRows, table.names);
 ```
 
+To hand spans over while a trace runs, convert a span's start row the moment it opens
+(`convertSpanStartToArrowTable(buffer)`) and its whole buffer (`convertToArrowTable(buffer)`) once it ends. An open
+span's whole buffer also holds its completion, pre-armed as `span-exception` at timestamp 0, which a reader would take
+for a failure.
+
 - **SQLite / D1** — use `SQLiteTracer`/`SQLiteAsyncTracer` with `createNodeSQLiteDatabase`
   (`@smoothbricks/lmao/sqlite/node`) or `createD1SQLiteDatabase` (`@smoothbricks/lmao/sqlite`).
 - **Query engine** — the companion package [`@smoothbricks/lmao-inspector`](../lmao-inspector) runs SQL over exported
