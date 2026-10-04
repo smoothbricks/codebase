@@ -8,12 +8,15 @@ import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'n
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
+import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
+
+useFixtureCargoHome();
 
 const [, rawInferTargets] = createNodesV2;
 const inferTargets: typeof rawInferTargets = async (files, options, context) => {
@@ -2481,6 +2484,7 @@ async function prepareCargoFixture(root: string): Promise<void> {
   for (const manifest of workspaces) {
     if (await Bun.file(join(dirname(manifest), 'Cargo.lock')).exists()) continue;
     const child = Bun.spawn(['cargo', 'generate-lockfile', '--offline', '--manifest-path', manifest], {
+      env: process.env,
       cwd: root,
       stdout: 'pipe',
       stderr: 'pipe',

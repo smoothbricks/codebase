@@ -3,8 +3,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
+
+useFixtureCargoHome();
 
 it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
   const root = await mkdtemp(join(tmpdir(), 'cargo-hash-'));
@@ -153,7 +156,14 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
     const { workspace, leafSource } = await workspaceCargoFixture(root);
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
     const run = async (args: string[]) => {
-      const child = Bun.spawn(['bun', bin, ...args], { cwd: workspace, stdout: 'pipe', stderr: 'pipe' });
+      // Bun.spawn's default environment is the one this process started with,
+      // not process.env, so pass it: the file's own CARGO_HOME must reach the CLI.
+      const child = Bun.spawn(['bun', bin, ...args], {
+        cwd: workspace,
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
       const [exitCode, stdout, stderr] = await Promise.all([
         child.exited,
         new Response(child.stdout).text(),

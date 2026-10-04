@@ -17,11 +17,14 @@ import {
   waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
+import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
 import { createNodesV2 } from './index.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
+
+useFixtureCargoHome();
 
 /**
  * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf`

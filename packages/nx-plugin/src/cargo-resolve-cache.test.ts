@@ -18,9 +18,12 @@ import {
   waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
+import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import { type CargoResolve, readCargoResolve } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
+
+useFixtureCargoHome();
 
 /*
  * What Cargo resolution costs, measured by the one number that matters: how many `cargo metadata`

@@ -4,7 +4,10 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { createNodesV2 } from './index.js';
+
+useFixtureCargoHome();
 
 it('executes every archived test once across ordinary and exceptional partitions', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-nextest-partitions-')));
