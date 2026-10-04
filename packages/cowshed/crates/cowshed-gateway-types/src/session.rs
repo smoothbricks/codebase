@@ -14,7 +14,12 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{policy::WorkspacePolicy, repo_id::validate_repo_id};
 
 pub const TOKEN_BYTES: usize = 32;
-pub const MACOS_PORT_MIN: u16 = 40_960;
+/// The macOS workspace port range: the 16384 ports below the kernel's ephemeral range
+/// (`net.inet.ip.portrange.first` = 49152), so no outbound connection's local port is ever
+/// carved into a workspace's block. Every live block, current and retained, is durable
+/// workspace authority until the workspace retires — detached workspaces included — so the
+/// range bounds how many workspaces a host can hold at once: 256 at the initial block size.
+pub const MACOS_PORT_MIN: u16 = 32_768;
 pub const MACOS_PORT_MAX: u16 = 49_151;
 /// The size a newly allocated macOS workspace port block gets. A block's size is data recorded
 /// with it when it is allocated, so raising this changes only what new workspaces get: every
@@ -276,7 +281,9 @@ pub enum ConfigError {
     #[error("gateway endpoints are unsupported on this host platform")]
     UnsupportedHostPlatform,
     #[error(
-        "macOS gateway endpoint must be the base of a power-of-two port block aligned to its size within 40960-49151"
+        "macOS gateway endpoint must be the base of a power-of-two port block aligned to its size within {}-{}",
+        MACOS_PORT_MIN,
+        MACOS_PORT_MAX
     )]
     InvalidMacosPortBlock,
     #[error("workspace token must be exactly 32 bytes of unpadded base64url")]

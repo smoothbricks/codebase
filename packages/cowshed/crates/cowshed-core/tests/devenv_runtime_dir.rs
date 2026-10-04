@@ -756,7 +756,7 @@ impl ProbeBlocks {
 /// Blocks below the macOS allocator range, where live workspaces hold theirs, whose probed ports
 /// are free on this host.
 fn free_probe_blocks() -> ProbeBlocks {
-    (32_768..MACOS_PORT_MIN)
+    (MACOS_PORT_MIN / 2..MACOS_PORT_MIN)
         .step_by(usize::from(4 * GROWN_BLOCK_SIZE))
         .find_map(|base| {
             let claim = TcpListener::bind((Ipv4Addr::LOCALHOST, base)).ok()?;

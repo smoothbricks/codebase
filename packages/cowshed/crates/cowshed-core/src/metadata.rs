@@ -1489,12 +1489,12 @@ mod tests {
 
         /// A macOS sidecar's `portBlock` is drawn as a size and a block index rather than raw
         /// `u16`s, because the durable grammar is "a power-of-two block aligned to its own size
-        /// inside 40960-49151" — a block keeps the size it was allocated with, so every size the
-        /// grammar admits round-trips, not only the one new workspaces get.
+        /// inside `MACOS_PORT_MIN..=MACOS_PORT_MAX`" — a block keeps the size it was allocated
+        /// with, so every size the grammar admits round-trips, not only the one new workspaces get.
         #[test]
         fn valid_sidecar_schemas_round_trip_across_platforms(
             macos in any::<bool>(),
-            size_log2 in 1_u32..=13,
+            size_log2 in 1_u32..=14,
             block in any::<u16>(),
         ) {
             let mut expected = frozen_sidecar_json();

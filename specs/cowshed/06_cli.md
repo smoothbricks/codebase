@@ -365,7 +365,7 @@ capacity = "100g"              # image cap
 keep = 5
 [gateway]
 port = 7644                    # macOS host control plane; Linux private-netns connector; never a service port
-port_range = "40960-49151"    # macOS only: reserved range workspace port blocks are carved from
+port_range = "32768-49151"    # macOS only: reserved range workspace port blocks are carved from
 [cache]                        # extend (never replace) the convention table
 extra_workspace_dirs = ["build-out"]
 [shell]

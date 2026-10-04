@@ -32,7 +32,7 @@ from a workspace, and the sandbox baseline denies both. Linux separately reuses 
 inside each private netns for its data-plane connector; namespace separation makes it a different listener. Data-plane
 topology is platform-specific:
 
-- **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from 40960–49151, recorded as
+- **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from 32768–49151, recorded as
   `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new workspaces get 64 ports, and a
   live block grows only through a `service_ports` grant; one that moves keeps its old block reserved as
   `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at new/fork (adopt for main),

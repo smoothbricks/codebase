@@ -258,7 +258,7 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
-   sidecar's allocated contiguous `portBlock` from the reserved range (default `40960–49151`; its size is recorded with
+   sidecar's allocated contiguous `portBlock` from the reserved range (default `32768–49151`; its size is recorded with
    it, 04_sandbox.md): the gateway binds `base`, and `base+1 … base+size-1` are workspace service ports. On Linux, omit
    `portBlock`; after the dataset is mounted, create and bind-mount the per-incarnation Unix gateway socket and launch
    the trusted connector inside the workspace's private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark

@@ -15919,8 +15919,8 @@ mod port_reservation_tests {
     };
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, Platform, PortBlock, PublicationState,
-        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
+        PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
@@ -15968,6 +15968,7 @@ mod port_reservation_tests {
             (80, 128),
             (255, 256),
             (8191, 8192),
+            (16383, 16384),
         ] {
             assert_eq!(PortBlock::size_for_service_ports(services).unwrap(), size);
             let blocks = PortBlock::macos_candidates_with_size(size)
@@ -15976,7 +15977,7 @@ mod port_reservation_tests {
             assert!(!blocks.is_empty());
             assert!(blocks.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
         }
-        for services in [0, 8192, u16::MAX] {
+        for services in [0, 16384, u16::MAX] {
             assert!(PortBlock::size_for_service_ports(services).is_err());
         }
     }
@@ -16472,6 +16473,37 @@ mod port_reservation_tests {
         let released = TcpListener::bind((Ipv4Addr::LOCALHOST, granted_base))
             .expect("dropping the publication guard releases its kernel listeners");
         drop(released);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Every block is durable workspace authority until retirement, attached or detached, so the
+    /// range bounds the workspaces a host holds. A host whose workspaces fill every initial-size
+    /// cell of 40960-49151 — the whole range once, 128 workspaces — still allocates the next one.
+    #[tokio::test]
+    async fn a_host_holding_128_initial_blocks_still_allocates_a_workspace() {
+        let root = root("past-128");
+        let (inventory, _) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let held = || {
+            (40_960..=49_151 - (NEW_PORT_BLOCK_SIZE - 1))
+                .step_by(usize::from(NEW_PORT_BLOCK_SIZE))
+                .map(|base| PortBlock::new(base, NEW_PORT_BLOCK_SIZE).expect("held block"))
+        };
+        assert_eq!(held().count(), 128);
+        let mut used = crate::metadata::ReservedPortBlocks::default();
+        for block in held() {
+            used.insert(block).expect("disjoint held blocks");
+        }
+        let granted = reserve_port_grants(&inventory, &staging, used)
+            .await
+            .expect("a 129th workspace gets a block");
+        let block = granted.grants.port_block.expect("granted block");
+        assert!(cowshed_gateway_types::is_macos_port_block(
+            block.base(),
+            block.size()
+        ));
+        assert!(held().all(|owned| !owned.overlaps(block)));
+        drop(granted);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

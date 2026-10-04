@@ -334,7 +334,7 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   Dev-side headless simulators need no `sim` grant at all — they are reached directly via the "simulator" profile preset
   below. macOS desktop apps add no grant axis, and no sandbox verb launches one as the personal user.
 - `portBlock` is **macOS-only and platform-optional**. When present it is the workspace's contiguous block
-  `{base, size}` from the reserved range (default 40960–49151; 05_gateway.md): `base` is the gateway data-plane listener
+  `{base, size}` from the reserved range (default 32768–49151; 05_gateway.md): `base` is the gateway data-plane listener
   and `base+1 … base+size-1` are workspace service ports. A block's size is persisted data, not a global assumption:
   `size` is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
   validation, the gateway's session check, the Seatbelt profile — validates a block against its own recorded
@@ -347,7 +347,11 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   socket and private loopback namespace are runtime topology, not grant authority. Unpublished allocations claim every
   initial-size 64-port grid cell they touch, even when a legacy 16-port block grows into an upper-half 32-port block.
   Cell claims and newly owned kernel listeners stay held through the authoritative inventory re-read and durable grant
-  publication.
+  publication. A block is held for the workspace's whole life, attached or detached: detach closes the gateway listener
+  on `base` but releases no port, and only retirement frees the block and its retained blocks. The range therefore
+  bounds how many workspaces a host holds at once — 256 at the initial size. It ends just below the macOS ephemeral
+  range (`net.inet.ip.portrange.first`, 49152), so no outbound connection's local port falls inside a block. It started
+  at 40960, a ceiling of 128 workspaces that a busy host reached; blocks allocated there are still valid.
 - **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
   block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
   least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the
@@ -357,8 +361,8 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   block contains needs no separate entry (the base stays the same exactly when the current base is aligned to the target
   size); a current block it does not contain joins `retainedPortBlocks`. A retained block that a later, larger block
   contains is dropped from the list without releasing any port, since the containing block still owns it; every other
-  retained block stays. Growth at least doubles the current size, so growth alone can retain at most seven predecessor
-  blocks from the initial 64-port allocation to the 8192-port host range. Slot reassignment can retain additional
+  retained block stays. Growth at least doubles the current size, so growth alone can retain at most eight predecessor
+  blocks from the initial 64-port allocation to the 16384-port host range. Slot reassignment can retain additional
   blocks; allocation failures report this workspace's retained block count and port footprint. A retained block is
   durable ownership — written with the grants, counted by the host-wide allocator and every overlap check, allowed by
   every new job's Seatbelt profile, absent from the environment and the gateway endpoint — because a background process

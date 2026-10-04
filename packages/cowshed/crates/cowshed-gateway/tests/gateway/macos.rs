@@ -194,7 +194,7 @@ impl AuditSink for ChannelAudit {
 /// across test runners with different temp roots. Hold the block's next port for this process's
 /// lifetime instead: every runner sees the same reservation, independent of its filesystem.
 fn free_endpoint() -> SocketAddr {
-    const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN)
+    const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN + 1)
         / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
     static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
     let seed = (std::process::id() % u32::from(BLOCKS)) as u16;
