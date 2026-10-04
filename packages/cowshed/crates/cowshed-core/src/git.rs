@@ -3529,7 +3529,7 @@ mod tests {
         )
         .unwrap();
         fs::create_dir(root.join(".cowshed")).unwrap();
-        let environment = root.join(WORKSPACE_ENVIRONMENT_PATH);
+        let environment = root.join(super::WORKSPACE_ENVIRONMENT_PATH);
         fs::write(&environment, b"export COWSHED_ENV_WIRING_PROBE=published\n").unwrap();
         let repository = GitRepository::from_root(&root);
         repository
@@ -3544,7 +3544,7 @@ mod tests {
             fs::read(&envrc).unwrap(),
             b"export PROJECT_ENV_WIRING_PROBE=project-owned\n# cowshed: workspace environment\nsource_env_if_exists .cowshed/env\nexport PROJECT_ENV_WIRING_TAIL=tail-owned\n",
         );
-        let stdlib = Command::new("direnv").arg("stdlib").output().await.unwrap();
+        let stdlib = Command::new("direnv").arg("stdlib").output().unwrap();
         assert!(
             stdlib.status.success(),
             "direnv stdlib failed: {}",
@@ -3566,7 +3566,6 @@ mod tests {
                 .env_remove("BASH_ENV")
                 .env_remove("COWSHED_ENV_WIRING_PROBE")
                 .output()
-                .await
                 .unwrap();
             assert!(
                 loaded.status.success(),
