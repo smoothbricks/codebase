@@ -12,10 +12,10 @@ use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
 use cowshed_cli::probe::GitIdentityGap;
-use cowshed_cli::sccache_client_config::{
+use cowshed_cli::capabilities::sccache::client_config::{
     ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
 };
-use cowshed_cli::sccache_nix::BuildRefusal;
+use cowshed_cli::capabilities::sccache::nix::BuildRefusal;
 use cowshed_cli::setup_service::{
     GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectIdentity, SccacheInstall,
     WorkspaceCensus, dispatch as setup_dispatch,

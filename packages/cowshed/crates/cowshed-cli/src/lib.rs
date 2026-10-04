@@ -1,4 +1,5 @@
 pub mod args;
+pub mod capabilities;
 pub mod controller_service;
 pub mod credential_service;
 pub mod gateway_service;
@@ -12,9 +13,6 @@ pub mod rekey;
 pub mod resident;
 pub mod run;
 pub mod runtime;
-pub mod sccache_client_config;
-pub mod sccache_nix;
-pub mod sccache_service;
 pub mod setup_service;
 pub mod skill;
 pub mod workspace_supervisor;

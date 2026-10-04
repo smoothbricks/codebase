@@ -36,7 +36,7 @@ use crate::gateway_service::launchd_error;
 use crate::launchd::{SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram};
 use cowshed_core::api::{Finding, FindingSeverity};
 use cowshed_core::fork_lock::Run as _;
-use cowshed_core::sandbox::sccache_gc_root;
+use cowshed_core::capabilities::sccache::gc_root;
 use cowshed_core::{CowshedError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -220,7 +220,7 @@ pub fn build(home: &Path, flake: &Path) -> Result<BuildOutcome> {
             system,
         }));
     }
-    let root = sccache_gc_root(home);
+    let root = gc_root(home);
     let parent = root
         .parent()
         .expect("the gc root is always derived with a parent");
@@ -338,7 +338,7 @@ pub fn pinning_findings(home: &Path, plist: &Path) -> Vec<Finding> {
     if !plist.is_file() {
         return Vec::new();
     }
-    let root = sccache_gc_root(home);
+    let root = gc_root(home);
     let unpinned = |message: String, hint: &str| {
         vec![Finding {
             code: UNPINNED_CODE.into(),
@@ -487,7 +487,7 @@ mod tests {
         // A root pointing at a collected store path is the same class of problem, said with the
         // path that went missing.
         let collected = home.join("collected-store-path");
-        let root = sccache_gc_root(&home);
+        let root = gc_root(&home);
         std::fs::create_dir_all(root.parent().expect("root parent")).expect("root parent");
         std::os::unix::fs::symlink(&collected, &root).expect("symlink the gc root");
         let findings = pinning_findings(&home, &plist);

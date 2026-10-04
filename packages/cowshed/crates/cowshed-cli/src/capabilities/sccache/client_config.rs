@@ -5,7 +5,7 @@
 //! inside a workspace already reaches the host-owned daemon. A build run anywhere else does not:
 //! `RUSTC_WRAPPER=sccache` survives in any shell that once loaded a project environment, and a
 //! wrapped `cargo` with no `SCCACHE_DIR` falls back to sccache's private per-user default
-//! directory. `cowshed_core::sandbox::sccache_cache_directory` already states the requirement this
+//! directory. `cowshed_core::capabilities::sccache::cache_directory` already states the requirement this
 //! module makes true — "a client that finds no daemon spawns its own server, and that fallback
 //! must land in this cache rather than sccache's user-default directory" — and the only host state
 //! a store-less client reads is sccache's config file.

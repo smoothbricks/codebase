@@ -436,7 +436,7 @@ mod tests {
         fs::create_dir_all(checkout.join("tooling")).unwrap();
         fs::write(
             checkout.join("tooling/workspace.gitconfig"),
-            "[merge \"smoo-newer-pins\"]\n    name = keep the newer pins\n",
+            "[merge \"newer-pins\"]\n    name = keep the newer pins\n",
         )
         .unwrap();
         fs::write(&shared, "[user]\n    name = Shared\n").unwrap();

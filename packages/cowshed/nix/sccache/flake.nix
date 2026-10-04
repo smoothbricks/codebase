@@ -14,7 +14,7 @@
 #   environment.systemPackages = [inputs.cowshed-sccache.packages.${system}.sccache];
 #
 # On a cowshed host, `cowshed setup --sccache` runs the first of those with `--out-link` and hands
-# the resolved store path to launchd; see crates/cowshed-cli/src/sccache_nix.rs.
+# the resolved store path to launchd; see crates/cowshed-cli/src/capabilities/sccache/nix.rs.
 {
   description = "sccache patched for cowshed: one shared cache across workspace mount paths, one compile per cache key";
 

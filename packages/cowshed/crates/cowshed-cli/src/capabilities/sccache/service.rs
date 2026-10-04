@@ -6,7 +6,7 @@
 //! sccache binary itself as a foreground unix-socket server *outside* every
 //! workspace sandbox — launchd, not any workspace, owns the process, so it
 //! enforces no workspace's Seatbelt boundary and can serve them all
-//! (cowshed_core::sandbox::sccache_server_socket documents the client side).
+//! (cowshed_core::capabilities::sccache::server_socket documents the client side).
 
 use crate::args::SccacheCommand;
 use crate::gateway_service::{
@@ -19,11 +19,11 @@ use crate::launchd::{
     SCCACHE_LABEL, StoreBackedProgram, kickstart_hint, plan_install,
 };
 use crate::output::Output;
-use crate::sccache_nix;
+use super::nix;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
 use cowshed_core::fork_lock::RunAsync as _;
 use cowshed_core::metadata::ImageCapacity;
-use cowshed_core::sandbox::{sccache_cache_directory, sccache_server_socket};
+use cowshed_core::capabilities::sccache::{cache_directory, gc_root, server_socket};
 use cowshed_core::storage::bootstrap::ValidatedHostStorage;
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use std::fs;
@@ -114,7 +114,7 @@ where
 pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
-    let cache_directory = sccache_cache_directory();
+    let cache_directory = cache_directory();
     fs::create_dir_all(&cache_directory).map_err(|error| {
         CowshedError::internal(format!(
             "could not create {}: {error}",
@@ -125,7 +125,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         Some(capacity) => capacity,
         None => derived_capacity(&storage).await?,
     };
-    let socket = sccache_server_socket();
+    let socket = server_socket();
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let program = installed_program(&home)?;
     let spec = LaunchAgentSpec::sccache(
@@ -236,7 +236,7 @@ fn record_previous_program(home: &Path, previous_plist: &[u8]) {
     let Some(program) = plist_program(previous_plist) else {
         return;
     };
-    let directory = cowshed_core::sandbox::sccache_gc_root(home)
+    let directory = gc_root(home)
         .parent()
         .expect("the gc root is always derived with a parent")
         .to_path_buf();
@@ -330,7 +330,7 @@ pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<I
 fn stop_service() -> Result<()> {
     let home = canonical_home()?;
     remove_launch_agent(&control_target(&home)?)?;
-    remove_stale_socket(&sccache_server_socket())?;
+    remove_stale_socket(&server_socket())?;
     Ok(())
 }
 
@@ -355,7 +355,7 @@ pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
 
 pub(crate) async fn service_status() -> Result<SccacheStatus> {
     let home = canonical_home()?;
-    let socket = sccache_server_socket();
+    let socket = server_socket();
     let target = control_target(&home)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = match executor
@@ -452,8 +452,8 @@ pub(crate) fn control_target(home: &Path) -> Result<LaunchAgentTarget> {
 pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, PathBuf, PathBuf)> {
     Ok((
         control_target(home)?,
-        cowshed_core::sandbox::sccache_gc_root(home),
-        sccache_server_socket(),
+        gc_root(home),
+        server_socket(),
     ))
 }
 
@@ -465,7 +465,7 @@ pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, Pa
 /// other profile ended up serving a patched client, and a recorded path is a mutable pointer where
 /// a store path is an identity.
 pub(crate) fn installed_program(home: &Path) -> Result<StoreBackedProgram> {
-    sccache_nix::rooted_program(home, &cowshed_core::sandbox::sccache_gc_root(home))
+    nix::rooted_program(home, &gc_root(home))
 }
 
 async fn socket_answers(socket: &Path) -> bool {
@@ -519,7 +519,7 @@ mod tests {
         fs::create_dir_all(binary.parent().expect("bin")).expect("store bin");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("store binary");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o555)).expect("store mode");
-        let root = cowshed_core::sandbox::sccache_gc_root(home);
+        let root = gc_root(home);
         fs::create_dir_all(root.parent().expect("root parent")).expect("root parent");
         std::os::unix::fs::symlink(&store, &root).expect("gc root symlink");
         store
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(program.program(), store.join("bin").join("sccache"));
         assert_eq!(
             program.gc_root(),
-            cowshed_core::sandbox::sccache_gc_root(&home)
+            gc_root(&home)
         );
         assert!(
             program.program().starts_with(&store),
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(error.code.as_str(), "environment-missing");
         assert!(
             error.message.contains(
-                &cowshed_core::sandbox::sccache_gc_root(&home)
+                &gc_root(&home)
                     .display()
                     .to_string()
             ),
@@ -621,7 +621,7 @@ mod tests {
 
         // The provenance note names the store path that was replaced.
         record_previous_program(&home, previous);
-        let record = cowshed_core::sandbox::sccache_gc_root(&home)
+        let record = gc_root(&home)
             .parent()
             .expect("parent")
             .join(SCCACHE_PREVIOUS_PROGRAM_RECORD);
@@ -655,8 +655,8 @@ mod tests {
         // the store path be collected.
         let (agent, root, socket) = sccache_launch_agent(&home).expect("teardown artifacts");
         assert_eq!(agent.label(), SCCACHE_LABEL);
-        assert_eq!(root, cowshed_core::sandbox::sccache_gc_root(&home));
-        assert_eq!(socket, sccache_server_socket());
+        assert_eq!(root, gc_root(&home));
+        assert_eq!(socket, server_socket());
 
         let _ = fs::remove_dir_all(&home);
     }

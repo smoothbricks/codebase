@@ -857,7 +857,7 @@ async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
 /// A host without sccache installed is not a broken host, so failure is a log line: the gateway's
 /// job is to serve, and every workspace works without a compile cache.
 async fn heal_sccache_daemon() {
-    if let Err(error) = crate::sccache_service::start_service(None).await {
+    if let Err(error) = crate::capabilities::sccache::service::start_service(None).await {
         eprintln!(
             "cowshed: could not start the sccache daemon at startup: {}",
             error.message

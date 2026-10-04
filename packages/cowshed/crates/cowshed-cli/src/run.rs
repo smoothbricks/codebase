@@ -13,9 +13,10 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
+use crate::capabilities::sccache;
 use crate::{
     args, controller_service, credential_service, gateway_service, help, identity_service, output,
-    runtime, sccache_service, setup_service, skill,
+    runtime, setup_service, skill,
 };
 
 /// How one invocation ends.
@@ -192,7 +193,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     }
     if let args::Command::Sccache(action) = &parsed.command {
         let outcome =
-            sccache_service::dispatch(action.clone(), parsed.global.json, &mut output).await;
+            sccache::service::dispatch(action.clone(), parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json));
     }
     // `setup` has no project and no workspace: its subject is the host, so it dispatches here

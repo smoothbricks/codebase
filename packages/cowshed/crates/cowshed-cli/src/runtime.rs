@@ -3782,7 +3782,7 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
     diagnosis
         .findings
         .extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
-    match crate::sccache_service::service_status().await {
+    match crate::capabilities::sccache::service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
         Err(error) => diagnosis.findings.push(Finding {
             code: "sccache-status".into(),
@@ -3795,10 +3795,10 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
     // Whether the agent still has a program to run, which the status above cannot answer: a loaded
     // agent whose store path was collected looks identical to a healthy one until launchd next
     // tries to exec it, which may be a reboot away.
-    match crate::sccache_service::control_target(&home) {
+    match crate::capabilities::sccache::service::control_target(&home) {
         Ok(target) => diagnosis
             .findings
-            .extend(crate::sccache_nix::pinning_findings(
+            .extend(crate::capabilities::sccache::nix::pinning_findings(
                 &home,
                 target.plist_path(),
             )),

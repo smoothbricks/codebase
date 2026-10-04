@@ -24,16 +24,18 @@ use crate::gateway_service::{
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
 use crate::probe::{GitIdentityGap, probe_project};
-use crate::sccache_client_config::{self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore};
-use crate::sccache_nix::{self, BuildOutcome, BuildRefusal};
-use crate::sccache_service::{
+use crate::capabilities::sccache::client_config::{
+    self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore,
+};
+use crate::capabilities::sccache::nix::{self, BuildOutcome, BuildRefusal};
+use crate::capabilities::sccache::service::{
     derived_capacity, remove_stale_socket, sccache_launch_agent, start_service,
 };
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
-use cowshed_core::sandbox::sccache_cache_directory;
+use cowshed_core::capabilities::sccache::cache_directory;
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
@@ -479,12 +481,12 @@ impl HostSetup for NativeHostSetup {
     /// Gated on validated host storage rather than on the plan: a config naming a directory under
     /// an unmounted caches volume would resolve onto the boot disk beneath the empty mountpoint —
     /// a fourth orphaned cache, created by the command whose whole job is to prevent them. The
-    /// destination is the daemon's own [`sccache_cache_directory`] and the cap is the daemon's own
+    /// destination is the daemon's own [`cache_directory`] and the cap is the daemon's own
     /// derivation, so the config file and the plist can never name two different stores or two
     /// different eviction bounds.
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
-        let path = sccache_client_config::client_config_path(&self.home);
-        let directory = sccache_cache_directory();
+        let path = client_config::client_config_path(&self.home);
+        let directory = cache_directory();
         let storage = match validate_existing_host_storage(&self.home).await {
             Ok(storage) => storage,
             Err(error) => {
@@ -501,7 +503,7 @@ impl HostSetup for NativeHostSetup {
             CowshedError::internal(format!("could not create {}: {error}", directory.display()))
         })?;
         let capacity = derived_capacity(&storage).await?;
-        sccache_client_config::apply(&path, &SharedStore::new(directory, capacity))
+        client_config::apply(&path, &SharedStore::new(directory, capacity))
     }
 
     /// Relocate every host cache, holding cargo's own package-cache locks while cargo's move.
@@ -512,7 +514,7 @@ impl HostSetup for NativeHostSetup {
     async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || {
-            let cargo_home = cowshed_core::sandbox::CARGO.host_path(&home);
+            let cargo_home = cowshed_core::capabilities::cargo::HOME.host_path(&home);
             let _cargo_lock = if cargo_home.is_dir() {
                 match cowshed_core::capabilities::cargo::try_lock_caches(&cargo_home) {
                     Ok(Some(lock)) => Some(lock),
@@ -550,8 +552,8 @@ impl HostSetup for NativeHostSetup {
     /// caller only reaches this on a run whose volumes came up, so the failure here is genuinely
     /// about nix or launchd rather than about storage.
     async fn install_sccache(&mut self) -> Result<SccacheInstall> {
-        let flake = sccache_nix::flake_directory()?;
-        let program = match sccache_nix::build(&self.home, &flake)? {
+        let flake = nix::flake_directory()?;
+        let program = match nix::build(&self.home, &flake)? {
             BuildOutcome::Installed(program) => program,
             BuildOutcome::Refused(refusal) => {
                 return Ok(SccacheInstall::Unavailable { flake, refusal });
