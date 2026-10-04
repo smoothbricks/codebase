@@ -210,9 +210,31 @@ pub struct PendingPublicationFact {
     pub replaced_incarnation: WorkspaceIncarnation,
     pub destination_incarnation: WorkspaceIncarnation,
 }
+
+/// An adoption a crash interrupted: the canonical main image its `PendingFence` sidecar still
+/// fences, the incarnation that sidecar was minted for, and what it records of the adoption.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResumableStage {
+pub struct PendingAdoption {
+    pub incarnation: WorkspaceIncarnation,
     pub image: PathBuf,
+    pub info: crate::metadata::WorkspaceInfoSnapshot,
+    pub grants: crate::metadata::GrantSet,
+}
+
+impl PendingAdoption {
+    /// The identity the interrupted attempt recorded, resumed under `trace`.
+    pub fn identity(&self, trace: &str) -> OperationIdentity {
+        OperationIdentity {
+            project_root: self.info.project_root.clone(),
+            base_commit: self.info.base_commit.clone(),
+            created_at: self.info.created_at.clone(),
+            branch: self.info.branch.clone(),
+            forked_from: self.info.forked_from.clone(),
+            created_trace: trace.to_owned(),
+            grants: self.grants.clone(),
+            git_worktree: self.info.git_worktree,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -367,7 +389,15 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     type Attachment: Send + 'static;
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
-    fn create_staged(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsStorageError>;
+    /// Create `image` and hand it back attached, formatted and verified, but not mounted. The
+    /// blank file is written at `request.staged_stem.asif` and renamed to `image` before its
+    /// first attach, so the canonical name only ever holds a complete file, and the formatting
+    /// attach is the one the caller keeps: no detach and second attach follow it.
+    fn create_attached(
+        &self,
+        request: &CreateImageRequest,
+        image: &Path,
+    ) -> Result<Self::Attachment, ApfsStorageError>;
     /// Clone `source` to `destination` with the source's latest writes in it. `source_mount` is
     /// where the source is mounted when it is a live workspace — its volume is what gets flushed
     /// — and `None` for an image nothing mounts (a staged image, a checkpoint).
@@ -394,15 +424,32 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         let _ = (config, source, destination, destination_topology, identity);
         Ok(None)
     }
-    fn resumable_staged_adopt(
+    /// The unfinished adoption whose canonical main still carries `PendingFence`, if any. A main
+    /// that is already published is not an adoption to resume and is refused.
+    fn pending_adoption(
         &self,
         config: &ApfsSubstrateConfig,
         repo: &RepoId,
-        identity: &OperationIdentity,
-    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
-        let _ = (config, repo, identity);
-        Ok(None)
+    ) -> Result<Option<PendingAdoption>, ApfsStorageError>;
+    /// Attach and mount an unfinished adoption's canonical image at its staging mountpoint the
+    /// way [`Self::attach_and_mount_resumable`] does, or answer `None` when its payload never
+    /// became a verified APFS volume (creation died before formatting finished, or `fsck_apfs`
+    /// refuses it); whatever the attempt attached is released first.
+    fn resume_pending_adopt(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
+        self.attach_and_mount_resumable(image, mount_point, workspace)
+            .map(Some)
     }
+    /// Release and reclaim an unpublished canonical image no attachment handle is held for:
+    /// whatever the kernel still attaches from it, then the image, its companion and sidecar.
+    fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError>;
+    /// Unmount the volume `attachment` holds through the kernel's own unmount, leaving the image
+    /// attached for its next mount. No Disk Arbitration round trip.
+    fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError>;
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError>;
     fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError>;
     fn mount(
@@ -412,7 +459,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
-    /// Attach and mount a pending canonical clone, reusing an exact surviving kernel mount and
+    /// Attach and mount a pending canonical image, reusing an exact surviving kernel mount and
     /// otherwise replacing an unmounted crash-left attachment before mounting. Implementations
     /// own cleanup when either the mount or replacement attach fails.
     fn attach_and_mount_resumable(
@@ -512,15 +559,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         source_checkout: &Path,
         pre_cowshed_checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
-    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError>;
     /// Hand the checkout path over to main's mountpoint.
     ///
     /// Builds the mountpoint directory with its self-healing stub under a staging sibling,
     /// exchanges it with the original checkout in one `renameatx_np(RENAME_SWAP)`, and renames the
     /// displaced original to `pre_cowshed_checkout`. The checkout path transitions straight from
-    /// the user's directory to the mountpoint, so it is never absent. The mount is attached
-    /// afterwards — it cannot be attached before, because the mountpoint does not exist until this
-    /// swap creates it — and until it is, the stub inside heals on the next `cd`.
+    /// the user's directory to the mountpoint, so it is never absent. Main is mounted there
+    /// afterwards — it cannot be before, because the mountpoint does not exist until this swap
+    /// creates it — and until it is, the stub inside heals on the next `cd`.
     fn vacate_adopted_checkout(
         &self,
         source_checkout: &Path,
@@ -535,7 +581,8 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         identity: Option<&OperationIdentity>,
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError>;
-    fn activate_pending_clone(
+    /// Publish a pending image: one atomic sidecar rewrite from `PendingFence` to `Active`.
+    fn activate_pending(
         &self,
         image: &Path,
         workspace: &LifecycleWorkspace,
@@ -817,10 +864,63 @@ where
         .await
     }
 
-    /// Prepare an unenumerated mounted clone, let the controller initialize it, then publish it.
+    /// Complete an adoption whose main is published but whose checkout swap or mount at the
+    /// checkout was interrupted: swap the checkout for main's mountpoint if that has not happened,
+    /// then mount main there, reusing a surviving attachment. Idempotent once main is mounted.
+    pub async fn finish_adoption(
+        &self,
+        workspace: &LifecycleWorkspace,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        if !workspace.name().is_main() {
+            return Err(ApfsStorageError::InvalidPlan(
+                "only main's adoption has a checkout to finish",
+            ));
+        }
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+        )?];
+        let workspace = workspace.clone();
+        let pre_cowshed_checkout = pre_cowshed_checkout.to_owned();
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            finish_adoption(host.as_ref(), &config, &workspace, &pre_cowshed_checkout)
+        })
+        .await
+    }
+
+    /// Retire an unpublished main nothing will finish: release whatever the kernel still attaches
+    /// from it and reclaim the image with its sidecar and companion. Only the exact `incarnation`
+    /// the caller judged abandoned is touched, re-read under main's lifecycle lock; the checkout
+    /// is never involved, because an unpublished adoption never changed it.
+    pub async fn discard_pending_adoption(
+        &self,
+        repo: &RepoId,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Result<(), ApfsStorageError> {
+        let lock_paths = vec![workspace_lock_path(&self.config, repo, &main_name())?];
+        let repo = repo.clone();
+        let incarnation = incarnation.clone();
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            match host.pending_adoption(&config, &repo)? {
+                Some(pending) if pending.incarnation == incarnation => {
+                    host.discard_pending(&pending.image)
+                }
+                Some(_) => Err(ApfsStorageError::InvalidPlan(
+                    "unpublished main changed incarnation before its retirement",
+                )),
+                None => Ok(()),
+            }
+        })
+        .await
+    }
+
+    /// Create main's canonical image behind its `PendingFence`, mount it at a staging mountpoint
+    /// for the controller to initialize, then publish it and mount it at the checkout.
     ///
-    /// The lifecycle lock remains owned across the callback. The canonical image and main
-    /// mountpoint are not changed until `initialize` returns success.
+    /// The lifecycle lock remains owned across the callback. The image stays unpublished and the
+    /// checkout untouched until `initialize` returns success.
     pub async fn execute_adopt_staged<F, Fut, E>(
         &self,
         plan: AdoptPlan,
@@ -1852,8 +1952,8 @@ struct AdoptExecution<'a> {
 struct PreparedAdopt<A> {
     stage: AdoptStage,
     attachment: A,
-    staged_image: PathBuf,
-    canonical_image: PathBuf,
+    /// Main's canonical image, still behind its `PendingFence` sidecar.
+    image: PathBuf,
     canonical_mount: PathBuf,
     source_checkout: PathBuf,
     pre_cowshed_checkout: PathBuf,
@@ -2000,6 +2100,26 @@ fn apply_operation<H: ApfsExecutionHost>(
     }
 }
 
+fn adopted_workspace(
+    repo: &RepoId,
+    incarnation: WorkspaceIncarnation,
+    topology: Revision,
+) -> Result<LifecycleWorkspace, ApfsStorageError> {
+    LifecycleWorkspace::new(
+        repo.clone(),
+        main_name(),
+        incarnation,
+        Revision::new(1),
+        Revision::new(topology.get() + 1),
+        WorkspaceRole::Main,
+    )
+    .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))
+}
+
+/// Main's image is created at its canonical path, behind a `PendingFence` sidecar, and attached
+/// exactly once: the copy runs on a staging mount of that attachment, and publication is the
+/// sidecar's activation followed by a remount of the same attachment at the checkout. Nothing
+/// is renamed under an attachment, whose identity is the backing path it was opened with.
 fn prepare_adopt_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
@@ -2012,9 +2132,9 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         capacity,
         source_checkout,
         pre_cowshed_checkout,
-        identity,
+        identity: requested,
     } = execution;
-    if identity.project_root != source_checkout || config.checkout_path != source_checkout {
+    if requested.project_root != source_checkout || config.checkout_path != source_checkout {
         return Err(ApfsStorageError::InvalidPlan(
             "adopt source must equal operation project root and the configured checkout path",
         ));
@@ -2025,131 +2145,192 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         ));
     }
     let topology = absent_expected(expected)?;
-    let incarnation = incarnations.mint()?;
-    let staged_stem = staging_stem(config, repo, &main_name(), &incarnation)?;
-    let resumable = host.resumable_staged_adopt(config, repo, identity)?;
-    let staged_image = match resumable {
-        Some(resumable) => {
-            let path = staged_stem.with_extension(IMAGE_EXTENSION);
-            host.clone_image(&resumable.image, None, &path)?;
-            path
-        }
-        None => host.create_staged(&CreateImageRequest {
-            staged_stem,
-            capacity,
-            volume_name: volume_label(repo, &main_name()),
-            // SAFETY: `getuid`/`getgid` read this process's credentials;
-            // they take no pointers and cannot fail.
-            owner_uid: unsafe { libc::getuid() },
-            // SAFETY: `getgid` reads this process's credentials; it takes no
-            // pointers and cannot fail.
-            owner_gid: unsafe { libc::getgid() },
-        })?,
-    };
-    let workspace = LifecycleWorkspace::new(
-        repo.clone(),
-        main_name(),
-        incarnation,
-        Revision::new(1),
-        Revision::new(topology.get() + 1),
-        WorkspaceRole::Main,
-    )
-    .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))?;
-    let canonical_image = canonical_image_path(config, &workspace)?;
-    let canonical_mount = mount_point(config, &workspace)?;
-    let mount_point = staging_mount(config, &workspace)?;
-    let staged_companion = companion_path(&staged_image);
+    let image = layout(config, repo)?.main_image()?.image().to_owned();
 
-    if let Err(primary) = host.publish_metadata(
-        &staged_image,
-        &workspace,
-        workspace.revision(),
-        MetadataPolicy::Fresh,
-        Some(identity),
-        None,
-    ) {
-        return combine_cleanup(
-            "adopt metadata preparation",
-            primary,
-            host.reclaim_image(&staged_image),
-        );
-    }
-    let attachment = match host.attach_verified(&staged_image) {
-        Ok(attachment) => attachment,
-        Err(primary) => {
-            return combine_cleanup(
-                "adopt attachment preparation",
-                primary,
-                host.reclaim_image(&staged_image),
-            );
+    // An adoption a crash interrupted resumes in place: the delta copier skips every leaf the
+    // last attempt finished, so the repository copy never starts over. Its sidecar names the
+    // source it was copying; a different checkout root or commit is a different adoption, and
+    // the unpublished image is replaced — the checkout itself was never touched.
+    let mut resumed = None;
+    if let Some(pending) = host.pending_adoption(config, repo)? {
+        let workspace = adopted_workspace(repo, pending.incarnation.clone(), topology)?;
+        let staging = staging_mount(config, &workspace)?;
+        let same_source = pending.info.project_root == requested.project_root
+            && pending.info.base_commit == requested.base_commit;
+        let attachment = if same_source {
+            timed_apfs_step("staging", "resume", || {
+                host.resume_pending_adopt(&pending.image, &staging, &workspace)
+            })?
+        } else {
+            None
+        };
+        match attachment {
+            Some(attachment) => {
+                // The recorded identity, not the retry's: the marker the last attempt may have
+                // written then validates as already current instead of growing its own lineage.
+                let identity = pending.identity(&requested.created_trace);
+                resumed = Some((workspace, identity, attachment, staging));
+            }
+            None => {
+                eprintln!(
+                    "cowshed: replacing unpublished main image {} ({}); the checkout was never touched",
+                    pending.image.display(),
+                    if same_source {
+                        "its payload never became a verified APFS volume"
+                    } else {
+                        "it was copying a different checkout or commit"
+                    }
+                );
+                host.discard_pending(&pending.image)?;
+            }
         }
-    };
-    let prepared = host
-        .mount(&attachment, &mount_point, MountAccess::ReadWrite, false)
-        .and_then(|()| {
-            timed_apfs_step("staging", "copy", || {
-                host.copy_tree(source_checkout, &mount_point)
-            })?;
-            timed_apfs_step("staging", "creds", || {
-                host.mint_workspace_credentials(
+    }
+    let (workspace, identity, attachment, staging, resuming) = match resumed {
+        Some((workspace, identity, attachment, staging)) => {
+            (workspace, identity, attachment, staging, true)
+        }
+        None => {
+            let workspace = adopted_workspace(repo, incarnations.mint()?, topology)?;
+            let staging = staging_mount(config, &workspace)?;
+            // The sidecar is the publication fence and is durable before the payload name
+            // appears. A crash in the gap leaves a sidecar-only record that recover_pending
+            // removes; once the payload exists, PendingFence keeps it out of enumeration.
+            if let Err(primary) = timed_apfs_step("canonical", "metadata-pending", || {
+                host.publish_metadata(
+                    &image,
                     &workspace,
-                    &staged_image,
-                    &mount_point,
-                    &canonical_mount,
-                    &staged_companion,
+                    workspace.revision(),
+                    MetadataPolicy::FreshPendingFence,
+                    Some(requested),
+                    None,
                 )
-            })?;
-            timed_apfs_step("staging", "marker", || {
-                host.write_marker(&mount_point, &workspace, None, identity)
-            })?;
-            timed_apfs_step("staging", "validate", || {
-                host.validate_marker(
-                    &mount_point,
-                    &MarkerExpectation::freshly_stamped(&workspace),
-                )
-            })
-        });
-    if let Err(primary) = prepared {
-        let cleanup = detach_and_reclaim(host, attachment, &staged_image, "adopt staging detach");
-        return combine_cleanup("adopt preparation", primary, cleanup);
-    }
-
-    Ok(PreparedAdopt {
+            }) {
+                return combine_cleanup(
+                    "adopt metadata preparation",
+                    primary,
+                    host.reclaim_image(&image),
+                );
+            }
+            // The blank is written under a staging name of its own, so a crash mid-write leaves
+            // only a staging orphan; the canonical name appears with a complete file.
+            let blank = staging_stem(config, repo, &main_name(), &incarnations.mint()?)?;
+            let request = CreateImageRequest {
+                staged_stem: blank,
+                capacity,
+                volume_name: volume_label(repo, &main_name()),
+                // SAFETY: `getuid`/`getgid` read this process's credentials;
+                // they take no pointers and cannot fail.
+                owner_uid: unsafe { libc::getuid() },
+                // SAFETY: `getgid` reads this process's credentials; it takes no
+                // pointers and cannot fail.
+                owner_gid: unsafe { libc::getgid() },
+            };
+            let attachment = match host.create_attached(&request, &image) {
+                Ok(attachment) => attachment,
+                // Creation releases what it attached; anything it could not is released here,
+                // before the image beneath it is removed.
+                Err(primary) => {
+                    return combine_cleanup(
+                        "adopt image creation",
+                        primary,
+                        host.discard_pending(&image),
+                    );
+                }
+            };
+            if let Err(primary) = host.mount(&attachment, &staging, MountAccess::ReadWrite, false) {
+                return combine_cleanup(
+                    "adopt staging mount",
+                    primary,
+                    detach_and_reclaim(host, attachment, &image, "adopt detach"),
+                );
+            }
+            (workspace, requested.clone(), attachment, staging, false)
+        }
+    };
+    let canonical_mount = mount_point(config, &workspace)?;
+    let companion = companion_path(&image);
+    let prepared = timed_apfs_step("staging", "copy", || {
+        host.copy_tree(source_checkout, &staging)
+    })
+    .and_then(|()| {
+        timed_apfs_step("staging", "creds", || {
+            host.mint_workspace_credentials(
+                &workspace,
+                &image,
+                &staging,
+                &canonical_mount,
+                &companion,
+            )
+        })
+    })
+    .and_then(|()| {
+        timed_apfs_step("staging", "marker", || {
+            host.write_marker(&staging, &workspace, None, &identity)
+        })
+    })
+    .and_then(|()| {
+        timed_apfs_step("staging", "validate", || {
+            host.validate_marker(&staging, &MarkerExpectation::freshly_stamped(&workspace))
+        })
+    });
+    let adopt = PreparedAdopt {
         stage: WorkspaceStage {
             workspace,
-            mount_point,
-            companion: staged_companion,
-            resuming: false,
+            mount_point: staging,
+            companion,
+            resuming,
         },
         attachment,
-        staged_image,
-        canonical_image,
+        image,
         canonical_mount,
         source_checkout: source_checkout.to_owned(),
         pre_cowshed_checkout: pre_cowshed_checkout.to_owned(),
-    })
+    };
+    match prepared {
+        Ok(()) => Ok(adopt),
+        Err(primary) => combine_cleanup(
+            "adopt preparation",
+            primary,
+            abort_prepared_adopt(host, adopt),
+        ),
+    }
 }
 
 fn abort_prepared_adopt<H: ApfsExecutionHost>(
     host: &H,
     prepared: PreparedAdopt<H::Attachment>,
 ) -> Result<(), ApfsStorageError> {
-    detach_and_reclaim(
+    release_unpublished_adopt(
         host,
         prepared.attachment,
-        &prepared.staged_image,
-        "adopt staging detach",
+        &prepared.image,
+        prepared.stage.resuming,
     )
+}
+
+/// Let go of an adoption that will not be published. A fresh image is reclaimed with its sidecar
+/// and companion. A resumed one keeps them: it holds the copy the next attempt continues from.
+fn release_unpublished_adopt<H: ApfsExecutionHost>(
+    host: &H,
+    attachment: H::Attachment,
+    image: &Path,
+    resuming: bool,
+) -> Result<(), ApfsStorageError> {
+    if resuming {
+        host.detach(attachment, DetachIntent::Release)
+    } else {
+        detach_and_reclaim(host, attachment, image, "adopt detach")
+    }
 }
 
 fn detach_and_reclaim<H: ApfsExecutionHost>(
     host: &H,
     attachment: H::Attachment,
-    staged_image: &Path,
+    image: &Path,
     operation: &'static str,
 ) -> Result<(), ApfsStorageError> {
     let detached = host.detach(attachment, DetachIntent::Release);
-    let reclaimed = host.reclaim_image(staged_image);
+    let reclaimed = host.reclaim_image(image);
     match detached {
         Ok(()) => reclaimed,
         Err(primary) => combine_cleanup(operation, primary, reclaimed),
@@ -2161,60 +2342,109 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
     config: &ApfsSubstrateConfig,
     prepared: PreparedAdopt<H::Attachment>,
 ) -> Result<Applied, ApfsStorageError> {
+    if let Err(primary) = host
+        .validate_staged_companion(&prepared.stage.companion)
+        .and_then(|()| {
+            host.validate_marker(
+                &prepared.stage.mount_point,
+                &MarkerExpectation::freshly_stamped(&prepared.stage.workspace),
+            )
+        })
+    {
+        return combine_cleanup(
+            "adopt post-initialization validation",
+            primary,
+            abort_prepared_adopt(host, prepared),
+        );
+    }
     let PreparedAdopt {
         stage,
         attachment,
-        staged_image,
-        canonical_image,
+        image,
         canonical_mount,
         source_checkout,
         pre_cowshed_checkout,
     } = prepared;
-    if let Err(primary) = host
-        .validate_staged_companion(&stage.companion)
-        .and_then(|()| {
-            host.validate_marker(
-                &stage.mount_point,
-                &MarkerExpectation::freshly_stamped(&stage.workspace),
-            )
-        })
-    {
-        let cleanup = detach_and_reclaim(host, attachment, &staged_image, "adopt staging detach");
-        return combine_cleanup("adopt post-initialization validation", primary, cleanup);
-    }
-    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
+    // The staging mount comes down through the kernel's unmount and the image stays attached, so
+    // the checkout mount below needs no detach, second attach or second fsck.
+    if let Err(primary) = timed_apfs_step("staging", "unmount", || {
+        host.unmount_attachment(&attachment)
+    }) {
         return combine_cleanup(
-            "adopt staging detach",
+            "adopt staging unmount",
             primary,
-            host.reclaim_image(&staged_image),
+            release_unpublished_adopt(host, attachment, &image, stage.resuming),
         );
     }
-    // Publication order is the transaction: every durable artifact is built before the user's tree
-    // is touched, and the checkout path changes hands in one atomic swap. The mountpoint *is* the
+    // Publication is the sidecar's one atomic rewrite from PendingFence to Active; until it lands
+    // the image is invisible to every verb and the user's tree is untouched.
+    if let Err(primary) = timed_apfs_step("canonical", "activate", || {
+        host.activate_pending(&image, &stage.workspace)
+    }) {
+        return combine_cleanup(
+            "adopt activation",
+            primary,
+            release_unpublished_adopt(host, attachment, &image, stage.resuming),
+        );
+    }
+    // Only now does the checkout path change hands, in one atomic swap. The mountpoint *is* the
     // checkout path and cannot exist until the swap creates it, so the swap comes first and the
-    // attach follows; the self-healing stub the swap plants covers that window. A failure or crash
-    // before the swap leaves the user's directory exactly as it was.
-    if let Err(primary) = host.publish_image(&staged_image, &canonical_image) {
-        let cleanup = match primary.disposition() {
-            PublicationDisposition::RolledBack => host.reclaim_image(&staged_image),
-            PublicationDisposition::ForwardOnly => Ok(()),
-        };
-        return combine_cleanup("adopt publication", primary.into_source(), cleanup);
+    // mount follows; the self-healing stub the swap plants covers that window. A failure from
+    // here on leaves a published main that `ApfsSubstrate::finish_adoption` completes.
+    host.vacate_adopted_checkout(&source_checkout, &pre_cowshed_checkout)
+        .map_err(PublicationError::into_source)?;
+    if let Err(primary) = host
+        .mount(&attachment, &canonical_mount, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            timed_apfs_step("canonical", "validate", || {
+                host.validate_marker(
+                    &canonical_mount,
+                    &MarkerExpectation::owned(config, &stage.workspace),
+                )
+            })
+        })
+    {
+        return detach_after_failure(host, attachment, primary, "canonical validation");
     }
-    if let Err(primary) = host.vacate_adopted_checkout(&source_checkout, &pre_cowshed_checkout) {
-        return Err(primary.into_source());
-    }
-    mount_canonical(
-        host,
-        config,
-        &canonical_image,
-        &canonical_mount,
-        &stage.workspace,
-    )?;
+    timed_apfs_step("canonical", "retain", || {
+        host.retain_mounted(&stage.workspace, attachment)
+    })?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: stage.workspace.revision(),
         workspace: stage.workspace,
     }))
+}
+
+/// Finish an adoption whose image is published but whose checkout swap or mount a crash or
+/// failure interrupted: every step converges from what is already on disk and in the kernel.
+fn finish_adoption<H: ApfsExecutionHost>(
+    host: &H,
+    config: &ApfsSubstrateConfig,
+    workspace: &LifecycleWorkspace,
+    pre_cowshed_checkout: &Path,
+) -> Result<(), ApfsStorageError> {
+    host.vacate_adopted_checkout(&config.checkout_path, pre_cowshed_checkout)
+        .map_err(PublicationError::into_source)?;
+    let checkout = mount_point(config, workspace)?;
+    let derived = super::lifecycle::derive_workspaces(
+        host.list(workspace.repo())?,
+        host.mounts(workspace.repo())?,
+        host.checkpoints(workspace.repo())?,
+    )?;
+    let mounted = derived.into_iter().any(|candidate| {
+        candidate.workspace == *workspace
+            && matches!(candidate.mount_state, MountState::Mounted { .. })
+    });
+    let expected = MarkerExpectation::owned(config, workspace);
+    if mounted {
+        return host.validate_marker(&checkout, &expected);
+    }
+    let image = canonical_image_path(config, workspace)?;
+    let attachment = host.attach_and_mount_resumable(&image, &checkout, workspace)?;
+    if let Err(primary) = host.validate_marker(&checkout, &expected) {
+        return detach_after_failure(host, attachment, primary, "canonical validation");
+    }
+    host.retain_mounted(workspace, attachment).map(|_| ())
 }
 
 fn prepare_clone_stage<H: ApfsExecutionHost>(
@@ -2407,7 +2637,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
         })
     })?;
     timed_apfs_step("canonical", "activate", || {
-        host.activate_pending_clone(&image, &stage.workspace)
+        host.activate_pending(&image, &stage.workspace)
     })?;
     timed_apfs_step("canonical", "retain", || {
         host.retain_mounted(&stage.workspace, attachment)

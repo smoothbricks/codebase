@@ -1016,6 +1016,10 @@ pub enum ApfsError {
         output: CommandOutput,
     },
     InvalidAttachmentPlist(String),
+    /// The attach succeeded but reported no APFS volume at all: the image was never formatted,
+    /// or its formatting never finished. Distinct from a malformed report, which proves nothing
+    /// about the image.
+    NoApfsVolume,
     InvalidAttachmentInventory(String),
     AttachmentCleanupFailed {
         image: PathBuf,
@@ -1086,6 +1090,9 @@ impl fmt::Display for ApfsError {
             ),
             Self::InvalidAttachmentPlist(message) => {
                 write!(f, "invalid attachment plist: {message}")
+            }
+            Self::NoApfsVolume => {
+                f.write_str("attach reported no APFS volume: the image was never formatted")
             }
             Self::InvalidAttachmentInventory(message) => {
                 write!(f, "invalid attachment inventory: {message}")
@@ -1184,6 +1191,18 @@ impl From<CloneFileError> for ApfsError {
 
 pub trait ApfsBackend {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError>;
+    /// Write the blank, unattached ASIF file `staged_stem.asif` and nothing else: the one step
+    /// of creation that needs no attachment, so a crash inside it leaves only a staging file.
+    fn create_blank_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError>;
+    /// Attach the blank image at `image`, format its one case-sensitive APFS volume, and hand
+    /// the attachment back verified (`fsck_apfs -q`) and pinned, ready to mount. The formatting
+    /// attach is the image's only one: no detach and second attach follow it. Every failure
+    /// releases the attachment and removes the image.
+    fn format_attached(
+        &self,
+        image: &Path,
+        request: &CreateImageRequest,
+    ) -> Result<AttachedImage, ApfsError>;
     /// Make the source's latest writes part of the image a clone is about to be cut from:
     /// its volume when `mount_point` is mounted, then the image file itself.
     ///
@@ -1492,6 +1511,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn create_asif(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path)?;
         let _lease = self.image_lease(path)?;
+        self.create_blank_unlocked(path, request)?;
+        let whole_device = self.attach_and_format_unlocked(path, request)?;
+        self.detach_image_device_unlocked(path, &whole_device, DetachIntent::Release)?;
+        Ok(())
+    }
+
+    fn create_blank_unlocked(
+        &self,
+        path: &Path,
+        request: &CreateImageRequest,
+    ) -> Result<(), ApfsError> {
         let create = CommandRequest::new(
             DISKUTIL,
             [
@@ -1511,7 +1541,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         );
         timed_apfs_step(apfs_step_leg(path), "blank-create", || {
             self.run_checked("create ASIF image", create)
-        })?;
+        })
+        .map(|_| ())
+    }
+
+    /// Attach the blank image at `path` and format its whole device. Returns that whole device,
+    /// still attached; every failure releases what this attach added and removes the image.
+    fn attach_and_format_unlocked(
+        &self,
+        path: &Path,
+        request: &CreateImageRequest,
+    ) -> Result<String, ApfsError> {
         let attached_before = self.attached_whole_devices(path)?;
 
         let attach = CommandRequest::new(
@@ -1565,21 +1605,65 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         if let Err(primary) = timed_apfs_step(apfs_step_leg(path), "format", || {
             self.run_checked("format ASIF APFS volume", format)
         }) {
-            return match self.detach_image_device_unlocked(
-                path,
-                &whole_device,
-                DetachIntent::Release,
-            ) {
-                Ok(()) => Err(self.cleanup_failed_asif(path, primary)),
-                Err(detach) => Err(ApfsError::AsifCreationAndCleanupFailed {
-                    primary: Box::new(primary),
-                    detach: Some(Box::new(detach)),
-                    remove: None,
-                }),
-            };
+            return Err(self.release_failed_format(path, &whole_device, primary));
         }
-        self.detach_image_device_unlocked(path, &whole_device, DetachIntent::Release)?;
-        Ok(())
+        Ok(whole_device)
+    }
+
+    /// Release a just-formatted image's attachment after a failed step and remove the image.
+    fn release_failed_format(
+        &self,
+        path: &Path,
+        whole_device: &str,
+        primary: ApfsError,
+    ) -> ApfsError {
+        match self.detach_image_device_unlocked(path, whole_device, DetachIntent::Release) {
+            Ok(()) => self.cleanup_failed_asif(path, primary),
+            Err(detach) => ApfsError::AsifCreationAndCleanupFailed {
+                primary: Box::new(primary),
+                detach: Some(Box::new(detach)),
+                remove: None,
+            },
+        }
+    }
+
+    /// The APFS volume formatting just put on `image`, read from the kernel's own record of the
+    /// image, pinned against device reuse and checked with `fsck_apfs -q` exactly as a verified
+    /// attach is, so the volume mounts through the same gate every other mount passes.
+    fn verify_formatted_unlocked(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
+        let leg = apfs_step_leg(image);
+        let attachment = match self.recovered_image_attachment(image)? {
+            Some(RecoveredImageAttachment::Apfs(attachment)) => attachment,
+            Some(RecoveredImageAttachment::Unformatted { whole_device, .. }) => {
+                return Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "{} still shows only the unformatted {whole_device} after formatting",
+                    image.display()
+                )));
+            }
+            None => {
+                return Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "{} is not attached after formatting",
+                    image.display()
+                )));
+            }
+        };
+        let pin = self.pin_attached_volume(&attachment)?;
+        let request = CommandRequest::new(
+            FSCK_APFS,
+            [
+                OsString::from("-q"),
+                OsString::from(raw_device_from(&attachment.volume_device)),
+            ],
+        );
+        let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
+        if !output.succeeded() {
+            return Err(ApfsError::VerificationFailed { request, output });
+        }
+        *attachment
+            .pin
+            .lock()
+            .expect("attachment pin mutex poisoned") = pin;
+        Ok(attachment)
     }
 
     fn cleanup_failed_asif(&self, path: &Path, primary: ApfsError) -> ApfsError {
@@ -1860,23 +1944,49 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 }
 
+/// The `.asif` path a creation request stages its image at, once the request itself is sound.
+fn staged_image_path(request: &CreateImageRequest) -> Result<PathBuf, ApfsError> {
+    if request.staged_stem.extension().is_some() || request.staged_stem.file_name().is_none() {
+        return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
+    }
+    if !is_valid_apfs_volume_name(&request.volume_name) {
+        return Err(ApfsError::InvalidCreateRequest(
+            "volume name must be path-safe and at most 255 bytes",
+        ));
+    }
+    Ok(request.staged_stem.with_extension(IMAGE_EXTENSION))
+}
+
 impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError> {
-        if request.staged_stem.extension().is_some() {
-            return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
-        }
-        if request.staged_stem.file_name().is_none() {
-            return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
-        }
+        let path = staged_image_path(request)?;
+        self.create_asif(&path, request)?;
+        Ok(path)
+    }
+
+    fn create_blank_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError> {
+        let path = staged_image_path(request)?;
+        validate_image_path(&path)?;
+        let _lease = self.image_lease(&path)?;
+        self.create_blank_unlocked(&path, request)?;
+        Ok(path)
+    }
+
+    fn format_attached(
+        &self,
+        image: &Path,
+        request: &CreateImageRequest,
+    ) -> Result<AttachedImage, ApfsError> {
         if !is_valid_apfs_volume_name(&request.volume_name) {
             return Err(ApfsError::InvalidCreateRequest(
                 "volume name must be path-safe and at most 255 bytes",
             ));
         }
-
-        let path = request.staged_stem.with_extension(IMAGE_EXTENSION);
-        self.create_asif(&path, request)?;
-        Ok(path)
+        validate_image_path(image)?;
+        let _lease = self.image_lease(image)?;
+        let whole_device = self.attach_and_format_unlocked(image, request)?;
+        self.verify_formatted_unlocked(image)
+            .map_err(|primary| self.release_failed_format(image, &whole_device, primary))
     }
 
     fn sync_for_freshness(
@@ -2516,8 +2626,11 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         .and_then(|root| root.get("system-entities"))
         .and_then(plist::Value::as_array)
         .ok_or_else(|| ApfsError::InvalidAttachmentPlist("missing system-entities array".into()))?;
-    attached_apfs_volume(&collect_attachment_entities(system_entities)?)
-        .map_err(ApfsError::InvalidAttachmentPlist)
+    let entities = collect_attachment_entities(system_entities)?;
+    if !entities.iter().any(|(_, hint)| is_apfs_volume_hint(hint)) {
+        return Err(ApfsError::NoApfsVolume);
+    }
+    attached_apfs_volume(&entities).map_err(ApfsError::InvalidAttachmentPlist)
 }
 
 /// Apple's fixed APFS partition-type GUID prefixes, as the kernel's IOMedia `Content` labels an
@@ -4426,6 +4539,91 @@ mod tests {
         assert!(backend.sleeper.waits().is_empty());
     }
 
+    /// The canonical image adopt creates is formatted on its one attach and handed back verified:
+    /// the kernel's own record names the new volume, `fsck_apfs` checks it, and nothing detaches,
+    /// so no second attach is needed to mount it.
+    #[test]
+    fn formatting_keeps_its_one_attach_and_hands_back_a_verified_volume() {
+        let image = temp_path("asif-format-attached", IMAGE_EXTENSION);
+        let formatted = || {
+            let path = attachment_inventory_path(&image).unwrap();
+            images(&[(
+                path.to_str().unwrap(),
+                &["/dev/disk8", "/dev/disk5", "/dev/disk5s1"][..],
+            )])
+        };
+        let backend = graced_backend([
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
+            holding(&image, "/dev/disk8"),
+            ok([]),
+            formatted(),
+            formatted(),
+            ok([]),
+        ]);
+
+        let attachment = backend
+            .format_attached(&image, &blank_request(image.with_extension("")))
+            .unwrap();
+
+        assert_eq!(attachment.volume_device(), "/dev/disk5s1");
+        let steps = backend.runner().steps();
+        let commands = commands(&steps);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|request| argv(request).get(1).is_some_and(|arg| arg == "attach"))
+                .count(),
+            1,
+            "one attach formats and verifies the image"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "detach")),
+            "nothing detaches the image it formatted"
+        );
+        assert_eq!(
+            commands.last().unwrap().program,
+            Path::new(FSCK_APFS),
+            "the volume is verified before anything mounts it"
+        );
+        assert_eq!(argv(commands.last().unwrap()), ["-q", "/dev/rdisk5s1"]);
+    }
+
+    /// A format whose volume never appears in the kernel's record is not trusted: the attachment
+    /// is released by the image's own mapping and the image removed.
+    #[test]
+    fn formatting_without_a_registered_volume_releases_the_attachment_and_the_image() {
+        let image = temp_path("asif-format-no-volume", IMAGE_EXTENSION);
+        fs::write(&image, b"blank").unwrap();
+        let backend = graced_backend([
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
+            holding(&image, "/dev/disk8"),
+            ok([]),
+            holding(&image, "/dev/disk8"),
+            holding(&image, "/dev/disk8"),
+            ok([]),
+            no_images(),
+        ]);
+
+        let error = backend
+            .format_attached(&image, &blank_request(image.with_extension("")))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ApfsError::InvalidAttachmentInventory(_)),
+            "{error}"
+        );
+        assert!(!image.exists());
+        let steps = backend.runner().steps();
+        assert_eq!(
+            argv(commands(&steps).last().unwrap()),
+            ["detach", "/dev/disk8"]
+        );
+    }
+
     /// An unreadable kernel inventory at the final release is a typed refusal, never a release.
     #[test]
     fn an_unreadable_inventory_at_release_is_never_treated_as_released() {
@@ -5689,10 +5887,6 @@ mod tests {
                 r#"expected one APFS volume, reported ["/dev/disk5s1", "/dev/disk5s2"]"#,
             ),
             (
-                &[("disk4", ""), ("disk5", "Apple_APFS_Container")][..],
-                "expected one APFS volume, reported []",
-            ),
-            (
                 &[("disk4", ""), ("disk5s1", "Apple_APFS_Volume")][..],
                 "APFS volume /dev/disk5s1 was reported without its container /dev/disk5",
             ),
@@ -5709,6 +5903,20 @@ mod tests {
                 matches!(
                     parse_attachment_plist(plist(entities).as_bytes()),
                     Err(ApfsError::InvalidAttachmentPlist(message)) if message == refusal
+                ),
+                "{entities:?}"
+            );
+        }
+        // No volume at all is a typed answer, not a malformed report: the image was never
+        // formatted (a blank whole device), or formatting stopped before its volume existed.
+        for entities in [
+            &[("disk4", "")][..],
+            &[("disk4", ""), ("disk5", "Apple_APFS_Container")][..],
+        ] {
+            assert!(
+                matches!(
+                    parse_attachment_plist(plist(entities).as_bytes()),
+                    Err(ApfsError::NoApfsVolume)
                 ),
                 "{entities:?}"
             );

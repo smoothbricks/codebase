@@ -50,7 +50,7 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingPublicationFact, PublicationError, ResumableClone, ResumableStage,
+    MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone,
     companion_path, extents, layout, main_aware_mount_point, recovery_staging_mount,
     retired_image_below, split_retired_stem, volume_key,
 };
@@ -840,18 +840,11 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreFailpoint {
     Disabled = 0,
-    CanonicalSidecarRollbackFailure = 10,
     AfterUndoSidecar = 1,
     AfterImageSwap = 2,
     AfterUndoRename = 3,
     AfterMetadataPublish = 4,
     AfterMetadataFsync = 5,
-    AfterCanonicalImageRename = 6,
-    AfterCanonicalSidecarRename = 7,
-    CanonicalParentFsyncFailure = 8,
-    PersistentCanonicalParentFsyncFailure = 9,
-    AfterCanonicalCompanionRename = 11,
-    AfterCanonicalParentFsync = 12,
     AfterRestoreImageSwap = 13,
     AfterRestoreUndoImageRename = 14,
     AfterRestoreCanonicalParentFsync = 15,
@@ -1324,23 +1317,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     RestoreFailpoint::AfterUndoRename => "undo rename",
                     RestoreFailpoint::AfterMetadataPublish => "metadata publish",
                     RestoreFailpoint::AfterMetadataFsync => "metadata fsync",
-                    RestoreFailpoint::AfterCanonicalImageRename => "canonical image rename",
-                    RestoreFailpoint::CanonicalSidecarRollbackFailure => {
-                        "canonical sidecar rollback"
-                    }
-                    RestoreFailpoint::AfterCanonicalSidecarRename => {
-                        "canonical sidecar rename"
-                    }
-                    RestoreFailpoint::CanonicalParentFsyncFailure => {
-                        "canonical parent fsync"
-                    }
-                    RestoreFailpoint::PersistentCanonicalParentFsyncFailure => {
-                        "persistent canonical parent fsync"
-                    }
-                    RestoreFailpoint::AfterCanonicalCompanionRename => {
-                        "canonical CA companion rename"
-                    }
-                    RestoreFailpoint::AfterCanonicalParentFsync => "canonical parent fsync",
                     RestoreFailpoint::AfterRestoreImageSwap => "restore image swap",
                     RestoreFailpoint::AfterRestoreUndoImageRename => {
                         "restore undo image rename"
@@ -1362,17 +1338,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         } else {
             Ok(())
         }
-    }
-    fn sync_canonical_parent(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
-        if self.restore_failpoint.load(AtomicOrdering::SeqCst)
-            == RestoreFailpoint::PersistentCanonicalParentFsyncFailure as u8
-        {
-            return Err(ApfsStorageError::Host(format!(
-                "injected persistent canonical parent fsync failure: {}",
-                canonical.display()
-            )));
-        }
-        sync_parent_path(canonical)
     }
 
     pub fn backend(&self) -> &MacOsApfsBackend<R> {
@@ -2400,6 +2365,38 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(mount_point)
     }
 
+    /// The image a staging mountpoint's volume comes from: the staged image of its stem, or, for
+    /// an adoption — which stages its mount but never its image — main's canonical image while
+    /// that image's `PendingFence` sidecar names the stem's incarnation. Anything else answers the
+    /// staged path, whose ownership check then refuses a volume it does not hold.
+    fn staging_mount_backing(
+        &self,
+        repo: &RepoId,
+        staged: PathBuf,
+        stem: &str,
+        workspace: &WorkspaceName,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        if !workspace.is_main() || stem.starts_with("recover-") || path_exists(&staged)? {
+            return Ok(staged);
+        }
+        let canonical = layout(&self.config, repo)?.main_image()?.image().to_owned();
+        if !path_exists(&sidecar_path(&canonical))? {
+            return Ok(staged);
+        }
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let names_stem = stem
+            .rsplit_once('-')
+            .is_some_and(|(_, incarnation)| incarnation == metadata.workspace_incarnation.as_str());
+        Ok(
+            if metadata.publication_state == PublicationState::PendingFence && names_stem {
+                canonical
+            } else {
+                staged
+            },
+        )
+    }
+
     /// Detach a staging mountpoint if the kernel still holds a volume there, then remove the
     /// directory.
     ///
@@ -2986,11 +2983,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             )?;
                     }
                     StorageGcReason::OrphanStagingMount => {
-                        let staged = candidate.path().file_name().and_then(|stem| {
-                            stem.to_str()
-                                .and_then(staged_stem_workspace)
-                                .map(|workspace| (stem, workspace))
-                        });
+                        let staged = candidate
+                            .path()
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .and_then(|stem| {
+                                staged_stem_workspace(stem).map(|workspace| (stem, workspace))
+                            });
                         if let Some((stem, workspace)) = staged {
                             let mut image = PathBuf::with_capacity(
                                 project.as_os_str().len()
@@ -3003,6 +3002,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             image.push(super::STAGING_NAMESPACE);
                             image.push(stem);
                             image.set_extension(IMAGE_EXTENSION);
+                            let image =
+                                self.staging_mount_backing(plan.repo(), image, stem, &workspace)?;
                             if self.retire_staging_mount(candidate.path(), &image)? {
                                 deletion_log::log_deletion(
                                     project,
@@ -3497,11 +3498,43 @@ where
             .collect()
     }
 
-    fn create_staged(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsStorageError> {
+    fn create_attached(
+        &self,
+        request: &CreateImageRequest,
+        image: &Path,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_controller_path(&request.staged_stem)?;
+        self.verify_controller_path(image)?;
+        crate::metadata::validate_image_path(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if path_exists(image)? {
+            return Err(ApfsStorageError::Host(format!(
+                "canonical image already exists: {}",
+                image.display()
+            )));
+        }
         Self::ensure_parent(&request.staged_stem)?;
+        Self::ensure_parent(image)?;
+        let blank = request.staged_stem.with_extension(IMAGE_EXTENSION);
+        if let Err(primary) = self.backend.create_blank_image(request) {
+            return super::combine_cleanup(
+                "create blank image",
+                primary.into(),
+                self.backend.delete_image(&blank).map_err(Into::into),
+            );
+        }
+        // Never attached under its staging name, the blank carries no attachment identity, so it
+        // can take the canonical name before the one attach that formats it.
+        if let Err(error) = fs::rename(&blank, image) {
+            return super::combine_cleanup(
+                "publish blank image",
+                io_error("rename blank image into place", image, error),
+                self.backend.delete_image(&blank).map_err(Into::into),
+            );
+        }
+        sync_parent_path(image)?;
         self.backend
-            .create_staged_image(request)
+            .format_attached(image, request)
             .map_err(Into::into)
     }
 
@@ -3629,48 +3662,86 @@ where
         }))
     }
 
-    fn resumable_staged_adopt(
+    fn pending_adoption(
         &self,
         config: &ApfsSubstrateConfig,
         repo: &RepoId,
-        identity: &OperationIdentity,
-    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
-        let staging = layout(config, repo)?
-            .project()
-            .project_root
-            .join(super::STAGING_NAMESPACE);
-        let mut resumable = None;
-        for sidecar in regular_file_children(&staging)? {
-            if !sidecar
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
-            {
-                continue;
-            }
-            let image = image_from_sidecar(&sidecar)?;
-            if !is_image_path(&image) || !image.exists() || companion_path(&image).exists() {
-                continue;
-            }
-            let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            let info = &metadata.info_snapshot;
-            if metadata.repo_id != *repo
-                || !metadata.workspace.is_main()
-                || info.project_root != identity.project_root
-                || info.base_commit != identity.base_commit
-            {
-                continue;
-            }
-            let candidate = ResumableStage { image };
-            if resumable.replace(candidate).is_some() {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "multiple incomplete adoption stages match {}",
-                    identity.project_root.display()
-                )));
-            }
+    ) -> Result<Option<PendingAdoption>, ApfsStorageError> {
+        let image = layout(config, repo)?.main_image()?.image().to_owned();
+        let image_exists = path_exists(&image)?;
+        if !path_exists(&sidecar_path(&image))? {
+            return if image_exists {
+                Err(ApfsStorageError::MarkerMismatch(format!(
+                    "canonical main image has no metadata: {}",
+                    image.display()
+                )))
+            } else {
+                Ok(None)
+            };
         }
-        Ok(resumable)
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.publication_state != PublicationState::PendingFence {
+            return Err(ApfsStorageError::InvalidPlan("main is already published"));
+        }
+        if !image_exists {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending adoption metadata has no canonical payload: {}",
+                image.display()
+            )));
+        }
+        if metadata.repo_id != *repo
+            || !metadata.workspace.is_main()
+            || metadata.info_snapshot.role != WorkspaceRole::Main
+            || metadata.grants.revision != 1
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending main does not record an adoption of {repo}: {}",
+                image.display()
+            )));
+        }
+        Ok(Some(PendingAdoption {
+            incarnation: metadata.workspace_incarnation,
+            image,
+            info: metadata.info_snapshot,
+            grants: metadata.grants,
+        }))
+    }
+
+    fn resume_pending_adopt(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        // Formatting is the attach that creation keeps, so an image the kernel still shows
+        // unformatted is one whose creation died before its volume existed: nothing was copied.
+        if let Some(RecoveredImageAttachment::Unformatted {
+            image,
+            whole_device,
+        }) = self.backend.recovered_image_attachment(image)?
+        {
+            self.backend
+                .detach_unformatted_image(&image, &whole_device, DetachIntent::Release)?;
+            return Ok(None);
+        }
+        match self.attach_and_mount_resumable(image, mount_point, workspace) {
+            Ok(attachment) => Ok(Some(attachment)),
+            Err(ApfsStorageError::Apfs(
+                ApfsError::NoApfsVolume | ApfsError::VerificationFailed { .. },
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        self.detach_existing_image(image, DetachIntent::Release)?;
+        self.reclaim_image(image)
+    }
+
+    fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError> {
+        self.unmount_attached(attachment, DetachIntent::Release)
     }
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
@@ -4234,152 +4305,6 @@ where
         restore_adopted_checkout_paths(source_checkout, pre_cowshed_checkout)
     }
 
-    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError> {
-        self.verify_controller_path(staged)
-            .map_err(PublicationError::rolled_back)?;
-        self.verify_controller_path(canonical)
-            .map_err(PublicationError::rolled_back)?;
-        Self::ensure_parent(canonical).map_err(PublicationError::rolled_back)?;
-        for path in [staged, canonical] {
-            crate::metadata::validate_image_path(path).map_err(|error| {
-                PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
-            })?;
-        }
-        if canonical.exists() {
-            return Err(PublicationError::forward_only(ApfsStorageError::Host(
-                format!("canonical image already exists: {}", canonical.display()),
-            )));
-        }
-        let expected_metadata =
-            DetachedWorkspaceMetadata::read_for_image(staged).map_err(|error| {
-                PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
-            })?;
-        let staged_companion = companion_path(staged);
-        let canonical_companion = companion_path(canonical);
-        self.validate_staged_companion(&staged_companion)
-            .map_err(PublicationError::rolled_back)?;
-        if canonical_companion.exists() {
-            return Err(PublicationError::forward_only(ApfsStorageError::Host(
-                format!(
-                    "canonical CA key already exists: {}",
-                    canonical_companion.display()
-                ),
-            )));
-        }
-        let canonical_sidecar = sidecar_path(canonical);
-        if canonical_sidecar.exists() {
-            return Err(PublicationError::forward_only(ApfsStorageError::Host(
-                format!(
-                    "canonical metadata already exists: {}",
-                    canonical_sidecar.display()
-                ),
-            )));
-        }
-        let publication = (|| {
-            let staged_sidecar = sidecar_path(staged);
-            let canonical_sidecar = sidecar_path(canonical);
-            fs::rename(&staged_sidecar, &canonical_sidecar).map_err(|error| {
-                io_error("publish canonical metadata", &canonical_sidecar, error)
-            })?;
-            if self.restore_failpoint.load(AtomicOrdering::SeqCst)
-                == RestoreFailpoint::CanonicalSidecarRollbackFailure as u8
-            {
-                return Err(ApfsStorageError::Host(
-                    "injected failure after canonical sidecar rename".to_owned(),
-                ));
-            }
-            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
-            sync_parent_path(&canonical_sidecar)?;
-            self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
-            fs::rename(&staged_companion, &canonical_companion).map_err(|error| {
-                io_error("publish canonical CA key", &canonical_companion, error)
-            })?;
-            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalCompanionRename)?;
-            fs::rename(staged, canonical)
-                .map_err(|error| io_error("publish canonical image", canonical, error))?;
-            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
-            self.trip_restore_failpoint(RestoreFailpoint::CanonicalParentFsyncFailure)?;
-            self.sync_canonical_parent(canonical)?;
-            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalParentFsync)
-        })();
-        let Err(primary) = publication else {
-            return Ok(());
-        };
-
-        let canonical_sidecar = sidecar_path(canonical);
-        if canonical.exists() && canonical_sidecar.exists() && canonical_companion.exists() {
-            let verified = (|| {
-                let actual = DetachedWorkspaceMetadata::read_for_image(canonical)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                if actual != expected_metadata {
-                    return Err(ApfsStorageError::Host(format!(
-                        "durable canonical publication identity mismatch: {}",
-                        canonical.display()
-                    )));
-                }
-                self.sync_canonical_parent(canonical)
-            })();
-            return match verified {
-                Ok(()) => Ok(()),
-                Err(cleanup) => Err(PublicationError::forward_only(ApfsStorageError::Cleanup {
-                    operation: "verify durable canonical publication",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                })),
-            };
-        }
-
-        if !canonical.exists() && canonical_sidecar.exists() && staged.exists() {
-            let staged_sidecar = sidecar_path(staged);
-            let inject_rollback_failure = self.restore_failpoint.load(AtomicOrdering::SeqCst)
-                == RestoreFailpoint::CanonicalSidecarRollbackFailure as u8;
-            if inject_rollback_failure {
-                self.restore_failpoint
-                    .store(RestoreFailpoint::Disabled as u8, AtomicOrdering::SeqCst);
-            }
-            let rollback = if inject_rollback_failure {
-                Err(ApfsStorageError::Host(
-                    "injected canonical sidecar rollback rename failure".to_owned(),
-                ))
-            } else {
-                (|| {
-                    if canonical_companion.exists() {
-                        fs::rename(&canonical_companion, &staged_companion).map_err(|error| {
-                            io_error(
-                                "roll back prepublication canonical CA key",
-                                &staged_companion,
-                                error,
-                            )
-                        })?;
-                    }
-                    fs::rename(&canonical_sidecar, &staged_sidecar)
-                        .map_err(|error| {
-                            io_error(
-                                "roll back prepublication canonical metadata",
-                                &staged_sidecar,
-                                error,
-                            )
-                        })
-                        .and_then(|()| sync_parent_path(&staged_sidecar))
-                })()
-            };
-            return match rollback {
-                Ok(()) => Err(PublicationError::rolled_back(primary)),
-                Err(cleanup) => Err(PublicationError::forward_only(ApfsStorageError::Cleanup {
-                    operation: "roll back partial canonical publication",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                })),
-            };
-        }
-
-        if canonical.exists() || canonical_sidecar.exists() || canonical_companion.exists() {
-            Err(PublicationError::forward_only(primary))
-        } else {
-            Err(PublicationError::rolled_back(primary))
-        }
-    }
-
     fn vacate_adopted_checkout(
         &self,
         source_checkout: &Path,
@@ -4489,6 +4414,9 @@ where
         self.verify_controller_path(image)?;
         crate::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        // The fence can be the first artifact a project holds: adopt writes it before anything
+        // else exists beside main's image.
+        Self::ensure_parent(image)?;
         let preserved = match (policy, source_image) {
             (MetadataPolicy::Preserve | MetadataPolicy::PendingFence, Some(source)) => Some(
                 DetachedWorkspaceMetadata::read_for_image(source)
@@ -4573,7 +4501,7 @@ where
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
-    fn activate_pending_clone(
+    fn activate_pending(
         &self,
         image: &Path,
         workspace: &LifecycleWorkspace,
@@ -4588,7 +4516,7 @@ where
             || metadata.publication_state != PublicationState::PendingFence
         {
             return Err(ApfsStorageError::MarkerMismatch(format!(
-                "pending clone metadata disagrees with activation target: {}",
+                "pending metadata disagrees with activation target: {}",
                 image.display()
             )));
         }
@@ -5174,9 +5102,10 @@ where
                         if metadata.publication_state == PublicationState::PendingFence
                             && !restore_recovery_fact_path(&canonical).exists()
                         {
-                            // A canonical create/fork is deliberately visible by path while its
-                            // init fence is pending. Its lifecycle intent owns resumption; generic
-                            // publication recovery must neither bless nor reclaim it.
+                            // A canonical create, fork or adopt is deliberately visible by path
+                            // while its init fence is pending. Its lifecycle intent owns
+                            // resumption; generic publication recovery must neither bless nor
+                            // reclaim it.
                             continue;
                         }
                         self.check_canonical_companion(&project, &metadata, &canonical)?;
@@ -5203,68 +5132,7 @@ where
                         self.check_canonical_companion(&project, &metadata, &canonical)?;
                         continue;
                     }
-                    let staged = project.join(super::STAGING_NAMESPACE).join(format!(
-                        "{}-{}.{IMAGE_EXTENSION}",
-                        metadata.workspace, metadata.workspace_incarnation,
-                    ));
-                    let staged_companion = companion_path(&staged);
-                    let canonical_companion = companion_path(&canonical);
-                    if staged.exists() {
-                        match (staged_companion.exists(), canonical_companion.exists()) {
-                            (true, false) => {
-                                self.recovery_companion(&staged, "staged publication image")?;
-                                fs::rename(&staged_companion, &canonical_companion).map_err(
-                                    |error| {
-                                        io_error(
-                                            "complete canonical CA companion publication",
-                                            &canonical_companion,
-                                            error,
-                                        )
-                                    },
-                                )?;
-                                sync_parent_path(&canonical_companion)?;
-                            }
-                            (false, true) => {
-                                self.recovery_companion(
-                                    &canonical,
-                                    "canonical companion before image publication",
-                                )?;
-                            }
-                            (staged_exists, canonical_exists) => {
-                                return Err(ApfsStorageError::MarkerMismatch(format!(
-                                    "canonical publication has contradictory CA companions: staged_image={}, staged_companion={} (exists={staged_exists}), canonical_image={}, canonical_companion={} (exists={canonical_exists})",
-                                    staged.display(),
-                                    staged_companion.display(),
-                                    canonical.display(),
-                                    canonical_companion.display()
-                                )));
-                            }
-                        }
-                        let staged_sidecar = sidecar_path(&staged);
-                        if staged_sidecar.exists() {
-                            let staged_metadata =
-                                DetachedWorkspaceMetadata::read_for_image(&staged)
-                                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                            if staged_metadata != metadata {
-                                return Err(ApfsStorageError::MarkerMismatch(format!(
-                                    "staged and canonical metadata disagree during recovery: staged={}, canonical={}",
-                                    staged.display(),
-                                    canonical.display()
-                                )));
-                            }
-                            fs::remove_file(&staged_sidecar).map_err(|error| {
-                                io_error("remove duplicate staged metadata", &staged_sidecar, error)
-                            })?;
-                        }
-                        fs::rename(&staged, &canonical).map_err(|error| {
-                            io_error(
-                                "complete sidecar-first image publication",
-                                &canonical,
-                                error,
-                            )
-                        })?;
-                        sync_parent_path(&canonical)?;
-                    } else if restore_recovery_fact_path(&canonical).exists() {
+                    if restore_recovery_fact_path(&canonical).exists() {
                         // The one reading of this state that is not "the payload is gone": a
                         // restore is in flight, its undo generation under `checkpoints/` still
                         // holds the old image, and the restore pass below owns that decision — it
@@ -5272,38 +5140,36 @@ where
                         // Leave every artifact for it rather than deciding here with less
                         // evidence.
                         continue;
-                    } else {
-                        // A canonical sidecar with no canonical image and no staged image names a
-                        // workspace whose payload does not exist. The image is the only artifact
-                        // here that carries data, and both spellings that reach this branch — a
-                        // publication that died before renaming its image in, and a retirement
-                        // that already moved the image to the trash — agree there is nothing left
-                        // to recover. That absence is decidable rather than ambiguous: the
-                        // sidecar and the image are siblings in one directory, so a pass that can
-                        // read the sidecar can see the image is gone.
-                        //
-                        // Refusing here instead was over-broad in the worst direction. This pass
-                        // is store-wide and runs before every lifecycle operation, so one
-                        // workspace's orphaned metadata failed every verb on every *other*
-                        // workspace — including the `rm` that would have cleared it — while
-                        // preserving nothing: a grants sidecar and a per-workspace CA key are
-                        // derived artifacts that the next publication regenerates, and neither is
-                        // reachable again once the image they describe is gone.
-                        //
-                        // Companion before sidecar. This loop finds work by enumerating sidecars,
-                        // so a crash after removing the sidecar would strand a private CA key no
-                        // later pass ever visits, while a crash after removing the companion
-                        // leaves the sidecar that brings the next pass straight back here.
-                        Self::remove_companion(&canonical)?;
-                        fs::remove_file(&canonical_sidecar).map_err(|error| {
-                            io_error(
-                                "remove orphan canonical metadata",
-                                &canonical_sidecar,
-                                error,
-                            )
-                        })?;
-                        sync_parent_path(&canonical_sidecar)?;
                     }
+                    // A canonical sidecar with no canonical image names a workspace whose payload
+                    // does not exist. The image is the only artifact here that carries data, and
+                    // both spellings that reach this branch — a create, fork or adopt that died
+                    // between its fence and its payload, and a retirement that already moved the
+                    // image to the trash — agree there is nothing left to recover. That absence is
+                    // decidable rather than ambiguous: the sidecar and the image are siblings in
+                    // one directory, so a pass that can read the sidecar can see the image is gone.
+                    //
+                    // Refusing here instead was over-broad in the worst direction. This pass is
+                    // store-wide and runs before every lifecycle operation, so one workspace's
+                    // orphaned metadata failed every verb on every *other* workspace — including
+                    // the `rm` that would have cleared it — while preserving nothing: a grants
+                    // sidecar and a per-workspace CA key are derived artifacts that the next
+                    // publication regenerates, and neither is reachable again once the image
+                    // they describe is gone.
+                    //
+                    // Companion before sidecar. This loop finds work by enumerating sidecars, so
+                    // a crash after removing the sidecar would strand a private CA key no later
+                    // pass ever visits, while a crash after removing the companion leaves the
+                    // sidecar that brings the next pass straight back here.
+                    Self::remove_companion(&canonical)?;
+                    fs::remove_file(&canonical_sidecar).map_err(|error| {
+                        io_error(
+                            "remove orphan canonical metadata",
+                            &canonical_sidecar,
+                            error,
+                        )
+                    })?;
+                    sync_parent_path(&canonical_sidecar)?;
                 }
             }
 
@@ -5361,40 +5227,18 @@ where
                     if sidecar_path(&restore_undo).exists() {
                         continue;
                     }
-                    if metadata.workspace.is_main() {
-                        // Adoption's durable state is built before the user's tree is touched, so
-                        // an interrupted adopt is recognized by the image alone. The retained
-                        // `.pre-cowshed` tree is not a precondition here: it only comes into
-                        // existence with the swap, and reaching this point means that swap has
-                        // not happened yet.
-                        if staged.exists() && !companion_path(&staged).exists() {
-                            // The durable lifecycle intent re-enters adoption and clone-copies this
-                            // partial image before the convergent tree copier resumes it. Publishing
-                            // now would expose a checkout whose copy never reached its marker fence.
-                            continue;
-                        }
-                        if staged.exists() {
-                            self.recovery_companion(&staged, "staged main publication image")?;
-                            if !canonical.exists() {
-                                self.publish_image(&staged, &canonical)?;
-                            }
-                            continue;
-                        }
-                    } else if staged.exists() {
-                        // A staged session image beside its grants sidecar and without its CA
-                        // companion is the window `prepare_clone_stage` leaves open between
-                        // `publish_metadata` and `mint_workspace_credentials`: the sidecar is
-                        // durable before the volume is attached, mounted, relabelled and its key
-                        // minted, so a create or fork that dies inside that window leaves exactly
-                        // this shape, and every error path there reclaims the image itself. No
-                        // canonical sidecar names it, so there is nothing here to complete: it is
-                        // an orphan the gc sweep judges by its lock and reclaims
+                    if staged.exists() {
+                        // A staged image beside its grants sidecar, with no restore naming it, has
+                        // nothing here to complete: create, fork and adopt publish at the canonical
+                        // name behind a PendingFence sidecar, and a restore's stage is named by the
+                        // undo sidecar checked above. Such a pair is an orphan the gc sweep judges
+                        // by its lock and reclaims
                         // (`OrphanStagingImage`), and doctor names as a staging orphan. Refusing
                         // instead was the same over-breadth the canonical branch above retired -
-                        // this pass runs before every verb, so one dead create failed `ls`, `land`
-                        // and the very `gc` that clears it, for every other workspace.
+                        // this pass runs before every verb, so one dead operation failed `ls`,
+                        // `land` and the very `gc` that clears it, for every other workspace.
                         if companion_path(&staged).exists() {
-                            self.recovery_companion(&staged, "staged session publication image")?;
+                            self.recovery_companion(&staged, "staged publication image")?;
                         }
                         continue;
                     }

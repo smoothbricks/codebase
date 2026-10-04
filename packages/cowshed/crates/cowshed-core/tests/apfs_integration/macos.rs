@@ -8,21 +8,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner, volume_name,
+    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
+    MountAccess, SystemCommandRunner, volume_name,
 };
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceName,
+    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_core::storage::apfs::native::{
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
+};
 use cowshed_core::storage::apfs::{
-    ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
-    volume_label,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource,
+    MetadataPolicy, TokioApfsBlockingLane, volume_label,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, LifecyclePlanner, MountIntent, MountState, OperationIdentity, Pin,
-    RestoreMode, Revision, Substrate,
+    AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
+    OperationIdentity, Pin, RestoreMode, Revision, Substrate,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 
@@ -496,4 +500,302 @@ fn assert_case_sensitive(mount: &Path) -> Result<(), Box<dyn Error>> {
     fs::remove_file(upper)?;
     fs::remove_file(lower)?;
     Ok(())
+}
+
+/// An adoption killed at one of its windows, on real APFS: a checkout holding `tracked`, a store,
+/// and the production host, with main's fence and image left exactly as the killed process left
+/// them. Recovery is the same call a restarted controller makes; the kernel is the only witness
+/// of what the dead process held.
+struct KillWindow {
+    substrate: ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    checkout: PathBuf,
+    pre_cowshed: PathBuf,
+    repo: RepoId,
+    image: PathBuf,
+    staging: PathBuf,
+    main: LifecycleWorkspace,
+    identity: OperationIdentity,
+    _root: ScratchRoot,
+}
+
+impl KillWindow {
+    fn new(label: &str) -> Result<Self, Box<dyn Error>> {
+        let root = ScratchRoot::new(label)?;
+        let store = root.path().join("store");
+        let caches = store.join("caches");
+        let checkout = root.path().join("checkout");
+        fs::create_dir_all(&caches)?;
+        fs::create_dir_all(&checkout)?;
+        fs::write(checkout.join("tracked"), b"original source\n")?;
+        let config = ApfsSubstrateConfig::new(&store, &caches, &checkout)
+            .with_capacity(ImageCapacity::from_gibibytes(1));
+        let repo = RepoId::parse(&format!("cowshed/kill-{}", std::process::id()))?;
+        let layout = StorageLayout::new(&store, &repo)?;
+        let image = layout.main_image()?.image().to_owned();
+        let main = LifecycleWorkspace::new(
+            repo.clone(),
+            WorkspaceName::new("main")?,
+            WorkspaceIncarnation::new(format!("{:032x}", 0xad))?,
+            Revision::new(1),
+            Revision::new(1),
+            WorkspaceRole::Main,
+        )
+        .map_err(|error| format!("main identity: {error:?}"))?;
+        let staging = layout
+            .project()
+            .mount_root
+            .join(".staging")
+            .join(format!("main-{}", main.incarnation()));
+        let identity = OperationIdentity {
+            project_root: checkout.clone(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            branch: Some("main".to_owned()),
+            forked_from: None,
+            created_trace: "apfs-kill-window".to_owned(),
+            git_worktree: false,
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(
+                MACOS_PORT_MIN,
+                NEW_PORT_BLOCK_SIZE,
+            )?))?,
+        };
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+        let substrate = ApfsSubstrate::with_lane_and_incarnations(
+            config,
+            host,
+            TokioApfsBlockingLane,
+            DeterministicIncarnations(AtomicU64::new(1)),
+        );
+        Ok(Self {
+            substrate,
+            pre_cowshed: PathBuf::from(format!("{}.pre-cowshed", checkout.display())),
+            checkout,
+            repo,
+            image,
+            staging,
+            main,
+            identity,
+            _root: root,
+        })
+    }
+
+    fn host(&self) -> &MacOsApfsExecutionHost<SystemCommandRunner> {
+        self.substrate.host()
+    }
+
+    fn request(&self, stem: PathBuf) -> CreateImageRequest {
+        CreateImageRequest {
+            staged_stem: stem,
+            capacity: ImageCapacity::from_gibibytes(1),
+            volume_name: volume_label(&self.repo, self.main.name()),
+            // SAFETY: `getuid`/`getgid` read this process's credentials and cannot fail.
+            owner_uid: unsafe { libc::getuid() },
+            owner_gid: unsafe { libc::getgid() },
+        }
+    }
+
+    /// Main's PendingFence sidecar, durable before any payload.
+    fn fence(&self) -> Result<(), Box<dyn Error>> {
+        self.host().publish_metadata(
+            &self.image,
+            &self.main,
+            Revision::new(1),
+            MetadataPolicy::FreshPendingFence,
+            Some(&self.identity),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// The fence and the image behind it, attached once, handed back as the killed process held
+    /// it: dropping the handle leaves the kernel's attachment exactly where it was.
+    fn fenced_image(&self) -> Result<AttachedImage, Box<dyn Error>> {
+        self.fence()?;
+        let blank = self
+            .image
+            .parent()
+            .ok_or("canonical image has no parent")?
+            .join(".staging")
+            .join(format!("main-{:032x}", 0xbe));
+        Ok(self
+            .host()
+            .create_attached(&self.request(blank), &self.image)?)
+    }
+
+    /// Everything adoption does before the checkout changes hands, killed at `swapped`: after
+    /// activation, either before the checkout swap or after it.
+    fn published(&self, swapped: bool) -> Result<(), Box<dyn Error>> {
+        let host = self.host();
+        let attachment = self.fenced_image()?;
+        host.mount(&attachment, &self.staging, MountAccess::ReadWrite, false)?;
+        host.copy_tree(&self.checkout, &self.staging)?;
+        host.mint_workspace_credentials(
+            &self.main,
+            &self.image,
+            &self.staging,
+            &self.checkout,
+            &PathBuf::from(format!("{}.ca.key", self.image.display())),
+        )?;
+        host.write_marker(&self.staging, &self.main, None, &self.identity)?;
+        host.unmount_attachment(&attachment)?;
+        host.activate_pending(&self.image, &self.main)?;
+        if swapped {
+            host.vacate_adopted_checkout(&self.checkout, &self.pre_cowshed)
+                .map_err(ApfsStorageError::from)?;
+        }
+        drop(attachment);
+        Ok(())
+    }
+
+    fn block_on<T>(&self, work: impl Future<Output = T>) -> Result<T, Box<dyn Error>> {
+        Ok(tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(work))
+    }
+
+    /// What the next `cowshed adopt` does: plan from an absent main and execute.
+    fn adopt(&self) -> Result<LifecycleWorkspace, Box<dyn Error>> {
+        let plan = self.substrate.plan_adopt(AdoptRequest {
+            repo: self.repo.clone(),
+            capacity: ImageCapacity::from_gibibytes(1),
+            topology_revision: Revision::new(0),
+            source_checkout: self.checkout.clone(),
+            pre_cowshed_checkout: self.pre_cowshed.clone(),
+            identity: self.identity.clone(),
+        })?;
+        let receipt = self
+            .block_on(
+                self.substrate
+                    .execute_adopt_staged(plan, |_| async { Ok::<(), std::io::Error>(()) }),
+            )?
+            .map_err(|error| format!("adopt: {error}"))?;
+        Ok(receipt.workspace)
+    }
+
+    fn mounted_device(&self) -> Result<Option<String>, Box<dyn Error>> {
+        Ok(SystemKernelMountSource
+            .mounts()?
+            .into_iter()
+            .find(|mount| mount.mount_point == self.checkout)
+            .map(|mount| mount.source_device))
+    }
+
+    /// Main is published, mounted at the checkout carrying its marker, and the original tree is
+    /// retained beside it, intact.
+    fn assert_adopted(&self) -> Result<(), Box<dyn Error>> {
+        assert!(
+            self.mounted_device()?.is_some(),
+            "main is mounted at the checkout"
+        );
+        assert!(self.checkout.join(WORKSPACE_MARKER_PATH).is_file());
+        assert_eq!(
+            fs::read(self.checkout.join("tracked"))?,
+            b"original source\n"
+        );
+        assert_eq!(
+            fs::read(self.pre_cowshed.join("tracked"))?,
+            b"original source\n"
+        );
+        let listed = self.block_on(self.substrate.list(&self.repo))??;
+        assert_eq!(listed.len(), 1, "main is the one published workspace");
+        Ok(())
+    }
+}
+
+/// Killed inside image creation, after the blank took the canonical name and before its volume
+/// was formatted: the fenced payload never held a copy, so adoption discards it and starts over.
+#[test]
+fn real_apfs_adopt_replaces_a_fenced_image_killed_before_its_volume_existed() {
+    let world = KillWindow::new("adopt-kill-unformatted").expect("kill window");
+    world.fence().expect("fence");
+    world
+        .host()
+        .backend()
+        .create_blank_image(&world.request(world.image.with_extension("")))
+        .expect("blank image under the canonical name");
+
+    let adopted = world.adopt().expect("adopt starts over");
+
+    assert_ne!(adopted.incarnation(), world.main.incarnation());
+    world.assert_adopted().expect("adopted");
+}
+
+/// Killed after the image's one attach and before its staging mount: the next adopt settles the
+/// unmounted attachment, verifies the volume afresh, and resumes the same incarnation.
+#[test]
+fn real_apfs_adopt_resumes_a_fenced_image_killed_between_attach_and_mount() {
+    let world = KillWindow::new("adopt-kill-attached").expect("kill window");
+    drop(world.fenced_image().expect("attached fenced image"));
+
+    let adopted = world.adopt().expect("adopt resumes");
+
+    assert_eq!(adopted.incarnation(), world.main.incarnation());
+    world.assert_adopted().expect("adopted");
+}
+
+/// Killed mid-copy: the staging mount survived its process, and the next adopt resumes on that
+/// very attachment — the checkout ends up mounted from the same device, with no reattach — while
+/// the delta copier removes what the source no longer holds.
+#[test]
+fn real_apfs_adopt_resumes_a_fenced_image_killed_mid_copy_on_its_surviving_attachment() {
+    let world = KillWindow::new("adopt-kill-copy").expect("kill window");
+    let attachment = world.fenced_image().expect("attached fenced image");
+    world
+        .host()
+        .mount(&attachment, &world.staging, MountAccess::ReadWrite, false)
+        .expect("staging mount");
+    fs::write(world.staging.join("half-copied"), b"stale").expect("partial copy");
+    let device = attachment.volume_device().to_owned();
+    drop(attachment);
+
+    let adopted = world.adopt().expect("adopt resumes");
+
+    assert_eq!(adopted.incarnation(), world.main.incarnation());
+    world.assert_adopted().expect("adopted");
+    assert_eq!(world.mounted_device().expect("mounts"), Some(device));
+    assert!(!world.checkout.join("half-copied").exists());
+}
+
+/// Killed after activation and before the checkout swap: main is published, the checkout is still
+/// the user's tree, and finishing swaps it and mounts main there — twice is the same as once.
+#[test]
+fn real_apfs_finishing_an_adoption_killed_before_its_checkout_swap() {
+    let world = KillWindow::new("adopt-kill-activated").expect("kill window");
+    world.published(false).expect("published, swap pending");
+    assert!(
+        !world.pre_cowshed.exists(),
+        "the checkout was never touched"
+    );
+
+    for _ in 0..2 {
+        world
+            .block_on(
+                world
+                    .substrate
+                    .finish_adoption(&world.main, &world.pre_cowshed),
+            )
+            .expect("runtime")
+            .expect("finish adoption");
+    }
+    world.assert_adopted().expect("adopted");
+}
+
+/// Killed after the checkout swap and before main's mount: the stub stands at the checkout, and
+/// finishing mounts main over it.
+#[test]
+fn real_apfs_finishing_an_adoption_killed_between_checkout_swap_and_mount() {
+    let world = KillWindow::new("adopt-kill-swapped").expect("kill window");
+    world.published(true).expect("published and swapped");
+    assert!(world.mounted_device().expect("mounts").is_none());
+
+    world
+        .block_on(
+            world
+                .substrate
+                .finish_adoption(&world.main, &world.pre_cowshed),
+        )
+        .expect("runtime")
+        .expect("finish adoption");
+    world.assert_adopted().expect("adopted");
 }

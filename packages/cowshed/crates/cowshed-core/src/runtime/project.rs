@@ -3096,21 +3096,11 @@ impl NativeProjectRuntimeHost {
             let replayed: Result<()> = async {
                 let phase = record.phase;
                 match record.operation {
-                    LifecycleIntent::Adopt { options } => match self.current(&main_name()).await {
-                        Ok(current) => {
-                            self.complete_lifecycle_intent(
-                                current.derived.workspace.name(),
-                                LifecycleIntentCompletion::Workspace(
-                                    current.derived.workspace.incarnation().clone(),
-                                ),
-                            )
-                            .await?;
-                        }
-                        Err(error) if error.code == ErrorCode::NotFound => {
-                            self.adopt(options).await?;
-                        }
-                        Err(error) => return Err(error),
-                    },
+                    // Adopt resumes itself: an unpublished main continues its copy in place, and a
+                    // published one has its checkout swap and mount finished before completion.
+                    LifecycleIntent::Adopt { options } => {
+                        self.adopt(options).await?;
+                    }
                     LifecycleIntent::Create { workspace, options } => {
                         match self.current(&workspace).await {
                             Ok(current) => {
@@ -3456,6 +3446,50 @@ impl NativeProjectRuntimeHost {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("pending metadata task failed: {error}")))?
+    }
+
+    /// Finish an adoption whose main is already published: swap the checkout for main's
+    /// mountpoint if a crash or failure stopped before it, mount main there, and conclude.
+    async fn finish_adoption(&mut self, current: NativeWorkspace) -> Result<WorkspaceSnapshot> {
+        let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+        timed_async(
+            "adopt",
+            "finish",
+            self.substrate
+                .finish_adoption(&current.derived.workspace, &pre_cowshed),
+        )
+        .await
+        .map_err(native_storage_error)?;
+        self.conclude_adoption(&current.derived.workspace).await
+    }
+
+    /// Everything adoption does once main is mounted at the checkout. Each step is safe to repeat
+    /// on a replay: the commitment is append-safe and completion overwrites.
+    async fn conclude_adoption(
+        &mut self,
+        workspace: &crate::storage::lifecycle::LifecycleWorkspace,
+    ) -> Result<WorkspaceSnapshot> {
+        use super::supervisor::CommitmentSink;
+        self.commitments
+            .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
+                repo_id: self.descriptor.repo_id.clone(),
+                workspace_incarnation: workspace.incarnation().clone(),
+            })
+            .await?;
+        self.complete_lifecycle_intent(
+            workspace.name(),
+            crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                workspace.incarnation().clone(),
+            ),
+        )
+        .await?;
+        timed_async(
+            "adopt",
+            "supervisor",
+            self.ensure_supervisor(workspace.name()),
+        )
+        .await?;
+        timed_async("adopt", "snapshot", self.snapshot_named(workspace.name())).await
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
@@ -5695,24 +5729,24 @@ impl NativeProjectRuntimeHost {
         Ok(authority)
     }
 
-    /// Unpublished clones nothing will ever finish: no unfinished lifecycle intent names them (a
-    /// crash residue that one names is finished by recovery), and no process is creating them —
-    /// neither under an intent lease nor under the image's lifecycle lock, which a create or fork
-    /// of any cowshed version holds for as long as it works on the image. Such a clone was never
-    /// published, so nothing ever ran in it. Each one comes back with its intent lease held by
-    /// this verb, so no other process can take it up while it is retired.
-    async fn abandoned_pending_clones(
+    /// Unpublished workspaces nothing will ever finish: no unfinished lifecycle intent names them
+    /// (a crash residue that one names is finished by recovery), and no process is creating them —
+    /// neither under an intent lease nor under the image's lifecycle lock, which a create, fork or
+    /// adopt of any cowshed version holds for as long as it works on the image. Such a workspace
+    /// was never published, so nothing ever ran in it, and an unpublished main never touched its
+    /// checkout. Each one comes back with its intent lease held by this verb, so no other process
+    /// can take it up while it is retired.
+    async fn abandoned_pending_workspaces(
         &mut self,
     ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
         self.reload_lifecycle_intents().await?;
         let mut abandoned = Vec::new();
         for (image, metadata) in self.pending_metadata().await? {
             let workspace = &metadata.workspace;
-            if workspace.is_main()
-                || self
-                    .lifecycle_intents
-                    .get(workspace)
-                    .is_some_and(|record| record.completion.is_none())
+            if self
+                .lifecycle_intents
+                .get(workspace)
+                .is_some_and(|record| record.completion.is_none())
                 || !self.claim_intent_lease(workspace)?
                 || image_lifecycle_lock_is_held(&image)?
             {
@@ -5723,35 +5757,49 @@ impl NativeProjectRuntimeHost {
         Ok(abandoned)
     }
 
-    /// Retire every [abandoned](Self::abandoned_pending_clones) clone, or with `dry_run` only name
-    /// them. A clone whose retirement is refused — say its history is not in main — stays, named
-    /// with the refusal and its next step; it no longer blocks the rest of `gc`.
-    async fn retire_abandoned_pending_clones(&mut self, dry_run: bool) -> Result<()> {
-        for (image, metadata) in self.abandoned_pending_clones().await? {
+    /// Retire every [abandoned](Self::abandoned_pending_workspaces) workspace, or with `dry_run`
+    /// only name them. A clone is retired as the create or fork its metadata records; one whose
+    /// retirement is refused — say its history is not in main — stays, named with the refusal and
+    /// its next step, and no longer blocks the rest of `gc`. An unpublished main is retired as the
+    /// adopt it records: its image, sidecar and companion are reclaimed.
+    async fn retire_abandoned_pending_workspaces(&mut self, dry_run: bool) -> Result<()> {
+        for (image, metadata) in self.abandoned_pending_workspaces().await? {
             let workspace = metadata.workspace.clone();
+            let kind = if workspace.is_main() {
+                "adoption"
+            } else {
+                "clone"
+            };
             if dry_run {
                 eprintln!(
-                    "cowshed: would retire {workspace}, an unfinished clone its creating process \
+                    "cowshed: would retire {workspace}, an unfinished {kind} its process \
                      abandoned before publishing it: {}",
                     image.display()
                 );
                 continue;
             }
-            let origin = abandoned_clone_origin(&metadata);
-            let options = RemoveOptions {
-                force: true,
-                ..RemoveOptions::default()
+            let retired = if workspace.is_main() {
+                self.substrate
+                    .discard_pending_adoption(&metadata.repo_id, &metadata.workspace_incarnation)
+                    .await
+                    .map_err(native_storage_error)
+            } else {
+                let origin = abandoned_clone_origin(&metadata);
+                let options = RemoveOptions {
+                    force: true,
+                    ..RemoveOptions::default()
+                };
+                self.retire_pending_workspace(&workspace, options, origin, metadata)
+                    .await
+                    .map(|_| ())
             };
-            match self
-                .retire_pending_workspace(&workspace, options, origin, metadata)
-                .await
-            {
-                Ok(_) => eprintln!(
-                    "cowshed: retired {workspace}, an unfinished clone its creating process \
-                     abandoned before publishing it"
+            match retired {
+                Ok(()) => eprintln!(
+                    "cowshed: retired {workspace}, an unfinished {kind} its process abandoned \
+                     before publishing it"
                 ),
                 Err(error) => eprintln!(
-                    "cowshed: kept unfinished clone {workspace}: {}\nnext: {}",
+                    "cowshed: kept unfinished {kind} {workspace}: {}\nnext: {}",
                     error.message, error.hint
                 ),
             }
@@ -6998,12 +7046,25 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
-        use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
-        timed_async("adopt", "binding", self.validate_binding()).await?;
         let intent = crate::storage::recovery::LifecycleIntent::Adopt {
             options: options.clone(),
         };
+        // Publication is main's sidecar activation, and the checkout swap and mount follow it. An
+        // adoption that published main and then stopped is finished, not repeated — before the
+        // binding gate, which reads Git at a checkout path the swap may already have vacated.
+        let unfinished = self
+            .lifecycle_intents
+            .get(intent.target())
+            .is_some_and(|record| record.operation == intent && record.completion.is_none());
+        if unfinished {
+            match self.current(&main_name()).await {
+                Ok(current) => return self.finish_adoption(current).await,
+                Err(error) if error.code == ErrorCode::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        timed_async("adopt", "binding", self.validate_binding()).await?;
         if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
             let current = self.current(&main_name()).await?;
             Self::require_exact_incarnation(&current, &expected)?;
@@ -7116,22 +7177,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_staged_error)?;
-        self.commitments
-            .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
-                repo_id: self.descriptor.repo_id.clone(),
-                workspace_incarnation: receipt.workspace.incarnation().clone(),
-            })
-            .await?;
-        self.complete_lifecycle_intent(
-            receipt.workspace.name(),
-            crate::storage::recovery::LifecycleIntentCompletion::Workspace(
-                receipt.workspace.incarnation().clone(),
-            ),
-        )
-        .await?;
-        let name = receipt.workspace.name().clone();
-        timed_async("adopt", "supervisor", self.ensure_supervisor(&name)).await?;
-        timed_async("adopt", "snapshot", self.snapshot_named(&name)).await
+        self.conclude_adoption(&receipt.workspace).await
     }
 
     async fn create(
@@ -8153,7 +8199,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         use crate::storage::lifecycle::{StorageGcReason, Substrate};
 
         self.validate_binding().await?;
-        self.retire_abandoned_pending_clones(options.dry_run)
+        self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
         let plan = self
             .substrate
@@ -9075,7 +9121,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             )),
         }
-        let abandoned = match self.abandoned_pending_clones().await {
+        let abandoned = match self.abandoned_pending_workspaces().await {
             Ok(abandoned) => abandoned
                 .into_iter()
                 .map(|(image, _)| image)
@@ -9095,9 +9141,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     let (message, hint) = if abandoned.contains(&image) {
                         (
                             format!(
-                                "workspace {} is an unfinished clone its creating process \
-                                 abandoned; it was never published",
-                                metadata.workspace
+                                "workspace {} is an unfinished {} its process abandoned; it was \
+                                 never published",
+                                metadata.workspace,
+                                if metadata.workspace.is_main() {
+                                    "adoption"
+                                } else {
+                                    "clone"
+                                }
                             ),
                             "cowshed gc retires it (so does cowshed doctor --repair)".to_owned(),
                         )

@@ -25,7 +25,7 @@ use cowshed_core::storage::apfs::native::{
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PublicationDisposition,
+    MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
     LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
@@ -327,13 +327,15 @@ impl RealFixture {
         StorageLayout::new(self.root(), &repo()).expect("layout")
     }
 
-    /// Mint a real one-volume ASIF image at `image` (which must end `.asif`) the way the host
-    /// stages one, and nothing beside it. Staging hands the image back detached: every verb that
-    /// grows or replaces it next needs an image nothing holds.
+    /// Mint a real one-volume ASIF image at `image` (which must end `.asif`) and nothing beside
+    /// it, handed back detached: every verb that grows or replaces it next needs an image nothing
+    /// holds.
     fn blank_image(&self, image: &Path) {
+        std::fs::create_dir_all(image.parent().expect("image parent")).expect("image parent");
         let staged = self
             .host()
-            .create_staged(&CreateImageRequest {
+            .backend()
+            .create_staged_image(&CreateImageRequest {
                 staged_stem: image.with_extension(""),
                 capacity: ImageCapacity::from_gibibytes(1),
                 volume_name: "cowshed.acme--widget.main".to_owned(),
@@ -672,34 +674,6 @@ fn a_clone_into_a_path_that_is_not_an_asif_image_fails_before_any_command() {
     );
     assert!(!bad_destination.exists());
     assert_eq!(runner.calls(), 0);
-}
-
-#[test]
-fn canonical_publication_moves_complete_image_and_sidecar_together() {
-    let fixture = Fixture::new("publish");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let staged = layout.project().project_root.join(".staging/main.asif");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(&staged);
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    host.publish_image(&staged, canonical.image())
-        .expect("publish complete image");
-
-    assert!(!staged.exists());
-    assert!(!sidecar_path(&staged).exists());
-    assert!(canonical.image().exists());
-    assert!(sidecar_path(canonical.image()).exists());
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("canonical metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-    let facts = host.list(&repo()).expect("published facts");
-    assert_eq!(facts.len(), 1);
-    assert_eq!(facts[0].workspace.repo(), &repo());
-    assert!(facts[0].workspace.name().is_main());
 }
 
 #[test]
@@ -1349,25 +1323,6 @@ fn retirement_moves_image_and_sidecar_atomically_and_reclaim_is_idempotent() {
     host.reclaim_image(&trash).expect("idempotent reclaim");
     assert!(!trash.exists());
     assert!(!sidecar_path(&trash).exists());
-}
-
-#[test]
-fn canonical_publication_rejects_a_sidecar_only_destination_without_effects() {
-    let fixture = Fixture::new("publish-sidecar-conflict");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let staged = layout.project().project_root.join(".staging/main.asif");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(&staged);
-    std::fs::create_dir_all(canonical.image().parent().expect("parent")).expect("parent");
-    std::fs::write(sidecar_path(canonical.image()), b"occupied").expect("sidecar conflict");
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    host.publish_image(&staged, canonical.image())
-        .expect_err("sidecar-only destination is a conflict");
-
-    assert!(staged.exists());
-    assert!(sidecar_path(&staged).exists());
-    assert!(!canonical.image().exists());
 }
 
 #[test]
@@ -2895,106 +2850,7 @@ fn interrupted_restore_image_publication(
 }
 
 #[test]
-fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
-    let fixture = Fixture::new("publish-image-boundary");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    std::fs::write(&staged, b"published generation").expect("staged bytes");
-    let staged_ca_key = std::fs::read(ca_key_path(&staged)).expect("staged CA key");
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.set_restore_failpoint(RestoreFailpoint::AfterMetadataFsync);
-    host.publish_image(&staged, canonical.image())
-        .expect_err("recoverable prepublication failure");
-    assert!(!canonical.image().exists());
-    assert!(!sidecar_path(canonical.image()).exists());
-    assert!(staged.exists());
-    assert!(sidecar_path(&staged).exists());
-    std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
-        .expect("simulate process death after durable sidecar rename");
-    assert!(
-        host.list(&repo()).expect("sidecar-only listing").is_empty(),
-        "readers enumerate images, so sidecar-only publication remains invisible"
-    );
-
-    drop(host);
-    let restarted = native_host(&fixture, RecordingRunner::default());
-    restarted
-        .recover_pending(&fixture.config(), &[])
-        .expect("complete sidecar publication");
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical"),
-        b"published generation"
-    );
-    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-    assert_eq!(
-        std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
-        staged_ca_key
-    );
-    assert!(!sidecar_path(&staged).exists());
-    assert!(!ca_key_path(&staged).exists());
-    restarted
-        .recover_pending(&fixture.config(), &[])
-        .expect("repeated recovery is idempotent");
-}
-
-#[test]
-fn publication_recovery_converges_every_rename_and_fsync_layout_with_its_ca_key() {
-    for (boundary, move_companion, move_image) in [
-        ("sidecar-rename", false, false),
-        ("sidecar-fsync", false, false),
-        ("companion-rename", true, false),
-        ("image-rename", true, true),
-        ("parent-fsync", true, true),
-    ] {
-        let fixture = Fixture::new(&format!("publication-crash-{boundary}"));
-        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-        let canonical = layout.main_image().expect("canonical");
-        let staged = layout
-            .project()
-            .project_root
-            .join(".staging/main-00000000000000000000000000000001.asif");
-        create_image(&staged);
-        std::fs::write(&staged, b"new generation").expect("staged image");
-        write_ca_key(&staged, b"new-ca-key");
-        std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
-            .expect("publish sidecar");
-        if move_companion {
-            std::fs::rename(ca_key_path(&staged), ca_key_path(canonical.image()))
-                .expect("publish CA companion");
-        }
-        if move_image {
-            std::fs::rename(&staged, canonical.image()).expect("publish image");
-        }
-
-        let host = native_host(&fixture, RecordingRunner::default());
-        host.recover_pending(&fixture.config(), &[])
-            .expect("recover publication triple");
-        assert_eq!(
-            std::fs::read(canonical.image()).expect("canonical image"),
-            b"new generation",
-            "{boundary}"
-        );
-        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-        assert_eq!(
-            std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
-            b"new-ca-key",
-            "{boundary}"
-        );
-        assert!(!staged.exists(), "{boundary}");
-        assert!(!sidecar_path(&staged).exists(), "{boundary}");
-        assert!(!ca_key_path(&staged).exists(), "{boundary}");
-        host.recover_pending(&fixture.config(), &[])
-            .expect("idempotent recovery");
-    }
-}
-
-#[test]
-fn recovery_rejects_missing_or_contradictory_ca_companion_layouts() {
+fn recovery_quarantines_a_canonical_image_missing_its_ca_companion() {
     let missing = Fixture::new("recovery-missing-ca");
     let missing_layout = StorageLayout::new(&missing.root, &repo()).expect("layout");
     let missing_canonical = missing_layout.main_image().expect("canonical");
@@ -3036,34 +2892,6 @@ fn recovery_rejects_missing_or_contradictory_ca_companion_layouts() {
         missing_wire["image"],
         serde_json::Value::String(missing_canonical.image().display().to_string())
     );
-
-    let contradictory = Fixture::new("recovery-contradictory-ca");
-    let layout = StorageLayout::new(&contradictory.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
-        .expect("publish sidecar");
-    std::fs::copy(ca_key_path(&staged), ca_key_path(canonical.image()))
-        .expect("create contradictory CA keys");
-    std::fs::set_permissions(
-        ca_key_path(canonical.image()),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("canonical CA mode");
-    let error = native_host(&contradictory, RecordingRunner::default())
-        .recover_pending(&contradictory.config(), &[])
-        .expect_err("contradictory CA keys");
-    match error {
-        ApfsStorageError::MarkerMismatch(message) => {
-            assert!(message.contains(&staged.display().to_string()));
-            assert!(message.contains(&canonical.image().display().to_string()));
-        }
-        other => panic!("expected typed integrity error, got {other:?}"),
-    }
 }
 
 /// A sibling whose payload is provably gone must not fail recovery for the rest of the store.
@@ -3480,37 +3308,6 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
         std::fs::read(&invalid_name).expect("invalid staging name"),
         b"not a transaction"
     );
-}
-
-#[test]
-fn adopt_recovery_completes_publication_after_restart_without_the_checkout() {
-    // Adoption's durable state is built before the checkout changes hands, so the resumable crash
-    // point is "mount and image exist, swap still pending" — recovery needs nothing from the
-    // user's tree to finish it, and `.pre-cowshed` does not exist yet at this point.
-    let fixture = Fixture::new("adopt-recovery");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    std::fs::create_dir_all(&config.checkout_path).expect("source");
-    std::fs::write(config.checkout_path.join("tracked"), b"source").expect("source file");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
-
-    native_host(&fixture, RecordingRunner::default())
-        .recover_pending(&config, &[])
-        .expect("recovery completes publication");
-
-    assert!(canonical.image().exists());
-    assert!(!staged.exists());
-    assert_eq!(
-        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
-        b"source"
-    );
-    assert!(!pre_cowshed.exists());
 }
 
 #[test]
@@ -4664,7 +4461,7 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
         owner_gid: 20,
     };
     assert!(
-        host.create_staged(&request).is_err(),
+        host.create_attached(&request, canonical.image()).is_err(),
         "command target validation must reject the same ancestor"
     );
     assert!(runner.requests().is_empty(), "no APFS command may spawn");
@@ -4677,282 +4474,138 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
     );
 }
 
-#[test]
-fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
-    let fixture = Fixture::new("gc-first-adopt");
+/// Main as an interrupted adoption leaves it: its canonical image and CA companion behind a
+/// `PendingFence` sidecar recording revision 1, and the user's checkout still the original tree.
+fn pending_adopt_fixture(fixture: &Fixture) -> (PathBuf, DetachedWorkspaceMetadata) {
     let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    let credential_mount = fixture.root.join("credential-mount");
-    std::fs::create_dir_all(&credential_mount).expect("credential mount");
-    mint_credentials(&workspace(), &credential_mount, &ca_key_path(&staged))
-        .expect("valid staged credentials");
-    std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
+    let canonical = StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .main_image()
+        .expect("canonical")
+        .image()
+        .to_owned();
+    create_image(&canonical);
+    std::fs::write(&canonical, b"partially copied main").expect("pending payload");
+    let mut pending = metadata();
+    pending.publication_state = PublicationState::PendingFence;
+    pending.grants.revision = 1;
+    pending.info_snapshot.project_root = config.checkout_path.clone();
+    pending
+        .write_for_image(&canonical)
+        .expect("pending sidecar");
     std::fs::create_dir_all(&config.checkout_path).expect("source checkout");
     std::fs::write(config.checkout_path.join("tracked"), b"original source").expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+    (canonical, pending)
+}
 
+#[test]
+fn recovery_and_gc_leave_an_unpublished_main_to_its_adoption_and_the_checkout_alone() {
+    let fixture = Fixture::new("pending-adopt-recovery");
+    let config = fixture.config();
+    let (canonical, pending) = pending_adopt_fixture(&fixture);
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
     let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&config, &[])
-        .expect("startup recovery before GC");
-    execute_gc(&host, &config).expect("post-recovery GC");
+
+    for _ in 0..2 {
+        host.recover_pending(&config, &[])
+            .expect("recovery leaves the pending main to its intent");
+        execute_gc(&host, &config).expect("gc never deletes a PendingFence image");
+    }
+
     assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical image"),
-        b"complete adopted image"
+        std::fs::read(&canonical).expect("pending payload"),
+        b"partially copied main"
     );
-    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-    // GC and recovery converge on the durable half of adoption without ever reaching for the
-    // user's tree: the checkout is still the original directory and the swap is still pending.
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(&canonical).expect("pending sidecar"),
+        pending
+    );
+    assert!(ca_key_path(&canonical).exists());
+    assert!(
+        host.list(&repo()).expect("published facts").is_empty(),
+        "an unpublished main is invisible to enumeration"
+    );
+    let adoption = host
+        .pending_adoption(&config, &repo())
+        .expect("pending adoption")
+        .expect("the interrupted adoption is found");
+    assert_eq!(adoption.image, canonical);
+    assert_eq!(adoption.incarnation, pending.workspace_incarnation);
+    assert_eq!(adoption.info, pending.info_snapshot);
     assert_eq!(
         std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
         b"original source"
     );
     assert!(!pre_cowshed.exists());
-    assert!(!staged.exists());
-    assert!(!sidecar_path(&staged).exists());
-
-    execute_gc(&host, &config).expect("repeated GC converges");
-    host.recover_pending(&config, &[])
-        .expect("repeated recovery converges");
-    assert!(canonical.image().exists());
-    assert!(sidecar_path(canonical.image()).exists());
-}
-
-#[test]
-fn publication_failpoints_converge_for_clone_and_adopt_callers() {
-    for failpoint in [
-        RestoreFailpoint::AfterCanonicalSidecarRename,
-        RestoreFailpoint::AfterMetadataFsync,
-        RestoreFailpoint::AfterCanonicalCompanionRename,
-        RestoreFailpoint::AfterCanonicalImageRename,
-        RestoreFailpoint::CanonicalParentFsyncFailure,
-        RestoreFailpoint::AfterCanonicalParentFsync,
-    ] {
-        let fixture = Fixture::new(&format!("publish-clone-{failpoint:?}"));
-        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-        let canonical = layout.main_image().expect("canonical");
-        let staged = layout
-            .project()
-            .project_root
-            .join(".staging/main-00000000000000000000000000000001.asif");
-        create_image(&staged);
-        std::fs::write(&staged, b"clone generation").expect("staged bytes");
-        let host = native_host(&fixture, RecordingRunner::default());
-        host.set_restore_failpoint(failpoint);
-        let result = host.publish_image(&staged, canonical.image());
-        if matches!(
-            failpoint,
-            RestoreFailpoint::AfterCanonicalSidecarRename
-                | RestoreFailpoint::AfterMetadataFsync
-                | RestoreFailpoint::AfterCanonicalCompanionRename
-        ) {
-            result.expect_err("prepublication failure");
-            assert!(staged.exists());
-            assert!(sidecar_path(&staged).exists());
-            native_host(&fixture, RecordingRunner::default())
-                .publish_image(&staged, canonical.image())
-                .expect("retry prepublication");
-        } else {
-            result.expect("durable pair is recovered as success");
-        }
-        assert_eq!(
-            std::fs::read(canonical.image()).expect("canonical bytes"),
-            b"clone generation"
-        );
-        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-        assert!(ca_key_path(canonical.image()).exists(), "{failpoint:?}");
-        assert!(!staged.exists());
-        assert!(!sidecar_path(&staged).exists());
-        assert!(!ca_key_path(&staged).exists(), "{failpoint:?}");
-    }
-
-    for failpoint in [
-        RestoreFailpoint::AfterCanonicalSidecarRename,
-        RestoreFailpoint::AfterMetadataFsync,
-        RestoreFailpoint::AfterCanonicalCompanionRename,
-        RestoreFailpoint::AfterCanonicalImageRename,
-        RestoreFailpoint::CanonicalParentFsyncFailure,
-        RestoreFailpoint::AfterCanonicalParentFsync,
-    ] {
-        let fixture = Fixture::new(&format!("publish-adopt-{failpoint:?}"));
-        let config = fixture.config();
-        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-        let canonical = layout.main_image().expect("canonical");
-        let staged = layout
-            .project()
-            .project_root
-            .join(".staging/main-00000000000000000000000000000001.asif");
-        create_image(&staged);
-        std::fs::write(&staged, b"adopted generation").expect("staged bytes");
-        std::fs::create_dir_all(&config.checkout_path).expect("source");
-        std::fs::write(config.checkout_path.join("tracked"), b"original").expect("source bytes");
-        let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
-        let host = native_host(&fixture, RecordingRunner::default());
-        host.set_restore_failpoint(failpoint);
-        let result = host.publish_image(&staged, canonical.image());
-        if matches!(
-            failpoint,
-            RestoreFailpoint::AfterCanonicalSidecarRename
-                | RestoreFailpoint::AfterMetadataFsync
-                | RestoreFailpoint::AfterCanonicalCompanionRename
-        ) {
-            result.expect_err("prepublication adopt failure");
-            native_host(&fixture, RecordingRunner::default())
-                .publish_image(&staged, canonical.image())
-                .expect("adopt retry");
-        } else {
-            result.expect("durable adopt pair recovers as success");
-        }
-        assert_eq!(
-            std::fs::read(canonical.image()).expect("canonical bytes"),
-            b"adopted generation"
-        );
-        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-        // Publication never touches the user's tree, so no failpoint in it can lose the original:
-        // the checkout is still the original directory and nothing has been moved aside.
-        assert_eq!(
-            std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
-            b"original"
-        );
-        assert!(!pre_cowshed.exists());
-        let restarted = native_host(&fixture, RecordingRunner::default());
-        assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
-        execute_gc(&restarted, &config).expect("GC convergence");
-        restarted
-            .recover_pending(&config, &[])
-            .expect("recovery convergence");
-    }
-}
-
-#[test]
-fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_pair() {
-    let fixture = Fixture::new("persistent-adopt-fsync");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    std::fs::write(&staged, b"durable adopted generation").expect("staged bytes");
-    std::fs::create_dir_all(&config.checkout_path).expect("source");
-    std::fs::write(
-        config.checkout_path.join("tracked"),
-        b"irreplaceable original",
-    )
-    .expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.set_restore_failpoint(RestoreFailpoint::PersistentCanonicalParentFsyncFailure);
-    let error = host
-        .publish_image(&staged, canonical.image())
-        .expect_err("persistent fsync remains uncertain");
-    assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
-    assert!(matches!(
-        error.into_source(),
-        ApfsStorageError::Cleanup { .. }
-    ));
-    assert!(canonical.image().exists());
-    assert!(sidecar_path(canonical.image()).exists());
-    assert_eq!(
-        std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
-        b"irreplaceable original"
-    );
-    assert!(!pre_cowshed.exists());
-
-    drop(host);
-    let restarted = native_host(&fixture, RecordingRunner::default());
-    restarted
-        .recover_pending(&config, &[])
-        .expect("fresh-host recovery");
-    execute_gc(&restarted, &config).expect("fresh-host GC");
-    for _ in 0..2 {
-        let facts = restarted.list(&repo()).expect("idempotent list");
-        assert_eq!(facts.len(), 1);
-        assert_eq!(
-            std::fs::read(canonical.image()).expect("canonical bytes"),
-            b"durable adopted generation"
-        );
-        assert_eq!(
-            std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
-            b"irreplaceable original"
-        );
-        assert!(!pre_cowshed.exists());
-        restarted
-            .recover_pending(&config, &[])
-            .expect("repeated recovery");
-    }
-}
-
-#[test]
-fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() {
-    let fixture = Fixture::new("sidecar-double-failure");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.asif");
-    create_image(&staged);
-    std::fs::write(&staged, b"complete forward image").expect("staged bytes");
-    std::fs::create_dir_all(&config.checkout_path).expect("source");
-    std::fs::write(
-        config.checkout_path.join("tracked"),
-        b"irreplaceable source",
-    )
-    .expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.set_restore_failpoint(RestoreFailpoint::CanonicalSidecarRollbackFailure);
-    let error = host
-        .publish_image(&staged, canonical.image())
-        .expect_err("compound publication failure");
-    assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
-    assert!(matches!(
-        error.into_source(),
-        ApfsStorageError::Cleanup { .. }
-    ));
-    assert!(staged.exists(), "full staged image must be retained");
-    assert!(!sidecar_path(&staged).exists());
-    assert!(!canonical.image().exists());
     assert!(
-        sidecar_path(canonical.image()).exists(),
-        "canonical sidecar remains the forward reference"
+        matches!(
+            host.attach_verified(&canonical),
+            Err(ApfsStorageError::PendingPublication(path)) if path == canonical
+        ),
+        "no verb may mount an unpublished main"
     );
-    assert_eq!(
-        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
-        b"irreplaceable source"
-    );
-    assert!(!pre_cowshed.exists());
+}
 
-    drop(host);
-    let restarted = native_host(&fixture, RecordingRunner::default());
-    restarted
+#[test]
+fn recovery_removes_a_pending_main_sidecar_whose_payload_never_appeared() {
+    let fixture = Fixture::new("pending-adopt-sidecar-only");
+    let config = fixture.config();
+    let (canonical, _) = pending_adopt_fixture(&fixture);
+    std::fs::remove_file(&canonical).expect("crash before the payload existed");
+
+    native_host(&fixture, RecordingRunner::default())
         .recover_pending(&config, &[])
-        .expect("fresh recovery completes image-last publication");
+        .expect("sidecar-only fence is removed");
+
+    assert!(!sidecar_path(&canonical).exists());
+    assert!(!ca_key_path(&canonical).exists());
     assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical bytes"),
-        b"complete forward image"
+        native_host(&fixture, RecordingRunner::default())
+            .pending_adoption(&config, &repo())
+            .expect("no adoption left"),
+        None
     );
-    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
-    assert!(!staged.exists());
-    assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
-    execute_gc(&restarted, &config).expect("GC convergence");
-    restarted
-        .recover_pending(&config, &[])
-        .expect("idempotent recovery");
     assert_eq!(
         std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
-        b"irreplaceable source"
+        b"original source"
     );
-    assert!(!pre_cowshed.exists());
+}
+
+#[test]
+fn pending_adoption_refuses_a_published_main() {
+    let fixture = Fixture::new("pending-adopt-published");
+    let canonical = StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .main_image()
+        .expect("canonical");
+    create_image(canonical.image());
+
+    assert!(matches!(
+        native_host(&fixture, RecordingRunner::default())
+            .pending_adoption(&fixture.config(), &repo()),
+        Err(ApfsStorageError::InvalidPlan("main is already published"))
+    ));
+}
+
+#[test]
+fn gc_retires_a_crash_left_adopt_staging_mountpoint_and_keeps_the_pending_main() {
+    let fixture = Fixture::new("pending-adopt-staging-mount");
+    let config = fixture.config();
+    let (canonical, pending) = pending_adopt_fixture(&fixture);
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let staging_mount = layout
+        .project()
+        .mount_root
+        .join(".staging")
+        .join(format!("main-{}", pending.workspace_incarnation));
+    std::fs::create_dir_all(&staging_mount).expect("crash-left staging mountpoint");
+    let host = native_host(&fixture, RecordingRunner::default());
+
+    execute_gc(&host, &config).expect("gc retires the empty staging mountpoint");
+
+    assert!(!staging_mount.exists());
+    assert!(canonical.exists());
+    assert!(sidecar_path(&canonical).exists());
 }
 
 /// A real main image mounted canonically at the checkout, carrying its marker, its minted

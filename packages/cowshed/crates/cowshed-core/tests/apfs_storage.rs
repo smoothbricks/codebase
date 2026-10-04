@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use cowshed_core::apfs::{CreateImageRequest, DetachIntent, MountAccess};
 use cowshed_core::metadata::{
     GrantSet, IMAGE_EXTENSION, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, is_image_path,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, is_image_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode, MarkerExpectation,
-    MetadataPolicy, PublicationError, RestoreStage, ResumableClone, ResumableStage,
+    MetadataPolicy, PendingAdoption, PublicationError, RestoreStage, ResumableClone,
     RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
@@ -39,7 +39,9 @@ struct FakeState {
     next_mount_id: u64,
     paths: Vec<PathBuf>,
     mount_paths: Vec<PathBuf>,
-    resumable_adopt: Option<ResumableStage>,
+    resumable_adopt: Option<PendingAdoption>,
+    /// The pending main's payload never became a verified volume.
+    unformatted_adopt: bool,
     resumable_clone: Option<ResumableClone>,
 }
 
@@ -112,10 +114,37 @@ impl FakeHost {
             },
         );
     }
-    fn resume_adopt_from(&self, image: impl Into<PathBuf>) {
-        self.state.lock().expect("fake state").resumable_adopt = Some(ResumableStage {
-            image: image.into(),
-        });
+    fn resume_adopt_from(&self, adoption: PendingAdoption) {
+        let workspace = LifecycleWorkspace::new(
+            repo(),
+            WorkspaceName::new("main").expect("main"),
+            adoption.incarnation.clone(),
+            Revision::new(1),
+            Revision::new(1),
+            WorkspaceRole::Main,
+        )
+        .expect("pending main");
+        let mut state = self.state.lock().expect("fake state");
+        state.pending.insert(
+            adoption.image.clone(),
+            StorageFact {
+                volume_key: volume_key(workspace.repo(), workspace.name()),
+                workspace,
+            },
+        );
+        state.resumable_adopt = Some(adoption);
+    }
+
+    fn leave_pending_adopt_unformatted(&self) {
+        self.state.lock().expect("fake state").unformatted_adopt = true;
+    }
+
+    fn pending_adopt(&self) -> Option<PendingAdoption> {
+        self.state
+            .lock()
+            .expect("fake state")
+            .resumable_adopt
+            .clone()
     }
 
     fn resume_clone_from(
@@ -235,9 +264,25 @@ impl ApfsExecutionHost for FakeHost {
             .collect())
     }
 
-    fn create_staged(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsStorageError> {
-        self.record(format!("create:{}", request.capacity));
-        Ok(request.staged_stem.with_extension(IMAGE_EXTENSION))
+    fn create_attached(
+        &self,
+        request: &CreateImageRequest,
+        image: &Path,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        if !is_image_path(image)
+            || !request
+                .staged_stem
+                .with_extension(IMAGE_EXTENSION)
+                .components()
+                .any(|component| component.as_os_str() == ".staging")
+        {
+            return Err(ApfsStorageError::Host(
+                "the blank is staged and the attached image is canonical".to_owned(),
+            ));
+        }
+        self.record_path(image);
+        self.record(format!("create-attached+fsck:{}", request.capacity));
+        Ok(FakeAttachment)
     }
 
     fn clone_image(
@@ -263,18 +308,54 @@ impl ApfsExecutionHost for FakeHost {
         self.record("first-write");
         Ok(())
     }
-    fn resumable_staged_adopt(
+    fn pending_adoption(
         &self,
         _: &ApfsSubstrateConfig,
         _: &RepoId,
-        _: &OperationIdentity,
-    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
+    ) -> Result<Option<PendingAdoption>, ApfsStorageError> {
         Ok(self
             .state
             .lock()
             .expect("fake state")
             .resumable_adopt
             .clone())
+    }
+
+    fn resume_pending_adopt(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        _: &LifecycleWorkspace,
+    ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
+        self.record_path(image);
+        if self.state.lock().expect("fake state").unformatted_adopt {
+            self.record("resume-unformatted");
+            return Ok(None);
+        }
+        self.record("resume-attach-or-reuse");
+        self.mount(&FakeAttachment, mount_point, MountAccess::ReadWrite, false)?;
+        Ok(Some(FakeAttachment))
+    }
+
+    fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        self.record("discard-pending");
+        let mut state = self.state.lock().expect("fake state");
+        state.pending.remove(image);
+        state.unformatted_adopt = false;
+        if state
+            .resumable_adopt
+            .as_ref()
+            .is_some_and(|pending| pending.image == image)
+        {
+            state.resumable_adopt = None;
+        }
+        Ok(())
+    }
+
+    fn unmount_attachment(&self, _: &Self::Attachment) -> Result<(), ApfsStorageError> {
+        self.record("unmount");
+        self.mounted_paths.lock().expect("mounted paths").clear();
+        Ok(())
     }
 
     fn resumable_clone(
@@ -483,15 +564,6 @@ impl ApfsExecutionHost for FakeHost {
         self.record("atomic-restore-checkout");
         Ok(())
     }
-    fn publish_image(&self, staged: &Path, _: &Path) -> Result<(), PublicationError> {
-        self.record("atomic-publish-image");
-        let mut state = self.state.lock().expect("fake state");
-        if let Some(fact) = state.staged.remove(staged) {
-            let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-            state.published.insert(key, fact);
-        }
-        Ok(())
-    }
     fn vacate_adopted_checkout(
         &self,
         source_checkout: &Path,
@@ -538,15 +610,33 @@ impl ApfsExecutionHost for FakeHost {
             state.published.remove(&key);
             state.pending.insert(image.to_owned(), fact);
             if policy == MetadataPolicy::FreshPendingFence {
-                state.resumable_clone = Some(ResumableClone {
-                    workspace: workspace.clone(),
-                    identity: identity
-                        .ok_or(ApfsStorageError::InvalidPlan(
-                            "fake pending clone requires operation identity",
-                        ))?
-                        .clone(),
-                    image: image.to_owned(),
-                });
+                let identity = identity.ok_or(ApfsStorageError::InvalidPlan(
+                    "fake pending publication requires operation identity",
+                ))?;
+                if workspace.name().is_main() {
+                    state.resumable_adopt = Some(PendingAdoption {
+                        incarnation: workspace.incarnation().clone(),
+                        image: image.to_owned(),
+                        info: WorkspaceInfoSnapshot {
+                            project_root: identity.project_root.clone(),
+                            role: workspace.role(),
+                            base_commit: identity.base_commit.clone(),
+                            branch: identity.branch.clone(),
+                            created_at: identity.created_at.clone(),
+                            forked_from: identity.forked_from.clone(),
+                            captured_at: identity.created_at.clone(),
+                            stale: false,
+                            git_worktree: identity.git_worktree,
+                        },
+                        grants: identity.grants.clone(),
+                    });
+                } else {
+                    state.resumable_clone = Some(ResumableClone {
+                        workspace: workspace.clone(),
+                        identity: identity.clone(),
+                        image: image.to_owned(),
+                    });
+                }
             }
         } else if image
             .components()
@@ -670,24 +760,26 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn activate_pending_clone(
+    fn activate_pending(
         &self,
         image: &Path,
         workspace: &LifecycleWorkspace,
     ) -> Result<(), ApfsStorageError> {
-        self.record("activate-pending-clone");
+        self.record("activate-pending");
         let mut state = self.state.lock().expect("fake state");
-        let fact = state.pending.remove(image).ok_or_else(|| {
-            ApfsStorageError::Host("missing fake pending clone metadata".to_owned())
-        })?;
+        let fact = state
+            .pending
+            .remove(image)
+            .ok_or_else(|| ApfsStorageError::Host("missing fake pending metadata".to_owned()))?;
         if fact.workspace != *workspace {
             return Err(ApfsStorageError::Host(
-                "fake pending clone identity mismatch".to_owned(),
+                "fake pending identity mismatch".to_owned(),
             ));
         }
         let key = (workspace.repo().clone(), workspace.name().clone());
         state.published.insert(key, fact);
         state.resumable_clone = None;
+        state.resumable_adopt = None;
         Ok(())
     }
 
@@ -714,6 +806,13 @@ impl ApfsExecutionHost for FakeHost {
             .is_some_and(|pending| pending.image == image)
         {
             state.resumable_clone = None;
+        }
+        if state
+            .resumable_adopt
+            .as_ref()
+            .is_some_and(|pending| pending.image == image)
+        {
+            state.resumable_adopt = None;
         }
         if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
             Err(ApfsStorageError::Host(
@@ -819,13 +918,19 @@ impl ApfsExecutionHost for FakeHost {
         _: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         let mut state = self.state.lock().expect("fake state");
-        let resumable = state
-            .resumable_clone
-            .as_ref()
-            .map(|clone| clone.image.clone());
+        let resumable = [
+            state
+                .resumable_clone
+                .as_ref()
+                .map(|clone| clone.image.clone()),
+            state
+                .resumable_adopt
+                .as_ref()
+                .map(|adoption| adoption.image.clone()),
+        ];
         let pending = std::mem::take(&mut state.pending);
         for (image, fact) in pending {
-            if resumable.as_ref() == Some(&image) {
+            if resumable.contains(&Some(image.clone())) {
                 state.pending.insert(image, fact);
                 continue;
             }
@@ -992,8 +1097,12 @@ fn assert_no_orphan_stage(host: &FakeHost) {
     );
 }
 
+/// Adopt creates main at its canonical path behind a PendingFence sidecar and attaches it exactly
+/// once: the staging mount and the checkout mount are two mounts of that one attachment, the
+/// staging one comes down through the kernel's unmount, and publication is the sidecar's
+/// activation. No detach, no second attach and no rename sit on the normal path.
 #[tokio::test]
-async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
+async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
@@ -1018,12 +1127,12 @@ async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
                     .list(&repo())
                     .expect("controller listing")
                     .is_empty(),
-                "the mounted stage must not be visible in canonical enumeration"
+                "the fenced main must not be visible in canonical enumeration"
             );
             assert!(
                 !callback_host
                     .events()
-                    .contains(&"atomic-publish-image".to_owned())
+                    .contains(&"activate-pending".to_owned())
             );
             callback_host.record("controller-initialize");
             Ok::<(), &'static str>(())
@@ -1039,14 +1148,15 @@ async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
         4,
         "lock, authoritative read, staged preparation, and post-callback commit"
     );
+    let events = host.events();
     assert_eq!(
-        host.events(),
+        events,
         [
             "lock:1",
             "observe",
-            "create:100g",
-            "atomic-metadata+parent-fsync:Fresh",
-            "attach-no-mount+fsck",
+            // The fence is durable before the payload name appears.
+            "atomic-metadata+parent-fsync:FreshPendingFence",
+            "create-attached+fsck:100g",
             "mount",
             "copy-until-quiescent",
             "mint-workspace-credentials",
@@ -1056,15 +1166,43 @@ async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
             "controller-initialize",
             "validate-staged-companion",
             "validate-marker",
-            "detach:Release",
-            // Durable state first: the image is published before the user's tree is touched...
-            "atomic-publish-image",
-            // ...then the swap plants the mountpoint at the checkout path, and main mounts there.
+            "unmount",
+            // Publication: the user's tree is untouched until the image is published...
+            "activate-pending",
+            // ...then the swap plants the mountpoint at the checkout path, and the same
+            // attachment mounts there.
             "atomic-adopt-checkout-vacate",
-            "attach-no-mount+fsck",
             "mount",
             "validate-marker",
             "retain-mounted",
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("create-attached")
+                || event.starts_with("attach-no-mount"))
+            .count(),
+        1,
+        "main is attached exactly once"
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("detach")),
+        "the normal path never detaches main"
+    );
+    assert_eq!(
+        host.paths()[0],
+        PathBuf::from("/store/acme/widget/main.asif"),
+        "the image is created at its canonical path"
+    );
+    assert_eq!(
+        host.mount_paths(),
+        [
+            PathBuf::from(format!(
+                "/store/mnt/acme/widget/.staging/main-{}",
+                incarnation(0)
+            )),
+            PathBuf::from("/project"),
         ]
     );
     assert_eq!(
@@ -1080,38 +1218,163 @@ async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
     );
 }
 
+fn pending_adoption(identity: &OperationIdentity) -> PendingAdoption {
+    PendingAdoption {
+        incarnation: incarnation(7),
+        image: PathBuf::from("/store/acme/widget/main.asif"),
+        info: WorkspaceInfoSnapshot {
+            project_root: identity.project_root.clone(),
+            role: WorkspaceRole::Main,
+            base_commit: identity.base_commit.clone(),
+            branch: identity.branch.clone(),
+            created_at: "2026-07-12T00:00:00Z".to_owned(),
+            forked_from: None,
+            captured_at: "2026-07-12T00:00:00Z".to_owned(),
+            stale: false,
+            git_worktree: false,
+        },
+        grants: identity.grants.clone(),
+    }
+}
+
+/// Killed during the tree copy (or after attach, or after the marker), adopt resumes the same
+/// canonical image in place under its recorded identity: nothing is created, the delta copier
+/// runs over what the last attempt left, and the marker validates instead of growing a lineage.
 #[tokio::test]
-async fn interrupted_adopt_clones_the_partial_stage_and_resumes_tree_copy() {
+async fn interrupted_adopt_resumes_its_canonical_image_in_place() {
     let host = FakeHost::default();
-    host.resume_adopt_from("/store/acme/widget/.staging/main-partial.asif");
+    let pending = pending_adoption(&identity());
+    host.resume_adopt_from(pending.clone());
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
+
+    let receipt = substrate
+        .execute_adopt_staged(plan, |stage| async move {
+            assert!(
+                stage.resuming,
+                "the initializer reruns with resume authority"
+            );
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("resumed adopt");
+
+    assert_eq!(receipt.workspace.incarnation(), &pending.incarnation);
+    let events = host.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("create-attached"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("atomic-metadata+parent-fsync"))
+    );
+    assert!(!events.contains(&"discard-pending".to_owned()));
+    let resumed = events
+        .iter()
+        .position(|event| event == "resume-attach-or-reuse")
+        .expect("pending image resumed");
+    let copy = events
+        .iter()
+        .position(|event| event == "copy-until-quiescent")
+        .expect("convergent tree copy");
+    assert!(resumed < copy, "the resumed image seeds the tree copy");
+    assert!(events.contains(&"activate-pending".to_owned()));
+    assert!(!events.iter().any(|event| event.starts_with("detach")));
+    assert_eq!(host.pending_adopt(), None);
+}
+
+/// An unpublished main recording a different commit is a different adoption: it is replaced, and
+/// the checkout it was copying was never touched.
+#[tokio::test]
+async fn adopt_replaces_an_unpublished_main_copied_from_another_commit() {
+    let host = FakeHost::default();
+    let mut stale = identity();
+    stale.base_commit = "fedcba9876543210".to_owned();
+    host.resume_adopt_from(pending_adoption(&stale));
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
+
+    let receipt = substrate
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect("fresh adopt");
+
+    assert_eq!(receipt.workspace.incarnation(), &incarnation(0));
+    let events = host.events();
+    assert!(!events.iter().any(|event| event.starts_with("resume-")));
+    let discarded = events
+        .iter()
+        .position(|event| event == "discard-pending")
+        .expect("stale main discarded");
+    let created = events
+        .iter()
+        .position(|event| event.starts_with("create-attached"))
+        .expect("fresh main created");
+    assert!(discarded < created);
+}
+
+/// Killed while the image was being created — before its volume was formatted — the pending main
+/// never held a copy: it is discarded and adoption starts over.
+#[tokio::test]
+async fn adopt_replaces_a_pending_main_whose_volume_was_never_formatted() {
+    let host = FakeHost::default();
+    host.resume_adopt_from(pending_adoption(&identity()));
+    host.leave_pending_adopt_unformatted();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
+
+    let receipt = substrate
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect("fresh adopt");
+
+    assert_eq!(receipt.workspace.incarnation(), &incarnation(0));
+    let events = host.events();
+    let order = [
+        "resume-unformatted",
+        "discard-pending",
+        "create-attached+fsck:100g",
+    ]
+    .map(|step| {
+        events
+            .iter()
+            .position(|event| event == step)
+            .unwrap_or_else(|| panic!("missing {step}: {events:?}"))
+    });
+    assert!(order[0] < order[1] && order[1] < order[2], "{events:?}");
+}
+
+/// A resumed adoption that fails again keeps its image: it holds the copy the next attempt
+/// continues from, so the repository copy never restarts from zero.
+#[tokio::test]
+async fn failed_resumed_adopt_keeps_the_pending_image_for_the_next_attempt() {
+    let host = FakeHost::default();
+    let pending = pending_adoption(&identity());
+    host.resume_adopt_from(pending.clone());
+    host.fail_next_credentials();
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
         .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
-        .expect("resumed adopt");
+        .expect_err("credential mint failure");
 
     let events = host.events();
-    assert!(!events.iter().any(|event| event.starts_with("create:")));
-    let clone = events
-        .iter()
-        .position(|event| event == "clone")
-        .expect("partial stage clone");
-    let copy = events
-        .iter()
-        .position(|event| event == "copy-until-quiescent")
-        .expect("convergent tree copy");
-    assert!(
-        clone < copy,
-        "the partial image must seed the resumed tree copy"
-    );
+    assert!(events.contains(&"detach:Release".to_owned()));
+    assert!(!events.contains(&"idempotent-reclaim".to_owned()));
+    assert!(!events.contains(&"activate-pending".to_owned()));
+    assert_eq!(host.pending_adopt(), Some(pending));
+    assert!(host.list(&repo()).expect("listing").is_empty());
 }
 
 /// The mountpoint *is* the checkout path and cannot exist until the swap creates it, so the swap
-/// comes first and the attach follows it.
+/// comes first and the mount follows it — of the attachment the copy ran on.
 #[tokio::test]
-async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
+async fn direct_mount_adopt_swaps_the_checkout_before_mounting_it() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
@@ -1125,25 +1388,74 @@ async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
     let events = host.events();
     let tail: Vec<_> = events
         .iter()
-        .skip_while(|event| event.as_str() != "detach:Release")
+        .skip_while(|event| event.as_str() != "unmount")
         .cloned()
         .collect();
     assert_eq!(
         tail,
         [
-            "detach:Release",
+            "unmount",
             // The image is published on its own: there is no mountpoint to create under the store,
             // because main's mountpoint is the user's checkout path.
-            "atomic-publish-image",
+            "activate-pending",
             // The swap plants the mountpoint and the self-healing stub at the checkout path...
             "atomic-adopt-checkout-vacate",
-            // ...and only then can anything be attached there.
+            // ...and only then can main be mounted there.
+            "mount",
+            "validate-marker",
+            "retain-mounted",
+        ]
+    );
+}
+
+/// Killed after activation — before the checkout swap, or after it and before the mount — main is
+/// published and the adoption is finished from durable facts: the swap is idempotent, and main is
+/// mounted at the checkout. A second pass finds it mounted and only validates it.
+#[tokio::test]
+async fn finishing_a_published_adoption_swaps_and_mounts_once() {
+    let host = FakeHost::default();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let main = workspace("main", 1);
+    host.seed(&main);
+    let pre_cowshed = PathBuf::from("/project.pre-cowshed");
+
+    substrate
+        .finish_adoption(&main, &pre_cowshed)
+        .await
+        .expect("finish adoption");
+    let first = host.events();
+    let tail: Vec<_> = first
+        .iter()
+        .skip_while(|event| event.as_str() != "atomic-adopt-checkout-vacate")
+        .cloned()
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "atomic-adopt-checkout-vacate",
             "attach-no-mount+fsck",
             "mount",
             "validate-marker",
             "retain-mounted",
         ]
     );
+    assert_eq!(host.mount_paths(), [PathBuf::from("/project")]);
+    assert_eq!(
+        substrate.mount_state(&main).await.expect("mount state"),
+        MountState::Mounted { mount_id: 1 }
+    );
+
+    host.clear_events();
+    substrate
+        .finish_adoption(&main, &pre_cowshed)
+        .await
+        .expect("finishing again is idempotent");
+    let second: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter(|event| !event.starts_with("lock:"))
+        .collect();
+    assert_eq!(second, ["atomic-adopt-checkout-vacate", "validate-marker"]);
 }
 
 #[tokio::test]
@@ -1183,7 +1495,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     assert!(events.contains(&"controller-rejected".to_owned()));
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-publish-image".to_owned()));
+    assert!(!events.contains(&"activate-pending".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
 }
 
@@ -1210,7 +1522,7 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"write-marker".to_owned()));
-    assert!(!events.contains(&"atomic-publish-image".to_owned()));
+    assert!(!events.contains(&"activate-pending".to_owned()));
     assert!(host.list(&repo()).expect("post-failure listing").is_empty());
 }
 
@@ -1237,7 +1549,7 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
         other => panic!("unexpected compound adopt error: {other:?}"),
     }
     assert!(host.mounted_paths_now().is_empty());
-    assert!(!host.events().contains(&"atomic-publish-image".to_owned()));
+    assert!(!host.events().contains(&"activate-pending".to_owned()));
 }
 
 #[tokio::test]
@@ -1322,7 +1634,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
     let events = host.events();
     assert!(events.iter().any(|event| event.starts_with("detach:")));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-publish-image".to_owned()));
+    assert!(!events.contains(&"activate-pending".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
 }
 
@@ -1924,7 +2236,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     let events = host.events();
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-publish-image".to_owned()));
+    assert!(!events.contains(&"activate-pending".to_owned()));
 }
 
 #[tokio::test]
@@ -2421,10 +2733,9 @@ async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
         "one canonical mount, got {events:?}"
     );
     assert!(!events.iter().any(|event| event.starts_with("detach:")));
-    assert!(!events.iter().any(|event| event == "atomic-publish-image"));
     let activate = events
         .iter()
-        .position(|event| event == "activate-pending-clone")
+        .position(|event| event == "activate-pending")
         .expect("activation fence");
     let retain = events
         .iter()
@@ -2509,7 +2820,7 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.as_str() == "activate-pending-clone")
+            .filter(|event| event.as_str() == "activate-pending")
             .count(),
         1
     );
@@ -2584,6 +2895,6 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     assert_eq!(retired.workspace().revision(), Revision::new(6));
     let events = host.events();
     assert!(events.iter().any(|event| event == "atomic-retire-to-trash"));
-    assert!(!events.iter().any(|event| event == "activate-pending-clone"));
+    assert!(!events.iter().any(|event| event == "activate-pending"));
     assert!(!events.iter().any(|event| event.as_str() == "clone"));
 }
