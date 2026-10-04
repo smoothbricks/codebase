@@ -1,5 +1,5 @@
 //! Real-compiler regressions, copied into upstream tests by the standalone flake.
-//! Run explicitly: cargo test --no-default-features --test compiler_executable -- --ignored
+//! Run explicitly: cargo test --no-default-features --test real_compiler -- --ignored
 //! Requires rustc and clang on PATH; the Rustup control also requires rustup,
 //! but uses private homes and the already-installed real toolchain. No downloads.
 //! SCCACHE_TEST_CLANG may select an unwrapped clang for the multicall control;
@@ -9,6 +9,8 @@
 #![cfg(unix)]
 
 use sccache::server::ServerInfo;
+use std::env::consts::{DLL_EXTENSION, DLL_PREFIX};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
@@ -451,4 +453,169 @@ fn rustup_proxy_preserves_basename_and_toolchain_resolution() {
         daemon.assert_rust_value(&rustc, expected);
     }
     assert_eq!(daemon.stats().stats.cache_misses.all(), 2);
+}
+
+/// Two checkouts of the same sources at different paths. Canonical, as the client's working
+/// directory will be.
+struct Checkouts {
+    a: PathBuf,
+    b: PathBuf,
+}
+
+impl Checkouts {
+    fn new(root: &Path, files: &[(&str, &str)]) -> Self {
+        let root = fs::canonicalize(root).unwrap();
+        let [a, b] = ["checkout-a", "checkout-b"].map(|name| root.join(name));
+        for checkout in [&a, &b] {
+            for (path, contents) in files {
+                let path = checkout.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, contents).unwrap();
+            }
+        }
+        Self { a, b }
+    }
+}
+
+impl Daemon {
+    /// Compile `<name>/src/lib.rs` the way cargo compiles a workspace member, opted into cwd
+    /// normalization as every cowshed workspace is: from the checkout root, with a relative
+    /// source path and an absolute manifest and output directory. Returns the output directory.
+    fn cargo_compile(
+        &self,
+        rustc: &Path,
+        checkout: &Path,
+        name: &str,
+        extra: &[&OsStr],
+    ) -> PathBuf {
+        let out = checkout.join("target");
+        fs::create_dir_all(&out).unwrap();
+        run(self
+            .command()
+            .current_dir(checkout)
+            .env("SCCACHE_BASEDIR_CWD", "1")
+            .env("CARGO_MANIFEST_DIR", checkout.join(name))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                name,
+                "--edition=2021",
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata,link",
+            ])
+            .arg(format!("{name}/src/lib.rs"))
+            .arg("--out-dir")
+            .arg(&out)
+            .args(extra));
+        out
+    }
+}
+
+fn names(file: &Path, path: &Path) -> bool {
+    let path = path.as_os_str().as_bytes();
+    fs::read(file)
+        .unwrap()
+        .windows(path.len())
+        .any(|window| window == path)
+}
+
+/// rustc records its working directory in rmeta and in debuginfo. A cwd-normalized key is
+/// shared by every checkout, so its entry must not carry the first checkout's path to the
+/// next: unremapped, checkout B is handed an rmeta and line tables that name checkout A.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn shared_entry_names_no_checkout() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(
+        daemon.root.path(),
+        &[(
+            "plain/src/lib.rs",
+            "pub fn located() -> u32 { line!() }\npub fn made<T: Default>() -> T { T::default() }\n",
+        )],
+    );
+    let line_tables = [OsStr::new("-C"), OsStr::new("debuginfo=line-tables-only")];
+    daemon.cargo_compile(&rustc, &checkouts.a, "plain", &line_tables);
+    daemon.wait_for_writes(1);
+    let out = daemon.cargo_compile(&rustc, &checkouts.b, "plain", &line_tables);
+    let stats = daemon.stats().stats;
+    assert_eq!(
+        (stats.cache_misses.all(), stats.cache_hits.all()),
+        (1, 1),
+        "checkout B must reuse checkout A's entry"
+    );
+    for artifact in ["libplain.rlib", "libplain.rmeta"] {
+        assert!(
+            !names(&out.join(artifact), &checkouts.a),
+            "checkout B's {artifact} names checkout A"
+        );
+    }
+}
+
+/// A proc macro can read a checkout path that no key input reveals: here through
+/// std::env::var("CARGO_MANIFEST_DIR"), which dep-info does not record, from one dylib that
+/// both checkouts load, as every registry proc macro is. The output names the checkout it was
+/// compiled in, so only that checkout may reuse it.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn path_reading_proc_macro_output_stays_with_its_checkout() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let root = fs::canonicalize(daemon.root.path()).unwrap();
+    let registry = root.join("registry");
+    fs::create_dir(&registry).unwrap();
+    fs::write(
+        registry.join("pm.rs"),
+        "extern crate proc_macro;\n\
+         #[proc_macro]\n\
+         pub fn manifest_dir(_: proc_macro::TokenStream) -> proc_macro::TokenStream {\n\
+         \x20   format!(\"{:?}\", std::env::var(\"CARGO_MANIFEST_DIR\").unwrap()).parse().unwrap()\n\
+         }\n",
+    )
+    .unwrap();
+    let dylib = registry.join(format!("{DLL_PREFIX}pm.{DLL_EXTENSION}"));
+    run(Command::new(&rustc)
+        .current_dir(&registry)
+        .args([
+            "--crate-name",
+            "pm",
+            "--edition=2021",
+            "--crate-type",
+            "proc-macro",
+            "pm.rs",
+            "-o",
+        ])
+        .arg(&dylib));
+    let checkouts = Checkouts::new(
+        &root,
+        &[(
+            "baked/src/lib.rs",
+            "pub fn dir() -> &'static str { pm::manifest_dir!() }\n",
+        )],
+    );
+    let mut pm = OsString::from("pm=");
+    pm.push(&dylib);
+    let externs = [OsStr::new("--extern"), pm.as_os_str()];
+
+    let a = daemon
+        .cargo_compile(&rustc, &checkouts.a, "baked", &externs)
+        .join("libbaked.rlib");
+    assert!(names(&a, &checkouts.a));
+    daemon.wait_for_writes(1);
+    let b = daemon
+        .cargo_compile(&rustc, &checkouts.b, "baked", &externs)
+        .join("libbaked.rlib");
+    assert!(
+        !names(&b, &checkouts.a),
+        "checkout B was served checkout A's manifest directory"
+    );
+    assert!(names(&b, &checkouts.b));
+    daemon.wait_for_writes(2);
+    // Reuse at the same path survives.
+    fs::remove_file(&a).unwrap();
+    daemon.cargo_compile(&rustc, &checkouts.a, "baked", &externs);
+    assert!(names(&a, &checkouts.a));
+    let stats = daemon.stats().stats;
+    assert_eq!((stats.cache_misses.all(), stats.cache_hits.all()), (2, 1));
 }

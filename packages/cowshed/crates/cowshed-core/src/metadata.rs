@@ -464,11 +464,12 @@ impl<'de> Deserialize<'de> for CheckoutRootRecord {
 /// (measured on cargo 1.97: identical hashes for one workspace checked out at two paths), and
 /// the bundled sccache keys its residual path-bearing inputs — cwd, blanket `CARGO_*`
 /// environment values, argument bytes — relative to the request cwd when the client sets
-/// `SCCACHE_BASEDIR_CWD=1`, which every workspace now does. Cross-path sharing is therefore the
-/// default, with one deliberate exception: values rustc records as `# env-dep:` (a crate that
-/// compiles `env!("CARGO_MANIFEST_DIR")` into its output) are never normalized, so such crates
-/// fail closed across paths. A slot's remaining value is the stable absolute path itself, for
-/// tooling that persists paths across tenant generations.
+/// `SCCACHE_BASEDIR_CWD=1`, which every workspace now does, and compiles such a request with the
+/// cwd remapped out of rmeta and debuginfo. Cross-path sharing is therefore the default, with one
+/// deliberate exception: a unit whose output still names its checkout (an `env!` value, a proc
+/// macro that read the manifest directory) is stored for that path alone, so it fails closed
+/// across paths. A slot's remaining value is the stable absolute path itself: same-path reuse of
+/// those units, and tooling that persists paths across tenant generations.
 ///
 /// Slot numbering is shared with `coordinator.assignSlot`'s port blocks, hence the same upper
 /// bound: a slot has to be expressible as a `NEW_PORT_BLOCK_SIZE`-aligned base inside the 16-bit

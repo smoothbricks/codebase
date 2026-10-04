@@ -11944,8 +11944,7 @@ fn require_expected_ref(
 ///
 /// It carries no environment of its own, so a check builds the units an interactive command
 /// builds. Forcing `CARGO_INCREMENTAL=0` here once made every workspace member a separate unit,
-/// recompiled on each landing, and put members into sccache with the landing workspace's
-/// absolute source paths in their debuginfo.
+/// recompiled on each landing.
 #[cfg(target_os = "macos")]
 fn land_check_request(check: &str) -> ExecRequest {
     ExecRequest {

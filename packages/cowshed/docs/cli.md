@@ -404,13 +404,16 @@ does any more:
   workspace members (measured: identical hashes for one workspace checked out at two paths).
 - sccache additionally hashes the compiler's **physical** working directory. The bundled build keys that, the blanket
   `CARGO_*` values and the argument bytes relative to the request cwd for a client that sets `SCCACHE_BASEDIR_CWD=1` —
-  which every workspace does.
+  which every workspace does — and compiles such a request with the cwd remapped away, so the working directory rustc
+  records in rmeta and debuginfo is workspace-relative.
 
-So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach: a crate whose
-output records an `env-dep:` value (`env!("CARGO_MANIFEST_DIR")`) is never normalized and fails closed across paths,
-tooling that persists absolute paths across tenant generations keeps working, and an unpatched sccache or a cargo older
-than 1.97 still needs the path to be identical. The table below is that older world, measured on this hardware with
-sccache 0.16 over a ten-crate workspace, second checkout of identical sources:
+So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach. A unit whose
+output still names its checkout — an `env-dep:` value (`env!("CARGO_MANIFEST_DIR")`, never normalized), a proc macro
+that reads the manifest directory, an include recorded by absolute path — is found by reading the outputs before they
+are stored, and is stored for that path alone: it hits again at the same path and fails closed at every other. Tooling
+that persists absolute paths across tenant generations keeps working, and an unpatched sccache or a cargo older than
+1.97 still needs the path to be identical. The table below is that older world, measured on this hardware with sccache
+0.16 over a ten-crate workspace, second checkout of identical sources:
 
 | build path                         | Rust units hit |
 | ---------------------------------- | -------------- |
@@ -436,14 +439,13 @@ repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1` an
 (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a pinned sccache gets no wrapper. Name mounts are not excluded:
 the bundled sccache normalizes the residual path-bearing key inputs against the request cwd, so sibling paths share
 entries with each other. A slot buys the one input normalization cannot reach — cargo's `-C metadata`, a hash sccache
-never sees.
+never sees — and same-path reuse of the units whose output names their checkout.
 
 `CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
 profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a
 one-line edit rebuilds in ~1.7s, against ~20-32s with incremental forced off), while their dependencies are always
 non-incremental and reach the cache without anyone forcing anything. A land check therefore builds the same units an
-interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile every workspace crate a second time and
-store it with the landing workspace's absolute paths in its debuginfo.
+interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile every workspace crate a second time.
 
 `main` cannot take a slot — its mount is fixed by the project's checkout layout.
 
@@ -1042,12 +1044,21 @@ update or nix garbage collection: an sccache upgrade is picked up by rerunning `
 on byte drift and rewrites the plist only on drift.
 
 Cross-path Rust reuse — every workspace hitting one cache regardless of its mount path — requires an sccache that
-carries `patches/sccache-0.17.0-rust-basedir-cwd.patch`: it extends `SCCACHE_BASEDIRS` normalization to the Rust hasher
-and honors the per-request `SCCACHE_BASEDIR_CWD=1` client variable cowshed exports in every workspace, keying the cwd,
-the blanket `CARGO_*` environment values, and the argument bytes relative to the request cwd. Values rustc records as
-`# env-dep:` are never normalized, so a crate that compiles `env!("CARGO_MANIFEST_DIR")` into its output fail-closes
-across paths. Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache
-still serves same-path (slot-tenant) reuse, nothing more.
+carries `nix/sccache/sccache-rust-basedir-cwd.patch`. It extends `SCCACHE_BASEDIRS` normalization to the Rust hasher and
+honors the per-request `SCCACHE_BASEDIR_CWD=1` client variable cowshed exports in every workspace, keying the cwd, the
+blanket `CARGO_*` environment values, and the argument bytes relative to the request cwd. Values rustc records as
+`# env-dep:` are never normalized. A normalized key is only as good as the claim that the output does not depend on the
+path it omits, so the patch makes that claim true and then checks it:
+
+- such a compile runs under `--remap-path-prefix=<cwd>=`, so the working directory rustc writes into rmeta and debuginfo
+  is workspace-relative and identical at every mount;
+- before the entry is stored, its outputs (and the dependency list of its dep-info) are searched for every normalized
+  path. An output that names one — a proc macro that read `CARGO_MANIFEST_DIR` through `std::env`, which dep-info cannot
+  see, or an `env!` value — is stored under the verbatim per-path key, with a marker under the normalized key that sends
+  later lookups to their own per-path key. That checkout keeps reusing it; no other checkout is ever served it.
+
+Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache still serves
+same-path (slot-tenant) reuse, nothing more. Prove the build with `strings sccache | grep cowshed-path-v2`.
 
 Concurrent misses of one cache key wait for the first compile (`patches/sccache-singleflight.patch`; prove with
 `nm sccache | grep inflight_join`). Without it, parallel `cargo` processes compile the same crate N times.

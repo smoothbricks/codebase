@@ -77,7 +77,11 @@
         #    SCCACHE_BASEDIR_CWD=1 so cwd, blanket CARGO_* env, and argument bytes key relative to
         #    the request cwd. cargo >= 1.97 path-independent -C metadata plus this is what lets
         #    every cowshed workspace share one cache at any mount path. env-dep values are never
-        #    normalized. Present in the build iff `nm` finds `hash_normalized`.
+        #    normalized. A cwd-normalized compile runs under `--remap-path-prefix=<cwd>=`, so the
+        #    working directory rustc records in rmeta and debuginfo is workspace-relative, and an
+        #    entry is stored under the normalized key only if no output names a normalized path;
+        #    otherwise it goes under the verbatim key and a marker sends that checkout's later
+        #    lookups there. Present in the build iff `strings` finds `cowshed-path-v2`.
         # 2. singleflight: concurrent misses of one cache key wait for the first compile to publish
         #    instead of running N rustcs. Present in the build iff `nm` finds `inflight_join`.
         # 3. compiler-executable: bind concrete compilers to the same stable,
@@ -87,9 +91,9 @@
         #    Its Rust key epoch rejects entries poisoned by an older daemon
         #    executing a repointed alias under another compiler's identity.
         #
-        # This directory is the only copy of these patches. `smoo monorepo check` asserts that this
-        # list and the `.patch` files beside it name each other exactly, so neither an orphaned file
-        # nor a reference to a deleted one can land.
+        # This directory is the only copy of these patches. Every `.patch` file beside this flake must
+        # appear in this list and every entry must exist: nix ignores an unreferenced patch in
+        # silence, so an orphaned file would read as applied while the built binary lacks it.
         patches = [
           ./sccache-rust-basedir-cwd.patch
           ./sccache-singleflight.patch
@@ -122,7 +126,7 @@
             + ''
               substituteInPlace Cargo.toml \
                 --replace-fail 'version = "${previousAttrs.version}"' 'version = "${finalAttrs.version}"'
-              cp ${./compiler-executable.rs} tests/compiler_executable.rs
+              cp ${./real-compiler.rs} tests/real_compiler.rs
             '';
         });
       in {
@@ -139,7 +143,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
         sccache = self.packages.${system}.sccache;
       in {
-        compiler-executable = sccache.overrideAttrs (previousAttrs: {
+        real-compiler = sccache.overrideAttrs (previousAttrs: {
           doCheck = true;
           nativeCheckInputs =
             (previousAttrs.nativeCheckInputs or [])
@@ -148,7 +152,7 @@
               pkgs.clang
               pkgs.rustup
             ];
-          cargoTestFlags = ["--test" "compiler_executable"];
+          cargoTestFlags = ["--test" "real_compiler"];
           checkFlags = ["--ignored" "--test-threads=1"];
           preCheck =
             (previousAttrs.preCheck or "")
