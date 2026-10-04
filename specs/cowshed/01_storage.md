@@ -349,8 +349,8 @@ For every mounted attachment:
   `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and the sidebar regardless of Finder preferences.
 - The **main workspace mounts at the checkout's original path** (written `<project-root>` below; 02_workspaces.md). The
   user's path is the real thing, and sibling workspaces live under the shared mount root.
-- Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
-  "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
+- Mountpoint directories are created before attach and removed by `cowshed gc`. An unmounted main mountpoint is empty:
+  cowshed creates no repository shell hook underneath it. Reattachment is an explicit `cowshed attach` operation.
 - Cwd resolution is granted only when the canonical input path is contained in exactly one currently mounted,
   repository-owned attachment whose image metadata and kernel mount facts agree. An in-image marker, an empty
   mountpoint, a detached image, a mount owned by another project, or overlapping active mounts never grants a
@@ -405,7 +405,7 @@ All cowshed bytes live on two dedicated APFS volumes, split by **rebuildability 
 cowshed churn at all:
 
 - **`cowshed.caches`**, mounted at `/private/cowshed/caches` — everything rebuildable. Layout:
-  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state},devenv}` (see
+  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state}}` (see
   03_caches.md). `repo-mirrors/` holds bare git mirrors (`<host>/<org>/<repo>.git`) — written only by the gateway via
   `cowshed repo mirror`, sandbox-read-only, and distinct from Cargo's shared writable `cargo/git` cache. Because nothing
   unique lives here, the nuclear recovery path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror

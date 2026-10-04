@@ -2773,9 +2773,9 @@ fn real_apfs_canonical_path_with_an_unrelated_volume_fails_closed_without_detach
 
 /// The direct-mount handoff has one job the symlink handoff also has: the user's path is never
 /// absent and never half-built. It gets there with the same `RENAME_SWAP`, exchanging the original
-/// tree for a mountpoint that already carries the self-healing stub.
+/// tree for an empty mountpoint without creating repository shell hooks.
 #[test]
-fn direct_mount_handoff_swaps_the_checkout_for_a_stubbed_mountpoint() {
+fn direct_mount_handoff_swaps_the_checkout_for_an_empty_mountpoint() {
     let fixture = Fixture::new("direct-vacate");
     let checkout = fixture.root.join("mount");
     let pre_cowshed = fixture.root.join("mount.pre-cowshed");
@@ -2786,16 +2786,12 @@ fn direct_mount_handoff_swaps_the_checkout_for_a_stubbed_mountpoint() {
     host.vacate_adopted_checkout(&checkout, &pre_cowshed)
         .expect("vacate");
 
-    // The checkout path is now cowshed's mountpoint, carrying only the stub...
+    // The checkout path is now cowshed's empty mountpoint...
     assert!(checkout.is_dir());
     assert_eq!(
-        std::fs::read(checkout.join(".envrc")).expect("stub"),
-        b"cowshed attach\n"
-    );
-    assert_eq!(
         std::fs::read_dir(&checkout).expect("mountpoint").count(),
-        1,
-        "the mountpoint holds the stub and nothing else"
+        0,
+        "cowshed creates no shell hook underneath the mount"
     );
     // ...and the user's tree is retained beside it, whole.
     assert_eq!(

@@ -103,38 +103,29 @@ cowshed gateway status --json
 The gateway owns credentials, registry mirrors, and egress policy. Workspaces receive an isolated endpoint and opaque
 workspace token; secrets are not copied into the workspace.
 
-Every published workspace image carries its environment in `.cowshed/env`. Cowshed creates a two-line `.envrc` when the
-file is absent and already ignored, or reconciles its marked loader in an existing untracked hook:
+Every published workspace image carries its environment in `.cowshed/env`. Shell hooks are optional: cowshed neither
+requires nor writes `.envrc` or `.envrc-local`, and a plain Git repository needs no shell-hook ignore rules. A project
+that uses direnv interactively may add this line to its own hook:
 
 ```sh
 source_env_if_exists .cowshed/env
 ```
 
-This is direnv's standard optional-file loader. On an untracked hook, cowshed replaces only its own marked loader when
-reconciling the environment; project-owned lines stay unchanged. Tracked hooks must already load the file or expose an
-ignored `.envrc-local`; cowshed writes there without changing the tracked input.
+This is direnv's standard optional-file loader. It is not needed for `cowshed exec`: the supervisor supplies workspace
+values directly, whether or not the repository uses direnv. Existing repository hooks are cloned unchanged.
 
 The sourced file exports workspace-local `GOENV` and `COWSHED_*` values and is rewritten whenever cowshed rotates the
-workspace token. After a reboot or manual eject, reattach explicitly; devenv-native repositories then use their own
-`devenv:allow` command once for that mounted workspace:
+workspace token. After a reboot or manual eject, reattach explicitly:
 
 ```sh
 cowshed attach
-npm run devenv:allow  # use the repository's equivalent script
 ```
 
-Cowshed resolves the evaluation directory from repository-owned configuration:
+`attach` is safe to run repeatedly. It does not install dependencies or fetch code, and cowshed never writes direnv
+trust records.
 
-```toml
-[devenv]
-dir = "tooling/devenv"
-```
-
-The path must be relative and cannot contain `..`. Without that section, a `devenv.nix` at the workspace root selects
-the root; without either signal, exec behavior is unchanged.
-
-`attach` is safe to run repeatedly. It does not install dependencies or fetch code, and cowshed never writes direnv or
-devenv trust records.
+A project's shell is its own `.envrc`. A devenv project writes `use devenv` there, and `cowshed exec` activates it
+through direnv inside the sandbox; cowshed has no devenv configuration or `devenv shell` path of its own.
 
 ## Daily human workflow
 
@@ -155,9 +146,8 @@ cowshed exec "$WS" -- bun test
 cowshed exec "$WS" -- git status --porcelain
 ```
 
-When `.cowshed.toml` selects a devenv directory, the workspace supervisor watches its devenv inputs. A changed input
-refreshes the saved environment exactly once before the next `cowshed exec`; clean execs reuse the snapshot without
-running devenv. Processes already running keep the environment they launched with.
+Under a workspace `.envrc`, the workspace supervisor keeps an activated shell and activates a fresh one only when an
+input direnv recorded for it changes (11_shell.md). Processes already running keep the environment they launched with.
 
 Before a risky operation, create a checkpoint:
 

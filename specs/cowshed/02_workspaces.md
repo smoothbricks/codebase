@@ -743,10 +743,10 @@ step.
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else no validation with one honest
    `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact, output captured as a job (11_shell.md)
    for diagnosis. The check is an ordinary sandboxed exec and gets exactly the environment one gets (04_sandbox.md): the
-   workspace's activated shell over cowshed's own job contract — the bootstrap `PATH` of the workspace profile and the
-   `direnv`/`devenv`/`nix` packages, plus a private `HOME`. A verify command that needs more than that needs it wired
-   into the workspace, not leaked from the caller's shell; the check runs where the work was done, and a check that only
-   passes in the coordinator's environment has not validated the workspace.
+   workspace's optional activated shell over cowshed's own job contract — the bootstrap `PATH` of the
+   `direnv`/`devenv`/`nix` packages and system directories, plus a private `HOME`. A verify command that needs more
+   needs it wired into the workspace, not leaked from the caller's shell; the check runs where the work was done, and a
+   check that only passes in the coordinator's environment has not validated the workspace.
 
    Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already _is_ the
    project's pinned toolchain, resolved to store paths, so wrapping a check in `devenv shell --` or a direnv
@@ -901,7 +901,7 @@ persist. `attach` mounts at the canonical path with canonical flags and, on Linu
 socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
 at login by a launchd agent; Linux uses its platform service/controller lifecycle.
 
-## Workspace environment: `.cowshed/env`, sourced by `.envrc`
+## Workspace environment: `.cowshed/env`, optionally sourced by direnv
 
 Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
 `.cowshed/env` exports `GOENV` (pointing at the workspace's `.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN`
@@ -912,19 +912,19 @@ fork and restore publish it as they mint, and every supervisor start publishes i
 a workspace minted before a variable existed gains it on its next start. Nothing is derived from cwd, guessed from a
 slot, or trusted from a marker alone.
 
-The repo-visible wiring is one line. When a checkout has no `.envrc`, cowshed writes:
+Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
+new, fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration
+uses the ordinary sandbox environment; a project-owned `.envrc` needs no cowshed-specific loader.
+
+Projects that want interactive direnv shells to receive the published workspace values may add this optional line to
+their own hook:
 
 ```bash
 source_env_if_exists .cowshed/env
 ```
 
-The loader is direnv's `source_env_if_exists`, including when the optional file is absent. An untracked hook's marked
-loader is reconciled in place; all project-owned lines remain unchanged. Tracked hooks remain immutable input.
-
-When the project tracks `.envrc`, that input is never rewritten: it must already load this file, or expose an ignored
-`.envrc-local` through `source_env_if_exists "$local_override"`. Cowshed writes its marked loader to that untracked
-local hook. Interactive shells get real values through direnv; agent processes get the same environment injected at
-spawn by the supervisor (04_sandbox.md), so no verb exists to print these exports on demand.
+Agent processes receive the same workspace values at spawn from the supervisor (04_sandbox.md), without sourcing this
+file or requiring direnv. No verb exists to print these exports on demand.
 
 **Empty mountpoints are not user-visible state.** A mountpoint directory exists only while its workspace is attached;
 detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project before

@@ -7305,12 +7305,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     repository.record_case_sensitive_filesystem(),
                 )
                 .await?;
-                timed_async(
-                    "adopt",
-                    "environment",
-                    repository.ensure_workspace_environment_wiring(),
-                )
-                .await?;
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     crate::metadata::write_json(&binding_path, &binding)
                 })
@@ -7662,7 +7656,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             )
                             .await?;
                     }
-                    repository.ensure_workspace_environment_wiring().await
+                    Ok::<_, CowshedError>(())
                 })
                 .await
                 .map_err(native_staged_error)?;
@@ -8320,14 +8314,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .execute_restore_staged(
                 plan,
-                |stage| async move {
-                    if let crate::storage::apfs::RestoreStage::Replace(stage) = stage {
-                        crate::git::GitRepository::from_root(&stage.mount_point)
-                            .ensure_workspace_environment_wiring()
-                            .await?;
-                    }
-                    Ok::<_, CowshedError>(())
-                },
+                |_| async { Ok::<_, CowshedError>(()) },
                 move |fence| async move {
                     commitments
                         .record(CommitmentDraft::Restore {

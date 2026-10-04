@@ -6,23 +6,17 @@ isn't reconciling state — it's _deriving_ it from disk and the mount table, so
 
 ## Mounts
 
-**Workspace missing after reboot.** Mounts don't survive reboots; images do. Direnv repositories normally reattach when
-their allowed `.envrc` runs:
+**Workspace missing after reboot.** Mounts don't survive reboots; images do. Reattach explicitly:
 
 ```sh
 $ cowshed attach
 cowshed: attached acme/widget/raven
 ```
 
-Adopted main workspaces retain the byte-stable stub `.envrc` cowshed wrote underneath the mountpoint. When unmounted,
-`cd <project-root>` exposes that stub, which runs `cowshed attach`; after the real workspace is mounted its own `.envrc`
-shadows the stub and direnv reloads. Cowshed does **not** authorize either file: run `direnv allow` once at each
-workspace path.
-
-Devenv's hook cannot activate from the bare mountpoint stub. For a devenv-native repository, run `cowshed attach`, then
-run the repository's `devenv:allow` command once at that workspace path. The mounted image's `.envrc` sources
-`.cowshed/env`; no command prints those exports on demand. Cowshed never reads or writes devenv's trust database. The
-login LaunchAgent may attach permanent workspaces proactively, but explicit `attach` remains the recovery command.
+An unmounted main workspace exposes an empty mountpoint, not an auto-attach `.envrc`. Cowshed does not create or rewrite
+repository shell hooks. After attaching, a project that uses direnv interactively can authorize its own hook with
+`direnv allow`; sandboxed exec uses a private approval store. The login LaunchAgent may attach permanent workspaces
+proactively, but explicit `cowshed attach` remains the recovery command.
 
 **Finder ejected a volume** (or `diskutil eject` by hand): use the same explicit `cowshed attach` recovery.
 
@@ -32,11 +26,6 @@ login LaunchAgent may attach permanent workspaces proactively, but explicit `att
 **A command does not see an edited shell file.** A warm workspace shell re-activates when a file direnv recorded as an
 input changes. A file your `.envrc` reads without telling direnv (a sourced script, a lockfile an install step uses) is
 not on that list: add `watch_file <path>` to the `.envrc`, and edits to it re-activate the next command.
-
-**devenv refresh fails during `cowshed exec`.** With `[devenv] dir` in `.cowshed.toml` (or a root `devenv.nix`), cowshed
-watches the configuration inputs and refreshes the environment before the next sandbox process. A missing configured
-`devenv.nix`, missing `devenv` executable, or evaluation error fails closed with exit 5 and devenv's stderr; cowshed
-never reuses a stale snapshot. Existing long-running processes keep their launch environment.
 
 **`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
@@ -323,12 +312,12 @@ wrapper. Run `cowshed setup --sccache`; the next command in the workspace uses i
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 
-The workspace supervisor looks for `direnv` (and `devenv` and `nix`) in the workspace's own devenv profile and in the
-host's Nix profiles — `~/.nix-profile`, `~/.local/state/nix/profile`, `/etc/profiles/per-user/<you>`,
-`/run/current-system/sw` and the default profile — never on your shell's PATH, and puts only the store package each one
-resolves to on the job's PATH, never a whole profile. Install `direnv` into one of those profiles
-(`nix profile install nixpkgs#direnv`, or home-manager/nix-darwin), then run the command again. The message names the
-PATH that was searched. A different tool your shell has but a job lacks belongs in the workspace devenv.
+The workspace supervisor looks for `direnv` (and `devenv` and `nix`) in the host's Nix profiles — `~/.nix-profile`,
+`~/.local/state/nix/profile`, `/etc/profiles/per-user/<you>`, `/run/current-system/sw` and the default profile — never
+on your shell's PATH, and puts only the store package each one resolves to on the job's PATH, never a whole profile.
+Install `direnv` into one of those profiles (`nix profile install nixpkgs#direnv`, or home-manager/nix-darwin), then run
+the command again. The message names the PATH that was searched. A different tool your shell has but a job lacks belongs
+in the workspace's own `.envrc` activation.
 
 ## When cowshed itself misbehaves
 

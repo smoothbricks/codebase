@@ -58,7 +58,6 @@ use crate::timing::timed;
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
-const SELF_HEALING_STUB: &[u8] = b"cowshed attach\n";
 
 const ROOT_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -619,13 +618,12 @@ fn checkout_mountpoint_staging_path(source_checkout: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Remove the staging name if it currently holds cowshed's own bare mountpoint stub; never touch
-/// anything else, and in particular never a tree with the user's files in it.
+/// Remove only an empty staging mountpoint; never remove a tree containing user files.
 fn remove_checkout_staging_mountpoint(staging: &Path) -> Result<(), ApfsStorageError> {
     if !path_exists(staging)? {
         return Ok(());
     }
-    remove_exact_mount_stub(staging)
+    remove_empty_mountpoint(staging)
 }
 
 fn path_exists(path: &Path) -> Result<bool, ApfsStorageError> {
@@ -645,7 +643,7 @@ fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
         .map_err(|error| io_error("sync image directory", parent, error))
 }
 
-fn exact_mount_stub(path: &Path) -> Result<bool, ApfsStorageError> {
+fn empty_mountpoint(path: &Path) -> Result<bool, ApfsStorageError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -654,52 +652,29 @@ fn exact_mount_stub(path: &Path) -> Result<bool, ApfsStorageError> {
     if !metadata.file_type().is_dir() {
         return Ok(false);
     }
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| io_error("enumerate adoption rollback path", path, error))?;
-    let Some(entry) = entries
+    fs::read_dir(path)
+        .map_err(|error| io_error("enumerate adoption rollback path", path, error))?
         .next()
         .transpose()
-        .map_err(|error| io_error("read adoption rollback path", path, error))?
-    else {
-        return Ok(false);
-    };
-    if entries
-        .next()
-        .transpose()
-        .map_err(|error| io_error("read adoption rollback path", path, error))?
-        .is_some()
-        || entry.file_name() != OsStr::new(".envrc")
-        || !entry
-            .file_type()
-            .map_err(|error| io_error("inspect adoption mount stub", &entry.path(), error))?
-            .is_file()
-    {
-        return Ok(false);
-    }
-    fs::read(entry.path())
-        .map(|bytes| bytes == SELF_HEALING_STUB)
-        .map_err(|error| io_error("read adoption mount stub", &entry.path(), error))
+        .map(|entry| entry.is_none())
+        .map_err(|error| io_error("read adoption rollback path", path, error))
 }
 
-fn remove_exact_mount_stub(path: &Path) -> Result<(), ApfsStorageError> {
-    if !exact_mount_stub(path)? {
+fn remove_empty_mountpoint(path: &Path) -> Result<(), ApfsStorageError> {
+    if !empty_mountpoint(path)? {
         return Err(ApfsStorageError::InvalidPlan(
-            "refusing to remove a path that is not the canonical Cowshed mount stub",
+            "refusing to remove a nonempty adoption mountpoint",
         ));
     }
-    let stub = path.join(".envrc");
-    fs::remove_file(&stub).map_err(|error| io_error("remove adoption mount stub", &stub, error))?;
     fs::remove_dir(path).map_err(|error| io_error("remove adoption mountpoint", path, error))?;
     sync_parent_path(path)
 }
 
 /// Give the checkout path back to the original tree — the exact inverse of publication's swap.
 ///
-/// The checkout path is main's mountpoint, so after the detach it is once more the bare stub.
-/// Restore is publication's `RENAME_SWAP` in reverse — stub out, retained tree back in — so the
-/// checkout path is never absent in between, and the displaced stub is removed afterwards. A
-/// crash between the two leaves the user's tree restored with the stub beside it at the
-/// `.pre-cowshed` name, which a later rollback refuses by name rather than guessing at.
+/// After detach the checkout path is an empty mountpoint. Restore exchanges it for the retained
+/// tree with `RENAME_SWAP`, so the checkout path is never absent. A crash before cleanup leaves
+/// the restored tree in place and an empty mountpoint beside it at `.pre-cowshed`.
 fn restore_adopted_checkout_paths(
     source_checkout: &Path,
     pre_cowshed_checkout: &Path,
@@ -714,12 +689,12 @@ fn restore_adopted_checkout_paths(
             "adopted checkout path is missing",
         ));
     }
-    if !exact_mount_stub(source_checkout)? {
+    if !empty_mountpoint(source_checkout)? {
         // A prior attempt already swapped the tree back; the only way this is the user's own
         // directory is that the restore completed.
         return if path_exists(pre_cowshed_checkout)? {
             Err(ApfsStorageError::InvalidPlan(
-                "adopted checkout is neither the mount stub nor the sole restored tree",
+                "adopted checkout is neither an empty mountpoint nor the sole restored tree",
             ))
         } else {
             Ok(())
@@ -732,7 +707,7 @@ fn restore_adopted_checkout_paths(
     }
     swap_paths(source_checkout, pre_cowshed_checkout)?;
     sync_parent_path(source_checkout)?;
-    remove_exact_mount_stub(pre_cowshed_checkout)
+    remove_empty_mountpoint(pre_cowshed_checkout)
 }
 
 const MNT_DONTBROWSE: u64 = 0x0010_0000;
@@ -1687,18 +1662,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 )));
             }
             Ok(_) => {
-                for entry in fs::read_dir(mount_point)
+                if let Some(entry) = fs::read_dir(mount_point)
                     .map_err(|error| io_error("read adopt mountpoint", mount_point, error))?
+                    .next()
+                    .transpose()
+                    .map_err(|error| io_error("read adopt mountpoint entry", mount_point, error))?
                 {
-                    let entry = entry.map_err(|error| {
-                        io_error("read adopt mountpoint entry", mount_point, error)
-                    })?;
-                    if entry.file_name() != ".envrc" {
-                        return Err(ApfsStorageError::Host(format!(
-                            "adopt mountpoint contains unexpected data: {}",
-                            entry.path().display()
-                        )));
-                    }
+                    return Err(ApfsStorageError::Host(format!(
+                        "adopt mountpoint contains unexpected data: {}",
+                        entry.path().display()
+                    )));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1709,9 +1682,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
             Err(error) => return Err(io_error("inspect adopt mountpoint", mount_point, error)),
         }
-        let stub = mount_point.join(".envrc");
-        fs::write(&stub, SELF_HEALING_STUB)
-            .map_err(|error| io_error("write automatic mount stub", &stub, error))?;
         fs::File::open(mount_point)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| io_error("sync adopt mountpoint", mount_point, error))?;
@@ -4383,15 +4353,23 @@ where
         }
         let staging = checkout_mountpoint_staging_path(source_checkout);
 
-        // Resume: the swap is done once the checkout path is cowshed's own — either still the bare
-        // stub, or already mounted over. Only the final rename can be outstanding.
+        // A Git checkout cannot be empty. Resume an empty mountpoint only when its displaced
+        // nonempty tree exists at a handoff name; an unrelated empty directory proves nothing.
         let already_swapped = self
             .mount_source
             .mounts()
             .map_err(PublicationError::rolled_back)?
             .iter()
             .any(|mount| mount.mount_point == source_checkout)
-            || exact_mount_stub(source_checkout).map_err(PublicationError::rolled_back)?;
+            || (empty_mountpoint(source_checkout).map_err(PublicationError::rolled_back)?
+                && [staging.as_path(), pre_cowshed_checkout]
+                    .into_iter()
+                    .try_fold(false, |found, path| {
+                        Ok::<_, ApfsStorageError>(
+                            found || (path_exists(path)? && !empty_mountpoint(path)?),
+                        )
+                    })
+                    .map_err(PublicationError::rolled_back)?);
         if already_swapped {
             if !path_exists(&staging).map_err(PublicationError::forward_only)? {
                 return Ok(());
@@ -4432,8 +4410,8 @@ where
 
         // The one step that changes what the user sees, and the same primitive the symlink layout
         // uses: `renameatx_np(RENAME_SWAP)` exchanges the original directory with the staged
-        // mountpoint atomically, so the checkout path goes straight from the user's tree to a
-        // mountpoint carrying the self-healing stub — never absent, never a half-built directory.
+        // mountpoint atomically, so the checkout path goes straight from the user's tree to an
+        // empty mountpoint — never absent, never a half-built directory.
         if let Err(primary) = swap_paths(source_checkout, &staging) {
             return Err(match remove_checkout_staging_mountpoint(&staging) {
                 Ok(()) => PublicationError::rolled_back(primary),
@@ -6351,15 +6329,14 @@ mod tests {
         std::fs::remove_dir_all(root).expect("fixture cleanup");
     }
 
-    /// Build the adopted shape after main's detach: the checkout path is main's bare mountpoint
-    /// carrying the self-healing stub, and the original tree is retained beside it.
+    /// After main's detach the checkout path is an empty mountpoint and the original tree is
+    /// retained beside it.
     fn adopted_rollback_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
         let parent =
             std::env::temp_dir().join(format!("cowshed-adopt-{label}-{}", uuid::Uuid::new_v4()));
         let source = parent.join("project");
         let retained = pre_cowshed_path(&source);
         std::fs::create_dir_all(&source).expect("checkout mountpoint");
-        std::fs::write(source.join(".envrc"), SELF_HEALING_STUB).expect("mountpoint stub");
         (parent, source, retained)
     }
 
@@ -6388,7 +6365,7 @@ mod tests {
         );
         assert!(
             !path_exists(&retained).expect("retained"),
-            "the displaced stub is removed"
+            "the displaced empty mountpoint is removed"
         );
         std::fs::remove_dir_all(parent).expect("fixture cleanup");
     }
@@ -6399,19 +6376,20 @@ mod tests {
         let (parent, source, retained) = adopted_rollback_fixture("rollback-retry");
         write_retained_tree(&retained);
         // Crash boundary: the swap landed, so the tree is already back at the checkout path and
-        // the displaced stub is still sitting at the retained name.
+        // the displaced empty mountpoint is still sitting at the retained name.
         swap_paths(&source, &retained).expect("injected crash boundary after swap");
 
-        let error = restore_adopted_checkout_paths(&source, &retained)
-            .expect_err("a stub still beside the restored tree is refused, never guessed at");
+        let error = restore_adopted_checkout_paths(&source, &retained).expect_err(
+            "an empty mountpoint beside the restored tree is refused, never guessed at",
+        );
         assert!(matches!(error, ApfsStorageError::InvalidPlan(_)));
         assert_eq!(
             std::fs::read(source.join(".git/HEAD")).expect("restored HEAD"),
             b"ref: refs/heads/main\n"
         );
-        assert!(exact_mount_stub(&retained).expect("the stub stays for the operator"));
+        assert!(empty_mountpoint(&retained).expect("the mountpoint stays for the operator"));
 
-        remove_exact_mount_stub(&retained).expect("the operator removes the stub");
+        remove_empty_mountpoint(&retained).expect("the operator removes the mountpoint");
         restore_adopted_checkout_paths(&source, &retained)
             .expect("completed rollback is idempotent");
         std::fs::remove_dir_all(parent).expect("fixture cleanup");
@@ -6424,7 +6402,7 @@ mod tests {
         let missing = restore_adopted_checkout_paths(&source, &retained)
             .expect_err("missing retained checkout");
         assert!(matches!(missing, ApfsStorageError::InvalidPlan(_)));
-        assert!(exact_mount_stub(&source).expect("source remains the mountpoint stub"));
+        assert!(empty_mountpoint(&source).expect("source remains an empty mountpoint"));
         std::fs::remove_dir_all(parent).expect("fixture cleanup");
     }
 
