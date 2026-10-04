@@ -1192,18 +1192,30 @@ describe('a shell direnv keeps loaded', () => {
   const MEMBER = 'packages/member/package.json';
   // Stands in for `use devenv` and the managed prologue: devenv's two
   // variables, then the script the prologue runs.
-  const ENVRC_SH = [
+  const USE_DEVENV = [
     'export DEVENV_ROOT="$PWD"',
     'export DEVENV_STATE="$PWD/.devenv/state"',
     'bun "$DEVENV_ROOT/setup-environment.ts" >&2',
-    '',
   ].join('\n');
 
-  /** direnv in `root` with a private home, so no host direnv config or approval leaks in. */
-  function isolatedDirenv(root: string) {
+  /**
+   * direnv in `root` with a private home, so no host direnv config or approval leaks in, and a
+   * `devenv` on PATH whose `direnvrc` defines `use_devenv` as `useDevenv`: the managed .envrc
+   * drives devenv through exactly that pair.
+   */
+  async function isolatedDirenv(root: string, useDevenv: string) {
     const home = join(dirname(root), 'home');
+    const devenvBin = join(dirname(root), 'devenv-bin');
+    await mkdir(devenvBin, { recursive: true });
+    await writeFile(
+      join(devenvBin, 'devenv'),
+      ['#!/bin/sh', '[ "$1" = direnvrc ] || exit 64', "cat <<'RC'", 'use_devenv() {', useDevenv, '}', 'RC', ''].join(
+        '\n',
+      ),
+    );
+    await chmod(join(devenvBin, 'devenv'), 0o755);
     const base: Record<string, string> = {
-      PATH: process.env['PATH'] ?? '',
+      PATH: `${devenvBin}:${process.env['PATH'] ?? ''}`,
       HOME: home,
       XDG_CONFIG_HOME: join(home, '.config'),
       XDG_DATA_HOME: join(home, '.local', 'share'),
@@ -1229,12 +1241,11 @@ describe('a shell direnv keeps loaded', () => {
         workspaces: ['packages/*'],
         files: {
           [MEMBER]: JSON.stringify({ name: 'member', version: '0.0.0' }),
-          'tooling/direnv/envrc.sh': ENVRC_SH,
           'README.md': 'fixture\n',
         },
       },
       async ({ root }) => {
-        const { base, direnv } = isolatedDirenv(root);
+        const { base, direnv } = await isolatedDirenv(root, USE_DEVENV);
         await direnv(['allow', root], base);
         // The load a shell pool keeps: every variable the export sets.
         const loaded: Record<string, string> = { ...base };
@@ -1253,20 +1264,36 @@ describe('a shell direnv keeps loaded', () => {
   });
 
   it("is built from the checkout alone, never from a parent directory's .envrc", async () => {
+    await withManagedRepository({}, async ({ root }) => {
+      const { base, direnv } = await isolatedDirenv(root, 'export DEVENV_ROOT="$PWD"');
+      // An approved .envrc one directory up, as a checkout under a projects folder has.
+      const parent = join(dirname(root), '.envrc');
+      await writeFile(parent, 'export SMOO_PARENT_ENVRC=loaded\n');
+      await direnv(['allow', parent], base);
+      await direnv(['allow', root], base);
+
+      const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
+      const variables = new Map(Object.entries(exported ?? {}));
+      expect(variables.get('DEVENV_ROOT')).toBe(join(root, 'tooling', 'direnv'));
+      expect(variables.has('SMOO_PARENT_ENVRC')).toBe(false);
+    });
+  });
+
+  it('loads the workspace environment, then .envrc-local, from the checkout root after devenv', async () => {
     await withManagedRepository(
-      { files: { 'tooling/direnv/envrc.sh': 'export DEVENV_ROOT="$PWD"\n' } },
+      {
+        files: {
+          '.cowshed/env': 'export SMOO_LOADED="cowshed"\n',
+          '.envrc-local': 'export SMOO_LOADED="$SMOO_LOADED local"\n',
+        },
+      },
       async ({ root }) => {
-        const { base, direnv } = isolatedDirenv(root);
-        // An approved .envrc one directory up, as a checkout under a projects folder has.
-        const parent = join(dirname(root), '.envrc');
-        await writeFile(parent, 'export SMOO_PARENT_ENVRC=loaded\n');
-        await direnv(['allow', parent], base);
+        // The export devenv replays leaves the shell where its hook last changed directory.
+        const { base, direnv } = await isolatedDirenv(root, 'export DEVENV_ROOT="$PWD"\ncd /');
         await direnv(['allow', root], base);
 
         const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
-        const variables = new Map(Object.entries(exported ?? {}));
-        expect(variables.get('DEVENV_ROOT')).toBe(join(root, 'tooling', 'direnv'));
-        expect(variables.has('SMOO_PARENT_ENVRC')).toBe(false);
+        expect(new Map(Object.entries(exported ?? {})).get('SMOO_LOADED')).toBe('cowshed local');
       },
     );
   });

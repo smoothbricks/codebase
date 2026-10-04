@@ -283,6 +283,40 @@ in {
   # runtime; a wheel that needs another library names that library here.
   languages.python.libraries = lib.mkIf uvProject (lib.mkDefault []);
 
+  # The stdenv build variables the shell derivation leaks beyond the ones devenv
+  # already drops: generic names (`name`, `system`) that collide with any
+  # script's own, and builder-only settings (NIX_CFLAGS_COMPILE,
+  # SOURCE_DATE_EPOCH, the sandbox profiles) that change what a compiler run
+  # from the shell produces. The shell is a place to run tools, not a builder.
+  # mkOptionDefault: devenv's own default list stays, this one joins it.
+  unsetEnvVars = lib.mkOptionDefault [
+    "CONFIG_SHELL"
+    "DETERMINISTIC_BUILD"
+    "IN_NIX_SHELL"
+    "MACOSX_DEPLOYMENT_TARGET"
+    "NIX_CFLAGS_COMPILE"
+    "NIX_COREFOUNDATION_RPATH"
+    "NIX_DONT_SET_RPATH"
+    "NIX_DONT_SET_RPATH_FOR_BUILD"
+    "NIX_ENFORCE_NO_NATIVE"
+    "NIX_IGNORE_LD_THROUGH_GCC"
+    "NIX_INDENT_MAKE"
+    "NIX_NO_SELF_RPATH"
+    "NIX_STORE"
+    "PATH_LOCALE"
+    "SOURCE_DATE_EPOCH"
+    "__darwinAllowLocalNetworking"
+    "__impureHostDeps"
+    "__propagatedImpureHostDeps"
+    "__propagatedSandboxProfile"
+    "__sandboxProfile"
+    "cmakeFlags"
+    "configureFlags"
+    "mesonFlags"
+    "name"
+    "system"
+  ];
+
   enterShell = lib.mkMerge [
     # Prologue, in order:
     #

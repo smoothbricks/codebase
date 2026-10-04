@@ -1,8 +1,7 @@
-# This shell is built from this checkout's inputs alone: no parent directory's
-# .envrc is sourced, so the same commit enters the same shell wherever it is
-# checked out. A wanted parent environment belongs in .envrc-local.
-
-watch_file tooling/direnv/envrc.sh
+# Managed by smoo. This shell is built from this checkout's inputs alone: no
+# parent directory's .envrc is sourced, so the same commit enters the same shell
+# wherever it is checked out. Project additions belong in .envrc-local
+# (gitignored); shell logic belongs in tooling/direnv/devenv.nix.
 
 # devenv asks the Cachix API for the signing key of each binary cache it pulls
 # from (`cachix.pull`, `devenv` by default) unless cachix_trusted_keys.json in
@@ -19,13 +18,18 @@ if [ ! -e "$devenv_keys" ]; then
 fi
 unset devenv_keys
 
-# Load local extensions and overrides from the project root (the gitignored
-# .envrc-local); capture it before we cd into tooling/direnv, since envrc.sh
-# leaves us there and a bare relative path would resolve under tooling/direnv.
-project_root="$PWD"
-local_override="$project_root/.envrc-local"
-cd tooling/direnv
-. envrc.sh
+# devenv lives in tooling/direnv. It is the one tool this file needs from the
+# host; everything else comes from the shell it evaluates. The directory stack,
+# not `cd ../..`, brings this file back: the export `use devenv` replays leaves
+# the shell wherever the devenv shell hook last changed directory.
+if ! has devenv; then
+  log_error "devenv is not on PATH: install it (https://devenv.sh/getting-started/), then run direnv reload"
+  exit 1
+fi
+pushd tooling/direnv >/dev/null
+eval "$(devenv direnvrc)"
+use devenv
+popd >/dev/null
 
 # Re-enter exactly when shell entry has something to do. The scripts it runs
 # decide what that is, and setup-environment.ts records the files its install
@@ -40,13 +44,16 @@ if [ -f "${DEVENV_STATE:-}/install-inputs" ]; then
   done <"$DEVENV_STATE/install-inputs"
 fi
 watch_file \
-  "$project_root/tooling/direnv/repo-path" \
-  "$project_root/tooling/direnv/shared-caches.sh" \
-  "$project_root/tooling/direnv/nx-socket-dir.sh" \
-  "$project_root/tooling/direnv/apple-developer.sh" \
-  "$project_root/tooling/direnv/setup-environment.ts" \
-  "$project_root/tooling/direnv/secret-references.ts" \
-  "$project_root/tooling/direnv/toolchain-stamp.ts" \
+  tooling/direnv/repo-path \
+  tooling/direnv/shared-caches.sh \
+  tooling/direnv/nx-socket-dir.sh \
+  tooling/direnv/apple-developer.sh \
+  tooling/direnv/setup-environment.ts \
+  tooling/direnv/secret-references.ts \
+  tooling/direnv/toolchain-stamp.ts \
   ${install_inputs[@]+"${install_inputs[@]}"}
 
-source_env_if_exists "$local_override"
+# A cowshed workspace's environment, for interactive shells inside one; an
+# absent file is skipped.
+source_env_if_exists .cowshed/env
+source_env_if_exists .envrc-local
