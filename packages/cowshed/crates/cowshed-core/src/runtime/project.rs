@@ -3849,10 +3849,13 @@ impl NativeProjectRuntimeHost {
 
     /// Refresh `current`'s build state at its mounted checkout `mount`
     /// ([`ProjectRuntimeHost::refresh_build_state`]). Detection reads the same canonical context
-    /// the supervisor's capability admission reads, and Cargo is asked in the same environment a
-    /// job gets, without the caller's: a `CARGO_TARGET_DIR` of the controller's shell names no
-    /// checkout's build state. Discovery runs only when the tracked build inputs' fingerprint
-    /// moved off the one the volume's state records; otherwise only displaced links are restored.
+    /// the supervisor's capability admission reads, and Cargo is asked as a job of the workspace
+    /// ([`crate::capabilities::JobCargo`]): sandboxed, after the workspace shell's activation, and
+    /// without the caller's variables, so a checkout whose toolchain comes from its dev
+    /// environment is asked with that toolchain, and a `CARGO_TARGET_DIR` of the controller's
+    /// shell names no checkout's build state. Discovery runs only when the tracked build inputs'
+    /// fingerprint moved off the one the volume's state records; otherwise only displaced links
+    /// are restored.
     async fn refresh_build_state_for(
         &self,
         current: &NativeWorkspace,
@@ -3893,14 +3896,13 @@ impl NativeProjectRuntimeHost {
         let (discovered, findings) = if unchanged {
             (Discovered::Unchanged, Vec::new())
         } else {
-            let environment =
-                super::supervisor::job_environment(&sandbox, &std::collections::BTreeMap::new())
-                    .await?;
             let discovery = {
                 let mount = mount.to_owned();
+                let runtime = tokio::runtime::Handle::current();
                 crate::storage::lifecycle::dispatch_blocking(move || {
+                    let mut cargo = crate::capabilities::JobCargo::new(&sandbox, runtime);
                     sandbox.with_detection_context(&mount, |context| {
-                        crate::capabilities::discover_build_state(context, &environment)
+                        crate::capabilities::discover_build_state(context, &mut cargo)
                     })
                 })
                 .await

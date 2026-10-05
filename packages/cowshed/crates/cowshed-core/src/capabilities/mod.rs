@@ -13,9 +13,11 @@ use cache::{HostCache, SharedLayout, SharedToolHome};
 mod build_state;
 pub use build_state::{BuildStatePath, RelPath};
 mod build_state_discovery;
+#[cfg(test)]
+pub(crate) use build_state_discovery::HostCargo;
 pub use build_state_discovery::{
-    BuildStateDiscovery, BuildStateFinding, CargoDiscoveryPhase, discover_build_state,
-    tracked_manifest_fingerprint,
+    BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
+    CargoRunner, JobCargo, discover_build_state, tracked_manifest_fingerprint,
 };
 mod bun;
 pub mod cache;

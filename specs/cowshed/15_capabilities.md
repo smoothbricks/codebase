@@ -52,16 +52,22 @@ Go likewise detects any git-tracked `go.mod` in the selected tree; its directory
 sandboxed Go checks because the sandbox could not write `/private/cowshed/caches/go`. Cargo, Go and sccache share one
 lazy tracked-manifest snapshot per detector loop, with no recursive walk and no extra Git query.
 
-Cargo runs `cargo metadata --no-deps --offline --format-version 1` once per root with the same canonical job environment
-builder used by a Cargo job; an in-checkout `target_directory` contributes its checkout-relative path. A disabled cargo
-capability skips discovery; its directory override narrows the tracked manifest scan. Offline lookup failures are typed
-findings and skip that workspace, not the whole mint. Discovery runs at mint and when tracked Cargo input contents
-change. One `git ls-files` query supplies every tracked `Cargo.toml`, `.cargo/config*` and `go.mod` path; BLAKE3 hashes
-their working-tree bytes, so unstaged edits refresh the build-state paths before the next job. Caller environment and
-untracked config are not fingerprint inputs. Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes
-depends on the tracked project files, exactly the fingerprint's inputs, not an unrelated shell's override. Forks inherit
-the snapshot and fixed links without rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`; the `.codegraph/`
-directory marker contributes the whole index, including its database, journals and other per-tree state.
+Cargo runs `cargo metadata --no-deps --offline --format-version 1` once per root exactly as a Cargo job of the workspace
+runs: sandboxed in the executed-child profile, from the job environment, after the workspace shell's activation inside
+the sandbox. A checkout whose toolchain comes from its dev environment has none on the bootstrap PATH, or a different
+one, so discovery from the pre-activation environment asked a cargo no job ever runs. One job per selected workspace
+shell answers a whole batch of lookups, so discovery pays one activation per shell, not one per manifest. An in-checkout
+`target_directory` contributes its checkout-relative path. A disabled cargo capability skips discovery; its directory
+override narrows the tracked manifest scan. Offline lookup failures, and an activation that ends before Cargo answers,
+are typed findings and skip that workspace, not the whole mint. Discovery runs at mint and when tracked Cargo input
+contents change. One `git ls-files` query supplies every tracked `Cargo.toml`, `.cargo/config*` and `go.mod` path;
+BLAKE3 hashes their working-tree bytes, so unstaged edits refresh the build-state paths before the next job. The
+fingerprint also folds in a discovery revision, so a cowshed that asks differently rediscovers instead of keeping an
+earlier discovery's answer, findings included. Caller environment and untracked config are not fingerprint inputs.
+Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depends on the tracked project files, exactly
+the fingerprint's inputs, not an unrelated shell's override. Forks inherit the snapshot and fixed links without
+rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`; the `.codegraph/` directory marker contributes the
+whole index, including its database, journals and other per-tree state.
 
 A project may keep its Nix files away from its root and reach them from its `.envrc`, for example with
 `cd tooling/shell` and then `. envrc.sh`. The Nix convention therefore also holds when the `.envrc` chain reaches Nix.

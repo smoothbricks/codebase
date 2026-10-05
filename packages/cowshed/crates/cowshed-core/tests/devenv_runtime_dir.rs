@@ -1281,6 +1281,84 @@ async fn host_controller_shell_activation_selects_nearest_workspace_envrc() {
     std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
+/// A checkout whose toolchain comes only from its dev environment: the bootstrap PATH a job
+/// starts from holds a different `cargo` that cannot read the project, and the checkout's
+/// `.envrc` puts the one its jobs build with first. Discovery names the target directory only
+/// if it asks Cargo after that activation, as a job of the workspace.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_provides() {
+    use cowshed_core::capabilities::{BuildStatePath, JobCargo, discover_build_state};
+    let root = scratch("cargo-discovery-toolchain");
+    let sandbox = workspace(&root, 41_120);
+    install_real_tool(&sandbox, "direnv");
+    let mount = sandbox.workspace_mount.clone();
+    let executable = |path: &Path, script: &str| {
+        std::fs::write(path, script).expect("fixture executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("executable fixture");
+    };
+    executable(
+        &mount.join(".cowshed/bin/cargo"),
+        "#!/bin/sh\necho 'the bootstrap cargo cannot read this project' >&2\nexit 101\n",
+    );
+    let real_cargo = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
+        .map(|directory| directory.join("cargo"))
+        .find(|candidate| candidate.is_file())
+        .expect("the gate's own cargo is on PATH");
+    std::fs::create_dir_all(mount.join("toolchain")).expect("dev environment toolchain");
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(real_cargo).expect("resolve the gate's cargo"),
+        mount.join("toolchain/cargo"),
+    )
+    .expect("dev environment cargo");
+    std::fs::write(mount.join(".envrc"), "PATH_add \"$PWD/toolchain\"\n").expect("envrc");
+    std::fs::write(
+        mount.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::create_dir_all(mount.join("src")).expect("sources");
+    std::fs::write(mount.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").expect("library");
+    for args in [&["init", "--quiet"][..], &["add", "Cargo.toml"]] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&mount)
+            .output_locked()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let runtime = tokio::runtime::Handle::current();
+    let discovery = tokio::task::spawn_blocking(move || {
+        let mut cargo = JobCargo::new(&sandbox, runtime);
+        sandbox.with_detection_context(&sandbox.workspace_mount, |context| {
+            discover_build_state(context, &mut cargo)
+        })
+    })
+    .await
+    .expect("discovery task")
+    .expect("discovery");
+    assert!(
+        discovery.findings.is_empty(),
+        "{}",
+        discovery
+            .findings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        discovery.paths,
+        [BuildStatePath::new("target", "target").expect("target path")]
+    );
+    std::fs::remove_dir_all(root).expect("remove test workspace");
+}
+
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_shell_activation_does_not_authorize_or_load_an_envrc_outside_the_workspace()

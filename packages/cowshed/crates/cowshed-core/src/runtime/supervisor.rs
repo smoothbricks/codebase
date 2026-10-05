@@ -723,20 +723,32 @@ fn shell_directory(sandbox: &SandboxConfig) -> Option<PathBuf> {
 }
 
 /// Activation runs inside the executed child, with directory and argv passed positionally.
-fn wrap_one_shot(
-    plan: &mut SpawnPlan,
-    shell: &crate::capabilities::ShellActivation,
-    directory: &Path,
-) {
+fn wrap_one_shot(plan: &mut SpawnPlan, shell: &crate::capabilities::ShellActivation) {
     let mut activation = vec![
         OsString::from("/bin/sh"),
         OsString::from("-c"),
         OsString::from(shell.script),
         OsString::from(shell.label),
-        directory.as_os_str().to_owned(),
+        shell.directory.as_os_str().to_owned(),
     ];
     activation.extend(plan.args.drain(3..));
     plan.args.extend(activation);
+}
+
+/// The sandboxed launch of a one-shot child running `argv` in `cwd`: entered through the
+/// workspace shell selected for that cwd when there is one.
+fn one_shot_plan(
+    sandbox: &SandboxConfig,
+    profile: &str,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+) -> Result<SpawnPlan> {
+    let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
+        .map_err(map_exec_error)?;
+    if let Some(shell) = &sandbox.capabilities.contribution.shell {
+        wrap_one_shot(&mut plan, shell);
+    }
+    Ok(plan)
 }
 
 /// Tool commands are exact private-bin links; no host profile joins PATH.
@@ -1057,13 +1069,34 @@ impl SandboxEnvironment {
     }
 }
 
-/// The same complete pre-activation environment used by a one-shot job. Controller-owned
-/// offline tool discovery uses this contract too, rather than inheriting the controller shell.
-pub async fn job_environment(
+/// Run `argv` in `cwd` exactly as a one-shot read-write job of `sandbox` runs it, and collect its
+/// output: the capabilities detected for `cwd`, the executed-child profile, the job environment
+/// without a caller's variables, and the workspace shell's activation inside the sandbox.
+///
+/// Controller-owned discovery asks a project's tools through this rather than through the
+/// pre-activation environment: a checkout whose toolchain comes from its dev environment has
+/// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
+pub async fn run_as_job(
     sandbox: &SandboxConfig,
-    caller: &BTreeMap<String, String>,
-) -> Result<BTreeMap<OsString, OsString>> {
-    Ok(sandbox_environment(sandbox, caller).await?.child(caller))
+    cwd: &Path,
+    argv: Vec<OsString>,
+) -> Result<std::process::Output> {
+    let mut ceiling = sandbox.clone();
+    ceiling.configure_capabilities_for(cwd)?;
+    let policy = SandboxPolicy::render(ceiling)?;
+    let (sandbox, profile) = policy.child(crate::api::dto::RunSandboxMode::ReadWrite);
+    let caller = BTreeMap::new();
+    let environment = sandbox_environment(sandbox, &caller).await?;
+    let plan = one_shot_plan(sandbox, profile, cwd.to_owned(), argv)?;
+    let mut command = sandboxed_command(&plan, &environment.child(&caller));
+    prepare_child_descriptors(command.as_std_mut())
+        .map_err(ExecError::from)
+        .map_err(map_exec_error)?;
+    crate::fork_lock::RunAsync::output_locked(&mut command)
+        .await
+        .map_err(classify_spawn_error)
+        .map_err(ExecError::from)
+        .map_err(map_exec_error)
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
@@ -1386,13 +1419,7 @@ impl SpawnSink for SystemSpawnSink {
                 events,
             );
         }
-        let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
-            .map_err(map_exec_error)?;
-        if let (Some(directory), Some(shell)) =
-            (&envrc_directory, &sandbox.capabilities.contribution.shell)
-        {
-            wrap_one_shot(&mut plan, shell, directory);
-        }
+        let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
         let mut command = sandboxed_command(&plan, &environment.child(&request.env));
         command
             .stdin(Stdio::piped())

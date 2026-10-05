@@ -8,21 +8,12 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DetectionContext, merge_build_state};
 use crate::fork_lock::Run;
 use crate::{CowshedError, Result};
-
-#[cfg(all(test, target_os = "macos"))]
-use crate::metadata::PortBlock;
-#[cfg(all(test, target_os = "macos"))]
-use crate::sandbox::{SandboxConfig, sandbox_runtime_dir, sandbox_runtime_link};
-#[cfg(all(test, target_os = "macos"))]
-#[path = "../../tests/support/runtime_link.rs"]
-mod runtime_link;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,11 +59,21 @@ pub struct BuildStateDiscovery {
     pub findings: Vec<BuildStateFinding>,
 }
 
+/// How discovery asks its tools. A recorded fingerprint certifies what discovery found for those
+/// inputs, so it must also name the discovery that found it: a cowshed that asks differently
+/// would otherwise keep an answer an earlier one got wrong, findings included, until a manifest
+/// happens to change. Bump it whenever discovery's questions or the environment they run in
+/// change. 2: Cargo is asked as a job, after the workspace shell's activation.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 2";
+
 /// Track the files Cargo reads, including unstaged edits, but not caller or untracked inputs.
 /// One index query supplies the path set; BLAKE3 hashes their working-tree bytes. Source-image
-/// clones inherit the matching fingerprint and links; capability config/markers invalidate it.
+/// clones inherit the matching fingerprint and links; capability config/markers and a new
+/// [`DISCOVERY_REVISION`] invalidate it.
 pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<String> {
     let mut digest = blake3::Hasher::new();
+    digest.update(DISCOVERY_REVISION);
+    digest.update(&[0]);
     for name in tracked_build_inputs(context.workspace_root)?
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
@@ -119,9 +120,190 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
     Ok(digest.finalize().to_hex().to_string())
 }
 
+/// Cargo's answer to one query discovery asks of it: its stdout, or why it gave none.
+pub type CargoAnswer = std::result::Result<Vec<u8>, String>;
+
+/// One question discovery asks Cargo: `cargo <args> --manifest-path <manifest>` in `directory`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoQuery {
+    pub directory: PathBuf,
+    pub manifest: PathBuf,
+}
+
+/// Where discovery's Cargo runs. Answers every query of one batch, in order. `Err` is a failure
+/// to run anything at all, which leaves the whole discovery unanswered.
+pub trait CargoRunner {
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>>;
+}
+
+/// Discovery's Cargo, run the way the workspace's jobs run it
+/// ([`crate::runtime::supervisor::run_as_job`]): inside the sandbox, after the workspace shell's
+/// activation, so a checkout whose toolchain comes from its dev environment is asked with that
+/// toolchain and not whatever the bootstrap PATH holds. One job per workspace shell that a
+/// batch's directories select answers the whole batch, so a batch pays one activation per
+/// shell rather than one per manifest.
+///
+/// Runs off the async runtime (the blocking pool): each job is awaited on `runtime`.
+pub struct JobCargo<'a> {
+    sandbox: &'a crate::sandbox::SandboxConfig,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<'a> JobCargo<'a> {
+    pub fn new(
+        sandbox: &'a crate::sandbox::SandboxConfig,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self { sandbox, runtime }
+    }
+}
+
+impl CargoRunner for JobCargo<'_> {
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+        let mut selected: BTreeMap<&Path, Option<PathBuf>> = BTreeMap::new();
+        let mut shells: BTreeMap<Option<PathBuf>, Vec<usize>> = BTreeMap::new();
+        for (index, query) in queries.iter().enumerate() {
+            let shell = match selected.get(query.directory.as_path()) {
+                Some(shell) => shell.clone(),
+                None => {
+                    let shell = self
+                        .sandbox
+                        .detect_capabilities_for(&query.directory)?
+                        .contribution
+                        .shell
+                        .map(|shell| shell.directory);
+                    selected.insert(&query.directory, shell.clone());
+                    shell
+                }
+            };
+            shells.entry(shell).or_default().push(index);
+        }
+        let mut answers: Vec<Option<CargoAnswer>> = vec![None; queries.len()];
+        for indices in shells.into_values() {
+            let batch: Vec<&CargoQuery> = indices.iter().map(|index| &queries[*index]).collect();
+            let output = self
+                .runtime
+                .block_on(crate::runtime::supervisor::run_as_job(
+                    self.sandbox,
+                    &batch[0].directory,
+                    driver_argv(args, &batch),
+                ))?;
+            for (index, answer) in indices
+                .into_iter()
+                .zip(driver_answers(&output, batch.len()))
+            {
+                answers[index] = Some(answer);
+            }
+        }
+        Ok(answers
+            .into_iter()
+            .map(|answer| answer.expect("every query belongs to exactly one shell's batch"))
+            .collect())
+    }
+}
+
+/// Runs each query's Cargo in its own directory and frames each answer for
+/// [`driver_answers`]: exit status, stdout, stderr, each NUL-terminated. Cargo prints no NUL.
+const DRIVER: &str = r#"set -u
+count=$1
+shift
+query=("${@:1:count}")
+shift "$count"
+stderr=$(/usr/bin/mktemp) || exit 70
+trap '/bin/rm -f -- "$stderr"' EXIT
+while (($# >= 2)); do
+  directory=$1
+  manifest=$2
+  shift 2
+  stdout=$({ cd -- "$directory" && exec cargo "${query[@]}" --manifest-path "$manifest"; } 2>"$stderr")
+  status=$?
+  printf '%s\0%s\0' "$status" "$stdout"
+  /bin/cat -- "$stderr"
+  printf '\0'
+done
+"#;
+
+fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![
+        "/bin/bash".into(),
+        "-c".into(),
+        DRIVER.into(),
+        "cowshed-cargo-discovery".into(),
+        args.len().to_string().into(),
+    ];
+    argv.extend(args.iter().map(OsString::from));
+    for query in queries {
+        argv.push(query.directory.clone().into_os_string());
+        argv.push(query.manifest.clone().into_os_string());
+    }
+    argv
+}
+
+/// The driver's `count` answers, in query order. A query the driver never answered -- its
+/// shell's activation failed, or the job died -- carries the job's own exit and stderr, which
+/// is where the activation said what went wrong.
+fn driver_answers(output: &std::process::Output, count: usize) -> Vec<CargoAnswer> {
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let mut answers: Vec<CargoAnswer> = std::iter::from_fn(|| {
+        let status = fields.next()?;
+        let stdout = fields.next()?;
+        let stderr = fields.next()?;
+        Some(
+            match std::str::from_utf8(status)
+                .ok()
+                .and_then(|status| status.parse::<i32>().ok())
+            {
+                Some(0) => Ok(stdout.to_vec()),
+                Some(status) => Err(format!(
+                    "Cargo exit status {status}: {}",
+                    String::from_utf8_lossy(stderr).trim_end()
+                )),
+                None => Err(format!(
+                    "the job running Cargo framed an exit status as {:?}",
+                    String::from_utf8_lossy(status)
+                )),
+            },
+        )
+    })
+    .take(count)
+    .collect();
+    while answers.len() < count {
+        answers.push(Err(format!(
+            "the job running Cargo ended ({}) before Cargo answered: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        )));
+    }
+    answers
+}
+
+/// Discovery's Cargo run straight on the host, in the test process's environment: the driver
+/// and its framing without a sandbox, for tests about what discovery does with the answers.
+#[cfg(test)]
+pub(crate) struct HostCargo;
+
+#[cfg(test)]
+impl CargoRunner for HostCargo {
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+        let Some(first) = queries.first() else {
+            return Ok(Vec::new());
+        };
+        let argv = driver_argv(args, &queries.iter().collect::<Vec<_>>());
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&first.directory)
+            // Where a job writes depends on the tracked project files, never a caller's shell.
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .output_locked()
+            .map_err(|error| CowshedError::internal(format!("cannot run bash: {error}")))?;
+        Ok(driver_answers(&output, queries.len()))
+    }
+}
+
 pub fn discover_build_state(
     context: &DetectionContext<'_>,
-    environment: &BTreeMap<OsString, OsString>,
+    cargo: &mut dyn CargoRunner,
 ) -> Result<BuildStateDiscovery> {
     let config = super::workspace_config(context)?;
     let mut tracked = TrackedManifests::default();
@@ -139,16 +321,33 @@ pub fn discover_build_state(
         .map(|directory| context.workspace_root.join(directory))
         .unwrap_or_else(|| context.workspace_root.to_owned());
     super::validate_project_directory(context.workspace_root, &selected)?;
-    let mut roots = BTreeSet::new();
+    let mut manifests = Vec::new();
+    let mut queries = Vec::new();
     for manifest in tracked_manifests(context.workspace_root, &selected, &mut tracked)? {
         let absolute = context.workspace_root.join(&manifest);
-        let root = cargo_output(
+        if let Err(error) = super::validate_project_directory(
             context.workspace_root,
-            &selected,
-            &absolute,
-            environment,
-            &["locate-project", "--workspace", "--message-format", "plain"],
-        );
+            absolute.parent().unwrap_or(&selected),
+        ) {
+            result.findings.push(BuildStateFinding::CargoUnavailable {
+                manifest,
+                phase: CargoDiscoveryPhase::WorkspaceRoot,
+                cause: error.to_string(),
+            });
+            continue;
+        }
+        manifests.push(manifest);
+        queries.push(CargoQuery {
+            directory: selected.clone(),
+            manifest: absolute,
+        });
+    }
+    let mut roots = BTreeSet::new();
+    let located = cargo.run(
+        &["locate-project", "--workspace", "--message-format", "plain"],
+        &queries,
+    )?;
+    for (manifest, root) in manifests.into_iter().zip(located) {
         match root {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(root) => {
@@ -179,27 +378,45 @@ pub fn discover_build_state(
             }),
         }
     }
+    let mut queries = Vec::with_capacity(roots.len());
     for manifest in roots {
-        let relative_manifest = manifest
+        let directory = manifest
+            .parent()
+            .expect("Cargo returned an absolute manifest")
+            .to_owned();
+        if let Err(error) = super::validate_project_directory(context.workspace_root, &directory) {
+            result.findings.push(BuildStateFinding::CargoUnavailable {
+                manifest: manifest
+                    .strip_prefix(context.workspace_root)
+                    .expect("workspace roots were checked above")
+                    .to_owned(),
+                phase: CargoDiscoveryPhase::Metadata,
+                cause: error.to_string(),
+            });
+            continue;
+        }
+        queries.push(CargoQuery {
+            directory,
+            manifest,
+        });
+    }
+    let metadata = cargo.run(
+        &[
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ],
+        &queries,
+    )?;
+    for (query, metadata) in queries.iter().zip(metadata) {
+        let relative_manifest = query
+            .manifest
             .strip_prefix(context.workspace_root)
             .expect("workspace roots were checked above")
             .to_owned();
-        let metadata = cargo_output(
-            context.workspace_root,
-            manifest
-                .parent()
-                .expect("Cargo returned an absolute manifest"),
-            &manifest,
-            environment,
-            &[
-                "metadata",
-                "--no-deps",
-                "--offline",
-                "--format-version",
-                "1",
-            ],
-        )
-        .and_then(|bytes| {
+        let metadata = metadata.and_then(|bytes| {
             serde_json::from_slice::<CargoMetadata>(&bytes).map_err(|error| error.to_string())
         });
         let metadata = match metadata {
@@ -238,35 +455,6 @@ pub fn discover_build_state(
 #[derive(Deserialize)]
 struct CargoMetadata {
     target_directory: PathBuf,
-}
-
-fn cargo_output(
-    workspace: &Path,
-    directory: &Path,
-    manifest: &Path,
-    environment: &BTreeMap<OsString, OsString>,
-    args: &[&str],
-) -> std::result::Result<Vec<u8>, String> {
-    super::validate_project_directory(workspace, manifest.parent().unwrap_or(directory))
-        .map_err(|error| error.to_string())?;
-    let output = Command::new("cargo")
-        .env_clear()
-        .envs(environment)
-        .current_dir(directory)
-        .args(args)
-        .arg("--manifest-path")
-        .arg(manifest)
-        .output_locked()
-        .map_err(|error| format!("cannot execute Cargo: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(format!(
-            "Cargo {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        ))
-    }
 }
 
 #[derive(Default)]
@@ -374,7 +562,6 @@ fn tracked_manifests(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::test_support::Fixture;
-    use super::runtime_link::RuntimeLink;
     use super::*;
 
     fn write(fixture: &Fixture, relative: &str, content: &str) {
@@ -484,42 +671,12 @@ mod tests {
         );
     }
 
-    async fn cargo_paths(fixture: &Fixture) -> BuildStateDiscovery {
-        use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
-        write(fixture, ".cowshed/token", &"A".repeat(43));
-        let mut sandbox = SandboxConfig {
-            home: PathBuf::from(std::env::var_os("HOME").expect("host home")),
-            mount_root: fixture.root.join("other-mounts"),
-            workspace_mount: fixture.root.clone(),
-            exec_temp_dir: fixture.root.join("exec-temp"),
-            port_block: crate::metadata::PortBlock::new(49_184, 16).unwrap(),
-            retained_port_blocks: Vec::new(),
-            mode: RunSandboxMode::ReadWrite,
-            grants: SandboxGrants::default(),
-            allowed_unix_sockets: Vec::new(),
-            additional_denies: Vec::new(),
-            shed_links: Vec::new(),
-            git_worktree_repository: None,
-            build_volume_mount: None,
-            capabilities: Default::default(),
-        };
-        let _runtime_link = RuntimeLink::reserve(&mut sandbox);
-        sandbox.configure_capabilities().unwrap();
-        let caller = BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/tmp/x".to_owned())]);
-        let environment = crate::runtime::supervisor::job_environment(&sandbox, &caller)
-            .await
-            .unwrap();
-        if sandbox.capabilities.active.contains(&CapabilityId::Cargo) {
-            assert!(
-                !environment.contains_key(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
-                "a caller target override never reaches discovery or a Cargo job"
-            );
-        }
-        discover_build_state(&fixture.context(), &environment).unwrap()
+    fn cargo_paths(fixture: &Fixture) -> BuildStateDiscovery {
+        discover_build_state(&fixture.context(), &mut HostCargo).unwrap()
     }
 
-    #[tokio::test]
-    async fn tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config() {
+    #[test]
+    fn tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         write(
@@ -547,7 +704,7 @@ mod tests {
                 "vendor/ignored/Cargo.toml",
             ],
         );
-        let state = cargo_paths(&fixture).await;
+        let state = cargo_paths(&fixture);
         assert!(state.findings.is_empty(), "{:?}", state.findings);
         assert_eq!(
             state.paths,
@@ -565,8 +722,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn directory_and_disabled_overrides_narrow_tracked_cargo_discovery() {
+    #[test]
+    fn directory_and_disabled_overrides_narrow_tracked_cargo_discovery() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         package(&fixture, "first", "first");
@@ -577,7 +734,7 @@ mod tests {
             ".cowshed.toml",
             "[capabilities.cargo]\ndirectory = \"second\"\n",
         );
-        let state = cargo_paths(&fixture).await;
+        let state = cargo_paths(&fixture);
         assert!(state.findings.is_empty(), "{:?}", state.findings);
         assert_eq!(
             state.paths,
@@ -588,11 +745,11 @@ mod tests {
             ".cowshed.toml",
             "[capabilities.cargo]\ndisabled = true\n",
         );
-        assert_eq!(cargo_paths(&fixture).await, BuildStateDiscovery::default());
+        assert_eq!(cargo_paths(&fixture), BuildStateDiscovery::default());
     }
 
-    #[tokio::test]
-    async fn offline_metadata_failure_is_a_typed_finding_and_does_not_hide_other_workspaces() {
+    #[test]
+    fn offline_metadata_failure_is_a_typed_finding_and_does_not_hide_other_workspaces() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         package(&fixture, "healthy", "healthy");
@@ -607,7 +764,7 @@ mod tests {
             &fixture,
             &["add", "healthy/Cargo.toml", "offline/Cargo.toml"],
         );
-        let state = cargo_paths(&fixture).await;
+        let state = cargo_paths(&fixture);
         assert_eq!(
             state.paths,
             [BuildStatePath::new("healthy/target", "healthy/target").unwrap()]
@@ -620,6 +777,28 @@ mod tests {
             ),
             "{:?}",
             state.findings
+        );
+    }
+
+    #[test]
+    fn a_query_the_job_never_answered_carries_the_activation_s_own_account() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"0\0/checkout/Cargo.toml\n\0\0101\0\0error: no workspace\n\0".to_vec(),
+            stderr: b"direnv: error .envrc failed\n".to_vec(),
+        };
+        assert_eq!(
+            driver_answers(&output, 3),
+            [
+                Ok(b"/checkout/Cargo.toml\n".to_vec()),
+                Err("Cargo exit status 101: error: no workspace".to_owned()),
+                Err(
+                    "the job running Cargo ended (exit status: 1) before Cargo answered: \
+                     direnv: error .envrc failed"
+                        .to_owned()
+                ),
+            ]
         );
     }
 
@@ -679,8 +858,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_unstaged_tracked_target_config_edit_refreshes_where_the_next_job_writes() {
+    #[test]
+    fn an_unstaged_tracked_target_config_edit_refreshes_where_the_next_job_writes() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         package(&fixture, "rust", "rust");
@@ -695,7 +874,7 @@ mod tests {
         );
         let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
         assert_eq!(
-            cargo_paths(&fixture).await.paths,
+            cargo_paths(&fixture).paths,
             [BuildStatePath::new("rust/first-target", "rust/first-target").unwrap()]
         );
         write(
@@ -708,7 +887,7 @@ mod tests {
             tracked_manifest_fingerprint(&fixture.context()).unwrap()
         );
         assert_eq!(
-            cargo_paths(&fixture).await.paths,
+            cargo_paths(&fixture).paths,
             [BuildStatePath::new("rust/second-target", "rust/second-target").unwrap()]
         );
     }

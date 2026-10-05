@@ -91,7 +91,6 @@ fn host(
 }
 
 fn sandbox(checkout: &Path) -> SandboxConfig {
-    write(checkout, ".cowshed/token", &"A".repeat(43));
     SandboxConfig {
         home: PathBuf::from(std::env::var_os("HOME").unwrap()),
         mount_root: checkout.join("other-mounts"),
@@ -258,8 +257,8 @@ fn overlapping_paths_and_symlinked_parents_refuse_without_deletion() {
     );
 }
 
-#[tokio::test]
-async fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_delete() {
+#[test]
+fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_delete() {
     let scratch = Scratch::new();
     let checkout = scratch.checkout();
     git(&checkout, &["init", "--quiet"]);
@@ -289,14 +288,9 @@ async fn configured_cargo_target_containing_tracked_source_refuses_before_mint_o
             "source-output/source.rs",
         ],
     );
-    let mut sandbox = sandbox(&checkout);
-    sandbox.configure_capabilities().unwrap();
-    let environment = crate::runtime::supervisor::job_environment(&sandbox, &Default::default())
-        .await
-        .unwrap();
-    let discovery = sandbox
+    let discovery = sandbox(&checkout)
         .with_detection_context(&checkout, |context| {
-            crate::capabilities::discover_build_state(context, &environment)
+            crate::capabilities::discover_build_state(context, &mut crate::capabilities::HostCargo)
         })
         .unwrap();
     assert!(discovery.findings.is_empty(), "{:?}", discovery.findings);
