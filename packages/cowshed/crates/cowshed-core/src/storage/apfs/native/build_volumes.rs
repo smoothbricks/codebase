@@ -337,3 +337,156 @@ fn same_path(left: &Path, right: &Path) -> bool {
             _ => false,
         }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::apfs::SystemCommandRunner;
+    use crate::build_volume::BuildVolumeRole;
+    use crate::metadata::WorkspaceName;
+    use crate::repository::{ProjectPaths, RepoId};
+    use crate::storage::apfs::ApfsSubstrateConfig;
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn fixture(
+        root: &Path,
+    ) -> (
+        MacOsApfsExecutionHost<SystemCommandRunner>,
+        BuildVolumeLayout,
+    ) {
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let host = MacOsApfsExecutionHost::new(
+            SystemCommandRunner,
+            ApfsSubstrateConfig::new(&store, root.join("caches"), root.join("checkout")),
+        )
+        .unwrap();
+        (host, BuildVolumeLayout::new(&project).unwrap())
+    }
+
+    fn linked(name: &str) -> BuildVolumeRecord {
+        BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Linked {
+                checkout: WorkspaceName::new(name).unwrap(),
+            },
+        )
+    }
+
+    /// Every regular file and directory under `root` with its bytes and modification time.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, SystemTime)> {
+        let mut entries = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if relative.starts_with(".fseventsd") || relative.starts_with(".Spotlight-V100") {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    pending.push(path.clone());
+                    entries.push((relative, None, metadata.modified().unwrap()));
+                } else {
+                    entries.push((
+                        relative,
+                        Some(fs::read(&path).unwrap()),
+                        metadata.modified().unwrap(),
+                    ));
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    /// A build volume's clone holds every byte and every modification time of its source (rule
+    /// "Clones preserve mtimes"), in milliseconds; a volume with a file open refuses release and
+    /// keeps everything; an idle one is deleted with its record and mountpoint.
+    #[test]
+    fn real_apfs_build_volumes_clone_with_mtimes_and_release_only_when_idle() {
+        let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");
+        let (host, layout) = fixture(root.path());
+        let source = BuildVolumeId::mint();
+        let mount = host
+            .create_build_volume(
+                &layout,
+                &source,
+                &linked("main"),
+                ImageCapacity::from_gibibytes(1),
+            )
+            .expect("create a build volume");
+        assert_eq!(mount, layout.mount(&source));
+        assert_eq!(
+            host.mount_build_volume(&layout, &source).unwrap(),
+            mount,
+            "idempotent"
+        );
+        fs::create_dir_all(mount.join("target/debug/deps")).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(86_400);
+        for (index, name) in ["a.rlib", "b.rlib", "c.d"].iter().enumerate() {
+            let path = mount.join("target/debug/deps").join(name);
+            fs::write(&path, name.repeat(1000)).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old + Duration::from_secs(index as u64))
+                .unwrap();
+        }
+        let before = snapshot(&mount);
+
+        let clone = BuildVolumeId::mint();
+        let started = Instant::now();
+        host.clone_build_volume(&layout, &source, &clone, &linked("topic"))
+            .expect("clone the build volume");
+        let cloned = started.elapsed();
+        let started = Instant::now();
+        let clone_mount = host
+            .mount_build_volume(&layout, &clone)
+            .expect("mount the clone");
+        let mounted = started.elapsed();
+        eprintln!("build volume clone {cloned:?}, attach+mount {mounted:?}");
+        assert_eq!(
+            snapshot(&clone_mount),
+            before,
+            "bytes and mtimes survive the clone"
+        );
+        assert_eq!(
+            layout.read_record(&clone).unwrap().role,
+            linked("topic").role
+        );
+
+        let held = fs::File::open(clone_mount.join("target/debug/deps/a.rlib")).unwrap();
+        match host.release_build_volume(&layout, &clone).unwrap() {
+            Release::Busy(_) => {}
+            Release::Deleted => panic!("a volume with an open file was released"),
+        }
+        assert!(layout.image(&clone).exists() && layout.record(&clone).exists());
+        assert_eq!(
+            snapshot(&clone_mount),
+            before,
+            "a refused release changes nothing"
+        );
+        drop(held);
+        assert_eq!(
+            host.release_build_volume(&layout, &clone).unwrap(),
+            Release::Deleted
+        );
+        assert!(!layout.image(&clone).exists());
+        assert!(!layout.record(&clone).exists());
+        assert!(!layout.mount(&clone).exists());
+        assert_eq!(
+            host.release_build_volume(&layout, &source).unwrap(),
+            Release::Deleted
+        );
+        assert_eq!(layout.list().unwrap(), []);
+    }
+}
