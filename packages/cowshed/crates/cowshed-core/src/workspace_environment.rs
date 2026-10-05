@@ -14,7 +14,8 @@ pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 
 /// Agent harnesses export `CI`; only a real runner may change local Cargo unit identities.
-const DEV_CI_POLICY: &str = "if [ \"${GITHUB_ACTIONS:-}\" != true ]; then unset CI; fi\n";
+pub(crate) const DEV_CI_POLICY: &str =
+    "if [ \"${GITHUB_ACTIONS:-}\" != true ]; then unset CI; fi\n";
 
 #[derive(Debug, Error)]
 pub enum WorkspaceEnvironmentError {

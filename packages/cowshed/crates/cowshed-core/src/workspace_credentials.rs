@@ -530,7 +530,9 @@ fn invalid(kind: &'static str, path: &Path) -> WorkspaceCredentialError {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
+    use crate::workspace_environment::{
+        DEV_CI_POLICY, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV,
+    };
 
     use super::*;
     use crate::metadata::WorkspaceRole;
@@ -600,7 +602,7 @@ mod tests {
         assert_eq!(
             first_environment,
             format!(
-                "export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
             )
         );
 
@@ -662,7 +664,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
             format!(
-                "export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
             )
         );
         assert_eq!(
@@ -689,7 +691,11 @@ mod tests {
         .expect("mint Linux credentials");
         let environment =
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
-        assert_eq!(environment.lines().count(), 1);
+        let token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
+        assert_eq!(
+            environment,
+            format!("{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\n")
+        );
         assert!(!environment.contains("COWSHED_PORT_BASE"));
         assert!(!environment.contains("COWSHED_PORT_BLOCK_SIZE"));
 
