@@ -183,6 +183,18 @@ unchanged: `nextest.toml` singles out only tests carrying a raised `slow-timeout
 full-lifecycle tests), and those are hash-partitioned into `cargo-test-<crate>-exceptions-shard1..N` by the crate's
 declared shard count.
 
+**Host limit: DiskImages2 attach slots are not returned on detach.** Measured on macOS 26, 2026-10-05, ten days after a
+boot with ~19.9k image attaches since (the `IOUnit` of the newest `AppleDiskImageDevice`). Once the pool runs out, every
+`diskutil image attach` and `diskutil image info` of every format fails with "error code 150"; verbose, that is "Failed
+to initialize IO manager: Driver returned error code -536870210" (`kIOReturnNoResources`). Only legacy `hdiutil attach`
+of UDIF still works. Each attach→detach cycle used up one slot and the detach did not give it back: 330 images attached
+together at 06:45, but after ~300 blank-image cycles a probe failed at 128 attached, then at 114, 100 and 98 as later
+cycles were spent. No zombie devices remain: IORegistry devices and `hdiutil info` match 1:1, and every
+`DIDeviceIOUserClient` creator `diskimagesiod` is alive. Detaching an image sometimes freed one attach and sometimes
+none. The pool did not recover over the following 15 minutes. The suite therefore spends a finite host resource: every
+attach a test does not need is a slot the host's live sheds lose until reboot. A run that killed a test leaves that
+test's images attached until the next run's sweep (`real_apfs_fixture_images_are_released_however_their_run_ends`).
+
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 
