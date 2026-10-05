@@ -310,7 +310,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// ASIF version-1 header growth: the fields a grow reads are all big-endian (huven/asif-format,
+/// ASIF version-1 header reads and growth: the fields used are all big-endian (huven/asif-format,
 /// "ASIF binary specification", header version 1; Apple publishes no layout) — the `shdw` magic
 /// at 0x00, the version at 0x04, the header length at 0x08, the virtual disk's 512-byte sector
 /// count at 0x30 and the largest sector count the image accepts at 0x38. Directories and tables
@@ -364,10 +364,9 @@ mod asif {
             })
         }
 
-        /// The sector count growing this image to `capacity` writes, or why it is refused: an
-        /// unrecognized header, a size off the 4 KiB grid, one that does not grow, or one past
-        /// the image's own maximum. Pure; nothing is written unless this answers.
-        pub(super) fn grown_sector_count(&self, capacity: ImageCapacity) -> io::Result<u64> {
+        /// Why this header is not one cowshed reads or writes: no `shdw` magic, or a version or
+        /// header length other than the measured version-1 layout.
+        fn recognized(&self) -> io::Result<()> {
             if self.magic != MAGIC {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -384,6 +383,22 @@ mod asif {
                     ),
                 ));
             }
+            Ok(())
+        }
+
+        /// The virtual disk's size as the header records it.
+        pub(super) fn capacity(&self) -> io::Result<ImageCapacity> {
+            self.recognized()?;
+            Ok(ImageCapacity::from_bytes(
+                self.sector_count.saturating_mul(SECTOR_BYTES),
+            ))
+        }
+
+        /// The sector count growing this image to `capacity` writes, or why it is refused: an
+        /// unrecognized header, a size off the 4 KiB grid, one that does not grow, or one past
+        /// the image's own maximum. Pure; nothing is written unless this answers.
+        pub(super) fn grown_sector_count(&self, capacity: ImageCapacity) -> io::Result<u64> {
+            self.recognized()?;
             let bytes = capacity.bytes();
             if !bytes.is_multiple_of(GROW_BLOCK) {
                 return Err(io::Error::new(
@@ -406,6 +421,22 @@ mod asif {
             }
             Ok(requested)
         }
+    }
+
+    /// The capacity an image's header records, read without a lock: the image driver holds an
+    /// attached image's file under `O_EXLOCK`, and a lock-free read neither waits on nor disturbs
+    /// it. Only [`grow`] changes the count, and only while the image is detached, so an attached
+    /// image's header is the size it was attached at.
+    ///
+    /// This replaces `diskutil image resize --plist`, whose `current` is the same count: every
+    /// `diskutil image` verb first waits on StorageKit's host-wide disk resync, which measured
+    /// 2.5–8.2 s per call under the parallel real-APFS suite for an eight-byte read.
+    pub(super) fn capacity(image: &Path) -> io::Result<ImageCapacity> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(image)?;
+        Header::read(&file)?.capacity()
     }
 
     /// Rewrite a detached image's eight-byte sector count in place, and nothing else.
@@ -1058,7 +1089,6 @@ pub enum ApfsError {
         detach: Option<Box<ApfsError>>,
         remove: Option<Box<ApfsError>>,
     },
-    InvalidResizeLimits(String),
     ImageNotAttached(PathBuf),
     /// The kernel's disk-image inventory could not be read.
     KernelInventory(io::Error),
@@ -1186,9 +1216,6 @@ impl fmt::Display for ApfsError {
                 }
                 Ok(())
             }
-            Self::InvalidResizeLimits(message) => {
-                write!(f, "invalid image resize limits: {message}")
-            }
             Self::ImageNotAttached(image) => write!(
                 f,
                 "{} reports no attachment to read a capacity from",
@@ -1272,7 +1299,8 @@ pub trait ApfsBackend {
     ) -> Result<(), ApfsError>;
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path) -> Result<(), ApfsError>;
-    /// The capacity a detached image currently holds, read from its own resize limits.
+    /// The capacity an image's ASIF header records. Spawns nothing: the header is the record
+    /// `diskutil image resize --plist` itself reports from.
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
     /// Grow a detached image's virtual disk to `capacity`. Only the image grows: the container
     /// inside it grows afterwards through an owned, verified attachment ([`Self::grow_container`]).
@@ -2233,19 +2261,18 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
 
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
         validate_image_path(image)?;
-        let output = self.run_checked(
-            "read ASIF image resize limits",
-            CommandRequest::new(
-                DISKUTIL,
-                [
-                    OsString::from("image"),
-                    OsString::from("resize"),
-                    OsString::from("--plist"),
-                    image.as_os_str().to_owned(),
-                ],
-            ),
-        )?;
-        parse_asif_resize_limits(&output.stdout)
+        #[cfg(target_os = "macos")]
+        let capacity = asif::capacity(image);
+        #[cfg(not(target_os = "macos"))]
+        let capacity = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ASIF images exist only on macOS",
+        ));
+        capacity.map_err(|source| ApfsError::FileOperation {
+            operation: "read ASIF image capacity",
+            path: image.to_owned(),
+            source,
+        })
     }
 
     fn resize_image(&self, image: &Path, capacity: ImageCapacity) -> Result<(), ApfsError> {
@@ -2346,18 +2373,6 @@ fn command_failed(
             output,
         }
     }
-}
-
-/// `diskutil image resize --plist` reports limits in bytes under `current`.
-fn parse_asif_resize_limits(bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| ApfsError::InvalidResizeLimits(error.to_string()))?;
-    value
-        .as_dictionary()
-        .and_then(|root| root.get("current"))
-        .and_then(plist::Value::as_unsigned_integer)
-        .map(ImageCapacity::from_bytes)
-        .ok_or_else(|| ApfsError::InvalidResizeLimits("missing unsigned current".to_owned()))
 }
 
 /// One walk of the kernel inventory for one image: whether it is attached, its whole devices,
@@ -6394,39 +6409,43 @@ mod tests {
         ));
     }
 
-    const ASIF_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>current</key><integer>107374182400</integer>
-      <key>max</key><integer>4503599626321920</integer>
-      <key>min</key><integer>20971520</integer>
-    </dict></plist>"#;
-
-    /// Limits are still diskutil's to report, but growing spawns nothing: the image's own header
-    /// is grown through the runner seam, never by `diskutil image resize`, whose content resize
-    /// attaches the image outside every ownership check.
+    /// Neither reading an image's capacity nor growing it spawns a disk command: the capacity is
+    /// the header's own sector count, read while another descriptor holds the file exclusively as
+    /// the image driver does for an attached image, and the grow goes through the runner seam,
+    /// never `diskutil image resize`, whose content resize attaches the image outside every
+    /// ownership check.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn asif_limits_come_from_diskutil_and_growth_spawns_no_disk_command() {
-        let image = Path::new("/tmp/cowshed-resize/main.asif");
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok(ASIF_RESIZE_LIMITS_PLIST),
-            Reply::Grow(Ok(())),
-        ]));
+    fn asif_capacity_comes_from_the_header_and_growth_spawns_no_disk_command() {
+        use std::os::unix::fs::OpenOptionsExt;
 
-        assert_eq!(backend.image_capacity(image).unwrap(), capacity("100g"));
-        backend.resize_image(image, capacity("200g")).unwrap();
+        let (image, mut bytes) = synthetic_asif("capacity-from-header");
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([Reply::Grow(Ok(()))]));
+        let holder = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK)
+            .open(&image)
+            .unwrap();
 
-        let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].command().program, Path::new(DISKUTIL));
+        assert_eq!(backend.image_capacity(&image).unwrap(), capacity("1g"));
+        drop(holder);
+        backend.resize_image(&image, capacity("2g")).unwrap();
         assert_eq!(
-            argv(steps[0].command()),
-            [
-                "image",
-                "resize",
-                "--plist",
-                "/tmp/cowshed-resize/main.asif"
-            ]
+            backend.runner().steps(),
+            [Seen::Grow(image.clone(), capacity("2g"))]
         );
-        assert_eq!(steps[1], Seen::Grow(image.to_owned(), capacity("200g")));
+
+        bytes[0] = b'x';
+        fs::write(&image, &bytes).unwrap();
+        assert!(
+            matches!(
+                backend.image_capacity(&image),
+                Err(ApfsError::FileOperation { operation: "read ASIF image capacity", path, source })
+                    if path == image && source.kind() == io::ErrorKind::InvalidData
+            ),
+            "a header without the ASIF magic has no capacity"
+        );
+        fs::remove_file(image).unwrap();
     }
 
     /// A refused grow is the operation's failure, typed and naming the image, never a success.
