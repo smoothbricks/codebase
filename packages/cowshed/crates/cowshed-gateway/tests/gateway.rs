@@ -1,9 +1,13 @@
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
 #[cfg(target_os = "linux")]
 #[path = "gateway/linux.rs"]
 mod linux;
 #[cfg(target_os = "macos")]
 #[path = "gateway/macos.rs"]
 mod macos;
+
+use fixture_dir::{FixtureDir, secure_fixture_dir};
 
 use std::{
     io,
@@ -153,57 +157,14 @@ fn grant(host: &str, port: u16) -> EgressGrant {
         .expect("valid path")
 }
 
-/// A temporary directory every cowshed private-root check accepts.
+/// The config every gateway test starts from, and the guard owning the mirror-cache root it names.
 ///
-/// `create_dir` masks 0o777 with the process umask, so a permissive umask yields a group- and
-/// world-writable directory. Every gateway root check refuses one — correctly, because a directory
-/// a stranger can write is a directory a stranger can swap a socket or a cache entry into — so the
-/// mode is set explicitly here rather than inherited from the environment.
-///
-/// The mode is then read back and asserted. That is what keeps a permissive umask, or a temp
-/// strategy that hands back a directory this fixture did not create, from resurfacing as a bare
-/// `InvalidInput` raised deep inside `Gateway::start`, which names neither the path nor the mode.
-fn secure_fixture_dir(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(name);
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir(&path)
-        .unwrap_or_else(|error| panic!("create fixture directory {}: {error}", path.display()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap_or_else(
-            |error| panic!("restrict fixture directory {}: {error}", path.display()),
-        );
-        let metadata = std::fs::symlink_metadata(&path)
-            .unwrap_or_else(|error| panic!("lstat fixture directory {}: {error}", path.display()));
-        assert!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "fixture directory {} must be a real directory, got {:?}",
-            path.display(),
-            metadata.file_type()
-        );
-        assert_eq!(
-            metadata.uid(),
-            unsafe { libc::geteuid() },
-            "fixture directory {} must be owned by the test process",
-            path.display()
-        );
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(
-            mode,
-            0o700,
-            "fixture directory {} is mode {mode:04o}, not 0700: it is group- or other-writable and \
-             every gateway private-root check will refuse it",
-            path.display()
-        );
-    }
-    path
-}
-
-fn test_config() -> GatewayConfig {
+/// The gateway writes under that root (`repo/` is created before a bad control socket can refuse
+/// the start), so bind the guard before the gateway: the gateway drops first, then the root goes,
+/// however the test ends.
+fn test_config() -> (GatewayConfig, FixtureDir) {
     static NEXT_CACHE: AtomicUsize = AtomicUsize::new(0);
-    let cache_root = secure_fixture_dir(&format!(
+    let cache = secure_fixture_dir(&format!(
         "cowshed-gateway-cache-{}-{}",
         std::process::id(),
         NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
@@ -219,7 +180,7 @@ fn test_config() -> GatewayConfig {
             tunnel_total: Duration::from_secs(5),
             leaf_lifetime: Duration::from_secs(60 * 60),
         },
-        mirror_cache: MirrorCacheConfig::new(cache_root),
+        mirror_cache: MirrorCacheConfig::new(cache.path().to_path_buf()),
         ..GatewayConfig::default()
     };
     #[cfg(target_os = "linux")]
@@ -227,7 +188,7 @@ fn test_config() -> GatewayConfig {
         data_socket_root: Some(linux::socket_root()),
         ..config
     };
-    config
+    (config, cache)
 }
 
 async fn gateway(
@@ -314,9 +275,10 @@ fn basic_absolute_request(host: &str, port: u16, credential: &str, path: &str) -
 #[tokio::test]
 async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     let root = secure_fixture_dir(&format!("cowshed-gateway-audit-{}", std::process::id()));
-    let sink =
-        ArrowAuditSink::start(ArrowAuditConfig::new(root.clone()).expect("audit configuration"))
-            .expect("start Arrow sink");
+    let sink = ArrowAuditSink::start(
+        ArrowAuditConfig::new(root.path().to_path_buf()).expect("audit configuration"),
+    )
+    .expect("start Arrow sink");
     sink.record(AuditEvent {
         sequence: 1,
         timestamp_unix_ms: 1_700_000_000_000,
@@ -372,7 +334,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     sink.flush()
         .await
         .expect("invalid event leaves the audit writer available");
-    let partition = std::fs::read_dir(&root)
+    let partition = std::fs::read_dir(root.path())
         .expect("read telemetry root")
         .next()
         .expect("date partition")
@@ -416,8 +378,6 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         .expect("mirror cache status string column");
     assert_eq!(cache_status.value(0), "filled");
     assert!(reader.next().is_none());
-    drop(sink);
-    std::fs::remove_dir_all(root).expect("remove audit fixture");
 }
 
 #[test]

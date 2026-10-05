@@ -4,6 +4,8 @@
 //! parent and a parent that is a symlink. These cases are constructed here rather than
 //! inferred from the happy-path fixture.
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
 #[cfg(target_os = "linux")]
 #[path = "control_parent_probe/linux.rs"]
 mod linux;
@@ -25,6 +27,7 @@ use cowshed_gateway::{
     GatewayError, GatewayTimeouts, MirrorCacheConfig, NegotiatedTransport, UpstreamConnection,
     UpstreamConnector, UpstreamHealth, UpstreamPurpose,
 };
+use fixture_dir::{FixtureDir, secure_fixture_dir};
 use tokio::net::TcpStream;
 
 #[derive(Debug)]
@@ -77,21 +80,17 @@ impl UpstreamConnector for LocalConnector {
     }
 }
 
-fn probe_config() -> GatewayConfig {
+/// The probe's config, and the guard owning the mirror-cache root it names.
+///
+/// `Gateway::start` creates `repo/` under that root before the control-socket parent check
+/// refuses it, so the root exists after every probe; the guard removes it however the test ends.
+fn probe_config() -> (GatewayConfig, FixtureDir) {
     static NEXT_CACHE: AtomicUsize = AtomicUsize::new(0);
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache = secure_fixture_dir(&format!(
         "cowshed-gateway-probe-cache-{}-{}",
         std::process::id(),
         NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&cache_root);
-    std::fs::create_dir(&cache_root).expect("create probe cache root");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700))
-            .expect("secure probe cache root");
-    }
     let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
@@ -103,7 +102,7 @@ fn probe_config() -> GatewayConfig {
             tunnel_total: Duration::from_secs(5),
             leaf_lifetime: Duration::from_secs(60 * 60),
         },
-        mirror_cache: MirrorCacheConfig::new(cache_root),
+        mirror_cache: MirrorCacheConfig::new(cache.path().to_path_buf()),
         ..GatewayConfig::default()
     };
     #[cfg(target_os = "linux")]
@@ -111,21 +110,15 @@ fn probe_config() -> GatewayConfig {
         data_socket_root: Some(linux::socket_root()),
         ..config
     };
-    config
+    (config, cache)
 }
 
-fn secure_root(tag: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = std::env::temp_dir().join(format!("cowshed-ctl-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir(&path).expect("create probe root");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-        .expect("restrict probe root");
-    path
+fn secure_root(tag: &str) -> FixtureDir {
+    secure_fixture_dir(&format!("cowshed-ctl-{}-{}", tag, std::process::id()))
 }
 
 async fn start_error(control: &std::path::Path) -> GatewayError {
-    let mut config = probe_config();
+    let (mut config, _cache) = probe_config();
     config.control_socket = Some(control.to_path_buf());
     let Err(error) = Gateway::start(
         config,
@@ -152,7 +145,7 @@ async fn group_writable_parent_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = secure_root("gw");
-    let shared = root.join("shared");
+    let shared = root.path().join("shared");
     std::fs::create_dir(&shared).expect("create group-writable parent");
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770))
         .expect("relax group-writable parent");
@@ -168,7 +161,6 @@ async fn group_writable_parent_is_refused() {
         "refusal must happen before bind: {}",
         control.display()
     );
-    std::fs::remove_dir_all(root).expect("remove probe root");
 }
 
 #[tokio::test]
@@ -176,11 +168,11 @@ async fn symlink_parent_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = secure_root("ln");
-    let target = root.join("real");
+    let target = root.path().join("real");
     std::fs::create_dir(&target).expect("create symlink target");
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
         .expect("secure symlink target");
-    let link = root.join("link");
+    let link = root.path().join("link");
     std::os::unix::fs::symlink(&target, &link).expect("link a private parent");
     let control = link.join("gateway.sock");
     let error = io_refusal(start_error(&control).await);
@@ -198,5 +190,4 @@ async fn symlink_parent_is_refused() {
         !target.join("gateway.sock").exists(),
         "the refusal must not bind through the link either"
     );
-    std::fs::remove_dir_all(root).expect("remove probe root");
 }

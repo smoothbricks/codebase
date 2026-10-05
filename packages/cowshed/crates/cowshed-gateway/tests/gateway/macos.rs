@@ -338,8 +338,9 @@ async fn gateway_port_claim_is_a_live_kernel_reservation() {
     // closes: the kernel's own word that it was released, whoever binds the port afterwards.
     let mut queued = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, occupied.port() + 1))
         .expect("connect to the occupied block's claim");
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -725,8 +726,9 @@ async fn allow_deny_malformed_token_and_audit_fields() {
     let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
     let endpoint = free_endpoint();
     let (audit_tx, mut audit_rx) = mpsc::channel(8);
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -863,8 +865,9 @@ async fn allow_deny_malformed_token_and_audit_fields() {
 async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
     let (upstream_port, _captured, _upstream) = http_fixture(0, None).await;
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -944,8 +947,9 @@ async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
 async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
     let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1026,8 +1030,9 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
     let (audit_tx, mut audit_rx) = mpsc::channel(8);
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1049,7 +1054,7 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
     );
     let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let root = secure_fixture_dir(&format!("cowshed-node-fetch-{}", std::process::id()));
-    let ca_path = root.join("ca.pem");
+    let ca_path = root.path().join("ca.pem");
     std::fs::write(
         &ca_path,
         format!(
@@ -1071,7 +1076,7 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
              console.log(await response.text());",
             &format!("https://node-fetch.test:{upstream_port}/allowed/node"),
         ])
-        .current_dir(&root)
+        .current_dir(root.path())
         .env("HTTP_PROXY", &proxy)
         .env("HTTPS_PROXY", &proxy)
         .env("http_proxy", &proxy)
@@ -1112,7 +1117,6 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
         }
     }
     assert!(saw_request, "the workspace gateway audits native fetch");
-    std::fs::remove_dir_all(root).expect("remove Node workspace fixture");
 }
 
 #[tokio::test]
@@ -1120,8 +1124,9 @@ async fn endpoint_identity_precedes_token_authentication() {
     let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
     let endpoint_a = free_endpoint();
     let endpoint_b = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1191,7 +1196,7 @@ async fn endpoint_identity_precedes_token_authentication() {
 async fn eight_intercept_tunnels_do_not_starve_their_own_registry_requests() {
     let (upstream_port, mut captured, _upstream) = http_fixture(8, None).await;
     let endpoint = free_endpoint();
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.limits.workspace_active = 8;
     config.limits.global_active = 8;
     config.limits.origin_active = 8;
@@ -1296,8 +1301,9 @@ async fn native_registry_requests_use_one_admitted_proxy_path_and_cache() {
     let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
     let (audit_tx, mut audit_rx) = mpsc::channel(32);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1421,8 +1427,9 @@ async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_m
     });
     let (audit_tx, mut audit_rx) = mpsc::channel(16);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1526,8 +1533,9 @@ async fn opaque_connect_preserves_bytes_exactly() {
     });
     let endpoint = free_endpoint();
     let (observed_tx, mut observed_rx) = mpsc::channel(1);
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1596,8 +1604,9 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
         origin,
         value: "Bearer host-secret".to_owned(),
     });
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         credentials,
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -1672,8 +1681,9 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
 async fn a_scoped_packument_carries_the_held_credential_and_forwards_its_bytes_unchanged() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(ScopedRegistryCredential {
             repo_id: "owner/repo-registry".to_owned(),
             origin: format!("http://registry.test:{upstream_port}"),
@@ -1730,8 +1740,9 @@ async fn a_scoped_packument_carries_the_held_credential_and_forwards_its_bytes_u
 async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_credential() {
     let (upstream_port, mut captured, _upstream) = http_fixture(0, None).await;
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(ScopedRegistryCredential {
             repo_id: "owner/repo-scope".to_owned(),
             origin: format!("http://scope.test:{upstream_port}"),
@@ -1794,8 +1805,9 @@ async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_creden
 #[tokio::test]
 async fn dead_upstream_fails_fast_without_connecting() {
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Offline,
@@ -1833,7 +1845,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     let gate = Arc::new(Notify::new());
     let (upstream_port, mut captured, _upstream) = http_fixture(2, Some(Arc::clone(&gate))).await;
     let endpoint = free_endpoint();
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
         max_sessions: 2,
         workspace_active: 1,
@@ -1920,7 +1932,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
             .expect("held tunnel closes");
     });
     let endpoint = free_endpoint();
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
         max_sessions: 2,
         workspace_active: 1,
@@ -2003,7 +2015,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
 }
 #[tokio::test]
 async fn control_start_failure_stops_and_joins_gateway_actor() {
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     let missing_parent = std::env::temp_dir().join(format!(
         "cowshed-missing-control-parent-{}",
         std::process::id()
@@ -2041,7 +2053,7 @@ async fn control_socket_parent_must_be_a_private_real_directory() {
     use std::os::unix::fs::PermissionsExt as _;
 
     async fn refusal(control: &std::path::Path) -> io::Error {
-        let mut config = test_config();
+        let (mut config, _cache) = test_config();
         config.control_socket = Some(control.to_path_buf());
         let Err(error) = Gateway::start(
             config,
@@ -2073,7 +2085,7 @@ async fn control_socket_parent_must_be_a_private_real_directory() {
     // the wrong reason if the check under test were ever removed.
     let root = secure_fixture_dir(&format!("cowshed-ctl-parent-{}", std::process::id()));
 
-    let shared = root.join("shared");
+    let shared = root.path().join("shared");
     std::fs::create_dir(&shared).expect("create group-writable parent");
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770))
         .expect("relax group-writable parent");
@@ -2084,11 +2096,11 @@ async fn control_socket_parent_must_be_a_private_real_directory() {
         "control socket parent must be an owned, non-writable real directory"
     );
 
-    let target = root.join("real");
+    let target = root.path().join("real");
     std::fs::create_dir(&target).expect("create symlink target");
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
         .expect("secure symlink target");
-    let link = root.join("link");
+    let link = root.path().join("link");
     std::os::unix::fs::symlink(&target, &link).expect("link a private parent");
     let error = refusal(&link.join("gateway.sock")).await;
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -2100,15 +2112,13 @@ async fn control_socket_parent_must_be_a_private_real_directory() {
         !target.join("gateway.sock").exists(),
         "the refusal must not bind through the link either"
     );
-
-    std::fs::remove_dir_all(root).expect("remove control parent fixture directory");
 }
 
 #[tokio::test]
 async fn control_socket_is_local_authenticated_and_reports_status() {
     let root = secure_fixture_dir(&format!("cowshed-gateway-control-{}", std::process::id()));
-    let control = root.join("gateway.sock");
-    let mut config = test_config();
+    let control = root.path().join("gateway.sock");
+    let (mut config, _cache) = test_config();
     config.control_socket = Some(control.clone());
     let gateway = gateway(
         config,
@@ -2164,14 +2174,14 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     );
     gateway.drain().await.expect("drain gateway");
     assert!(!control.exists());
-    std::fs::remove_dir_all(root).expect("remove control fixture directory");
 }
 
 #[tokio::test]
 async fn revision_tombstone_and_rotation_preserve_authority() {
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -2255,8 +2265,9 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
         assert!(trailing.is_empty(), "bytes arrived after audit hard-stop");
     });
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let mut gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -2323,8 +2334,9 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
 async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_calls() {
     let endpoint = free_endpoint();
     let calls = Arc::new(AtomicUsize::new(0));
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(CountingFailConnector {
             calls: Arc::clone(&calls),
@@ -2395,7 +2407,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
 #[tokio::test]
 async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     let single_permit_config = || {
-        let mut config = test_config();
+        let (mut config, cache) = test_config();
         config.limits = GatewayLimits {
             max_sessions: 2,
             workspace_active: 1,
@@ -2406,14 +2418,15 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             leaf_cache_workspace: 2,
             leaf_cache_global: 2,
         };
-        config
+        (config, cache)
     };
 
     {
         let endpoint = free_endpoint();
         let calls = Arc::new(AtomicUsize::new(0));
+        let (config, _cache) = single_permit_config();
         let gateway = gateway(
-            single_permit_config(),
+            config,
             Arc::new(NoCredentials),
             Arc::new(CountingFailConnector {
                 calls: Arc::clone(&calls),
@@ -2466,8 +2479,9 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             }
         });
         let endpoint = free_endpoint();
+        let (config, _cache) = single_permit_config();
         let gateway = gateway(
-            single_permit_config(),
+            config,
             Arc::new(FailingCredentials),
             Arc::new(LocalConnector {
                 health: UpstreamHealth::Healthy,
@@ -2517,8 +2531,9 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             }
         });
         let endpoint = free_endpoint();
+        let (config, _cache) = single_permit_config();
         let gateway = gateway(
-            single_permit_config(),
+            config,
             Arc::new(NoCredentials),
             Arc::new(LocalConnector {
                 health: UpstreamHealth::Healthy,
@@ -2561,8 +2576,9 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         let (upstream_port, mut captured, _upstream) =
             http_fixture(1, Some(Arc::clone(&gate))).await;
         let endpoint = free_endpoint();
+        let (config, _cache) = single_permit_config();
         let gateway = gateway(
-            single_permit_config(),
+            config,
             Arc::new(NoCredentials),
             Arc::new(LocalConnector {
                 health: UpstreamHealth::Healthy,
@@ -2615,7 +2631,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
             .await
             .expect("held tunnel closes");
     });
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
         max_sessions: 2,
         workspace_active: 1,
@@ -2716,7 +2732,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
 
 #[tokio::test]
 async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audited() {
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
         max_sessions: 2,
         workspace_active: 1,
@@ -2801,8 +2817,9 @@ async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
         h2_tls_fixture("secure-h2.test").await;
     let (negotiated, mut negotiated_rx) = mpsc::channel(2);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(VerifiedTlsConnector {
             tls: upstream_tls,
@@ -2911,8 +2928,9 @@ async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
     let (upstream_port, upstream_tls, upstream_task) = h1_tls_fixture("fallback.test").await;
     let (negotiated, mut negotiated_rx) = mpsc::channel(1);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(VerifiedTlsConnector {
             tls: upstream_tls,
@@ -2980,8 +2998,9 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
         no_alpn_tls_fixture("no-alpn.test").await;
     let (negotiated, mut negotiated_rx) = mpsc::channel(1);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(VerifiedTlsConnector {
             tls: upstream_tls,
@@ -3039,8 +3058,9 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
 async fn missing_downstream_alpn_serves_http1_for_registry_clients() {
     let (port, mut captured, _upstream) = http_fixture(1, None).await;
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -3116,8 +3136,9 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
     let (negotiated, _negotiated_rx) = mpsc::channel(1);
     let (audit_tx, mut audit_rx) = mpsc::channel(16);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(VerifiedTlsConnector {
             tls: upstream_tls,
@@ -3204,8 +3225,9 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
 async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
     let calls = Arc::new(AtomicUsize::new(0));
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let mut gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(CountingFailConnector {
             calls: Arc::clone(&calls),
@@ -3261,8 +3283,9 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
         h2_tls_fixture("direct-h2.test").await;
     let (negotiated, mut negotiated_rx) = mpsc::channel(1);
     let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(VerifiedTlsConnector {
             tls: upstream_tls,

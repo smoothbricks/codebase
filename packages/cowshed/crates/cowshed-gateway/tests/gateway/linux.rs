@@ -2,18 +2,20 @@ use super::*;
 
 use std::{path::PathBuf, sync::LazyLock};
 use tokio::net::UnixStream;
-static LINUX_SOCKET_ROOT: LazyLock<PathBuf> =
+// A static is never dropped, so this root outlives the process: one per Linux test process.
+static LINUX_SOCKET_ROOT: LazyLock<FixtureDir> =
     LazyLock::new(|| secure_fixture_dir(&format!("cowshed-gateway-data-{}", std::process::id())));
 
 pub(super) fn socket_root() -> PathBuf {
-    LINUX_SOCKET_ROOT.clone()
+    LINUX_SOCKET_ROOT.path().to_path_buf()
 }
 #[tokio::test]
 async fn unix_socket_churn_unlinks_every_session() {
-    let socket = LINUX_SOCKET_ROOT.join("workspace.sock");
+    let socket = LINUX_SOCKET_ROOT.path().join("workspace.sock");
     let _ = std::fs::remove_file(&socket);
+    let (config, _cache) = test_config();
     let gateway = gateway(
-        test_config(),
+        config,
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
             health: UpstreamHealth::Healthy,
@@ -51,20 +53,20 @@ async fn unix_socket_churn_unlinks_every_session() {
         );
     }
     gateway.drain().await.expect("drain gateway");
-    assert!(LINUX_SOCKET_ROOT.exists());
+    assert!(LINUX_SOCKET_ROOT.path().exists());
 }
 
 #[tokio::test]
 async fn linux_data_socket_root_is_enforced_and_serves_requests() {
-    let socket = LINUX_SOCKET_ROOT.join("linux-request.sock");
-    let control = LINUX_SOCKET_ROOT.join("control.sock");
-    let regular = LINUX_SOCKET_ROOT.join("regular.sock");
+    let socket = LINUX_SOCKET_ROOT.path().join("linux-request.sock");
+    let control = LINUX_SOCKET_ROOT.path().join("control.sock");
+    let regular = LINUX_SOCKET_ROOT.path().join("regular.sock");
     let outside = std::env::temp_dir().join("outside.sock");
     for path in [&socket, &control, &regular, &outside] {
         let _ = std::fs::remove_file(path);
     }
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
-    let mut config = test_config();
+    let (mut config, _cache) = test_config();
     config.control_socket = Some(control.clone());
     let gateway = gateway(
         config,
