@@ -532,3 +532,207 @@ async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without
         .expect("stop plain repository runtime");
     fixture.stop_gateway().await;
 }
+
+/// The repository's own Nx and the node that runs it, as absolute paths resolved at run time:
+/// `env!` would compile this checkout's path into the test binary.
+fn repository_nx() -> (PathBuf, PathBuf) {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    let nx = PathBuf::from(manifest)
+        .join("../../../../node_modules/nx")
+        .canonicalize()
+        .expect("the repository's own Nx is installed");
+    let node = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("node"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("node on the test's PATH")
+        .canonicalize()
+        .expect("node resolves");
+    (nx, node)
+}
+
+/// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
+/// default inputs include it). `declared` says whether `a:build` declares that output.
+fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
+    let node = node.display();
+    let outputs = if declared {
+        r#"["{projectRoot}/generated.txt"]"#
+    } else {
+        "[]"
+    };
+    fs::write(
+        checkout.join("package.json"),
+        r#"{"name":"fixture","private":true}"#,
+    )
+    .unwrap();
+    fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":false}"#).unwrap();
+    fs::write(checkout.join(".gitignore"), "node_modules\n.nx\n").unwrap();
+    fs::create_dir_all(checkout.join("a")).unwrap();
+    fs::write(checkout.join("a/src.txt"), b"src\n").unwrap();
+    fs::write(
+        checkout.join("a/project.json"),
+        format!(
+            r#"{{"name":"a","targets":{{
+  "build":{{"executor":"nx:run-commands","cache":true,"inputs":["{{projectRoot}}/src.txt"],"outputs":{outputs},
+    "options":{{"command":"{node} -e \"require('fs').writeFileSync('a/generated.txt','generated\\n')\""}}}},
+  "test":{{"executor":"nx:run-commands","cache":true,"inputs":["default"],"dependsOn":["build"],"outputs":[],
+    "options":{{"command":"{node} -e \"require('fs').readFileSync('a/generated.txt')\""}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(checkout.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(nx, checkout.join("node_modules/nx")).unwrap();
+    git(checkout, &["add", "-A"]);
+    git(checkout, &["commit", "-q", "-m", "nx project"]);
+}
+
+/// Every `landAdoption` commitment sealed under `telemetry`.
+fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionCommitment> {
+    let mut found = Vec::new();
+    let mut pending = vec![telemetry.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                pending.push(path);
+            } else if name.starts_with("commitment-") && name.ends_with(".arrow") {
+                let commitment = cowshed_core::storage::job_artifact::decode_controller_commitment(
+                    &fs::read(&path).unwrap(),
+                )
+                .unwrap();
+                if let cowshed_core::api::dto::ControllerCommitment::LandAdoption(adoption) =
+                    commitment
+                {
+                    found.push(adoption);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A land whose checks build `a` and then test it, from a topic forked off main: the build's
+/// output reaches the test in the topic, where the build wrote it. In main, after adoption, the
+/// build hits the cache and restores only what it declares. Answers the `landAdoption`
+/// commitments the land sealed and the topic's landed head.
+async fn land_nx_project(
+    declared: bool,
+) -> (Vec<cowshed_core::api::dto::LandAdoptionCommitment>, String) {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::new();
+    write_nx_project(&fixture.checkout, &nx, &node, declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let links = nx
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "links"))
+        .unwrap_or(&nx)
+        .to_path_buf();
+    let (granted, _, stderr) = run(
+        &mut service,
+        [
+            OsString::from("grant"),
+            OsString::from("--project-wide"),
+            OsString::from("--read"),
+            links.into_os_string(),
+            OsString::from("--read"),
+            OsString::from("/nix/store"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        granted.unwrap_or_else(|error| panic!(
+            "grant Nx: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
+    assert_eq!(
+        created.unwrap_or_else(|error| panic!(
+            "new topic: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let topic = service.path("topic", false).await.expect("mounted topic");
+    fs::write(topic.mount.join("a/src.txt"), b"src, changed\n").unwrap();
+    git(&topic.mount, &["commit", "-q", "-am", "change a"]);
+    let landed_head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&topic.mount)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let check = |target: &str| {
+        format!(
+            "{} node_modules/nx/dist/bin/nx.js run-many -t {target}",
+            node.display()
+        )
+    };
+    let (landed, _, stderr) = run(
+        &mut service,
+        [
+            "land".to_owned(),
+            "topic".to_owned(),
+            // The undeclared output is untracked work in the topic, which a retire refuses.
+            "--no-retire".to_owned(),
+            "--check".to_owned(),
+            check("build"),
+            "--check".to_owned(),
+            check("test"),
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    assert_eq!(
+        landed.unwrap_or_else(|error| panic!("land: {error}; {stderr}")),
+        0,
+        "{stderr}"
+    );
+    eprintln!("land report: {stderr}");
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    (land_adoptions(&fixture.storage.telemetry()), landed_head)
+}
+
+/// A task output Nx is not told about is a 2b miss (16_build_volumes.md, Land step 7), and each
+/// miss is a durable `landAdoption` commitment naming the task (13_telemetry.md). Declaring the
+/// output makes the miss, and the record, disappear.
+#[tokio::test]
+async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment() {
+    let (adoptions, landed_head) = land_nx_project(false).await;
+    assert_eq!(
+        adoptions
+            .iter()
+            .map(|adoption| (adoption.task.as_str(), adoption.landed_head.as_str()))
+            .collect::<Vec<_>>(),
+        [("a:test", landed_head.as_str())],
+        "{adoptions:?}"
+    );
+    assert_ne!(
+        adoptions[0].landing_incarnation,
+        adoptions[0].target_incarnation
+    );
+    assert!(!adoptions[0].task_hash.is_empty());
+
+    let (adoptions, _) = land_nx_project(true).await;
+    assert_eq!(adoptions, [], "a declared output restores in main and hits");
+}
