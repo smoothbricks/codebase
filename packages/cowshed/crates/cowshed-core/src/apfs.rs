@@ -2306,16 +2306,19 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                 OsString::from("0"),
             ],
         );
-        let output = self.runner.run(&request)?;
-        if output.succeeded() || container_already_spans_image(&output) {
-            Ok(())
-        } else {
-            Err(ApfsError::CommandFailed {
-                operation: "grow APFS container into image",
-                request,
-                output,
-            })
-        }
+        // Timed like every other disk-tool call: `resizeContainer` queues on storagekitd too.
+        crate::timing::timed("apfs-command", format_args!("grow APFS container"), || {
+            let output = self.runner.run(&request)?;
+            if output.succeeded() || container_already_spans_image(&output) {
+                Ok(())
+            } else {
+                Err(ApfsError::CommandFailed {
+                    operation: "grow APFS container into image",
+                    request,
+                    output,
+                })
+            }
+        })
     }
 
     fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
