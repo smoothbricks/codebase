@@ -162,7 +162,7 @@ where
             if mounted.source_device != attachment.volume_device() {
                 continue;
             }
-            if same_path(&mounted.mount_point, &mount) {
+            if MountPoint::new(&mount).names(&mounted.mount_point) {
                 return Ok(mount);
             }
             return Err(ApfsStorageError::Host(format!(
@@ -178,11 +178,12 @@ where
 
     /// The kernel mount at `mount`, if a volume is mounted exactly there.
     fn mounted_at(&self, mount: &Path) -> Result<Option<String>, ApfsStorageError> {
+        let mount = MountPoint::new(mount);
         Ok(self
             .mount_source
             .mounts()?
             .into_iter()
-            .find(|mounted| same_path(&mounted.mount_point, mount))
+            .find(|mounted| mount.names(&mounted.mount_point))
             .map(|mounted| mounted.source_device))
     }
 
@@ -334,13 +335,28 @@ fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
     }
 }
 
-/// Whether two spellings name one directory: the kernel reports canonical mount points.
-fn same_path(left: &Path, right: &Path) -> bool {
-    left == right
-        || match (fs::canonicalize(left), fs::canonicalize(right)) {
-            (Ok(left), Ok(right)) => left == right,
-            _ => false,
+/// A path asked about, against the kernel's mount table. The kernel records a mount point as
+/// the path it resolved at mount time, so only the asked-for spelling needs resolving, once.
+/// Resolving each mounted filesystem's path instead `statfs`es every volume on the host, and
+/// one volume whose I/O is stalled -- a fresh clone whose extent map the store is still
+/// committing -- held a fork's `new build-volume` for 14-17 s.
+struct MountPoint<'a> {
+    given: &'a Path,
+    /// `None` when the path does not resolve: no directory, so nothing is mounted there.
+    canonical: Option<PathBuf>,
+}
+
+impl<'a> MountPoint<'a> {
+    fn new(given: &'a Path) -> Self {
+        Self {
+            given,
+            canonical: fs::canonicalize(given).ok(),
         }
+    }
+
+    fn names(&self, mounted: &Path) -> bool {
+        mounted == self.given || self.canonical.as_deref() == Some(mounted)
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
