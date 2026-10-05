@@ -329,16 +329,17 @@ Concrete targets come from concrete files:
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
   `cargo-test-compile` warms one workspace `cargo test --no-run`. `cargo-test-archive` runs one
-  `cargo --frozen nextest archive --workspace` into `target/nextest/archive.tar.zst` and is the only cached cargo BUILD:
-  it produces a file rather than a mutable build tree. Its inputs, like every cargo-derived fileset, are anchored at
-  `{workspaceRoot}`: Nx resolves a `{projectRoot}` glob against only the files its project owns, and a nested package
-  owns the crates under it, so a root workspace's archive spelled that way hashes none of its members and replays stale
-  binaries against edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s per-test timeout like
+  `cargo --frozen nextest archive --workspace` into `.cache/nextest/archive.tar.zst` and is the only cached cargo BUILD:
+  it produces a file outside the build-volume links rather than a mutable build tree. Nx cache restoration must never
+  replace Cargo's `target` link. Its inputs, like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx
+  resolves a `{projectRoot}` glob against only the files its project owns, and a nested package owns the crates under
+  it, so a root workspace's archive spelled that way hashes none of its members and replays stale binaries against
+  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s per-test timeout like
   `bun test --timeout=30000`) whose inputs include that crate and its path dependencies, and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they write nothing to cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`
-  hashes it and extracts it into `target/nextest/archive.tar.zst.extracted/<sha256>` unless a runner already did — one
+  hashes it and extracts it into `.cache/nextest/archive.tar.zst.extracted/<sha256>` unless a runner already did — one
   extracts, the others wait — so a workspace with ~200 test binaries and ~25 crates unpacks them once per archive
   instead of once per crate. The directory is keyed by the archive's bytes, so a rebuilt or cache-restored archive never
   runs an older extraction's binaries, and publishing one removes the others; it is never an Nx output.

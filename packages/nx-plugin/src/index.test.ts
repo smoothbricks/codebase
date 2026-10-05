@@ -879,7 +879,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // builds, re-resolves features, or writes cargo's flocked `target/`.
       expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-archive']?.cache).toBe(true);
-      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/target/nextest/archive.tar.zst']);
+      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive.tar.zst']);
       expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris' });
       // nextest does not create the archive's parent directory and fails the
       // whole build if it is missing (measured: "error writing to archive").
@@ -891,7 +891,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // `$PWD` because tool config paths must be absolute and an absolute path
       // in the command text would split one cache entry per checkout.
       expect(String(targets['cargo-test-archive']?.options?.command)).toMatch(
-        /^mkdir -p target\/nextest && cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^mkdir -p \.cache\/nextest && cargo --frozen nextest archive --workspace --archive-file \.cache\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
@@ -911,7 +911,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // moved tree). `--workspace` is not merely redundant here, nextest
       // rejects it beside a reused build.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js target\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -979,8 +979,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.clean?.cache).toBe(false);
       expect(targets.clean?.options?.outputs).toEqual([
         '{projectRoot}/dist',
+        '{workspaceRoot}/packages/ferris/.cache/nextest',
         '{workspaceRoot}/packages/ferris/target/cargo-lint-cross',
-        '{workspaceRoot}/packages/ferris/target/nextest',
       ]);
     } finally {
       await workspace.cleanup();
@@ -1138,7 +1138,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
       // At the root the helper is the root's own `node_modules` link, no `../`.
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
-        'extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js target/nextest/archive.tar.zst)" && ',
+        'extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && ',
       );
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
         `--target-dir-remap "$extracted/target" --workspace-remap . -E 'package(runtime-core)`,
@@ -1472,7 +1472,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           }),
         );
 
-      await workspace.write('packages/ferris/target/nextest/archive.tar.zst', 'first archive');
+      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'first archive');
       for (const run of await runAll()) {
         expect(run).toMatchObject({ exitCode: 0 });
       }
@@ -1485,7 +1485,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // A rebuilt archive is new bytes at the same path: the runners must not
       // execute what the old one unpacked, and the old unpacking is garbage.
-      await workspace.write('packages/ferris/target/nextest/archive.tar.zst', 'second archive');
+      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'second archive');
       for (const run of await runAll()) {
         expect(run).toMatchObject({ exitCode: 0 });
       }
@@ -1499,11 +1499,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'run second archive',
         'run second archive',
       ]);
-      const target = join(root, 'packages/ferris/target');
-      const unpacked = (await readdir(target, { recursive: true })).filter((path) =>
+      const archives = join(root, 'packages/ferris/.cache/nextest');
+      const unpacked = (await readdir(archives, { recursive: true })).filter((path) =>
         path.endsWith('binaries-metadata.json'),
       );
-      expect(await Promise.all(unpacked.map((path) => readFile(join(target, path), 'utf8')))).toEqual([
+      expect(await Promise.all(unpacked.map((path) => readFile(join(archives, path), 'utf8')))).toEqual([
         'second archive',
       ]);
     } finally {
@@ -1818,7 +1818,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-debug',
       ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js target\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -2390,8 +2390,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // A distinct archive file, declared as this target's output: the host
       // archive must survive a cross build and each must be cached as itself.
-      expect(archive?.outputs).toEqual(['{projectRoot}/target/nextest/archive-aarch64-apple-darwin.tar.zst']);
-      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/target/nextest/archive.tar.zst']);
+      expect(archive?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive-aarch64-apple-darwin.tar.zst']);
+      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive.tar.zst']);
       expect(archive?.cache).toBe(true);
       // Everything the host archive hashes, plus the declared driver: the
       // script that decides how the foreign link happens is an input of the
@@ -2407,7 +2407,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // `cargo-nextest`, not `cargo nextest`: cargo overwrites CARGO for its
       // subcommands, and CARGO is the only seam a cross cargo driver has.
       expect(String(archive?.options?.command)).toMatch(
-        /^mkdir -p target\/nextest && cargo-nextest nextest archive --workspace --target aarch64-apple-darwin --frozen --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^mkdir -p \.cache\/nextest && cargo-nextest nextest archive --workspace --target aarch64-apple-darwin --frozen --archive-file \.cache\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(archive?.configurations?.[RELEASE_CONFIGURATION]).toBeUndefined();
       expect(run?.configurations?.[RELEASE_CONFIGURATION]).toBeUndefined();
@@ -2416,7 +2416,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(archive?.dependsOn).toEqual(['cargo-fetch']);
       expect(run?.dependsOn).toEqual([]);
       expect(String(run?.options?.command)).toMatch(
-        /^cargo-nextest nextest run --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --workspace-remap \. --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^cargo-nextest nextest run --archive-file \.cache\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --workspace-remap \. --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(run?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       // Not a crate: the per-crate coverage policy reads `cargo-test-<name>`,

@@ -1293,7 +1293,7 @@ function darwinCrossTestTargetNames(options: CiWorkflowDefinitionOptions): strin
  * step carries exactly these archives, and upload-artifact roots an artifact at
  * the least common ancestor of the files it uploaded.
  *
- * One cargo workspace's triples all share `target/nextest` and travel together.
+ * One cargo workspace's triples all share `.cache/nextest` and travel together.
  * Two workspaces that each declare a darwin triple do not: their common
  * ancestor is above the directory the runner targets read from, so the pair is
  * refused here instead of restoring both archives one directory too high.

@@ -896,7 +896,7 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
 describe('renderCiWorkflowYaml with cross-built test archives', () => {
   const darwin = {
     triple: 'aarch64-apple-darwin',
-    path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst',
+    path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst',
   };
   const declared = options({
     runsOn: [...nixosRunsOn],
@@ -992,7 +992,7 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
     const rendered = renderCiWorkflowYaml(
       options({
         crossTestArchives: [
-          { triple: 'x86_64-unknown-linux-musl', path: 'target/nextest/archive-x86_64-unknown-linux-musl.tar.zst' },
+          { triple: 'x86_64-unknown-linux-musl', path: '.cache/nextest/archive-x86_64-unknown-linux-musl.tar.zst' },
         ],
       }),
     );
@@ -1041,7 +1041,7 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
     // workspace's archive would raise that root to the repository and restore
     // the darwin archive one directory below where its runner target opens it.
     expect(producing[0]?.with?.path?.trim()).toBe(darwin.path);
-    expect(download?.path).toBe('target/nextest');
+    expect(download?.path).toBe('.cache/nextest');
     expect(rendered).not.toContain(embedded.path);
   });
 
@@ -1075,19 +1075,19 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
       ),
     );
 
-    expect(execute).toContain('path: packages/ferris/target/nextest');
+    expect(execute).toContain('path: packages/ferris/.cache/nextest');
   });
 
   it('refuses declarations the Nx graph could not have produced, at render time', () => {
     expect(() =>
-      renderCiWorkflowYaml(options({ crossTestArchives: [{ ...darwin, path: 'target/nextest/archive.tar.zst' }] })),
-    ).toThrow('must be a repository-relative target/nextest/archive-aarch64-apple-darwin.tar.zst');
+      renderCiWorkflowYaml(options({ crossTestArchives: [{ ...darwin, path: '.cache/nextest/archive.tar.zst' }] })),
+    ).toThrow('must be a repository-relative .cache/nextest/archive-aarch64-apple-darwin.tar.zst');
     expect(() =>
       renderCiWorkflowYaml(options({ crossTestArchives: [{ ...darwin, path: `../${darwin.path}` }] })),
     ).toThrow('must stay inside the repository');
     expect(() =>
       renderCiWorkflowYaml(
-        options({ crossTestArchives: [{ triple: 'Bad Triple; rm -rf /', path: 'target/nextest/x.tar.zst' }] }),
+        options({ crossTestArchives: [{ triple: 'Bad Triple; rm -rf /', path: '.cache/nextest/x.tar.zst' }] }),
       ),
     ).toThrow('must be a target triple');
     // Two cargo workspaces cannot share one artifact: upload-artifact roots it
@@ -1113,5 +1113,5 @@ function crossTestJob(rendered: string): string {
 }
 
 function cargoArchive(triple: string): string {
-  return `target/nextest/archive-${triple}.tar.zst`;
+  return `.cache/nextest/archive-${triple}.tar.zst`;
 }

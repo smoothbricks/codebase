@@ -198,7 +198,7 @@ export function cargoCrossTestTargetName(triple: string): string {
  * the other's name.
  */
 export function cargoCrossTestArchiveFile(triple: string): string {
-  return `target/nextest/archive-${triple}.tar.zst`;
+  return `.cache/nextest/archive-${triple}.tar.zst`;
 }
 
 const CARGO_CROSS_TEST_ARCHIVE_PREFIX = cargoCrossTestArchiveTargetName('');

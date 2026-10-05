@@ -23,7 +23,7 @@ try {
       'nextest',
       'run',
       '--archive-file',
-      join(checkout, 'target/nextest/archive.tar.zst'),
+      join(checkout, '.cache/nextest/archive.tar.zst'),
       '--workspace-remap',
       checkout,
       '-E',

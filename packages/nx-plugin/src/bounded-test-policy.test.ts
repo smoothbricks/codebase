@@ -526,7 +526,7 @@ describe('cargo-test reachability policy', () => {
       const archiveOptions = new Map<string, Record<string, unknown>>([
         [
           'cargo-test-archive',
-          { command: 'cargo --frozen nextest archive --workspace --archive-file target/nextest/archive.tar.zst' },
+          { command: 'cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst' },
         ],
       ]);
       const archiveOnly: ResolvedProjectTargets = {
@@ -563,7 +563,7 @@ describe('cargo-test reachability policy', () => {
             'cargo-test-rusty-core',
             {
               command:
-                'extracted="$(node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js target/nextest/archive.tar.zst)" && ' +
+                'extracted="$(node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && ' +
                 'cargo --frozen nextest run --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" ' +
                 '--cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" ' +
                 "--workspace-remap . -E 'package(rusty-core)'",

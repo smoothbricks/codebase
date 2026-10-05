@@ -2394,7 +2394,7 @@ async function resolveCargoWorkspaces(
  * from `--archive-file` is the Rust standard library directory: nextest has no
  * flag to remap it, so a run uses the producing toolchain's own sysroot rather
  * than the archived copy of it — the same toolchain, because the archive's hash
- * covers the toolchain pin. The extraction lives under `target/nextest`, never
+ * covers the toolchain pin. The extraction lives under `.cache/nextest`, never
  * in an Nx output: it is a multi-GB tree for a cached verdict that has no
  * outputs.
  *

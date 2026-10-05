@@ -78,10 +78,10 @@ describe('managed publish platform discovery', () => {
         'acme-web': { root: 'packages/web', targets: { build: {}, 'cargo-cross-test-aarch64-apple-darwin': {} } },
       }),
     ).toEqual([
-      { triple: 'aarch64-apple-darwin', path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst' },
+      { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
       {
         triple: 'thumbv7em-none-eabihf',
-        path: 'packages/embedded/target/nextest/archive-thumbv7em-none-eabihf.tar.zst',
+        path: 'packages/embedded/.cache/nextest/archive-thumbv7em-none-eabihf.tar.zst',
       },
     ]);
     // A repository with no cross declaration has no such target, so the CI
@@ -417,7 +417,7 @@ describe('publish workflow rendering by repo shape', () => {
     const crossing: ManagedFileContext = {
       ...bare,
       crossTestArchives: [
-        { triple: 'aarch64-apple-darwin', path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst' },
+        { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
       ],
     };
 

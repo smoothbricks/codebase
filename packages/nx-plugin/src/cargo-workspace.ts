@@ -632,8 +632,10 @@ export const CARGO_TEST_ARCHIVE_TARGET = 'cargo-test-archive';
  * does NOT create this parent directory and fails the whole build when it is
  * missing ("error writing to archive ... No such file or directory"), so the
  * target mkdir's it first.
+ * The archive is an Nx-restored output, so it lives on the source volume, never
+ * beneath Cargo's symlinked target directory (16_build_volumes.md).
  */
-export const CARGO_TEST_ARCHIVE_FILE = 'target/nextest/archive.tar.zst';
+export const CARGO_TEST_ARCHIVE_FILE = '.cache/nextest/archive.tar.zst';
 
 /**
  * One foreign target triple this cargo workspace also archives its tests for.
