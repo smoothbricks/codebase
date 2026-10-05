@@ -142,11 +142,21 @@ mod tests {
     fn published_environment_strips_harness_ci_but_preserves_real_ci_and_compiler_identity() {
         use crate::fork_lock::Run;
 
-        let root = std::env::temp_dir().join(format!("cowshed-env-{}", uuid::Uuid::new_v4()));
+        /// Removes the fixture root however the test ends, a failed assertion included.
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("remove {}: {error}", self.0.display());
+                }
+            }
+        }
+        let root = Root(std::env::temp_dir().join(format!("cowshed-env-{}", uuid::Uuid::new_v4())));
+        let root = &root.0;
         std::fs::create_dir_all(root.join(".cowshed")).unwrap();
         let temp_dir = root.join("exec temp");
         write_workspace_environment(
-            &root,
+            root,
             &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
@@ -187,6 +197,5 @@ mod tests {
                 "{marker:?}",
             );
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
