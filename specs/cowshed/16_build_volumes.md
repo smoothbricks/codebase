@@ -50,12 +50,12 @@ follow from that, and a second volume removes each of them.
 
 ### What lives where
 
-| State                                                                                                | Volume                            | Shared how                                                |
-| ---------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
-| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs       | Source volume                     | Cloned with the workspace image                           |
-| Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph)     | Build volume                      | Cloned at fork; adopted by main at land                   |
-| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                          | Per checkout, never travels       | Deleted from a build volume before main adopts it (below) |
-| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache) | Shared cache paths (03_caches.md) | Written once, read by every checkout; never in any image  |
+| State                                                                                                                                                       | Volume                            | Shared how                                                |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                     | Cloned with the workspace image                           |
+| Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                      | Cloned at fork; adopted by main at land                   |
+| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels       | Deleted from a build volume before main adopts it (below) |
+| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md) | Written once, read by every checkout; never in any image  |
 
 The build volume holds exactly the state a build tool keeps **for one tree and keys by its own fingerprints**: state
 that is correct to reuse for any tree the tool checks against, but costly to rebuild and useless to share between two
@@ -142,9 +142,19 @@ home's package-cache locks, or none, in which case it is the shell's activation 
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
-`.nx/workspace-data`, and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/`
-whole. A capability that keeps no per-tree incremental state contributes none. A project with no build-state capability
-gets no build volume and pays nothing.
+`.nx/workspace-data`, a JavaScript package manager contributes the `node_modules/.cache` of every package it installed,
+and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/` whole. A capability that
+keeps no per-tree incremental state contributes none. A project with no build-state capability gets no build volume and
+pays nothing.
+
+A tool's own per-checkout state that no capability names belongs inside one that is named, never in the source tree
+beside an output. Measured on a consumer repository over three hours, with sessions holding clones of main: nextest's
+extracted test archive (2 GB, rewritten for every new archive) sat beside its archive under `.cache/nextest`, and lmao's
+SQLite trace sink (716 MB in one package, rewritten page by page on every test run) sat in each package's `.cache/`,
+together 2.7 GB of the 5 GB written into main's source image. Both are content-keyed or per-run tool state, not outputs:
+the nextest extraction now lives under the Cargo target directory (`<target_directory>/nextest-extracted`) and the trace
+sink under `node_modules/.cache/lmao`. A package's `.cache/` itself cannot be build state, because build tools declare
+their outputs there.
 
 ### Targets and seeds
 

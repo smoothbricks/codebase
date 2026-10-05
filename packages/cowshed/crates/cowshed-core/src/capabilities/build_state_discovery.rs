@@ -63,12 +63,18 @@ pub struct BuildStateDiscovery {
 /// inputs, so it must also name the discovery that found it: a cowshed that asks differently
 /// would otherwise keep an answer an earlier one got wrong, findings included, until a manifest
 /// happens to change. Bump it whenever discovery's questions or the environment they run in
-/// change. 2: Cargo is asked as a job, after the workspace shell's activation.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 2";
+/// change. 2: Cargo is asked as a job, after the workspace shell's activation. 3: installed
+/// JavaScript packages contribute their `node_modules/.cache`.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 3";
+
+/// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
+const PACKAGE_MANIFEST: &str = "package.json";
 
 /// Track the files Cargo reads, including unstaged edits, but not caller or untracked inputs.
-/// One index query supplies the path set; BLAKE3 hashes their working-tree bytes. Source-image
-/// clones inherit the matching fingerprint and links; capability config/markers and a new
+/// One index query supplies the path set; BLAKE3 hashes their working-tree bytes. A tracked
+/// `package.json` contributes whether its package is installed, not its bytes: only that decides
+/// its build state, and a dependency edit must not rediscover Cargo. Source-image clones inherit
+/// the matching fingerprint and links; capability config/markers and a new
 /// [`DISCOVERY_REVISION`] invalidate it.
 pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<String> {
     let mut digest = blake3::Hasher::new();
@@ -78,12 +84,13 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
-        let path = context
-            .workspace_root
-            .join(std::ffi::OsStr::from_bytes(name));
+        let relative = Path::new(std::ffi::OsStr::from_bytes(name));
+        let path = context.workspace_root.join(relative);
         digest.update(name);
         digest.update(&[0]);
-        if super::convention_file(context.workspace_root, &path)? {
+        if relative.file_name() == Some(std::ffi::OsStr::new(PACKAGE_MANIFEST)) {
+            digest.update(&[u8::from(installed_package(context.workspace_root, &path)?)]);
+        } else if super::convention_file(context.workspace_root, &path)? {
             let bytes = fs::read(&path).map_err(|error| super::detection_error(&path, error))?;
             digest.update(&[1]);
             digest.update(blake3::hash(&bytes).as_bytes());
@@ -100,7 +107,13 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
         Err(error) => return Err(super::detection_error(&config, error)),
     }
     let settings = super::workspace_config(context)?;
-    for detector in [&super::nx::DETECTOR, &super::codegraph::DETECTOR] {
+    for detector in [
+        &super::nx::DETECTOR,
+        &super::bun::DETECTOR,
+        &super::npm::DETECTOR,
+        &super::pnpm::DETECTOR,
+        &super::codegraph::DETECTOR,
+    ] {
         let setting = settings.capabilities().get(&detector.id);
         if setting.is_some_and(|setting| setting.disabled) {
             digest.update(&[0]);
@@ -379,6 +392,14 @@ pub fn discover_build_state(
         paths: detected.contribution.build_state,
         findings: Vec::new(),
     };
+    let caches = javascript_tool_caches(
+        context,
+        config.capabilities(),
+        &detected.active,
+        &mut tracked,
+    )?;
+    merge_build_state(&mut result.paths, caches)?;
+    result.paths.sort();
     let cargo_override = config.capabilities().get(&CapabilityId::Cargo);
     if cargo_override.is_some_and(|setting| setting.disabled) {
         return Ok(result);
@@ -524,6 +545,81 @@ struct CargoMetadata {
     target_directory: PathBuf,
 }
 
+/// The checkout-relative directory a JavaScript package's tools keep their per-tree state in:
+/// `node_modules/.cache/<tool>` of the package they run in (the find-cache-dir convention babel,
+/// webpack, ava and stryker follow, and lmao's trace sink).
+const TOOL_CACHE: &str = "node_modules/.cache";
+
+/// The JavaScript tool caches of every package a detected JavaScript package manager installed:
+/// a tracked `package.json` beside a real `node_modules` directory. Each contributes its own
+/// `node_modules/.cache` to the build volume. That directory is rewritten on every run, rebuilt
+/// when missing and reused only by the tree that wrote it, which is build state
+/// (16_build_volumes.md); left on the source volume, every run's writes fragment an image that
+/// clones share. A tracked `package.json` the package manager never installed, such as a
+/// fixture's, contributes nothing, and none under `node_modules` is a package of the project.
+fn javascript_tool_caches(
+    context: &DetectionContext<'_>,
+    overrides: &BTreeMap<CapabilityId, super::CapabilityOverride>,
+    active: &[CapabilityId],
+    tracked: &mut TrackedManifests,
+) -> Result<Vec<BuildStatePath>> {
+    let mut caches = Vec::new();
+    for id in [CapabilityId::Bun, CapabilityId::Npm, CapabilityId::Pnpm] {
+        if !active.contains(&id) {
+            continue;
+        }
+        let selected = overrides
+            .get(&id)
+            .and_then(|setting| setting.directory.as_ref())
+            .map(|directory| context.workspace_root.join(directory))
+            .unwrap_or_else(|| context.workspace_root.to_owned());
+        super::validate_project_directory(context.workspace_root, &selected)?;
+        let prefix = selected
+            .strip_prefix(context.workspace_root)
+            .expect("directory was contained");
+        for name in tracked
+            .inputs(context.workspace_root)?
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let manifest = Path::new(std::ffi::OsStr::from_bytes(name));
+            if !tracked_manifest(manifest, prefix, PACKAGE_MANIFEST)
+                || !installed_package(
+                    context.workspace_root,
+                    &context.workspace_root.join(manifest),
+                )?
+            {
+                continue;
+            }
+            let cache = manifest
+                .parent()
+                .expect("a manifest path names a file")
+                .join(TOOL_CACHE);
+            caches.push(BuildStatePath::from_paths(&cache, &cache)?);
+        }
+    }
+    caches.sort();
+    caches.dedup();
+    Ok(caches)
+}
+
+/// Whether the package whose tracked manifest is `manifest` is installed: the manifest is a file
+/// in the checkout and a real `node_modules` directory sits beside it.
+fn installed_package(workspace: &Path, manifest: &Path) -> Result<bool> {
+    if !super::convention_file(workspace, manifest)? {
+        return Ok(false);
+    }
+    let modules = manifest
+        .parent()
+        .expect("a manifest path names a file")
+        .join("node_modules");
+    match fs::symlink_metadata(&modules) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(super::detection_error(&modules, error)),
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TrackedManifests {
     inputs: Option<Vec<u8>>,
@@ -564,12 +660,18 @@ impl TrackedManifests {
 }
 
 fn tracked_manifest(path: &Path, prefix: &Path, manifest: &str) -> bool {
+    let excluded = match manifest {
+        "Cargo.toml" => Some("vendor"),
+        PACKAGE_MANIFEST => Some("node_modules"),
+        _ => None,
+    };
     path.file_name() == Some(std::ffi::OsStr::new(manifest))
         && path.starts_with(prefix)
-        && (manifest != "Cargo.toml"
-            || !path
+        && excluded.is_none_or(|excluded| {
+            !path
                 .components()
-                .any(|component| component.as_os_str() == "vendor"))
+                .any(|component| component.as_os_str() == excluded)
+        })
 }
 
 fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
@@ -586,6 +688,7 @@ fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
             ":(glob)**/Cargo.toml",
             ":(glob)**/.cargo/config*",
             ":(glob)**/go.mod",
+            ":(glob)**/package.json",
         ])
         .output_locked()
         .map_err(|error| crate::git::git_spawn_error(&error))?;
@@ -956,6 +1059,107 @@ mod tests {
         assert_eq!(
             cargo_paths(&fixture).paths,
             [BuildStatePath::new("rust/second-target", "rust/second-target").unwrap()]
+        );
+    }
+
+    /// A Bun workspace: the root and `packages/app` are installed, `packages/fixture` is a
+    /// tracked manifest nothing installed, and `node_modules/vendored` is a tracked dependency.
+    fn javascript_workspace(fixture: &Fixture) {
+        git(fixture, &["init", "--quiet"]);
+        for manifest in [
+            "package.json",
+            "packages/app/package.json",
+            "packages/fixture/package.json",
+            "node_modules/vendored/package.json",
+        ] {
+            write(fixture, manifest, "{}\n");
+        }
+        write(fixture, "bun.lock", "{}\n");
+        fs::create_dir_all(fixture.root.join("packages/app/node_modules")).unwrap();
+        git(fixture, &["add", "-f", "."]);
+    }
+
+    #[test]
+    fn installed_javascript_packages_contribute_their_tool_caches_and_nothing_else_does() {
+        let fixture = Fixture::new();
+        javascript_workspace(&fixture);
+        let state = cargo_paths(&fixture);
+        assert!(state.findings.is_empty(), "{:?}", state.findings);
+        assert_eq!(
+            state.paths,
+            [
+                BuildStatePath::new("node_modules/.cache", "node_modules/.cache").unwrap(),
+                BuildStatePath::new(
+                    "packages/app/node_modules/.cache",
+                    "packages/app/node_modules/.cache"
+                )
+                .unwrap(),
+            ]
+        );
+        assert!(
+            !fixture.root.join("node_modules/.cache").exists()
+                && !fixture.root.join("packages/fixture/node_modules").exists(),
+            "discovery creates nothing"
+        );
+
+        // An override narrows the packages to its directory; disabling the package manager, or
+        // removing its convention, contributes none.
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.bun]\ndirectory = \"packages/app\"\n",
+        );
+        write(&fixture, "packages/app/bun.lock", "{}\n");
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            [BuildStatePath::new(
+                "packages/app/node_modules/.cache",
+                "packages/app/node_modules/.cache"
+            )
+            .unwrap()]
+        );
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.bun]\ndisabled = true\n",
+        );
+        assert_eq!(cargo_paths(&fixture), BuildStateDiscovery::default());
+        fs::remove_file(fixture.root.join(".cowshed.toml")).unwrap();
+        fs::remove_file(fixture.root.join("bun.lock")).unwrap();
+        assert_eq!(cargo_paths(&fixture), BuildStateDiscovery::default());
+    }
+
+    #[test]
+    fn installing_a_package_refreshes_discovery_but_editing_its_manifest_does_not() {
+        let fixture = Fixture::new();
+        javascript_workspace(&fixture);
+        let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        write(
+            &fixture,
+            "packages/app/package.json",
+            "{\"dependencies\":{}}\n",
+        );
+        assert_eq!(
+            before,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            "a dependency edit leaves where tools write unchanged"
+        );
+        fs::create_dir(fixture.root.join("packages/fixture/node_modules")).unwrap();
+        assert_ne!(
+            before,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            "a newly installed package adds its tool cache"
+        );
+        fs::remove_dir(fixture.root.join("packages/fixture/node_modules")).unwrap();
+        assert_eq!(
+            before,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap()
+        );
+        fs::remove_file(fixture.root.join("bun.lock")).unwrap();
+        assert_ne!(
+            before,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            "the package manager's convention decides whether any cache is build state"
         );
     }
 }

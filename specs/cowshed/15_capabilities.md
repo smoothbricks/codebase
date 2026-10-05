@@ -29,9 +29,9 @@ path and failure.
 | Nx        | `nx.json`                                                                      | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records  |
 | cargo     | Tracked `Cargo.toml` files                                                     | Distinct workspaces' configured target dirs; shared registry/git caches and exact cache-state files; Git and trust  |
 | Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                            |
-| Bun       | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings                                                               |
-| npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                | npm content cache and JavaScript trust/proxy settings                                                               |
-| pnpm      | `package.json` and `pnpm-lock.yaml`                                            | pnpm store and JavaScript trust/proxy settings                                                                      |
+| Bun       | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
+| npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
+| pnpm      | `package.json` and `pnpm-lock.yaml`                                            | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                      |
 | uv        | `pyproject.toml` or `uv.lock`                                                  | uv cache and platform certificate opt-in                                                                            |
 | Zig       | `build.zig`                                                                    | Zig global cache                                                                                                    |
 | Gradle    | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts` | Gradle cache, not host credentials or configuration                                                                 |
@@ -68,6 +68,16 @@ Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depen
 the fingerprint's inputs, not an unrelated shell's override. Forks inherit the snapshot and fixed links without
 rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`; the `.codegraph/` directory marker contributes the
 whole index, including its database, journals and other per-tree state.
+
+A detected JavaScript package manager (Bun, npm or pnpm) contributes the `node_modules/.cache` of every package it
+installed: a tracked `package.json` beside a real `node_modules` directory, below the capability's selected directory
+and not itself inside a `node_modules`. `node_modules/.cache/<tool>` of the package a tool runs in is the JavaScript
+convention for per-tree tool state (find-cache-dir: babel, webpack, ava, stryker, lmao's trace sink), so the capability
+names the convention and never a tool. A tracked manifest nothing installed, such as a fixture's, gets nothing, so
+discovery never creates a `node_modules` in a fixture. The fingerprint records each tracked `package.json` path with
+whether its package is installed, never its bytes: a dependency edit does not change where any tool writes, and must not
+rediscover Cargo. Why: lmao's trace sink rewrote a SQLite database of 716 MB in place on every test run of one package
+of the consumer repository, inside the source image that every session clone shares.
 
 A project may keep its Nix files away from its root and reach them from its `.envrc`, for example with
 `cd tooling/shell` and then `. envrc.sh`. The Nix convention therefore also holds when the `.envrc` chain reaches Nix.
