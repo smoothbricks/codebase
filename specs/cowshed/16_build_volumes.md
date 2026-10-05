@@ -97,6 +97,14 @@ A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no
 configuration file ever names a build volume directly.
 
+Mounting a checkout mounts the volume its link names only when that volume's sidecar records the checkout as its linker,
+or the volume has no sidecar yet (a creation in progress, whose sidecar is written last). Any other link is stale and is
+re-pointed at the one volume recorded as the checkout's; none or several refuses. Why: the link lives inside the source
+image, so a restored checkpoint carries the link it had when taken, and a land interrupted between renaming a target's
+link and updating the sidecars leaves the target naming the landing volume. Mounting such a link as found would let the
+checkout write a volume a target or another checkout owns, or one already collected. A restore therefore never rewinds
+the build volume.
+
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
 `.nx/workspace-data`, and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/`

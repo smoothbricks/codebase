@@ -8539,16 +8539,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 info.git_worktree,
             )
             .await?;
-        // A checkpoint's image carries the build link it had when taken; the workspace keeps the
-        // volume it links now (16_build_volumes.md, "One link per checkout"), which a restore
-        // never rewinds: that older volume may be collected, or adopted by a target since.
-        let linked_now = match self
-            .build_volumes()?
-            .linked(&current_snapshot_mount(self, &current)?)?
-        {
-            Some(id) => Some(self.build_volumes()?.layout_mount(&id)),
-            None => None,
-        };
         let stopped = self.stop_supervisor(&workspace).await?;
         require_lost_groups_released(&workspace, &stopped, "restore").await?;
         let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
@@ -8584,19 +8574,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await;
         drop(stopped);
         match result {
+            // The restored image carries the build link it had when the checkpoint was taken;
+            // mounting it re-points a stale one at the workspace's own volume
+            // (`BuildVolumeLayout::resolve_link`), so a restore never rewinds the build volume.
             Ok(_) => {
-                let restored = self.current(&workspace).await?;
-                if let Some(mount) = linked_now
-                    && matches!(
-                        restored.derived.mount_state,
-                        crate::storage::lifecycle::MountState::Mounted { .. }
-                    )
-                {
-                    crate::build_volume::link::point(
-                        &current_snapshot_mount(self, &restored)?,
-                        &mount,
-                    )?;
-                }
                 self.ensure_supervisor(&workspace).await?;
                 Ok(())
             }

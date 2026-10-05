@@ -4154,16 +4154,16 @@ where
 
     fn ensure_linked_build_volume(
         &self,
-        repo: &RepoId,
+        workspace: &LifecycleWorkspace,
         checkout: &Path,
     ) -> Result<(), ApfsStorageError> {
-        let Some(target) = crate::build_volume::link::linked(checkout)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
-        else {
+        let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
+        let Some(target) = crate::build_volume::link::linked(checkout).map_err(host)? else {
             return Ok(());
         };
-        let layout =
-            crate::build_volume::BuildVolumeLayout::new(layout(&self.config, repo)?.project())?;
+        let layout = crate::build_volume::BuildVolumeLayout::new(
+            layout(&self.config, workspace.repo())?.project(),
+        )?;
         let id = layout.volume_at(&target).ok_or_else(|| {
             ApfsStorageError::Host(format!(
                 "{} names {}, which is not one of this project's build volumes",
@@ -4171,7 +4171,15 @@ where
                 target.display()
             ))
         })?;
-        self.mount_build_volume(&layout, &id).map(|_| ())
+        match layout.resolve_link(workspace.name(), &id).map_err(host)? {
+            crate::build_volume::LinkResolution::Keep => {
+                self.mount_build_volume(&layout, &id).map(|_| ())
+            }
+            crate::build_volume::LinkResolution::Repoint(own) => {
+                let mount = self.mount_build_volume(&layout, &own)?;
+                crate::build_volume::link::point(checkout, &mount).map_err(host)
+            }
+        }
     }
 
     fn resize(

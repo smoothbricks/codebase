@@ -523,7 +523,7 @@ impl ApfsExecutionHost for FakeHost {
 
     fn ensure_linked_build_volume(
         &self,
-        _: &RepoId,
+        _: &LifecycleWorkspace,
         checkout: &Path,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("ensure-build-volume:{}", checkout.display()));

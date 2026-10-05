@@ -295,6 +295,15 @@ fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> cr
     )
 }
 
+/// What a checkout's build link should become before its volume is mounted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkResolution {
+    /// The link names the checkout's own volume.
+    Keep,
+    /// The link is stale; it names this volume, the one recorded as the checkout's.
+    Repoint(BuildVolumeId),
+}
+
 /// Where one project's build volumes live.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildVolumeLayout {
@@ -420,6 +429,48 @@ impl BuildVolumeLayout {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    /// The volume `checkout`'s build link should name, given that it names `linked`
+    /// (16_build_volumes.md, "One link per checkout"). The link is kept when its volume is
+    /// recorded as linked by `checkout`, or has no record yet (a migration or fork in progress,
+    /// whose record is written last). Otherwise the link is stale: a restored checkpoint carries
+    /// the link it had when taken, and an interrupted land can leave a target naming the
+    /// landing volume before its record moved. It is then re-pointed at the one volume recorded
+    /// as `checkout`'s; none, or several, refuses, so a checkout never writes a volume another
+    /// checkout, a target or a seed owns.
+    pub fn resolve_link(
+        &self,
+        checkout: &WorkspaceName,
+        linked: &BuildVolumeId,
+    ) -> crate::Result<LinkResolution> {
+        let owns = |record: &BuildVolumeRecord| matches!(&record.role, BuildVolumeRole::Linked { checkout: owner } if owner == checkout);
+        match self.read_record_present(linked)? {
+            Some(record) if owns(&record) => return Ok(LinkResolution::Keep),
+            None if self.image(linked).exists() => return Ok(LinkResolution::Keep),
+            _ => {}
+        }
+        let mut owned = Vec::new();
+        for id in self.list()? {
+            if self
+                .read_record_present(&id)?
+                .is_some_and(|record| owns(&record))
+            {
+                owned.push(id);
+            }
+        }
+        match owned.as_slice() {
+            [id] => Ok(LinkResolution::Repoint(id.clone())),
+            _ => Err(crate::CowshedError::integrity(
+                format!(
+                    "{checkout}'s build link names {linked}, which {checkout} does not own, and {} \
+                     build volumes are recorded as {checkout}'s{}",
+                    owned.len(),
+                    owned.iter().map(|id| format!(" {id}")).collect::<String>()
+                ),
+                "cowshed doctor --json",
+            )),
+        }
     }
 
     /// The latest seed of `target` at `incarnation`. Two seeds of one target are an
@@ -669,5 +720,64 @@ mod tests {
             .with_discovered(&inside, "new".to_owned(), Path::new("/v"))
             .unwrap_err();
         assert!(error.message.contains("target/sub"), "{error:?}");
+    }
+
+    /// A restored checkpoint, or a land interrupted between moving a target's link and its
+    /// records, leaves a link naming a volume the checkout does not own: mounting re-points it at
+    /// the checkout's own volume, and refuses when there is none to point at.
+    #[test]
+    fn a_stale_build_link_is_repointed_at_the_checkouts_own_volume() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-build-resolve-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project = ProjectPaths::with_mount_root(
+            &root,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let topic = WorkspaceName::new("topic").unwrap();
+        let volume = |role: Option<BuildVolumeRole>| {
+            let id = BuildVolumeId::mint();
+            fs::write(layout.image(&id), b"").unwrap();
+            if let Some(role) = role {
+                layout
+                    .write_record(&id, &BuildVolumeRecord::new(None, role))
+                    .unwrap();
+            }
+            id
+        };
+        let linked = |name: &WorkspaceName| {
+            Some(BuildVolumeRole::Linked {
+                checkout: name.clone(),
+            })
+        };
+        let own = volume(linked(&topic));
+        let unrecorded = volume(None);
+        let adopted = volume(linked(&WorkspaceName::main()));
+        let collected = BuildVolumeId::mint();
+        assert_eq!(
+            layout.resolve_link(&topic, &own).unwrap(),
+            LinkResolution::Keep
+        );
+        assert_eq!(
+            layout.resolve_link(&topic, &unrecorded).unwrap(),
+            LinkResolution::Keep,
+            "a creation in progress keeps the link that protects it"
+        );
+        for stale in [&adopted, &collected] {
+            assert_eq!(
+                layout.resolve_link(&topic, stale).unwrap(),
+                LinkResolution::Repoint(own.clone()),
+                "{stale}"
+            );
+        }
+        let orphan = WorkspaceName::new("orphan").unwrap();
+        let error = layout.resolve_link(&orphan, &adopted).unwrap_err();
+        assert!(error.message.contains("0 build volumes"), "{error:?}");
+        fs::remove_dir_all(&root).unwrap();
     }
 }

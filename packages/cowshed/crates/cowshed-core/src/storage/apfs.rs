@@ -502,10 +502,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     /// Mount the build volume the checkout mounted at `checkout` links, when it links one
     /// (16_build_volumes.md, "One link per checkout"): a mounted checkout's build-state paths
-    /// always resolve into a mounted volume.
+    /// always resolve into a mounted volume, and a stale link is re-pointed at `workspace`'s own
+    /// volume first (`BuildVolumeLayout::resolve_link`).
     fn ensure_linked_build_volume(
         &self,
-        repo: &RepoId,
+        workspace: &LifecycleWorkspace,
         checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
     /// Grow the workspace's image to `capacity` and restore the mount state it was found in.
@@ -1691,7 +1692,7 @@ where
                 .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
             if matches!(state, MountState::Mounted { .. }) {
                 host.validate_marker(&mount_point, &MarkerExpectation::owned(&config, &workspace))?;
-                host.ensure_linked_build_volume(workspace.repo(), &mount_point)?;
+                host.ensure_linked_build_volume(&workspace, &mount_point)?;
                 return Ok(mount_point);
             }
             let canonical = canonical_image_path(&config, &workspace)?;
@@ -1713,7 +1714,7 @@ where
                 return detach_after_failure(host.as_ref(), attachment, primary, "mount workspace");
             }
             host.retain_mounted(&workspace, attachment)?;
-            host.ensure_linked_build_volume(workspace.repo(), &mount_point)?;
+            host.ensure_linked_build_volume(&workspace, &mount_point)?;
             Ok(mount_point)
         })
         .await
