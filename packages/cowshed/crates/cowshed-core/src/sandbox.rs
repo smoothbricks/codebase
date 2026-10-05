@@ -165,6 +165,12 @@ pub struct SandboxConfig {
     /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
     /// baseline.
     pub git_worktree_repository: Option<PathBuf>,
+    /// The physical build volume selected by the controller at this job's admission.
+    ///
+    /// Build state stays writable even when source is read-only. Never derive this authority
+    /// from a repository-controlled symlink while rendering policy; the controller resolves
+    /// the checkout's current owned volume through its validated project layout.
+    pub build_volume_mount: Option<PathBuf>,
     /// The project capabilities detected in this workspace for this mode
     /// ([`SandboxConfig::configure_capabilities`]): every tool-specific grant, cache mount,
     /// socket and environment entry a child receives comes from here, never from a tool table.
@@ -203,6 +209,7 @@ impl SandboxConfig {
             allowed_unix_sockets: capabilities.contribution.unix_sockets.clone(),
             additional_denies: self.additional_denies.clone(),
             git_worktree_repository: self.git_worktree_repository.clone(),
+            build_volume_mount: self.build_volume_mount.clone(),
             capabilities,
         }
     }
@@ -294,6 +301,8 @@ pub struct WorkspaceSandbox<'a> {
     pub repository_deny: &'a [PathBuf],
     /// The `.git` of main's mount, for a git-worktree workspace only.
     pub git_worktree_repository: Option<PathBuf>,
+    /// The checkout's current owned build-volume mount, resolved by the controller.
+    pub build_volume_mount: Option<PathBuf>,
     pub workspace_mount: PathBuf,
     /// The workspace's `TMPDIR`: [`crate::storage::StorageLayout::exec_temp_dir`].
     pub exec_temp_dir: PathBuf,
@@ -313,6 +322,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         grants,
         repository_deny,
         git_worktree_repository,
+        build_volume_mount,
         workspace_mount: mount,
         exec_temp_dir,
     } = workspace;
@@ -359,6 +369,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         allowed_unix_sockets: Vec::new(),
         additional_denies,
         git_worktree_repository,
+        build_volume_mount,
         capabilities: DetectedCapabilities::default(),
     };
     // The supervisor is the trusted tier of the same workspace; it gets the same capability
@@ -398,6 +409,7 @@ pub enum SandboxError {
     InvalidPortBlock { base: u16, size: u16 },
     InvalidPath { path: PathBuf, reason: &'static str },
     GrantIntersectsDeny { grant: PathBuf, deny: PathBuf },
+    DenyResolution { path: PathBuf, cause: String },
 }
 
 impl fmt::Display for SandboxError {
@@ -419,6 +431,11 @@ impl fmt::Display for SandboxError {
                 "grant {} intersects protected path {}",
                 grant.display(),
                 deny.display()
+            ),
+            Self::DenyResolution { path, cause } => write!(
+                formatter,
+                "cannot resolve workspace deny {}: {cause}",
+                path.display()
             ),
         }
     }
@@ -460,7 +477,53 @@ fn validated_sandbox_paths(
     if let Some(repository) = &config.git_worktree_repository {
         validate_path(repository)?;
     }
+    if let Some(volume) = &config.build_volume_mount {
+        validate_path(volume)?;
+        let valid = volume
+            .strip_prefix(&config.mount_root)
+            .is_ok_and(|relative| {
+                relative.starts_with(".build")
+                    && relative.components().count() == 4
+                    && relative
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .is_some_and(|id| {
+                            id.len() == 32
+                                && id.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+            });
+        if !valid {
+            return Err(SandboxError::InvalidPath {
+                path: volume.clone(),
+                reason: "a build grant must name one volume under the host mount root's .build/owner/repo directory",
+            });
+        }
+        if paths_intersect(volume, &config.workspace_mount) {
+            return Err(SandboxError::InvalidPath {
+                path: volume.clone(),
+                reason: "a build volume must be outside the source workspace",
+            });
+        }
+    }
     let hard_denies = hard_denies(&config.home, &config.mount_root, &config.additional_denies)?;
+    if let Some(volume) = &config.build_volume_mount
+        && let Some(deny) = hard_denies.iter().find(|deny| {
+            let boundary = deny.as_ref();
+            (boundary != cowshed_root() && boundary != config.mount_root
+                || config
+                    .additional_denies
+                    .iter()
+                    .any(|extra| extra == boundary))
+                && paths_intersect(volume, boundary)
+        })
+    {
+        return Err(SandboxError::GrantIntersectsDeny {
+            grant: volume.clone(),
+            deny: deny.as_ref().to_owned(),
+        });
+    }
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
@@ -721,6 +784,12 @@ pub fn seatbelt_profile(
     for grant in &contribution.grants {
         push_capability_grant(&mut profile, &config.home, grant)?;
     }
+    // Build state is not source. Grant only the controller-selected physical volume, after
+    // the store and mount-tree denies; sibling volumes and images remain inaccessible.
+    if let Some(volume) = &config.build_volume_mount {
+        push_readable_ancestors(&mut profile, volume)?;
+        push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", volume)?;
+    }
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
         push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
@@ -743,6 +812,17 @@ pub fn seatbelt_profile(
                 operations,
                 &config.workspace_mount.join(relative),
             )?;
+            if let Some(volume) = &config.build_volume_mount {
+                let resolved = resolve_deny(&config.workspace_mount.join(relative))?;
+                if let Ok(relative) = resolved.strip_prefix(volume) {
+                    let mut parent = volume.clone();
+                    for component in relative.components() {
+                        parent.push(component);
+                        push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
+                    }
+                    push_exact_and_subpath_rule(&mut profile, operations, &resolved)?;
+                }
+            }
         }
     }
     let workspace_metadata = config.workspace_mount.join(".cowshed");
@@ -950,6 +1030,41 @@ fn normalized_paths(paths: &[PathBuf]) -> Result<Vec<&Path>, SandboxError> {
     Ok(paths)
 }
 
+/// Resolve a deny even when its leaf has not been created. This adds no authority: only
+/// deny rules beneath an already controller-selected physical build volume use the result.
+fn resolve_deny(path: &Path) -> Result<PathBuf, SandboxError> {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for part in suffix.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = existing.file_name() else {
+                    return Err(SandboxError::DenyResolution {
+                        path: path.to_owned(),
+                        cause: error.to_string(),
+                    });
+                };
+                suffix.push(name);
+                existing = existing
+                    .parent()
+                    .expect("an absolute named path has a parent");
+            }
+            Err(error) => {
+                return Err(SandboxError::DenyResolution {
+                    path: path.to_owned(),
+                    cause: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
 fn validate_path(path: &Path) -> Result<(), SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::InvalidPath {
@@ -1116,8 +1231,160 @@ mod tests {
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             additional_denies: vec![],
             git_worktree_repository: None,
+            build_volume_mount: None,
             capabilities: DetectedCapabilities::default(),
         }
+    }
+
+    #[test]
+    fn build_volume_grants_require_one_external_mount_and_preserve_explicit_denies() {
+        let mut sandbox = config(RunSandboxMode::ReadOnly);
+        let volume = sandbox
+            .mount_root
+            .join(".build/example-org/example-app/0123456789abcdef0123456789abcdef");
+        sandbox.build_volume_mount = Some(volume.clone());
+        validate_sandbox_config(&sandbox).unwrap();
+        let contribution = sandbox.capabilities.clone();
+        assert_eq!(
+            sandbox.with_capabilities(contribution).build_volume_mount,
+            Some(volume.clone())
+        );
+        for bad in [
+            PathBuf::from("relative"),
+            sandbox.mount_root.clone(),
+            volume.parent().unwrap().to_owned(),
+            sandbox
+                .mount_root
+                .join(".build/example-org/example-app/not-a-volume"),
+            sandbox.workspace_mount.clone(),
+        ] {
+            sandbox.build_volume_mount = Some(bad);
+            assert!(validate_sandbox_config(&sandbox).is_err());
+        }
+        sandbox.build_volume_mount = Some(volume.clone());
+        sandbox
+            .additional_denies
+            .push(volume.parent().unwrap().to_owned());
+        assert!(matches!(
+            validate_sandbox_config(&sandbox),
+            Err(SandboxError::GrantIntersectsDeny { .. })
+        ));
+        sandbox.additional_denies.clear();
+        sandbox.workspace_mount = volume.parent().unwrap().to_owned();
+        assert!(matches!(
+            validate_sandbox_config(&sandbox),
+            Err(SandboxError::InvalidPath { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_volume_is_writable_with_read_only_source_and_a_pivot_changes_only_new_job_authority() {
+        let fixture = crate::capabilities::test_support::Fixture::new();
+        let mut sandbox = config(RunSandboxMode::ReadOnly);
+        sandbox.home = fixture.home.clone();
+        sandbox.mount_root = fixture.root.join("mounts");
+        sandbox.workspace_mount = sandbox.mount_root.join("workspace");
+        sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        let volumes = sandbox.mount_root.join(".build/example-org/example-app");
+        let first = volumes.join("0123456789abcdef0123456789abcdef");
+        let second = volumes.join("abcdef0123456789abcdef0123456789");
+        fs::create_dir_all(&sandbox.workspace_mount).unwrap();
+        fs::create_dir_all(&sandbox.exec_temp_dir).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let paths = vec![
+            crate::capabilities::BuildStatePath::new("target", "target").unwrap(),
+            crate::capabilities::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+        ];
+        crate::build_volume::link::point(&sandbox.workspace_mount, &first).unwrap();
+        crate::build_volume::link::link_paths(&sandbox.workspace_mount, &first, &paths).unwrap();
+        crate::build_volume::link::link_paths(&sandbox.workspace_mount, &second, &paths).unwrap();
+        sandbox.build_volume_mount = Some(first.clone());
+        sandbox
+            .grants
+            .deny_write
+            .push(PathBuf::from("target/blocked"));
+        let old = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let touch = |profile: &str, path: &Path| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--", "/usr/bin/touch"])
+                .arg(path)
+                .output_locked()
+                .unwrap()
+        };
+        for path in ["target/cargo-output", ".nx/cache/nx-output"] {
+            let output = touch(&old, &sandbox.workspace_mount.join(path));
+            assert!(output.status.success(), "{path}: {output:?}");
+        }
+        assert!(
+            !touch(&old, &sandbox.workspace_mount.join("source.rs"))
+                .status
+                .success()
+        );
+        assert!(
+            !touch(&old, &sandbox.workspace_mount.join("target/blocked"))
+                .status
+                .success(),
+            "build authority cannot override a workspace-relative deny"
+        );
+        assert!(
+            !touch(&old, &second.join("target/sibling-output"))
+                .status
+                .success()
+        );
+        crate::build_volume::link::point(&sandbox.workspace_mount, &second).unwrap();
+        assert!(
+            !touch(&old, &sandbox.workspace_mount.join("target/after-pivot"))
+                .status
+                .success(),
+            "an old job never acquires the new volume"
+        );
+        assert!(
+            touch(&old, &first.join("target/still-owned"))
+                .status
+                .success()
+        );
+        sandbox.build_volume_mount = Some(second.clone());
+        let new = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(
+            touch(&new, &sandbox.workspace_mount.join("target/after-pivot"))
+                .status
+                .success()
+        );
+        assert!(
+            !touch(&new, &first.join("target/old-volume"))
+                .status
+                .success()
+        );
+        assert!(
+            !touch(&new, &sandbox.workspace_mount.join("source.rs"))
+                .status
+                .success()
+        );
+        sandbox.mode = RunSandboxMode::ReadWrite;
+        let writable_source =
+            seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(
+            touch(&writable_source, &sandbox.workspace_mount.join("source.rs"))
+                .status
+                .success()
+        );
+        assert!(
+            touch(
+                &writable_source,
+                &sandbox.workspace_mount.join(".nx/cache/rw-output")
+            )
+            .status
+            .success()
+        );
+        assert!(
+            !touch(&writable_source, &first.join("target/sibling-output"))
+                .status
+                .success()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1455,6 +1722,7 @@ mod tests {
                 grants: &grants,
                 repository_deny: &[],
                 git_worktree_repository: None,
+                build_volume_mount: None,
                 workspace_mount: mount.to_path_buf(),
                 exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             })
@@ -1555,6 +1823,7 @@ mod tests {
             grants: &grants,
             repository_deny: &[PathBuf::from("c"), PathBuf::from("a")],
             git_worktree_repository: None,
+            build_volume_mount: None,
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
         })

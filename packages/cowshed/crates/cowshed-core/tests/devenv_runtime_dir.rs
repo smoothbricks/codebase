@@ -105,6 +105,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         additional_denies: Vec::new(),
         shed_links: Vec::new(),
         git_worktree_repository: None,
+        build_volume_mount: None,
         capabilities: Default::default(),
     }
 }
@@ -1492,6 +1493,7 @@ fn production_workspace(
         },
         repository_deny,
         git_worktree_repository: None,
+        build_volume_mount: None,
         workspace_mount: mount,
         exec_temp_dir,
     })

@@ -12951,6 +12951,7 @@ mod grant_unit_tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
+            build_volume_mount: None,
             capabilities: Default::default(),
         }
     }
@@ -13284,6 +13285,10 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
             CowshedError::usage(error.to_string(), "choose an absolute filesystem path")
         }
         crate::sandbox::SandboxError::InvalidPortBlock { .. } => native_integrity_error(error),
+        crate::sandbox::SandboxError::DenyResolution { .. } => CowshedError::environment_missing(
+            error.to_string(),
+            "repair the named deny path and retry",
+        ),
     })
 }
 
@@ -13307,6 +13312,7 @@ fn supervisor_sandbox(
         grants,
         repository_deny: repository.sandbox_deny(),
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
+        build_volume_mount: None,
         workspace_mount: mount,
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)

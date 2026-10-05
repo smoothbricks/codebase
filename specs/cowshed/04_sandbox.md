@@ -738,6 +738,14 @@ task history from the checked-in plugins, which any read-write job would run any
 client under the client's own boundary. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the
 workspace, or the capability's override directory.
 
+Build-volume write authority is a controller-only `build_volume_mount` selected for each job, not a filesystem grant in
+a repository's configuration or a path accepted from a job request. It names exactly one physical mount beneath the
+host's `.build/<owner>/<repo>/<id>` tree, outside source; explicit policy and credential denies still win. Only that
+volume is carved back through the mount-tree deny, in both source read-write and source read-only modes. A declared
+workspace-relative deny beneath a fixed build-state link also denies the resolved volume path and its rename/unlink
+ancestors, including a leaf not created yet. Selecting a new volume does not grant a sibling volume to an already
+running job: its compiled profile keeps its old physical authority.
+
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
 the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree; a host shell of a cowshed checkout reaches the same
 leaf through a short link (the managed devenv's `NX_SOCKET_DIR`), because the checkout path is too long for Nx's

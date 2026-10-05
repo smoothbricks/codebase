@@ -389,6 +389,7 @@ mod tests {
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
+            build_volume_mount: None,
             capabilities: Default::default(),
         };
         sandbox.configure_capabilities().unwrap();

@@ -441,13 +441,13 @@ fn map_sandbox_error(error: SandboxError) -> ExecError {
         SandboxError::GrantIntersectsDeny { .. } => ExecError::SandboxDenied {
             message: error.to_string(),
         },
-        SandboxError::InvalidPortBlock { .. } | SandboxError::InvalidPath { .. } => {
-            ExecError::WrapperFailure {
-                stage: WrapperStage::ValidateProfile,
-                message: error.to_string(),
-                source: None,
-            }
-        }
+        SandboxError::InvalidPortBlock { .. }
+        | SandboxError::InvalidPath { .. }
+        | SandboxError::DenyResolution { .. } => ExecError::WrapperFailure {
+            stage: WrapperStage::ValidateProfile,
+            message: error.to_string(),
+            source: None,
+        },
     }
 }
 
@@ -502,6 +502,7 @@ mod tests {
                 additional_denies: vec![],
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
+                build_volume_mount: None,
                 capabilities: Default::default(),
             }
         }
