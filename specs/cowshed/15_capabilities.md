@@ -62,6 +62,9 @@ Each detector returns data through one `CapabilityContribution`:
   descriptor. The same descriptor supplies environment, preparation and sandbox authority; no second table owns cache
   permissions. Only detected capabilities use their cache mounts. Without provisioned shared caches a tool uses private
   state.
+- **Build state:** `BuildStatePath` pairs a normalized checkout-relative tool path with its normalized volume-relative
+  destination (16_build_volumes.md). Overlapping contributions fail; identical ones coalesce. The storage implementation
+  applies fixed relative links through the checkout's one `.cowshed/build` link.
 - **Daemon isolation:** private directories to create and workspace-relative inherited state to discard at mint. The
   detector owns the convention-specific paths; the clone implementation only applies the returned paths.
 - **Unix sockets:** canonical, individually admitted host service sockets. No wildcard socket grants or in-sandbox

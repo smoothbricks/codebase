@@ -10,7 +10,9 @@ use std::path::{Component, Path, PathBuf};
 use crate::{CowshedError, Result};
 use cache::{HostCache, SharedLayout, SharedToolHome};
 
+mod build_state;
 mod bun;
+pub use build_state::{BuildStatePath, RelPath};
 pub mod cache;
 pub mod cargo;
 mod direnv;
@@ -170,6 +172,8 @@ pub struct CapabilityContribution {
     pub env: BTreeMap<&'static str, EnvAction>,
     pub grants: Vec<CapabilityGrant>,
     pub cache_mounts: Vec<CacheMount>,
+    /// Checkout-relative tool paths and their destinations relative to the build volume.
+    pub build_state: Vec<BuildStatePath>,
     pub daemon_isolation: DaemonIsolation,
     pub unix_sockets: Vec<PathBuf>,
     pub bootstrap_programs: Vec<BootstrapProgram>,
@@ -337,6 +341,41 @@ enum ContributionKey {
     Shell,
 }
 
+fn merge_build_state(
+    output: &mut Vec<BuildStatePath>,
+    incoming: Vec<BuildStatePath>,
+) -> Result<()> {
+    for path in incoming {
+        for prior in output.iter() {
+            if prior != &path
+                && (prior
+                    .checkout
+                    .as_path()
+                    .starts_with(path.checkout.as_path())
+                    || path
+                        .checkout
+                        .as_path()
+                        .starts_with(prior.checkout.as_path())
+                    || prior.volume.as_path().starts_with(path.volume.as_path())
+                    || path.volume.as_path().starts_with(prior.volume.as_path()))
+            {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "overlapping capability build-state paths {} -> {} and {} -> {}",
+                        prior.checkout.as_path().display(),
+                        prior.volume.as_path().display(),
+                        path.checkout.as_path().display(),
+                        path.volume.as_path().display(),
+                    ),
+                    "repair the conflicting capability build-state contributions",
+                ));
+            }
+        }
+        output.push(path);
+    }
+    Ok(())
+}
+
 fn merge(
     output: &mut CapabilityContribution,
     owners: &mut BTreeMap<ContributionKey, CapabilityId>,
@@ -418,6 +457,7 @@ fn merge(
     }
     output.grants.extend(contribution.grants);
     output.cache_mounts.extend(contribution.cache_mounts);
+    merge_build_state(&mut output.build_state, contribution.build_state)?;
     output
         .daemon_isolation
         .directories
@@ -475,6 +515,8 @@ fn normalize(contribution: &mut CapabilityContribution) {
     }
     contribution.cache_mounts.sort();
     contribution.cache_mounts.dedup();
+    contribution.build_state.sort();
+    contribution.build_state.dedup();
     contribution.daemon_isolation.directories.sort();
     contribution.daemon_isolation.directories.dedup();
     contribution.daemon_isolation.discard_at_mint.sort();

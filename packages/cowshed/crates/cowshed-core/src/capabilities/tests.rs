@@ -231,6 +231,36 @@ fn normalization_coalesces_grants_without_broadening_literals() {
 }
 
 #[test]
+fn overlapping_build_state_contributions_are_refused_and_identical_ones_coalesce() {
+    let path = |checkout, volume| BuildStatePath::new(checkout, volume).unwrap();
+    for conflicting in [
+        path("target/debug", "other"),
+        path("other", "target/debug"),
+        path("target", "different"),
+        path("different", "target"),
+    ] {
+        for reverse in [false, true] {
+            let mut paths = vec![path("target", "target"), conflicting.clone()];
+            if reverse {
+                paths.reverse();
+            }
+            let mut output = CapabilityContribution::default();
+            let first = paths.remove(0);
+            merge_build_state(&mut output.build_state, vec![first]).unwrap();
+            assert!(merge_build_state(&mut output.build_state, paths).is_err());
+        }
+    }
+    let mut output = CapabilityContribution::default();
+    merge_build_state(
+        &mut output.build_state,
+        vec![path("target", "target"), path("target", "target")],
+    )
+    .unwrap();
+    normalize(&mut output);
+    assert_eq!(output.build_state, vec![path("target", "target")]);
+}
+
+#[test]
 fn shared_caches_are_not_granted_before_host_links_are_provisioned() {
     static HOME: SharedToolHome = SharedToolHome {
         variable: Some("TEST_CACHE"),
