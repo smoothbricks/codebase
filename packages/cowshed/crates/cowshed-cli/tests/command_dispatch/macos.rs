@@ -32,6 +32,9 @@ mod scratch_apfs;
 
 use scratch_apfs::ScratchRoot;
 
+/// The checkout's whole `.cowshed.toml`: the build-volume cap, nothing else.
+const FIXTURE_COWSHED_TOML: &str = "[build]\ncapacity = \"1g\"\n";
+
 struct Fixture {
     _scratch: ScratchRoot,
     checkout: PathBuf,
@@ -54,7 +57,10 @@ impl Fixture {
         }
         git(&checkout, &["init", "-q", "-b", "main"]);
         fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
-        git(&checkout, &["add", "tracked"]);
+        // Integration images stay at the 1 GiB test cap (08_testing.md): main through `adopt
+        // --capacity`, the build volume through the operator's own `.cowshed.toml` setting.
+        fs::write(checkout.join(".cowshed.toml"), FIXTURE_COWSHED_TOML).expect("cowshed config");
+        git(&checkout, &["add", "tracked", ".cowshed.toml"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
         let storage = ValidatedHostStorage::new(
             scratch.path().to_path_buf(),
@@ -449,15 +455,14 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
 #[tokio::test]
 async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
     let mut fixture = Fixture::new();
-    for convention in [
-        ".envrc",
-        ".envrc-local",
-        "flake.nix",
-        "devenv.nix",
-        ".cowshed.toml",
-    ] {
+    for convention in [".envrc", ".envrc-local", "flake.nix", "devenv.nix"] {
         assert!(!fixture.checkout.join(convention).exists());
     }
+    assert_eq!(
+        fs::read_to_string(fixture.checkout.join(".cowshed.toml")).expect("fixture config"),
+        FIXTURE_COWSHED_TOML,
+        "the only cowshed configuration is the fixture's image cap"
+    );
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
