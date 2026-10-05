@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, parse_args};
 use cowshed_cli::gateway_service::{
-    GatewayDrain, GatewayPaths, activate_launch_agent, drain_after_shutdown, emit_gateway_status,
-    install_host_stable_executable, refuse_unsupervisable_build, restore_previous_executable,
-    retain_previous_executable,
+    GatewayDrain, GatewayPaths, RELEASE_CLI_TARGET, activate_launch_agent, drain_after_shutdown,
+    emit_gateway_status, install_host_stable_executable, refuse_unsupervisable_build,
+    restore_previous_executable, retain_previous_executable,
 };
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, HostStableExecutable, InstallOutcome, LaunchAgentSpec,
@@ -473,6 +473,36 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
         error.message
     );
     assert!(error.hint.contains("--release"), "{}", error.hint);
+    // The remedy must name a build that this guard accepts. `nx run cowshed:build` builds the
+    // platform `cli-*` target in its default configuration, which is a debug build: a hint
+    // naming it sent the operator straight back here.
+    let package: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../package.json"))
+            .expect("cowshed package.json"),
+    )
+    .expect("package.json is JSON");
+    let target = &package["nx"]["targets"][RELEASE_CLI_TARGET];
+    let command = |configuration: &serde_json::Value| {
+        configuration["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{RELEASE_CLI_TARGET} names its command: {target}"))
+            .to_owned()
+    };
+    assert!(
+        command(&target["configurations"]["production"]).contains("--release"),
+        "{RELEASE_CLI_TARGET}:production must be a release build: {target}"
+    );
+    assert!(
+        !command(&target["options"]).contains("--release"),
+        "{RELEASE_CLI_TARGET}'s default configuration is a debug build, as the hint says: {target}"
+    );
+    assert!(
+        error
+            .hint
+            .contains(&format!("nx run cowshed:{RELEASE_CLI_TARGET}:production")),
+        "{}",
+        error.hint
+    );
 
     // A release build is accepted unchanged: the guard is a gate, not a transformation.
     assert_eq!(

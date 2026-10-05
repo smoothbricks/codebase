@@ -1043,14 +1043,30 @@ pub fn refuse_unsupervisable_build(source: PathBuf, debug_build: bool) -> Result
     if debug_build {
         return Err(CowshedError::conflict(
             format!(
-                "{} is a debug build and will not be installed as this host's supervised binary",
+                "{} is a debug build (compiled with debug assertions) and will not be installed \
+                 as this host's supervised binary",
                 source.display()
             ),
-            "build a release binary (cargo build --release, or nx run cowshed:build) and run this from it",
+            format!(
+                "build a release binary with `nx run cowshed:{RELEASE_CLI_TARGET}:production` \
+                 (or `cargo build --release -p cowshed-cli`) and run this from it; \
+                 `nx run cowshed:build` and `{RELEASE_CLI_TARGET}`'s default configuration \
+                 build a debug one"
+            ),
         ));
     }
     Ok(source)
 }
+
+/// The package's Nx target that builds this host's `cowshed`; its `production` configuration is
+/// the release build. One per platform the package ships (`napi.targets`).
+pub const RELEASE_CLI_TARGET: &str =
+    match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
+        (true, true) => "cli-arm64-macos",
+        (true, false) => "cli-x64-macos",
+        (false, true) => "cli-arm64-linux",
+        (false, false) => "cli-x64-linux",
+    };
 
 /// The running build, refused when it is unfit for launchd to supervise.
 fn supervisable_running_executable() -> Result<PathBuf> {
