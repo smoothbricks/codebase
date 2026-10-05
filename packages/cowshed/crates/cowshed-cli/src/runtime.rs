@@ -3810,6 +3810,35 @@ fn vnode_table_finding(
     }
 }
 
+/// `diskimagesiod` helpers that outlived their disk image, each still holding the 72 MiB of
+/// kernel mapping whose exhaustion fails every attach with error code 150. Only root can end
+/// them, so the finding names the pids and the command, and cowshed signals nothing itself.
+fn orphaned_disk_image_helpers_finding(
+    orphans: std::io::Result<cowshed_core::disk_image_helpers::OrphanedHelpers>,
+) -> Option<Finding> {
+    match orphans {
+        Ok(orphans) if orphans.is_empty() => None,
+        Ok(orphans) => Some(Finding {
+            code: "orphaned-disk-image-helpers".into(),
+            severity: FindingSeverity::Warning,
+            message: orphans.to_string(),
+            hint: orphans.remedy(),
+            path: None,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+        Err(error) => Some(Finding {
+            code: "disk-image-helpers".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "could not tell orphaned diskimagesiod helpers from the ones serving attached \
+                 disk images: {error}"
+            ),
+            hint: "ioreg -r -c DIDeviceIOUserClient -l | grep IOUserClientCreator".into(),
+            path: None,
+        }),
+    }
+}
+
 struct HostDiagnosis {
     storage_ready: bool,
     findings: Vec<Finding>,
@@ -3853,6 +3882,11 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
     diagnosis
         .findings
         .extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
+    diagnosis
+        .findings
+        .extend(orphaned_disk_image_helpers_finding(
+            cowshed_core::disk_image_helpers::OrphanedHelpers::read(),
+        ));
     match crate::capabilities::sccache::service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
         Err(error) => diagnosis.findings.push(Finding {
@@ -4730,6 +4764,30 @@ mod tests {
         assert!(vnode_table_finding(Ok(full_cache)).is_none());
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no vnode table");
         assert!(vnode_table_finding(Err(linux)).is_none());
+    }
+
+    #[test]
+    fn doctor_names_orphaned_disk_image_helpers_and_the_root_command() {
+        use cowshed_core::disk_image_helpers::OrphanedHelpers;
+        use std::collections::BTreeSet;
+        let helpers = BTreeSet::from([4353, 25101, 75251]);
+        let finding = orphaned_disk_image_helpers_finding(Ok(OrphanedHelpers::among(
+            &helpers,
+            &BTreeSet::from([25101]),
+        )))
+        .expect("orphans are a finding");
+        assert_eq!(finding.code, "orphaned-disk-image-helpers");
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.hint, "sudo kill -9 4353 75251");
+        assert!(finding.message.contains("(pid 4353, 75251)"), "{finding:?}");
+
+        let served = OrphanedHelpers::among(&helpers, &helpers);
+        assert!(orphaned_disk_image_helpers_finding(Ok(served)).is_none());
+        let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no helpers");
+        assert!(orphaned_disk_image_helpers_finding(Err(linux)).is_none());
+        let refused = std::io::Error::other("proc_pidpath(1): refused");
+        let finding = orphaned_disk_image_helpers_finding(Err(refused)).expect("a failed read");
+        assert_eq!(finding.code, "disk-image-helpers");
     }
 
     /// Compile-visible seam over core's `StdinSource`: every variant must name the CLI flag that

@@ -389,6 +389,18 @@ recycle, and a mount that takes a second can outlast the deadline. When that is 
 it (`… vnodes in use of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor` reports it as
 `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl kern.maxvnodes=<n>`.
 
+## Every attach fails with `error code 150`
+
+`Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from every image attach,
+`diskutil image info`, `cowshed new` and cold mount, while images already attached keep working, means the kernel has no
+room left to map one more disk image helper's IO buffers. Every attached image has its own `diskimagesiod`, which maps
+72 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
+`cowshed doctor` reports them as `orphaned-disk-image-helpers`: the count, the pids (running helpers that no attached
+`AppleDiskImageDevice`'s user client names as its creator), the mapping they hold, and the root command that frees it,
+`sudo kill -9 <pids>`. `launchctl kill` refuses them, and no reboot is needed. A helper whose attach is still under way
+is named until its device registers, so kill the pids a second `cowshed doctor` still names. cowshed never signals a
+helper itself.
+
 ## `cowshed path` or `cowshed exec` is slow
 
 `COWSHED_TIMING=1 cowshed exec <ws> -- true` prints one `cowshed: timing +<since start> <scope> <step> <elapsed>` line

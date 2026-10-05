@@ -2923,6 +2923,8 @@ pub(crate) struct RegisteredApfsVolume {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) use io_registry::disk_image_user_client_creators;
+#[cfg(target_os = "macos")]
 pub(crate) use io_registry::registered_apfs_containers;
 
 /// What one `AppleAPFSMedia` registers. `reference` is absent until the media's BSD client has
@@ -3112,6 +3114,10 @@ fn project_registered_apfs(
 /// is one the kernel finalizes while the walk holds it: finalizing destroys the entry's port, so
 /// every reference to it becomes a dead name that answers `MACH_SEND_INVALID_DEST` to any call
 /// and nothing at all to a property read. Any other read failure fails the whole inventory.
+///
+/// Each `AppleDiskImageDevice` also names, as its user client's creator, the `diskimagesiod`
+/// helper serving it: the half of [`crate::disk_image_helpers`] that tells a helper from an
+/// orphan.
 #[cfg(target_os = "macos")]
 mod io_registry {
     use super::{
@@ -3159,6 +3165,7 @@ mod io_registry {
             existing: *mut IoObject,
         ) -> KernReturn;
         fn IOIteratorNext(iterator: IoObject) -> IoObject;
+        fn IOIteratorIsValid(iterator: IoObject) -> libc::c_int;
         fn IOObjectRelease(object: IoObject) -> KernReturn;
         fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> libc::c_int;
         fn IORegistryEntryGetParentEntry(
@@ -3167,6 +3174,11 @@ mod io_registry {
             parent: *mut IoObject,
         ) -> KernReturn;
         fn IORegistryEntryGetRegistryEntryID(entry: IoObject, entry_id: *mut u64) -> KernReturn;
+        fn IORegistryEntryGetChildIterator(
+            entry: IoObject,
+            plane: *const c_char,
+            iterator: *mut IoObject,
+        ) -> KernReturn;
         fn IORegistryEntryCreateCFProperty(
             entry: IoObject,
             key: CfType,
@@ -3244,10 +3256,19 @@ mod io_registry {
         uuid: Cf,
     }
 
-    /// Every IOMedia node registered at one instant, yielded as owned references.
-    struct MediaSnapshot(Object);
+    /// The registry entries one IOKit iterator yields, as owned references.
+    struct Entries(Object);
 
-    impl Iterator for MediaSnapshot {
+    impl Entries {
+        /// Whether the iteration saw a consistent registry. A child iteration that a concurrent
+        /// attach or detach invalidated may have skipped entries and must be walked again.
+        fn consistent(&self) -> bool {
+            // SAFETY: the wrapped iterator is live.
+            unsafe { IOIteratorIsValid(self.0.0) != 0 }
+        }
+    }
+
+    impl Iterator for Entries {
         type Item = Object;
 
         fn next(&mut self) -> Option<Object> {
@@ -3259,13 +3280,15 @@ mod io_registry {
         }
     }
 
-    fn registered_media() -> io::Result<MediaSnapshot> {
+    /// Every registered instance of `class` at one instant.
+    fn registered(class: &CStr) -> io::Result<Entries> {
+        let named = class.to_string_lossy();
         // SAFETY: the class name is NUL-terminated; a null answer is refused below.
-        let matching = unsafe { IOServiceMatching(c"IOMedia".as_ptr()) };
+        let matching = unsafe { IOServiceMatching(class.as_ptr()) };
         if matching.is_null() {
-            return Err(io::Error::other(
-                "IOServiceMatching(IOMedia) returned no matching dictionary",
-            ));
+            return Err(io::Error::other(format!(
+                "IOServiceMatching({named}) returned no matching dictionary"
+            )));
         }
         let mut iterator: IoObject = 0;
         // SAFETY: `matching` is a +1 dictionary the call consumes whatever it returns, and
@@ -3273,9 +3296,20 @@ mod io_registry {
         let status =
             unsafe { IOServiceGetMatchingServices(MAIN_PORT_DEFAULT, matching, &mut iterator) };
         if status != KERN_SUCCESS {
-            return Err(kernel_error("match registered IOMedia", status));
+            return Err(kernel_error(&format!("match registered {named}"), status));
         }
-        Ok(MediaSnapshot(Object(iterator)))
+        Ok(Entries(Object(iterator)))
+    }
+
+    /// The entry's children in the service plane, unregistered ones (user clients) included.
+    fn children(entry: &Object) -> Read<Entries> {
+        let mut iterator: IoObject = 0;
+        // SAFETY: `entry` is a registry reference, the plane name is NUL-terminated, and
+        // `iterator` is writable.
+        let status = unsafe {
+            IORegistryEntryGetChildIterator(entry.0, SERVICE_PLANE.as_ptr(), &mut iterator)
+        };
+        checked("read a registry entry's children", status).map(|()| Entries(Object(iterator)))
     }
 
     /// Why a read of one held registry entry has no answer.
@@ -3321,7 +3355,7 @@ mod io_registry {
             url: key("DiskImageURL")?,
         };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
-        for media in registered_media()? {
+        for media in registered(c"IOMedia")? {
             settle(record_image_media(&mut images, &media, &keys))?;
         }
         Ok(images
@@ -3396,10 +3430,54 @@ mod io_registry {
         };
         let mut media: BTreeMap<u64, ApfsMediaFacts> = BTreeMap::new();
         let mut volumes = Vec::new();
-        for entry in registered_media()? {
+        for entry in registered(c"IOMedia")? {
             settle(record_apfs_entry(&mut media, &mut volumes, &entry, &keys))?;
         }
         project_registered_apfs(&media, volumes)
+    }
+
+    /// The `IOUserClientCreator` of every `DIDeviceIOUserClient` an attached image's
+    /// `AppleDiskImageDevice` holds, `pid N, diskimagesiod`: the helper serving the image's IO.
+    /// User clients are never registered, so they are reached as each device's children rather
+    /// than matched. A device or client the kernel finalizes mid-walk is departing and names no
+    /// helper. A client that names no creator fails the read: its helper would pass for an
+    /// orphan.
+    pub(crate) fn disk_image_user_client_creators() -> io::Result<Vec<String>> {
+        let key = key("IOUserClientCreator")?;
+        let mut creators = Vec::new();
+        for device in registered(c"AppleDiskImageDevice")? {
+            settle(record_user_client_creators(&mut creators, &device, &key))?;
+        }
+        Ok(creators)
+    }
+
+    /// Record one device's user client creators, walking its children again whenever a
+    /// concurrent registry change invalidated the walk, so no client is skipped.
+    fn record_user_client_creators(
+        creators: &mut Vec<String>,
+        device: &Object,
+        key: &Cf,
+    ) -> Read<()> {
+        loop {
+            let mut walk = children(device)?;
+            let mut found = Vec::new();
+            for child in walk.by_ref() {
+                if !conforms(&child, c"DIDeviceIOUserClient") {
+                    continue;
+                }
+                let Some(creator) = string_property(&child, key, "IOUserClientCreator")? else {
+                    return Err(invalid(
+                        "a disk image's DIDeviceIOUserClient names no IOUserClientCreator",
+                    )
+                    .into());
+                };
+                found.push(creator);
+            }
+            if walk.consistent() {
+                creators.append(&mut found);
+                return Ok(());
+            }
+        }
     }
 
     /// Record one IOMedia node if it is an APFS container's media or an APFS volume. A volume's
@@ -3724,7 +3802,7 @@ mod io_registry {
         /// absent, not a departure.
         #[test]
         fn a_live_entry_keeps_its_absent_properties() {
-            let media = registered_media()
+            let media = registered(c"IOMedia")
                 .expect("match registered IOMedia")
                 .next()
                 .expect("a host registers at least one IOMedia");
