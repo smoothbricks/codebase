@@ -74,7 +74,8 @@ pub fn point(checkout: &Path, mount: &Path) -> Result<()> {
 /// path already holding its exact link is left alone, an absent one is created, and anything
 /// else there — a real directory (a checkout's own build state, or what a tool rebuilt after
 /// removing the link), a file, a link aimed elsewhere — refuses before anything changes, naming
-/// the path. Cowshed never moves or deletes build state to make a link fit.
+/// the path. Rebuild-only migration and displaced-directory recovery belong to `migrate`;
+/// this strict primitive never removes a caller's entries.
 pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> Result<()> {
     let mut missing = Vec::new();
     for state in paths {
@@ -96,8 +97,8 @@ pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> R
                         at.display(),
                         target.display()
                     ),
-                    "move it aside (a checkout's first build state is moved by `cowshed setup`; a \
-                     directory a tool made after removing the link is rebuildable) and retry",
+                    "run cowshed setup or retry job admission to recover a contributed real \
+                     directory; move foreign files or links aside first",
                 ));
             }
         }
@@ -126,7 +127,10 @@ pub fn relative_target(checkout_path: &Path, volume_path: &Path) -> PathBuf {
 /// The real parent directory of `relative` inside `checkout`, created where missing, and its
 /// file name. No component between the checkout and the parent may be a symlink: a link planted
 /// there would aim the rename and the removal at a directory outside the checkout.
-fn contained_parent<'a>(checkout: &Path, relative: &'a Path) -> io::Result<(PathBuf, &'a OsStr)> {
+pub(crate) fn contained_parent<'a>(
+    checkout: &Path,
+    relative: &'a Path,
+) -> io::Result<(PathBuf, &'a OsStr)> {
     let mut components = relative.components();
     let Some(Component::Normal(name)) = components.next_back() else {
         return Err(io::Error::new(

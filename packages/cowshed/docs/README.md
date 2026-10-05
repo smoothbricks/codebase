@@ -162,6 +162,14 @@ Two different mechanisms save build time, and it helps to keep them apart.
 build-volume seed. Cargo target directories, Nx state and per-tree indexers live in that separate private APFS image,
 reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land.
 
+**Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
+volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.
+The state file and image sidecar are written last, so an interrupted migration resumes on the same volume. One Git query
+checks every directory before any deletion: tracked files under a configured target directory refuse migration and name
+the protected paths. The next build repopulates the volume; a land freezes the warm seed for later forks. If a tool such
+as `cargo clean` replaces a fixed link with a real directory, the next admission reports it, applies the same
+tracked-source guard, discards that rebuildable directory and restores the link. Files and foreign links refuse.
+
 **The compile cache is for the work that is left.** When a workspace does have to compile something — its own edits, or
 whatever landed on main since the clone — the host compile-cache daemon can hand back an object another workspace or
 main already produced. That only works if the cache key ignores where the workspace happens to be mounted, because every

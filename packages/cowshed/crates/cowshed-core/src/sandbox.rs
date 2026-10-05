@@ -210,12 +210,21 @@ impl SandboxConfig {
     /// The workspace's project capabilities for this sandbox's mode, for a command in the
     /// contained `command_cwd`. Project detectors read the project root whatever the cwd; only a
     /// command-scoped convention (a shell hook nearest the cwd) depends on it. The private
-    /// environment root remains mode-private, while build state and the daemon/socket namespace
-    /// belong to the checkout and are shared by read-only and read-write jobs.
+    /// environment root and generic runtime remain mode-private; build state and the contributed
+    /// Nx daemon/socket leaf belong to the checkout and are shared across job modes.
     pub fn detect_capabilities_for(
         &self,
         command_cwd: &Path,
     ) -> crate::Result<DetectedCapabilities> {
+        self.with_detection_context(command_cwd, crate::capabilities::detect_for_workspace)
+    }
+
+    /// Run controller discovery against the exact same inputs as capability admission.
+    pub fn with_detection_context<T>(
+        &self,
+        command_cwd: &Path,
+        discover: impl FnOnce(&DetectionContext<'_>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
         if !command_cwd.starts_with(&self.workspace_mount) {
             return Err(crate::CowshedError::sandbox_denied(
                 format!(
@@ -262,7 +271,7 @@ impl SandboxConfig {
             runtime_dir: &runtime_dir,
             trust_bundle: has_workspace_ca.then_some(trust_bundle.as_path()),
         };
-        crate::capabilities::detect_for_workspace(&context)
+        discover(&context)
     }
 }
 
