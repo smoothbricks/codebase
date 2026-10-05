@@ -22,6 +22,7 @@ import {
   deployStepSecretEnvLines,
   remoteCacheJobEnvLines,
   sourceCheckoutsStepLines,
+  TRACE_DB_ARTIFACT_GLOB,
 } from './ci-workflow.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
@@ -640,7 +641,7 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         'upload',
         [
           `name: trace-results-${githubExpression('github.run_id')}`,
-          'path: packages/*/.cache/trace-results.db*',
+          `path: ${TRACE_DB_ARTIFACT_GLOB}`,
           'if-no-files-found: ignore',
           'retention-days: 14',
           'include-hidden-files: true',

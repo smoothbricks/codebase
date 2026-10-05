@@ -12,19 +12,19 @@ modified: '2026-07-21T09:58:49.226Z'
 
 Every tracer takes the same base options (see [Tracers](/reference/tracers/)):
 
-| Option | Required | Default |
-|---|---|---|
-| `bufferStrategy` | yes | — (use `new JsBufferStrategy()`) |
-| `createTraceRoot` | yes | — (from `/node` or `/es`) |
-| `flagEvaluator` | no | none |
+| Option            | Required | Default                          |
+| ----------------- | -------- | -------------------------------- |
+| `bufferStrategy`  | yes      | — (use `new JsBufferStrategy()`) |
+| `createTraceRoot` | yes      | — (from `/node` or `/es`)        |
+| `flagEvaluator`   | no       | none                             |
 
 `StdioTracer` adds:
 
-| Option | Default |
-|---|---|
-| `out` | `process.stdout` |
-| `err` | `process.stderr` |
-| `colorEnabled` | `true` |
+| Option         | Default          |
+| -------------- | ---------------- |
+| `out`          | `process.stdout` |
+| `err`          | `process.stderr` |
+| `colorEnabled` | `true`           |
 
 `SQLiteTracer` / `SQLiteAsyncTracer` add a required `db`; `CompositeTracer` adds `delegates`.
 
@@ -39,7 +39,7 @@ const scheduler = new FlushScheduler(
   (table, meta) => {
     /* handle the Arrow table; meta.flushReason explains why */
   },
-  { maxFlushInterval: 5000, capacityThreshold: 0.9 },
+  { maxFlushInterval: 5000, capacityThreshold: 0.9 }
 );
 
 scheduler.register(buffer);
@@ -48,9 +48,9 @@ await scheduler.flush(); // manual flush
 scheduler.stop();
 ```
 
-Common config fields: `maxFlushInterval`, `minFlushInterval`, `capacityThreshold` (0–1), `idleDetection`,
-`idleTimeout`, `memoryPressureDetection`, `memoryPressureThreshold`. The handler receives the Arrow table and metadata
-whose `flushReason` is one of `capacity`, `time`, `memory`, `idle`, or `manual`.
+Common config fields: `maxFlushInterval`, `minFlushInterval`, `capacityThreshold` (0–1), `idleDetection`, `idleTimeout`,
+`memoryPressureDetection`, `memoryPressureThreshold`. The handler receives the Arrow table and metadata whose
+`flushReason` is one of `capacity`, `time`, `memory`, `idle`, or `manual`.
 
 ## Test-harness options
 
@@ -58,9 +58,9 @@ whose `flushReason` is one of `capacity`, `time`, `memory`, `idle`, or `manual`.
 
 - `sqlite` — write results to a database. On Node/bun, `{ dbPath: DEFAULT_TRACE_DB_PATH }`; on vitest, also pass
   `createDatabase: createNodeSQLiteDatabase`. `DEFAULT_TRACE_DB_PATH` is exported by every testing entry point and
-  resolves to `.cache/trace-results.db`, a directory project walkers and file watchers skip. Point `dbPath` somewhere
-  else only if that location is skipped too — a SQLite database keeps journal sidecars beside itself, and a watched
-  directory whose membership moves mid-build invalidates the build.
+  resolves to `node_modules/.cache/lmao/trace-results.db`, inside the `node_modules` every project walker and file
+  watcher skips. Point `dbPath` somewhere else only if that location is skipped too — a SQLite database keeps journal
+  sidecars beside itself, and a watched directory whose membership moves mid-build invalidates the build.
 - `verbose` — extra logging.
 
 See [Set up trace-testing](/guides/set-up-trace-testing/).

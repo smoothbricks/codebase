@@ -10,7 +10,7 @@
 > `smoo/lmao!n/ai-agent-distributed-query-impl`. What **does** ship are the underlying trace primitives the layer would
 > sit on: the columnar `SpanBuffer` → Arrow conversion (`lib/convertToArrow.ts`), the Arrow column/schema model (see
 > [`01f_arrow_table_structure.md`](./01f_arrow_table_structure.md)), the `SQLiteTracer` (`lib/tracers/SQLiteTracer.ts`
-> `smoo/lmao!n/tracer-implementations.sqlite`) that writes the queryable `.cache/trace-results.db`, and the
+> `smoo/lmao!n/tracer-implementations.sqlite`) that writes the queryable `DEFAULT_TRACE_DB_PATH` sink, and the
 > op/span/tag/log/ff/env/setScope authoring API the prompt section documents (`lib/op.ts`, `lib/spanContext.ts`,
 > `lib/defineOpContext.ts`). The query/analysis surface that an MCP server would expose lives separately in the
 > `lmao-inspector` package (specs 02/03), not here.
@@ -180,9 +180,9 @@ traceServer.addTool({
 
 > **Implementation status:** the trace-plugin surface shown here (Jest reporter, Bun plugin, `generateTestRunId`,
 > `globalThis.__TEST_RUN_ID__`, `trace.setContext`) is **not** implemented in `packages/lmao/src`. Tracked as
-> `smoo/lmao!n/ai-agent-test-plugins-impl`. Note the repo's OWN test suites already flush LMAO traces to per-package
-> `.cache/trace-results.db` via the shared test harness + `SQLiteTracer`, which is a different, working mechanism
-> than the framework-agnostic `testRunId === trace_id` plugin described below.
+> `smoo/lmao!n/ai-agent-test-plugins-impl`. Note the repo's OWN test suites already flush LMAO traces to each package's
+> `DEFAULT_TRACE_DB_PATH` via the shared test harness + `SQLiteTracer`, which is a different, working mechanism than the
+> framework-agnostic `testRunId === trace_id` plugin described below.
 
 **Purpose**: Automatically correlate traces with test runs for AI-driven analysis.
 

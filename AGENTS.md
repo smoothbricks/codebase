@@ -663,14 +663,18 @@ needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner har
   why `SQLiteTraceWriter` reads the pragma back and refuses a file-backed sink that settled on `memory` or `off`.
 - **`DEFAULT_TRACE_DB_PATH` owns the sink's path** (`packages/lmao/src/lib/sqlite/trace-db-path.ts`, re-exported from
   `@smoothbricks/lmao/testing{,/bun,/vitest}`; `TRACE_DB_DIRECTORY` and `TRACE_DB_FILENAME` join onto a root). Never
-  restate the literal in a package or a doc. The CI artifact glob is the one legitimate exception: `packages/cli`
-  depends only on nx-plugin and validation, so importing the constant would add a package dependency to interpolate a
-  string, and the glob needs a shape the constant does not have — a `packages/*/` prefix and a trailing `*` so a
-  SIGKILLed run's WAL sidecars are collected. Without the sidecars the uploaded database reads `no such table: spans`,
-  because the committed frames are still in the `-wal`.
+  restate the literal in a package or a doc. The CI artifact glob is the one legitimate exception: the nx-plugin
+  generates it (`TRACE_DB_ARTIFACT_GLOB`) and cannot import lmao at runtime, and the glob needs a shape the constant
+  does not have — a `packages/*/` prefix and a trailing `*` so a SIGKILLed run's WAL sidecars are collected. A plugin
+  test pins it to the constant. Without the sidecars the uploaded database reads `no such table: spans`, because the
+  committed frames are still in the `-wal`.
 - **It must live under a directory name project walkers and watchers ignore.** A database in a compiled package's root
   makes its own per-transaction journal churn look like the project tree changing mid-compile, which breaks
   transform-generation caching in tools that verify directory membership.
+- **It is per-checkout tool state, not an output.** It lives in `node_modules/.cache/<tool>`, the JavaScript home of
+  tool state, which cowshed keeps on the build volume: the sink rewrites its pages on every run, and in the source image
+  those writes fragment an image every clone shares. A package-level `.cache/` holds Nx outputs and cannot be build
+  state.
 - **A run that dies is exactly the run whose trace you want.** Never reason about the sink as disposable output.
 
 ### Property-Based Testing with fast-check

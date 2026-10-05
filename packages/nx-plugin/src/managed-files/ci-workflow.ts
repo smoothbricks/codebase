@@ -529,7 +529,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         'upload',
         [
           'name: trace-results-${{ github.run_id }}',
-          'path: packages/*/.cache/trace-results.db*',
+          `path: ${TRACE_DB_ARTIFACT_GLOB}`,
           'if-no-files-found: ignore',
           'retention-days: 14',
           'include-hidden-files: true',
@@ -1364,6 +1364,16 @@ ${renderOptionalLines(deployStepSecretEnvLines(options))}        # prettier-igno
 
 ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
 }
+
+/**
+ * Every package's lmao trace sink, with its WAL sidecars: a run killed before a
+ * checkpoint leaves its committed frames in `-wal`, and without them the
+ * uploaded database reads `no such table: spans`. lmao's
+ * `TRACE_DB_DIRECTORY`/`TRACE_DB_FILENAME` own the path; the plugin cannot
+ * import them at runtime (lmao is not a runtime dependency), so a test pins
+ * this glob to them.
+ */
+export const TRACE_DB_ARTIFACT_GLOB = 'packages/*/node_modules/.cache/lmao/trace-results.db*';
 
 export function artifactStepLines(
   provider: PackageSmooGithub['actionsProvider'],

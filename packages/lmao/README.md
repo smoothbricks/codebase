@@ -232,11 +232,12 @@ Setup is wiring-only: a preload/setup file calls
 `initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } })` and installs a transparent mock so tests
 import `describe`/`it`/`expect` from their native runner as usual. Bun and Vitest are both supported
 (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
-`.cache/trace-results.db` under the package or workspace root: the sink must sit in a directory that project walkers and
-file watchers skip, because a SQLite database churns its directory's membership through journal sidecars and a compiler
-watching that directory would call its own transform generation incoherent. Traces flush to a SQLite sink you can query
-with the `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema, and query
-recipes.
+`node_modules/.cache/lmao/trace-results.db` under the package or workspace root. Every project walker and file watcher
+skips `node_modules`, which the sink needs because a SQLite database churns its directory's membership through journal
+sidecars and a compiler watching that directory would call its own transform generation incoherent. And
+`node_modules/.cache/<tool>` is the JavaScript home of per-checkout tool state, so a workspace manager that keeps build
+state off the source tree moves the sink's rewrites with it. Traces flush to a SQLite sink you can query with the
+`TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema, and query recipes.
 
 ## Package exports
 
@@ -316,7 +317,7 @@ These constraints are defined by the deterministic scheduler and trace-testing s
    (`benches/overhead.rs` harness; gate comparison TBD).
 4. **Deterministic encoding:** sorted dictionaries, no HashMap-iteration-order or float-formatting leakage into emitted
    bytes.
-5. **Tracer-agnostic queries:** the same selector must run against SQLite (`.cache/trace-results.db` parity) and
+5. **Tracer-agnostic queries:** the same selector must run against SQLite (`DEFAULT_TRACE_DB_PATH` parity) and
    in-process Arrow batches.
 
 ### TDD workflow
