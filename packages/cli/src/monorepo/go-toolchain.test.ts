@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -70,13 +70,24 @@ describe('validateGoToolchainPair', () => {
 });
 
 describe('readGoToolchainPair', () => {
-  test('no ttsc dependency means no invariant to check', async () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  async function tempRoot(): Promise<string> {
     const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
+    roots.push(root);
+    return root;
+  }
+
+  test('no ttsc dependency means no invariant to check', async () => {
+    const root = await tempRoot();
     expect(readGoToolchainPair(root, 'go', 'go version go1.26.7 darwin/arm64')).toBeNull();
   });
 
   test('an installed ttsc whose vendored SDK is missing is an error, never a silent pass', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
+    const root = await tempRoot();
     installTtsc(root, '0.28.3');
     const result = readGoToolchainPair(root, 'go', 'go version go1.26.7 darwin/arm64');
     if (!(result instanceof Error)) {
@@ -86,7 +97,7 @@ describe('readGoToolchainPair', () => {
   });
 
   test('reads the pair from the bun store layout, which is where a real install puts it', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
+    const root = await tempRoot();
     installTtsc(root, '0.28.3');
     const storePath = bunStoreVersionPath(root, '0.28.3');
     mkdirSync(join(storePath, '..'), { recursive: true });
@@ -101,7 +112,7 @@ describe('readGoToolchainPair', () => {
   });
 
   test('an unreadable devenv go version is an error rather than a pass', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
+    const root = await tempRoot();
     installTtsc(root, '0.28.3');
     const storePath = bunStoreVersionPath(root, '0.28.3');
     mkdirSync(join(storePath, '..'), { recursive: true });
