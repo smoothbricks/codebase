@@ -723,6 +723,12 @@ pub enum GcReason {
     OrphanSessionImage,
     OrphanMountpoint,
     ExpiredCheckpoint,
+    /// A build volume no checkout links (16_build_volumes.md, "Garbage collection").
+    UnlinkedBuildVolume,
+    /// A seed that is not its target's latest, or whose target retired.
+    SupersededSeed,
+    /// A build volume image an interrupted creation left without its record.
+    UnrecordedBuildVolume,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2607,6 +2613,170 @@ pub struct LandReport {
     pub previous_target_head: Option<GitOid>,
     pub target_was_checked_out: bool,
     pub retired: bool,
+    /// What the land did with build volumes (16_build_volumes.md, Land steps 4–7).
+    pub build_volume: LandBuildVolume,
+}
+
+/// A land's build-volume steps: the landing workspace quiesced, the target's seed frozen from
+/// its volume, the target adopting it, and the adoption checked (2b).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandBuildVolume {
+    /// Whether the target's seed was frozen from the landing volume (step 5).
+    pub seeded: bool,
+    pub adoption: Adoption,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Adoption {
+    /// The target's build link names the landing volume now (step 6); `check` is step 7.
+    Adopted {
+        #[serde(rename = "elapsedMs")]
+        elapsed_ms: u64,
+        check: AdoptionCheck,
+    },
+    /// The target kept its own volume and builds the landed delta itself. Never wrong, only
+    /// slower.
+    Skipped { reason: AdoptionSkip },
+}
+
+impl Adoption {
+    pub fn is_adopted(&self) -> bool {
+        matches!(self, Self::Adopted { .. })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AdoptionSkip {
+    /// The landing workspace links no build volume.
+    NoLandingVolume,
+    /// The target links no build volume.
+    NoTargetVolume,
+    /// A process of the landing workspace still holds its Nx task database (step 4).
+    LandingHeld {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The landing workspace's Nx daemon outlived its stop.
+    LandingDaemonStayed { daemon: DatabaseHolder },
+    /// A process holds the target's Nx task database (step 6).
+    TargetHeld {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The target's Nx daemon outlived its stop.
+    TargetDaemonStayed { daemon: DatabaseHolder },
+}
+
+impl AdoptionSkip {
+    /// The stable name telemetry records for the reason.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NoLandingVolume => "noLandingVolume",
+            Self::NoTargetVolume => "noTargetVolume",
+            Self::LandingHeld { .. } => "landingHeld",
+            Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
+            Self::TargetHeld { .. } => "targetHeld",
+            Self::TargetDaemonStayed { .. } => "targetDaemonStayed",
+        }
+    }
+}
+
+impl fmt::Display for AdoptionSkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let holders = |formatter: &mut fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
+            for (index, holder) in holders.iter().enumerate() {
+                let separator = if index == 0 { "" } else { ", " };
+                write!(
+                    formatter,
+                    "{separator}pid {} ({})",
+                    holder.pid, holder.command
+                )?;
+            }
+            Ok(())
+        };
+        match self {
+            Self::NoLandingVolume => {
+                formatter.write_str("the landing workspace has no build volume")
+            }
+            Self::NoTargetVolume => formatter.write_str("the target has no build volume"),
+            Self::LandingHeld {
+                database,
+                holders: held,
+            } => {
+                write!(
+                    formatter,
+                    "the landing workspace's {} is open in ",
+                    database.display()
+                )?;
+                holders(formatter, held)
+            }
+            Self::TargetHeld {
+                database,
+                holders: held,
+            } => {
+                write!(formatter, "the target's {} is open in ", database.display())?;
+                holders(formatter, held)
+            }
+            Self::LandingDaemonStayed { daemon } | Self::TargetDaemonStayed { daemon } => write!(
+                formatter,
+                "the {} Nx daemon pid {} ({}) did not exit after SIGTERM",
+                if matches!(self, Self::LandingDaemonStayed { .. }) {
+                    "landing workspace's"
+                } else {
+                    "target's"
+                },
+                daemon.pid,
+                daemon.command
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DatabaseHolder {
+    pub pid: i32,
+    pub command: String,
+}
+
+/// Step 7: the landed check re-run in the target on the adopted volume. Every Nx task should hit.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionCheck {
+    pub hits: u64,
+    /// Each Nx task that missed: a defect in the project's build configuration.
+    pub misses: Vec<CacheMiss>,
+    /// Checks after which no Nx run lay within the check: they ran no Nx in the target, or a
+    /// concurrent run replaced the summary, so they give no verdict.
+    pub without_nx_run: Vec<String>,
+    /// Checks that exited nonzero in the target.
+    pub failed: Vec<FailedCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FailedCheck {
+    pub check: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+}
+
+/// One Nx task that missed the cache in the target after adoption, with the inputs Nx hashes
+/// for it (`nx show target inputs`) and their digest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheMiss {
+    pub task: String,
+    pub hash: String,
+    /// Each input category Nx reports (`files`, `environment`, `external`, …) and its entries;
+    /// empty when Nx could not name them, with `inputs_error` saying why.
+    pub inputs: std::collections::BTreeMap<String, Vec<String>>,
+    pub inputs_digest: Sha256Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs_error: Option<String>,
 }
 
 /// The commits a `--abandon` removal destroyed, and where their bundle went.

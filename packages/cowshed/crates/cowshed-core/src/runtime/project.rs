@@ -3626,6 +3626,192 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)
     }
 
+    fn build_volumes(&self) -> Result<super::build_volumes::BuildVolumes> {
+        Ok(super::build_volumes::BuildVolumes::new(
+            self.substrate.shared_host(),
+            crate::build_volume::BuildVolumeLayout::new(self.layout.project())
+                .map_err(native_integrity_error)?,
+        ))
+    }
+
+    /// What links build volumes now (16_build_volumes.md, "Garbage collection"): each mounted
+    /// checkout's build link, every workspace at its incarnation (whose seed a seed may be), and
+    /// the detached workspaces, whose links cannot be read and whose volumes their records name.
+    async fn build_volume_links(&self) -> Result<super::build_volumes::Links> {
+        let volumes = self.build_volumes()?;
+        let mut links = super::build_volumes::Links::default();
+        for workspace in self.authoritative().await? {
+            let name = workspace.derived.workspace.name().clone();
+            links.owners.insert(super::build_volumes::Owner {
+                name: name.clone(),
+                incarnation: workspace.derived.workspace.incarnation().clone(),
+            });
+            if matches!(
+                workspace.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            ) {
+                if let Some(id) = volumes.linked(&self.workspace_mount_path(&name)?)? {
+                    links.volumes.insert(id);
+                }
+            } else {
+                links.detached.insert(name);
+            }
+        }
+        Ok(links)
+    }
+
+    /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, freeze the
+    /// target's seed from its volume, move the target's build link onto it, and re-run the
+    /// landed checks in the target, where every Nx task should hit.
+    async fn land_build_volume(
+        &mut self,
+        workspace: &WorkspaceName,
+        landing: &Path,
+        into: &NativeLandingInto,
+        checks: &[String],
+        retire: bool,
+    ) -> Result<crate::api::dto::LandBuildVolume> {
+        use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume};
+        let volumes = self.build_volumes()?;
+        let skipped = |reason| LandBuildVolume {
+            seeded: false,
+            adoption: Adoption::Skipped { reason },
+        };
+        if volumes.linked(landing)?.is_none() {
+            return Ok(skipped(AdoptionSkip::NoLandingVolume));
+        }
+        if volumes.linked(&into.mount)?.is_none() {
+            return Ok(skipped(AdoptionSkip::NoTargetVolume));
+        }
+        // Step 4: the supervisor stops every job of the landing workspace; the volume's own
+        // daemon and database holders are then the build volume module's to settle.
+        let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
+        require_lost_groups_released(workspace, &stopped, "quiesce").await?;
+        drop(stopped);
+        let quiet =
+            match timed_async("land", "quiesce", volumes.quiesce(landing.to_owned())).await? {
+                Ok(quiet) => quiet,
+                Err(reason) => return Ok(skipped(reason)),
+            };
+        let tree = git_revision_oid(landing, "HEAD^{tree}").await?;
+        let target = self.current(&into.name).await?;
+        let owner = super::build_volumes::Owner {
+            name: into.name.clone(),
+            incarnation: target.derived.workspace.incarnation().clone(),
+        };
+        timed_async(
+            "land",
+            "freeze-seed",
+            volumes.freeze_seed(&quiet, owner.clone(), tree.clone()),
+        )
+        .await?;
+        let adoption = match timed_async(
+            "land",
+            "adopt",
+            volumes.adopt(&quiet, into.name.clone(), into.mount.clone(), tree),
+        )
+        .await?
+        {
+            Err(reason) => Adoption::Skipped { reason },
+            Ok(elapsed_ms) => {
+                if !retire {
+                    volumes
+                        .refork(owner, workspace.clone(), landing.to_owned())
+                        .await?;
+                }
+                let check = timed_async(
+                    "land",
+                    "adoption-check",
+                    self.check_adoption(&into.name, &into.mount, checks),
+                )
+                .await?;
+                Adoption::Adopted { elapsed_ms, check }
+            }
+        };
+        Ok(LandBuildVolume {
+            seeded: true,
+            adoption,
+        })
+    }
+
+    /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and
+    /// misses come from the run summary stock Nx writes into the target's cache directory; each
+    /// miss carries the inputs Nx hashes for it.
+    async fn check_adoption(
+        &mut self,
+        target: &WorkspaceName,
+        mount: &Path,
+        checks: &[String],
+    ) -> Result<crate::api::dto::AdoptionCheck> {
+        use crate::build_volume::nx::{CacheStatus, run_within};
+        let mut result = crate::api::dto::AdoptionCheck::default();
+        let state = crate::build_volume::BuildVolumeState::read(
+            &mount.join(crate::build_volume::BUILD_LINK),
+        )?;
+        let caches = state
+            .paths
+            .iter()
+            .filter(|path| {
+                path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new("cache"))
+                    && path
+                        .checkout
+                        .as_path()
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == ".nx")
+            })
+            .map(|path| mount.join(path.checkout.as_path()))
+            .collect::<Vec<_>>();
+        let handle = self.ensure_supervisor(target).await?;
+        for check in checks {
+            let started = std::time::SystemTime::now();
+            let job = handle.exec(None, land_check_request(check)).await?;
+            let info = handle.wait(job).await?;
+            let ended = std::time::SystemTime::now();
+            match info.exit {
+                Some(crate::api::dto::ExitStatus::Exited { code: 0 }) => {}
+                Some(crate::api::dto::ExitStatus::Exited { code }) => {
+                    result.failed.push(crate::api::dto::FailedCheck {
+                        check: check.clone(),
+                        exit: Some(code),
+                    });
+                }
+                _ => result.failed.push(crate::api::dto::FailedCheck {
+                    check: check.clone(),
+                    exit: None,
+                }),
+            }
+            let mut ran = false;
+            for cache in &caches {
+                let run = run_within(cache, started, ended).map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "cannot read Nx's run summary in {}: {error}",
+                            cache.display()
+                        ),
+                        "cowshed doctor --json",
+                    )
+                })?;
+                let Some(run) = run else { continue };
+                ran = true;
+                for task in run.tasks {
+                    match task.cache {
+                        CacheStatus::LocalHit | CacheStatus::RemoteHit => result.hits += 1,
+                        CacheStatus::Miss => {
+                            result
+                                .misses
+                                .push(task_inputs(&handle, task.task_id, task.hash).await?);
+                        }
+                    }
+                }
+            }
+            if !ran {
+                result.without_nx_run.push(check.clone());
+            }
+        }
+        Ok(result)
+    }
+
     /// Give `workspace` the stable mount path of `slot`.
     ///
     /// Recorded before the workspace's first mount, because the record is what every mount path
@@ -4782,6 +4968,16 @@ impl NativeProjectRuntimeHost {
                 None => None,
             };
             self.finish_retirement(current).await?;
+            // The workspace's build volume and seed retire with it, unless a target adopted the
+            // volume (16_build_volumes.md, "Garbage collection"); a busy one waits for `gc`.
+            let links = self.build_volume_links().await?;
+            for deferred in self.build_volumes()?.collect(links, false).await?.deferred {
+                eprintln!(
+                    "cowshed: build volume {} is still in use ({}); `cowshed gc` reclaims it once idle",
+                    deferred.path.display(),
+                    deferred.diagnostic
+                );
+            }
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -7435,6 +7631,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
             let home = &self.home;
+            let build_volumes = self.build_volumes()?;
+            let seed_source = super::build_volumes::Owner {
+                name: source_name.clone(),
+                incarnation: source.derived.workspace.incarnation().clone(),
+            };
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
@@ -7453,6 +7654,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         crate::inherited_daemons::macos::discard_in(
                             &stage.mount_point,
                             crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                        ),
+                    )
+                    .await?;
+                    timed_async(
+                        "new",
+                        "build-volume",
+                        build_volumes.fork(
+                            seed_source,
+                            super::build_volumes::Owner {
+                                name: destination.clone(),
+                                incarnation: stage.workspace.incarnation().clone(),
+                            },
+                            stage.mount_point.clone(),
                         ),
                     )
                     .await?;
@@ -7648,6 +7862,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .map_err(native_integrity_error)?;
             self.mark_lifecycle_intent_mutating(&destination).await?;
             let home = &self.home;
+            let build_volumes = self.build_volumes()?;
+            let seed_source = super::build_volumes::Owner {
+                name: source.clone(),
+                incarnation: source_fact.derived.workspace.incarnation().clone(),
+            };
             let receipt = self
                 .substrate
                 .execute_fork_staged(plan, move |stage| async move {
@@ -7657,6 +7876,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
                     )
                     .await?;
+                    build_volumes
+                        .fork(
+                            seed_source,
+                            super::build_volumes::Owner {
+                                name: forked.clone(),
+                                incarnation: stage.workspace.incarnation().clone(),
+                            },
+                            stage.mount_point.clone(),
+                        )
+                        .await?;
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                     repository.restore_inherited_links(&source_mount).await?;
                     if source_is_git_worktree {
@@ -8401,6 +8630,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 },
             })
             .collect::<Vec<_>>();
+        let links = self.build_volume_links().await?;
+        let build = self
+            .build_volumes()?
+            .collect(links, options.dry_run)
+            .await?;
         if options.dry_run {
             let freed_bytes = candidates
                 .iter()
@@ -8408,16 +8642,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
             return Ok(GcReport {
                 examined: u64::try_from(plan.examined())
-                    .map_err(|_| CowshedError::internal("GC count overflow"))?,
+                    .map_err(|_| CowshedError::internal("GC count overflow"))?
+                    + build.examined,
                 reclaimed: 0,
                 retained_pinned: u64::try_from(plan.retained_pinned())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
-                freed_bytes,
+                freed_bytes: freed_bytes.saturating_add(build.freed_bytes),
                 dry_run: true,
                 deferred: Vec::new(),
-                candidates,
+                candidates: candidates.into_iter().chain(build.candidates).collect(),
             });
         }
         // Host-side state goes before the image does here too, for the same reason retirement
@@ -8446,16 +8681,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_storage_error)?;
         Ok(GcReport {
             examined: u64::try_from(report.examined)
-                .map_err(|_| CowshedError::internal("GC count overflow"))?,
+                .map_err(|_| CowshedError::internal("GC count overflow"))?
+                + build.examined,
             reclaimed: u64::try_from(report.reclaimed)
-                .map_err(|_| CowshedError::internal("GC count overflow"))?,
+                .map_err(|_| CowshedError::internal("GC count overflow"))?
+                + build.reclaimed,
             retained_pinned: u64::try_from(report.retained_pinned)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
             retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
-            freed_bytes: report.freed_bytes,
+            freed_bytes: report.freed_bytes.saturating_add(build.freed_bytes),
             dry_run: false,
-            candidates,
+            candidates: candidates.into_iter().chain(build.candidates).collect(),
             deferred: report
                 .deferred
                 .into_iter()
@@ -8463,6 +8700,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     path: deferred.path,
                     diagnostic: deferred.diagnostic,
                 })
+                .chain(build.deferred)
                 .collect(),
         })
     }
@@ -8962,11 +9200,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         )?;
         let retire = options.retire;
         let handle = timed_async("land", "supervisor", self.ensure_supervisor(&workspace)).await?;
-        for check in options.check.unwrap_or_default() {
+        let checks = options.check.unwrap_or_default();
+        for check in &checks {
             let job_id = timed_async(
                 "land",
                 "check-exec",
-                handle.exec(None, land_check_request(&check)),
+                handle.exec(None, land_check_request(check)),
             )
             .await?;
             let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
@@ -9032,6 +9271,23 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ),
         )
         .await?;
+        // The target has moved: a failed build-volume step reads as such, never as a refused land.
+        let build_volume = timed_async(
+            "land",
+            "build-volume",
+            self.land_build_volume(&workspace, &source_mount, &into, &checks, retire),
+        )
+        .await
+        .map_err(|failed| {
+            CowshedError::new(
+                failed.code,
+                format!(
+                    "landed {source_head} on {target_branch}, but its build volume was not adopted: {}",
+                    failed.message
+                ),
+                failed.hint,
+            )
+        })?;
         if retire {
             // The target has already moved, so a refused retire must not read as a refused land:
             // the retry its hint names would land nothing. Containment is measured against the
@@ -9056,6 +9312,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             previous_target_head: previous,
             target_was_checked_out: true,
             retired: retire,
+            build_volume,
         })
     }
 
@@ -11991,6 +12248,80 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
             CowshedError::conflict(message, "inspect the repository state: git status")
         },
     )
+}
+
+/// The inputs Nx hashes for the missed task `task` in the workspace `handle` serves, from
+/// `nx show target inputs <task> --json` run there, each category Nx names with its entries,
+/// and their digest. A task Nx cannot describe keeps its hash and says why.
+#[cfg(target_os = "macos")]
+async fn task_inputs(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    task: String,
+    hash: String,
+) -> Result<crate::api::dto::CacheMiss> {
+    use crate::storage::job_artifact::StreamKind;
+    let request = land_check_request(&format!(
+        "exec node_modules/.bin/nx show target inputs '{}' --json",
+        task.replace('\'', "'\\''")
+    ));
+    let job = handle.exec(None, request).await?;
+    let info = handle.wait(job).await?;
+    let mut stdout = Vec::new();
+    let mut offset = 0_u64;
+    while let Ok(chunk) = handle
+        .log_read(job, StreamKind::Stdout, offset, false)
+        .await
+    {
+        stdout.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if chunk.eof {
+            break;
+        }
+    }
+    let mut inputs = std::collections::BTreeMap::new();
+    let inputs_error = match (
+        &info.exit,
+        serde_json::from_slice::<serde_json::Value>(&stdout),
+    ) {
+        (
+            Some(crate::api::dto::ExitStatus::Exited { code: 0 }),
+            Ok(serde_json::Value::Object(map)),
+        ) => {
+            for (category, entries) in map {
+                if let serde_json::Value::Array(entries) = entries {
+                    inputs.insert(
+                        category,
+                        entries
+                            .into_iter()
+                            .map(|entry| match entry {
+                                serde_json::Value::String(entry) => entry,
+                                other => other.to_string(),
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            None
+        }
+        (exit, parsed) => Some(format!(
+            "nx show target inputs {task} ended {exit:?}{}: {}",
+            parsed
+                .err()
+                .map(|error| format!(", output unreadable ({error})"))
+                .unwrap_or_default(),
+            read_job_stderr_tail(handle, job).await
+        )),
+    };
+    let inputs_digest = crate::api::dto::Sha256Digest::compute(
+        &serde_json::to_vec(&inputs).map_err(|error| CowshedError::internal(error.to_string()))?,
+    );
+    Ok(crate::api::dto::CacheMiss {
+        task,
+        hash,
+        inputs,
+        inputs_digest,
+        inputs_error,
+    })
 }
 
 #[cfg(target_os = "macos")]

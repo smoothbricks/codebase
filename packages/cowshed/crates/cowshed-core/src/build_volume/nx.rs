@@ -438,7 +438,7 @@ pub fn run_within(cache: &Path, started: SystemTime, ended: SystemTime) -> io::R
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or(0)
     };
-    if run_started < floor(started) || run_ended > floor(ended) + 1 {
+    if run_ended < run_started || run_started < floor(started) || run_ended > floor(ended) + 1 {
         return Ok(None);
     }
     let tasks = summary

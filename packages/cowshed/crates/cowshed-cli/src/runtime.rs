@@ -2730,6 +2730,11 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanSessionImage => "orphaned session image without metadata",
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
+        GcReason::UnlinkedBuildVolume => "build volume no checkout links",
+        GcReason::SupersededSeed => "seed superseded by its target's latest, or its target retired",
+        GcReason::UnrecordedBuildVolume => {
+            "build volume an interrupted creation left without its record"
+        }
     }
 }
 
@@ -2756,7 +2761,63 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
             })
         })
         .and_then(|()| output.bare(b"\n"))
+        .and_then(|()| {
+            for line in land_build_volume_lines(&report.build_volume) {
+                output.guidance(&line)?;
+            }
+            Ok(())
+        })
         .map_err(output_error)
+}
+
+/// What the land did with build volumes, one stderr line each (16_build_volumes.md, Land steps
+/// 4–7); the same value the JSON report and the controller's `LandAdoption` record carry.
+fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> Vec<String> {
+    use cowshed_core::api::dto::Adoption;
+    let mut lines = Vec::new();
+    if build.seeded {
+        lines.push("build volume the target's seed is frozen from the landed volume".to_owned());
+    }
+    match &build.adoption {
+        Adoption::Skipped { reason } => {
+            lines.push(format!("build volume adoption skipped: {reason}"));
+        }
+        Adoption::Adopted { elapsed_ms, check } => {
+            lines.push(format!(
+                "build volume adopted by the target in {elapsed_ms} ms"
+            ));
+            lines.push(format!(
+                "build volume: the re-run check hit {} Nx task(s) and missed {}",
+                check.hits,
+                check.misses.len()
+            ));
+            for miss in &check.misses {
+                lines.push(format!(
+                    "build volume: cache miss {} (hash {}, inputs {}){}",
+                    miss.task,
+                    miss.hash,
+                    miss.inputs_digest.to_hex(),
+                    miss.inputs_error
+                        .as_ref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+            for check in &check.without_nx_run {
+                lines.push(format!("build volume `{check}` left no Nx run to judge"));
+            }
+            for failed in &check.failed {
+                lines.push(format!(
+                    "build volume: `{}` failed in the target ({})",
+                    failed.check,
+                    failed
+                        .exit
+                        .map_or_else(|| "killed".to_owned(), |code| format!("exit {code}"))
+                ));
+            }
+        }
+    }
+    lines
 }
 
 /// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates

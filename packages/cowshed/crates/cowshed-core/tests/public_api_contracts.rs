@@ -837,10 +837,25 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         previous_target_head: Some(oid('a')),
         target_was_checked_out: true,
         retired: true,
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: true,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
+                    database: PathBuf::from("/m/.nx/workspace-data/A-v3.db"),
+                    holders: vec![cowshed_core::api::dto::DatabaseHolder {
+                        pid: 42,
+                        command: "node nx run-many".into(),
+                    }],
+                },
+            },
+        },
     };
+    let land = serde_json::to_value(land).unwrap();
+    assert_eq!(land["targetWasCheckedOut"], true);
     assert_eq!(
-        serde_json::to_value(land).unwrap()["targetWasCheckedOut"],
-        true
+        land["buildVolume"],
+        json!({"seeded":true,"adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
+            "database":"/m/.nx/workspace-data/A-v3.db","holders":[{"pid":42,"command":"node nx run-many"}]}}})
     );
 
     let status = GatewayStatus {

@@ -74,6 +74,24 @@
           "identity": "67586e98fad27da0b9968bc039a1ef34c939b9b8e523a8bef89d478608c5ecf6",
           "path": "/Users/fixture/Dev/.cowshed/gc/6",
           "reason": "orphanSessionImage"
+        },
+        {
+          "bytes": 8192,
+          "identity": "ca358758f6d27e6cf45272937977a748fd88391db679ceda7dc7bf1f005ee879",
+          "path": "/Users/fixture/Dev/.cowshed/gc/7",
+          "reason": "unlinkedBuildVolume"
+        },
+        {
+          "bytes": 9216,
+          "identity": "beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a",
+          "path": "/Users/fixture/Dev/.cowshed/gc/8",
+          "reason": "supersededSeed"
+        },
+        {
+          "bytes": 10240,
+          "identity": "2b4c342f5433ebe591a1da77e013d1b72475562d48578dca8b84bac6651c3cb9",
+          "path": "/Users/fixture/Dev/.cowshed/gc/9",
+          "reason": "unrecordedBuildVolume"
         }
       ],
       "deferred": [],
@@ -908,13 +926,71 @@
     }
   },
   "LandReport": {
+    "adoptionSkipped": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
+            "holders": [
+              {
+                "command": "node nx run-many -t build",
+                "pid": 4242
+              }
+            ],
+            "kind": "targetHeld"
+          }
+        },
+        "seeded": true
+      },
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "firstLanding": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "kind": "noLandingVolume"
+          }
+        },
+        "seeded": false
+      },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
     "retired": {
+      "buildVolume": {
+        "adoption": {
+          "check": {
+            "failed": [
+              {
+                "check": "bun nx run-many -t lint",
+                "exit": 1
+              }
+            ],
+            "hits": 41,
+            "misses": [
+              {
+                "hash": "1234567890",
+                "inputs": {
+                  "files": ["src/a.ts"]
+                },
+                "inputsDigest": "32381523e63197c929b67f793a8098bed0ae3a6fa902634fdbcc6fa4567f3346",
+                "task": "widget:build"
+              }
+            ],
+            "withoutNxRun": ["cargo test"]
+          },
+          "elapsedMs": 3,
+          "kind": "adopted"
+        },
+        "seeded": true
+      },
       "landedHead": "1111111111111111111111111111111111111111",
       "previousTargetHead": "2222222222222222222222222222222222222222",
       "retired": true,

@@ -478,11 +478,55 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         previous_target_head: None,
         target_was_checked_out: false,
         retired: false,
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: false,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::NoLandingVolume,
+            },
+        },
     };
     let land_retired = LandReport {
         previous_target_head: Some(oid("2222222222222222222222222222222222222222")),
         target_was_checked_out: true,
         retired: true,
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: true,
+            adoption: cowshed_core::api::dto::Adoption::Adopted {
+                elapsed_ms: 3,
+                check: cowshed_core::api::dto::AdoptionCheck {
+                    hits: 41,
+                    misses: vec![cowshed_core::api::dto::CacheMiss {
+                        task: "widget:build".to_owned(),
+                        hash: "1234567890".to_owned(),
+                        inputs: [("files".to_owned(), vec!["src/a.ts".to_owned()])]
+                            .into_iter()
+                            .collect(),
+                        inputs_digest: Sha256Digest::compute(b"inputs"),
+                        inputs_error: None,
+                    }],
+                    without_nx_run: vec!["cargo test".to_owned()],
+                    failed: vec![cowshed_core::api::dto::FailedCheck {
+                        check: "bun nx run-many -t lint".to_owned(),
+                        exit: Some(1),
+                    }],
+                },
+            },
+        },
+        ..land_first.clone()
+    };
+    let land_held = LandReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: true,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
+                    database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
+                    holders: vec![cowshed_core::api::dto::DatabaseHolder {
+                        pid: 4242,
+                        command: "node nx run-many -t build".to_owned(),
+                    }],
+                },
+            },
+        },
         ..land_first.clone()
     };
 
@@ -513,6 +557,9 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanMountpoint,
             GcReason::ExpiredCheckpoint,
             GcReason::OrphanSessionImage,
+            GcReason::UnlinkedBuildVolume,
+            GcReason::SupersededSeed,
+            GcReason::UnrecordedBuildVolume,
         ]
         .into_iter()
         .enumerate()
@@ -593,6 +640,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             BTreeMap::from([
                 ("firstLanding", document("land report", &land_first)),
                 ("retired", document("land report", &land_retired)),
+                ("adoptionSkipped", document("land report", &land_held)),
             ]),
         ),
         (

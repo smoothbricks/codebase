@@ -280,6 +280,43 @@ export interface LandReport {
   readonly previousTargetHead?: string;
   readonly targetWasCheckedOut: boolean;
   readonly retired: boolean;
+  /** What the land did with build volumes (16_build_volumes.md, Land steps 4–7). */
+  readonly buildVolume: LandBuildVolume;
+}
+
+export interface LandBuildVolume {
+  readonly seeded: boolean;
+  readonly adoption:
+    | { readonly kind: 'adopted'; readonly elapsedMs: number; readonly check: AdoptionCheck }
+    | { readonly kind: 'skipped'; readonly reason: AdoptionSkip };
+}
+
+export interface DatabaseHolder {
+  readonly pid: number;
+  readonly command: string;
+}
+
+export type AdoptionSkip =
+  | { readonly kind: 'noLandingVolume' }
+  | { readonly kind: 'noTargetVolume' }
+  | { readonly kind: 'landingHeld'; readonly database: string; readonly holders: readonly DatabaseHolder[] }
+  | { readonly kind: 'landingDaemonStayed'; readonly daemon: DatabaseHolder }
+  | { readonly kind: 'targetHeld'; readonly database: string; readonly holders: readonly DatabaseHolder[] }
+  | { readonly kind: 'targetDaemonStayed'; readonly daemon: DatabaseHolder };
+
+export interface AdoptionCheck {
+  readonly hits: number;
+  readonly misses: readonly CacheMiss[];
+  readonly withoutNxRun: readonly string[];
+  readonly failed: readonly { readonly check: string; readonly exit?: number }[];
+}
+
+export interface CacheMiss {
+  readonly task: string;
+  readonly hash: string;
+  readonly inputs: Readonly<Record<string, readonly string[]>>;
+  readonly inputsDigest: string;
+  readonly inputsError?: string;
 }
 
 export interface GcCandidate {
@@ -293,7 +330,10 @@ export interface GcCandidate {
     | 'orphanStagingMetadata'
     | 'orphanStagingMount'
     | 'orphanMountpoint'
-    | 'expiredCheckpoint';
+    | 'expiredCheckpoint'
+    | 'unlinkedBuildVolume'
+    | 'supersededSeed'
+    | 'unrecordedBuildVolume';
 }
 
 export interface GcDeferred {
