@@ -134,10 +134,13 @@ impl BuildVolumeRecord {
     }
 }
 
-/// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]).
+/// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), and the
+/// fingerprint of the tracked build inputs they were discovered from
+/// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildVolumeState {
     pub paths: Vec<BuildStatePath>,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,6 +148,8 @@ pub struct BuildVolumeState {
 struct StateWire {
     version: u32,
     paths: Vec<PathWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,25 +178,11 @@ impl BuildVolumeState {
             .iter()
             .map(path_from_wire)
             .collect::<crate::Result<Vec<_>>>()?;
-        for (index, left) in paths.iter().enumerate() {
-            for right in &paths[index + 1..] {
-                let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-                if overlap(left.checkout.as_path(), right.checkout.as_path())
-                    || overlap(left.volume.as_path(), right.volume.as_path())
-                {
-                    return Err(crate::CowshedError::integrity(
-                        format!(
-                            "{} names overlapping build-state paths {} and {}",
-                            path.display(),
-                            left.checkout.as_path().display(),
-                            right.checkout.as_path().display()
-                        ),
-                        "cowshed doctor --json",
-                    ));
-                }
-            }
-        }
-        Ok(Self { paths })
+        disjoint(&paths).map_err(|(left, right)| overlapping(&path, left, right))?;
+        Ok(Self {
+            paths,
+            fingerprint: wire.fingerprint,
+        })
     }
 
     pub fn write(&self, volume_root: &Path) -> crate::Result<()> {
@@ -206,8 +197,42 @@ impl BuildVolumeState {
                     volume: state.volume.as_path().to_string_lossy().into_owned(),
                 })
                 .collect(),
+            fingerprint: self.fingerprint.clone(),
         };
         write_json(&path, &wire).map_err(|error| record_error(&path, &error))
+    }
+
+    /// This state with each `discovered` path it does not hold yet added, recorded at
+    /// `fingerprint`, and the paths added. A path already held keeps its volume name: links are
+    /// fixed once made (16_build_volumes.md, "One link per checkout"). A new path that overlaps
+    /// a held one is refused, naming both.
+    pub fn with_discovered(
+        &self,
+        discovered: &[BuildStatePath],
+        fingerprint: String,
+        volume_root: &Path,
+    ) -> crate::Result<(Self, Vec<BuildStatePath>)> {
+        let added: Vec<BuildStatePath> = discovered
+            .iter()
+            .filter(|path| {
+                !self
+                    .paths
+                    .iter()
+                    .any(|held| held.checkout.as_path() == path.checkout.as_path())
+            })
+            .cloned()
+            .collect();
+        let mut paths = self.paths.clone();
+        paths.extend(added.iter().cloned());
+        disjoint(&paths)
+            .map_err(|(left, right)| overlapping(&volume_root.join(STATE_FILE), left, right))?;
+        Ok((
+            Self {
+                paths,
+                fingerprint: Some(fingerprint),
+            },
+            added,
+        ))
     }
 
     /// Every Nx `workspace-data` directory the volume holds, relative to its root: where Nx keeps
@@ -240,6 +265,34 @@ impl BuildVolumeState {
 
 fn path_from_wire(wire: &PathWire) -> crate::Result<BuildStatePath> {
     BuildStatePath::new(&wire.checkout, &wire.volume)
+}
+
+/// The first two paths that overlap on either side, or `()` when none do: one build-state path
+/// inside another would link a tool's state through another tool's.
+fn disjoint(paths: &[BuildStatePath]) -> Result<(), (&BuildStatePath, &BuildStatePath)> {
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    for (index, left) in paths.iter().enumerate() {
+        for right in &paths[index + 1..] {
+            if overlap(left.checkout.as_path(), right.checkout.as_path())
+                || overlap(left.volume.as_path(), right.volume.as_path())
+            {
+                return Err((left, right));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> crate::CowshedError {
+    crate::CowshedError::integrity(
+        format!(
+            "{} names overlapping build-state paths {} and {}",
+            path.display(),
+            left.checkout.as_path().display(),
+            right.checkout.as_path().display()
+        ),
+        "cowshed doctor --json",
+    )
 }
 
 /// Where one project's build volumes live.
@@ -566,6 +619,7 @@ mod tests {
                 BuildStatePath::new("apps/web/.nx/workspace-data", "apps/web/nx/workspace-data")
                     .unwrap(),
             ],
+            fingerprint: Some("f1".to_owned()),
         };
         assert_eq!(
             state.nx_workspace_data().collect::<Vec<_>>(),
@@ -590,5 +644,30 @@ mod tests {
         state.write(&root).unwrap();
         assert_eq!(BuildVolumeState::read(&root).unwrap(), state);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Rediscovery adds only what the state does not hold yet; a held path keeps its volume name
+    /// (links never move), and a new path inside a held one is refused by name.
+    #[test]
+    fn rediscovered_paths_are_added_never_moved() {
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new("target", "target").unwrap()],
+            fingerprint: Some("old".to_owned()),
+        };
+        let discovered = [
+            BuildStatePath::new("target", "elsewhere").unwrap(),
+            BuildStatePath::new("tools/x/target", "tools-x-target").unwrap(),
+        ];
+        let (next, added) = state
+            .with_discovered(&discovered, "new".to_owned(), Path::new("/v"))
+            .unwrap();
+        assert_eq!(added, [discovered[1].clone()]);
+        assert_eq!(next.paths, [state.paths[0].clone(), discovered[1].clone()]);
+        assert_eq!(next.fingerprint.as_deref(), Some("new"));
+        let inside = [BuildStatePath::new("target/sub", "sub").unwrap()];
+        let error = state
+            .with_discovered(&inside, "new".to_owned(), Path::new("/v"))
+            .unwrap_err();
+        assert!(error.message.contains("target/sub"), "{error:?}");
     }
 }

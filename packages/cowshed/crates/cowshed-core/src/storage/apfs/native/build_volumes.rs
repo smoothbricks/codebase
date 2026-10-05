@@ -31,13 +31,14 @@ impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
-    /// Create the empty build volume `id` at `capacity` and mount it. Its record is written last:
-    /// an image without one is an interrupted creation, which nothing links.
+    /// Create the empty build volume `id` at `capacity` and mount it, without a record. The
+    /// caller writes the record last, once the volume holds what it should (a migration's copied
+    /// build state); until then the volume is an interrupted creation, which collection deletes
+    /// unless a live build link names it.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-        record: &BuildVolumeRecord,
         capacity: ImageCapacity,
     ) -> Result<PathBuf, ApfsStorageError> {
         let image = layout.image(id);
@@ -96,9 +97,6 @@ where
                     .map_err(Into::into),
             );
         }
-        layout
-            .write_record(id, record)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         Ok(mount)
     }
 
@@ -416,13 +414,9 @@ mod tests {
         let (host, layout) = fixture(root.path());
         let source = BuildVolumeId::mint();
         let mount = host
-            .create_build_volume(
-                &layout,
-                &source,
-                &linked("main"),
-                ImageCapacity::from_gibibytes(1),
-            )
+            .create_build_volume(&layout, &source, ImageCapacity::from_gibibytes(1))
             .expect("create a build volume");
+        layout.write_record(&source, &linked("main")).unwrap();
         assert_eq!(mount, layout.mount(&source));
         assert_eq!(
             host.mount_build_volume(&layout, &source).unwrap(),

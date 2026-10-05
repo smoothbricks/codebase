@@ -674,6 +674,7 @@ mod tests {
                 BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
                 BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
             ],
+            fingerprint: None,
         }
     }
 
@@ -920,6 +921,7 @@ mod tests {
         std::os::unix::fs::symlink(&package, checkout.join("node_modules/nx")).unwrap();
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
+            fingerprint: None,
         };
         let daemon = |verb: &str| {
             let mut command = std::process::Command::new("node");
