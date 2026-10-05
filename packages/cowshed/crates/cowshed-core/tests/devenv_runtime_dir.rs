@@ -1960,16 +1960,27 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
     let root = scratch("shared-tool-caches");
     let mut sandbox = workspace(&root, 42_592);
     let _runtime_link = runtime_link::RuntimeLink::reserve(&mut sandbox);
+    // A shared directory this rule finds empty while the host's own cache is not yet relocated
+    // into it is emptied again: left holding the probe's packages, it is the conflict that keeps
+    // host setup from ever relocating the host cache, and every sandbox then misses the shared one.
+    let host_home = std::env::var_os("HOME").expect("host HOME");
+    let mut found_empty = Vec::new();
     for (host, shared) in [
         (".cargo/registry", "cargo/registry"),
         (".cargo/git", "cargo/git"),
         (".bun/install/cache", "bun/install/cache"),
     ] {
+        let cache = cowshed_core::capabilities::cache::HostCache {
+            host: Path::new(&host_home).join(host),
+            shared: caches.join(shared),
+        };
         let host = sandbox.home.join(host);
-        let shared = caches.join(shared);
         std::fs::create_dir_all(host.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&shared).unwrap();
-        std::os::unix::fs::symlink(shared, host).unwrap();
+        std::fs::create_dir_all(&cache.shared).unwrap();
+        if !cache.is_shared() && std::fs::read_dir(&cache.shared).unwrap().next().is_none() {
+            found_empty.push(cache.shared.clone());
+        }
+        std::os::unix::fs::symlink(cache.shared, host).unwrap();
     }
     for name in cowshed_core::capabilities::cargo::STATE_FILES {
         std::fs::write(sandbox.home.join(".cargo").join(name), "").unwrap();
@@ -2149,6 +2160,10 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
         outcomes.push((tool, result));
     }
     std::fs::remove_dir_all(&root).expect("remove cache fixture");
+    for shared in found_empty {
+        std::fs::remove_dir_all(&shared).expect("empty a shared cache this rule filled");
+        std::fs::create_dir(&shared).expect("restore the empty shared cache");
+    }
     for (tool, (exit, stdout, stderr)) in outcomes {
         assert_eq!(
             exit,
