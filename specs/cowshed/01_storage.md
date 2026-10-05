@@ -375,18 +375,23 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    disk-tool processes and measured 2.5–8 s for single calls that take 0.2 s idle. CPU load changes none of this; the
    number of concurrent disk-tool calls on the host does. `hdiutil detach`, `newfs_apfs`, `fsck_apfs`, `mount_apfs` and
    IORegistry reads do not go through `storagekitd`.
-2. **AppleDiskImages2 does not give attach slots back.** Every attach sets up a kernel IO manager in AppleDiskImages2,
-   and detaching the image does not reliably return its slot. Each attach→detach cycle lowers the number of images the
-   host can attach until reboot. Past the ceiling, every `diskutil image attach` and `diskutil image info` of every
-   format fails with "error code 150" ("Failed to initialize IO manager: Driver returned error code -536870210",
-   `kIOReturnNoResources`), and so does every new workspace, build volume, checkpoint and cold mount; images already
-   attached keep working, and legacy `hdiutil attach` of UDIF still attaches. Measured: a host about 20,000 attaches
-   into its uptime held 330 images at once, then failed at 128 after about 300 more attach→detach cycles, then at 114,
-   100 and 98 as later cycles were spent. IORegistry devices and `hdiutil info` matched one to one (no zombie devices),
-   and every `diskimagesiod` that created a device was alive. Over 80 idle minutes the ceiling did not recover;
-   detaching an image freed at most one attach, and detaching 15 freed only a few. Whether a `launchctl` restart of the
-   per-image `diskimagesiod` jobs frees slots was not tried. A reboot is the expected reset. An attach is therefore a
-   consumable: an operation or test pays the fewest attach cycles that prove its behavior.
+2. **AppleDiskImages2 runs out of kernel mappings, and detach does not give them all back.** Every attached image's
+   `diskimagesiod` maps its IO request pool into the kernel: 36 shared buffers of 2 MiB each (queue depth 36, 2 MiB max
+   IO), 72 MiB per attached image, so 100 attached images hold about 7 GiB mapped. When the kernel cannot map a new pool
+   the kernel log reads `DISharedBuffer::init: Can't map buffer at user address … size 2097152 to kernel` and
+   `DIDeviceRequestPool::AllocateRequests: Can't allocate all buffers, allocated 0/36`, and the attach fails with "error
+   code 150" ("Failed to initialize IO manager: Driver returned error code -536870210", `kIOReturnNoResources`). So does
+   every `diskutil image info`, every new workspace, build volume, checkpoint and cold mount; images already attached
+   keep working, and legacy `hdiutil attach` of UDIF still attaches. It is not the user wire limit: the host that failed
+   had 17.8 GB wired against a 116.8 GB `vm.global_user_wire_limit`, so no sysctl raises it. Detach does not return the
+   whole mapping: each attach→detach cycle lowered the number of images the host could attach until reboot. Measured: a
+   host about 20,000 attaches into its uptime held 330 images at once, then failed at 128 after about 300 more
+   attach→detach cycles, then at 114, 100 and 98 as later cycles were spent. IORegistry devices and `hdiutil info`
+   matched one to one (no zombie devices). Over 80 idle minutes the ceiling did not recover; detaching an image freed at
+   most one attach, and detaching 15 freed only a few. `launchctl kill` of the per-image `diskimagesiod` jobs is refused
+   even to root ("Not privileged to signal service"). A reboot is the expected reset. An attach is therefore a
+   consumable, and an attached image is a standing 72 MiB of kernel mapping: an operation or test pays the fewest attach
+   cycles that prove its behavior, and an idle workspace is detached rather than kept.
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
    and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach
    that followed 45.3 s. A held file anywhere in a volume keeps its image attached, so a stray process with a cwd inside
