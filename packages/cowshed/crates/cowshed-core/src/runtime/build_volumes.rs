@@ -1127,4 +1127,196 @@ mod tests {
             );
         }
     }
+
+    /// A scratch APFS store with one project's build volumes, for the refusal and adoption tests.
+    #[cfg(target_os = "macos")]
+    struct Scratch {
+        root: crate::scratch_apfs::ScratchRoot,
+        host: Arc<Host>,
+        layout: BuildVolumeLayout,
+        volumes: BuildVolumes,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            use crate::storage::apfs::ApfsSubstrateConfig;
+            let root = crate::scratch_apfs::ScratchRoot::new(name).expect("scratch root");
+            let store = root.path().join("store");
+            fs::create_dir_all(&store).unwrap();
+            let project = ProjectPaths::with_mount_root(
+                &store,
+                root.path().join("mnt"),
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap();
+            let host = Arc::new(
+                MacOsApfsExecutionHost::new(
+                    SystemCommandRunner,
+                    ApfsSubstrateConfig::new(
+                        &store,
+                        root.path().join("caches"),
+                        root.path().join("checkout"),
+                    ),
+                )
+                .unwrap(),
+            );
+            let layout = BuildVolumeLayout::new(&project).unwrap();
+            let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
+            Self {
+                root,
+                host,
+                layout,
+                volumes,
+            }
+        }
+
+        /// `name`'s checkout, linked to a new live volume of `gib` GiB recorded as its own.
+        fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
+            let checkout = self.root.path().join(name);
+            fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+            let id = BuildVolumeId::mint();
+            let mount = self
+                .host
+                .create_build_volume(&self.layout, &id, ImageCapacity::from_gibibytes(gib))
+                .expect("create a build volume");
+            BuildVolumeState::default().write(&mount).unwrap();
+            self.layout
+                .write_record(&id, &BuildVolumeRecord::new(None, linked(name)))
+                .unwrap();
+            link::point(&checkout, &mount).unwrap();
+            (checkout, id, mount)
+        }
+
+        fn release_all(&self) {
+            for id in self.layout.list().unwrap() {
+                assert_eq!(
+                    self.host.release_build_volume(&self.layout, &id).unwrap(),
+                    BuildVolumeRelease::Deleted
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn owner(name: &str, digit: char) -> Owner {
+        Owner {
+            name: WorkspaceName::new(name).unwrap(),
+            incarnation: WorkspaceIncarnation::new(digit.to_string().repeat(32)).unwrap(),
+        }
+    }
+
+    /// A resize that asks for no growth is the caller's mistake, decided from the image's own
+    /// limits before anything is detached.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_build_resize_that_does_not_grow_is_usage() {
+        let scratch = Scratch::new("build-resize-usage");
+        let (checkout, id, _) = scratch.linked_checkout("main", 1);
+        let refused = scratch
+            .volumes
+            .resize(
+                owner("main", '0'),
+                checkout,
+                ImageCapacity::from_gibibytes(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Usage, "{refused}");
+        assert_eq!(
+            scratch
+                .host
+                .build_volume_capacity(&scratch.layout, &id)
+                .unwrap(),
+            ImageCapacity::from_gibibytes(1)
+        );
+        scratch.release_all();
+    }
+
+    /// A volume with a file held open refuses the resize as a Conflict: the kernel will not let
+    /// go of it, and the image keeps its capacity.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_build_resize_of_a_held_volume_is_a_conflict() {
+        let scratch = Scratch::new("build-resize-held");
+        let (checkout, id, mount) = scratch.linked_checkout("main", 1);
+        let held = fs::File::create(mount.join("held")).unwrap();
+        let refused = scratch
+            .volumes
+            .resize(
+                owner("main", '0'),
+                checkout,
+                ImageCapacity::from_gibibytes(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Conflict, "{refused}");
+        assert_eq!(
+            scratch
+                .host
+                .build_volume_capacity(&scratch.layout, &id)
+                .unwrap(),
+            ImageCapacity::from_gibibytes(1)
+        );
+        drop(held);
+        scratch.release_all();
+    }
+
+    /// Adoption never shrinks a target (16_build_volumes.md, "Substrate"): a landing volume
+    /// smaller than the target's grows to the target's capacity while it is quiet, before the
+    /// seed is frozen from it, so the target and every later fork end at the larger capacity. A
+    /// landing volume already larger keeps its own.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_adoption_ends_at_the_larger_of_the_two_capacities() {
+        let scratch = Scratch::new("build-adopt-capacity");
+        let capacity = |id: &BuildVolumeId| {
+            scratch
+                .host
+                .build_volume_capacity(&scratch.layout, id)
+                .unwrap()
+        };
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 2);
+        let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
+        let quiet = scratch
+            .volumes
+            .quiesce(topic_checkout, main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        assert!(capacity(&topic) >= ImageCapacity::from_gibibytes(2));
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        scratch
+            .volumes
+            .freeze_seed(&quiet, owner("main", '0'), tree.clone())
+            .await
+            .unwrap();
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&WorkspaceName::main(), &owner("main", '0').incarnation)
+            .unwrap()
+            .unwrap();
+        assert!(capacity(&seed) >= ImageCapacity::from_gibibytes(2));
+        scratch
+            .volumes
+            .adopt(&quiet, WorkspaceName::main(), main_checkout.clone(), tree)
+            .await
+            .unwrap()
+            .expect("nothing holds the target's volume");
+        assert_eq!(
+            scratch.volumes.linked(&main_checkout).unwrap(),
+            Some(topic.clone())
+        );
+
+        // A landing volume larger than its target keeps its capacity.
+        let (other_checkout, other, _) = scratch.linked_checkout("other", 3);
+        scratch
+            .volumes
+            .quiesce(other_checkout, main_checkout)
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        assert_eq!(capacity(&other), ImageCapacity::from_gibibytes(3));
+        scratch.release_all();
+    }
 }
