@@ -626,6 +626,13 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 - `killAfterMs: 10000`
 - package script alias `nx run <project>:test --outputStyle=stream`
 
+A `test` aggregate that is a no-op target passes the check when every target it depends on, transitively, is a bounded
+leg: `bounded-exec` with a command, a `cwd`, and positive `timeoutMs` and `killAfterMs`. A bare prerequisite target
+(`^build`, `build`, a target in another project) is not a bounded leg, so name prerequisites on the legs that read them.
+Only a leg that runs `bun test` must start in the project root or its `src/`, where Bun's test-file discovery is cheap;
+any other command (a cargo workspace's per-crate nextest legs run from the workspace root, a gate may run a script that
+lives in another project) may use any `cwd`.
+
 ## Managed workspace files
 
 `nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as `smoo monorepo update`, without

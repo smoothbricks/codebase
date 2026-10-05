@@ -189,6 +189,37 @@ describe('bounded test target policy', () => {
     expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject })).toBe(true);
   });
 
+  it('bounds where `bun test` starts but not where other bounded legs run', () => {
+    const packageJson: BoundedTestPolicyPackageJson = {
+      nx: { targets: { test: { dependsOn: ['napi-test'] } } },
+    };
+    const withLeg = (command: string, cwd: string): ResolvedProjectTargets => {
+      const project = resolvedAggregateProject();
+      project.targetOptions = new Map<string, Record<string, unknown>>([
+        ['napi-test', { command, cwd, timeoutMs: BOUNDED_TEST_TIMEOUT_MS, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
+      ]);
+      return project;
+    };
+    const check = (resolvedProject: ResolvedProjectTargets) =>
+      checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject });
+
+    // A cargo workspace's nextest legs run from the workspace root, which no member project owns; Nx resolves
+    // `{workspaceRoot}` to the empty string. A gate script may also live in another project.
+    const nextest = "cargo --frozen nextest run --workspace-remap . -E 'package(rusty)'";
+    for (const cwd of ['.', '', '{workspaceRoot}']) {
+      expect(check(withLeg(nextest, cwd))).toBe(true);
+    }
+    expect(check(withLeg('bun --preload ../../tooling/preload.ts gate.ts', 'packages/other'))).toBe(true);
+
+    // `bun test` scans its cwd for test files, so it keeps the project-root bound.
+    const bunTest = `bun test ${TIMEOUT_FLAG} src/native.test.ts`;
+    expect(check(withLeg(bunTest, 'packages/cowshed'))).toBe(true);
+    expect(check(withLeg(bunTest, 'packages/cowshed/src'))).toBe(true);
+    expect(check(withLeg(bunTest, '.'))).toBe(false);
+    expect(check(withLeg(bunTest, ''))).toBe(false);
+    expect(check(withLeg(bunTest, 'packages/other'))).toBe(false);
+  });
+
   it('rejects aggregate bypass scripts, unbounded leaves, and dependency cycles', () => {
     const packageJson: BoundedTestPolicyPackageJson = {
       nx: { targets: { test: { dependsOn: ['napi-test'] } } },

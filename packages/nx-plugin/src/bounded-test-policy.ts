@@ -407,7 +407,11 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     isPackageTestScriptRunnerCommand(command) === false &&
     command === ensureBunTestTimeoutFlag(command) &&
     typeof rawOptions.cwd === 'string' &&
-    allowedCwds.has(rawOptions.cwd) &&
+    // `bun test` walks its working directory looking for test files, so it must start where that walk is cheap: the
+    // project root or its `src/`. Any other command names what it runs and has no walk to bound. A cargo workspace's
+    // per-crate nextest legs run from the workspace root, which no member project owns, and a gate may run a script
+    // that lives in another project; both are bounded by their timeouts alone.
+    (!BUN_TEST_PREFIX.test(command) || allowedCwds.has(rawOptions.cwd)) &&
     isPositiveSafeInteger(rawOptions.timeoutMs) &&
     isPositiveSafeInteger(rawOptions.killAfterMs)
   );
