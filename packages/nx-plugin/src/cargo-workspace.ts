@@ -795,6 +795,9 @@ export function exceptionalTestFilter(nextestConfigPath: string): string | null 
   return unique.length === 0 ? null : unique.map((filter) => `(${filter})`).join(' or ');
 }
 
+/** The plugin's nextest.toml as the workspace root's `node_modules` links it. */
+const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/nextest.toml';
+
 /**
  * The plugin's own nextest settings, as a config layer BENEATH the repository's.
  *
@@ -813,10 +816,19 @@ export function exceptionalTestFilter(nextestConfigPath: string): string | null 
  * (`bounded-exec`, which spawns with `shell: true`) go through a shell — so the
  * command text stays identical everywhere. Quoted, because a workspace path may
  * contain spaces.
+ *
+ * The file is named through the workspace root's `node_modules` link, as
+ * `NEXTEST_EXTRACT_BIN` is, never through where the plugin really lives: a
+ * plugin linked from a checkout outside the workspace sits a different number
+ * of `../` away from each workspace depending on how deep that workspace is,
+ * and that count re-keyed every target of every Cargo project — and every
+ * dependent task — in each workspace that sat at a new depth.
+ *
+ * `projectRoot` is the Cargo workspace's root relative to the Nx workspace
+ * root, which is the directory these commands run in.
  */
-export function nextestToolConfigArg(workspaceRoot: string, projectRoot: string, configAbs: string): string {
-  const rel = relative(join(workspaceRoot, projectRoot), configAbs);
-  const path = rel.length === 0 ? configAbs : rel.split(sep).join('/');
+export function nextestToolConfigArg(projectRoot: string): string {
+  const path = posix.join(posix.relative(projectRoot, '.'), PLUGIN_NEXTEST_CONFIG_PATH);
   return `--tool-config-file "smoo:$PWD/${path}"`;
 }
 

@@ -889,9 +889,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // sit UNDER the repository's `.config/nextest.toml`, which is the only
       // place an `archive.include` for a cdylib or fixture can be declared.
       // `$PWD` because tool config paths must be absolute and an absolute path
-      // in the command text would split one cache entry per checkout.
-      expect(String(targets['cargo-test-archive']?.options?.command)).toMatch(
-        /^mkdir -p \.cache\/nextest && cargo --frozen nextest archive --workspace --archive-file \.cache\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+      // in the command text would split one cache entry per checkout; through
+      // the root `node_modules` link because the plugin's real location is a
+      // different number of `../` away from each checkout.
+      expect(String(targets['cargo-test-archive']?.options?.command)).toBe(
+        'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml"',
       );
       expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
@@ -911,7 +913,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // moved tree). `--workspace` is not merely redundant here, nextest
       // rejects it beside a reused build.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -1136,12 +1138,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-test-runtime-core-exceptions-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-exceptions-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
-      // At the root the helper is the root's own `node_modules` link, no `../`.
+      // At the root the helper and the plugin's nextest config are the root's
+      // own `node_modules` link, no `../`.
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
         'extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && ',
       );
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
         `--target-dir-remap "$extracted/target" --workspace-remap . -E 'package(runtime-core)`,
+      );
+      expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toEndWith(
+        '--tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"',
       );
       expect(native['cargo-test-native-napi']?.options?.command).toContain('--no-tests=pass');
       expect(runtime['cargo-test']?.dependsOn).toEqual([
@@ -1377,6 +1383,51 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   }, 60_000);
+
+  // A consumer links the plugin from a checkout of its own, outside the
+  // workspace, and its forks sit at different depths. Nx hashes a project's
+  // configuration into every task of that project and of its dependents, so
+  // the configuration must not know how deep the workspace is: measured, a
+  // `../` count in the tool config path re-keyed 118 tasks of a fork of a warm
+  // main.
+  it('infers byte-identical cargo targets for a workspace at any depth', async () => {
+    const parent = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-depth-')));
+    const plugin = fileURLToPath(new URL('..', import.meta.url));
+    const pluginNextestConfig = await readFile(join(plugin, 'nextest.toml'), 'utf8');
+    try {
+      const inferred: string[] = [];
+      for (const dir of [parent, join(parent, 'a/b/c')]) {
+        await mkdir(dir, { recursive: true });
+        const workspace = await createWorkspace(dir);
+        const root = workspace.context.workspaceRoot;
+        await writeCargoIdentityFixture(workspace);
+        const project = await inferProject(workspace, 'packages/ferris/package.json');
+        // Installed the way a consumer links it: a checkout outside the
+        // workspace. After inference, whose fixture walk would follow it.
+        await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+        await symlink(plugin, join(root, 'node_modules/@smoothbricks/nx-plugin'));
+        // Stable is not enough: from where each command runs, the spelling
+        // must name the config the plugin ships.
+        const configured: string[] = [];
+        for (const [name, target] of cachedCargoTargets(project?.targets ?? {})) {
+          const named = /--tool-config-file "smoo:\$PWD\/([^"]+)"/.exec(String(target.options?.command));
+          if (!named?.[1]) continue;
+          configured.push(name);
+          const config = await readFile(join(root, String(target.options?.cwd), named[1]), 'utf8');
+          expect([name, config]).toEqual([name, pluginNextestConfig]);
+        }
+        expect(configured.sort()).toEqual([
+          'cargo-cross-test-archive-aarch64-apple-darwin',
+          'cargo-test-archive',
+          'cargo-test-ferris-core',
+        ]);
+        inferred.push(JSON.stringify(project, null, 2));
+      }
+      expect(inferred[1]).toBe(inferred[0]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
 
   it('scopes each per-crate cargo-test command to exactly one package', async () => {
     const workspace = await createWorkspace();
@@ -2498,10 +2549,10 @@ async function prepareCargoFixture(root: string): Promise<void> {
   }
 }
 
-async function createWorkspace(): Promise<WorkspaceFixture> {
+async function createWorkspace(parent = tmpdir()): Promise<WorkspaceFixture> {
   // Canonical, because macOS puts the temp directory behind a /private symlink
   // and a daemon never sees an edit made under a root named through one.
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-')));
+  const root = await realpath(await mkdtemp(join(parent, 'smoothbricks-nx-plugin-')));
 
   return {
     context: {

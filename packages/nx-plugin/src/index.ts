@@ -1270,7 +1270,7 @@ async function createProjectTargets(
     targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceCargoInputs;
     targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
       cargoWorkspaceRoot,
-      nextestToolConfigArg(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
+      nextestToolConfigArg(cargoWorkspaceRoot),
     );
     // `archive.include` lives in the repository's nextest config, so that file
     // decides what the archive CONTAINS, not merely how a run behaves.
@@ -1282,12 +1282,10 @@ async function createProjectTargets(
     for (const crossTarget of listCargoCrossTestTargets(join(workspaceRoot, cargoWorkspaceRoot))) {
       Object.assign(
         targets,
-        createCargoCrossTestTargets(
-          cargoWorkspaceRoot,
-          nextestToolConfigArg(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
-          crossTarget,
-          [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`],
-        ),
+        createCargoCrossTestTargets(cargoWorkspaceRoot, nextestToolConfigArg(cargoWorkspaceRoot), crossTarget, [
+          ...workspaceCargoInputs,
+          `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
+        ]),
       );
     }
     const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
@@ -2439,7 +2437,7 @@ async function addCargoTestTargets(
   workspace: CargoWorkspace,
 ): Promise<string[]> {
   const targetNames: string[] = [];
-  const toolConfig = nextestToolConfigArg(workspaceRoot, workspace.projectRoot, PLUGIN_NEXTEST_CONFIG);
+  const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
   const extractBin = posix.join(posix.relative(workspace.projectRoot, '.'), NEXTEST_EXTRACT_BIN);
   const reuseExtraction =

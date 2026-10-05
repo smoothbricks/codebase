@@ -367,13 +367,16 @@ Concrete targets come from concrete files:
   `napi-debug`, because its tests load that addon from `target/debug`. A crate declaring
   `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
   project.
-- The plugin's own `nextest.toml` is passed as `--tool-config-file "smoo:$PWD/<path>"`, so it is a layer BENEATH the
-  repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository can raise a
-  timeout or declare `archive.include` for a cdylib or fixture the archived test binaries need, and its settings win.
-  That file is an input of both the archive and every runner, so changing it invalidates the verdicts it governs. `$PWD`
-  keeps the command text identical across checkouts while satisfying nextest's requirement that a tool config path be
-  absolute; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must not decide a cached
-  verdict.
+- The plugin's own `nextest.toml` is passed as
+  `--tool-config-file "smoo:$PWD/<to workspace root>/node_modules/@smoothbricks/nx-plugin/nextest.toml"`, so it is a
+  layer BENEATH the repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository
+  can raise a timeout or declare `archive.include` for a cdylib or fixture the archived test binaries need, and its
+  settings win. That file is an input of both the archive and every runner, so changing it invalidates the verdicts it
+  governs. `$PWD` keeps the command text identical across checkouts while satisfying nextest's requirement that a tool
+  config path be absolute, and naming the file through the workspace root's `node_modules` link — never the plugin's
+  real location — keeps it identical for a plugin linked from a checkout outside the workspace, whatever depth each
+  workspace sits at; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must not decide a
+  cached verdict.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
