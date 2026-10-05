@@ -259,9 +259,9 @@ Notes:
   links equal across checkouts) — and its profile adds exactly: literal reads of that path (its ancestors beneath HOME
   metadata only) and of cargo's `registry` and `git` links, and read-write literals for cargo's root state files
   `.package-cache`, `.package-cache-mutate`, `.global-cache` and `.global-cache-journal`. Nothing else in `~/.cargo`,
-  `~/.bun` or `~/.cache` is granted. Until bun's cache is relocated, `~/.bun/install/cache` stays readable, never
-  writable: a clone's `node_modules` carries main's links into it. The denies above still follow every one of those
-  grants.
+  `~/.bun` or `~/.cache` is granted. A bun child is pointed at `~/.bun/install/cache` before relocation too, never a
+  private store (03_caches.md); until then that path stays readable, never writable: a clone's `node_modules` carries
+  main's links into it. The denies above still follow every one of those grants.
 - The `~/go` deny is a **misconfiguration tripwire, not secret protection**: a Go project's `GOMODCACHE`/`GOCACHE` name
   the caches volume and its `GOPATH` defaults under the private `HOME`, so nothing sandboxed should ever touch the
   host's `~/go`. A stray absolute reference would otherwise silently regrow a gigabyte-scale `~/go` on the Data volume;

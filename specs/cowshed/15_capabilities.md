@@ -89,7 +89,8 @@ Each detector returns data through one `CapabilityContribution`:
 - **Cache mounts:** a shared cache source, optional private-environment link target, and any host-cache relocation
   descriptor. The same descriptor supplies environment, preparation and sandbox authority; no second table owns cache
   permissions. Only detected capabilities use their cache mounts. Without provisioned shared caches a tool uses private
-  state.
+  state — except a link-target cache (Bun's install cache, 03_caches.md): checkouts write its path into their links, so
+  its variable always names the host's literal path, read-only until host setup relocates it.
 - **Build state:** `BuildStatePath` pairs a normalized checkout-relative tool path with its normalized volume-relative
   destination (16_build_volumes.md). Overlapping contributions fail; identical ones coalesce. The storage implementation
   applies fixed relative links through the checkout's one `.cowshed/build` link.
@@ -115,7 +116,10 @@ Each detector returns data through one `CapabilityContribution`:
 
 Host setup can relocate declared cache descriptors globally so host checkouts and clones retain identical cache path
 spellings. Descriptor declarations live with their detectors; host preparation does not enable a capability in a
-repository. Cargo's cache locks remain part of its detector's host relocation operation.
+repository. Cargo's cache locks remain part of its detector's host relocation operation. A relocated descriptor's
+variable names the host path, which resolves to the shared cache: a sandboxed `bun install` extracts into
+`/private/cowshed/caches/bun/install/cache` through `~/.bun/install/cache`, as cargo's registry and Go's `GOCACHE` land
+there.
 
 Shared cache mounts grant metadata-only access to their physical ancestors, after the store-wide deny. Cargo/libgit2
 canonicalizes a newly fetched Git cache path; a writable cache subtree is insufficient when `/private/cowshed` itself

@@ -200,8 +200,13 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   cargo writes at its root (the package-cache locks and the `.global-cache` usage database with its journal). Nothing
   else in a host tool home is granted. A caller's own value for these variables never reaches the child. Until a tool's
   caches are relocated the sandbox keeps the tool's private default under its private `HOME`, and `doctor` reports each
-  unshared cache; an unshared bun cache stays readable, never writable, so the links a clone inherited from main's
-  `node_modules` keep resolving.
+  unshared cache. Bun's link-target cache is the exception: a private default (bun prefers `$XDG_CACHE_HOME/.bun`, the
+  workspace's `.cowshed/cache`) would relink every package of the clone's first `bun install` into a store no other
+  checkout has, and the clone's `node_modules` would name a per-workspace path instead of main's. So a bun child is
+  always pointed at `BUN_INSTALL_CACHE_DIR=<host home>/.bun/install/cache`, and an unshared one stays readable, never
+  writable: the links a clone inherited from main's `node_modules` keep resolving, an install of what the cache already
+  holds links into it, and an install that would extract a new package fails with `EACCES` instead of forking the cache;
+  `doctor` names the relocation that makes it writable.
 
   **A clone is warm only for the units its origin built.** Cargo keys a unit on its profile, and whether it compiles
   incrementally is part of that key. A `test` profile that differs from `dev` makes `cargo test` and `cargo build` two
@@ -253,10 +258,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       host's own default path only to undo the private `HOME`), `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host
       `RUSTUP_HOME`; for a Go project `GOMODCACHE` and `GOCACHE`; the other shared tool homes of detected package
       managers and toolchains (`BUN_INSTALL_CACHE_DIR`, `NPM_CONFIG_CACHE`, `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`,
-      `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path once its link reaches the caches volume; and for a Gradle
-      project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the shared `gradle/caches`,
-      so the daemon, wrapper distributions, native libraries and JDKs stay private and no part of the host `~/.gradle`
-      is granted;
+      `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path once its link reaches the caches volume — bun's always
+      (above); and for a Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the
+      shared `gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no part
+      of the host `~/.gradle` is granted;
     - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
       daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
     - the build wiring: `SCCACHE_BASEDIR_CWD=1`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the

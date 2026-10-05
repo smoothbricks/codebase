@@ -745,7 +745,10 @@ pub fn validate_override_directory(value: &str) -> std::result::Result<PathBuf, 
     Ok(path.to_owned())
 }
 
-/// Reuse the host's exact cache spelling only after its links reach the shared cache volume.
+/// Reuse the host's exact cache spelling: for every tool once its links reach the shared cache
+/// volume, and for a cache checkouts link into from the start — any other spelling rewrites every
+/// link a `bun install` writes, so before relocation the sandbox reads the host cache instead of
+/// filling a private one.
 pub fn shared_tool_contribution(
     context: &DetectionContext<'_>,
     tool: &'static SharedToolHome,
@@ -757,7 +760,7 @@ pub fn shared_tool_contribution(
     if let Some(variable) = tool.variable {
         contribution.env.insert(
             variable,
-            if shared {
+            if shared || tool.linked_from_checkouts {
                 EnvAction::Own(host.clone().into_os_string())
             } else {
                 EnvAction::Unset

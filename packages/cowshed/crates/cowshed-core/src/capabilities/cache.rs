@@ -10,7 +10,9 @@
 //! `node_modules` and every clone's resolve only if each names the same cache path. A sandboxed
 //! child of a project that uses the tool is therefore pointed at the host path once host setup
 //! has relocated the tool's caches; until then it keeps the tool's private default under the
-//! sandbox HOME, and `cowshed doctor` says why.
+//! sandbox HOME, and `cowshed doctor` says why. A cache checkouts link into is the exception:
+//! a private store would rewrite every link the child's `bun install` writes, so the child is
+//! pointed at the host path from the start and reads it until relocation makes it writable.
 
 use std::path::{Path, PathBuf};
 
@@ -43,9 +45,11 @@ pub struct SharedToolHome {
     /// The tool's own default directory under HOME: the host uses it unconfigured.
     pub home: &'static str,
     pub layout: SharedLayout,
-    /// Checkouts hold symlinks into the cache (Bun's isolated linker), so while the host path is
-    /// still a private directory it stays readable to every sandbox: a cloned `node_modules`
-    /// would otherwise resolve to EPERM inside the sandbox while the same tree works on the host.
+    /// Checkouts hold symlinks into the cache (Bun's isolated linker), so the sandboxed tool is
+    /// pointed at the host path even while it is still a private directory, and that directory
+    /// stays readable to every sandbox: a cloned `node_modules` would otherwise resolve to EPERM
+    /// inside the sandbox while the same tree works on the host, and an install into a private
+    /// store would relink every package to a path no other checkout has.
     pub linked_from_checkouts: bool,
 }
 
