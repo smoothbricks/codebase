@@ -2,8 +2,8 @@ use super::*;
 
 use bytes::Bytes;
 use cowshed_gateway::{
-    ControlError, ControlFailureCode, CredentialProtocol, GatewayControlClient, GatewayLimits,
-    MirrorRoute,
+    ControlError, ControlFailureCode, CredentialProtocol, GatewayControlClient, GatewayHandle,
+    GatewayLimits, MirrorRoute,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body::{Body, Frame, SizeHint};
@@ -20,10 +20,11 @@ use rustls::{
     pki_types::{PrivatePkcs8KeyDer, ServerName},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    future::Future,
     pin::Pin,
-    sync::atomic::AtomicU16,
+    sync::{Mutex, atomic::AtomicU16},
     task::{Context, Poll},
     time::Instant,
 };
@@ -188,29 +189,56 @@ impl AuditSink for ChannelAudit {
         Ok(())
     }
 }
-/// Claim a gateway block in the kernel before probing its endpoint.
+
+const PORT_BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN + 1)
+    / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
+
+/// The blocks this process holds, by base port: a listener on each block's base+1. A static is
+/// never dropped, so a claim outlives every session its test installs and goes back to the
+/// kernel when the process exits, after a panic too, unless [`release_claim`] returns it first.
+static CLAIMS: Mutex<BTreeMap<u16, std::net::TcpListener>> = Mutex::new(BTreeMap::new());
+
+/// Claim a gateway block in the kernel and return its base as the endpoint to try.
 ///
 /// A PID modulo the block count is not unique, and file locks under TMPDIR are not shared
-/// across test runners with different temp roots. Hold the block's next port for this process's
-/// lifetime instead: every runner sees the same reservation, independent of its filesystem.
+/// across test runners with different temp roots. The claim is a listener on the block's next
+/// port instead, held for this process's lifetime: every runner sees it, independent of its
+/// filesystem, and a second claimant skips the block.
+///
+/// The base itself is not probed. A probe has to let go of the port before the gateway binds
+/// it, and every allocator on the host binds the lowest free block's base first, so a released
+/// base can be anyone's by then. [`install_claimed`] makes the gateway's own bind the probe.
 fn free_endpoint() -> SocketAddr {
-    const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN + 1)
-        / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
     static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
-    let seed = (std::process::id() % u32::from(BLOCKS)) as u16;
-    for _ in 0..BLOCKS {
+    let seed = (std::process::id() % u32::from(PORT_BLOCKS)) as u16;
+    for _ in 0..PORT_BLOCKS {
         let step = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
-        let index = ((u32::from(seed) + u32::from(step)) % u32::from(BLOCKS)) as u16;
-        if !claim_port_block(index) {
+        let index = ((u32::from(seed) + u32::from(step)) % u32::from(PORT_BLOCKS)) as u16;
+        let base = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE;
+        let Ok(claim) = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, base + 1)) else {
             continue;
-        }
-        let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE;
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        if std::net::TcpListener::bind(address).is_ok() {
-            return address;
+        };
+        CLAIMS.lock().expect("port claims").insert(base, claim);
+        return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
+    }
+    panic!("no free macOS gateway port block in {PORT_BLOCKS} candidates");
+}
+
+/// A claimed block whose base this process binds too, for a test that needs an endpoint the
+/// gateway must find occupied. The listener is the probe itself, kept rather than released.
+fn occupied_endpoint() -> (SocketAddr, std::net::TcpListener) {
+    for _ in 0..PORT_BLOCKS {
+        let endpoint = free_endpoint();
+        match std::net::TcpListener::bind(endpoint) {
+            Ok(listener) => return (endpoint, listener),
+            Err(_) => release_claim(endpoint),
         }
     }
-    panic!("no free macOS gateway port block in {BLOCKS} candidates");
+    panic!("no macOS gateway port block whose base this test could bind");
+}
+
+fn release_claim(endpoint: SocketAddr) {
+    CLAIMS.lock().expect("port claims").remove(&endpoint.port());
 }
 
 /// The session endpoint for a block [`free_endpoint`] claimed.
@@ -221,31 +249,121 @@ fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
     }
 }
 
-fn claim_port_block(index: u16) -> bool {
-    let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE + 1;
-    let Ok(listener) = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
-        return false;
-    };
-    // The claim must outlive the availability probe and every session installed by this test.
-    // The kernel releases the descriptor when the test process exits, including after a panic.
-    let _descriptor = std::os::unix::io::IntoRawFd::into_raw_fd(listener);
-    true
+/// An install refusal that is the kernel declining to bind the session's endpoint.
+trait EndpointRefusal: std::fmt::Debug {
+    fn address_in_use(&self) -> bool;
 }
 
-#[test]
-fn gateway_port_claim_is_a_live_kernel_reservation() {
+impl EndpointRefusal for GatewayError {
+    fn address_in_use(&self) -> bool {
+        matches!(self, GatewayError::Io(error) if error.kind() == io::ErrorKind::AddrInUse)
+    }
+}
+
+impl EndpointRefusal for ControlError {
+    fn address_in_use(&self) -> bool {
+        matches!(
+            self,
+            ControlError::Rejected {
+                code: ControlFailureCode::AddressInUse,
+                ..
+            }
+        )
+    }
+}
+
+/// `session` at another endpoint. Installing consumes a session, so [`install_claimed`] keeps
+/// the caller's and installs copies of it.
+fn session_at(session: &WorkspaceSession, endpoint: WorkspaceEndpoint) -> WorkspaceSession {
+    WorkspaceSession {
+        workspace_id: session.workspace_id.clone(),
+        repo_id: session.repo_id.clone(),
+        revision: session.revision,
+        endpoint,
+        token: session.token.clone(),
+        ca: WorkspaceCa {
+            certificate_pem: session.ca.certificate_pem.clone(),
+            private_key_pem: session.ca.private_key_pem.clone(),
+        },
+        policy: session.policy.clone(),
+    }
+}
+
+/// Install `session`, starting at the claimed block its endpoint names, and return the endpoint
+/// it serves. The gateway's own bind is the probe, so no window separates the check from the
+/// use: when the kernel refuses the base (a live workspace's gateway holds it, or an allocator
+/// is passing over it), the claim goes back and the session moves to the next claimed block,
+/// as the runtime's allocator walks past a block it cannot bind.
+async fn install_claimed<F, E>(
+    session: WorkspaceSession,
+    mut install: impl FnMut(WorkspaceSession) -> F,
+) -> SocketAddr
+where
+    F: Future<Output = Result<(), E>>,
+    E: EndpointRefusal,
+{
+    let WorkspaceEndpoint::Tcp { mut address, .. } = session.endpoint else {
+        panic!("a macOS gateway session listens on a TCP port block");
+    };
+    for _ in 0..PORT_BLOCKS {
+        match install(session_at(&session, block_endpoint(address))).await {
+            Ok(()) => return address,
+            Err(error) if error.address_in_use() => {
+                release_claim(address);
+                address = free_endpoint();
+            }
+            Err(error) => panic!("install session at {address}: {error:?}"),
+        }
+    }
+    panic!("no claimed macOS gateway port block whose base the gateway could bind");
+}
+
+/// [`install_claimed`] through the gateway's own handle.
+async fn install_in_free_block(gateway: &GatewayHandle, session: WorkspaceSession) -> SocketAddr {
+    install_claimed(session, move |session| gateway.install(session)).await
+}
+
+/// The claim and the gateway's bind arbitrate one block between them: a second claimant skips
+/// it, and a base the kernel refuses moves the session on and returns that block's claim.
+#[tokio::test]
+async fn gateway_port_claim_is_a_live_kernel_reservation() {
     let endpoint = free_endpoint();
-    let index =
-        (endpoint.port() - cowshed_gateway::MACOS_PORT_MIN) / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
-    assert!(
-        !claim_port_block(index),
-        "a second claimant cannot acquire the live block"
-    );
     let error = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, endpoint.port() + 1))
-        .expect_err("the shared kernel reservation remains bound");
+        .expect_err("a second claimant cannot acquire the live block");
     assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-    std::net::TcpListener::bind(endpoint)
-        .expect("the gateway endpoint remains available for install");
+    release_claim(endpoint);
+
+    let (occupied, _held) = occupied_endpoint();
+    // A connection queued, unaccepted, on the occupied block's claim is reset when that claim
+    // closes: the kernel's own word that it was released, whoever binds the port afterwards.
+    let mut queued = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, occupied.port() + 1))
+        .expect("connect to the occupied block's claim");
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (session, _token, _) = session(
+        "claimed",
+        "owner/repo-claimed",
+        block_endpoint(occupied),
+        3,
+        1,
+        WorkspacePolicy::default(),
+    );
+    let served = install_in_free_block(&gateway.handle(), session).await;
+    assert_ne!(served, occupied, "the session moved past the refused base");
+    let status = gateway.handle().status().await.expect("gateway status");
+    assert_eq!(status.sessions[0].endpoint, served.to_string());
+    let reset = std::io::Read::read(&mut queued, &mut [0])
+        .expect_err("a connection queued on a closed claim is reset");
+    assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+    gateway.drain().await.expect("drain gateway");
 }
 
 fn tls_client_hello(host: &str) -> Vec<u8> {
@@ -629,11 +747,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     let malformed = absolute_request(
         "allowed.test",
@@ -771,11 +885,7 @@ async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     let connect = |credential: Option<String>| {
         let header = credential
@@ -856,11 +966,7 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
     let target = format!("https://secure.test:{upstream_port}/allowed/item");
     // curl's latency belongs to the host scheduler, so it must not race the gateway's deadlines:
     // a loaded host once held curl's TLS 1.3 Finished past `test_config()`'s 2s handshake bound,
@@ -941,11 +1047,7 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install Node workspace");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let root = secure_fixture_dir(&format!("cowshed-node-fetch-{}", std::process::id()));
     let ca_path = root.join("ca.pem");
     std::fs::write(
@@ -1049,16 +1151,8 @@ async fn endpoint_identity_precedes_token_authentication() {
         1,
         policy_b,
     );
-    gateway
-        .handle()
-        .install(session_a)
-        .await
-        .expect("install alpha");
-    gateway
-        .handle()
-        .install(session_b)
-        .await
-        .expect("install bravo");
+    install_in_free_block(&gateway.handle(), session_a).await;
+    let endpoint_b = install_in_free_block(&gateway.handle(), session_b).await;
 
     let wrong_endpoint = proxy_request(
         endpoint_b,
@@ -1123,11 +1217,7 @@ async fn eight_intercept_tunnels_do_not_starve_their_own_registry_requests() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install concurrent session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let mut roots = RootCertStore::empty();
     roots.add(certificate).expect("trust workspace CA");
     let client = Arc::new(
@@ -1235,11 +1325,7 @@ async fn native_registry_requests_use_one_admitted_proxy_path_and_cache() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install registry session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     for path in ["/allowed", "/@scope%2fpkg"] {
         let request = format!(
             "GET https://mirror.test:{upstream_port}{path} HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nAccept: application/vnd.npm.install-v1+json\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -1364,11 +1450,7 @@ async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_m
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install registry session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let mut stream = TcpStream::connect(endpoint).await.expect("connect proxy");
     stream.write_all(format!(
         "CONNECT mirror.test:{upstream_port} HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
@@ -1466,11 +1548,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
     let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
     let connect = format!(
         "CONNECT pinned.test:{upstream_port} HTTP/1.1\r\nHost: pinned.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
@@ -1540,11 +1618,7 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
         1,
         policy,
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
     let connect = format!(
@@ -1624,11 +1698,7 @@ async fn a_scoped_packument_carries_the_held_credential_and_forwards_its_bytes_u
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     // Exactly what bun 1.4 sends for a scoped packument: one encoded slash inside the package
     // segment, after the registry's own namespace path.
@@ -1686,11 +1756,7 @@ async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_creden
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     // An encoded slash that would read as the admitted namespace once decoded. Upstream would
     // read a different resource, so the prefix is matched on raw bytes and this is out of scope.
@@ -1749,11 +1815,7 @@ async fn dead_upstream_fails_fast_without_connecting() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
     let started = Instant::now();
     let response = proxy_request(
         endpoint,
@@ -1803,11 +1865,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
     let first_request = absolute_request("queue.test", upstream_port, &token, "/allowed/one");
     let first = tokio::spawn(proxy_request(endpoint, first_request));
@@ -1900,11 +1958,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), session).await;
     let mut tunnel = TcpStream::connect(endpoint).await.expect("connect gateway");
     tunnel
         .write_all(
@@ -2076,10 +2130,11 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
         1,
         WorkspacePolicy::default(),
     );
-    client
-        .install(&session)
-        .await
-        .expect("install through control socket");
+    let control_client = &client;
+    install_claimed(session, move |session| async move {
+        control_client.install(&session).await
+    })
+    .await;
     let status = client.status().await.expect("control status");
     assert_eq!(status.sessions.len(), 1);
     assert_eq!(status.sessions[0].workspace_id, "controlled");
@@ -2136,11 +2191,7 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
         )
         .0
     };
-    gateway
-        .handle()
-        .install(make_session(1, endpoint))
-        .await
-        .expect("install revision one");
+    let endpoint = install_in_free_block(&gateway.handle(), make_session(1, endpoint)).await;
     gateway
         .handle()
         .remove("revision", 1)
@@ -2150,16 +2201,9 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
         gateway.handle().install(make_session(1, endpoint)).await,
         Err(GatewayError::StaleRevision)
     ));
-    gateway
-        .handle()
-        .install(make_session(2, endpoint))
-        .await
-        .expect("install revision two");
+    let endpoint = install_in_free_block(&gateway.handle(), make_session(2, endpoint)).await;
 
-    let occupied_endpoint = free_endpoint();
-    let occupied = TcpListener::bind(occupied_endpoint)
-        .await
-        .expect("occupy replacement endpoint");
+    let (occupied_endpoint, occupied) = occupied_endpoint();
     assert!(matches!(
         gateway
             .handle()
@@ -2232,11 +2276,7 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let mut active = TcpStream::connect(endpoint).await.expect("connect gateway");
     active
         .write_all(
@@ -2306,11 +2346,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
 
     opaque_payload(endpoint, &token, "expected.test", 443, b"not tls").await;
     await_reclaimed(&gateway).await;
@@ -2396,7 +2432,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
                 mirrors: Vec::new(),
             },
         );
-        gateway.handle().install(installed).await.expect("install");
+        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
         for _ in 0..2 {
             let response = proxy_request(
                 endpoint,
@@ -2411,6 +2447,8 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             .drain()
             .await
             .expect("drain connect-failure gateway");
+        // Each scenario's gateway is gone once drained; its block goes back before the next.
+        release_claim(endpoint);
     }
 
     {
@@ -2449,7 +2487,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
                 mirrors: Vec::new(),
             },
         );
-        gateway.handle().install(installed).await.expect("install");
+        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
         for _ in 0..2 {
             let response = proxy_request(
                 endpoint,
@@ -2464,6 +2502,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             .expect("credential accepts timeout")
             .expect("credential accepts task");
         gateway.drain().await.expect("drain credential gateway");
+        release_claim(endpoint);
     }
 
     {
@@ -2499,7 +2538,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
                 mirrors: Vec::new(),
             },
         );
-        gateway.handle().install(installed).await.expect("install");
+        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
         for _ in 0..2 {
             let response = proxy_request(
                 endpoint,
@@ -2514,6 +2553,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
             .expect("header accepts timeout")
             .expect("header accepts task");
         gateway.drain().await.expect("drain header gateway");
+        release_claim(endpoint);
     }
 
     {
@@ -2542,7 +2582,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
                 mirrors: Vec::new(),
             },
         );
-        gateway.handle().install(installed).await.expect("install");
+        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
         let mut client = TcpStream::connect(endpoint).await.expect("connect client");
         client
             .write_all(
@@ -2611,7 +2651,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
             mirrors: Vec::new(),
         },
     );
-    gateway.handle().install(installed).await.expect("install");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
 
     let mut tunnel = TcpStream::connect(endpoint).await.expect("connect tunnel");
     let connect = format!(
@@ -2710,7 +2750,7 @@ async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audit
             mirrors: Vec::new(),
         },
     );
-    gateway.handle().install(installed).await.expect("install");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
 
     let malformed = format!(
         "CONNECT client-tls.test:443 HTTP/1.1\r\nHost: wrong.test:443\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -2782,11 +2822,7 @@ async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install h2 session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
 
     let (mut sender, downstream_connection) = h2_intercept_client(
         endpoint,
@@ -2896,11 +2932,7 @@ async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install fallback session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let (mut sender, downstream_connection) = h2_intercept_client(
         endpoint,
         &token,
@@ -2969,11 +3001,7 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install no-ALPN session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let (mut sender, downstream_connection) = h2_intercept_client(
         endpoint,
         &token,
@@ -3032,11 +3060,7 @@ async fn missing_downstream_alpn_serves_http1_for_registry_clients() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install downstream no-ALPN session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
     stream
         .write_all(
@@ -3113,11 +3137,7 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install cancellation session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let (mut sender, downstream_connection) = h2_intercept_client(
         endpoint,
         &token,
@@ -3205,11 +3225,7 @@ async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install h2 audit session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     let (mut sender, connection) =
         h2_intercept_client(endpoint, &token, "audit-h2.test", port, ca_certificate).await;
     let malformed = Request::builder()
@@ -3266,11 +3282,7 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
             mirrors: Vec::new(),
         },
     );
-    gateway
-        .handle()
-        .install(installed)
-        .await
-        .expect("install direct h2 session");
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
     gate.notify_one();
     let response = proxy_request(
         endpoint,
