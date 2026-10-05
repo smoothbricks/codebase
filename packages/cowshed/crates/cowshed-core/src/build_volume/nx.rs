@@ -642,7 +642,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
-        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        // Read at run time: `env!` would compile this checkout's path into the test binary,
+        // and a test binary built in one checkout must not reach another's files.
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+        let package = PathBuf::from(manifest)
             .join("../../../../node_modules/nx")
             .canonicalize()
             .expect("the repository's own Nx is installed");
