@@ -315,7 +315,7 @@ fn companion_path_for(image: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn rfc3339_utc(now: SystemTime) -> String {
+pub(crate) fn rfc3339_utc(now: SystemTime) -> String {
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())

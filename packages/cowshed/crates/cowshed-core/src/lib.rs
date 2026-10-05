@@ -2,6 +2,7 @@
 
 pub mod apfs;
 pub mod api;
+pub mod build_volume;
 pub mod capabilities;
 pub mod checkout;
 pub mod copy;

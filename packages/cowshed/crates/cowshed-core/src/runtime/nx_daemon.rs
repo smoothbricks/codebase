@@ -100,6 +100,14 @@ pub(crate) fn probe(record: &Path) -> Probe {
     }
 }
 
+/// The positive pid `record` names, or `None` for a record absent or not as Nx writes it.
+pub(crate) fn recorded_pid(record: &Path) -> Option<libc::pid_t> {
+    let recorded = serde_json::from_slice::<Record>(&std::fs::read(record).ok()?).ok()?;
+    libc::pid_t::try_from(recorded.process_id)
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
 /// Whether the process `pid` exists, by the null signal: nothing is delivered.
 fn running(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 performs only the existence and permission checks, and `pid` is positive,

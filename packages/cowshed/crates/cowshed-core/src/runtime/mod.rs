@@ -1,6 +1,6 @@
 pub mod commitment_feed;
 pub mod job_groups;
-mod nx_daemon;
+pub(crate) mod nx_daemon;
 pub mod project;
 pub mod shell_host;
 mod shell_job;
