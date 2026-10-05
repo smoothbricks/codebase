@@ -318,6 +318,10 @@ async function installLocalDependencies(pending: readonly Installer[]): Promise<
  * shell entry cannot leave a lock behind for the next one to wait out. Bun
  * has no flock binding, so it comes from libc; LOCK_EX and LOCK_NB have the
  * same values on Darwin and Linux. The waiting entry says why it is waiting.
+ *
+ * flock needs no write access, so an existing lock file is opened read-only:
+ * an entry whose installs are current then writes nothing in the checkout,
+ * and enters a read-only view of it (a read-only sandboxed job) as well.
  */
 async function withInstallLock<T>(run: () => Promise<T>): Promise<T> {
   const LOCK_EX = 2;
@@ -326,8 +330,7 @@ async function withInstallLock<T>(run: () => Promise<T>): Promise<T> {
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   });
   const lockPath = path.join(projectRoot, 'node_modules', '.smoo-install.lock');
-  mkdirSync(path.dirname(lockPath), { recursive: true });
-  const fd = openSync(lockPath, 'a');
+  const fd = openInstallLock(lockPath);
   try {
     if (libc.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
       console.error(`setup-environment: waiting for another shell entry's install in ${projectRoot}`);
@@ -340,6 +343,16 @@ async function withInstallLock<T>(run: () => Promise<T>): Promise<T> {
     closeSync(fd);
     libc.close();
   }
+}
+
+function openInstallLock(lockPath: string): number {
+  try {
+    return openSync(lockPath, 'r');
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+  }
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  return openSync(lockPath, 'a');
 }
 
 /**

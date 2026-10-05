@@ -409,7 +409,8 @@ nothing when nothing changed:
 - Shell entries in one checkout install one at a time: the install runs under a flock(2) on
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves
-  nothing behind.
+  nothing behind. An existing lock file is opened read-only (flock needs no write access), so an entry whose installs
+  are current writes nothing in the checkout and enters a read-only view of it, such as a read-only cowshed job.
 - The managed `.envrc` loads no parent directory's `.envrc`: the shell is built from the checkout's own inputs, so the
   same commit enters the same shell wherever it is checked out. An environment wanted from outside the checkout belongs
   in the gitignored `.envrc-local`.

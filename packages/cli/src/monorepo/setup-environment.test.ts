@@ -466,6 +466,22 @@ describe('what shell entry installs', () => {
       },
     );
   });
+
+  it('enters a read-only checkout whose installs are current without writing it', async () => {
+    // A sandboxed job may be handed a read-only view of the checkout. Its shell
+    // entry has nothing to install, so it must neither install nor need the
+    // write access an install would.
+    await withManagedRepository({}, async ({ root, enterShell: enter, count }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      expect(Bun.spawnSync(['chmod', '-R', 'a-w', root]).exitCode).toBe(0);
+      try {
+        expect(await enter()).toEqual(HEALTHY);
+      } finally {
+        expect(Bun.spawnSync(['chmod', '-R', 'u+w', root]).exitCode).toBe(0);
+      }
+      expect(count('install')).toBe(1);
+    });
+  });
 });
 
 describe('what a CI install that finds a stale lockfile reports', () => {
