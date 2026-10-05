@@ -8,12 +8,14 @@
 //!
 //! A land moves a checkout to another volume by renaming one new symlink over [`BUILD_LINK`],
 //! which `rename(2)` does atomically: every path a tool opens afterwards resolves into the new
-//! volume, and no tool ever names a volume directly. `.cowshed/` is in every checkout's
-//! `.git/info/exclude`, so linking never makes a tree dirty.
+//! volume, and no tool ever names a volume directly. Every link cowshed makes has an exact
+//! pattern in the repository's `info/exclude` before it exists, so linking never makes a tree
+//! dirty, whatever the repository's own ignore rules say.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use crate::capabilities::BuildStatePath;
@@ -105,10 +107,177 @@ pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> R
         let directory = volume.join(state.volume.as_path());
         fs::create_dir_all(&directory).map_err(|error| link_error(&directory, &error))?;
     }
+    // Excluded before any link exists, so no link is ever an untracked file.
+    exclude_links(checkout, paths)?;
     for (at, target) in missing {
         std::os::unix::fs::symlink(&target, &at).map_err(|error| link_error(&at, &error))?;
     }
     Ok(())
+}
+
+/// Opens the block of `info/exclude` lines cowshed owns. Every entry in it is one of cowshed's
+/// own links, anchored at the checkout root.
+const EXCLUDE_BEGIN: &str =
+    "# cowshed build-state links (managed by cowshed; entries are only ever added)";
+const EXCLUDE_END: &str = "# end cowshed build-state links";
+
+/// Keep the build link and every build-state link out of `git status`. To Git a symlink is a
+/// file, so a repository's own directory pattern (`target/`) never matches the link that
+/// replaced its directory. The patterns belong to cowshed, not to the repository, so they go in
+/// the repository's `info/exclude` (its common directory's, for a linked worktree), in one
+/// managed block. Entries are only ever added: linked worktrees share the file, and an entry
+/// naming a path nothing occupies matches nothing. A checkout outside Git has no status to keep
+/// clean.
+fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result<()> {
+    use crate::fork_lock::Run as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match fs::symlink_metadata(checkout.join(".git")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(exclude_error(&checkout.join(".git"), &error)),
+        Ok(_) => {}
+    }
+    let output = crate::git::git_command_at(checkout)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ])
+        .output_locked()
+        .map_err(|error| crate::git::git_spawn_error(&error))?;
+    if !output.status.success() {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "cannot locate {}'s Git exclude file: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ),
+            "repair the checkout's Git metadata and retry",
+        ));
+    }
+    let exclude = PathBuf::from(OsStr::from_bytes(
+        output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout),
+    ));
+    let existing = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&exclude)
+    {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut file, &mut bytes)
+                .map_err(|error| exclude_error(&exclude, &error))?;
+            String::from_utf8(bytes).map_err(|_| {
+                CowshedError::integrity(
+                    format!("{} is not UTF-8", exclude.display()),
+                    "repair .git/info/exclude and retry",
+                )
+            })?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(exclude_error(&exclude, &error)),
+    };
+    let wanted = std::iter::once(Path::new(BUILD_LINK))
+        .chain(paths.iter().map(|state| state.checkout.as_path()))
+        .map(exclude_pattern);
+    let Some(updated) = with_excluded(&existing, wanted) else {
+        return Ok(());
+    };
+    let directory = exclude
+        .parent()
+        .expect("Git names info/exclude inside a directory");
+    fs::create_dir_all(directory).map_err(|error| exclude_error(directory, &error))?;
+    let staged = directory.join(format!(".exclude.cowshed-{}", unique()));
+    let written = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged)?;
+        io::Write::write_all(&mut file, updated.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&staged, &exclude)?;
+        fs::File::open(directory)?.sync_all()
+    })();
+    written.map_err(|error| {
+        let _ = fs::remove_file(&staged);
+        exclude_error(&exclude, &error)
+    })
+}
+
+/// `existing` with every pattern of `wanted` in cowshed's block, or `None` when it already has
+/// them all. Lines outside the block are kept byte for byte; a missing block is appended.
+fn with_excluded(existing: &str, wanted: impl Iterator<Item = String>) -> Option<String> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let begin = lines.iter().position(|line| *line == EXCLUDE_BEGIN);
+    let end = begin.and_then(|begin| {
+        lines[begin..]
+            .iter()
+            .position(|line| *line == EXCLUDE_END)
+            .map(|offset| begin + offset)
+    });
+    let (before, mut block, after) = match (begin, end) {
+        (Some(begin), Some(end)) => (
+            &lines[..begin],
+            lines[begin + 1..end]
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<std::collections::BTreeSet<_>>(),
+            &lines[end + 1..],
+        ),
+        _ => (&lines[..], std::collections::BTreeSet::new(), &[][..]),
+    };
+    let known = block.len();
+    block.extend(wanted);
+    if block.len() == known && begin.is_some() && end.is_some() {
+        return None;
+    }
+    let mut updated = String::with_capacity(existing.len() + 64 * block.len());
+    for line in before {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    updated.push_str(EXCLUDE_BEGIN);
+    updated.push('\n');
+    for pattern in &block {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
+    updated.push_str(EXCLUDE_END);
+    updated.push('\n');
+    for line in after {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    Some(updated)
+}
+
+/// The gitignore pattern matching exactly the checkout-relative `path`: anchored at the root,
+/// with no trailing slash so it matches a link, and with every glob or escape character quoted.
+fn exclude_pattern(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let mut pattern = String::with_capacity(path.len() + 1);
+    pattern.push('/');
+    for character in path.chars() {
+        if matches!(character, '*' | '?' | '[' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    if pattern.ends_with(' ') {
+        pattern.insert(pattern.len() - 1, '\\');
+    }
+    pattern
+}
+
+fn exclude_error(path: &Path, error: &io::Error) -> CowshedError {
+    CowshedError::integrity(
+        format!(
+            "cannot keep build-state links out of Git status via {}: {error}",
+            path.display()
+        ),
+        "repair .git/info/exclude and retry",
+    )
 }
 
 /// `../` once per directory above `checkout_path`, then the build link, then the volume path:
@@ -256,6 +425,55 @@ mod tests {
         assert_eq!(fs::read(volume.join("target/unit")).unwrap(), b"a");
         fs::write(checkout.join(".nx/cache/run.json"), b"{}").unwrap();
         assert!(volume.join("nx/cache/run.json").is_file());
+    }
+
+    /// A repository ignores its build directories with directory patterns (`target/`), which
+    /// never match the symlink a migration puts there: every migrated checkout showed its links
+    /// as untracked. Cowshed excludes its own links, and leaves the repository's lines alone.
+    #[test]
+    fn linked_checkouts_show_no_build_links_in_git_status() {
+        use crate::fork_lock::Run as _;
+        let scratch = Scratch::new("status");
+        let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command_at(&checkout)
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "--quiet"]);
+        fs::write(checkout.join(".gitignore"), "target/\n.nx/\n").unwrap();
+        let exclude = checkout.join(".git/info/exclude");
+        fs::write(&exclude, "# the user's own\nlocal-notes\n").unwrap();
+        git(&["add", ".gitignore"]);
+        point(&checkout, &volume).unwrap();
+        let mut weird = paths();
+        weird.push(BuildStatePath::new("odd[1]*dir ", "odd").unwrap());
+        link_paths(&checkout, &volume, &weird).unwrap();
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert_eq!(status, "A  .gitignore\n", "{status}");
+        fs::write(checkout.join("local-notes"), "mine").unwrap();
+        fs::write(checkout.join("odd[1]x"), "not a link").unwrap();
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert_eq!(
+            status, "A  .gitignore\n?? odd[1]x\n",
+            "only cowshed's exact link paths are excluded: {status}"
+        );
+        let written = fs::read_to_string(&exclude).unwrap();
+        assert!(
+            written.starts_with("# the user's own\nlocal-notes\n"),
+            "{written}"
+        );
+        // Linking again, or with fewer paths, changes nothing.
+        link_paths(&checkout, &volume, &paths()).unwrap();
+        assert_eq!(fs::read_to_string(&exclude).unwrap(), written);
     }
 
     #[test]

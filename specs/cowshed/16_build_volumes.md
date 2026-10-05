@@ -104,6 +104,13 @@ A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no
 configuration file ever names a build volume directly.
 
+To Git each of these links is a file. A repository's own directory pattern (`target/`) matches the directory a link
+replaced and never the link itself. Before cowshed creates any link, it therefore adds an anchored, exact pattern for
+the build link and for every build-state link to one managed block in the repository's `info/exclude` (the common
+directory's, for a linked worktree). Lines outside the block are left exactly as they were, and entries in the block are
+only ever added. A migrated checkout's `git status` shows none of its links, and the repository's `.gitignore` stays the
+repository's own.
+
 Mounting a checkout mounts the volume its link names only when that volume's sidecar records the checkout as its linker,
 or the volume has no sidecar yet (a creation in progress, whose sidecar is written last). Any other link is stale and is
 re-pointed at the one volume recorded as the checkout's. When the checkout owns none and the link names another
