@@ -25,6 +25,12 @@
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
     },
+    "./build-state-output-policy": {
+      "types": "./dist/build-state-output-policy.d.ts",
+      "development": "./src/build-state-output-policy.ts",
+      "import": "./dist/build-state-output-policy.js",
+      "default": "./dist/build-state-output-policy.js"
+    },
     "./workspace-config-policy": {
       "types": "./dist/workspace-config-policy.d.ts",
       "development": "./src/workspace-config-policy.ts",

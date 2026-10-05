@@ -311,6 +311,19 @@ installed. Every fallback costs cache hits and never trades away invalidation, b
 reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale results
 silently.
 
+## Cowshed Build-State Output Policy
+
+Consuming repositories enforce build-volume safety in their Nx lint, using the graph that lint already resolved:
+`refuseOutputsUnderBuildState(graph, buildState.paths, workspaceRoot)` from
+`@smoothbricks/nx-plugin/build-state-output-policy`. Obtain `buildState` from `cowshed build-state --json` in that
+checkout; no graph is constructed by cowshed job admission or doctor.
+
+The validator uses Nx output interpolation for every target and configuration, including resolved project overrides. It
+refuses outputs at, beneath, or above a contributed path, and globs whose static prefix can cover one. Absolute outputs
+are resolved against the caller's workspace root. `BuildStateOutputError.findings` names each project, target,
+configuration, output, and contributed path. Keep cacheable artifacts under source-tree paths such as `dist/` and
+`.cache/nextest/`; restoring an output under `target/` or `.nx/` can replace a build-volume link with a real directory.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are

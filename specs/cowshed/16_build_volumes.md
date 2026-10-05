@@ -325,14 +325,18 @@ every mtime. A file-by-file copy that restamps files in walk order (`cp -c -R`) 
 
 ### Nx outputs never live in the build volume
 
-No Nx target declares an output at or under a build-volume path (`target/…`, `.nx/…`).
+No Nx target declares an output that can cover a contributed build-volume path: at it, under it, or an ancestor of it.
+Globs whose static prefix overlaps one of those paths are also refused; absolute outputs are resolved against the
+workspace root.
 
 - **Why**, measured on stock Nx: restoring a cached output beneath a symlinked directory replaces the symlink with a
   real directory, which silently detaches the checkout from its build volume; declaring the link itself as an output
   caches the symlink, not the bytes, so a hit restores nothing. Task outputs belong on the source volume (`dist/`,
   `.cache/<tool>/`), where the source image carries them to forks.
-- **Enforced by**: a check in the Nx capability (and `cowshed doctor`) that refuses a project whose resolved target
-  outputs fall under a build-volume path, naming the target and the output.
+- **Enforced by**: the consuming repository's Nx lint calls the plugin's `refuseOutputsUnderBuildState` validator with
+  its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
+  root. A refusal names the target, output, and build-state path. Job admission and `cowshed doctor` never construct an
+  Nx graph or execute repository plugins for this rule.
 
 ### Hash inputs are the same in every checkout
 
