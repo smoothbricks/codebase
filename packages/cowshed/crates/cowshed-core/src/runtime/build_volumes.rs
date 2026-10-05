@@ -56,7 +56,7 @@ pub(crate) struct Collection {
     pub reclaimed: u64,
     pub freed_bytes: u64,
     pub candidates: Vec<GcCandidate>,
-    pub deferred: Vec<GcDeferred>,
+    pub deferred: Vec<Deferred>,
 }
 
 #[derive(Clone)]
@@ -333,68 +333,29 @@ impl BuildVolumes {
         .await
     }
 
-    /// Mount every linked volume a detached image could not have mounted itself, then delete
-    /// (16_build_volumes.md, "Garbage collection") each build volume nothing links that is not
-    /// a seed and that the kernel lets go of, each seed that is not its existing target's
-    /// latest, and each image an interrupted creation left without a record. A volume the
-    /// kernel refuses to detach is deferred to the next pass with the kernel's words.
+    /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms when the kernel
+    /// lets go of it. A volume the kernel refuses to detach is deferred to the next pass with
+    /// the kernel's words, beside what the plan itself deferred.
     pub async fn collect(&self, links: Links, dry_run: bool) -> Result<Collection> {
         self.blocking(move |host, layout| {
             if !dry_run {
                 host.sweep_build_volume_staging(layout).map_err(storage)?;
             }
-            let mut collection = Collection::default();
-            let mut latest = std::collections::BTreeMap::<Owner, (String, BuildVolumeId)>::new();
-            let mut doomed = Vec::new();
-            for id in layout.list()? {
-                collection.examined += 1;
-                let record = match layout.read_record(&id) {
-                    Ok(record) => record,
-                    Err(_) if !layout.record(&id).exists() => {
-                        doomed.push((id, GcReason::UnrecordedBuildVolume));
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                match record.role {
-                    BuildVolumeRole::Seed {
-                        target,
-                        incarnation,
-                    } => {
-                        let owner = Owner {
-                            name: target,
-                            incarnation,
-                        };
-                        if !links.owners.contains(&owner) {
-                            doomed.push((id, GcReason::SupersededSeed));
-                            continue;
-                        }
-                        match latest.get(&owner) {
-                            Some((at, _)) if *at >= record.created_at => {
-                                doomed.push((id, GcReason::SupersededSeed));
-                            }
-                            _ => {
-                                if let Some((_, older)) =
-                                    latest.insert(owner, (record.created_at, id))
-                                {
-                                    doomed.push((older, GcReason::SupersededSeed));
-                                }
-                            }
-                        }
-                    }
-                    BuildVolumeRole::Linked { checkout } if links.detached.contains(&checkout) => {}
-                    BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => {
-                        if !links.volumes.contains(&id) {
-                            doomed.push((id, GcReason::UnlinkedBuildVolume));
-                        }
-                    }
-                }
-            }
-            for (id, reason) in doomed {
+            let plan = plan(layout, &links)?;
+            let mut collection = Collection {
+                examined: plan.examined,
+                deferred: plan
+                    .deferred
+                    .into_iter()
+                    .map(|(id, deferral)| Deferred {
+                        path: layout.image(&id),
+                        deferral,
+                    })
+                    .collect(),
+                ..Collection::default()
+            };
+            for Doomed { id, reason, bytes } in plan.doomed {
                 let image = layout.image(&id);
-                let bytes = std::fs::metadata(&image)
-                    .map(|metadata| metadata.blocks().saturating_mul(512))
-                    .unwrap_or(0);
                 collection.candidates.push(GcCandidate {
                     identity: Sha256Digest::compute(image.as_os_str().as_encoded_bytes()),
                     path: image.clone(),
@@ -411,9 +372,9 @@ impl BuildVolumes {
                         collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
                     }
                     BuildVolumeRelease::Busy(diagnostic) => {
-                        collection.deferred.push(GcDeferred {
+                        collection.deferred.push(Deferred {
                             path: image,
-                            diagnostic,
+                            deferral: Deferral::Busy(diagnostic),
                         });
                     }
                 }
@@ -424,13 +385,177 @@ impl BuildVolumes {
     }
 }
 
+/// Why collection leaves a build volume for a later pass instead of deleting it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Deferral {
+    /// The kernel refused a non-forced detach: something still uses the volume.
+    Busy(String),
+    /// Its record exists but cannot be read, so nothing proves it unreachable.
+    RecordUnreadable(String),
+    /// Its image's size cannot be read.
+    SizeUnreadable(String),
+    /// Its record names `0` as its checkout, which is detached: that checkout's link cannot be
+    /// read until it is attached, so nothing proves the volume unreachable.
+    DetachedCheckout(WorkspaceName),
+    /// It has no record, and these detached workspaces' links cannot be read: any may name it.
+    UnrecordedWhileDetached(Vec<WorkspaceName>),
+}
+
+impl Deferral {
+    /// Whether this is the ordinary state of a detached workspace's own volume rather than
+    /// something a person should look at.
+    pub fn is_routine(&self) -> bool {
+        matches!(self, Self::DetachedCheckout(_))
+    }
+}
+
+impl std::fmt::Display for Deferral {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(diagnostic) => write!(formatter, "still in use: {diagnostic}"),
+            Self::RecordUnreadable(error) => write!(formatter, "its record is unreadable: {error}"),
+            Self::SizeUnreadable(error) => write!(formatter, "its size is unreadable: {error}"),
+            Self::DetachedCheckout(checkout) => write!(
+                formatter,
+                "its record names {checkout}, which is detached; decided once {checkout} is attached"
+            ),
+            Self::UnrecordedWhileDetached(detached) => {
+                formatter.write_str("it has no record, and the links of detached ")?;
+                for (index, name) in detached.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{name}")?;
+                }
+                formatter.write_str(" cannot be read until they are attached")
+            }
+        }
+    }
+}
+
+/// A build volume collection left for a later pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Deferred {
+    pub path: PathBuf,
+    pub deferral: Deferral,
+}
+
+impl From<Deferred> for GcDeferred {
+    fn from(deferred: Deferred) -> Self {
+        Self {
+            path: deferred.path,
+            diagnostic: deferred.deferral.to_string(),
+        }
+    }
+}
+
+/// A build volume collection deletes, with why and its allocated size.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Doomed {
+    pub id: BuildVolumeId,
+    pub reason: GcReason,
+    pub bytes: u64,
+}
+
+/// What collection decides from the records, the links and the images' sizes alone.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Plan {
+    pub examined: u64,
+    pub doomed: Vec<Doomed>,
+    pub deferred: Vec<(BuildVolumeId, Deferral)>,
+}
+
+/// Which build volumes are garbage (16_build_volumes.md, "Garbage collection"): each one nothing
+/// links that is not a seed, each seed that is not its existing target's latest, and each image
+/// an interrupted creation left without a record.
+///
+/// A live link proves reachability by itself, so a volume one names is kept before its record
+/// is read. A detached workspace's link cannot be read, so whatever it may name is deferred with
+/// it named, never counted reachable and never deleted; so is a volume whose record or size
+/// cannot be read. Nothing is deleted on a guess.
+pub(crate) fn plan(layout: &BuildVolumeLayout, links: &Links) -> Result<Plan> {
+    let mut plan = Plan::default();
+    let mut latest = std::collections::BTreeMap::<Owner, (String, BuildVolumeId)>::new();
+    let mut doomed = Vec::new();
+    for id in layout.list()? {
+        plan.examined += 1;
+        if links.volumes.contains(&id) {
+            continue;
+        }
+        let record = match layout.read_record_present(&id) {
+            Ok(Some(record)) => record,
+            Ok(None) if links.detached.is_empty() => {
+                doomed.push((id, GcReason::UnrecordedBuildVolume));
+                continue;
+            }
+            Ok(None) => {
+                let detached = links.detached.iter().cloned().collect();
+                plan.deferred
+                    .push((id, Deferral::UnrecordedWhileDetached(detached)));
+                continue;
+            }
+            Err(error) => {
+                plan.deferred
+                    .push((id, Deferral::RecordUnreadable(error.to_string())));
+                continue;
+            }
+        };
+        match record.role {
+            BuildVolumeRole::Seed {
+                target,
+                incarnation,
+            } => {
+                let owner = Owner {
+                    name: target,
+                    incarnation,
+                };
+                if !links.owners.contains(&owner) {
+                    doomed.push((id, GcReason::SupersededSeed));
+                    continue;
+                }
+                match latest.get(&owner) {
+                    Some((at, _)) if *at >= record.created_at => {
+                        doomed.push((id, GcReason::SupersededSeed));
+                    }
+                    _ => {
+                        if let Some((_, older)) = latest.insert(owner, (record.created_at, id)) {
+                            doomed.push((older, GcReason::SupersededSeed));
+                        }
+                    }
+                }
+            }
+            BuildVolumeRole::Linked { checkout } if links.detached.contains(&checkout) => {
+                plan.deferred
+                    .push((id, Deferral::DetachedCheckout(checkout)));
+            }
+            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => {
+                doomed.push((id, GcReason::UnlinkedBuildVolume));
+            }
+        }
+    }
+    for (id, reason) in doomed {
+        let image = layout.image(&id);
+        match std::fs::metadata(&image) {
+            Ok(metadata) => plan.doomed.push(Doomed {
+                id,
+                reason,
+                bytes: metadata.blocks().saturating_mul(512),
+            }),
+            Err(error) => plan.deferred.push((
+                id,
+                Deferral::SizeUnreadable(format!("{}: {error}", image.display())),
+            )),
+        }
+    }
+    Ok(plan)
+}
+
 fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolumeId>> {
     let mut seeds = Vec::new();
     for id in layout.list()? {
-        if layout.record(&id).exists()
-            && layout
-                .read_record(&id)?
-                .is_seed_of(&owner.name, &owner.incarnation)
+        if layout
+            .read_record_present(&id)?
+            .is_some_and(|record| record.is_seed_of(&owner.name, &owner.incarnation))
         {
             seeds.push(id);
         }
@@ -479,4 +604,187 @@ fn io(operation: &str, path: &Path, error: &std::io::Error) -> CowshedError {
         format!("cannot {operation} at {}: {error}", path.display()),
         "cowshed doctor --json",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::{ProjectPaths, RepoId};
+    use std::fs;
+
+    struct Store {
+        root: PathBuf,
+        layout: BuildVolumeLayout,
+    }
+
+    impl Store {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "cowshed-build-gc-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let project = ProjectPaths::with_mount_root(
+                &root,
+                root.join("mnt"),
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap();
+            let layout = BuildVolumeLayout::new(&project).unwrap();
+            fs::create_dir_all(layout.images()).unwrap();
+            Self { root, layout }
+        }
+
+        fn image(&self) -> BuildVolumeId {
+            let id = BuildVolumeId::mint();
+            fs::write(self.layout.image(&id), vec![7u8; 8192]).unwrap();
+            id
+        }
+
+        fn volume(&self, role: BuildVolumeRole) -> BuildVolumeId {
+            let id = self.image();
+            self.layout
+                .write_record(&id, &BuildVolumeRecord::new(None, role))
+                .unwrap();
+            id
+        }
+    }
+
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn name(value: &str) -> WorkspaceName {
+        WorkspaceName::new(value).unwrap()
+    }
+
+    fn linked(checkout: &str) -> BuildVolumeRole {
+        BuildVolumeRole::Linked {
+            checkout: name(checkout),
+        }
+    }
+
+    fn doomed(plan: &Plan) -> Vec<(BuildVolumeId, GcReason)> {
+        plan.doomed
+            .iter()
+            .map(|doomed| (doomed.id.clone(), doomed.reason))
+            .collect()
+    }
+
+    /// A live link is the proof of reachability, so it protects its volume before any record is
+    /// read: a crash can leave a linked volume whose record is missing, and deleting it would
+    /// pull the build state out from under a checkout.
+    #[test]
+    fn a_live_link_keeps_its_volume_recorded_or_not() {
+        let store = Store::new();
+        let unrecorded = store.image();
+        let recorded_elsewhere = store.volume(linked("other"));
+        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        let links = Links {
+            volumes: [unrecorded, recorded_elsewhere].into_iter().collect(),
+            ..Links::default()
+        };
+        let plan = plan(&store.layout, &links).unwrap();
+        assert_eq!(
+            doomed(&plan),
+            [(garbage, GcReason::UnlinkedBuildVolume)],
+            "{plan:?}"
+        );
+        assert_eq!(plan.doomed[0].bytes, 8192);
+        assert_eq!(plan.deferred, []);
+        assert_eq!(plan.examined, 3);
+    }
+
+    /// A detached workspace's link cannot be read, so a record naming it proves nothing: the
+    /// volume is deferred with that workspace named, never counted reachable or deleted. An
+    /// image without a record may be any detached workspace's, so it waits for them too.
+    #[test]
+    fn a_detached_checkout_defers_what_it_may_link() {
+        let store = Store::new();
+        let named = store.volume(linked("topic"));
+        let unrecorded = store.image();
+        let links = Links {
+            detached: [name("topic")].into_iter().collect(),
+            ..Links::default()
+        };
+        let mut plan = plan(&store.layout, &links).unwrap();
+        plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (named, Deferral::DetachedCheckout(name("topic"))),
+            (
+                unrecorded,
+                Deferral::UnrecordedWhileDetached(vec![name("topic")]),
+            ),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(plan.deferred, expected);
+        assert_eq!(doomed(&plan), []);
+        assert!(plan.deferred.iter().all(|(_, deferral)| match deferral {
+            Deferral::DetachedCheckout(_) => deferral.is_routine(),
+            _ => !deferral.is_routine(),
+        }));
+        // With nothing detached, the same unrecorded image is an interrupted creation.
+        let plan = super::plan(&store.layout, &Links::default()).unwrap();
+        assert!(
+            doomed(&plan).contains(&(
+                plan.doomed
+                    .iter()
+                    .find(|doomed| doomed.reason == GcReason::UnrecordedBuildVolume)
+                    .unwrap()
+                    .id
+                    .clone(),
+                GcReason::UnrecordedBuildVolume
+            )),
+            "{plan:?}"
+        );
+    }
+
+    /// A record or size that cannot be read is an error about that one volume: it is deferred
+    /// with the error, the pass goes on, and nothing is deleted on a guess.
+    #[test]
+    fn unreadable_records_and_sizes_defer_and_never_delete() {
+        let store = Store::new();
+        // A record that loops: `exists()` answers false for it, which once read as "no record".
+        let looping = store.image();
+        std::os::unix::fs::symlink(store.layout.record(&looping), store.layout.record(&looping))
+            .unwrap();
+        let corrupt = store.image();
+        fs::write(store.layout.record(&corrupt), b"{not json").unwrap();
+        // An image whose size cannot be read: a link to nothing.
+        let sizeless = BuildVolumeId::mint();
+        std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
+        store
+            .layout
+            .write_record(
+                &sizeless,
+                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
+            )
+            .unwrap();
+        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        let plan = plan(&store.layout, &Links::default()).unwrap();
+        assert_eq!(
+            doomed(&plan),
+            [(garbage, GcReason::UnlinkedBuildVolume)],
+            "{plan:?}"
+        );
+        let deferral = |id: &BuildVolumeId| {
+            plan.deferred
+                .iter()
+                .find(|(deferred, _)| deferred == id)
+                .map(|(_, deferral)| deferral.clone())
+        };
+        assert!(
+            matches!(deferral(&looping), Some(Deferral::RecordUnreadable(_))),
+            "{plan:?}"
+        );
+        assert!(
+            matches!(deferral(&corrupt), Some(Deferral::RecordUnreadable(_))),
+            "{plan:?}"
+        );
+        assert!(
+            matches!(deferral(&sizeless), Some(Deferral::SizeUnreadable(_))),
+            "{plan:?}"
+        );
+    }
 }

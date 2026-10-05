@@ -303,13 +303,35 @@ impl BuildVolumeLayout {
     }
 
     pub fn read_record(&self, id: &BuildVolumeId) -> crate::Result<BuildVolumeRecord> {
+        self.read_record_present(id)?.ok_or_else(|| {
+            crate::CowshedError::integrity(
+                format!(
+                    "build volume {id} has no record at {}",
+                    self.record(id).display()
+                ),
+                "cowshed doctor --json",
+            )
+        })
+    }
+
+    /// The record of `id`, or `None` when it has none (an unpublished creation). Every other
+    /// failure to read it is an error: an unreadable record says nothing about the volume.
+    pub fn read_record_present(
+        &self,
+        id: &BuildVolumeId,
+    ) -> crate::Result<Option<BuildVolumeRecord>> {
         let path = self.record(id);
-        let record: BuildVolumeRecord =
-            read_json(&path).map_err(|error| record_error(&path, &error))?;
+        let record: BuildVolumeRecord = match read_json(&path) {
+            Ok(record) => record,
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(record_error(&path, &error)),
+        };
         if record.version != RECORD_VERSION {
             return Err(unknown_version(&path, record.version));
         }
-        Ok(record)
+        Ok(Some(record))
     }
 
     pub fn write_record(
@@ -356,11 +378,9 @@ impl BuildVolumeLayout {
     ) -> crate::Result<Option<(BuildVolumeId, BuildVolumeRecord)>> {
         let mut seeds = Vec::new();
         for id in self.list()? {
-            let record = match self.read_record(&id) {
-                Ok(record) => record,
-                // An image without its record is an unpublished creation: never a seed.
-                Err(_) if !self.record(&id).exists() => continue,
-                Err(error) => return Err(error),
+            // An image without its record is an unpublished creation: never a seed.
+            let Some(record) = self.read_record_present(&id)? else {
+                continue;
             };
             if record.is_seed_of(target, incarnation) {
                 seeds.push((id, record));

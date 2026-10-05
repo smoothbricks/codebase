@@ -4972,11 +4972,13 @@ impl NativeProjectRuntimeHost {
             // volume (16_build_volumes.md, "Garbage collection"); a busy one waits for `gc`.
             let links = self.build_volume_links().await?;
             for deferred in self.build_volumes()?.collect(links, false).await?.deferred {
-                eprintln!(
-                    "cowshed: build volume {} is still in use ({}); `cowshed gc` reclaims it once idle",
-                    deferred.path.display(),
-                    deferred.diagnostic
-                );
+                if !deferred.deferral.is_routine() {
+                    eprintln!(
+                        "cowshed: build volume {} stays: {}; `cowshed gc` retries it",
+                        deferred.path.display(),
+                        deferred.deferral
+                    );
+                }
             }
             Ok(RemoveReport { abandoned })
         }
@@ -8673,7 +8675,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 freed_bytes: freed_bytes.saturating_add(build.freed_bytes),
                 dry_run: true,
-                deferred: Vec::new(),
+                deferred: build.deferred.into_iter().map(Into::into).collect(),
                 candidates: candidates.into_iter().chain(build.candidates).collect(),
             });
         }
@@ -8722,7 +8724,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     path: deferred.path,
                     diagnostic: deferred.diagnostic,
                 })
-                .chain(build.deferred)
+                .chain(build.deferred.into_iter().map(Into::into))
                 .collect(),
         })
     }
