@@ -1065,6 +1065,8 @@ mod parity_tests {
             | Command::Rekey(_)
             | Command::Defrag(_)
             | Command::Version
+            // A read-only lint helper over the checkout's recorded volume state; no controller call.
+            | Command::BuildState
             | Command::Help(_) => None,
         }
     }
@@ -1115,6 +1117,7 @@ mod parity_tests {
         (&["defrag", "parity"], None),
         (&["help"], None),
         (&["setup"], None),
+        (&["build-state"], None),
         (&["--version"], None),
     ];
 
