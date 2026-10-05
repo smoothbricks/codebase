@@ -155,8 +155,9 @@ same for main and for an integration workspace; "the target" is whichever one it
 6. **Adopt the build volume.** Under the same lock (rule "The adoption needs the target's Nx database closed"):
    1. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
       not the daemon named by the target's `nx/workspace-data/d` record, skip;
-   2. stop that daemon with stock `nx daemon --stop` through the target's checkout (it restarts on the next client;
-      cowshed never signals the pid itself);
+   2. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
+      verified it live, and wait for its exit on a process-exit event (it restarts on the next client). A test with a
+      real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
    3. query again; any holder at all, including a daemon a host client started in between, means skip;
    4. delete `nx/workspace-data/d` in the landing build volume;
    5. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
