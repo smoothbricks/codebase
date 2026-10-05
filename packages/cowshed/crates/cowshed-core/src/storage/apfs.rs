@@ -500,6 +500,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError>;
+    /// Mount the build volume the checkout mounted at `checkout` links, when it links one
+    /// (16_build_volumes.md, "One link per checkout"): a mounted checkout's build-state paths
+    /// always resolve into a mounted volume.
+    fn ensure_linked_build_volume(
+        &self,
+        repo: &RepoId,
+        checkout: &Path,
+    ) -> Result<(), ApfsStorageError>;
     /// Grow the workspace's image to `capacity` and restore the mount state it was found in.
     ///
     /// Refuses before touching the image when `capacity` does not exceed what the image already
@@ -1683,6 +1691,7 @@ where
                 .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
             if matches!(state, MountState::Mounted { .. }) {
                 host.validate_marker(&mount_point, &MarkerExpectation::owned(&config, &workspace))?;
+                host.ensure_linked_build_volume(workspace.repo(), &mount_point)?;
                 return Ok(mount_point);
             }
             let canonical = canonical_image_path(&config, &workspace)?;
@@ -1704,6 +1713,7 @@ where
                 return detach_after_failure(host.as_ref(), attachment, primary, "mount workspace");
             }
             host.retain_mounted(&workspace, attachment)?;
+            host.ensure_linked_build_volume(workspace.repo(), &mount_point)?;
             Ok(mount_point)
         })
         .await

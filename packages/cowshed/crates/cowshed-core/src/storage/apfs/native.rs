@@ -56,6 +56,9 @@ use super::{
 };
 use crate::timing::timed;
 
+mod build_volumes;
+pub use build_volumes::Release as BuildVolumeRelease;
+
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
 
@@ -4147,6 +4150,28 @@ where
                 }
             }
         }
+    }
+
+    fn ensure_linked_build_volume(
+        &self,
+        repo: &RepoId,
+        checkout: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let Some(target) = crate::build_volume::link::linked(checkout)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let layout =
+            crate::build_volume::BuildVolumeLayout::new(layout(&self.config, repo)?.project())?;
+        let id = layout.volume_at(&target).ok_or_else(|| {
+            ApfsStorageError::Host(format!(
+                "{} names {}, which is not one of this project's build volumes",
+                checkout.join(crate::build_volume::BUILD_LINK).display(),
+                target.display()
+            ))
+        })?;
+        self.mount_build_volume(&layout, &id).map(|_| ())
     }
 
     fn resize(

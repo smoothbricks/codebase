@@ -2434,7 +2434,7 @@ fn attachment_capacity(
 ///
 /// The image driver reports EBUSY plus its resource-busy diagnostic. Anything else — a bad
 /// device, a missing tool, a spawn failure — is not a dissent and must not be waited on.
-fn detach_was_dissented(error: &ApfsError) -> bool {
+pub(crate) fn detach_was_dissented(error: &ApfsError) -> bool {
     let ApfsError::CommandFailed {
         request, output, ..
     } = error
