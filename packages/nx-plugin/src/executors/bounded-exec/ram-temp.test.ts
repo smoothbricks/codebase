@@ -7,6 +7,7 @@ import {
   createHostCommands,
   type HostCommands,
   imagesBackedUnder,
+  mountsBelow,
   operationDisk,
   type RamTempPaths,
   RamTempVolume,
@@ -40,6 +41,18 @@ describe('RAM temp volume output parsing', () => {
     ].join('\n');
     expect(imagesBackedUnder(registry, '/private/tmp/smoo-ram-501/')).toEqual([
       '/private/tmp/smoo-ram-501/501-a1b2c3/store/main copy.asif (/dev/disk280)',
+    ]);
+  });
+
+  it('finds the mounts that would make removing a lease delete through them', () => {
+    const table = [
+      '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)',
+      '/dev/disk271s1 on /private/tmp/smoo-ram-501 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse)',
+      '/dev/disk290s1 on /private/tmp/smoo-ram-501/501-a1b2c3/checkout (apfs, local, nobrowse, mounted by danny)',
+      '/dev/disk291s1 on /private/tmp/smoo-ram-501/501-a1b2c3x/other (apfs, local)',
+    ].join('\n');
+    expect(mountsBelow(table, '/private/tmp/smoo-ram-501/501-a1b2c3/')).toEqual([
+      '/private/tmp/smoo-ram-501/501-a1b2c3/checkout',
     ]);
   });
 

@@ -32,8 +32,11 @@ import { join } from 'node:path';
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
  * lease, from scratch roots outside TMPDIR (specs/cowshed/08_testing.md). This
- * module never detaches one. A dead lease that still backs an image is kept,
- * with the volume under it, and every task that takes a lease names it.
+ * module never detaches one, and never deletes through a mount below a lease.
+ * A dead lease that still backs an image or holds a mount is kept, with the
+ * volume under it, and every task that takes a lease names it. Every disk
+ * child runs under a deadline, so a wedged DiskArbitration fails the task
+ * instead of every task queued on the lock.
  *
  * A cowshed sandbox denies writes to /private/tmp (EPERM on the lock), and
  * cannot attach disk images at all; there the task keeps the workspace's own
@@ -279,9 +282,10 @@ export class RamTempVolume {
   }
 
   /**
-   * An image attached from a file below the lease keeps the lease: deleting the tree would leave
-   * the image pinned to a deleted file, and detaching it here would race the owner that releases
-   * it under its own lease.
+   * Anything attached from below the lease keeps the lease. An image backed by a file there would
+   * be left pinned to a deleted file, and detaching it here would race the owner that releases it
+   * under its own lease. A mount there is backed elsewhere — a cowshed workspace adopted from a
+   * fixture checkout, say — and `rm -r` would delete its contents through the mount.
    */
   private async removeLease(directory: string): Promise<Result<LeaseRemoval, RamTempError>> {
     const holders = await this.holders(`${directory}/`);
@@ -406,15 +410,25 @@ export class RamTempVolume {
 
   /**
    * What is attached from below `prefix`: images whose backing file is there, read from the I/O
-   * Registry. `hdiutil info` omits attached images while another image attaches or detaches
-   * (measured by cowshed's scratch-root sweep), and tests attach images concurrently.
+   * Registry, and mounts. `hdiutil info` omits attached images while another image attaches or
+   * detaches (measured by cowshed's scratch-root sweep), and tests attach images concurrently.
    */
   private async holders(prefix: string): Promise<Result<string[], RamTempError>> {
     const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'AppleDiskImageDevice', '-l', '-w0']);
     if (registry.status !== 0) {
       return failed('ioreg (attached disk images)', commandText(registry));
     }
-    return { ok: true, value: imagesBackedUnder(registry.stdout, prefix) };
+    const mounts = await this.commands.run('/sbin/mount', []);
+    if (mounts.status !== 0) {
+      return failed('mount (mount table)', commandText(mounts));
+    }
+    return {
+      ok: true,
+      value: [
+        ...imagesBackedUnder(registry.stdout, prefix),
+        ...mountsBelow(mounts.stdout, prefix).map((point) => `${point} (mounted)`),
+      ],
+    };
   }
 }
 
@@ -439,6 +453,18 @@ export function imagesBackedUnder(registry: string, prefix: string): string[] {
     }
   }
   return images;
+}
+
+/** Mount points in `mount` output (`<device> on <path> (<options>)`) that lie under `prefix`. */
+export function mountsBelow(table: string, prefix: string): string[] {
+  const points: string[] = [];
+  for (const line of table.split('\n')) {
+    const point = /^\S+ on (.+) \([^)]*\)$/.exec(line)?.[1];
+    if (point?.startsWith(prefix)) {
+      points.push(point);
+    }
+  }
+  return points;
 }
 
 /** The disk `diskutil apfs` reports it created: "Disk from APFS operation: disk271". */
@@ -469,16 +495,33 @@ function parseDevices(text: string): VolumeDevices | null {
   return null;
 }
 
+/**
+ * A disk child that DiskArbitration never answers would wedge the task, and every task queued
+ * behind the lock, forever; measured: `diskutil mount` hung past 60 s while the host's
+ * DiskArbitration was saturated. Cowshed bounds its disk children the same way.
+ */
+const HOST_COMMAND_DEADLINE_MS = 120_000;
+
 export function createHostCommands(): HostCommands {
   return {
     run(file, args) {
       return new Promise((resolve) => {
         // The registry listing of every attached image runs to megabytes on a busy host
-        // (2 MB measured with ~40 images); execFile's 1 MB default truncates it into a failure.
-        execFile(file, [...args], { encoding: 'utf8', maxBuffer: 64 * MIB }, (error, stdout, stderr) => {
-          const status = error === null ? 0 : typeof error.code === 'number' ? error.code : 1;
-          resolve({ status, stdout, stderr: error !== null && stderr === '' ? error.message : stderr });
-        });
+        // (2 MB measured with 136 images); execFile's 1 MB default truncates it into a failure.
+        execFile(
+          file,
+          [...args],
+          { encoding: 'utf8', maxBuffer: 64 * MIB, timeout: HOST_COMMAND_DEADLINE_MS, killSignal: 'SIGKILL' },
+          (error, stdout, stderr) => {
+            if (error === null) {
+              resolve({ status: 0, stdout, stderr });
+              return;
+            }
+            const status = typeof error.code === 'number' ? error.code : 1;
+            const detail = error.killed ? `no answer within ${HOST_COMMAND_DEADLINE_MS} ms; killed` : error.message;
+            resolve({ status, stdout, stderr: stderr === '' || error.killed ? detail : stderr });
+          },
+        );
       });
     },
   };
