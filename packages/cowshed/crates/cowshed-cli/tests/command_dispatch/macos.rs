@@ -710,7 +710,7 @@ async fn land_nx_project(
     eprintln!("land report: {stderr}");
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
-    (land_adoptions(&fixture.storage.telemetry()), landed_head)
+    (land_adoptions(fixture.storage.telemetry()), landed_head)
 }
 
 /// A task output Nx is not told about is a 2b miss (16_build_volumes.md, Land step 7), and each
