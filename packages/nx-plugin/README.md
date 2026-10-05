@@ -660,6 +660,8 @@ tests) owns those roots:
   directory of the test process that owns it. The first root a process creates for a suite first reclaims every run of
   that suite whose owner pid is gone: each process working in it gets SIGTERM (SIGKILL if it outlives 10 s), then the
   run is deleted. A run whose owner is alive is never touched.
+- `reclaimDeadFixtureRuns(suite)` runs that sweep on demand, for a test that has just watched a fixture-owning process
+  die.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
   `<workspace>/.nx/workspace-data/d/server-process.json`, and every process it started, has exited.
 

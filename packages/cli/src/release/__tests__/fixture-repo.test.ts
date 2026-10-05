@@ -2,7 +2,12 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { nxDaemonProcesses, pidsWorkingIn, processTable } from '@smoothbricks/nx-plugin/testing';
+import {
+  nxDaemonProcesses,
+  pidsWorkingIn,
+  processTable,
+  reclaimDeadFixtureRuns,
+} from '@smoothbricks/nx-plugin/testing';
 import {
   classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
@@ -194,6 +199,8 @@ describe('release planning with fixture git repositories', () => {
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
 
+  // The two abandoned-fixture tests start a nested `bun test` process and a real
+  // daemon: the default 30 s is the budget of one test, not of a second runner in it.
   it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
     const { root, pids } = await abandonFixture(`
       await runFixtureNx(root, ['show', 'projects'], { daemon: true });
@@ -203,7 +210,7 @@ describe('release planning with fixture git repositories', () => {
 
     expect(pids.length).toBeGreaterThan(1);
     expect(await survivors(root, pids)).toEqual([]);
-  });
+  }, 120_000);
 
   it('stops an abandoned fixture nx client still starting its daemon, and that daemon', async () => {
     // The client logs this line just before it spawns the daemon, which records
@@ -220,7 +227,7 @@ describe('release planning with fixture git repositories', () => {
     `);
 
     expect(await survivors(root, [])).toEqual([]);
-  });
+  }, 120_000);
 
   it('repairs multiple fetched remote targets from a runner clone with real git checkout and Nx build', async () => {
     await withFixtureRepo(async (author) => {
@@ -486,6 +493,11 @@ test('returns without its fixture body', async () => {
     ]);
     const root = /^ABANDONED_FIXTURE_ROOT (.+)$/m.exec(stdout)?.[1];
     if (exitCode !== 0 || root === undefined) {
+      // A nested run killed before its fixture retired (Bun SIGTERMs it when
+      // this test times out) leaves its daemon behind: reclaim it now, not at
+      // the next run. Only then: a run that exited cleanly must have retired
+      // its own fixture, which is what the caller asserts.
+      await reclaimDeadFixtureRuns('cli');
       throw new Error(`abandoned fixture test exited ${exitCode}\n${stdout}\n${stderr}`);
     }
     const pids = /^ABANDONED_FIXTURE_PIDS (.+)$/m.exec(stdout)?.[1]?.split(' ').map(Number) ?? [];

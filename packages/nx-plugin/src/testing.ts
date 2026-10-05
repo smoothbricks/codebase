@@ -251,19 +251,26 @@ export async function ownedFixtureRoot(suite: string, prefix: string): Promise<s
 }
 
 async function openRun(suite: string): Promise<string> {
-  const suiteDirectory = join(await realpath(tmpdir()), FIXTURE_HOME, suite);
-  await mkdir(suiteDirectory, { recursive: true });
-  await reclaimDeadRuns(suiteDirectory);
+  const suiteDirectory = await reclaimDeadFixtureRuns(suite);
   const directory = join(suiteDirectory, `run-${process.pid}`);
   await mkdir(directory, { recursive: true });
   return directory;
 }
 
 /**
- * Stop every process working in a run of the suite whose owner is gone, then
- * delete the run. An owner's pid reused by an unrelated process makes its run
- * look alive; it is reclaimed once that process is gone too, never early.
+ * Stop every process working in a run of `suite` whose owner is gone, then
+ * delete the run, and return the suite's directory. The first fixture root of a suite in
+ * a process does this; a test that just watched a fixture-owning process die
+ * may too. An owner's pid reused by an unrelated process makes its run look
+ * alive; it is reclaimed once that process is gone too, never early.
  */
+export async function reclaimDeadFixtureRuns(suite: string): Promise<string> {
+  const suiteDirectory = join(await realpath(tmpdir()), FIXTURE_HOME, suite);
+  await mkdir(suiteDirectory, { recursive: true });
+  await reclaimDeadRuns(suiteDirectory);
+  return suiteDirectory;
+}
+
 async function reclaimDeadRuns(suiteDirectory: string): Promise<void> {
   const dead = (await readdir(suiteDirectory)).flatMap((name) => {
     const owner = RUN_NAME.exec(name)?.[1];
