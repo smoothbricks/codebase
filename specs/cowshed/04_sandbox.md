@@ -747,10 +747,15 @@ ancestors, including a leaf not created yet. Selecting a new volume does not gra
 running job: its compiled profile keeps its old physical authority.
 
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
-the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree; a host shell of a cowshed checkout reaches the same
-leaf through a short link (the managed devenv's `NX_SOCKET_DIR`), because the checkout path is too long for Nx's
-plugin-worker sockets and Nx refuses a symlinked leaf. Main's sandboxed jobs therefore connect to main's host daemon
-instead of starting their own and overwriting its record.
+the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree, which jobs of every mode name as
+`/tmp/cs-<port base>/nx`. A host shell of a cowshed checkout names the same leaf by the same literal path: the managed
+devenv's `NX_SOCKET_DIR` reads the port base from the checkout's `.cowshed/env` and takes the workspace's own short
+link, creating it when no job has yet. Any other path fails, for three reasons. The checkout path is too long for Nx's
+plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting client's environment, so its
+plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets by literal path, so a
+sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and its plugin fails to
+load. Main's sandboxed jobs therefore connect to main's host daemon instead of starting their own and overwriting its
+record, and a host client in a workspace uses the workspace's sandboxed daemon without breaking its plugin workers.
 
 A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
 only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting

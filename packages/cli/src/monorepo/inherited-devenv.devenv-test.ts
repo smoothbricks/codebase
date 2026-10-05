@@ -145,14 +145,16 @@ describe('private inherited devenv with real devenv', () => {
     () => {
       const scratch = realpathSync(mkdtempSync('/tmp/smoo-inh-'));
       try {
+        const socketScript = join(managedAssetsRoot, 'raw/tooling/direnv/nx-socket-dir.sh');
         const managedShell = readFileSync(join(managedAssetsRoot, 'raw/tooling/direnv/devenv.smoo.nix'), 'utf8');
-        const socketHook = managedShell.match(/(nx_workspace_root=.*?mkdir -p "\$NX_SOCKET_DIR")/s)?.[1];
-        if (!socketHook) throw new Error('the managed shell must compute its workspace-owned Nx socket');
+        if (!managedShell.includes('. "$DEVENV_ROOT/nx-socket-dir.sh" /tmp'))
+          throw new Error('the managed shell must compute its workspace-owned Nx socket');
         const main = workspace(
           scratch,
           'main',
           `{ ... }: { enterShell = ''
-        ${socketHook}
+        cd "$DEVENV_ROOT/../.."
+        . "${socketScript}" /tmp
         echo entered >> "$DEVENV_ROOT/hook-runs"
       ''; }
 `,

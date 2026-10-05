@@ -137,6 +137,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/nx-socket-dir.sh',
+    target: 'tooling/direnv/nx-socket-dir.sh',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/inherited-devenv.ts',
     target: 'tooling/direnv/inherited-devenv.ts',
     executable: true,

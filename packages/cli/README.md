@@ -417,6 +417,11 @@ nothing when nothing changed:
   `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
   sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
   defaults. A value the caller already exported wins.
+- `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
+  dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
+  `.cowshed/env` names a port base uses `/tmp/cs-<port base>/nx`, the literal path cowshed gives its sandboxed jobs, and
+  creates that link if no job has yet. Host shells and sandboxed jobs then share one Nx daemon, and a sandboxed daemon's
+  plugin workers can bind their sockets whichever side connected.
 - The origin checkout's shell publishes a private `.devenv` evaluated export; after cowshed clones the image,
   `tooling/direnv/inherited-devenv.ts` can reuse that export in the new checkout. It checks the exact contents and
   executable bits of `tooling/direnv` and local `path:` inputs, devenv's watched inputs, the toolchain and the emitted
