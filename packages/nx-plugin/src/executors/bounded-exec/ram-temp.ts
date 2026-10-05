@@ -59,8 +59,12 @@ const GIB = 1024 * MIB;
 /**
  * The volume's ceiling. Pages are allocated as they are written and returned when the
  * volume detaches, so this bounds what a runaway suite can take, not what a gate costs.
+ * Measured 2026-10-04: a full parallel smoothbricks `lint test build host-controller-test`
+ * gate peaked at 1.61 GiB used with 18 concurrent leases; 8 GiB is five times that. That
+ * gate also staged cowshed's real-APFS fixture images on the volume, which now stay under
+ * /private/tmp, so the peak is an upper bound.
  */
-export const RAM_TEMP_CAPACITY_BYTES = 64 * GIB;
+export const RAM_TEMP_CAPACITY_BYTES = 8 * GIB;
 /** A failed task with less than this free on the volume is reported as having run out of space. */
 const FULL_FREE_BYTES = 64 * MIB;
 /** `<pid>-<mkdtemp suffix>`: the pid says whether the lease's task is alive. */
