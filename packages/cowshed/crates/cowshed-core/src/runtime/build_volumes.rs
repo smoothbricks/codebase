@@ -70,6 +70,11 @@ impl BuildVolumes {
         Self { host, layout }
     }
 
+    /// Where build volume `id` mounts.
+    pub fn layout_mount(&self, id: &BuildVolumeId) -> PathBuf {
+        self.layout.mount(id)
+    }
+
     async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(&Host, &BuildVolumeLayout) -> Result<T> + Send + 'static,
