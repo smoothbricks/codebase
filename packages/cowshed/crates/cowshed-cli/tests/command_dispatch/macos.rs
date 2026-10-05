@@ -45,6 +45,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with(Project::Plain)
+    }
+
+    /// A fixture whose checkout holds `project`, committed: an APFS clone of this run's checkout
+    /// template for it ([`checkout_template`]).
+    fn with(project: Project<'_>) -> Self {
         // The supervisor socket includes this root and an incarnation hash. Keep the root short
         // enough for Darwin's Unix-socket path limit; ScratchRoot's pid/sequence keep it unique.
         let scratch = ScratchRoot::new("cli").expect("scratch APFS root");
@@ -52,20 +58,20 @@ impl Fixture {
         let store = scratch.path().join("store");
         let caches = scratch.path().join("caches");
         let granted = scratch.path().join("granted");
-        for path in [&checkout, &store, &caches, &granted] {
+        for path in [&store, &caches, &granted] {
             fs::create_dir_all(path).expect("fixture directory");
         }
-        git(&checkout, &["init", "-q", "-b", "main"]);
-        fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
-        // Integration images stay at the 1 GiB test cap (08_testing.md): main through `adopt
-        // --capacity`, the build volume through the operator's own `.cowshed.toml` setting.
-        fs::write(checkout.join(".cowshed.toml"), FIXTURE_COWSHED_TOML).expect("cowshed config");
-        git(&checkout, &["add", "tracked", ".cowshed.toml"]);
-        git(&checkout, &["commit", "-q", "-m", "initial"]);
+        clone_tree(&checkout_template(project), &checkout);
         let storage = ValidatedHostStorage::new(
             scratch.path().to_path_buf(),
             CanonicalRoots::at(store, caches),
         );
+        if let Project::Build {
+            rust: Some(rust), ..
+        } = project
+        {
+            install_rust(storage.home(), rust);
+        }
         Self {
             _scratch: scratch,
             checkout,
@@ -130,6 +136,124 @@ impl Fixture {
             gateway.drain().await.expect("drain real gateway");
         }
     }
+}
+
+/// What a fixture's checkout holds, committed, when its test starts.
+#[derive(Clone, Copy)]
+enum Project<'a> {
+    /// `tracked` and the build-volume cap in `.cowshed.toml`, in one commit.
+    Plain,
+    /// [`Project::Plain`] and then [`write_nx_project`]'s project, its output `declared` or not.
+    Nx {
+        nx: &'a Path,
+        node: &'a Path,
+        declared: bool,
+    },
+    /// [`Project::Plain`] and then the build-volume tests' tree ([`write_build_project`]).
+    Build {
+        nx: Option<(&'a Path, &'a Path)>,
+        rust: Option<&'a Path>,
+    },
+}
+
+impl Project<'_> {
+    /// The template's name: everything that varies between checkouts of one run. The toolchain
+    /// paths are the run's own and the same in every test.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Nx { declared: true, .. } => "nx-declared",
+            Self::Nx {
+                declared: false, ..
+            } => "nx-undeclared",
+            Self::Build {
+                nx: Some(_),
+                rust: Some(_),
+            } => "build-nx-rust",
+            Self::Build {
+                nx: Some(_),
+                rust: None,
+            } => "build-nx",
+            Self::Build {
+                nx: None,
+                rust: Some(_),
+            } => "build-rust",
+            Self::Build {
+                nx: None,
+                rust: None,
+            } => "build",
+        }
+    }
+
+    fn write(self, checkout: &Path) {
+        fs::create_dir_all(checkout).expect("checkout directory");
+        git(checkout, &["init", "-q", "-b", "main"]);
+        fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
+        // Integration images stay at the 1 GiB test cap (08_testing.md): main through `adopt
+        // --capacity`, the build volume through the operator's own `.cowshed.toml` setting.
+        fs::write(checkout.join(".cowshed.toml"), FIXTURE_COWSHED_TOML).expect("cowshed config");
+        git(checkout, &["add", "tracked", ".cowshed.toml"]);
+        git(checkout, &["commit", "-q", "-m", "initial"]);
+        match self {
+            Self::Plain => {}
+            Self::Nx { nx, node, declared } => {
+                write_nx_project(checkout, nx, node, declared);
+                git(checkout, &["add", "-A"]);
+                git(checkout, &["commit", "-q", "-m", "nx project"]);
+            }
+            Self::Build { nx, rust } => write_build_project(checkout, nx, rust),
+        }
+    }
+}
+
+/// This run's committed checkout holding `project`, written by whichever test asks first.
+///
+/// A fixture checkout is a handful of git, Cargo and file writes that every test repeated; on
+/// the loaded gate each git process took 0.8 s against 75 ms alone. The tree holds no path of
+/// the scratch root it is cloned under, so one per run serves every test. Like the blank image
+/// template, it lives in the runner's template directory and is written aside and moved in
+/// whole, so the next run's sweep reclaims it and a writer killed halfway leaves no template.
+fn checkout_template(project: Project<'_>) -> PathBuf {
+    // SAFETY: `getppid` has no preconditions and cannot fail.
+    let run = unsafe { libc::getppid() };
+    let directory = PathBuf::from(format!("{}{run}-templates", scratch_apfs::ROOT_PREFIX));
+    fs::create_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
+    let key = project.key();
+    let template = directory.join(format!("checkout-{key}"));
+    let lock = directory.join(format!("checkout-{key}.lock"));
+    let _writing = scratch_apfs::lock_exclusive(&lock)
+        .unwrap_or_else(|error| panic!("template lock {}: {error}", lock.display()));
+    if !template.exists() {
+        let aside = directory.join(format!("checkout-{key}.{}", std::process::id()));
+        project.write(&aside);
+        fs::rename(&aside, &template).unwrap_or_else(|error| {
+            panic!("publish checkout template {}: {error}", template.display())
+        });
+    }
+    template
+}
+
+/// `source`'s whole tree cloned to `destination`, which must not exist: one `clonefile`, no copy.
+fn clone_tree(source: &Path, destination: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32)
+        -> libc::c_int;
+    }
+    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    let (from, to) = (path(source), path(destination));
+    // SAFETY: both arguments are NUL-terminated strings that outlive the call, which reads them
+    // and touches no other memory.
+    let cloned = unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) };
+    assert_eq!(
+        cloned,
+        0,
+        "clone {} to {}: {}",
+        source.display(),
+        destination.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 impl Drop for Fixture {
@@ -741,10 +865,11 @@ async fn land_nx_project(
     declared: bool,
 ) -> (Vec<cowshed_core::api::dto::LandAdoptionCommitment>, String) {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::new();
-    write_nx_project(&fixture.checkout, &nx, &node, declared);
-    git(&fixture.checkout, &["add", "-A"]);
-    git(&fixture.checkout, &["commit", "-q", "-m", "nx project"]);
+    let mut fixture = Fixture::with(Project::Nx {
+        nx: &nx,
+        node: &node,
+        declared,
+    });
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
@@ -903,17 +1028,15 @@ fn write_cargo_workspace(checkout: &Path, rust: &Path) {
     );
 }
 
-/// Main's tree for the build-volume tests: the Nx project with its outputs declared and/or the
-/// Cargo workspace, with every build output and the tests' own control files ignored, so a
-/// retiring land finds the landing tree clean.
-fn write_build_project(fixture: &Fixture, nx: Option<(&Path, &Path)>, rust: Option<&Path>) {
-    let checkout = &fixture.checkout;
+/// Main's tree for the build-volume tests, written into `checkout` and committed: the Nx project
+/// with its outputs declared and/or the Cargo workspace, with every build output and the tests'
+/// own control files ignored, so a retiring land finds the landing tree clean.
+fn write_build_project(checkout: &Path, nx: Option<(&Path, &Path)>, rust: Option<&Path>) {
     if let Some((nx, node)) = nx {
         write_nx_project(checkout, nx, node, true);
     }
     if let Some(rust) = rust {
         write_cargo_workspace(checkout, rust);
-        install_rust(fixture.storage.home(), rust);
     }
     fs::write(
         checkout.join(".gitignore"),
@@ -1126,8 +1249,10 @@ impl Drop for Holder {
 async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
     let (nx, node) = repository_nx();
     let rust = rust_toolchain();
-    let mut fixture = Fixture::new();
-    write_build_project(&fixture, Some((&nx, &node)), Some(&rust));
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: Some(&rust),
+    });
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     assert_target_on_build_volume(&fixture.checkout);
     let nx_check = nx_run_many(&node);
@@ -1213,8 +1338,10 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
 #[tokio::test]
 async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_reports_2b() {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::new();
-    write_build_project(&fixture, Some((&nx, &node)), None);
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
@@ -1269,8 +1396,10 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
 #[tokio::test]
 async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::new();
-    write_build_project(&fixture, Some((&nx, &node)), None);
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
@@ -1349,8 +1478,10 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
 async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
     let rust = rust_toolchain();
-    let mut fixture = Fixture::new();
-    write_build_project(&fixture, None, Some(&rust));
+    let mut fixture = Fixture::with(Project::Build {
+        nx: None,
+        rust: Some(&rust),
+    });
     let mut service = serve_project(&mut fixture, &[]).await;
     assert_target_on_build_volume(&fixture.checkout);
     let layout = build_volumes(&fixture);
