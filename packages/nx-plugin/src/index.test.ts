@@ -14,6 +14,7 @@ import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
+import { NEXTEST_EXTRACTION_DIRECTORY } from './nextest-extraction.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
 useFixtureCargoHome();
@@ -1516,7 +1517,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // A cargo that does what nextest does with an archive, and says so: an
       // `--archive-file` unpacks it (into `--extract-to`, or a private temp
       // dir when a run is given the archive itself), and a run reports which
-      // archive's binaries it executed.
+      // archive's binaries it executed. `metadata` names the workspace's
+      // target directory, where the extraction root lives.
       const log = join(root, 'nextest.log');
       await workspace.write(
         'bin/cargo',
@@ -1525,6 +1527,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'archive= dest= binaries=',
           'while [ $# -gt 0 ]; do',
           '  case "$1" in',
+          '    metadata) printf \'{"target_directory":"%s/target"}\\n\' "$PWD"; exit 0 ;;',
           '    --archive-file) archive=$2; shift ;;',
           '    --extract-to) dest=$2; shift ;;',
           '    --binaries-metadata) binaries=$2; shift ;;',
@@ -1587,13 +1590,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'run second archive',
         'run second archive',
       ]);
-      const archives = join(root, 'packages/ferris/.cache/nextest');
-      const unpacked = (await readdir(archives, { recursive: true })).filter((path) =>
+      // The old unpacking is gone from Cargo's build tree, and the archive's
+      // directory holds only the archive, the declared Nx output.
+      const extracted = join(root, 'packages/ferris/target', NEXTEST_EXTRACTION_DIRECTORY);
+      const unpacked = (await readdir(extracted, { recursive: true })).filter((path) =>
         path.endsWith('binaries-metadata.json'),
       );
-      expect(await Promise.all(unpacked.map((path) => readFile(join(archives, path), 'utf8')))).toEqual([
+      expect(await Promise.all(unpacked.map((path) => readFile(join(extracted, path), 'utf8')))).toEqual([
         'second archive',
       ]);
+      expect(await readdir(join(root, 'packages/ferris/.cache/nextest'))).toEqual(['archive.tar.zst']);
     } finally {
       await workspace.cleanup();
     }
