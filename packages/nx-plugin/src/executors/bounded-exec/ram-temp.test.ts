@@ -56,9 +56,14 @@ describe('RAM temp volume output parsing', () => {
     ]);
   });
 
-  it('keeps the mountpoint short enough to hold sockets', () => {
+  it('mounts where DiskArbitration puts it, short enough to hold sockets', () => {
     // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths.
-    expect(ramTempPaths(501).mountpoint).toBe('/private/tmp/smoo-ram-501');
+    expect(ramTempPaths(501)).toEqual({
+      mountpoint: '/Volumes/smoo-ram-501',
+      lockFile: '/private/tmp/smoo-ram-501.lock',
+      stateFile: '/private/tmp/smoo-ram-501.device',
+      volumeName: 'smoo-ram-501',
+    });
   });
 });
 
@@ -67,7 +72,7 @@ describe('RAM temp volume on this host', () => {
     const parent = mkdtempSync(join(process.env.TMPDIR ?? '/private/tmp', 'rt-'));
     const name = `smoo-ram-test-${process.pid}`;
     const paths: RamTempPaths = {
-      mountpoint: join(parent, 'v'),
+      mountpoint: join('/Volumes', name),
       lockFile: join(parent, 'v.lock'),
       stateFile: join(parent, 'v.device'),
       volumeName: name,

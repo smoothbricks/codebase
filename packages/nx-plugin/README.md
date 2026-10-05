@@ -622,6 +622,10 @@ those belong to whoever attached them, so the lease and the volume are kept and 
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
 
+The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: asking for any other mountpoint escalates
+to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
+plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
+
 The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
 tools that need to normalize package JSON consistently.
 

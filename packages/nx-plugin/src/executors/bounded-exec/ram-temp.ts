@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { mkdir, mkdtemp, open, readdir, readFile, rm, rmdir, stat, statfs, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /**
@@ -22,12 +22,20 @@ import { join } from 'node:path';
  *   the APFS host degrades"; measured 2026-10-05).
  * - Attach + format + mount costs ~2 s and is DiskArbitration traffic, so the
  *   volume is created once, lazily, and every task takes a subdirectory.
+ * - Only DiskArbitration's own mountpoint (`/Volumes/<volume name>`) is safe to
+ *   ask for: `diskutil mount -mountPoint <dir>` was refused as not privileged
+ *   (0xf8da0009), and storagekitd escalated it to an administrator dialog whose
+ *   wait blocked every diskutil on the host. A default mount raised no authd
+ *   request (log show, 2026-10-04).
+ * - Without authorization the volume mounts only `noowners`: launchd refuses a
+ *   plist from it ("Caller specified a plist with bad ownership/permissions"),
+ *   so a test that bootstraps a launchd job keeps the plist outside TMPDIR.
  *
- * Every step runs under one kernel lock (`O_EXLOCK` on a file beside the
- * mountpoint), held only while the volume or the lease set changes, and dropped
- * by the kernel when the holder dies. A lease is a directory named after the
- * task process's pid; a lease whose pid is gone is reclaimed by the next task
- * that takes the lock, and the volume is detached when the last live lease ends.
+ * Every step runs under one kernel lock (`O_EXLOCK` on a file in /private/tmp),
+ * held only while the volume or the lease set changes, and dropped by the
+ * kernel when the holder dies. A lease is a directory named after the task
+ * process's pid; a lease whose pid is gone is reclaimed by the next task that
+ * takes the lock, and the volume is detached when the last live lease ends.
  *
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
@@ -71,21 +79,21 @@ export interface HostCommands {
 }
 
 export interface RamTempPaths {
-  /** Where the volume mounts; also the lock and state files' stem. Kept short for sun_path (104 bytes). */
+  /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */
   mountpoint: string;
   lockFile: string;
   stateFile: string;
-  /** APFS volume name; identifies the volume when its mountpoint cannot. */
+  /** APFS volume name; names the mountpoint and identifies the volume when its mountpoint cannot. */
   volumeName: string;
 }
 
-export function ramTempPaths(uid: number, parent = '/private/tmp'): RamTempPaths {
-  const stem = join(parent, `smoo-ram-${uid}`);
+export function ramTempPaths(uid: number): RamTempPaths {
+  const volumeName = `smoo-ram-${uid}`;
   return {
-    mountpoint: stem,
-    lockFile: `${stem}.lock`,
-    stateFile: `${stem}.device`,
-    volumeName: `smoo-ram-${uid}`,
+    mountpoint: join('/Volumes', volumeName),
+    lockFile: `/private/tmp/${volumeName}.lock`,
+    stateFile: `/private/tmp/${volumeName}.device`,
+    volumeName,
   };
 }
 
@@ -344,16 +352,16 @@ export class RamTempVolume {
     }
     devices.volume = volume;
     await writeFile(this.paths.stateFile, JSON.stringify(devices), { mode: 0o600 });
-    await mkdir(this.paths.mountpoint, { recursive: true, mode: 0o700 });
-    const mounted = await this.commands.run('/usr/sbin/diskutil', [
-      'mount',
-      '-nobrowse',
-      '-mountPoint',
-      this.paths.mountpoint,
-      volume,
-    ]);
+    // No -mountPoint: see the module comment. DiskArbitration names the mountpoint after the
+    // volume, and appends " 1" when a stale /Volumes entry already holds the name.
+    const mounted = await this.commands.run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', volume]);
     if (mounted.status !== 0) {
       return failed('diskutil mount', commandText(mounted));
+    }
+    const table = await this.commands.run('/sbin/mount', []);
+    const point = new RegExp(`^/dev/${volume} on (.+) \\(`, 'm').exec(table.stdout)?.[1];
+    if (point !== this.paths.mountpoint) {
+      return failed('diskutil mount', `${volume} mounted at ${point ?? 'nowhere'}, expected ${this.paths.mountpoint}`);
     }
     await writeFile(join(this.paths.mountpoint, MARKER_FILE), `${this.paths.volumeName}\n`);
     return { ok: true, value: undefined };
@@ -404,7 +412,7 @@ export class RamTempVolume {
       return failed('hdiutil detach', commandText(detached));
     }
     await rm(this.paths.stateFile, { force: true });
-    await rmdir(this.paths.mountpoint).catch(() => undefined);
+    // DiskArbitration removes the /Volumes directory it created when the volume goes.
     return { ok: true, value: undefined };
   }
 
