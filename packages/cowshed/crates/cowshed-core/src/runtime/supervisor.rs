@@ -946,9 +946,10 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The caller's variables a child may take: all but the Git configuration channels the managed
-/// fetch include must not be bypassed through. What the sandbox owns or withholds is laid over
-/// this by [`SandboxEnvironment`].
+/// The caller's variables a child may take: no bypass of managed Git configuration and no
+/// agent-harness `CI` in a development checkout. GitHub/Forgejo Actions identifies real CI
+/// with `GITHUB_ACTIONS=true`; a bare `CI` changes Cargo unit identities but names no runner.
+/// What the sandbox owns or withholds is laid over this by [`SandboxEnvironment`].
 pub(super) fn caller_environment(
     caller: &BTreeMap<String, String>,
 ) -> impl Iterator<Item = (&str, &str)> {
@@ -956,6 +957,12 @@ pub(super) fn caller_environment(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .filter(|(name, _)| crate::workspace_git_fetch::caller_git_environment_allowed(name))
+        .filter(|(name, _)| {
+            *name != "CI"
+                || caller
+                    .get("GITHUB_ACTIONS")
+                    .is_some_and(|value| value == "true")
+        })
 }
 
 /// The environment every child of this workspace starts from, split by who may change what.
@@ -4600,6 +4607,53 @@ mod workspace_toolchain_tests {
         assert_eq!(wiring().await, unwrapped, "a collected store path");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
+    #[test]
+    fn caller_ci_is_local_unless_a_real_runner_identifies_itself() {
+        for marker in [None, Some(""), Some("false"), Some("true")] {
+            let mut caller = BTreeMap::from([
+                ("CI".to_owned(), "true".to_owned()),
+                (
+                    "CC_aarch64_apple_darwin".to_owned(),
+                    "/usr/bin/clang".to_owned(),
+                ),
+                (
+                    "CXX_aarch64_apple_darwin".to_owned(),
+                    "/usr/bin/clang++".to_owned(),
+                ),
+                (
+                    "AR_aarch64_apple_darwin".to_owned(),
+                    "/usr/bin/ar".to_owned(),
+                ),
+            ]);
+            if let Some(marker) = marker {
+                caller.insert("GITHUB_ACTIONS".to_owned(), marker.to_owned());
+            }
+            let environment = SandboxEnvironment {
+                owned: BTreeMap::new(),
+                withheld: Vec::new(),
+                defaults: BTreeMap::new(),
+                appended: BTreeMap::new(),
+            };
+            let one_shot = environment.child(&caller);
+            let warm: BTreeMap<_, _> = environment.overlay(&caller).into_iter().collect();
+            assert_eq!(one_shot, warm, "{marker:?}");
+            assert_eq!(
+                one_shot.contains_key(OsStr::new("CI")),
+                marker == Some("true")
+            );
+            for name in [
+                "CC_aarch64_apple_darwin",
+                "CXX_aarch64_apple_darwin",
+                "AR_aarch64_apple_darwin",
+            ] {
+                assert_eq!(
+                    one_shot.get(OsStr::new(name)),
+                    caller.get(name).map(OsString::from).as_ref()
+                );
+            }
+        }
     }
 
     /// Names the fixture workspace a re-executed probe describes; see
