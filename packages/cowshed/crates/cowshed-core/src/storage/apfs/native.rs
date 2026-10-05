@@ -70,8 +70,10 @@ const ROOT_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
-const LOCK_FILE_OPEN_FLAGS: libc::c_int =
-    libc::O_RDWR + libc::O_CREAT + libc::O_NOFOLLOW + libc::O_CLOEXEC;
+/// An existing lock file: opened, never created.
+const LOCK_FILE_OPEN_FLAGS: libc::c_int = libc::O_RDWR + libc::O_NOFOLLOW + libc::O_CLOEXEC;
+/// A lock file no one has created yet: created, or `EEXIST` when someone just did.
+const LOCK_FILE_CREATE_FLAGS: libc::c_int = LOCK_FILE_OPEN_FLAGS + libc::O_CREAT + libc::O_EXCL;
 const WAIT_LOCK_OPERATION: libc::c_int = libc::LOCK_EX;
 const TRY_LOCK_OPERATION: libc::c_int = libc::LOCK_EX + libc::LOCK_NB;
 const LOCK_FILE_MODE: libc::c_uint = 0o600;
@@ -127,6 +129,49 @@ fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsS
     })
 }
 
+/// The lock file `name` in `directory`, created if it does not exist yet.
+///
+/// Never one `O_CREAT` open: when several processes `openat` the same new name with `O_CREAT` at
+/// once, macOS answers some of them `ENOENT` (measured on APFS: thousands of failures in 4,800
+/// racing `openat`s, none with path-based `open`). An open of the existing file, then an
+/// exclusive create, then an open of the file the `EEXIST` names, measured none in 12,000.
+fn open_or_create_lock_at(
+    directory: &File,
+    name: &CString,
+    path: &Path,
+) -> Result<File, ApfsStorageError> {
+    let open = |flags: libc::c_int| {
+        // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that outlives the
+        // call. Both flag sets include `O_NOFOLLOW | O_CLOEXEC`, so the lock file cannot be a
+        // symlink and the fd cannot leak; the mode applies only to `O_CREAT`.
+        let fd =
+            unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, LOCK_FILE_MODE) };
+        if fd_failed(fd) {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `fd` is a live descriptor we exclusively own from a successful `openat`;
+            // `File` takes ownership and will close it.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    };
+    open(LOCK_FILE_OPEN_FLAGS)
+        .or_else(|error| match error.kind() {
+            io::ErrorKind::NotFound => open(LOCK_FILE_CREATE_FLAGS),
+            _ => Err(error),
+        })
+        .or_else(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists => open(LOCK_FILE_OPEN_FLAGS),
+            _ => Err(error),
+        })
+        .map_err(|error| {
+            io_error(
+                "open lifecycle lock without following symlinks",
+                path,
+                error,
+            )
+        })
+}
+
 fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
     let relative = path.strip_prefix(root).map_err(|_| {
         ApfsStorageError::Layout(super::super::StorageLayoutError::EscapesStoreRoot)
@@ -159,27 +204,7 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
         };
         let name = path_component(name, path)?;
         if components.peek().is_none() {
-            // SAFETY: `directory` owns a live directory fd; `name` is a `CString`
-            // that outlives the call. `LOCK_FILE_OPEN_FLAGS` includes `O_NOFOLLOW |
-            // O_CLOEXEC` so the lock file cannot be a symlink and the fd cannot leak.
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    LOCK_FILE_OPEN_FLAGS,
-                    LOCK_FILE_MODE,
-                )
-            };
-            if fd_failed(fd) {
-                return Err(io_error(
-                    "open lifecycle lock without following symlinks",
-                    path,
-                    io::Error::last_os_error(),
-                ));
-            }
-            // SAFETY: `fd` is a live descriptor we exclusively own from a successful
-            // `openat`; `File` takes ownership and will close it.
-            return Ok(unsafe { File::from_raw_fd(fd) });
+            return open_or_create_lock_at(&directory, &name, path);
         }
         // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that
         // outlives the call. `DIRECTORY_OPEN_FLAGS` includes `O_NOFOLLOW | O_DIRECTORY`.
@@ -6181,7 +6206,11 @@ mod tests {
         assert_eq!(DIRECTORY_OPEN_FLAGS, ROOT_OPEN_FLAGS);
         assert_eq!(
             LOCK_FILE_OPEN_FLAGS,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        );
+        assert_eq!(
+            LOCK_FILE_CREATE_FLAGS,
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL
         );
         assert_eq!(WAIT_LOCK_OPERATION, libc::LOCK_EX);
         assert_eq!(TRY_LOCK_OPERATION, libc::LOCK_EX | libc::LOCK_NB);
