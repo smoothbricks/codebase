@@ -165,11 +165,32 @@ impl BuildVolumeState {
             }
             Err(error) => return Err(record_error(&path, &error)),
         };
+        if wire.version != RECORD_VERSION {
+            return Err(unknown_version(&path, wire.version));
+        }
         let paths = wire
             .paths
             .iter()
-            .map(|path| path_from_wire(path))
+            .map(path_from_wire)
             .collect::<crate::Result<Vec<_>>>()?;
+        for (index, left) in paths.iter().enumerate() {
+            for right in &paths[index + 1..] {
+                let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+                if overlap(left.checkout.as_path(), right.checkout.as_path())
+                    || overlap(left.volume.as_path(), right.volume.as_path())
+                {
+                    return Err(crate::CowshedError::integrity(
+                        format!(
+                            "{} names overlapping build-state paths {} and {}",
+                            path.display(),
+                            left.checkout.as_path().display(),
+                            right.checkout.as_path().display()
+                        ),
+                        "cowshed doctor --json",
+                    ));
+                }
+            }
+        }
         Ok(Self { paths })
     }
 
@@ -283,7 +304,12 @@ impl BuildVolumeLayout {
 
     pub fn read_record(&self, id: &BuildVolumeId) -> crate::Result<BuildVolumeRecord> {
         let path = self.record(id);
-        read_json(&path).map_err(|error| record_error(&path, &error))
+        let record: BuildVolumeRecord =
+            read_json(&path).map_err(|error| record_error(&path, &error))?;
+        if record.version != RECORD_VERSION {
+            return Err(unknown_version(&path, record.version));
+        }
+        Ok(record)
     }
 
     pub fn write_record(
@@ -343,6 +369,16 @@ impl BuildVolumeLayout {
         seeds.sort_by(|left, right| left.1.created_at.cmp(&right.1.created_at));
         Ok(seeds.pop())
     }
+}
+
+fn unknown_version(path: &Path, version: u32) -> crate::CowshedError {
+    crate::CowshedError::integrity(
+        format!(
+            "{} is version {version}; this cowshed reads version {RECORD_VERSION}",
+            path.display()
+        ),
+        "run the cowshed that wrote it, or `cowshed doctor --json`",
+    )
 }
 
 fn record_error(path: &Path, error: &MetadataError) -> crate::CowshedError {

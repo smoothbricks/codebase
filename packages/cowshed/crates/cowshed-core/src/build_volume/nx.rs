@@ -20,7 +20,6 @@ const DAEMON_RECORD: &str = "server-process.json";
 pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
-const DAEMON_EXIT_POLL: Duration = Duration::from_millis(25);
 
 /// A process that holds a task database open.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,8 +65,8 @@ pub enum Busy {
         database: PathBuf,
         holders: Vec<Holder>,
     },
-    /// The daemon did not exit within its grace after `SIGTERM`.
-    DaemonStayed { pid: i32 },
+    /// The daemon did not exit within its hang guard after `SIGTERM`.
+    DaemonStayed { daemon: Holder },
 }
 
 impl std::fmt::Display for Busy {
@@ -83,20 +82,20 @@ impl std::fmt::Display for Busy {
                 }
                 Ok(())
             }
-            Self::DaemonStayed { pid } => write!(
+            Self::DaemonStayed { daemon } => write!(
                 formatter,
-                "the Nx daemon (pid {pid}) did not exit within {}s of SIGTERM",
+                "the Nx daemon {daemon} did not exit within {}s of SIGTERM",
                 DAEMON_EXIT_GRACE.as_secs()
             ),
         }
     }
 }
 
-/// Close the Nx state of the volume rooted at `volume`, through whichever checkout links it:
-/// when no process but the recorded daemon holds a task database open, stop that daemon the way
-/// `nx daemon --stop` does (`SIGTERM` to the pid its record names, `daemon/client/client.js`
-/// `stop`), wait for it to exit, and ask once more. Anything still holding a database is
-/// [`Busy`]; nothing is stopped then except a daemon already asked to.
+/// Close the Nx state of the volume rooted at `volume`: when no process but the checkout's live
+/// daemon holds a task database open, stop that daemon as stock `nx daemon --stop` does
+/// (`SIGTERM` to the pid its record names, `daemon/client/client.js` `stop`), wait for its exit,
+/// and ask once more. Any holder then is [`Busy`]; nothing is stopped except a daemon already
+/// asked to.
 #[cfg(target_os = "macos")]
 pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
     for data in state.nx_workspace_data() {
@@ -118,7 +117,12 @@ pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), B
         if let Some(pid) = daemon
             && !stop_daemon(pid)?
         {
-            return Ok(Err(Busy::DaemonStayed { pid }));
+            return Ok(Err(Busy::DaemonStayed {
+                daemon: Holder {
+                    pid,
+                    command: command_line(pid),
+                },
+            }));
         }
         for database in &databases {
             let holders = holders(database)?;
@@ -150,21 +154,54 @@ fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(databases)
 }
 
-/// The pid of the daemon `workspace-data`'s record names, when that daemon is live: its process
-/// runs and its socket accepts a connection, so the pid is not a recycled one.
+/// The pid of the daemon `workspace-data`'s record names, when that daemon is live, from the one
+/// read of the record that verified it: its process runs and its socket accepts a connection.
 #[cfg(target_os = "macos")]
 fn live_daemon(data: &Path) -> Option<i32> {
-    let record = data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD);
-    match crate::runtime::nx_daemon::probe(&record) {
-        crate::runtime::nx_daemon::Probe::Live => crate::runtime::nx_daemon::recorded_pid(&record),
-        _ => None,
-    }
+    crate::runtime::nx_daemon::live_pid(&data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD))
 }
 
-/// `SIGTERM` `pid` and wait for it to exit: `true` once it has, `false` when it outlived its
-/// grace. The daemon's own termination handler removes its socket.
+/// `SIGTERM` `pid` and wait for its exit on the kernel's exit event: `true` once it has exited,
+/// `false` when it outlived [`DAEMON_EXIT_GRACE`], which guards only against a hang. The
+/// daemon's own termination handler removes its socket and record.
 #[cfg(target_os = "macos")]
 fn stop_daemon(pid: i32) -> io::Result<bool> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `queue` is a fresh descriptor this function alone owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let exit = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    use std::os::fd::AsRawFd;
+    // Registered before the signal, so an exit between the two is never missed.
+    // SAFETY: one valid change, no events requested back.
+    if unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &exit,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            _ => Err(error),
+        };
+    }
     // SAFETY: `pid` is positive (a live daemon's), so it names one process and never a group.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         let error = io::Error::last_os_error();
@@ -173,17 +210,34 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
             _ => Err(error),
         };
     }
-    let started = std::time::Instant::now();
-    while started.elapsed() < DAEMON_EXIT_GRACE {
-        // SAFETY: signal 0 only checks existence.
-        if unsafe { libc::kill(pid, 0) } != 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
-            return Ok(true);
+    let timeout = libc::timespec {
+        tv_sec: DAEMON_EXIT_GRACE.as_secs() as libc::time_t,
+        tv_nsec: 0,
+    };
+    let mut event = exit;
+    loop {
+        // SAFETY: room for one event; `timeout` outlives the call.
+        let ready = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                &timeout,
+            )
+        };
+        match ready {
+            1 => return Ok(true),
+            0 => return Ok(false),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
         }
-        std::thread::sleep(DAEMON_EXIT_POLL);
     }
-    Ok(false)
 }
 
 /// Every process that has `path` open: one open-file query (`proc_listpidspath`), the kernel's
@@ -228,11 +282,10 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
             capacity *= 4;
             continue;
         }
-        let own = std::process::id() as libc::pid_t;
         return Ok(pids[..count]
             .iter()
             .copied()
-            .filter(|&pid| pid > 0 && pid != own)
+            .filter(|&pid| pid > 0)
             .map(|pid| Holder {
                 pid,
                 command: command_line(pid),
@@ -305,6 +358,14 @@ fn parse_procargs(buffer: &[u8]) -> Option<String> {
     (!arguments.is_empty()).then(|| arguments.join(" "))
 }
 
+/// The last Nx run recorded in a cache directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Run {
+    /// `nx <arguments>`, as Nx records its own command line.
+    pub command: String,
+    pub tasks: Vec<RunTask>,
+}
+
 /// One task of a run, as Nx's run summary records it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunTask {
@@ -326,7 +387,16 @@ pub enum CacheStatus {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunSummaryWire {
+    run: RunWire,
     tasks: Vec<RunTaskWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunWire {
+    command: String,
+    start_time: String,
+    end_time: String,
 }
 
 #[derive(Deserialize)]
@@ -340,22 +410,38 @@ struct RunTaskWire {
     status: i32,
 }
 
-/// The tasks of the last Nx run whose summary was written into `cache` at or after `since`, or
-/// `None` when no run has finished there since: the command ran no Nx, or another run's summary
-/// replaced it.
-pub fn run_since(cache: &Path, since: SystemTime) -> io::Result<Option<Vec<RunTask>>> {
+/// The last Nx run recorded in `cache` when that run began at or after `started` and ended by
+/// `ended` (Nx's own `run.startTime`/`run.endTime`), or `None` when none did: the command ran
+/// no Nx there, or a run outside the window wrote the summary last.
+pub fn run_within(cache: &Path, started: SystemTime, ended: SystemTime) -> io::Result<Option<Run>> {
     let path = cache.join(RUN_SUMMARY);
-    let modified = match fs::metadata(&path) {
-        Ok(metadata) => metadata.modified()?,
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if modified < since {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    let summary: RunSummaryWire = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+    let time = |value: &str| {
+        parse_utc_millis(value).ok_or_else(|| {
+            invalid(format!(
+                "{} records an unreadable time {value:?}",
+                path.display()
+            ))
+        })
+    };
+    let (run_started, run_ended) = (time(&summary.run.start_time)?, time(&summary.run.end_time)?);
+    // Nx stamps milliseconds; the window is widened to the millisecond it truncates to.
+    let floor = |at: SystemTime| {
+        at.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0)
+    };
+    if run_started < floor(started) || run_ended > floor(ended) + 1 {
         return Ok(None);
     }
-    let summary: RunSummaryWire = serde_json::from_slice(&fs::read(&path)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    summary
+    let tasks = summary
         .tasks
         .into_iter()
         .map(|task| {
@@ -364,10 +450,10 @@ pub fn run_since(cache: &Path, since: SystemTime) -> io::Result<Option<Vec<RunTa
                 "remote-cache-hit" => CacheStatus::RemoteHit,
                 "cache-miss" => CacheStatus::Miss,
                 other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} records unknown cache status {other:?}", path.display()),
-                    ));
+                    return Err(invalid(format!(
+                        "{} records unknown cache status {other:?}",
+                        path.display()
+                    )));
                 }
             };
             Ok(RunTask {
@@ -379,14 +465,48 @@ pub fn run_since(cache: &Path, since: SystemTime) -> io::Result<Option<Vec<RunTa
                 code: task.status,
             })
         })
-        .collect::<io::Result<Vec<_>>>()
-        .map(Some)
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(Some(Run {
+        command: summary.run.command,
+        tasks,
+    }))
+}
+
+/// Milliseconds since the epoch of `YYYY-MM-DDTHH:MM:SS.mmmZ`, as JavaScript's
+/// `Date.prototype.toISOString` writes it.
+fn parse_utc_millis(value: &str) -> Option<u128> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<u64>().ok();
+    let days = crate::storage::days_from_civil(number(0..4)?, number(5..7)?, number(8..10)?)?;
+    let (hour, minute, second, millis) = (
+        number(11..13)?,
+        number(14..16)?,
+        number(17..19)?,
+        number(20..23)?,
+    );
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(u128::from(seconds) * 1_000 + u128::from(millis))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
+    use crate::fork_lock::Spawn as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -406,29 +526,48 @@ mod tests {
         }
     }
 
+    fn summary(start: &str, end: &str) -> String {
+        format!(
+            r#"{{"run":{{"command":"nx run-many -t build","startTime":"{start}","endTime":"{end}","inner":false}},
+               "tasks":[
+                 {{"taskId":"a:build","target":"build","projectName":"a","hash":"1","startTime":"x","endTime":"y","params":"","cacheStatus":"local-cache-hit","status":0}},
+                 {{"taskId":"b:test","target":"test","projectName":"b","hash":"2","startTime":"x","endTime":"y","params":"","cacheStatus":"cache-miss","status":0}}]}}"#
+        )
+    }
+
+    fn at(millis: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
+    }
+
     #[test]
-    fn the_run_summary_is_read_only_when_written_since_the_check_began() {
+    fn the_run_summary_counts_only_when_its_own_run_lies_within_the_check() {
         let root = scratch("run");
-        let before = SystemTime::now() - Duration::from_secs(60);
-        assert_eq!(run_since(&root, before).unwrap(), None);
+        // 2026-10-03T16:19:43.794Z .. 16:19:44.292Z
+        let (start, end) = (1_791_044_383_794, 1_791_044_384_292);
+        assert_eq!(run_within(&root, at(0), at(u64::MAX / 2)).unwrap(), None);
         fs::write(
             root.join(RUN_SUMMARY),
-            r#"{"run":{"command":"nx run-many -t build","startTime":"x","endTime":"y","inner":false},
-               "tasks":[
-                 {"taskId":"a:build","target":"build","projectName":"a","hash":"1","startTime":"x","endTime":"y","params":"","cacheStatus":"local-cache-hit","status":0},
-                 {"taskId":"b:test","target":"test","projectName":"b","hash":"2","startTime":"x","endTime":"y","params":"","cacheStatus":"cache-miss","status":0}]}"#,
+            summary("2026-10-03T16:19:43.794Z", "2026-10-03T16:19:44.292Z"),
         )
         .unwrap();
-        let tasks = run_since(&root, before).unwrap().unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].cache, CacheStatus::LocalHit);
-        assert_eq!(tasks[1].cache, CacheStatus::Miss);
-        assert_eq!(tasks[1].task_id, "b:test");
+        let run = run_within(&root, at(start), at(end)).unwrap().unwrap();
+        assert_eq!(run.command, "nx run-many -t build");
+        assert_eq!(run.tasks.len(), 2);
+        assert_eq!(run.tasks[0].cache, CacheStatus::LocalHit);
+        assert_eq!(run.tasks[1].cache, CacheStatus::Miss);
+        assert_eq!(run.tasks[1].task_id, "b:test");
         assert_eq!(
-            run_since(&root, SystemTime::now() + Duration::from_secs(60)).unwrap(),
+            run_within(&root, at(start + 1), at(end)).unwrap(),
             None,
-            "a summary older than the check is another run's"
+            "a run that began before the check is another run"
         );
+        assert_eq!(
+            run_within(&root, at(start), at(end - 2)).unwrap(),
+            None,
+            "a run that ended after the check is another run"
+        );
+        fs::write(root.join(RUN_SUMMARY), summary("yesterday", "today")).unwrap();
+        assert!(run_within(&root, at(start), at(end)).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -471,7 +610,7 @@ mod tests {
             .arg("exec 3<\"$0\"; read _")
             .arg(&database)
             .stdin(std::process::Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
         let started = std::time::Instant::now();
@@ -494,6 +633,83 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert_eq!(close(&root, &state()).unwrap(), Ok(()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
+    /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
+    /// new one cleanly. If stock Nx ever needs more than the signal, this fails.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../node_modules/nx")
+            .canonicalize()
+            .expect("the repository's own Nx is installed");
+        let nx = package.join("dist/bin/nx.js");
+        let root = scratch("daemon");
+        let checkout = fs::canonicalize(&root).unwrap();
+        fs::write(
+            checkout.join("package.json"),
+            r#"{"name":"fixture","private":true}"#,
+        )
+        .unwrap();
+        fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":true}"#).unwrap();
+        fs::create_dir_all(checkout.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&package, checkout.join("node_modules/nx")).unwrap();
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
+        };
+        let daemon = |verb: &str| {
+            let mut command = std::process::Command::new("node");
+            command
+                .arg(&nx)
+                .args(["daemon", verb])
+                .current_dir(&checkout);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn_locked()
+                .and_then(std::process::Child::wait_with_output)
+                .expect("node runs");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "nx daemon {verb}: {text}");
+            text
+        };
+        let record = checkout.join(".nx/workspace-data/d/server-process.json");
+        daemon("--start");
+        let first = crate::runtime::nx_daemon::live_pid(&record).expect("a live daemon");
+        let socket = PathBuf::from(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&record).unwrap()).unwrap()
+                ["socketPath"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(socket.exists());
+        assert_eq!(close(&checkout, &state).unwrap(), Ok(()));
+        // SAFETY: signal 0 only checks existence.
+        assert_ne!(unsafe { libc::kill(first, 0) }, 0, "the daemon exited");
+        // The daemon's own shutdown ran: it removed its record and its socket, as after
+        // `nx daemon --stop`. A signal Nx did not handle would leave both behind.
+        assert!(!record.exists(), "the daemon removed its record");
+        assert!(!socket.exists(), "the daemon removed its socket");
+        let restarted = daemon("--start");
+        assert!(
+            !restarted.to_lowercase().contains("stale") && !restarted.contains("EADDRINUSE"),
+            "{restarted}"
+        );
+        let second = crate::runtime::nx_daemon::live_pid(&record).expect("a new live daemon");
+        assert_ne!(first, second);
+        assert_eq!(close(&checkout, &state).unwrap(), Ok(()));
         fs::remove_dir_all(&root).unwrap();
     }
 }

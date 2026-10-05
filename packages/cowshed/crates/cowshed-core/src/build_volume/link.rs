@@ -14,7 +14,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::capabilities::BuildStatePath;
@@ -22,9 +21,6 @@ use crate::error::{CowshedError, Result};
 
 /// The one name a checkout reaches its build volume through, relative to the checkout root.
 pub const BUILD_LINK: &str = ".cowshed/build";
-
-/// What a stray directory found where a build-state link belongs is renamed to, beside it.
-const DISPLACED_INFIX: &str = ".displaced-";
 
 /// The mountpoint `checkout`'s build link names, or `None` for a checkout never linked.
 pub fn linked(checkout: &Path) -> Result<Option<PathBuf>> {
@@ -74,44 +70,42 @@ pub fn point(checkout: &Path, mount: &Path) -> Result<()> {
 /// Make every build-state path of `checkout` the fixed relative link through its build link,
 /// with the directory it names present in the volume mounted at `volume`.
 ///
-/// A real directory where a build-state link belongs is honoured only in a checkout that is
-/// already linked: there a tool removed the link (`cargo clean` deletes `target` itself) and
-/// rebuilt into the source image, so that directory is rebuildable private state, displaced and
-/// removed in the background. In a checkout never linked it is the checkout's whole build
-/// history, which only the setup migration may move, so linking refuses it.
+/// The links are made once and never changed (16_build_volumes.md, "One link per checkout"): a
+/// path already holding its exact link is left alone, an absent one is created, and anything
+/// else there — a real directory (a checkout's own build state, or what a tool rebuilt after
+/// removing the link), a file, a link aimed elsewhere — refuses before anything changes, naming
+/// the path. Cowshed never moves or deletes build state to make a link fit.
 pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> Result<()> {
-    let linked = linked(checkout)?.is_some();
+    let mut missing = Vec::new();
     for state in paths {
         let path = state.checkout.as_path();
         let (parent, name) = contained_parent(checkout, path)
             .map_err(|error| link_error(&checkout.join(path), &error))?;
         let at = parent.join(name);
-        if !linked
-            && let Ok(metadata) = fs::symlink_metadata(&at)
-            && !metadata.file_type().is_symlink()
-        {
-            return Err(CowshedError::integrity(
-                format!(
-                    "{} holds the checkout's own build state and no build volume is linked yet",
-                    at.display()
-                ),
-                "run `cowshed setup`, which moves a checkout's build state into its first build volume",
-            ));
+        let target = relative_target(path, state.volume.as_path());
+        match fs::symlink_metadata(&at) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push((at, target)),
+            Err(error) => return Err(link_error(&at, &error)),
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && fs::read_link(&at).map_err(|error| link_error(&at, &error))? == target => {}
+            Ok(_) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "{} is where the build-state link to {} belongs, but something else is there",
+                        at.display(),
+                        target.display()
+                    ),
+                    "move it aside (a checkout's first build state is moved by `cowshed setup`; a \
+                     directory a tool made after removing the link is rebuildable) and retry",
+                ));
+            }
         }
         let directory = volume.join(state.volume.as_path());
         fs::create_dir_all(&directory).map_err(|error| link_error(&directory, &error))?;
     }
-    for state in paths {
-        let path = state.checkout.as_path();
-        let (parent, name) = contained_parent(checkout, path)
-            .map_err(|error| link_error(&checkout.join(path), &error))?;
-        remove_displaced(&parent, name);
-        through_build_link(
-            &parent,
-            name,
-            &relative_target(path, state.volume.as_path()),
-        )
-        .map_err(|error| link_error(&parent.join(name), &error))?;
+    for (at, target) in missing {
+        std::os::unix::fs::symlink(&target, &at).map_err(|error| link_error(&at, &error))?;
     }
     Ok(())
 }
@@ -162,67 +156,6 @@ fn contained_parent<'a>(checkout: &Path, relative: &'a Path) -> io::Result<(Path
         }
     }
     Ok((parent, name))
-}
-
-/// `parent/name` becomes the symlink to `target`: created, left, retargeted, or put in place of
-/// a stray directory, which is renamed aside in one step and removed in the background.
-fn through_build_link(parent: &Path, name: &OsStr, target: &Path) -> io::Result<()> {
-    let path = parent.join(name);
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::os::unix::fs::symlink(target, &path)
-        }
-        Err(error) => Err(error),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if fs::read_link(&path)? == target {
-                return Ok(());
-            }
-            let staged = parent.join(sibling(name, ".next-", &unique()));
-            std::os::unix::fs::symlink(target, &staged)?;
-            fs::rename(&staged, &path)
-        }
-        Ok(metadata) if metadata.is_dir() => {
-            let displaced = parent.join(sibling(name, DISPLACED_INFIX, &unique()));
-            fs::rename(&path, &displaced)?;
-            std::os::unix::fs::symlink(target, &path)?;
-            remove_in_background(displaced);
-            Ok(())
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} is a file where a build-state link belongs",
-                path.display()
-            ),
-        )),
-    }
-}
-
-/// Finish removing the directories an earlier link displaced beside `name`.
-fn remove_displaced(parent: &Path, name: &OsStr) {
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    let mut prefix = name.as_bytes().to_vec();
-    prefix.extend_from_slice(DISPLACED_INFIX.as_bytes());
-    for entry in entries.flatten() {
-        if entry.file_name().as_bytes().starts_with(&prefix) {
-            remove_in_background(entry.path());
-        }
-    }
-}
-
-fn remove_in_background(directory: PathBuf) {
-    std::thread::spawn(move || {
-        if let Err(error) = fs::remove_dir_all(&directory)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            eprintln!(
-                "cowshed: cannot remove displaced build state {}: {error}; the next link retries it",
-                directory.display()
-            );
-        }
-    });
 }
 
 fn sibling(name: &OsStr, infix: &str, suffix: &str) -> OsString {
@@ -344,35 +277,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unlinked_checkout_with_its_own_build_state_is_refused() {
-        let scratch = Scratch::new("unlinked");
+    fn build_state_already_at_a_link_path_is_refused_and_left_untouched() {
+        let scratch = Scratch::new("occupied");
         let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        // A checkout's own build state before the migration moved it.
         fs::create_dir_all(checkout.join("target/debug")).unwrap();
-        let error = link_paths(&checkout, &scratch.volume("volume-a"), &paths()).unwrap_err();
-        assert!(
-            error.message.contains("no build volume is linked yet"),
-            "{error}"
-        );
+        let error = link_paths(&checkout, &volume, &paths()).unwrap_err();
+        assert!(error.message.contains("something else is there"), "{error}");
         assert!(
             checkout.join("target/debug").is_dir(),
             "the build state is untouched"
         );
-    }
-
-    #[test]
-    fn a_linked_checkout_displaces_a_directory_a_tool_put_in_place_of_its_link() {
-        let scratch = Scratch::new("displace");
-        let checkout = scratch.checkout();
-        let volume = scratch.volume("volume-a");
+        assert!(
+            !checkout.join(".nx").exists(),
+            "nothing was linked before the refusal"
+        );
+        // `cargo clean` removed the link and the next build made a real directory there.
+        fs::remove_dir_all(checkout.join("target")).unwrap();
         point(&checkout, &volume).unwrap();
         link_paths(&checkout, &volume, &paths()).unwrap();
-        // `cargo clean` removes the link; the next build makes a real directory there.
         fs::remove_file(checkout.join("target")).unwrap();
         fs::create_dir_all(checkout.join("target/debug")).unwrap();
-        link_paths(&checkout, &volume, &paths()).unwrap();
+        assert!(link_paths(&checkout, &volume, &paths()).is_err());
+        assert!(checkout.join("target/debug").is_dir());
+        // A link aimed elsewhere is never retargeted either.
+        fs::remove_dir_all(checkout.join("target")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", checkout.join("target")).unwrap();
+        assert!(link_paths(&checkout, &volume, &paths()).is_err());
         assert_eq!(
             fs::read_link(checkout.join("target")).unwrap(),
-            Path::new(".cowshed/build/target")
+            Path::new("elsewhere")
         );
     }
 

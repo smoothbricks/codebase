@@ -75,37 +75,43 @@ struct Record {
 /// Whether the daemon `record` names is live: the process it records runs and its socket accepts
 /// a connection. The connection is closed unused, as Nx's own availability probe closes it.
 pub(crate) fn probe(record: &Path) -> Probe {
-    let bytes = match std::fs::read(record) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Probe::Unrecorded,
-        Err(_) => return Probe::Unreadable,
-    };
-    let Ok(recorded) = serde_json::from_slice::<Record>(&bytes) else {
-        return Probe::Unreadable;
-    };
-    // `kill` reads a pid of 0, or one past `pid_t`, as a process group: never one process.
-    let Ok(pid @ 1..) = libc::pid_t::try_from(recorded.process_id) else {
-        return Probe::Unreadable;
-    };
-    // A relative path would be resolved against this process's directory, not the daemon's.
-    if !recorded.socket_path.is_absolute() {
-        return Probe::Unreadable;
-    }
-    if !running(pid) {
-        return Probe::Dead;
-    }
-    match UnixStream::connect(&recorded.socket_path) {
-        Ok(_) => Probe::Live,
-        Err(_) => Probe::Refused,
+    read_and_probe(record).0
+}
+
+/// The pid of the daemon `record` names when that daemon is live, taken from the same read of
+/// the record that verified it: a record rewritten between a check and a signal can never aim
+/// the signal at another process.
+pub(crate) fn live_pid(record: &Path) -> Option<libc::pid_t> {
+    match read_and_probe(record) {
+        (Probe::Live, pid) => pid,
+        _ => None,
     }
 }
 
-/// The positive pid `record` names, or `None` for a record absent or not as Nx writes it.
-pub(crate) fn recorded_pid(record: &Path) -> Option<libc::pid_t> {
-    let recorded = serde_json::from_slice::<Record>(&std::fs::read(record).ok()?).ok()?;
-    libc::pid_t::try_from(recorded.process_id)
-        .ok()
-        .filter(|pid| *pid > 0)
+fn read_and_probe(record: &Path) -> (Probe, Option<libc::pid_t>) {
+    let bytes = match std::fs::read(record) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Probe::Unrecorded, None),
+        Err(_) => return (Probe::Unreadable, None),
+    };
+    let Ok(recorded) = serde_json::from_slice::<Record>(&bytes) else {
+        return (Probe::Unreadable, None);
+    };
+    // `kill` reads a pid of 0, or one past `pid_t`, as a process group: never one process.
+    let Ok(pid @ 1..) = libc::pid_t::try_from(recorded.process_id) else {
+        return (Probe::Unreadable, None);
+    };
+    // A relative path would be resolved against this process's directory, not the daemon's.
+    if !recorded.socket_path.is_absolute() {
+        return (Probe::Unreadable, None);
+    }
+    if !running(pid) {
+        return (Probe::Dead, None);
+    }
+    match UnixStream::connect(&recorded.socket_path) {
+        Ok(_) => (Probe::Live, Some(pid)),
+        Err(_) => (Probe::Refused, None),
+    }
 }
 
 /// Whether the process `pid` exists, by the null signal: nothing is delivered.
