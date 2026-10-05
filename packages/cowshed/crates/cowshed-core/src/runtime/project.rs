@@ -9296,6 +9296,40 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 failed.hint,
             )
         })?;
+        // Each 2b miss is a durable finding (13_telemetry.md, `landAdoption`), from the same
+        // value the report carries.
+        if let crate::api::dto::Adoption::Adopted { check, .. } = &build_volume.adoption
+            && !check.misses.is_empty()
+        {
+            use super::supervisor::{CommitmentDraft, CommitmentSink};
+            let landing_incarnation = self
+                .current(&workspace)
+                .await?
+                .derived
+                .workspace
+                .incarnation()
+                .clone();
+            let target_incarnation = self
+                .current(&into.name)
+                .await?
+                .derived
+                .workspace
+                .incarnation()
+                .clone();
+            for miss in &check.misses {
+                self.commitments
+                    .record(CommitmentDraft::LandAdoption {
+                        repo_id: self.descriptor.repo_id.clone(),
+                        landing_incarnation: landing_incarnation.clone(),
+                        target_incarnation: target_incarnation.clone(),
+                        landed_head: source_head.clone(),
+                        task: miss.task.clone(),
+                        task_hash: miss.hash.clone(),
+                        inputs_digest: miss.inputs_digest,
+                    })
+                    .await?;
+            }
+        }
         if retire {
             // The target has already moved, so a refused retire must not read as a refused land:
             // the retry its hint names would land nothing. Containment is measured against the

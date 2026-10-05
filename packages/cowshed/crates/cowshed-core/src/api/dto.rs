@@ -1398,6 +1398,28 @@ pub struct RestoreCommitment {
     pub destination_incarnation: WorkspaceIncarnation,
 }
 
+/// One Nx task that missed the cache when a land re-ran its check in the target on the adopted
+/// build volume (16_build_volumes.md, Land step 7): a defect in the project's build
+/// configuration, recorded once per miss so a coordinator can turn each into fix work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandAdoptionCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    /// The workspace that landed; its build volume is now the target's.
+    pub landing_incarnation: WorkspaceIncarnation,
+    pub target_incarnation: WorkspaceIncarnation,
+    pub landed_head: GitOid,
+    /// The Nx task id (`project:target`, or `project:target:configuration`).
+    pub task: String,
+    /// The task hash Nx computed in the target.
+    pub task_hash: String,
+    /// The digest of the task's hash inputs as `nx show target inputs` named them; the land
+    /// report carries the inputs themselves.
+    pub inputs_digest: Sha256Digest,
+}
+
 /// Versioned controller-owned existence, lifecycle, order, and lineage evidence.
 ///
 /// Protected payload bytes and artifact paths deliberately do not appear in any variant.
@@ -1410,6 +1432,7 @@ pub enum ControllerCommitment {
     Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
+    LandAdoption(LandAdoptionCommitment),
 }
 
 impl ControllerCommitment {
@@ -1422,6 +1445,7 @@ impl ControllerCommitment {
             Self::Checkpoint(value) => value.version,
             Self::Fork(value) => value.version,
             Self::Restore(value) => value.version,
+            Self::LandAdoption(value) => value.version,
         }
     }
 
@@ -1434,6 +1458,7 @@ impl ControllerCommitment {
             Self::Checkpoint(value) => value.order,
             Self::Fork(value) => value.order,
             Self::Restore(value) => value.order,
+            Self::LandAdoption(value) => value.order,
         }
     }
 
@@ -1446,6 +1471,7 @@ impl ControllerCommitment {
             Self::Checkpoint(value) => &value.repo_id,
             Self::Fork(value) => &value.repo_id,
             Self::Restore(value) => &value.repo_id,
+            Self::LandAdoption(value) => &value.repo_id,
         }
     }
 
@@ -1509,6 +1535,16 @@ impl ControllerCommitment {
                     "restore replaced and destination incarnations must differ",
                 ))
             }
+            Self::LandAdoption(value) if value.landing_incarnation == value.target_incarnation => {
+                Err(DtoError::InvalidJobProjection(
+                    "land adoption landing and target incarnations must differ",
+                ))
+            }
+            Self::LandAdoption(value) if value.task.is_empty() || value.task_hash.is_empty() => {
+                Err(DtoError::InvalidJobProjection(
+                    "land adoption task and hash must be named",
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -1531,6 +1567,7 @@ enum ControllerCommitmentRef<'a> {
     Checkpoint(&'a CheckpointCommitment),
     Fork(&'a ForkCommitment),
     Restore(&'a RestoreCommitment),
+    LandAdoption(&'a LandAdoptionCommitment),
 }
 
 #[derive(Deserialize)]
@@ -1543,6 +1580,7 @@ enum ControllerCommitmentWire {
     Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
+    LandAdoption(LandAdoptionCommitment),
 }
 
 impl Serialize for ControllerCommitment {
@@ -1559,6 +1597,7 @@ impl Serialize for ControllerCommitment {
             Self::Checkpoint(value) => ControllerCommitmentRef::Checkpoint(value),
             Self::Fork(value) => ControllerCommitmentRef::Fork(value),
             Self::Restore(value) => ControllerCommitmentRef::Restore(value),
+            Self::LandAdoption(value) => ControllerCommitmentRef::LandAdoption(value),
         }
         .serialize(serializer)
     }
@@ -1579,6 +1618,7 @@ impl<'de> Deserialize<'de> for ControllerCommitment {
             ControllerCommitmentWire::Checkpoint(value) => Self::Checkpoint(value),
             ControllerCommitmentWire::Fork(value) => Self::Fork(value),
             ControllerCommitmentWire::Restore(value) => Self::Restore(value),
+            ControllerCommitmentWire::LandAdoption(value) => Self::LandAdoption(value),
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)

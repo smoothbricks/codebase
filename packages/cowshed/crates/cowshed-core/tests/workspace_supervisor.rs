@@ -328,6 +328,7 @@ impl CommitmentSink for FakeCommitments {
                 ControllerCommitment::Checkpoint(_) => "checkpoint",
                 ControllerCommitment::Fork(_) => "fork",
                 ControllerCommitment::Restore(_) => "restore",
+                ControllerCommitment::LandAdoption(_) => "land-adoption",
             }))
             .expect("order observer");
         self.observations

@@ -22,11 +22,11 @@ use thiserror::Error;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
-    DtoError, ExecCommand, ExitStatus, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES,
-    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
-    TerminalCommitment, WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
-    validate_command_argv,
+    DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId, JobState,
+    LandAdoptionCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES,
+    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
+    RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIntroducedCommitment,
+    WorkspacePath, WorkspaceRetiredCommitment, validate_command_argv,
 };
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
@@ -4121,9 +4121,24 @@ fn parse_state(value: &str) -> Result<JobState, ArtifactError> {
 }
 
 /// The controller commitment schema is compared against every decoded segment during replay, so
-/// it is built once rather than allocating twenty-three fields per comparison.
+/// it is built once rather than allocating twenty-seven fields per comparison.
 pub fn controller_commitment_schema() -> Arc<Schema> {
     static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(build_controller_commitment_schema);
+    Arc::clone(&SCHEMA)
+}
+
+/// The columns segments sealed before `landAdoption` existed carry: the current schema's first
+/// twenty-three. Every earlier variant reads the same from them, since the later columns are
+/// `landAdoption`'s alone and null for every other kind.
+const SEGMENT_COLUMNS_BEFORE_LAND_ADOPTION: usize = 23;
+
+fn controller_commitment_schema_before_land_adoption() -> Arc<Schema> {
+    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+        Arc::new(Schema::new(
+            controller_commitment_schema().fields()[..SEGMENT_COLUMNS_BEFORE_LAND_ADOPTION]
+                .to_vec(),
+        ))
+    });
     Arc::clone(&SCHEMA)
 }
 
@@ -4152,6 +4167,10 @@ fn build_controller_commitment_schema() -> Arc<Schema> {
         field("output_limit_bytes", DataType::UInt64, true),
         field("output_crossing_bytes", DataType::UInt64, true),
         field("replaced_incarnation", DataType::Utf8, true),
+        field("landed_head", DataType::Utf8, true),
+        field("task", DataType::Utf8, true),
+        field("task_hash", DataType::Utf8, true),
+        field("inputs_digest", DataType::Binary, true),
     ]))
 }
 
@@ -4179,6 +4198,10 @@ struct ControllerFlatRow<'a> {
     destination_incarnation: Option<&'a str>,
     source_checkpoint: Option<&'a str>,
     replaced_incarnation: Option<&'a str>,
+    landed_head: Option<&'a str>,
+    task: Option<&'a str>,
+    task_hash: Option<&'a str>,
+    inputs_digest: Option<&'a [u8]>,
 }
 
 fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
@@ -4206,6 +4229,10 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         destination_incarnation: None,
         source_checkpoint: None,
         replaced_incarnation: None,
+        landed_head: None,
+        task: None,
+        task_hash: None,
+        inputs_digest: None,
     };
     match value {
         ControllerCommitment::WorkspaceIntroduced(value) => {
@@ -4257,6 +4284,15 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
             row.replaced_incarnation = Some(value.replaced_incarnation.as_str());
             row.destination_incarnation = Some(value.destination_incarnation.as_str());
             row.source_checkpoint = Some(&value.source_checkpoint);
+        }
+        ControllerCommitment::LandAdoption(value) => {
+            row.kind = "landAdoption";
+            row.source_incarnation = Some(value.landing_incarnation.as_str());
+            row.destination_incarnation = Some(value.target_incarnation.as_str());
+            row.landed_head = Some(value.landed_head.as_str());
+            row.task = Some(&value.task);
+            row.task_hash = Some(&value.task_hash);
+            row.inputs_digest = Some(value.inputs_digest.as_bytes());
         }
     }
     row
@@ -4359,6 +4395,18 @@ pub fn controller_commitments_to_batch(
                 .map(|row| row.replaced_incarnation)
                 .collect::<Vec<_>>(),
         )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.landed_head).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.task).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.task_hash).collect::<Vec<_>>(),
+        )),
+        Arc::new(BinaryArray::from(
+            rows.iter().map(|row| row.inputs_digest).collect::<Vec<_>>(),
+        )),
     ];
     RecordBatch::try_new(controller_commitment_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -4408,7 +4456,10 @@ pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment
 pub fn decode_controller_commitments(
     batch: &RecordBatch,
 ) -> Result<Vec<ControllerCommitment>, ArtifactError> {
-    if batch.schema() != controller_commitment_schema() {
+    let schema = batch.schema();
+    if schema != controller_commitment_schema()
+        && schema != controller_commitment_schema_before_land_adoption()
+    {
         return Err(ArtifactError::Arrow(
             "controller commitment schema mismatch".into(),
         ));
@@ -4518,6 +4569,25 @@ pub fn decode_controller_commitments(
                     source_incarnation: required_incarnation(batch, 17, row)?,
                     replaced_incarnation: required_incarnation(batch, 22, row)?,
                     destination_incarnation: required_incarnation(batch, 18, row)?,
+                })
+            }
+            "landAdoption" => {
+                if batch.num_columns() == SEGMENT_COLUMNS_BEFORE_LAND_ADOPTION {
+                    return Err(ArtifactError::Arrow(
+                        "a landAdoption commitment in a segment without its columns".into(),
+                    ));
+                }
+                require_variant_columns(batch, row, &[17, 18, 23, 24, 25, 26])?;
+                ControllerCommitment::LandAdoption(LandAdoptionCommitment {
+                    version,
+                    order,
+                    repo_id,
+                    landing_incarnation: required_incarnation(batch, 17, row)?,
+                    target_incarnation: required_incarnation(batch, 18, row)?,
+                    landed_head: GitOid::new(required_string(batch, 23, row)?)?,
+                    task: required_string(batch, 24, row)?.to_owned(),
+                    task_hash: required_string(batch, 25, row)?.to_owned(),
+                    inputs_digest: required_digest(batch, 26, row)?,
                 })
             }
             _ => {

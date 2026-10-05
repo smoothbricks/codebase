@@ -10,17 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow_schema::DataType;
 use cowshed_core::api::{
     AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, CommandArg,
-    ControllerCommitment, DtoError, JobId, JobState, MAX_COMMAND_ARG_BYTES,
-    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, ProtectedOutput,
-    PublicationPolicy, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIncarnation,
-    WorkspacePath,
+    ControllerCommitment, DtoError, GitOid, JobId, JobState, LandAdoptionCommitment,
+    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
+    TerminalCommitment, WorkspaceIncarnation, WorkspacePath,
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, OutputTargets, ProtectedRecord,
     PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
-    controller_commitments_to_batch, decode_controller_commitments, open_stream_reader,
-    protected_record_schema, read_stream, recover_records, recover_records_with_budget,
+    controller_commitments_to_batch, decode_controller_commitment, decode_controller_commitments,
+    encode_controller_commitment, open_stream_reader, protected_record_schema, read_stream,
+    recover_records, recover_records_with_budget,
 };
 use proptest::prelude::*;
 
@@ -733,6 +734,60 @@ fn controller_commitment_arrow_is_payload_free_and_round_trips_lineage() {
             "controller JSON leaked {forbidden}"
         );
     }
+}
+
+/// A land's 2b miss is one `landAdoption` row that round-trips every field; segments sealed
+/// before the variant existed (the first twenty-three columns) still decode every earlier kind,
+/// and a `landAdoption` row cannot hide in one.
+#[test]
+fn land_adoption_commitments_round_trip_and_earlier_segments_still_read() {
+    let repo_id = RepoId::parse("acme/widget").unwrap();
+    let miss = ControllerCommitment::LandAdoption(LandAdoptionCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 2,
+        repo_id: repo_id.clone(),
+        landing_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+        target_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap(),
+        landed_head: GitOid::new("1111111111111111111111111111111111111111").unwrap(),
+        task: "widget:build".to_owned(),
+        task_hash: "1234567890".to_owned(),
+        inputs_digest: Sha256Digest::compute(b"inputs"),
+    });
+    let admission = ControllerCommitment::Admission(AdmissionCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 1,
+        repo_id,
+        workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+            .unwrap(),
+        job_id: JobId::new(2).unwrap(),
+        grant_revision: 7,
+    });
+    let values = vec![admission.clone(), miss.clone()];
+    let batch = controller_commitments_to_batch(&values).unwrap();
+    assert_eq!(decode_controller_commitments(&batch).unwrap(), values);
+    let bytes = encode_controller_commitment(&miss).unwrap();
+    assert_eq!(decode_controller_commitment(&bytes).unwrap(), miss);
+
+    let earlier: Vec<usize> = (0..23).collect();
+    let sealed_before = controller_commitments_to_batch(std::slice::from_ref(&admission))
+        .unwrap()
+        .project(&earlier)
+        .unwrap();
+    assert_eq!(
+        decode_controller_commitments(&sealed_before).unwrap(),
+        [admission]
+    );
+    let hidden = batch.project(&earlier).unwrap();
+    assert!(decode_controller_commitments(&hidden).is_err());
+
+    let ControllerCommitment::LandAdoption(mut same) = miss else {
+        unreachable!()
+    };
+    same.target_incarnation = same.landing_incarnation.clone();
+    assert!(
+        controller_commitments_to_batch(&[ControllerCommitment::LandAdoption(same)]).is_err(),
+        "a workspace never lands into itself"
+    );
 }
 
 #[test]

@@ -31,8 +31,9 @@ use uuid::Uuid;
 
 use crate::api::dto::{
     AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment, ControllerCommitment,
-    ForkCommitment, JobId, JobState, OutputLimitInfo, RestoreCommitment, Sha256Digest,
-    TerminalCommitment, WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
+    ForkCommitment, GitOid, JobId, JobState, LandAdoptionCommitment, OutputLimitInfo,
+    RestoreCommitment, Sha256Digest, TerminalCommitment, WorkspaceIntroducedCommitment,
+    WorkspaceRetiredCommitment,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
@@ -53,7 +54,8 @@ fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
         | ControllerCommitment::WorkspaceRetired(_)
         | ControllerCommitment::Checkpoint(_)
         | ControllerCommitment::Fork(_)
-        | ControllerCommitment::Restore(_) => Durability::PowerLoss,
+        | ControllerCommitment::Restore(_)
+        | ControllerCommitment::LandAdoption(_) => Durability::PowerLoss,
     }
 }
 
@@ -114,6 +116,15 @@ pub enum CommitmentDraft {
         source_incarnation: WorkspaceIncarnation,
         replaced_incarnation: WorkspaceIncarnation,
         destination_incarnation: WorkspaceIncarnation,
+    },
+    LandAdoption {
+        repo_id: RepoId,
+        landing_incarnation: WorkspaceIncarnation,
+        target_incarnation: WorkspaceIncarnation,
+        landed_head: GitOid,
+        task: String,
+        task_hash: String,
+        inputs_digest: Sha256Digest,
     },
 }
 
@@ -218,6 +229,25 @@ impl CommitmentDraft {
                 source_incarnation,
                 replaced_incarnation,
                 destination_incarnation,
+            }),
+            Self::LandAdoption {
+                repo_id,
+                landing_incarnation,
+                target_incarnation,
+                landed_head,
+                task,
+                task_hash,
+                inputs_digest,
+            } => ControllerCommitment::LandAdoption(LandAdoptionCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order,
+                repo_id,
+                landing_incarnation,
+                target_incarnation,
+                landed_head,
+                task,
+                task_hash,
+                inputs_digest,
             }),
         }
     }
