@@ -175,9 +175,10 @@ fn process_is_gone(pid: i32) -> bool {
 }
 
 /// Select images by the backing path the kernel's I/O Registry holds, then let the production
-/// host reread and release their exact attachment identities under its lease/pin/native-unmount
+/// host reread and release every attachment of each one under its lease/pin/native-unmount
 /// protocol. Never act on cached diskN, and never select from `hdiutil info`, which omits attached
-/// images while another image attaches or detaches.
+/// images while another image attaches or detaches. A path the kernel holds twice is one image
+/// with two attachments: it is released once, both detached, never refused as ambiguous.
 fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
     let attached = SystemCommandRunner.attached_disk_images()?;
     let root = Path::new("/private/tmp");
@@ -185,13 +186,14 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
         MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(root, root))
             .map_err(std::io::Error::other)?;
     let mut first_error = None;
-    for image in attached
+    let images = attached
         .iter()
         .filter_map(|attached| match &attached.source {
             DiskImageSource::File(path) => Some(path.as_path()),
             DiskImageSource::Url(_) => None,
         })
-    {
+        .collect::<std::collections::BTreeSet<_>>();
+    for image in images {
         if select(image)
             && let Err(error) = host.detach_existing_image(image, DetachIntent::Release)
         {

@@ -868,6 +868,15 @@ pub(crate) enum RecoveredImageAttachment {
     Apfs(AttachedImage),
 }
 
+impl RecoveredImageAttachment {
+    pub(crate) fn whole_device(&self) -> &str {
+        match self {
+            Self::Unformatted { whole_device, .. } => whole_device,
+            Self::Apfs(attachment) => &attachment.whole_device,
+        }
+    }
+}
+
 /// What backs an attached disk image, as the image driver registered it with the kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiskImageSource {
@@ -1388,19 +1397,28 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(pin)
     }
 
+    /// Whether `attachment`'s devices are still one of its image's attachments. Membership, not
+    /// uniqueness: a path the kernel holds twice (a dead process's attach landing on a file that
+    /// was replaced under it) still owns each of its devices, and releasing them one by one has to
+    /// get past this check.
     fn require_attached_mapping(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
-        let actual = self.existing_attachment(&attachment.image)?;
-        if actual.as_ref().is_some_and(|held| {
-            held.whole_device == attachment.whole_device
-                && held.volume_device == attachment.volume_device
+        let actual = self.recovered_image_attachments(&attachment.image)?;
+        if actual.iter().any(|held| {
+            matches!(held, RecoveredImageAttachment::Apfs(held)
+                if held.whole_device == attachment.whole_device
+                    && held.volume_device == attachment.volume_device)
         }) {
             Ok(())
         } else {
             Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} no longer owns {} / {} (holds {actual:?}); refusing a reused device",
+                "{} no longer owns {} / {} (holds {:?}); refusing a reused device",
                 attachment.image.display(),
                 attachment.whole_device,
-                attachment.volume_device
+                attachment.volume_device,
+                actual
+                    .iter()
+                    .map(RecoveredImageAttachment::whole_device)
+                    .collect::<Vec<_>>()
             )))
         }
     }
@@ -1618,7 +1636,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         path: &Path,
         request: &CreateImageRequest,
     ) -> Result<String, ApfsError> {
-        let attached_before = self.attached_whole_devices(path)?;
+        let attached_before = self.refuse_second_attach(path)?;
 
         let attach = CommandRequest::new(
             DISKUTIL,
@@ -1645,15 +1663,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 return Err(self.failed_asif_attachment(path, &attached_before, primary));
             }
         };
-        if attached_before.contains(&whole_device) {
-            return Err(self.failed_attachment(
-                path,
-                &attached_before,
-                ApfsError::InvalidAttachmentPlist(
-                    "attach reported a pre-existing whole image device".into(),
-                ),
-            ));
-        }
         self.require_blank_attachment(path, &whole_device)?;
         let format = CommandRequest::new(
             NEWFS_APFS,
@@ -1783,25 +1792,62 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         existing_image_attachment(&image, &self.attached_disk_images()?)
     }
 
-    pub(crate) fn detach_unformatted_image(
+    /// Every attachment the kernel holds for `image`, however many: what a release has to undo.
+    pub(crate) fn recovered_image_attachments(
         &self,
         image: &Path,
-        whole_device: &str,
+    ) -> Result<Vec<RecoveredImageAttachment>, ApfsError> {
+        validate_image_path(image)?;
+        let image = attachment_inventory_path(image)?;
+        image_attachments(&image, &self.attached_disk_images()?)
+    }
+
+    /// The backing file of every attached disk image, each once, by the path its attach was
+    /// handed. A file deleted since is still listed: the kernel keeps the path it registered.
+    pub(crate) fn attached_image_files(&self) -> Result<BTreeSet<PathBuf>, ApfsError> {
+        Ok(self
+            .attached_disk_images()?
+            .into_iter()
+            .filter_map(|attached| match attached.source {
+                DiskImageSource::File(path) => Some(path),
+                DiskImageSource::Url(_) => None,
+            })
+            .collect())
+    }
+
+    /// Detach every attachment the kernel holds for `image`, under its lease, each by the whole
+    /// device that attachment is detached through, re-reading the image's own mapping before
+    /// each one. A path held twice is released twice; a path held by nothing is already
+    /// released. One attachment is one detach: an APFS attachment shows two whole devices (the
+    /// image's and its synthesized container), and detaching one takes both. Nothing here
+    /// unmounts first: a mounted volume's caller unmounts it ([`Self::unmount_verified`]), and an
+    /// unmounted one, such as a template's staging image, has nothing to unmount.
+    pub(crate) fn release_every_attachment(
+        &self,
+        image: &Path,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let _lease = self.image_lease(image)?;
-        match self.recovered_image_attachment(image)? {
-            None => Ok(()),
-            Some(RecoveredImageAttachment::Unformatted {
-                whole_device: current,
-                ..
-            }) if current == whole_device => {
-                self.detach_image_device_unlocked(image, whole_device, intent)
-            }
-            Some(_) => Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} no longer has the observed unformatted attachment {whole_device}; retaining the image",
-                image.display(),
-            ))),
+        for attachment in self.recovered_image_attachments(image)? {
+            self.detach_image_device_unlocked(image, attachment.whole_device(), intent)?;
+        }
+        Ok(())
+    }
+
+    /// The devices `image` holds before an attach, which must be none. The image driver refuses
+    /// a second attach of one file, but not of a new file at the same path: once the file a live
+    /// attachment registered is replaced, attaching the path again gives it two attachments, and
+    /// every later lookup of that path (`matching image has multiple inventory entries`) refuses
+    /// until both are detached by hand. A path already held is refused before anything attaches.
+    fn refuse_second_attach(&self, image: &Path) -> Result<BTreeSet<String>, ApfsError> {
+        let held = self.attached_whole_devices(image)?;
+        if held.is_empty() {
+            Ok(held)
+        } else {
+            Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} is already attached as {held:?}; refusing to attach it a second time",
+                image.display()
+            )))
         }
     }
 
@@ -1809,7 +1855,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// reports ([`attached_apfs_volume`]). No Disk Arbitration query follows the attach.
     fn attach_without_mounting(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
         validate_image_path(image)?;
-        let attached_before = self.attached_whole_devices(image)?;
+        let attached_before = self.refuse_second_attach(image)?;
         let request = CommandRequest::new(
             DISKUTIL,
             [
@@ -1833,15 +1879,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 return Err(self.failed_attachment(image, &attached_before, primary));
             }
         };
-        if attached_before.contains(&whole_device) {
-            return Err(self.failed_attachment(
-                image,
-                &attached_before,
-                ApfsError::InvalidAttachmentPlist(
-                    "attach reported a pre-existing whole image device".into(),
-                ),
-            ));
-        }
         Ok(AttachedImage {
             image: image.to_owned(),
             whole_device,
@@ -2474,54 +2511,64 @@ fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
     })
 }
 
+/// The one attachment the kernel holds for `image`, if any. A second one is ambiguous: nothing
+/// says which device a caller that expects one should use, so it refuses.
 fn existing_image_attachment(
     image: &Path,
     images: &[AttachedDiskImage],
 ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
-    let mut attachment = None;
-    for attached in images
+    let mut attachments = image_attachments(image, images)?;
+    if attachments.len() > 1 {
+        return Err(ApfsError::InvalidAttachmentInventory(
+            "matching image has multiple inventory entries".into(),
+        ));
+    }
+    Ok(attachments.pop())
+}
+
+/// Every attachment the kernel holds for `image`, in inventory order.
+fn image_attachments(
+    image: &Path,
+    images: &[AttachedDiskImage],
+) -> Result<Vec<RecoveredImageAttachment>, ApfsError> {
+    images
         .iter()
         .filter(|attached| attached.is_backed_by(image))
-    {
-        let entities: Vec<(String, String)> = attached
-            .media
-            .iter()
-            .map(|media| {
-                (
-                    device_path(&media.device).unwrap_or_else(|| media.device.clone()),
-                    media.content.clone(),
-                )
-            })
-            .collect();
-        let found = match entities.as_slice() {
-            [(device, hint)]
-                if device_depth(device) == 0
-                    && is_kernel_device_path(device)
-                    && (hint.is_empty() || hint == "GUID_partition_scheme") =>
-            {
-                RecoveredImageAttachment::Unformatted {
-                    image: image.to_owned(),
-                    whole_device: device.clone(),
-                }
-            }
-            _ => {
-                let (whole_device, volume_device) = attached_apfs_volume(&entities)
-                    .map_err(ApfsError::InvalidAttachmentInventory)?;
-                RecoveredImageAttachment::Apfs(AttachedImage {
-                    image: image.to_owned(),
-                    whole_device,
-                    volume_device,
-                    pin: std::sync::Mutex::new(None),
+        .map(|attached| {
+            let entities: Vec<(String, String)> = attached
+                .media
+                .iter()
+                .map(|media| {
+                    (
+                        device_path(&media.device).unwrap_or_else(|| media.device.clone()),
+                        media.content.clone(),
+                    )
                 })
-            }
-        };
-        if attachment.replace(found).is_some() {
-            return Err(ApfsError::InvalidAttachmentInventory(
-                "matching image has multiple inventory entries".into(),
-            ));
-        }
-    }
-    Ok(attachment)
+                .collect();
+            Ok(match entities.as_slice() {
+                [(device, hint)]
+                    if device_depth(device) == 0
+                        && is_kernel_device_path(device)
+                        && (hint.is_empty() || hint == "GUID_partition_scheme") =>
+                {
+                    RecoveredImageAttachment::Unformatted {
+                        image: image.to_owned(),
+                        whole_device: device.clone(),
+                    }
+                }
+                _ => {
+                    let (whole_device, volume_device) = attached_apfs_volume(&entities)
+                        .map_err(ApfsError::InvalidAttachmentInventory)?;
+                    RecoveredImageAttachment::Apfs(AttachedImage {
+                        image: image.to_owned(),
+                        whole_device,
+                        volume_device,
+                        pin: std::sync::Mutex::new(None),
+                    })
+                }
+            })
+        })
+        .collect()
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -4204,24 +4251,19 @@ mod tests {
             }
             // Creation can fail after attach but before the caller receives an AttachedImage.
             // No tracked handle is not proof of a detached fixture or permission to unlink it.
-            match self.backend.recovered_image_attachment(&self.image)? {
-                Some(RecoveredImageAttachment::Apfs(attachment)) => {
-                    self.backend.detach(&attachment, DetachIntent::Release)
-                }
-                Some(RecoveredImageAttachment::Unformatted {
-                    image,
-                    whole_device,
-                }) => self.backend.detach_unformatted_image(
-                    &image,
-                    &whole_device,
-                    DetachIntent::Release,
-                ),
-                None if !self.image.exists() => Ok(()),
-                None => Err(ApfsError::InvalidAttachmentInventory(format!(
+            if self.image.exists()
+                && self
+                    .backend
+                    .recovered_image_attachments(&self.image)?
+                    .is_empty()
+            {
+                return Err(ApfsError::InvalidAttachmentInventory(format!(
                     "cannot prove fixture image {} was released; retaining its backing file",
                     self.image.display()
-                ))),
+                )));
             }
+            self.backend
+                .release_every_attachment(&self.image, DetachIntent::Release)
         }
 
         fn finish(mut self) -> Result<(), ApfsError> {
@@ -4450,52 +4492,77 @@ mod tests {
         );
     }
 
+    /// A path the kernel already holds is never attached again, neither to verify nor to format:
+    /// once its file is replaced, a second attach succeeds and the path has two attachments,
+    /// which every later lookup refuses as ambiguous. The refusal comes before any attach runs,
+    /// and the held device is left alone.
     #[test]
-    fn parsed_attach_never_detaches_a_preexisting_same_image_device() {
+    fn an_image_the_kernel_already_holds_is_never_attached_again() {
         let image = Path::new("/tmp/cowshed-preexisting.asif");
         let inventory = || images(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk5"][..])]);
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            inventory(),
-            ok(ATTACH_PLIST),
-            inventory(),
-            inventory(),
-        ]));
+        let refused = |error: ApfsError| {
+            matches!(
+                error,
+                ApfsError::InvalidAttachmentInventory(message)
+                    if message == "/tmp/cowshed-preexisting.asif is already attached as \
+                                   {\"/dev/disk5\"}; refusing to attach it a second time"
+            )
+        };
 
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([inventory()]));
         let error = backend.attach_verified(image).unwrap_err();
+        assert!(refused(error));
+        assert_eq!(backend.runner().steps(), [Seen::Inventory]);
 
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([inventory()]));
+        let request = CreateImageRequest {
+            staged_stem: PathBuf::from("/tmp/cowshed-preexisting"),
+            capacity: ImageCapacity::from_gibibytes(1),
+            volume_name: "cowshed".to_owned(),
+            owner_uid: 501,
+            owner_gid: 20,
+        };
+        let error = backend.format_attached(image, &request).unwrap_err();
+        assert!(refused(error));
+        assert_eq!(backend.runner().steps(), [Seen::Inventory]);
+    }
+
+    /// Two attachments of one path are listed both; only the caller that wants exactly one
+    /// refuses them as ambiguous.
+    #[test]
+    fn every_attachment_of_a_path_held_twice_is_listed() {
+        let image = Path::new("/tmp/cowshed-target.asif");
+        let mut second = live_capture();
+        for media in &mut second.media {
+            media.device = media.device.replace("/dev/disk1", "/dev/disk2");
+        }
+        let inventory = [live_capture(), second];
         assert!(matches!(
-            error,
-            ApfsError::InvalidAttachmentPlist(message)
-                if message == "attach reported a pre-existing whole image device"
+            existing_image_attachment(image, &inventory),
+            Err(ApfsError::InvalidAttachmentInventory(message))
+                if message == "matching image has multiple inventory entries"
         ));
-        let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 4);
-        assert_eq!(steps[0], Seen::Inventory);
-        assert_eq!(steps[2], Seen::Inventory);
-        assert_eq!(steps[3], Seen::Inventory);
-        assert!(
-            !commands(&steps)
-                .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "detach"))
+        let held = image_attachments(image, &inventory).unwrap();
+        assert_eq!(
+            held.iter()
+                .map(RecoveredImageAttachment::whole_device)
+                .collect::<Vec<_>>(),
+            ["/dev/disk15", "/dev/disk25"]
         );
     }
 
+    /// A malformed attach report releases only the device this attach added, never another
+    /// image's. (An image the kernel already holds is not attached at all; see
+    /// `an_image_the_kernel_already_holds_is_never_attached_again`.)
     #[test]
     fn malformed_asif_attach_detaches_only_the_new_device_and_verifies_absence() {
         let image = Path::new("/tmp/cowshed-malformed-attach.asif");
-        let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(
-            image,
-            &["/dev/disk4"],
-            false,
-        ));
+        let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(image, &[], false));
 
         let error = backend.attach_verified(image).unwrap_err();
 
         assert!(matches!(error, ApfsError::InvalidAttachmentPlist(_)));
-        assert_eq!(
-            backend.runner().devices_for(image),
-            BTreeSet::from(["/dev/disk4".into()])
-        );
+        assert_eq!(backend.runner().devices_for(image), BTreeSet::new());
         assert_eq!(
             backend
                 .runner()
@@ -4523,11 +4590,11 @@ mod tests {
             ["detach", "-verbose", "/dev/disk8"]
         );
         assert_eq!(steps[6], Seen::Inventory);
-        assert!(!commands(&steps).iter().any(|request| {
-            let args = argv(request);
-            args.iter()
-                .any(|arg| arg == "/dev/disk4" || arg == "/dev/disk20")
-        }));
+        assert!(
+            !commands(&steps)
+                .iter()
+                .any(|request| argv(request).iter().any(|arg| arg == "/dev/disk20"))
+        );
     }
 
     #[test]
@@ -4828,7 +4895,7 @@ mod tests {
             no_images(),
         ]);
         backend
-            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
+            .release_every_attachment(&image, DetachIntent::Release)
             .unwrap();
         assert_eq!(fs::read(&image).unwrap(), b"unformatted");
         assert!(
@@ -4841,27 +4908,8 @@ mod tests {
         fs::remove_file(image).unwrap();
     }
 
-    #[test]
-    fn changed_unformatted_media_mapping_never_releases_another_device() {
-        let image = temp_path("unformatted-changed-map", IMAGE_EXTENSION);
-        fs::write(&image, b"unformatted").unwrap();
-        let backend = graced_backend([holding(&image, "/dev/disk9")]);
-        let error = backend
-            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
-            .unwrap_err();
-        assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
-        assert_eq!(fs::read(&image).unwrap(), b"unformatted");
-        assert!(
-            !backend
-                .runner()
-                .requests()
-                .iter()
-                .any(|request| { request.args.first().is_some_and(|arg| arg == "detach") }),
-            "a cached device name is not ownership evidence"
-        );
-        fs::remove_file(image).unwrap();
-    }
-
+    /// The image's devices are read once to choose what to release and again right before each
+    /// detach: a device the image no longer holds by then is refused, never detached.
     #[test]
     fn a_second_observation_conflict_cannot_claim_unformatted_media_was_released() {
         let image = temp_path("unformatted-second-map", IMAGE_EXTENSION);
@@ -4869,7 +4917,7 @@ mod tests {
         let backend =
             graced_backend([holding(&image, "/dev/disk8"), holding(&image, "/dev/disk9")]);
         let error = backend
-            .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
+            .release_every_attachment(&image, DetachIntent::Release)
             .unwrap_err();
         assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
         assert_eq!(fs::read(&image).unwrap(), b"unformatted");

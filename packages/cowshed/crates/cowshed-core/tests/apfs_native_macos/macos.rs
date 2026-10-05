@@ -22,7 +22,8 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
-    RestoreFailpoint, SystemKernelMountSource, blank_template,
+    RestoreFailpoint, SystemKernelMountSource, blank_template, blank_template_path,
+    blank_template_staged_stem,
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
@@ -2601,6 +2602,110 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
         .expect("detach the owned image");
     assert!(!attached(&owned));
     assert!(!attached(&foreign));
+}
+
+/// Attach `image` the way another process does, outside every cowshed lease and check.
+fn attach_behind_cowshed(image: &Path) {
+    let attached = Command::new("/usr/sbin/diskutil")
+        .args(["image", "attach", "--nobrowse", "--noMount", "--plist"])
+        .arg(image)
+        .output_locked()
+        .expect("diskutil image attach");
+    assert!(
+        attached.status.success(),
+        "attach {}: {}",
+        image.display(),
+        String::from_utf8_lossy(&attached.stderr)
+    );
+}
+
+/// What a killed template minter left behind: `image` attached, its file then removed while the
+/// attachment lives on and keeps the path, a new image put at the same path, and that one
+/// attached too. The kernel then holds one path twice.
+fn hold_twice(fixture: &RealFixture, image: &Path) {
+    fixture.blank_image(image);
+    attach_behind_cowshed(image);
+    std::fs::remove_file(image).expect("remove the attached image's file");
+    fixture.blank_image(image);
+    attach_behind_cowshed(image);
+    assert_eq!(kernel_attachments(image).len(), 2, "the path is held twice");
+}
+
+/// A path the kernel holds twice wedged every real-APFS run on the host: each lookup refused it
+/// as `matching image has multiple inventory entries`, the sweep included. Cowshed never adds a
+/// third attachment to such a path, and releasing the image releases both.
+#[test]
+fn real_apfs_a_path_held_twice_is_never_attached_again_and_released_whole() {
+    let fixture = RealFixture::new("held-twice");
+    let image = fixture.root().join("twice.asif");
+    hold_twice(&fixture, &image);
+
+    let refused = MacOsApfsBackend::new(SystemCommandRunner)
+        .attach_verified(&image)
+        .expect_err("a held path is never attached again");
+    assert!(
+        matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
+            if message.contains("is already attached as")),
+        "{refused}"
+    );
+    assert_eq!(kernel_attachments(&image).len(), 2);
+
+    fixture
+        .host()
+        .detach_existing_image(&image, DetachIntent::Release)
+        .expect("release both attachments");
+    assert!(!attached(&image), "{:?}", kernel_attachments(&image));
+}
+
+/// The minter's own leftovers, as the incident left them: the single staging name older minters
+/// reused, held twice, and a staging image of this minter's kind whose file is gone while its
+/// attachment stays. The next mint releases every attachment of both, removes their files, and
+/// mints the template, which it leaves detached under its name.
+#[test]
+fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
+    let fixture = RealFixture::new("template-leftovers");
+    let store = fixture.root().join("store");
+    let capacity = blank_image::CAPACITY;
+    let template = blank_template_path(&store, capacity);
+    let reused = template.with_file_name(format!(
+        "{}-minting.asif",
+        template
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("a template stem")
+    ));
+    hold_twice(&fixture, &reused);
+    let orphaned = blank_template_staged_stem(&store, capacity).with_extension("asif");
+    fixture.blank_image(&orphaned);
+    attach_behind_cowshed(&orphaned);
+    std::fs::remove_file(&orphaned).expect("remove the attached image's file");
+    assert!(attached(&orphaned));
+
+    let minted = blank_template(
+        &MacOsApfsBackend::new(SystemCommandRunner),
+        &store,
+        capacity,
+    )
+    .expect("mint over the leftovers");
+
+    assert_eq!(minted, template);
+    assert!(template.is_file());
+    assert!(!attached(&template));
+    for leftover in [&reused, &orphaned] {
+        assert!(
+            !attached(leftover),
+            "{}: {:?}",
+            leftover.display(),
+            kernel_attachments(leftover)
+        );
+        assert!(!leftover.exists(), "{}", leftover.display());
+    }
+    let staging = std::fs::read_dir(template.parent().expect("a template directory"))
+        .expect("list templates")
+        .map(|entry| entry.expect("template entry").path())
+        .filter(|path| path.to_string_lossy().contains("-minting"))
+        .collect::<Vec<_>>();
+    assert_eq!(staging, Vec::<PathBuf>::new());
 }
 
 /// Release the owner's first real attachment before cowshed can open its raw volume.

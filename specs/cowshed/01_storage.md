@@ -48,7 +48,7 @@ layout root:
   .blank/                            # blank templates every new image is cloned from (see "Images")
     <bytes>-<uid>-<gid>.asif         # one formatted, verified, detached image per capacity and owner
     <bytes>-<uid>-<gid>.lock         # flock held only while that template is minted
-    <bytes>-<uid>-<gid>-minting.asif # a template being minted; the next minter removes one a killed minter left
+    <bytes>-<uid>-<gid>-minting-<nonce>.asif # a template being minted, under a name no minter used before
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
@@ -144,14 +144,19 @@ every clone automatically). Main and sessions use identical wiring; only the san
   verified with `fsck_apfs -q` like every attach. The clone takes the canonical name whole, so the name only ever holds
   a complete, formatted volume. A template is minted lazily, the first time a store mints at its capacity, in five
   unprivileged steps:
-  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting.asif`,
+  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.asif`,
   `diskutil image attach --nobrowse --noMount --plist <image>`,
   `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and
   `hdiutil detach <whole-device>`; only then is it renamed to its name. Only minting takes the template's lock, and a
   minter that finds the template once it holds the lock returns it, so concurrent first mints make one template and a
-  mint that finds it needs no lock at all. A minter killed partway leaves its `-minting` image, perhaps still attached;
-  the next minter detaches and removes it before it starts. The attaching user owns the image's device nodes, so
-  formatting needs no privilege, and `-U`/`-G` make the volume root the invoking user's from the start — which is why
+  mint that finds it needs no lock at all. Each minter stages under a name of its own (`-minting-<nonce>`), so a path is
+  attached at most once: a minter killed with its attach still queued on `storagekitd` can have that attach land after
+  the next minter removed its file, and on the single reused `-minting` name it landed beside the next minter's attach,
+  leaving one path attached twice. Before it starts, a minter releases every attachment the kernel holds for any of the
+  template's staging names (old reused name included) — the inventory decides, since an attachment outlives its file and
+  keeps its path — and removes their files. No attach runs for a path the kernel already holds: the image driver refuses
+  a second attach of one file, but not of a new file at the same path. The attaching user owns the image's device nodes,
+  so formatting needs no privilege, and `-U`/`-G` make the volume root the invoking user's from the start — which is why
   the owner is part of the template's name. `diskutil`'s own `--fs APFS` is not used: it cannot ask for case
   sensitivity, and it leaves a root-owned volume root that an `owners` mount cannot write and only root can hand over.
   Like every clone, a minted volume shares its template's APFS volume and container UUIDs (nothing records or reads

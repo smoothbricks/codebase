@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::{MacOsApfsExecutionHost, acquire_image_locks, path_exists, sync_parent_path};
 use crate::apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent,
-    MacOsApfsBackend, RecoveredImageAttachment, apfs_step_leg, timed_apfs_step,
+    MacOsApfsBackend, apfs_step_leg, timed_apfs_step,
 };
 use crate::metadata::{IMAGE_EXTENSION, ImageCapacity};
 use crate::storage::apfs::{ApfsStorageError, LockMode};
@@ -34,10 +34,32 @@ pub fn blank_template_path(store_root: &Path, capacity: ImageCapacity) -> PathBu
     template_file(store_root, capacity, "").with_extension(IMAGE_EXTENSION)
 }
 
-/// `<store>/.blank/<bytes>-<uid>-<gid>-minting`: where the template is written, formatted and
-/// detached before it takes its name, as `<stem>.asif`.
+/// The suffix every staging name of a template carries after the template's own stem.
+const STAGING_SUFFIX: &str = "-minting";
+
+/// `<store>/.blank/<bytes>-<uid>-<gid>-minting-<nonce>`: where one minter writes, formats and
+/// detaches the template before it takes its name, as `<stem>.asif`. Each call answers a name
+/// no minter used before, so a path is attached at most once in its life: a minter killed with
+/// its attach still queued on `storagekitd` can have that attach land later, after the next
+/// minter removed its file, and on a reused name it landed beside the next minter's own attach
+/// and gave the path two attachments.
 pub fn blank_template_staged_stem(store_root: &Path, capacity: ImageCapacity) -> PathBuf {
-    template_file(store_root, capacity, "-minting")
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    template_file(store_root, capacity, &format!("{STAGING_SUFFIX}-{nonce}"))
+}
+
+/// Whether `path` is a staging image of the template at `capacity`, under any nonce or none
+/// (the single staging name older minters reused).
+fn is_staging_image(store_root: &Path, capacity: ImageCapacity, path: &Path) -> bool {
+    let prefix = template_file(store_root, capacity, STAGING_SUFFIX);
+    let (Some(directory), Some(stem)) = (prefix.parent(), prefix.file_name()) else {
+        return false;
+    };
+    path.parent() == Some(directory)
+        && path.extension() == Some(std::ffi::OsStr::new(IMAGE_EXTENSION))
+        && path
+            .file_stem()
+            .is_some_and(|name| name.as_encoded_bytes().starts_with(stem.as_encoded_bytes()))
 }
 
 fn template_file(store_root: &Path, capacity: ImageCapacity, suffix: &str) -> PathBuf {
@@ -89,8 +111,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 /// detached: it is minted under a staging name of its own and renamed into place after the
 /// detach. So an existing template needs no lock and no check — a mint clones it on sight. Only
 /// minting takes the template's lock, and a minter that finds the template once it holds the lock
-/// returns it: concurrent first mints make one template. A minter killed partway leaves its
-/// staging image, perhaps still attached; the next minter releases and removes it first.
+/// returns it: concurrent first mints make one template. Every staging image a minter killed
+/// partway left — attached or not, its file present or not — is released and removed first.
 pub fn blank_template<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     store_root: &Path,
@@ -113,6 +135,7 @@ pub fn blank_template<R: CommandRunner>(
         return Ok(template);
     }
     timed_apfs_step("template", "mint", || {
+        release_leftovers(backend, store_root, capacity)?;
         mint(
             backend,
             &blank_template_staged_stem(store_root, capacity),
@@ -123,8 +146,8 @@ pub fn blank_template<R: CommandRunner>(
     Ok(template)
 }
 
-/// Create, format, verify and detach a fresh template at `staged_stem.asif`, replacing whatever
-/// a killed minter left there.
+/// Create, format, verify and detach a fresh template at `staged_stem.asif`, a name nothing has
+/// held before.
 fn mint<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     staged_stem: &Path,
@@ -139,7 +162,6 @@ fn mint<R: CommandRunner>(
         owner_gid,
     };
     let image = staged_stem.with_extension(IMAGE_EXTENSION);
-    release_leftover(backend, &image)?;
     if let Err(primary) = backend.create_blank_image(&request) {
         return super::super::combine_cleanup(
             "create blank template",
@@ -160,26 +182,39 @@ fn mint<R: CommandRunner>(
     Ok(image)
 }
 
-/// Release the attachment a killed minter may have left of `image` and remove the file. Nothing
-/// is asked of the kernel when no file is there.
-fn release_leftover<R: CommandRunner>(
+/// Release every attachment of every staging image of this template that killed minters left,
+/// then remove their files. The kernel's inventory decides what is attached, not the directory:
+/// an attachment outlives its file (a cleanup that removed the image while a queued attach was
+/// still to land), and keeps the path it was handed. The caller holds the template's lock, so no
+/// live minter owns any of them.
+fn release_leftovers<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
-    image: &Path,
+    store_root: &Path,
+    capacity: ImageCapacity,
 ) -> Result<(), ApfsStorageError> {
-    if !path_exists(image)? {
-        return Ok(());
-    }
-    match backend.recovered_image_attachment(image)? {
-        Some(RecoveredImageAttachment::Apfs(attachment)) => {
-            backend.detach(&attachment, DetachIntent::Release)?;
+    for image in backend.attached_image_files()? {
+        if is_staging_image(store_root, capacity, &image) {
+            backend.release_every_attachment(&image, DetachIntent::Release)?;
         }
-        Some(RecoveredImageAttachment::Unformatted {
-            image,
-            whole_device,
-        }) => backend.detach_unformatted_image(&image, &whole_device, DetachIntent::Release)?,
-        None => {}
     }
-    backend.delete_image(image).map_err(Into::into)
+    let directory = blank_template_path(store_root, capacity)
+        .parent()
+        .map(Path::to_owned)
+        .ok_or(ApfsStorageError::InvalidPlan("a template has a directory"))?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(super::io_error("list blank templates", &directory, error)),
+    };
+    for entry in entries {
+        let image = entry
+            .map_err(|error| super::io_error("list blank templates", &directory, error))?
+            .path();
+        if is_staging_image(store_root, capacity, &image) {
+            backend.delete_image(&image)?;
+        }
+    }
+    Ok(())
 }
 
 fn rename_into_place<R: CommandRunner>(
