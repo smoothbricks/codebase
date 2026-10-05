@@ -11,13 +11,12 @@ describe('DEFAULT_TRACE_DB_PATH', () => {
   });
 
   it('sits where project walkers and file watchers never descend, so SQLite sidecars cannot perturb a compile', () => {
-    expect(directories[0]).toBe('node_modules');
+    expect(directories[0]).toBe('.cache');
   });
 
-  it("is per-checkout tool state in the package's node_modules/.cache, never beside a package's declared outputs", () => {
-    // `node_modules/.cache/<tool>` is the convention a workspace manager keeps on its build volume; a
-    // package-level `.cache/` holds build outputs, which stay with the source.
-    expect(directories.slice(0, 3)).toEqual(['node_modules', '.cache', 'lmao']);
-    expect(directories).toHaveLength(3);
+  it('is per-checkout tool state in a directory of its own, never beside a package root or inside node_modules', () => {
+    // A workspace manager holds exactly `.cache/lmao` as build state; `.cache/` itself holds
+    // declared build outputs, which stay with the source.
+    expect(directories).toEqual(['.cache', 'lmao']);
   });
 });

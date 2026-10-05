@@ -72,12 +72,13 @@ whole index, including its database, journals and other per-tree state.
 A detected JavaScript package manager (Bun, npm or pnpm) contributes the `node_modules/.cache` of every package it
 installed: a tracked `package.json` beside a real `node_modules` directory, below the capability's selected directory
 and not itself inside a `node_modules`. `node_modules/.cache/<tool>` of the package a tool runs in is the JavaScript
-convention for per-tree tool state (find-cache-dir: babel, webpack, ava, stryker, lmao's trace sink), so the capability
-names the convention and never a tool. A tracked manifest nothing installed, such as a fixture's, gets nothing, so
-discovery never creates a `node_modules` in a fixture. The fingerprint records each tracked `package.json` path with
-whether its package is installed, never its bytes: a dependency edit does not change where any tool writes, and must not
-rediscover Cargo. Why: lmao's trace sink rewrote a SQLite database of 716 MB in place on every test run of one package
-of the consumer repository, inside the source image that every session clone shares.
+convention for per-tree tool state (find-cache-dir: babel, webpack, ava, stryker), so the capability names the
+convention and never a tool. A tracked manifest nothing installed, such as a fixture's, gets nothing, so discovery never
+creates a `node_modules` in a fixture. The fingerprint records each tracked `package.json` path with whether its package
+is installed, never its bytes: a dependency edit does not change where any tool writes, and must not rediscover Cargo.
+Why: such state is rewritten in place on every run, which in the source image fragments an image every session clone
+shares (measured: lmao's trace sink, a SQLite database of 716 MB in one package of a consumer repository, now in its own
+`.cache/lmao` declared as build state).
 
 A project may keep its Nix files away from its root and reach them from its `.envrc`, for example with
 `cd tooling/shell` and then `. envrc.sh`. The Nix convention therefore also holds when the `.envrc` chain reaches Nix.

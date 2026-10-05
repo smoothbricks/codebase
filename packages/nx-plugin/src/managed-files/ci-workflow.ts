@@ -1373,7 +1373,7 @@ ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
  * import them at runtime (lmao is not a runtime dependency), so a test pins
  * this glob to them.
  */
-export const TRACE_DB_ARTIFACT_GLOB = 'packages/*/node_modules/.cache/lmao/trace-results.db*';
+export const TRACE_DB_ARTIFACT_GLOB = 'packages/*/.cache/lmao/trace-results.db*';
 
 export function artifactStepLines(
   provider: PackageSmooGithub['actionsProvider'],

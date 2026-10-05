@@ -9,19 +9,22 @@
  * under a project root. A SQLite database mutates its directory's membership —
  * `-journal`, `-wal`, and `-shm` sidecars appear and vanish around transactions
  * and connections — so a sink sitting in a walked directory makes an unrelated
- * compile non-reproducible. Every project walker and file watcher skips
- * `node_modules`.
+ * compile non-reproducible. `.cache` resolves this by construction: it is on
+ * @ttsc/unplugin's hardcoded ignore list, so the walk never descends into it,
+ * never signs it, and never opens a watch on it. It is also gitignored
+ * tree-wide, and the monorepo's package and cargo policy scans skip it.
  *
- * It is per-checkout tool state, and belongs where such state is kept.
- * `node_modules/.cache/<tool>` of the package a tool runs in is the JavaScript
- * convention for exactly that (find-cache-dir: babel, webpack, ava, stryker): a
- * directory rewritten on every run, rebuilt when missing, never source and
- * never a build output. A workspace manager that keeps build state off the
- * source tree (cowshed's build volumes) recognises that convention without
- * knowing this library, so the sink's page-by-page rewrites of a database that
- * reaches hundreds of megabytes never land in a source image that clones share.
- * A package-level `.cache/` does not qualify: build tools declare their outputs
- * there (`.cache/<tool>/`), and an output must stay with the source.
+ * It is per-checkout tool state, never source and never a build output, so it
+ * has a directory of its own, `.cache/lmao`, that nothing else writes. A
+ * workspace manager that keeps build state off the source tree can then hold
+ * exactly that directory of every package (cowshed: a `.cowshed.toml`
+ * `[build] state` pattern over the packages), so the sink's page-by-page
+ * rewrites of a database that reaches hundreds of megabytes never land in a
+ * source image that clones share. `.cache/` itself is not that directory:
+ * build tools declare their Nx outputs inside it (`.cache/<tool>/`), and an
+ * output must stay with the source. `node_modules/.cache/lmao` was rejected: a
+ * package the package manager installed nothing into has no `node_modules`,
+ * and the sink creating one makes the package look installed.
  *
  * `tmp` was rejected: its contract is "safe to delete at any moment", and this
  * file must survive the run that wrote it so assertions and post-mortems can
@@ -31,7 +34,7 @@
  */
 
 /** Directory, relative to a package or workspace root, that holds the trace sink. */
-export const TRACE_DB_DIRECTORY = 'node_modules/.cache/lmao';
+export const TRACE_DB_DIRECTORY = '.cache/lmao';
 
 /** Trace sink filename within {@link TRACE_DB_DIRECTORY}. */
 export const TRACE_DB_FILENAME = 'trace-results.db';

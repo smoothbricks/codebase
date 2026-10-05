@@ -153,9 +153,9 @@ beside an output. Measured on a consumer repository over three hours, with sessi
 extracted test archive (2 GB, rewritten for every new archive) sat beside its archive under `.cache/nextest`, and lmao's
 SQLite trace sink (716 MB in one package, rewritten page by page on every test run) sat in each package's `.cache/`,
 together 2.7 GB of the 5 GB written into main's source image. Both are content-keyed or per-run tool state, not outputs:
-the nextest extraction now lives under the Cargo target directory (`<target_directory>/nextest-extracted`) and the trace
-sink under `node_modules/.cache/lmao`. A package's `.cache/` itself cannot be build state, because build tools declare
-their outputs there.
+the nextest extraction now lives under the Cargo target directory (`<target_directory>/nextest-extracted`), and the
+trace sink in `.cache/lmao`, a directory of its own that the project declares as build state (`packages/*/.cache/lmao`,
+below). A package's `.cache/` itself cannot be build state, because build tools declare their outputs there.
 
 ### Declared build state
 

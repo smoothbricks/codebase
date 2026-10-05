@@ -42,11 +42,11 @@ exception: the CI artifact glob (`TRACE_DB_ARTIFACT_GLOB` in the nx-plugin's man
 cannot import `@smoothbricks/lmao` at runtime and the glob needs a `packages/*/` prefix plus a trailing `*` for the WAL
 sidecars; a plugin test pins it to the constant. It must sit under a directory project walkers and watchers ignore,
 because a database inside a compiled package's root makes its own journal churn look like the project tree changing
-mid-compile, and it is per-checkout tool state, so it lives in `node_modules/.cache/<tool>`, which a build-volume
-checkout keeps off its source image. Parallel test workers share one database, so never trade on-disk rollback for
-quiet. Measured: with the journal held in memory, a SIGKILLed writer left 12 uncommitted rows _visible_ while
-`PRAGMA integrity_check` reported ok — phantom data that reads as valid, which is worse for an assertion oracle than a
-file that fails to open.
+mid-compile, and it is per-checkout tool state, so it lives in `.cache/lmao`, a directory nothing else writes, which a
+cowshed project declares as build state to keep it off its source image. Parallel test workers share one database, so
+never trade on-disk rollback for quiet. Measured: with the journal held in memory, a SIGKILLed writer left 12
+uncommitted rows _visible_ while `PRAGMA integrity_check` reported ok — phantom data that reads as valid, which is worse
+for an assertion oracle than a file that fails to open.
 
 **Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for API proof, comparison,
 and overhead benchmarking, but it is not the normal repo pattern. Require tracing context from callers, use child spans,

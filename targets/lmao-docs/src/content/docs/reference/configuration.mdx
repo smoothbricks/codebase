@@ -58,9 +58,9 @@ Common config fields: `maxFlushInterval`, `minFlushInterval`, `capacityThreshold
 
 - `sqlite` — write results to a database. On Node/bun, `{ dbPath: DEFAULT_TRACE_DB_PATH }`; on vitest, also pass
   `createDatabase: createNodeSQLiteDatabase`. `DEFAULT_TRACE_DB_PATH` is exported by every testing entry point and
-  resolves to `node_modules/.cache/lmao/trace-results.db`, inside the `node_modules` every project walker and file
-  watcher skips. Point `dbPath` somewhere else only if that location is skipped too — a SQLite database keeps journal
-  sidecars beside itself, and a watched directory whose membership moves mid-build invalidates the build.
+  resolves to `.cache/lmao/trace-results.db`, under the `.cache` directory project walkers and file watchers skip. Point
+  `dbPath` somewhere else only if that location is skipped too — a SQLite database keeps journal sidecars beside itself,
+  and a watched directory whose membership moves mid-build invalidates the build.
 - `verbose` — extra logging.
 
 See [Set up trace-testing](/guides/set-up-trace-testing/).

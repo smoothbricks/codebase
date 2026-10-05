@@ -232,11 +232,11 @@ Setup is wiring-only: a preload/setup file calls
 `initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } })` and installs a transparent mock so tests
 import `describe`/`it`/`expect` from their native runner as usual. Bun and Vitest are both supported
 (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
-`node_modules/.cache/lmao/trace-results.db` under the package or workspace root. Every project walker and file watcher
-skips `node_modules`, which the sink needs because a SQLite database churns its directory's membership through journal
-sidecars and a compiler watching that directory would call its own transform generation incoherent. And
-`node_modules/.cache/<tool>` is the JavaScript home of per-checkout tool state, so a workspace manager that keeps build
-state off the source tree moves the sink's rewrites with it. Traces flush to a SQLite sink you can query with the
+`.cache/lmao/trace-results.db` under the package or workspace root. Project walkers and file watchers skip `.cache`,
+which the sink needs because a SQLite database churns its directory's membership through journal sidecars and a compiler
+watching that directory would call its own transform generation incoherent. And `.cache/lmao` holds nothing but the
+sink, so a workspace manager that keeps build state off the source tree can hold exactly that directory (cowshed:
+`.cowshed.toml` `[build] state = ["packages/*/.cache/lmao"]`). Traces flush to a SQLite sink you can query with the
 `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema, and query recipes.
 
 ## Package exports

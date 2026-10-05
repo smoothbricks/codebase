@@ -166,8 +166,8 @@ preload = ["./test-trace-setup.ts"]
 
 3. Tests import `describe`/`it`/`expect` from `bun:test` as normal — the mock intercepts transparently.
 
-4. Nothing to ignore: `DEFAULT_TRACE_DB_PATH` puts the sink under `node_modules/.cache/lmao`, because project walkers
-   and file watchers skip `node_modules` and a SQLite database churns its directory's membership through journal
+4. Add `.cache/` to `.gitignore` — `DEFAULT_TRACE_DB_PATH` puts the sink under `.cache/lmao` because project walkers and
+   file watchers skip that directory name, and a SQLite database churns its directory's membership through journal
    sidecars.
 
 ### Querying Trace Results
@@ -175,7 +175,7 @@ preload = ["./test-trace-setup.ts"]
 After a test run, the trace database is written to the configured path. The `trace_id` is printed at the end:
 
 ```
-[trace] trace_id: 550e8400-e29b-41d4-a716-446655440000 → node_modules/.cache/lmao/trace-results.db
+[trace] trace_id: 550e8400-e29b-41d4-a716-446655440000 → .cache/lmao/trace-results.db
 ```
 
 The `trace_id` IS the run identifier — one root span per test run, with each `it()` as a child span.
@@ -184,10 +184,10 @@ The `trace_id` IS the run identifier — one root span per test run, with each `
 
 ```bash
 # All spans for the latest trace (root span name = 'test-run')
-sqlite3 node_modules/.cache/lmao/trace-results.db "SELECT s0.message, s0.describe FROM spans s0 WHERE s0.row_index = 0 ORDER BY s0.timestamp_ns"
+sqlite3 .cache/lmao/trace-results.db "SELECT s0.message, s0.describe FROM spans s0 WHERE s0.row_index = 0 ORDER BY s0.timestamp_ns"
 
 # Find root span_id, then query it-level spans
-sqlite3 node_modules/.cache/lmao/trace-results.db "
+sqlite3 .cache/lmao/trace-results.db "
   SELECT s0.message AS test_name, s0.describe,
          CASE WHEN s1.entry_type = 2 THEN 'ok'
               WHEN s1.entry_type = 3 THEN 'err'
@@ -202,10 +202,10 @@ sqlite3 node_modules/.cache/lmao/trace-results.db "
   ORDER BY s0.timestamp_ns"
 
 # All tests under a specific describe group
-sqlite3 node_modules/.cache/lmao/trace-results.db "SELECT message FROM spans WHERE describe = 'Order Processing > validation' AND row_index = 0"
+sqlite3 .cache/lmao/trace-results.db "SELECT message FROM spans WHERE describe = 'Order Processing > validation' AND row_index = 0"
 
 # Nested describe paths use ' > ' separator
-sqlite3 node_modules/.cache/lmao/trace-results.db "SELECT DISTINCT describe FROM spans WHERE describe IS NOT NULL AND row_index = 0"
+sqlite3 .cache/lmao/trace-results.db "SELECT DISTINCT describe FROM spans WHERE describe IS NOT NULL AND row_index = 0"
 ```
 
 **Schema:**

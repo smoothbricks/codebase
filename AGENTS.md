@@ -671,10 +671,12 @@ needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner har
 - **It must live under a directory name project walkers and watchers ignore.** A database in a compiled package's root
   makes its own per-transaction journal churn look like the project tree changing mid-compile, which breaks
   transform-generation caching in tools that verify directory membership.
-- **It is per-checkout tool state, not an output.** It lives in `node_modules/.cache/<tool>`, the JavaScript home of
-  tool state, which cowshed keeps on the build volume: the sink rewrites its pages on every run, and in the source image
-  those writes fragment an image every clone shares. A package-level `.cache/` holds Nx outputs and cannot be build
-  state.
+- **It is per-checkout tool state, not an output.** It lives in `.cache/lmao`, a directory nothing else writes, so a
+  cowshed project declares exactly that directory as build state (`.cowshed.toml` `[build] state`, a
+  `packages/*/.cache/lmao` pattern) and keeps it on the build volume: the sink rewrites its pages on every run, and in
+  the source image those writes fragment an image every clone shares. A package-level `.cache/` holds Nx outputs and
+  cannot be build state. `node_modules/.cache/lmao` would create a `node_modules` in a package nothing was installed
+  into, which makes the package look installed.
 - **A run that dies is exactly the run whose trace you want.** Never reason about the sink as disposable output.
 
 ### Property-Based Testing with fast-check

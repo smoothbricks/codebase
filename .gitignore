@@ -73,8 +73,9 @@ target/
 # cargo-mutants scratch trees.
 mutants.out*/
 
-# Local tool caches (ttsc plugins) and declared tool outputs such as the nextest
-# archive.
+# Local tool caches (ttsc plugins), declared tool outputs such as the nextest
+# archive, and the lmao trace sink (.cache/lmao), which lives here because
+# project walkers and file watchers skip this directory name.
 .cache/
 
 # Zig build cache (17.9 MB of build.exe/.pdb/.obj was committed by mistake)

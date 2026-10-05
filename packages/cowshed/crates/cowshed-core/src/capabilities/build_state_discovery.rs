@@ -721,7 +721,7 @@ struct CargoMetadata {
 
 /// The checkout-relative directory a JavaScript package's tools keep their per-tree state in:
 /// `node_modules/.cache/<tool>` of the package they run in (the find-cache-dir convention babel,
-/// webpack, ava and stryker follow, and lmao's trace sink).
+/// webpack, ava and stryker follow).
 const TOOL_CACHE: &str = "node_modules/.cache";
 
 /// The JavaScript tool caches of every package a detected JavaScript package manager installed:
