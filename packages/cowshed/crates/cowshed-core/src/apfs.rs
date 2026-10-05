@@ -6149,15 +6149,23 @@ mod tests {
     /// The line a fixture run prints once its image is attached and tracked.
     #[cfg(target_os = "macos")]
     const FIXTURE_IMAGE: &str = "cowshed-test-fixture-image=";
+    /// The line a fixture run prints once a process it started works in its root: that pid and
+    /// the root, space-separated.
+    #[cfg(target_os = "macos")]
+    const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 
-    /// A real-image fixture leaves nothing attached however its run ends. A panic unwinds
-    /// through the fixture's own teardown. A kill — nextest's `terminate-after`, a host-wide
-    /// stop — runs no teardown at all, so only the next run's sweep can release the image, and
-    /// the sweep finds only images staged under a scratch root that names the dead run's pid.
-    /// Fixtures staged under `$TMPDIR` stayed attached until reboot after every timed-out run.
+    /// A real-image fixture leaves nothing attached and nothing running however its run ends. A
+    /// panic unwinds through the fixture's own teardown. A kill — nextest's `terminate-after`, a
+    /// host-wide stop — runs no teardown at all, so only the next run's sweep can end the run's
+    /// processes and release its image, and the sweep finds only those working in or staged
+    /// under a scratch root that names the dead run's pid. Fixtures staged under `$TMPDIR` stayed
+    /// attached until reboot after every timed-out run, and the stock Nx daemon a timed-out test
+    /// started kept running in its deleted root. The run's worker stands in for that daemon: a
+    /// process the run started that outlives it, selected, as the daemon is, by its working
+    /// directory alone.
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_apfs_fixture_images_are_released_however_their_run_ends() {
+    fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
         use crate::fork_lock::Spawn;
         use std::io::{BufRead, BufReader};
         use std::os::unix::process::ExitStatusExt;
@@ -6180,14 +6188,20 @@ mod tests {
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         for ending in ["panic", "kill"] {
             let mut child = run(ending);
-            let mut lines = BufReader::new(child.stdout.take().expect("run stdout")).lines();
+            let mut lines = BufReader::new(child.stdout.take().expect("run stdout"))
+                .lines()
+                .map(|line| line.expect("run stdout"));
             let image = lines
-                .by_ref()
-                .map(|line| line.expect("run stdout"))
                 .find_map(|line| line.strip_prefix(FIXTURE_IMAGE).map(PathBuf::from))
                 .unwrap_or_else(|| panic!("the {ending} run never attached its fixture"));
             // A red run must not leak the image it proves leaked.
             let _leak = RealImageCleanup::new(&backend, image.clone());
+            let (worker, root) = lines
+                .find_map(|line| {
+                    let (pid, root) = line.strip_prefix(FIXTURE_WORKER)?.split_once(' ')?;
+                    Some((pid.parse::<libc::pid_t>().ok()?, PathBuf::from(root)))
+                })
+                .unwrap_or_else(|| panic!("the {ending} run never started its worker"));
             if ending == "kill" {
                 child.kill().expect("kill the run mid-fixture");
             }
@@ -6210,14 +6224,19 @@ mod tests {
                 image.display()
             );
             assert!(!image.exists(), "{ending}: {} remains", image.display());
+            let left = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&root))
+                .expect("list the processes working under the run's root");
+            assert_eq!(left, [], "{ending}: worker {worker} outlived its run");
+            assert!(!root.exists(), "{ending}: {} remains", root.display());
         }
     }
 
     /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it panics or waits to be
-    /// killed once its image is attached, or (`sweep`) only opens a root, which sweeps dead runs.
+    /// killed once its image is attached and its worker started, or (`sweep`) only opens a root,
+    /// which sweeps dead runs.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "spawned by real_apfs_fixture_images_are_released_however_their_run_ends"]
+    #[ignore = "spawned by real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end"]
     fn real_apfs_fixture_run_ended_by_its_parent() {
         let Some(ending) = std::env::var_os(FIXTURE_ENDING) else {
             return;
@@ -6236,6 +6255,22 @@ mod tests {
                 .expect("attach the fixture image"),
         );
         println!("{FIXTURE_IMAGE}{}", image.display());
+        // Bounded, so a worker no teardown or sweep ends still ends; a passing run ends it within
+        // seconds.
+        #[expect(
+            clippy::zombie_processes,
+            reason = "the worker must outlive this run; the scratch root or the next sweep ends it"
+        )]
+        let worker = crate::fork_lock::Spawn::spawn_locked(
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .current_dir(root.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("start a worker in the root");
+        println!("{FIXTURE_WORKER}{} {}", worker.id(), root.path().display());
         if ending == "panic" {
             panic!("the fixture's run fails with its image attached");
         }

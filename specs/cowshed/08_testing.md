@@ -167,11 +167,15 @@ same production owned-attachment cleanup used by normal removal, recovery-marker
 duplicate-attachment rejection, and staging GC. Each cleanup rereads image/whole-device/volume identity, pins the raw
 IOMedia for native unmount, and releases the image under the image's lease; a previously cached disk number or
 mountpoint never authorizes a detach. A failed release keeps the scratch tree intact for the next run, rather than
-deleting a still-attached image's backing files. Successful cleanup removes the root, and every run first reclaims roots
-and attachments whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`)
-with datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
-Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
-both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
+tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
+deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
+fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
+in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
+reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
+vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
+`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
+same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
 one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the run's template stay under `/private/tmp`
