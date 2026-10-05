@@ -46,6 +46,11 @@ function deny(pattern: string): void {
   git('config', '--add', 'smoothbricks.publicDenylist', pattern);
 }
 
+function commitMessage(...paragraphs: string[]): string {
+  git('commit', '--quiet', '--allow-empty', ...paragraphs.flatMap((paragraph) => ['-m', paragraph]));
+  return git('rev-parse', 'HEAD');
+}
+
 beforeEach(async () => {
   // Real path: git reports the resolved root, and macOS's temporary directory is a symlink.
   root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-public-denylist-')));
@@ -118,5 +123,114 @@ describe('public denylist scan', () => {
 
     expect(scan.outcome).toBe('failed');
     expect(scan.outcome === 'failed' && scan.reason).toContain('missing closing parenthesis');
+  });
+
+  it('denies a commit message that contains a configured word, naming sha and line', async () => {
+    deny('acme-secret');
+    const sha = commitMessage('tidy the adapters', 'Moves the Acme-Secret adapter\nout of core.');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment())).toEqual({
+      outcome: 'denied',
+      matches: `${sha}:message:3:Moves the Acme-Secret adapter\n`,
+    });
+  });
+
+  it('passes commit messages that contain none of the configured words', async () => {
+    deny('acme-secret');
+    commitMessage('tidy the adapters', 'No private names here.');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment())).toEqual({ outcome: 'clean', patterns: 1 });
+  });
+
+  it('judges a commit message with the same PCRE as a tree', async () => {
+    // \h is PCRE's horizontal space; JavaScript reads it as a literal "h".
+    deny('acme\\hsecret');
+    const sha = commitMessage('rename Acme\tSecret');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment())).toEqual({
+      outcome: 'denied',
+      matches: `${sha}:message:1:rename Acme\tSecret\n`,
+    });
+  });
+
+  it('reports a commit message before the tree it published', async () => {
+    deny('acme-secret');
+    await writeFile(join(root, 'notes.md'), 'acme-secret\n');
+    git('add', 'notes.md');
+    const sha = commitMessage('document acme-secret');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment())).toEqual({
+      outcome: 'denied',
+      matches: `${sha}:message:1:document acme-secret\nHEAD:notes.md:1:acme-secret\n`,
+    });
+  });
+
+  it('judges every commit behind the revisions, not only the tip', async () => {
+    deny('acme-secret');
+    const old = commitMessage('mention acme-secret');
+    commitMessage('a clean follow-up');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment())).toEqual({
+      outcome: 'denied',
+      matches: `${old}:message:1:mention acme-secret\n`,
+    });
+  });
+
+  it('given a remote, judges only the commits that remote does not hold', async () => {
+    deny('acme-secret');
+    const published = commitMessage('mention acme-secret');
+    git('update-ref', 'refs/remotes/origin/main', published);
+    commitMessage('a clean follow-up');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment(), 'origin')).toEqual({
+      outcome: 'clean',
+      patterns: 1,
+    });
+    // A commit another remote holds is still unpublished to this one.
+    expect(await scanPublicDenylist(root, ['HEAD'], environment(), 'private')).toEqual({
+      outcome: 'denied',
+      matches: `${published}:message:1:mention acme-secret\n`,
+    });
+  });
+
+  it('judges an unpublished commit message even when the remote holds its parents', async () => {
+    deny('acme-secret');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const unpublished = commitMessage('mention acme-secret');
+
+    expect(await scanPublicDenylist(root, ['HEAD'], environment(), 'origin')).toEqual({
+      outcome: 'denied',
+      matches: `${unpublished}:message:1:mention acme-secret\n`,
+    });
+  });
+
+  it('refuses an empty remote name instead of reading it as every remote', async () => {
+    deny('acme-secret');
+    commitMessage('mention acme-secret');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+
+    const scan = await scanPublicDenylist(root, ['HEAD'], environment(), '');
+
+    expect(scan.outcome).toBe('failed');
+    expect(scan.outcome === 'failed' && scan.reason).toContain('empty remote name');
+  });
+
+  it('fails on a bad pattern even when the remote already holds every commit', async () => {
+    deny('(unclosed');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+
+    const scan = await scanPublicDenylist(root, ['HEAD'], environment(), 'origin');
+
+    expect(scan.outcome).toBe('failed');
+    expect(scan.outcome === 'failed' && scan.reason).toContain('missing closing parenthesis');
+  });
+
+  it('fails instead of passing when a revision does not resolve', async () => {
+    deny('acme-secret');
+
+    const scan = await scanPublicDenylist(root, ['no-such-revision'], environment());
+
+    expect(scan.outcome).toBe('failed');
+    expect(scan.outcome === 'failed' && scan.reason).toContain('no-such-revision');
   });
 });

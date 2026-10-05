@@ -154,10 +154,14 @@ function buildProgram(): Command {
   monorepo
     .command('check-public-denylist [revisions...]')
     .description(
-      'refuse revisions (default HEAD) whose tree matches the local smoothbricks.publicDenylist git config or SMOOTHBRICKS_PUBLIC_DENYLIST; silent when neither is set',
+      'refuse revisions (default HEAD) whose tree, or the message of any commit behind them, matches the local smoothbricks.publicDenylist git config or SMOOTHBRICKS_PUBLIC_DENYLIST; silent when neither is set',
     )
-    .action(async (revisions: string[]) => {
-      await checkPublicDenylist(await findRepoRoot(), revisions.length > 0 ? revisions : ['HEAD']);
+    .option(
+      '--remote <name>',
+      'judge only the commit messages <name> does not already hold (its remote-tracking branches); default: all history behind the revisions',
+    )
+    .action(async (revisions: string[], options: { remote?: string }) => {
+      await checkPublicDenylist(await findRepoRoot(), revisions.length > 0 ? revisions : ['HEAD'], options.remote);
     });
   monorepo
     .command('sync-bun-lockfile-versions')

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Two gates, in order.
 #
-# 1. On every OS, the public-tree denylist: every commit this push publishes
-# is refused if its tree matches a pattern from this clone's local
-# `smoothbricks.publicDenylist` git config (or SMOOTHBRICKS_PUBLIC_DENYLIST).
-# The patterns live outside the repository so the guard never publishes what
-# it guards; with none configured the check passes silently.
+# 1. On every OS, the public denylist: every commit this push publishes is
+# refused if its tree, or the message of any commit the remote does not hold
+# yet, matches a pattern from this clone's local `smoothbricks.publicDenylist`
+# git config (or SMOOTHBRICKS_PUBLIC_DENYLIST). The patterns live outside the
+# repository so the guard never publishes what it guards; with none
+# configured the check passes silently.
 #
 # 2. The macOS-only Linux cross-compile gate. It is a cache PROBE and nothing
 # else: it reads the nx cache and never compiles. A hit means a real
@@ -40,9 +41,12 @@ if [ -z "${TTSC_TSGO_BINARY:-}" ] && [ -x "$PWD/node_modules/@typescript/native/
   export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
 fi
 
-# git hands a pre-push hook one `<local ref> <local sha> <remote ref> <remote sha>`
-# line per ref it updates; an all-zero local sha is a deletion, which publishes
-# no tree.
+# git hands a pre-push hook the remote's name as $1 and one
+# `<local ref> <local sha> <remote ref> <remote sha>` line per ref it updates;
+# an all-zero local sha is a deletion, which publishes no tree. The pushed shas
+# are the tips to judge; --remote narrows the commit messages judged to those
+# the remote's tracking branches do not already hold, so history that is
+# already public is not judged again on every push.
 pushed=()
 while read -r _local_ref local_sha _remote_ref _remote_sha; do
   case "$local_sha" in
@@ -50,7 +54,7 @@ while read -r _local_ref local_sha _remote_ref _remote_sha; do
   esac
 done
 if [ "${#pushed[@]}" -gt 0 ]; then
-  smoo monorepo check-public-denylist "${pushed[@]}" || exit 1
+  smoo monorepo check-public-denylist --remote "$1" "${pushed[@]}" || exit 1
 fi
 
 case "$(uname -s)" in

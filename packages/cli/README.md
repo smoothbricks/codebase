@@ -34,7 +34,7 @@ smoo monorepo update
 smoo monorepo check
 smoo monorepo diff
 smoo monorepo validate-commit-msg <commit-msg-file>
-smoo monorepo check-public-denylist [revisions...]
+smoo monorepo check-public-denylist [--remote <name>] [revisions...]
 smoo monorepo sync-bun-lockfile-versions [--mode <install|publish>] [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
@@ -536,17 +536,20 @@ The generated pre-push hook runs two gates. The first runs on every OS and guard
 what is private to the people working on it:
 
 ```bash
-smoo monorepo check-public-denylist <pushed-sha...>
+smoo monorepo check-public-denylist --remote <remote> <pushed-sha...>
 ```
 
-It judges the tree of every commit the push publishes (never the working tree; a ref deletion publishes nothing) against
-patterns kept outside the repository, so the guard never publishes what it guards: each value of this clone's local
+It judges, never the working tree (a ref deletion publishes nothing), the tree of every pushed commit and the message of
+every commit the push adds: those `<remote>`'s remote-tracking branches do not already hold, so history that is already
+public is not judged again on every push. Run without `--remote`, it judges every commit behind the revisions. The
+patterns are kept outside the repository, so the guard never publishes what it guards: each value of this clone's local
 `smoothbricks.publicDenylist` git config, plus each line of `SMOOTHBRICKS_PUBLIC_DENYLIST`. Every pattern is a
-Perl-compatible regex matched case-insensitively by `git grep -I -i -P` over text files; binary files are not read. Any
-match refuses the push and prints each offending `<sha>:<path>:<line>:<text>`. A pattern git cannot compile refuses the
-push too, so a typo cannot silently disable the guard. With no pattern configured the check passes silently, which is
-what CI and every clone that never set one see. Add a pattern with
-`git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
+Perl-compatible regex matched case-insensitively by `git grep -i -P`: over text files (`-I`; binary files are not read)
+and over each line of each commit message, which is written to a scratch file so the same regex engine decides both. Any
+match refuses the push and prints each offending `<sha>:<path>:<line>:<text>`, or `<sha>:message:<line>:<text>` for a
+commit message. A pattern git cannot compile refuses the push too, so a typo cannot silently disable the guard. With no
+pattern configured the check passes silently, which is what CI and every clone that never set one see. Add a pattern
+with `git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
 
 The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not.
 This gate is a probe: it runs `env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross` and nothing else. Nx
