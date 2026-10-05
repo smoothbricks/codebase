@@ -17481,15 +17481,8 @@ mod port_reservation_tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    fn root(label: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "cowshed-port-reservation-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+    fn root(label: &str) -> crate::temp_root::TempRoot {
+        crate::temp_root::TempRoot::new(&format!("cowshed-port-reservation-{label}"))
     }
 
     fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {
@@ -17600,7 +17593,6 @@ mod port_reservation_tests {
         }
         drop(grown);
         drop(old_listeners);
-        std::fs::remove_dir_all(root).unwrap();
         assert!(
             common_cell_claimed,
             "legacy growth must fence the same 64-port grid cell as a new allocator"
@@ -17638,7 +17630,6 @@ mod port_reservation_tests {
                 .expect("all grid claims release together");
             std::fs::remove_file(marker).unwrap();
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -17767,7 +17758,6 @@ mod port_reservation_tests {
             .expect("successful owner releases marker");
         std::fs::remove_file(released).expect("release probe");
         drop(old_listener);
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
@@ -17873,7 +17863,6 @@ mod port_reservation_tests {
                 crate::storage::apfs::ApfsStorageError::Host(_)
             ))
         ));
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
@@ -17897,7 +17886,6 @@ mod port_reservation_tests {
             .expect("claim after inventory error")
             .expect("failed allocation must release its marker");
         std::fs::remove_file(marker).expect("release probe");
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// A workspace keeps its recorded grant size until an explicit capacity grant, so the store
@@ -17990,7 +17978,6 @@ mod port_reservation_tests {
             "publication of the first block excludes it from the next allocation"
         );
         drop(second);
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// The host's port range is shared with live workspaces and every concurrent allocator, which
@@ -18054,7 +18041,6 @@ mod port_reservation_tests {
         };
         assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
         drop(outside);
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Every block is durable workspace authority until retirement, attached or detached, so the
@@ -18085,7 +18071,6 @@ mod port_reservation_tests {
         ));
         assert!(held().all(|owned| !owned.overlaps(block)));
         drop(granted);
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -18105,17 +18090,14 @@ mod port_reservation_tests {
                 .expect("claim after release")
                 .is_some()
         );
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn dead_process_reservation_is_reclaimed() {
         let root = root("stale");
-        std::fs::create_dir_all(&root).expect("root");
         let marker = root.join("port-40960.reservation");
         symlink(i32::MAX.to_string(), &marker).expect("stale marker");
         assert!(claim_port_block(&root, 40_960).expect("reclaim").is_some());
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// The cell's owner releases it between this claimant's refused `symlink` and its read of the
@@ -18140,7 +18122,6 @@ mod port_reservation_tests {
             std::fs::read_link(&claimed).expect("claimed marker"),
             PathBuf::from(std::process::id().to_string())
         );
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
 

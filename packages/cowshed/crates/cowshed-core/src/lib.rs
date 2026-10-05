@@ -60,6 +60,9 @@ mod blank_image;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[cfg(test)]
+#[path = "../tests/support/temp_root.rs"]
+mod temp_root;
 
 pub use error::{
     CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result, Retry,

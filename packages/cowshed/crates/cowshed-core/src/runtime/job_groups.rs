@@ -1250,7 +1250,7 @@ mod tests {
             .read_line(&mut ready)
             .unwrap();
         assert_eq!(ready.trim(), "READY");
-        let ledger = scratch();
+        let (_scratch, ledger) = scratch();
         record(&ledger, &[(9, leader(group.0.id()))], &[]).unwrap();
         group.0.kill().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -1280,18 +1280,19 @@ mod tests {
         unsafe { libc::killpg(pgid, 0) == 0 }
     }
 
-    fn scratch() -> std::path::PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("cowshed-groups-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&directory).unwrap();
-        ledger_path(&directory.join("s.sock"))
+    /// A scratch ledger and the directory holding it. The ledger's own removal is under test; the
+    /// directory goes when the test ends, on any path.
+    fn scratch() -> (crate::temp_root::TempRoot, std::path::PathBuf) {
+        let directory = crate::temp_root::TempRoot::new("cowshed-groups");
+        let ledger = ledger_path(&directory.join("s.sock"));
+        (directory, ledger)
     }
 
     #[test]
     fn a_lost_supervisor_s_groups_end_whole_and_its_ledger_goes() {
         let mut job = job_group();
         let pgid = i32::try_from(job.id()).unwrap();
-        let ledger = scratch();
+        let (_scratch, ledger) = scratch();
         record(&ledger, &[(7, leader(job.id()))], &[]).unwrap();
         assert!(group_alive(pgid));
 
@@ -1313,7 +1314,7 @@ mod tests {
     fn a_watcher_of_one_supervisor_never_acts_on_a_newer_one_s_ledger() {
         let mut job = job_group();
         let pgid = i32::try_from(job.id()).unwrap();
-        let ledger = scratch();
+        let (_scratch, ledger) = scratch();
         record(&ledger, &[(3, leader(job.id()))], &[]).unwrap();
 
         let other_supervisor = std::process::id() + 1;
@@ -1340,7 +1341,7 @@ mod tests {
     /// workspace's socket, may act on it.
     #[test]
     fn only_a_ledger_naming_the_watched_supervisor_s_groups_needs_recovery() {
-        let ledger = scratch();
+        let (_scratch, ledger) = scratch();
         let own = Writer::Process(std::process::id());
         assert!(!names_groups(&ledger, Writer::Any).unwrap(), "no ledger");
         record(&ledger, &[], &[]).unwrap();
@@ -1380,7 +1381,7 @@ mod tests {
             birth: first_seen.birth.min(stranger_leader.birth - 1),
         };
         assert_ne!(reused, stranger_leader);
-        let ledger = scratch();
+        let (_scratch, ledger) = scratch();
         record(&ledger, &[(5, reused)], &[]).unwrap();
         record(&ledger, &[(5, reused)], &[]).unwrap();
 
@@ -1525,7 +1526,7 @@ mod tests {
             assert_eq!(super::birth_time(pgid).unwrap(), None, "{label}");
             assert!(super::group_has_live_members(pgid).unwrap(), "{label}");
 
-            let ledger = scratch();
+            let (_scratch, ledger) = scratch();
             let lost_supervisor = std::process::id() + 1;
             super::replace(
                 &ledger,
@@ -1620,7 +1621,7 @@ mod tests {
         ] {
             let group = OwnedGroup(job_group());
             let pgid = i32::try_from(group.0.id()).unwrap();
-            let ledger = scratch();
+            let (_scratch, ledger) = scratch();
             record(&ledger, &[(7, leader(group.0.id()))], &[]).unwrap();
             if previously_ended {
                 let mut recorded = super::read(&ledger).unwrap().unwrap();

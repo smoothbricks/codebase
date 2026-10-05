@@ -28,6 +28,10 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 
+#[path = "support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 #[derive(Debug)]
 struct Spawned {
     request: ProcessSpawnRequest,
@@ -358,17 +362,10 @@ fn authority() -> WorkspaceAuthoritySnapshot {
     }
 }
 
-fn config() -> WorkspaceSupervisorConfig {
-    // Under TMPDIR and process-unique: a fixed shared path races concurrent test binaries and,
-    // on a shared runner, inherits a directory another user owns and this process cannot write.
-    let workspace_root = std::env::temp_dir().join(format!(
-        "cowshed-supervisor-test-workspace-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&workspace_root).expect("workspace root");
-    // Capability detection refuses a directory that resolves outside the workspace, and
-    // `/var/folders` resolves into `/private/var`.
-    let workspace_root = std::fs::canonicalize(&workspace_root).expect("canonical workspace root");
+/// The supervisor config of the workspace at `root/workspace`, mounted under `root`. A pure
+/// function of `root`, so a test advancing authority re-derives the very same sandbox.
+fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
+    let workspace_root = root.join("workspace");
     WorkspaceSupervisorConfig {
         authority: authority(),
         owned_repo_ids: OwnedRepoIds::sole(authority().repo_id),
@@ -376,7 +373,7 @@ fn config() -> WorkspaceSupervisorConfig {
         default_cwd: Some(WorkspacePath::new("packages/app").unwrap()),
         sandbox: SandboxConfig {
             home: PathBuf::from("/Users/tester"),
-            mount_root: workspace_root.parent().expect("temp root").to_path_buf(),
+            mount_root: root.to_path_buf(),
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
             port_block: PortBlock::new(49_136, 16).unwrap(),
@@ -407,8 +404,18 @@ fn config() -> WorkspaceSupervisorConfig {
     }
 }
 
-fn harness(start_id: u64, quota: u64, fail_next: bool, backpressure: bool) -> Harness {
-    harness_with_config(config(), start_id, quota, fail_next, backpressure)
+/// A test's private root holding the workspace `config` places in it, removed when the test
+/// ends on any path. Each test binds it before any supervisor over it, so it outlives them all.
+fn workspace_root(label: &str) -> TempRoot {
+    let root = TempRoot::new(&format!("cowshed-supervisor-{label}"));
+    std::fs::create_dir(root.join("workspace")).expect("workspace root");
+    root
+}
+
+fn harness(start_id: u64, quota: u64, fail_next: bool, backpressure: bool) -> (Harness, TempRoot) {
+    let root = workspace_root("test-workspace");
+    let h = harness_with_config(config(&root), start_id, quota, fail_next, backpressure);
+    (h, root)
 }
 
 fn harness_with_config(
@@ -429,8 +436,10 @@ fn harness_with_config(
 }
 
 /// A harness whose artifact sink commits a stdout stream that is not what the job wrote.
-fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> Harness {
-    harness_with_artifacts(config(), 1, 1024, false, false, Some(sealed_stdout))
+fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> (Harness, TempRoot) {
+    let root = workspace_root("test-workspace");
+    let h = harness_with_artifacts(config(&root), 1, 1024, false, false, Some(sealed_stdout));
+    (h, root)
 }
 
 fn harness_with_artifacts(
@@ -539,18 +548,9 @@ fn request(stdin: StdinSource) -> ExecRequest {
     }
 }
 
-fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
-    let root = std::fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!(
-            "cowshed-supervisor-{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-    let workspace_root = root.join("workspace");
-    std::fs::create_dir_all(&workspace_root).expect("isolated workspace");
-    let mut supervisor_config = config();
-    supervisor_config.workspace_root = workspace_root.clone();
-    supervisor_config.sandbox.workspace_mount = workspace_root;
+fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
+    let root = workspace_root(label);
+    let mut supervisor_config = config(&root);
     supervisor_config.sandbox.home = root.join("home");
     supervisor_config.sandbox.exec_temp_dir = root.join("tmp");
     (supervisor_config, root)
@@ -711,13 +711,12 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
             );
             assert_eq!(mount.join(target).exists(), writable);
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
 #[tokio::test]
 async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     for code in [0, 143] {
         let job = h
             .handle
@@ -750,7 +749,7 @@ async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
 
 #[tokio::test]
 async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let raw = vec![0xff, b'x', 0x80];
     let mut exec = request(StdinSource::Empty);
     exec.command = ExecCommand::Argv(vec![
@@ -776,7 +775,7 @@ async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
 
 #[tokio::test]
 async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     for argument in [
         OsString::from_vec(vec![b'x', 0]),
         OsString::from_vec(vec![b'x'; MAX_COMMAND_ARG_BYTES + 1]),
@@ -810,7 +809,8 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
 /// profile it was spawned with, and nothing is relaunched.
 #[tokio::test]
 async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
-    let supervisor_config = config();
+    let root = workspace_root("build-volume");
+    let supervisor_config = config(&root);
     let volumes = supervisor_config
         .sandbox
         .mount_root
@@ -870,7 +870,7 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
 
 #[tokio::test]
 async fn monotonic_ids_and_simultaneous_completions_are_serialized() {
-    let mut h = harness(41, 1024, false, false);
+    let (mut h, _root) = harness(41, 1024, false, false);
     let first = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -915,14 +915,14 @@ async fn monotonic_ids_and_simultaneous_completions_are_serialized() {
 
 #[tokio::test]
 async fn exact_authority_and_session_identity_are_fenced() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, root) = harness(1, 1024, false, false);
     let old = h.handle.clone();
     let session = open_named(&h.handle, "build").await;
     let same = open_named(&h.handle, "build").await;
     assert_eq!(session.identity(), same.identity());
     let advanced = h
         .handle
-        .advance_authority(8, 12, config().sandbox)
+        .advance_authority(8, 12, config(&root).sandbox)
         .await
         .unwrap();
     let stale = old.list().await.unwrap_err();
@@ -946,7 +946,7 @@ async fn exact_authority_and_session_identity_are_fenced() {
 
 #[tokio::test]
 async fn disconnect_does_not_cancel_background_process() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let session = open_named(&h.handle, "daemon").await;
     let job = h
         .handle
@@ -964,7 +964,7 @@ async fn disconnect_does_not_cancel_background_process() {
 
 #[tokio::test]
 async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -995,7 +995,7 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
 
 #[tokio::test]
 async fn stdin_write_observes_bounded_backpressure() {
-    let mut h = harness(1, 1024, false, true);
+    let (mut h, _root) = harness(1, 1024, false, true);
     let (stream_writer, stream_reader) = tokio::io::duplex(8);
     let job = h
         .handle
@@ -1040,7 +1040,7 @@ async fn stdin_write_observes_bounded_backpressure() {
 
 #[tokio::test]
 async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
-    let mut h = harness(1, 4, false, false);
+    let (mut h, _root) = harness(1, 4, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -1098,7 +1098,7 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
 
 #[tokio::test]
 async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
-    let mut h = harness(7, 1024, true, false);
+    let (mut h, _root) = harness(7, 1024, true, false);
     let error = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -1118,7 +1118,7 @@ async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
 
 #[tokio::test]
 async fn named_session_preserves_cwd_env_and_background_membership() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let session = open_named(&h.handle, "dev").await;
     let mut first = request(StdinSource::Empty);
     first.cwd = Some(WorkspacePath::new("packages/worker").unwrap());
@@ -1156,12 +1156,13 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
 /// which is why the session's own remembered environment is checked too.
 #[tokio::test]
 async fn a_registered_credential_env_name_never_reaches_a_child() {
+    let root = workspace_root("credential-env");
     let mut h = harness_with_config(
         WorkspaceSupervisorConfig {
             credential_env_names: std::collections::BTreeSet::from([
                 "REGISTRY_READ_TOKEN".to_owned()
             ]),
-            ..config()
+            ..config(&root)
         },
         1,
         1024,
@@ -1196,7 +1197,7 @@ async fn a_registered_credential_env_name_never_reaches_a_child() {
 
 #[tokio::test]
 async fn checkpoint_barrier_orders_artifact_digest_before_commitment() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let barrier = h
         .handle
         .checkpoint_barrier("checkpoint-1".into())
@@ -1334,7 +1335,7 @@ async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
 /// told the copy's own refusal.
 #[tokio::test]
 async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully() {
-    let (supervisor_config, root) = isolated_config("refused-copy");
+    let (supervisor_config, _root) = isolated_config("refused-copy");
     let destination = supervisor_config.workspace_root.join(".cowshed/leak");
     let mut h = real_store_harness(supervisor_config);
     let job = h
@@ -1382,7 +1383,6 @@ async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully()
     assert_eq!(terminals, 1);
     h.handle.quiesce().await.unwrap();
     h.handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A job whose terminal record the store refuses has still ended. Its waiters, early and late, and
@@ -1393,7 +1393,7 @@ async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully()
 async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated() {
     use std::os::unix::fs::PermissionsExt;
 
-    let (supervisor_config, root) = isolated_config("refused-seal");
+    let (supervisor_config, _root) = isolated_config("refused-seal");
     let job_root = supervisor_config.workspace_root.join(".cowshed/job");
     let store = (
         supervisor_config.workspace_root.clone(),
@@ -1457,7 +1457,6 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
             .collect::<Vec<_>>(),
         vec![(job, JobState::Failed, Some(JobFailure::SupervisorLost))]
     );
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A commitment sink whose publisher is gone by the time a job ends.
@@ -1480,7 +1479,7 @@ impl CommitmentSink for GoneTerminalPublisher {
 /// every waiter and killer, early or late, is told the commitment refusal.
 #[tokio::test]
 async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_callers() {
-    let (supervisor_config, root) = isolated_config("refused-commitment");
+    let (supervisor_config, _root) = isolated_config("refused-commitment");
     let refusal = CowshedError::environment_missing(
         "the commitment publisher is gone",
         "reattach the workspace",
@@ -1545,7 +1544,6 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
     assert_eq!((output.bytes.as_ref(), output.eof), (&b"payload"[..], true));
     handle.quiesce().await.unwrap();
     handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Spawns nothing: hands each job a process group the test owns, observed as its parent observes
@@ -1686,7 +1684,6 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         handle.wait(id).await.unwrap();
     }
     handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A job whose parent could not identify its group leader still runs and reports its pid, but its
@@ -1708,7 +1705,6 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
     h.handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The groups a lost predecessor left unresolved neither stop the next supervisor from serving
@@ -1797,12 +1793,11 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second).await.unwrap();
     h.handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -1862,7 +1857,7 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
 
 #[tokio::test]
 async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -1926,7 +1921,7 @@ async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
 /// with the leader's own exit, once its output ends.
 #[tokio::test]
 async fn a_kill_after_the_leader_exits_reaches_the_group_still_holding_its_output() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -1974,7 +1969,7 @@ async fn a_kill_after_the_leader_exits_reaches_the_group_still_holding_its_outpu
 
 #[tokio::test]
 async fn log_follow_and_attach_wait_for_exact_next_bytes() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -2047,7 +2042,7 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
 
 #[tokio::test]
 async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -2073,7 +2068,7 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
 
 #[tokio::test]
 async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
-    let mut h = harness(2, 1024, false, false);
+    let (mut h, _root) = harness(2, 1024, false, false);
     let first = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -2106,7 +2101,8 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
 
 #[tokio::test]
 async fn none_cwd_is_preserved_as_workspace_root_without_a_sentinel() {
-    let mut supervisor_config = config();
+    let root = workspace_root("none-cwd");
+    let mut supervisor_config = config(&root);
     supervisor_config.default_cwd = None;
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let mut exec = request(StdinSource::Empty);
@@ -2124,7 +2120,7 @@ async fn none_cwd_is_preserved_as_workspace_root_without_a_sentinel() {
 /// everyone awaiting the job is handed the integrity error instead of a false success.
 #[tokio::test]
 async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -2205,7 +2201,7 @@ async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
 /// per-job output quota is a gigabyte and no terminal record was ever released.
 #[tokio::test]
 async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_copy() {
-    let mut h = harness_with_sealed_stdout(b"sealed".to_vec());
+    let (mut h, _root) = harness_with_sealed_stdout(b"sealed".to_vec());
     let job = h
         .handle
         .exec(None, None, request(StdinSource::Empty))
@@ -2264,15 +2260,15 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
         .enable_all()
         .build()
         .expect("runtime");
-    let (mut h, job, spawned) = runtime.block_on(async {
-        let mut h = harness(1, 1024, false, false);
+    let (mut h, job, spawned, _root) = runtime.block_on(async {
+        let (mut h, root) = harness(1, 1024, false, false);
         let job = h
             .handle
             .exec_background(None, None, request(StdinSource::Empty))
             .await
             .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
-        (h, job, spawned)
+        (h, job, spawned, root)
     });
     let signals = |observed: Vec<ProcessObservation>| {
         observed
@@ -2317,7 +2313,7 @@ async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandl
 
 #[tokio::test]
 async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, path) = served(&h.handle).await;
     assert_eq!(
         cowshed_core::runtime::supervisor_socket::hello(&path)
@@ -2378,7 +2374,7 @@ async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
 #[tokio::test]
 async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     use tokio::io::AsyncWriteExt as _;
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let (mut writer, reader) = tokio::io::duplex(1024);
     let job = remote
@@ -2412,7 +2408,7 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
 
 #[tokio::test]
 async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let (_remote, path) = served(&h.handle).await;
     let stale = cowshed_core::runtime::supervisor_socket::connect(
         path,
@@ -2434,7 +2430,7 @@ async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
 
 #[tokio::test]
 async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
         .exec(None, None, request(StdinSource::Empty))
@@ -2556,7 +2552,7 @@ fn healed() -> std::sync::Arc<cowshed_core::StartupHealState> {
 #[tokio::test]
 async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
     use cowshed_core::runtime::supervisor_manager::SupervisorManager;
-    let h = harness(1, 1024, false, false);
+    let (h, _root) = harness(1, 1024, false, false);
     let store = manager_store();
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let manager = SupervisorManager::new(
@@ -2654,7 +2650,7 @@ async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
 #[tokio::test]
 async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, root) = harness(1, 1024, false, false);
     let store = manager_store();
     let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
     let listener = supervisor_socket::bind(&path).await.unwrap();
@@ -2670,6 +2666,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         ..authority()
     };
     let actor = h.handle.clone();
+    let sandbox = config(&root).sandbox;
     let answering = tokio::spawn(async move {
         let reply: tokio::sync::oneshot::Sender<Result<WorkspaceAuthoritySnapshot>> =
             requests.recv().await.expect("an advance request");
@@ -2677,7 +2674,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
             .advance_authority(
                 authority().grant_revision + 1,
                 authority().lifecycle_revision,
-                config().sandbox,
+                sandbox,
             )
             .await
             .map(|advanced| advanced.snapshot().clone());
@@ -2725,7 +2722,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
 #[tokio::test]
 async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, root) = harness(1, 1024, false, false);
     let store = manager_store();
     // The controller reads the grants...
     let read = authority();
@@ -2735,7 +2732,7 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
         .advance_authority(
             read.grant_revision + 1,
             read.lifecycle_revision,
-            config().sandbox,
+            config(&root).sandbox,
         )
         .await
         .unwrap();
@@ -2789,7 +2786,7 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
 #[tokio::test]
 async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
-    let h = harness(1, 1024, false, false);
+    let (h, _root) = harness(1, 1024, false, false);
     let store = manager_store();
     let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
     let listener = supervisor_socket::bind(&path).await.unwrap();
@@ -2826,7 +2823,7 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
 #[tokio::test]
 async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() {
     use cowshed_core::runtime::supervisor_socket;
-    let mut h = harness(1, 1024, false, false);
+    let (mut h, _root) = harness(1, 1024, false, false);
     let path = PathBuf::from("/tmp").join(format!(
         "cowshed-sock-{}/s",
         &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -2887,6 +2884,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
 async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it_acknowledges() {
     use cowshed_core::runtime::commitment_feed::{CommitmentFeed, FeedingSink};
     use cowshed_core::runtime::supervisor_socket;
+    let root = workspace_root("commitment-feed");
     let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
     let (process_tx, _process) = mpsc::unbounded_channel();
     let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
@@ -2894,7 +2892,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
     let (order_tx, _order) = mpsc::unbounded_channel();
     let feed = CommitmentFeed::default();
     let handle = WorkspaceSupervisor::start_with_sinks(
-        config(),
+        config(&root),
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
@@ -2991,7 +2989,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
 
 #[tokio::test]
 async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
-    let (supervisor_config, root) = isolated_config("job-record");
+    let (supervisor_config, _root) = isolated_config("job-record");
     let records = supervisor_config
         .workspace_root
         .join(".cowshed/job/records.arrow");
@@ -3021,11 +3019,10 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
     assert_eq!(terminal.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(terminal.duration_ms, info.duration_ms);
     assert!(terminal.duration_ms.is_some());
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Workspace `name`'s supervisor config, in an Nx project no daemon serves.
-fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
+fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
     let (mut supervisor_config, root) = isolated_config(&format!("nx-daemon-{name}"));
     supervisor_config.authority.workspace = WorkspaceName::new(name).unwrap();
     supervisor_config.default_cwd = None;
@@ -3055,7 +3052,7 @@ const NX_PROBES: Duration = Duration::from_secs(60);
 /// once the daemon it started is gone.
 #[tokio::test(start_paused = true)]
 async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
-    let (supervisor_config, root) = nx_project("raven");
+    let (supervisor_config, _root) = nx_project("raven");
     let project = supervisor_config.workspace_root.clone();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
 
@@ -3120,7 +3117,6 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
     std::fs::remove_dir_all(sockets).unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A keeper resolves the checkout's current pointer even when no user job has been
@@ -3220,13 +3216,12 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
     h.handle.retire().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Main is the operator's own checkout and its Nx daemon the host's: its supervisor starts none.
 #[tokio::test(start_paused = true)]
 async fn main_leaves_its_nx_daemon_to_the_host() {
-    let (supervisor_config, root) = nx_project("main");
+    let (supervisor_config, _root) = nx_project("main");
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     assert!(
         tokio::time::timeout(NX_PROBES, h.spawned.recv())
@@ -3234,5 +3229,4 @@ async fn main_leaves_its_nx_daemon_to_the_host() {
             .is_err(),
         "main's supervisor started a job of its own"
     );
-    std::fs::remove_dir_all(root).unwrap();
 }

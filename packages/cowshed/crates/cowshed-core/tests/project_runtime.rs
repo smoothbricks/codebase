@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,7 +33,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 use url::Url;
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+#[path = "support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
@@ -1345,18 +1347,10 @@ impl ProjectRuntimeHost for FakeHost {
     }
 }
 
-fn test_root() -> PathBuf {
-    let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "cowshed-project-runtime-{}-{id}",
-        std::process::id()
-    ));
-    match std::fs::remove_dir_all(&root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("remove stale test root: {error}"),
-    }
-    std::fs::create_dir_all(root.join("checkout")).expect("create test root");
+/// Each test binds its root before the runtime that uses it, so the root drops after the runtime.
+fn test_root() -> TempRoot {
+    let root = TempRoot::new("cowshed-project-runtime");
+    std::fs::create_dir(root.join("checkout")).expect("create test checkout");
     root
 }
 
