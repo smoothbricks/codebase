@@ -340,21 +340,28 @@ fn caches_home_is_an_array_of_home_relative_paths() {
 /// its own `declared/` namespace.
 #[test]
 fn build_state_declares_disjoint_checkout_relative_paths() {
-    use cowshed_core::capabilities::BuildStatePath;
+    use cowshed_core::capabilities::{BuildStatePath, DeclaredState};
     assert_eq!(parse_cowshed_config("").unwrap().build_state(), []);
     let config = parse_cowshed_config(
-        "[build]\nstate = [\"vendor/upstream\", \"tools/.pin\", \"vendor/upstream\"] # rebuildable\n",
+        "[build]\nstate = [\"vendor/upstream\", \"tools/.pin\", \"packages/*/.cache/lmao\", \"vendor/upstream\"] # rebuildable\n",
     )
     .unwrap();
     assert_eq!(
         config.build_state(),
         [
-            BuildStatePath::declared("tools/.pin").unwrap(),
-            BuildStatePath::declared("vendor/upstream").unwrap(),
+            DeclaredState::Path(BuildStatePath::declared("tools/.pin").unwrap()),
+            DeclaredState::Path(BuildStatePath::declared("vendor/upstream").unwrap()),
+            DeclaredState::Pattern {
+                selector: "packages/*".into(),
+                state: ".cache/lmao".into(),
+            },
         ]
     );
     assert_eq!(
-        config.build_state()[0].volume.as_path(),
+        BuildStatePath::declared("tools/.pin")
+            .unwrap()
+            .volume
+            .as_path(),
         Path::new("declared/tools/.pin")
     );
     let invalid = [
@@ -380,6 +387,14 @@ fn build_state_declares_disjoint_checkout_relative_paths() {
             "declares a/b inside a; declare only the outer path",
         ),
         ("[build]\nstate = []\nstate = []\n", "duplicated"),
+        (
+            "[build]\nstate = [\"packages/*\"]\n",
+            "must end in a literal name",
+        ),
+        (
+            "[build]\nstate = [\"packages/*/.cache\", \"packages/*/.cache/lmao\"]\n",
+            "declares packages/*/.cache/lmao inside packages/*/.cache",
+        ),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();

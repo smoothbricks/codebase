@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BuildStatePath, CapabilityId, DetectionContext, merge_build_state};
+use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
 use crate::fork_lock::Run;
 use crate::{CowshedError, Result};
 
@@ -74,7 +74,8 @@ const PACKAGE_MANIFEST: &str = "package.json";
 /// One index query supplies the path set; BLAKE3 hashes their working-tree bytes. A tracked
 /// `package.json` contributes whether its package is installed, not its bytes: only that decides
 /// its build state, and a dependency edit must not rediscover Cargo. Source-image clones inherit
-/// the matching fingerprint and links; capability config/markers and a new
+/// the matching fingerprint and links; capability config/markers, the expansion of the declared
+/// build state (a newly tracked package joins a pattern) and a new
 /// [`DISCOVERY_REVISION`] invalidate it.
 pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<String> {
     let mut digest = blake3::Hasher::new();
@@ -107,6 +108,10 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
         Err(error) => return Err(super::detection_error(&config, error)),
     }
     let settings = super::workspace_config(context)?;
+    for state in expand_declared(context.workspace_root, settings.build_state())? {
+        digest.update(state.checkout.as_path().as_os_str().as_bytes());
+        digest.update(&[0]);
+    }
     for detector in [
         &super::nx::DETECTOR,
         &super::bun::DETECTOR,
@@ -402,10 +407,97 @@ pub fn discover_build_state(
     )?;
     merge_build_state(&mut result.paths, caches)?;
     discover_cargo_targets(context, &config, &mut tracked, cargo, &mut result)?;
-    declare(context, config.build_state(), &mut result.paths)?;
+    let declared = expand_declared(context.workspace_root, config.build_state())?;
+    declare(context, &declared, &mut result.paths)?;
     result.paths.sort();
     result.paths.dedup();
     Ok(result)
+}
+
+/// Every checkout path the `[build] state` entries name, sorted: a literal as spelled, and a
+/// pattern once per directory its selector matches among those the checkout tracks files under
+/// (one `git ls-files` per pattern, with Git's own glob reading), each with the pattern's
+/// literal state beneath it. No two may overlap: a pattern's match inside a literal path, or
+/// the other way round, would link state through state.
+pub(super) fn expand_declared(
+    workspace: &Path,
+    entries: &[DeclaredState],
+) -> Result<Vec<BuildStatePath>> {
+    let mut expanded = BTreeSet::new();
+    for entry in entries {
+        let (selector, state) = match entry {
+            DeclaredState::Path(path) => {
+                expanded.insert(path.clone());
+                continue;
+            }
+            DeclaredState::Pattern { selector, state } => (selector, state),
+        };
+        if fs::symlink_metadata(workspace.join(".git")).is_err() {
+            continue;
+        }
+        let depth = selector.components().count();
+        let mut pathspec = OsString::from(":(glob)");
+        pathspec.push(selector.join("**"));
+        let output = crate::git::git_command_at(workspace)
+            .args(["ls-files", "-z", "--"])
+            .arg(&pathspec)
+            .output_locked()
+            .map_err(|error| crate::git::git_spawn_error(&error))?;
+        if !output.status.success() {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot expand [build] state {}: {}",
+                    entry.spelling().display(),
+                    String::from_utf8_lossy(&output.stderr).trim_end()
+                ),
+                "repair the checkout's Git index and retry",
+            ));
+        }
+        let mut selected = BTreeSet::new();
+        for name in output.stdout.split(|byte| *byte == 0) {
+            let tracked = Path::new(std::ffi::OsStr::from_bytes(name));
+            if tracked.components().count() > depth {
+                selected.insert(tracked.components().take(depth).collect::<PathBuf>());
+            }
+        }
+        for directory in selected {
+            let path = directory.join(state);
+            let declared = path
+                .to_str()
+                .ok_or("is not UTF-8")
+                .and_then(BuildStatePath::declared)
+                .map_err(|reason| {
+                    CowshedError::usage(
+                        format!(
+                            ".cowshed.toml [build] state {} selects {}, which {reason}",
+                            entry.spelling().display(),
+                            path.display()
+                        ),
+                        "narrow the pattern so it selects only checkout directories",
+                    )
+                })?;
+            expanded.insert(declared);
+        }
+    }
+    let expanded: Vec<BuildStatePath> = expanded.into_iter().collect();
+    for (index, outer) in expanded.iter().enumerate() {
+        if let Some(inner) = expanded[index + 1..].iter().find(|inner| {
+            inner
+                .checkout
+                .as_path()
+                .starts_with(outer.checkout.as_path())
+        }) {
+            return Err(CowshedError::usage(
+                format!(
+                    ".cowshed.toml [build] state declares {} inside {}",
+                    inner.checkout.as_path().display(),
+                    outer.checkout.as_path().display()
+                ),
+                "declare only the outer path, or narrow the pattern that selects the inner one",
+            ));
+        }
+    }
+    Ok(expanded)
 }
 
 /// Join `declared` to the `discovered` paths. Declared state is discarded and rebuilt, never
@@ -1370,6 +1462,61 @@ mod tests {
                 ".cowshed.toml [build] state declares escape/pin, which is not inside the checkout"
             ),
             "{escape:?}"
+        );
+    }
+
+    /// A pattern selects the directories the checkout tracks files under, never an untracked
+    /// one, and a package that becomes tracked joins it through the fingerprint. A literal
+    /// inside one of its matches is refused by name.
+    #[test]
+    fn a_declared_pattern_expands_over_tracked_packages_and_their_arrival_rediscovers() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        write(&fixture, "packages/a/package.json", "{}\n");
+        write(&fixture, "packages/b/src/index.ts", "\n");
+        write(&fixture, "packages/README.md", "\n");
+        git(&fixture, &["add", "packages"]);
+        write(&fixture, "packages/untracked/package.json", "{}\n");
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"packages/*/.cache/lmao\", \".cache/lmao\"]\n",
+        );
+        let expected = |names: &[&str]| {
+            let mut paths = vec![BuildStatePath::declared(".cache/lmao").unwrap()];
+            paths.extend(names.iter().map(|name| {
+                BuildStatePath::declared(&format!("packages/{name}/.cache/lmao")).unwrap()
+            }));
+            paths
+        };
+        let state = cargo_paths(&fixture);
+        assert!(state.findings.is_empty(), "{:?}", state.findings);
+        assert_eq!(state.paths, expected(&["a", "b"]));
+        assert!(
+            !fixture.root.join("packages/a/.cache").exists(),
+            "discovery makes nothing"
+        );
+        let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        git(&fixture, &["add", "packages/untracked/package.json"]);
+        assert_ne!(
+            before,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            "a newly tracked package moves the fingerprint"
+        );
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            expected(&["a", "b", "untracked"])
+        );
+
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"packages/*/.cache/lmao\", \"packages/a/.cache\"]\n",
+        );
+        let overlap = discover_build_state(&fixture.context(), &mut HostCargo).unwrap_err();
+        assert_eq!(
+            overlap.message,
+            ".cowshed.toml [build] state declares packages/a/.cache/lmao inside packages/a/.cache"
         );
     }
 }

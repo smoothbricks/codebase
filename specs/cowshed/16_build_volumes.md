@@ -165,14 +165,24 @@ repository: many GiB of incremental build output that no convention file names, 
 the source image, it is the largest thing a fork clones and the main source of main's fragmentation (Why two volumes);
 on the build volume it travels exactly as a Cargo target directory does.
 
+An entry may be a pattern, `packages/*/.cache/lmao`: its leading components hold `*`, `?` or `[...]`, each matching one
+directory level as Git's glob pathspec reads them (`**` is refused), and its last components are a literal name. At
+discovery the pattern selects every directory the checkout tracks files under (`git ls-files` of `<selector>/**`), never
+an untracked one, and declares the literal name beneath each: one declared path per match. **Why**: per-package tool
+state, a trace store every package's tests write under their own working directory, belongs on the volume for every
+package, and listing each package by hand goes stale the day one is added. The expansion, not only the spelling, is a
+fingerprint input, so a newly tracked package joins at the next refresh. A pattern whose last component is a glob is
+refused: it would select tracked directories, which are never build state.
+
 Each declared path is one more `BuildStatePath` contribution, `<path> -> declared/<path>` on the volume, merged into
 discovery after the capabilities'. The `declared/` namespace keeps it apart from every tool's own volume names, and
 tells cowshed it is declared rather than a tool's. The list is part of `.cowshed.toml`, which the discovery fingerprint
 already covers, so changing it rediscovers at the next refresh: a new path joins the volume, and a held path keeps its
 link. Validation refuses, before anything is deleted and with the remedy named:
 
-- a path that is not a normalized checkout-relative name, one naming `.git` or inside `.cowshed/`, and one declared
-  inside another (when `.cowshed.toml` is parsed);
+- an entry that is not a normalized checkout-relative name or pattern, one naming `.git` or inside `.cowshed/`, and one
+  spelled inside another (when `.cowshed.toml` is parsed); a pattern match inside another declared path, or around one
+  (at discovery);
 - a path reached through a symlinked parent that resolves outside the checkout;
 - a path that overlaps a capability's build state: the capability already links it;
 - a path holding tracked source: the same `git ls-files` guard migration applies.
@@ -190,7 +200,8 @@ that builds the upstream checkout when it is there, and takes a prebuilt artifac
 directory and try to build nothing. So a refresh makes nothing for a declared path nothing occupies, neither the link,
 the volume directory nor a missing parent; the volume's state still holds the path. Once a tool has made the directory,
 the next refresh adopts it as above. A reconstruct script that wants to fill the volume on its first run makes the empty
-directory, lets a refresh link it (any `cowshed exec`), and only then fills it.
+directory, lets a refresh link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a
+package whose tests never wrote a trace store gets no link.
 
 A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
 resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
@@ -200,7 +211,8 @@ location must compare against the resolved path, not the checkout spelling, and 
 - **Enforced by**: a real-APFS test in which main's first touch discards a declared nested checkout and links the path,
   the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing a
   tracked, overlapping or escaping declaration with its remedy; migration tests linking a declared checkout and leaving
-  an absent declared path absent until a tool makes it; and configuration parse tests.
+  an absent declared path absent until a tool makes it; a discovery test expanding a pattern over tracked packages only,
+  rediscovering when one is added; and configuration parse tests.
 
 ### Targets and seeds
 

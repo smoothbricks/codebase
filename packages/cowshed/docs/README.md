@@ -182,7 +182,8 @@ inside the checkout and apart from every detected tool's state; anything else re
 rebuild-only like all build state: the first admission after you declare it discards the existing directory, so re-run
 whatever reconstructs it once; from then on it lives on the volume and every fork gets it warm. A declared path that
 does not exist stays absent (tools read its existence as meaning) and is linked at the first admission after something
-creates it.
+creates it. A pattern such as `packages/*/.cache/lmao` declares the name beneath every directory the checkout tracks
+files under, so a package added later joins on its own.
 
 **The compile cache is for the work that is left.** When a workspace does have to compile something — its own edits, or
 whatever landed on main since the clone — the host compile-cache daemon can hand back an object another workspace or

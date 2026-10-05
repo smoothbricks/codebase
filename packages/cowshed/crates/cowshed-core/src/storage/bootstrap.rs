@@ -86,8 +86,8 @@ pub struct CowshedConfig {
     /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
     build_capacity: Option<crate::metadata::ImageCapacity>,
     /// `[build] state`: build state the repository declares for tools no capability detects
-    /// (16_build_volumes.md, "Declared build state"), sorted, pairwise disjoint.
-    build_state: Vec<crate::capabilities::BuildStatePath>,
+    /// (16_build_volumes.md, "Declared build state"), sorted, no spelling inside another.
+    build_state: Vec<crate::capabilities::DeclaredState>,
 }
 
 impl CowshedConfig {
@@ -119,8 +119,9 @@ impl CowshedConfig {
             .unwrap_or(crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY)
     }
 
-    /// The build state `[build] state` declares; empty without it.
-    pub fn build_state(&self) -> &[crate::capabilities::BuildStatePath] {
+    /// The entries `[build] state` declares; empty without it. Patterns are expanded against the
+    /// checkout at discovery.
+    pub fn build_state(&self) -> &[crate::capabilities::DeclaredState] {
         &self.build_state
     }
 }
@@ -464,35 +465,37 @@ fn parse_relative_paths(
     Ok(relative_paths)
 }
 
-/// `[build] state`: a TOML array of checkout-relative paths on one line, each a declared
-/// build-state path ([`crate::capabilities::BuildStatePath::declared`]), sorted and
-/// deduplicated, no two of which overlap: one inside another would link state through state.
+/// `[build] state`: a TOML array of checkout-relative paths or patterns on one line, each a
+/// [`crate::capabilities::DeclaredState`], sorted and deduplicated, no spelling inside another:
+/// one inside another would link state through state. A pattern's expansion is checked again
+/// at discovery, where its matches are known.
 fn parse_build_state(
     value: &str,
     line: usize,
-) -> Result<Vec<crate::capabilities::BuildStatePath>, ConfigError> {
+) -> Result<Vec<crate::capabilities::DeclaredState>, ConfigError> {
     let paths = serde_json::from_str::<Vec<String>>(value)
         .map_err(|_| ConfigError::ExpectedBuildStateArray { line })?;
     let mut state = Vec::with_capacity(paths.len());
     for path in paths {
         state.push(
-            crate::capabilities::BuildStatePath::declared(&path)
+            crate::capabilities::DeclaredState::parse(&path)
                 .map_err(|reason| ConfigError::InvalidBuildState { line, path, reason })?,
         );
     }
     state.sort();
     state.dedup();
-    for (index, outer) in state.iter().enumerate() {
-        if let Some(inner) = state[index + 1..].iter().find(|inner| {
-            inner
-                .checkout
-                .as_path()
-                .starts_with(outer.checkout.as_path())
-        }) {
+    let spellings: Vec<PathBuf> = state.iter().map(|entry| entry.spelling()).collect();
+    for (index, outer) in spellings.iter().enumerate() {
+        if let Some(inner) = spellings
+            .iter()
+            .enumerate()
+            .find(|(other, inner)| *other != index && inner.starts_with(outer))
+            .map(|(_, inner)| inner)
+        {
             return Err(ConfigError::OverlappingBuildState {
                 line,
-                outer: outer.checkout.as_path().to_owned(),
-                inner: inner.checkout.as_path().to_owned(),
+                outer: outer.clone(),
+                inner: inner.clone(),
             });
         }
     }

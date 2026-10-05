@@ -11,7 +11,7 @@ use crate::{CowshedError, Result};
 use cache::{SharedLayout, SharedToolHome};
 
 mod build_state;
-pub use build_state::{BuildStatePath, RelPath};
+pub use build_state::{BuildStatePath, DeclaredState, RelPath};
 mod build_state_discovery;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use build_state_discovery::HostCargo;
