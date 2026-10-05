@@ -81,6 +81,7 @@ pub(crate) fn probe(record: &Path) -> Probe {
 /// The pid of the daemon `record` names when that daemon is live, taken from the same read of
 /// the record that verified it: a record rewritten between a check and a signal can never aim
 /// the signal at another process.
+#[cfg(target_os = "macos")]
 pub(crate) fn live_pid(record: &Path) -> Option<libc::pid_t> {
     match read_and_probe(record) {
         (Probe::Live, pid) => pid,

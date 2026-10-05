@@ -15,6 +15,7 @@ use crate::api::dto::UnattributedRun;
 /// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 23.2.1,
 /// `daemon/tmp-dir.js`). It names one checkout's process and socket, so it never travels.
 pub const DAEMON_DIRECTORY: &str = "d";
+#[cfg(target_os = "macos")]
 const DAEMON_RECORD: &str = "server-process.json";
 /// The run summary Nx's `StoreRunInformationLifeCycle` writes into its cache directory after
 /// every `run`/`run-many` (pinned Nx 23.2.1, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
@@ -343,6 +344,7 @@ fn command_line(pid: libc::pid_t) -> String {
 
 /// `KERN_PROCARGS2`: a native-endian `argc`, the executable path, NUL padding, then `argc`
 /// NUL-terminated arguments (then the environment, which is never read).
+#[cfg(target_os = "macos")]
 fn parse_procargs(buffer: &[u8]) -> Option<String> {
     let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
     let mut rest = &buffer[4..];
@@ -657,6 +659,7 @@ fn parse_utc_millis(value: &str) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
+    #[cfg(target_os = "macos")]
     use crate::fork_lock::Spawn as _;
 
     fn scratch(label: &str) -> PathBuf {
@@ -846,6 +849,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn procargs_yield_the_argument_vector() {
         let mut buffer = 2i32.to_ne_bytes().to_vec();
