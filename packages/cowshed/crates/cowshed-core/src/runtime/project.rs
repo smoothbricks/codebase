@@ -8618,15 +8618,35 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         Ok(())
     }
 
+    /// Detach `workspace`: its supervisor stops its jobs, the checkout's Nx daemon is stopped as
+    /// a land stops it (the daemon the checkout's own record names, `nx daemon --stop`'s
+    /// `SIGTERM`), and the volume leaves the kernel. A daemon started from any shell keeps its
+    /// cwd on the checkout and serves nothing once the volume is gone; Nx starts a fresh one on
+    /// the next run. Whatever else still holds the volume is named, pid and argv, in the refusal.
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()> {
         use crate::storage::lifecycle::Substrate;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
+        let mount = self.workspace_mount_path(&workspace)?;
         let _stopped = self.stop_supervisor(&workspace).await?;
+        if matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            close_checkout_nx(&workspace, &mount).await?;
+        }
         self.substrate
             .unmount(&current.derived.workspace)
             .await
-            .map_err(native_storage_error)
+            .map_err(|error| {
+                if let crate::storage::apfs::ApfsStorageError::Apfs(apfs) = &error
+                    && crate::apfs::detach_was_dissented(apfs)
+                {
+                    detach_refused(&workspace, &mount, &error)
+                } else {
+                    native_storage_error(error)
+                }
+            })
     }
 
     /// Grow a workspace's image, or its build volume and seed, restoring the mount state the
@@ -14079,6 +14099,88 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             other.to_string(),
             &other,
             "repair APFS storage and retry",
+        ),
+    }
+}
+
+/// Stop the Nx daemon `workspace`'s checkout at `mount` records, as a land stops it, before its
+/// volume detaches: the daemon's cwd is the checkout, so a live one alone keeps it busy.
+/// `.nx/workspace-data` is read through the checkout, so a build-volume link is followed.
+#[cfg(target_os = "macos")]
+async fn close_checkout_nx(workspace: &WorkspaceName, mount: &Path) -> Result<()> {
+    let data = mount.join(".nx/workspace-data");
+    let closed = {
+        let data = data.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::build_volume::nx::close_workspace_data(&data)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("Nx close task failed: {error}")))?
+    };
+    match closed {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(busy)) => Err(CowshedError::conflict(
+            format!("{workspace} cannot detach while its Nx state is in use: {busy}"),
+            format!("stop those processes, then `cowshed detach {workspace}`"),
+        )),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!(
+                "cannot close {workspace}'s Nx state at {}: {error}",
+                data.display()
+            ),
+            "cowshed doctor --json",
+        )),
+    }
+}
+
+/// The kernel refused to unmount `workspace` at `mount` because something holds it: name every
+/// holder, pid and argv, so the next move is stopping them rather than repairing storage that is
+/// not broken.
+#[cfg(target_os = "macos")]
+fn detach_refused(
+    workspace: &WorkspaceName,
+    mount: &Path,
+    error: &crate::storage::apfs::ApfsStorageError,
+) -> CowshedError {
+    match crate::build_volume::nx::volume_holders(mount) {
+        Ok(holders) if !holders.is_empty() => {
+            let named = holders
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            let pids = holders
+                .iter()
+                .map(|holder| holder.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            CowshedError::conflict(
+                format!(
+                    "{workspace} is in use at {}, held by: {named}",
+                    mount.display()
+                ),
+                format!(
+                    "stop pid {pids} (or move their working directories off the workspace), \
+                     then `cowshed detach {workspace}`"
+                ),
+            )
+        }
+        Ok(_) => CowshedError::conflict(
+            format!(
+                "{workspace} was busy at {} ({error}), and nothing holds it now",
+                mount.display()
+            ),
+            format!("cowshed detach {workspace}"),
+        ),
+        Err(query) => CowshedError::conflict(
+            format!(
+                "{workspace} is in use at {} ({error}); its holders could not be listed: {query}",
+                mount.display()
+            ),
+            format!(
+                "`lsof +f -- {}` names them; stop them, then `cowshed detach {workspace}`",
+                mount.display()
+            ),
         ),
     }
 }

@@ -336,6 +336,12 @@ session resolved from the store readdir (`<owner>/<repo>/sessions/<ws>.image` pl
 or git discovery; `--project` still selects the project; `--all` every attached session store-wide. Mains are never
 detach targets. A bare `detach` with neither a name nor `--all` is usage.
 
+Detach stops the workspace's supervisor, then stops the Nx daemon the checkout's own `.nx/workspace-data` record names,
+as a land's quiesce does (`nx daemon --stop`'s `SIGTERM`): the daemon's cwd is the checkout, whichever shell started it,
+and Nx starts a fresh one on the next run. A volume the kernel still refuses to unmount is a `conflict` naming every
+holder, pid and argv (an open file, a working directory or an executable on the volume), with stopping them as the next
+move. It is not a storage failure.
+
 ### Resident workspaces
 
 `path <ws>` and `exec <ws> -- …` name one workspace, and when that workspace is mounted and its daemon-owned supervisor

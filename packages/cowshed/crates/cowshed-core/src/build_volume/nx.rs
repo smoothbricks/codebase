@@ -101,39 +101,48 @@ impl std::fmt::Display for Busy {
 #[cfg(target_os = "macos")]
 pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
     for data in state.nx_workspace_data() {
-        let data = volume.join(data);
-        let daemon = live_daemon(&data);
-        let databases = task_databases_in(&data)?;
-        for database in &databases {
-            let holders: Vec<Holder> = holders(database)?
-                .into_iter()
-                .filter(|holder| Some(holder.pid) != daemon)
-                .collect();
-            if !holders.is_empty() {
-                return Ok(Err(Busy::Held {
-                    database: database.clone(),
-                    holders,
-                }));
-            }
+        if let Err(busy) = close_workspace_data(&volume.join(data))? {
+            return Ok(Err(busy));
         }
-        if let Some(pid) = daemon
-            && !stop_daemon(pid)?
-        {
-            return Ok(Err(Busy::DaemonStayed {
-                daemon: Holder {
-                    pid,
-                    command: command_line(pid),
-                },
+    }
+    Ok(Ok(()))
+}
+
+/// [`close`] for one `workspace-data` directory, wherever it lives: in a build volume, or in a
+/// checkout that links none. A directory that does not exist holds nothing.
+#[cfg(target_os = "macos")]
+pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
+    let daemon = live_daemon(data);
+    let databases = task_databases_in(data)?;
+    for database in &databases {
+        let holders: Vec<Holder> = holders(database)?
+            .into_iter()
+            .filter(|holder| Some(holder.pid) != daemon)
+            .collect();
+        if !holders.is_empty() {
+            return Ok(Err(Busy::Held {
+                database: database.clone(),
+                holders,
             }));
         }
-        for database in &databases {
-            let holders = holders(database)?;
-            if !holders.is_empty() {
-                return Ok(Err(Busy::Held {
-                    database: database.clone(),
-                    holders,
-                }));
-            }
+    }
+    if let Some(pid) = daemon
+        && !stop_daemon(pid)?
+    {
+        return Ok(Err(Busy::DaemonStayed {
+            daemon: Holder {
+                pid,
+                command: command_line(pid),
+            },
+        }));
+    }
+    for database in &databases {
+        let holders = holders(database)?;
+        if !holders.is_empty() {
+            return Ok(Err(Busy::Held {
+                database: database.clone(),
+                holders,
+            }));
         }
     }
     Ok(Ok(()))
@@ -246,6 +255,24 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
 /// own answer, never a scan of `lsof` output.
 #[cfg(target_os = "macos")]
 pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
+    listpidspath(path, 0)
+}
+
+/// Every process holding anything on the volume mounted at `mount` -- an open file, its working
+/// directory, its executable -- which is what keeps `umount` answering `Resource busy`.
+/// Event-only opens (FSEvents, Spotlight) never block an unmount and are left out.
+#[cfg(target_os = "macos")]
+pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
+    const PROC_LISTPIDSPATH_PATH_IS_VOLUME: u32 = 1;
+    const PROC_LISTPIDSPATH_EXCLUDE_EVTONLY: u32 = 2;
+    listpidspath(
+        mount,
+        PROC_LISTPIDSPATH_PATH_IS_VOLUME | PROC_LISTPIDSPATH_EXCLUDE_EVTONLY,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
     use std::os::unix::ffi::OsStrExt;
     const PROC_ALL_PIDS: u32 = 1;
     unsafe extern "C" {
@@ -271,7 +298,7 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
                 PROC_ALL_PIDS,
                 0,
                 path_c.as_ptr(),
-                0,
+                pathflags,
                 pids.as_mut_ptr().cast(),
                 bytes,
             )
@@ -895,6 +922,47 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert_eq!(close(&root, &state()).unwrap(), Ok(()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A busy detach names what holds the volume. The holder a checkout most often has is a
+    /// process whose working directory is in it -- an Nx daemon, a shell -- with no file open,
+    /// which a per-file query never sees.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_whose_cwd_is_on_a_volume_is_one_of_its_holders() {
+        let root = scratch("volume-holders");
+        // Deeper than the queried path: only the volume, not the path itself, is in common.
+        let nested = root.join("checkout/packages/tool");
+        fs::create_dir_all(&nested).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _")
+            .current_dir(&nested)
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let pid = child.id() as i32;
+        let started = std::time::Instant::now();
+        let held = loop {
+            let held = volume_holders(&root).unwrap();
+            if held.iter().any(|holder| holder.pid == pid)
+                || started.elapsed() > Duration::from_secs(10)
+            {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let ours = held.iter().find(|holder| holder.pid == pid);
+        assert!(
+            ours.is_some_and(|holder| holder.command.contains("sh")),
+            "pid {pid} (cwd {}) is not named among the {} holders of {}'s volume",
+            nested.display(),
+            held.len(),
+            root.display()
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
