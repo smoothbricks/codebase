@@ -383,9 +383,10 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    attached keep working, and legacy `hdiutil attach` of UDIF still attaches. Measured: a host about 20,000 attaches
    into its uptime held 330 images at once, then failed at 128 after about 300 more attach→detach cycles, then at 114,
    100 and 98 as later cycles were spent. IORegistry devices and `hdiutil info` matched one to one (no zombie devices),
-   and every `diskimagesiod` instance was alive. The ceiling did not recover over 80 minutes or after detaching images,
-   and `launchctl` offers no restart that frees it. Only a reboot does. An attach is therefore a consumable: an
-   operation or test pays the fewest attach cycles that prove its behavior.
+   and every `diskimagesiod` that created a device was alive. Over 80 idle minutes the ceiling did not recover;
+   detaching an image freed at most one attach, and detaching 15 freed only a few. Whether a `launchctl` restart of the
+   per-image `diskimagesiod` jobs frees slots was not tried. A reboot is the expected reset. An attach is therefore a
+   consumable: an operation or test pays the fewest attach cycles that prove its behavior.
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
    and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach
    that followed 45.3 s. A held file anywhere in a volume keeps its image attached, so a stray process with a cwd inside
@@ -401,7 +402,7 @@ What the substrate does about each:
   capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses any layout other
   than the measured one), and a mounted volume's from IORegistry.
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
-- **Test images are 1 GiB** and a fixture detaches its images on every exit path, panic and kill included; a killed
+- **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached.
 - **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
