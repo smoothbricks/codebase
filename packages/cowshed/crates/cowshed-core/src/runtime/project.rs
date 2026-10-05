@@ -3654,11 +3654,31 @@ impl NativeProjectRuntimeHost {
     }
 
     /// What links build volumes now (16_build_volumes.md, "Garbage collection"): each mounted
-    /// checkout's build link, every workspace at its incarnation (whose seed a seed may be), and
-    /// the detached workspaces, whose links cannot be read and whose volumes their records name.
+    /// checkout's build link, every workspace at its incarnation (whose seed a seed may be), the
+    /// detached workspaces, whose links cannot be read and whose volumes their records name, and
+    /// the workspaces an unfinished create or fork is forming, in this process or any other.
+    ///
+    /// A create or fork forks its build volume and seed into its staged checkout, which no other
+    /// process can see, and completes its intent only after publishing the workspace; without
+    /// the journal, an `rm` in another process collected a fresh fork's volume and seed as
+    /// unlinked garbage, and the fork's own mount then refused its dangling link. The journal is
+    /// read from disk, before the workspaces: every such volume is then named by one of the two
+    /// reads, where the other order lets a create publish and complete between them.
     async fn build_volume_links(&self) -> Result<super::build_volumes::Links> {
         let volumes = self.build_volumes()?;
-        let mut links = super::build_volumes::Links::default();
+        let journal = self.lifecycle_intents_path.clone();
+        let creating = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::recovery::LifecycleIntentJournal::load(&journal)
+                .map(|journal| journal.forming().cloned().collect())
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("lifecycle intent read task failed: {error}"))
+        })??;
+        let mut links = super::build_volumes::Links {
+            creating,
+            ..super::build_volumes::Links::default()
+        };
         for workspace in self.authoritative().await? {
             let name = workspace.derived.workspace.name().clone();
             links.owners.insert(super::build_volumes::Owner {

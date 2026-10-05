@@ -333,6 +333,39 @@ fn only_a_prepared_clone_intent_can_be_withdrawn() {
     assert!(journal.get(&removed).is_some());
 }
 
+/// Build-volume collection keeps what a create or fork past its mutation fence may have forked
+/// into its unpublished clone: only those intents name a forming workspace. A prepared clone has
+/// made nothing, a completed one is published, and a retirement forms nothing.
+#[test]
+fn only_a_mutating_unfinished_clone_is_forming() {
+    let mut journal = LifecycleIntentJournal::default();
+    let forming = |journal: &LifecycleIntentJournal| journal.forming().cloned().collect::<Vec<_>>();
+    journal.begin(intent("create"));
+    journal.begin(intent("fork"));
+    journal.begin(intent("remove"));
+    assert_eq!(forming(&journal), Vec::<WorkspaceName>::new());
+
+    for name in ["created", "forked", "removed"] {
+        journal
+            .mark_mutating(&workspace(name))
+            .expect("cross the mutation fence");
+    }
+    assert_eq!(
+        forming(&journal),
+        [workspace("created"), workspace("forked")]
+    );
+
+    journal
+        .complete(
+            &workspace("created"),
+            LifecycleIntentCompletion::Workspace(
+                WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
+            ),
+        )
+        .expect("publish the created workspace");
+    assert_eq!(forming(&journal), [workspace("forked")]);
+}
+
 #[test]
 fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_authorized() {
     let root = TestRoot::new("pending-refusal");

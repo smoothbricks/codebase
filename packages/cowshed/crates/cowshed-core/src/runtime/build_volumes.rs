@@ -2,8 +2,10 @@
 //! land quiesces the landing workspace, freezes the target's seed, and moves the target's one
 //! link, and collection deletes what nothing links.
 //!
-//! Every step here runs inside the project actor, so no two of them interleave; what a crash
-//! leaves behind is a volume nothing links, which [`BuildVolumes::collect`] deletes.
+//! Every step here runs inside one process's project actor, so no two of that process's steps
+//! interleave; another cowshed process's can, which is why collection defers what a workspace
+//! still being created may own ([`Links::creating`]). What a crash leaves behind is a volume
+//! nothing links, which [`BuildVolumes::collect`] deletes.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
@@ -36,12 +38,15 @@ pub(crate) struct Owner {
 }
 
 /// What links build volumes right now: every mounted checkout's build link, every existing
-/// workspace (whose seed a seed may be), and the detached ones, whose links cannot be read.
+/// workspace (whose seed a seed may be), the detached ones, whose links cannot be read, and the
+/// ones being created: a create or fork forks its build volume and seed into the staged checkout
+/// before the workspace exists, so until its intent completes nothing readable names either.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Links {
     pub volumes: BTreeSet<BuildVolumeId>,
     pub owners: BTreeSet<Owner>,
     pub detached: BTreeSet<WorkspaceName>,
+    pub creating: BTreeSet<WorkspaceName>,
 }
 
 /// The landing workspace's volume once nothing writes it (Land step 4).
@@ -576,20 +581,38 @@ pub(crate) enum Deferral {
     /// Its record names `0` as its checkout, which is detached: that checkout's link cannot be
     /// read until it is attached, so nothing proves the volume unreachable.
     DetachedCheckout(WorkspaceName),
-    /// It has no record, and these detached workspaces' links cannot be read: any may name it.
-    UnrecordedWhileDetached(Vec<WorkspaceName>),
+    /// Its record names `0` as its checkout or seed target, whose create or fork has not
+    /// finished: the staged checkout's link cannot be read, and the workspace does not exist
+    /// yet, so nothing proves the volume unreachable.
+    Creating(WorkspaceName),
+    /// It has no record, and workspaces whose links cannot be read yet may name it: the
+    /// detached ones until they are attached, the ones being created until their create or fork
+    /// finishes.
+    Unrecorded {
+        detached: Vec<WorkspaceName>,
+        creating: Vec<WorkspaceName>,
+    },
 }
 
 impl Deferral {
-    /// Whether this is the ordinary state of a detached workspace's own volume rather than
-    /// something a person should look at.
+    /// Whether this is the ordinary state of a detached or still-forming workspace's own volume
+    /// rather than something a person should look at.
     pub fn is_routine(&self) -> bool {
-        matches!(self, Self::DetachedCheckout(_))
+        matches!(self, Self::DetachedCheckout(_) | Self::Creating(_))
     }
 }
 
 impl std::fmt::Display for Deferral {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |formatter: &mut std::fmt::Formatter<'_>, names: &[WorkspaceName]| {
+            for (index, name) in names.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str(", ")?;
+                }
+                write!(formatter, "{name}")?;
+            }
+            Ok(())
+        };
         match self {
             Self::Busy(diagnostic) => write!(formatter, "still in use: {diagnostic}"),
             Self::RecordUnreadable(error) => write!(formatter, "its record is unreadable: {error}"),
@@ -598,15 +621,26 @@ impl std::fmt::Display for Deferral {
                 formatter,
                 "its record names {checkout}, which is detached; decided once {checkout} is attached"
             ),
-            Self::UnrecordedWhileDetached(detached) => {
-                formatter.write_str("it has no record, and the links of detached ")?;
-                for (index, name) in detached.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str(", ")?;
-                    }
-                    write!(formatter, "{name}")?;
+            Self::Creating(workspace) => write!(
+                formatter,
+                "its record names {workspace}, whose create or fork has not finished; decided once it has"
+            ),
+            Self::Unrecorded { detached, creating } => {
+                formatter.write_str("it has no record, and the links of")?;
+                if !detached.is_empty() {
+                    formatter.write_str(" detached ")?;
+                    names(formatter, detached)?;
+                    formatter.write_str(" (until attached)")?;
                 }
-                formatter.write_str(" cannot be read until they are attached")
+                if !detached.is_empty() && !creating.is_empty() {
+                    formatter.write_str(" and")?;
+                }
+                if !creating.is_empty() {
+                    formatter.write_str(" still-forming ")?;
+                    names(formatter, creating)?;
+                    formatter.write_str(" (until their create or fork finishes)")?;
+                }
+                formatter.write_str(" cannot be read")
             }
         }
     }
@@ -650,8 +684,10 @@ pub(crate) struct Plan {
 ///
 /// A live link proves reachability by itself, so a volume one names is kept before its record
 /// is read. A detached workspace's link cannot be read, so whatever it may name is deferred with
-/// it named, never counted reachable and never deleted; so is a volume whose record or size
-/// cannot be read. Nothing is deleted on a guess.
+/// it named, never counted reachable and never deleted; so is whatever a workspace still being
+/// created may name, whose staged link no other process can read and whose seed belongs to a
+/// workspace that does not exist yet; so is a volume whose record or size cannot be read.
+/// Nothing is deleted on a guess.
 pub(crate) fn plan(layout: &BuildVolumeLayout, links: &Links) -> Result<Plan> {
     let mut plan = Plan::default();
     let mut latest = std::collections::BTreeMap::<Owner, (String, BuildVolumeId)>::new();
@@ -663,14 +699,18 @@ pub(crate) fn plan(layout: &BuildVolumeLayout, links: &Links) -> Result<Plan> {
         }
         let record = match layout.read_record_present(&id) {
             Ok(Some(record)) => record,
-            Ok(None) if links.detached.is_empty() => {
+            Ok(None) if links.detached.is_empty() && links.creating.is_empty() => {
                 doomed.push((id, GcReason::UnrecordedBuildVolume));
                 continue;
             }
             Ok(None) => {
-                let detached = links.detached.iter().cloned().collect();
-                plan.deferred
-                    .push((id, Deferral::UnrecordedWhileDetached(detached)));
+                plan.deferred.push((
+                    id,
+                    Deferral::Unrecorded {
+                        detached: links.detached.iter().cloned().collect(),
+                        creating: links.creating.iter().cloned().collect(),
+                    },
+                ));
                 continue;
             }
             Err(error) => {
@@ -680,6 +720,11 @@ pub(crate) fn plan(layout: &BuildVolumeLayout, links: &Links) -> Result<Plan> {
             }
         };
         match record.role {
+            BuildVolumeRole::Seed { target, .. } | BuildVolumeRole::Linked { checkout: target }
+                if links.creating.contains(&target) =>
+            {
+                plan.deferred.push((id, Deferral::Creating(target)));
+            }
             BuildVolumeRole::Seed {
                 target,
                 incarnation,
@@ -915,7 +960,10 @@ mod tests {
             (named, Deferral::DetachedCheckout(name("topic"))),
             (
                 unrecorded,
-                Deferral::UnrecordedWhileDetached(vec![name("topic")]),
+                Deferral::Unrecorded {
+                    detached: vec![name("topic")],
+                    creating: Vec::new(),
+                },
             ),
         ];
         expected.sort_by(|left, right| left.0.cmp(&right.0));
@@ -939,6 +987,163 @@ mod tests {
             )),
             "{plan:?}"
         );
+    }
+
+    /// A create or fork forks its volume and seed into a staged checkout no other process can
+    /// read, before its workspace exists. Until its intent completes, whatever may be its own —
+    /// its live volume, its seed, an image still being cloned for it — is deferred, never
+    /// collected. Another process's `rm` collected exactly these, and the new workspace's mount
+    /// then refused a link to a volume that was gone.
+    #[test]
+    fn a_forming_workspace_defers_its_volume_seed_and_unrecorded_clones() {
+        let store = Store::new();
+        let live = store.volume(linked("lane"));
+        let seed = store.volume(BuildVolumeRole::Seed {
+            target: name("lane"),
+            incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+        });
+        let cloning = store.image();
+        let garbage = store.volume(linked("gone"));
+        let links = Links {
+            creating: [name("lane")].into_iter().collect(),
+            ..Links::default()
+        };
+        let mut plan = plan(&store.layout, &links).unwrap();
+        plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
+        let unrecorded = Deferral::Unrecorded {
+            detached: Vec::new(),
+            creating: vec![name("lane")],
+        };
+        let mut expected = vec![
+            (live.clone(), Deferral::Creating(name("lane"))),
+            (seed.clone(), Deferral::Creating(name("lane"))),
+            (cloning.clone(), unrecorded.clone()),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(plan.deferred, expected);
+        assert_eq!(
+            doomed(&plan),
+            [(garbage.clone(), GcReason::UnlinkedBuildVolume)]
+        );
+        assert!(Deferral::Creating(name("lane")).is_routine());
+        assert!(!unrecorded.is_routine());
+        assert_eq!(
+            unrecorded.to_string(),
+            "it has no record, and the links of still-forming lane (until their create or fork \
+             finishes) cannot be read"
+        );
+        // Without the forming workspace, all three read as garbage: the collection that left
+        // a new workspace linking a volume nobody owned.
+        let mut doomed = doomed(&super::plan(&store.layout, &Links::default()).unwrap());
+        doomed.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (live, GcReason::UnlinkedBuildVolume),
+            (seed, GcReason::SupersededSeed),
+            (cloning, GcReason::UnrecordedBuildVolume),
+            (garbage, GcReason::UnlinkedBuildVolume),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(doomed, expected);
+    }
+
+    /// The `cowshed new` that another process's `rm` broke, on real APFS: a fork clones main's
+    /// seed into a staged checkout, and a collection runs before the workspace is published.
+    /// Told the workspace is forming, collection keeps its live volume and its seed, and the
+    /// fork owns what its link names. Without that, the same collection deletes both, and the
+    /// fork's mount refuses its link exactly as `new executor-log-l` did.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_collection_keeps_a_forming_forks_volume_and_seed() {
+        let scratch = Scratch::new("build-forming-fork");
+        let main = owner("main", '0');
+        let (_, main_live, _) = scratch.linked_checkout("main", 1);
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &BuildVolumeId::mint(),
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                ),
+            )
+            .expect("seed main");
+        let lane = owner("lane", '1');
+        let staged = scratch.root.path().join("staged-lane");
+        fs::create_dir_all(staged.join(".cowshed")).unwrap();
+        let forked = scratch
+            .volumes
+            .fork(main.clone(), lane.clone(), staged.clone())
+            .await
+            .expect("fork from main's seed")
+            .expect("main has a seed");
+        let (lane_seed, _) = scratch
+            .layout
+            .seed_of(&lane.name, &lane.incarnation)
+            .unwrap()
+            .expect("the fork seeded its destination");
+        // What another process's collection sees: main, mounted and linked; the lane only in the
+        // journal, as a create past its mutation fence.
+        let links = |creating: &[&Owner]| Links {
+            volumes: [main_live.clone()].into_iter().collect(),
+            owners: [main.clone()].into_iter().collect(),
+            creating: creating.iter().map(|owner| owner.name.clone()).collect(),
+            ..Links::default()
+        };
+
+        let kept = scratch
+            .volumes
+            .collect(links(&[&lane]), false)
+            .await
+            .unwrap();
+        assert_eq!(kept.reclaimed, 0, "{:?}", kept.candidates);
+        let mut deferred = kept
+            .deferred
+            .iter()
+            .map(|deferred| (deferred.path.clone(), deferred.deferral.clone()))
+            .collect::<Vec<_>>();
+        deferred.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (
+                scratch.layout.image(&forked),
+                Deferral::Creating(lane.name.clone()),
+            ),
+            (
+                scratch.layout.image(&lane_seed),
+                Deferral::Creating(lane.name.clone()),
+            ),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(deferred, expected);
+        assert_eq!(
+            scratch.layout.linked(&staged).unwrap(),
+            Some(forked.clone())
+        );
+        assert_eq!(
+            scratch.layout.resolve_link(&lane.name, &forked).unwrap(),
+            crate::build_volume::LinkResolution::Keep,
+            "the fork owns the volume its link names"
+        );
+
+        // The collection that ran beside `new executor-log-l`, which knew nothing of the fork.
+        let collected = scratch.volumes.collect(links(&[]), false).await.unwrap();
+        assert_eq!(collected.reclaimed, 2, "{:?}", collected.candidates);
+        let refusal = scratch
+            .layout
+            .resolve_link(&lane.name, &forked)
+            .unwrap_err();
+        assert_eq!(
+            refusal.message,
+            format!(
+                "lane's build link names {forked}, which lane does not own, and 0 build volumes \
+                 are recorded as lane's"
+            )
+        );
+        scratch.release_all();
     }
 
     /// A record or size that cannot be read is an error about that one volume: it is deferred

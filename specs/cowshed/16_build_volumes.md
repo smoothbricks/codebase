@@ -254,6 +254,12 @@ again at any level above it.
   process scan. A refused detach leaves the volume for the next GC pass. A process that still runs on main's previous
   build volume after a swap therefore keeps it alive until it exits.
 - Each target keeps only its latest seed; a target's seed is deleted when the target retires.
+- A fork's volume and seed exist before its workspace does: `cowshed new` and `cowshed fork` clone them into the staged
+  checkout, which no other process can read, and publish the workspace afterwards. While the create or fork is past its
+  mutation fence and unfinished in the lifecycle intent journal, collection in any process defers the volumes recorded
+  as that workspace's or as its seed, and every image without a record, naming the workspace. Without this, an `rm` in
+  one process deleted the volume and seed of a `new` running in another, and the new workspace's mount refused its link
+  to a volume nobody owned.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
   database indexes. Cargo's target directory is bounded by the tree it builds; cowshed does not prune it.
