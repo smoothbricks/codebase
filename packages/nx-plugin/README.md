@@ -207,10 +207,12 @@ Members the file index cannot hold, outside the Nx workspace or under `node_modu
 resolution checks external manifests too, so a dependency introduced by an external manifest edit is still covered.
 
 A runtime input that cannot be computed, whether from a manifest or locked dependency it cannot resolve or from
-arguments it refuses, prints one fixed line (`cargo-input-unavailable`, `cargo-input-invalid-arguments`), exits nonzero
-and writes nothing to stderr. Nx hashes a runtime input's stderr even when it exits nonzero, so a path or Cargo message
-there would key the same failure differently in every checkout. The Cargo target that runs next refuses the missing
-dependency or manifest with Cargo's own cause.
+arguments it refuses, prints one fixed line (`cargo-input-unavailable`, `cargo-input-invalid-arguments`) and exits
+nonzero. Nx hashes a runtime input's stderr even when it exits nonzero, so stderr carries the same bytes in every
+checkout: an unresolvable input writes its cause there, Cargo's own message included, with the checkout's absolute path
+written as a relative one and Cargo's timing-dependent lock-wait lines dropped; refused arguments write nothing. The
+cause reaches whoever reads the failed input, and the Cargo target that runs next still refuses the missing dependency
+or manifest with Cargo's own cause.
 
 Cargo resolution failures (no `cargo` on PATH, a stale `Cargo.lock`, or an unavailable locked dependency) fail graph
 inference with `CargoMetadataError`, including the manifest path and Cargo's cause. A member inside the workspace
