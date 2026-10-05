@@ -1272,7 +1272,7 @@ mod tests {
     /// seed into a staged checkout, and a collection runs before the workspace is published.
     /// Told the workspace is forming, collection keeps its live volume and its seed, and the
     /// fork owns what its link names. Without that, the same collection deletes both, and the
-    /// fork's mount refuses its link exactly as `new executor-log-l` did.
+    /// fork's mount refuses its link exactly as the broken `cowshed new` did.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_collection_keeps_a_forming_forks_volume_and_seed() {
@@ -1351,7 +1351,7 @@ mod tests {
             "the fork owns the volume its link names"
         );
 
-        // The collection that ran beside `new executor-log-l`, which knew nothing of the fork.
+        // The collection that ran beside the broken `cowshed new`, which knew nothing of the fork.
         let collected = scratch.volumes.collect(links(&[]), false).await.unwrap();
         assert_eq!(collected.reclaimed, 2, "{:?}", collected.candidates);
         let refusal = scratch
