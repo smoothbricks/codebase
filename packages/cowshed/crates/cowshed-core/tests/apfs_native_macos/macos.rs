@@ -1780,6 +1780,86 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
     assert!(!mountpoint.exists());
 }
 
+/// A retired workspace's checkpoint images are hundreds of gigabytes of sparse blocks, and `cowshed
+/// doctor` previews their collection. The preview, and the identical one the reclaim repeats under
+/// the locks, once hashed every image in full: 1.5 TB of reads and 23 CPU-minutes for one doctor.
+/// The images here are 100 GiB and mode 000, so any open of one to read it fails the preview.
+#[test]
+fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_images() {
+    const FIRST: &str = "00000000000000000000000000000001";
+    const SECOND: &str = "00000000000000000000000000000002";
+    const CURRENT: &str = "00000000000000000000000000000003";
+    const HUNDRED_GIB: u64 = 100 << 30;
+    let fixture = Fixture::new("retired-sparse-checkpoints");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    create_image(layout.main_image().expect("main").image());
+    let name = WorkspaceName::session("retired").expect("retired workspace");
+    let canonical = layout.session_image(&name).expect("session image");
+    create_image(canonical.image());
+    write_session_metadata(canonical.image(), "retired", CURRENT);
+
+    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &label)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint);
+    write_session_metadata(&checkpoint, "retired", FIRST);
+    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
+        .expect("pinned checkpoint fact");
+    let undo = layout
+        .project()
+        .checkpoints
+        .join("retired")
+        .join(format!("pre-restore-{SECOND}.asif"));
+    create_image(&undo);
+    write_session_metadata(&undo, "retired", FIRST);
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/retired-{CURRENT}.asif"));
+    host.retire_image(canonical.image(), &trash)
+        .expect("logical retirement");
+
+    for image in [&checkpoint, &undo] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(image)
+            .and_then(|file| file.set_len(HUNDRED_GIB))
+            .expect("sparse length");
+        std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable image");
+        assert!(
+            std::fs::File::open(image).is_err(),
+            "this test needs a process that mode 000 binds, not root"
+        );
+    }
+
+    let plan = host
+        .preview_gc(&config, &repo())
+        .expect("a preview over sparse checkpoint images reads none of them");
+    let retired = plan
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
+        .collect::<Vec<_>>();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].path(), trash);
+    assert!(
+        retired[0].bytes() < 1 << 20,
+        "sparse images allocate no blocks: {}",
+        retired[0].bytes()
+    );
+    host.execute_gc(&config, plan)
+        .expect("the reclaim repeats the preview and reads no image either");
+    for image in [&trash, &checkpoint, &undo] {
+        assert!(!image.exists(), "{} image remains", image.display());
+    }
+}
+
 #[test]
 fn retired_pending_clone_reclaims_without_touching_reused_name() {
     const RETIRED: &str = "00000000000000000000000000000004";

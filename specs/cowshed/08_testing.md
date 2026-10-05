@@ -59,7 +59,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **GC plan purity and revalidation**: preview fixtures freeze candidate identity/path/allocated-byte/reason ordering
   and byte sums, exclude every pinned checkpoint, and compare repeated previews. Dry-run preserves every image, sidecar,
   fact, and metadata byte. Pin/incarnation/size changes and a held lifecycle lock make execution return stale-plan
-  `Conflict` before mutation; a fresh unchanged plan reclaims exactly its candidates.
+  `Conflict` before mutation; a fresh unchanged plan reclaims exactly its candidates. A preview and reclaim over a
+  retired workspace whose 100 GiB sparse checkpoint images are mode 000 succeed, because identity is taken from `stat`
+  and never opens an image; a same-size, same-time replacement image and a same-length, same-time rewritten record each
+  change the identity.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID

@@ -3084,8 +3084,11 @@ fn active_expected(
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid active workspace identity"))
 }
 
+/// The suffix of the CA private key that rides beside a workspace image.
+const COMPANION_SUFFIX: &str = ".ca.key";
+
 fn companion_path(image: &Path) -> PathBuf {
-    crate::metadata::append_suffix(image, ".ca.key")
+    crate::metadata::append_suffix(image, COMPANION_SUFFIX)
 }
 
 fn absent_expected(expected: &[LifecycleFact]) -> Result<Revision, ApfsStorageError> {

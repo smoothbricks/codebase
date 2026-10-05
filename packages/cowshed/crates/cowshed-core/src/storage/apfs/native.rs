@@ -49,10 +49,10 @@ use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
 };
 use super::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone,
-    companion_path, extents, layout, main_aware_mount_point, recovery_staging_mount,
-    retired_image_below, split_retired_stem, volume_key,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, COMPANION_SUFFIX, LockMode,
+    MarkerExpectation, MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError,
+    ResumableClone, companion_path, extents, layout, main_aware_mount_point,
+    recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
 use crate::timing::timed;
 
@@ -570,6 +570,32 @@ fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
     }
 }
 
+/// A file GC pins by content: the few-hundred-byte records that ride beside an image.
+///
+/// Everything else an identity can name is an image, a sparse file of up to hundreds of
+/// gigabytes, and is pinned by `stat` alone (`gc_candidate`): opening one to hash it cost a
+/// `cowshed doctor` minutes of reads and CPU for a fence the inode already gives. Naming the
+/// records, rather than the images, keeps that true of any file kind added later.
+fn is_gc_record(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            [
+                GRANTS_SIDECAR_SUFFIX,
+                COMPANION_SUFFIX,
+                CHECKPOINT_FACT_SUFFIX,
+                RESTORE_RECOVERY_FACT_SUFFIX,
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        })
+}
+
+/// The identity of one reclamation, fencing it against any change between preview and execution.
+///
+/// Every associated file contributes its path, length, allocation and modification time. A record
+/// (`is_gc_record`) also contributes its content; any other file, above all an image, contributes
+/// the device and inode `stat` reports and is never opened.
 fn gc_candidate(
     reason: StorageGcReason,
     path: &Path,
@@ -611,11 +637,17 @@ fn gc_candidate(
             .unwrap_or_default();
         hasher.update(modified.as_secs().to_le_bytes());
         hasher.update(modified.subsec_nanos().to_le_bytes());
-        if associated != path {
+        if is_gc_record(associated) {
             hasher.update(
                 fs::read(associated)
                     .map_err(|error| io_error("read GC candidate identity", associated, error))?,
             );
+        } else {
+            #[cfg(unix)]
+            {
+                hasher.update(metadata.dev().to_le_bytes());
+                hasher.update(metadata.ino().to_le_bytes());
+            }
         }
     }
     Ok(StorageGcCandidate::new(
@@ -6143,6 +6175,141 @@ mod tests {
             "emptied bottom-up"
         );
         fs::remove_dir_all(root).expect("fixture");
+    }
+
+    const HUNDRED_GIB: u64 = 100 << 30;
+
+    fn gc_scratch(test: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-gc-identity-{test}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    /// An image of `bytes` logical length and no allocated block, as a checkpoint of a mostly
+    /// empty volume is.
+    fn sparse_image(path: &Path, bytes: u64) {
+        File::create(path)
+            .expect("image")
+            .set_len(bytes)
+            .expect("sparse length");
+    }
+
+    /// The records `image_gc_paths` names, small enough that their content is read.
+    fn write_gc_records(image: &Path, content: &[u8]) {
+        for record in image_gc_paths(image)
+            .iter()
+            .filter(|path| is_gc_record(path))
+        {
+            fs::write(record, content).expect("record");
+        }
+    }
+
+    /// `gc_candidate` runs inside every `cowshed doctor` and again inside every reclaim, over a
+    /// retired workspace's checkpoint images. It once hashed each one, 250 GB sparse files read
+    /// in full for 23 CPU-minutes. Here the images are mode 000: any open of one to read it fails,
+    /// so a plan taken at all proves no content read happened, and no read count or timing bound
+    /// can be flaky.
+    #[test]
+    fn gc_identity_never_reads_an_image_however_large() {
+        let root = gc_scratch("never-reads");
+        let trash = root.join("retired-00000000000000000000000000000001.asif");
+        let checkpoint = root.join("one.asif");
+        for image in [&trash, &checkpoint] {
+            sparse_image(image, HUNDRED_GIB);
+            write_gc_records(image, b"{}");
+            fs::set_permissions(image, fs::Permissions::from_mode(0o000))
+                .expect("unreadable image");
+        }
+        assert!(
+            File::open(&checkpoint).is_err(),
+            "this test needs a process that mode 000 binds, not root"
+        );
+        let mut associated = image_gc_paths(&trash);
+        associated.extend(image_gc_paths(&checkpoint));
+
+        let candidate = gc_candidate(StorageGcReason::RetiredWorkspace, &trash, &associated, &[])
+            .expect("an identity taken from metadata alone");
+        assert!(
+            candidate.bytes() < 1 << 20,
+            "a sparse image allocates no blocks: {}",
+            candidate.bytes()
+        );
+        fs::remove_dir_all(root).expect("scratch");
+    }
+
+    /// The identity still fences what the deletion needs fenced. An image replaced by another of
+    /// the same length, allocation and modification time differs by inode; a record rewritten to
+    /// the same length and time differs by content.
+    #[test]
+    fn gc_identity_fences_a_replaced_image_and_a_rewritten_record() {
+        let root = gc_scratch("fences");
+        let image = root.join("one.asif");
+        sparse_image(&image, 1 << 30);
+        write_gc_records(&image, b"{\"revision\":1}");
+        let identity = || {
+            gc_candidate(
+                StorageGcReason::ExpiredCheckpoint,
+                &image,
+                &image_gc_paths(&image),
+                &[],
+            )
+            .expect("identity")
+        };
+        let before = identity();
+        assert!(identity() == before, "an unchanged candidate is stable");
+
+        let modified = |path: &Path| {
+            fs::metadata(path)
+                .and_then(|m| m.modified())
+                .expect("mtime")
+        };
+        let image_time = modified(&image);
+        let replacement = root.join("replacement.asif");
+        sparse_image(&replacement, 1 << 30);
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .and_then(|file| file.set_modified(image_time))
+            .expect("same modification time");
+        fs::rename(&replacement, &image).expect("replace");
+        let replaced = identity();
+        assert!(
+            replaced != before,
+            "a replacement of the same size and time is a different file"
+        );
+
+        let record = sidecar_path(&image);
+        let record_time = modified(&record);
+        fs::write(&record, b"{\"revision\":2}").expect("rewrite the record");
+        File::options()
+            .write(true)
+            .open(&record)
+            .and_then(|file| file.set_modified(record_time))
+            .expect("same modification time");
+        assert!(
+            identity() != replaced,
+            "a record rewritten to the same length and time is different content"
+        );
+        fs::remove_dir_all(root).expect("scratch");
+    }
+
+    /// The records content-pinned are exactly the files `image_gc_paths` names beside an image;
+    /// the image, in either spelling, is never one.
+    #[test]
+    fn gc_records_are_exactly_the_files_that_ride_beside_an_image() {
+        let image = Path::new("/store/p/sessions/raven.asif");
+        let artifacts = image_gc_paths(image);
+        let (records, others): (Vec<_>, Vec<_>) =
+            artifacts.iter().partition(|path| is_gc_record(path));
+        assert_eq!(others, [&image.to_owned()]);
+        assert_eq!(records.len(), artifacts.len() - 1);
+        assert!(!is_gc_record(Path::new(
+            "/store/p/sessions/raven.sparseimage"
+        )));
     }
 
     #[test]

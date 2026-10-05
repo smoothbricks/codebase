@@ -71,6 +71,14 @@ pub trait Substrate: LifecyclePlanner {
 failure local to one candidate is returned in `StorageGcReport.deferred: Vec<StorageGcDeferred { path, diagnostic }>`;
 later candidates still run. Only a stale plan or unsafe ownership/integrity proof refuses the sweep.
 
+A candidate's identity is a digest of what `stat` reports, plus the content of the small records beside an image. Each
+file it names contributes its path, length, allocated bytes and modification time. A record (grants sidecar, CA key,
+checkpoint and restore-recovery facts) also contributes its content; every other file, above all an image, contributes
+its device and inode and is never opened. An image is a sparse file of up to hundreds of gigabytes, `doctor` previews
+every retired workspace's checkpoint images, and `execute_gc` repeats the preview under the locks, so hashing contents
+would read the whole store twice for a fence the inode already gives: a replacement differs by inode, a write by
+modification time, a resize by length.
+
 Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The
 implemented APFS controller boundary is staged so that controller-owned state can be initialized or fenced while the
 lifecycle lock remains held. `ApfsSubstrate` exposes these methods:
@@ -155,12 +163,11 @@ The executor contract is:
   fence is where the controller durably commits the incarnation/token/gateway/supervisor handoff; neither the old nor
   new incarnation may be admitted across that barrier. Verification-only restore detaches and returns without a fence.
 - **Cancellation follows the same transaction boundaries as errors.** Dropping a future while an adopt/create/fork
-  initialization callback is pending synchronously detaches its private attachment and reclaims any cloned staging
-  image before the lifecycle lock is released. Dropping a checkpoint future while its pre-clone barrier is pending
-  creates no image. Once restore has persisted `PendingPublicationFact`, rollback across the incarnation fence is
-  forbidden: a fence error, activation error, cancellation, or crash retains the typed pending fact, and the next
-  recovery pass completes publication forward. Recovery and `gc` also finish any idempotent cleanup left by an
-  interrupted abort.
+  initialization callback is pending synchronously detaches its private attachment and reclaims any cloned staging image
+  before the lifecycle lock is released. Dropping a checkpoint future while its pre-clone barrier is pending creates no
+  image. Once restore has persisted `PendingPublicationFact`, rollback across the incarnation fence is forbidden: a
+  fence error, activation error, cancellation, or crash retains the typed pending fact, and the next recovery pass
+  completes publication forward. Recovery and `gc` also finish any idempotent cleanup left by an interrupted abort.
 
 Plans remain pure, immutable, and capability-free: they contain validated logical names, expected incarnation/revision,
 and intended operations, but no open descriptors, caller-supplied mounted paths, or executed side effects. CLI commands
