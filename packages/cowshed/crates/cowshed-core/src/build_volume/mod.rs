@@ -447,6 +447,46 @@ impl BuildVolumeLayout {
         BuildVolumeId::parse(target.file_name()?.to_str()?)
     }
 
+    /// The build volume `checkout` links, or `None` when it links none. A link outside
+    /// this controller-owned project's mount directory is never accepted as authority.
+    pub fn linked(&self, checkout: &Path) -> crate::Result<Option<BuildVolumeId>> {
+        let Some(target) = link::linked(checkout)? else {
+            return Ok(None);
+        };
+        self.volume_at(&target).map(Some).ok_or_else(|| {
+            crate::CowshedError::integrity(
+                format!(
+                    "{} names {}, which is not one of this project's build volumes",
+                    checkout.join(link::BUILD_LINK).display(),
+                    target.display(),
+                ),
+                "cowshed doctor --json",
+            )
+        })
+    }
+
+    /// Resolve the current physical grant for one job, including an Nx keeper restart.
+    /// Mounting already resolved stale links; a volume this workspace does not own refuses.
+    pub fn grant(
+        &self,
+        workspace: &WorkspaceName,
+        checkout: &Path,
+    ) -> crate::Result<Option<PathBuf>> {
+        let Some(id) = self.linked(checkout)? else {
+            return Ok(None);
+        };
+        match self.resolve_link(workspace, &id)? {
+            LinkResolution::Keep => Ok(Some(self.mount(&id))),
+            resolution => Err(crate::CowshedError::integrity(
+                format!(
+                    "{workspace}'s mounted build link names {id}, which mounting should have \
+                     resolved ({resolution:?})"
+                ),
+                format!("cowshed detach {workspace}, then retry"),
+            )),
+        }
+    }
+
     pub fn read_record(&self, id: &BuildVolumeId) -> crate::Result<BuildVolumeRecord> {
         self.read_record_present(id)?.ok_or_else(|| {
             crate::CowshedError::integrity(

@@ -299,7 +299,7 @@ pub async fn resolve(
 }
 
 /// The build-volume grant of `workspace` mounted at `mount`, as the controller would resolve it
-/// (`BuildVolumes::grant`): the volume its build link names, when that volume's record says it
+/// (`BuildVolumeLayout::grant`): the volume its build link names, when that volume's record says it
 /// is the workspace's live volume and it is mounted. A link the controller would re-point, or a
 /// volume it would mount, declines.
 fn build_volume_grant(

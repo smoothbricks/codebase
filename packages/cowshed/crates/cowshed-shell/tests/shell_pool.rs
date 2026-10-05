@@ -153,6 +153,7 @@ impl Workspace {
             workspace_root: self.sandbox.workspace_mount.clone(),
             default_cwd: None,
             sandbox: self.sandbox.clone(),
+            build_volume_layout: None,
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_millis(300),
             actor_capacity: 16,

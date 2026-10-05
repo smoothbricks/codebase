@@ -78,7 +78,7 @@ pub(crate) struct Collection {
 #[derive(Clone)]
 pub(crate) struct BuildVolumes {
     host: Arc<Host>,
-    layout: BuildVolumeLayout,
+    pub layout: BuildVolumeLayout,
 }
 
 impl BuildVolumes {
@@ -96,28 +96,11 @@ impl BuildVolumes {
             .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
     }
 
-    /// The build volume `checkout` links, or `None` when it links none.
-    pub fn linked(&self, checkout: &Path) -> Result<Option<BuildVolumeId>> {
-        let Some(target) = link::linked(checkout)? else {
-            return Ok(None);
-        };
-        self.layout.volume_at(&target).map(Some).ok_or_else(|| {
-            CowshedError::integrity(
-                format!(
-                    "{} names {}, which is not one of this project's build volumes",
-                    checkout.join(link::BUILD_LINK).display(),
-                    target.display()
-                ),
-                "cowshed doctor --json",
-            )
-        })
-    }
-
     /// The published volume `checkout` links and the state written at its root, or `None` when
     /// it links none or an interrupted first touch left its volume without a record (which only
     /// a fresh discovery finishes). The checkout is mounted, which mounted its volume.
     pub fn state_of(&self, checkout: &Path) -> Result<Option<(BuildVolumeId, BuildVolumeState)>> {
-        let Some(id) = self.linked(checkout)? else {
+        let Some(id) = self.layout.linked(checkout)? else {
             return Ok(None);
         };
         if self.layout.read_record_present(&id)?.is_none() {
@@ -125,27 +108,6 @@ impl BuildVolumes {
         }
         let state = BuildVolumeState::read(&self.layout.mount(&id))?;
         Ok(Some((id, state)))
-    }
-
-    /// The mountpoint of the volume `workspace`'s mounted `checkout` links, verified as the
-    /// workspace's own by its record: the build-volume grant a job of the checkout runs with.
-    /// `None` when the checkout links no volume. Mounting already re-pointed a stale link, so
-    /// a link that still names a volume the workspace does not own is an integrity failure,
-    /// never a grant.
-    pub fn grant(&self, workspace: &WorkspaceName, checkout: &Path) -> Result<Option<PathBuf>> {
-        let Some(id) = self.linked(checkout)? else {
-            return Ok(None);
-        };
-        match self.layout.resolve_link(workspace, &id)? {
-            crate::build_volume::LinkResolution::Keep => Ok(Some(self.layout.mount(&id))),
-            resolution => Err(CowshedError::integrity(
-                format!(
-                    "{workspace}'s mounted build link names {id}, which mounting should have \
-                     resolved ({resolution:?})"
-                ),
-                format!("cowshed detach {workspace}, then retry"),
-            )),
-        }
     }
 
     /// Bring `checkout`'s build volume in line with what capability detection names now
@@ -163,7 +125,7 @@ impl BuildVolumes {
         checkout: PathBuf,
         discovered: Discovered,
     ) -> Result<std::result::Result<BuildStateRefresh, TrackedBuildStateRefusal>> {
-        let linked = self.linked(&checkout)?;
+        let linked = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| {
             let published = match &linked {
                 Some(id) => layout.read_record_present(id)?.is_some(),
@@ -341,8 +303,8 @@ impl BuildVolumes {
         checkout: PathBuf,
         target_checkout: PathBuf,
     ) -> Result<std::result::Result<Quiet, AdoptionSkip>> {
-        let id = self.linked(&checkout)?;
-        let target = self.linked(&target_checkout)?;
+        let id = self.layout.linked(&checkout)?;
+        let target = self.layout.linked(&target_checkout)?;
         self.blocking(move |host, layout| {
             let Some(id) = id else {
                 return Ok(Err(AdoptionSkip::NoLandingVolume));
@@ -425,7 +387,7 @@ impl BuildVolumes {
         target_checkout: PathBuf,
         tree: GitOid,
     ) -> Result<std::result::Result<u64, AdoptionSkip>> {
-        let previous = self.linked(&target_checkout)?;
+        let previous = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |host, layout| {
             let Some(previous) = previous else {

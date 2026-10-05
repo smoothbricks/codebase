@@ -71,6 +71,9 @@ pub struct WorkspaceSupervisorConfig {
     pub workspace_root: PathBuf,
     pub default_cwd: Option<WorkspacePath>,
     pub sandbox: SandboxConfig,
+    /// Controller-owned store and mount paths for resolving each Nx keeper start's current
+    /// build-volume grant. Repository links cannot supply this authority.
+    pub build_volume_layout: Option<crate::build_volume::BuildVolumeLayout>,
     pub artifacts: ArtifactConfig,
     pub term_grace: Duration,
     pub actor_capacity: usize,
@@ -156,6 +159,7 @@ impl Default for WorkspaceSupervisorConfig {
                 build_volume_mount: None,
                 capabilities: Default::default(),
             },
+            build_volume_layout: None,
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),
             actor_capacity: DEFAULT_ACTOR_CAPACITY,
@@ -2239,6 +2243,7 @@ impl WorkspaceSupervisor {
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             policy,
+            build_volume_layout: config.build_volume_layout,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger,
             inherited_groups: config.inherited_groups,
@@ -2511,6 +2516,7 @@ struct SupervisorActor {
     default_cwd: Option<WorkspacePath>,
     /// The sandbox of the authority served, rendered once when it was taken.
     policy: SandboxPolicy,
+    build_volume_layout: Option<crate::build_volume::BuildVolumeLayout>,
     /// Names withheld from every child; see [`WorkspaceSupervisorConfig::credential_env_names`].
     credential_env_names: BTreeSet<String>,
     term_grace: Duration,
@@ -3217,6 +3223,22 @@ impl SupervisorActor {
         }
     }
 
+    fn current_build_volume_grant(&self) -> Result<Option<PathBuf>> {
+        match &self.build_volume_layout {
+            Some(layout) => layout.grant(&self.authority.workspace, &self.workspace_root),
+            None => match crate::build_volume::link::linked(&self.workspace_root)? {
+                None => Ok(None),
+                Some(_) => Err(CowshedError::integrity(
+                    format!(
+                        "the supervisor of {} has no controller-owned build-volume layout",
+                        self.authority.workspace,
+                    ),
+                    "restart this workspace's supervisor with the current cowshed",
+                )),
+            },
+        }
+    }
+
     /// One probe of a shed's Nx daemon: nothing while the keeper's start job runs; once it has
     /// ended, say how it went unless it left the daemon live; start the daemon, inside the
     /// sandbox, when the probe finds none live. Nobody waits for the start, so a start that is
@@ -3248,13 +3270,11 @@ impl SupervisorActor {
             return;
         }
         let authority = self.authority.clone();
-        let started = match super::nx_daemon::start_request(&self.workspace_root, &project_root) {
-            Ok(request) => {
-                // The daemon follows the volume the last controller-admitted job was granted.
-                let build_volume = self.policy.ceiling().build_volume_mount.clone();
-                self.admit_exec(authority, None, build_volume, request, true)
-                    .await
-            }
+        let started = match self.current_build_volume_grant().and_then(|grant| {
+            super::nx_daemon::start_request(&self.workspace_root, &project_root)
+                .map(|request| (grant, request))
+        }) {
+            Ok((grant, request)) => self.admit_exec(authority, None, grant, request, true).await,
             Err(error) => Err(error),
         };
         match started {
@@ -5328,6 +5348,7 @@ mod lifecycle_commitment_tests {
                 workspace_mount: workspace_root.clone(),
                 ..defaults.sandbox
             },
+            build_volume_layout: None,
             artifacts: ArtifactConfig {
                 historical_incarnations: admitted.clone(),
                 ..ArtifactConfig::default()

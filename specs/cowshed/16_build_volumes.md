@@ -390,12 +390,18 @@ it belongs to. Each job's sandbox grants exactly the build volume the controller
 (04_sandbox.md); the supervisor is never relaunched for a swap:
 
 - A job admitted after a swap, and the Nx daemon the supervisor restarts after it, use the new build volume entirely.
+  The keeper resolves the current pointer through the same controller-owned layout as admission on every restart, even
+  when no user job has been admitted since the swap. Repository links alone never authorize a mount.
 - A job admitted before the swap keeps its grant and stays on the old volume. The target's previous volume is released
   without force, so it stays attached, busy, until the last such job exits; GC then deletes it. Nothing is killed.
 - A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the
   daemon it watched is stopped at a swap (Nx reports `reconnecting`).
+
+- **Enforced by**: a paused-clock supervisor test pivots the build link while its first keeper job runs, admits no
+  intervening user job, and requires the restarted daemon's grant to name only the adopted volume while the old job's
+  profile still names only the previous volume.
 
 ## Stacks and fragmentation
 

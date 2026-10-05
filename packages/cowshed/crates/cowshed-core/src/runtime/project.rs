@@ -3641,12 +3641,15 @@ impl NativeProjectRuntimeHost {
             .main_aware_workspace_mount(&self.substrate_config.checkout_path, workspace)
             .map_err(native_integrity_error)
     }
+    fn build_volume_layout(&self) -> Result<crate::build_volume::BuildVolumeLayout> {
+        crate::build_volume::BuildVolumeLayout::new(self.layout.project())
+            .map_err(native_integrity_error)
+    }
 
     fn build_volumes(&self) -> Result<super::build_volumes::BuildVolumes> {
         Ok(super::build_volumes::BuildVolumes::new(
             self.substrate.shared_host(),
-            crate::build_volume::BuildVolumeLayout::new(self.layout.project())
-                .map_err(native_integrity_error)?,
+            self.build_volume_layout()?,
         ))
     }
 
@@ -3666,7 +3669,7 @@ impl NativeProjectRuntimeHost {
                 workspace.derived.mount_state,
                 crate::storage::lifecycle::MountState::Mounted { .. }
             ) {
-                if let Some(id) = volumes.linked(&self.workspace_mount_path(&name)?)? {
+                if let Some(id) = volumes.layout.linked(&self.workspace_mount_path(&name)?)? {
                     links.volumes.insert(id);
                 }
             } else {
@@ -3693,10 +3696,10 @@ impl NativeProjectRuntimeHost {
             seeded: false,
             adoption: Adoption::Skipped { reason },
         };
-        if volumes.linked(landing)?.is_none() {
+        if volumes.layout.linked(landing)?.is_none() {
             return Ok(skipped(AdoptionSkip::NoLandingVolume));
         }
-        if volumes.linked(&into.mount)?.is_none() {
+        if volumes.layout.linked(&into.mount)?.is_none() {
             return Ok(skipped(AdoptionSkip::NoTargetVolume));
         }
         // Step 4: the supervisor stops every job of the landing workspace; the volume's own
@@ -3868,7 +3871,7 @@ impl NativeProjectRuntimeHost {
             &grants,
             mount.to_owned(),
             main_mount.clone(),
-            volumes.grant(&name, mount)?,
+            volumes.layout.grant(&name, mount)?,
         )?;
         let (fingerprint, recorded) = {
             let (sandbox, volumes, mount) = (sandbox.clone(), volumes.clone(), mount.to_owned());
@@ -3956,7 +3959,7 @@ impl NativeProjectRuntimeHost {
         let current = self.current(workspace).await?;
         let mount = self.workspace_mount_path(workspace)?;
         self.refresh_build_state_for(&current, &mount).await?;
-        let grant = self.build_volumes()?.grant(workspace, &mount)?;
+        let grant = self.build_volume_layout()?.grant(workspace, &mount)?;
         Ok((handle, grant))
     }
 
@@ -5787,6 +5790,7 @@ impl NativeProjectRuntimeHost {
         // One builder, so a grant advance cannot hand the supervisor a different policy than
         // its first start did. A deny, socket, or grant field added to only one of two inline
         // copies is a silent sandbox-policy fork.
+        let build_volume_layout = self.build_volume_layout()?;
         let sandbox = supervisor_sandbox(
             &self.home,
             &self.layout,
@@ -5796,7 +5800,7 @@ impl NativeProjectRuntimeHost {
             mount.clone(),
             self.workspace_mount_path(&main_name())?,
             // The volume the checkout links at start; each admitted job then carries its own.
-            self.build_volumes()?.grant(name, &mount)?,
+            build_volume_layout.grant(name, &mount)?,
         )?;
         let historical_incarnations = workspace_lineage(
             &mount,
@@ -5809,6 +5813,7 @@ impl NativeProjectRuntimeHost {
             workspace_root: mount,
             default_cwd: None,
             sandbox,
+            build_volume_layout: Some(build_volume_layout),
             artifacts: crate::storage::job_artifact::ArtifactConfig {
                 historical_incarnations,
                 ..crate::storage::job_artifact::ArtifactConfig::default()
@@ -6266,7 +6271,7 @@ impl NativeProjectRuntimeHost {
             &grants,
             self.workspace_mount_path(name)?,
             self.workspace_mount_path(&main_name())?,
-            self.build_volumes()?
+            self.build_volume_layout()?
                 .grant(name, &self.workspace_mount_path(name)?)?,
         )?;
         let served = self
@@ -13327,7 +13332,7 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
 }
 
 /// `build_volume_mount` is the checkout's build volume as resolved now
-/// ([`super::build_volumes::BuildVolumes::grant`]); a grant-only validation passes `None`.
+/// ([`crate::build_volume::BuildVolumeLayout::grant`]); a grant-only validation passes `None`.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn supervisor_sandbox(

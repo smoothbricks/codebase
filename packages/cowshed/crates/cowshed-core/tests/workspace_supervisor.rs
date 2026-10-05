@@ -390,6 +390,7 @@ fn config() -> WorkspaceSupervisorConfig {
             build_volume_mount: None,
             capabilities: Default::default(),
         },
+        build_volume_layout: None,
         artifacts: ArtifactConfig {
             combined_output_quota_bytes: 1024,
             ..ArtifactConfig::default()
@@ -3002,6 +3003,106 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
     std::fs::remove_dir_all(sockets).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A keeper resolves the checkout's current pointer even when no user job has been
+/// admitted since a land. Restarting the daemon must not reuse the previous job's grant.
+#[tokio::test(start_paused = true)]
+async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
+    use cowshed_core::build_volume::{
+        BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
+    };
+    use cowshed_core::capabilities::{BuildStatePath, RelPath};
+    use cowshed_core::repository::ProjectPaths;
+
+    let (mut supervisor_config, root) = nx_project("raven");
+    let checkout = supervisor_config.workspace_root.clone();
+    supervisor_config.sandbox.mount_root = root.join("mounts");
+    std::fs::create_dir_all(&supervisor_config.sandbox.mount_root).unwrap();
+    let project = ProjectPaths::with_mount_root(
+        root.join("store"),
+        &supervisor_config.sandbox.mount_root,
+        &supervisor_config.authority.repo_id,
+    )
+    .unwrap();
+    let layout = BuildVolumeLayout::new(&project).unwrap();
+    let before_id = BuildVolumeId::parse(&"a".repeat(32)).unwrap();
+    let adopted_id = BuildVolumeId::parse(&"b".repeat(32)).unwrap();
+    let before = layout.mount(&before_id);
+    let adopted = layout.mount(&adopted_id);
+    std::fs::create_dir_all(layout.images()).unwrap();
+    for id in [&before_id, &adopted_id] {
+        let mount = layout.mount(id);
+        std::fs::create_dir_all(mount.join("nx/cache")).unwrap();
+        std::fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
+        layout
+            .write_record(
+                id,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Linked {
+                        checkout: supervisor_config.authority.workspace.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+    }
+    link::point(&checkout, &before).unwrap();
+    let paths = [
+        BuildStatePath {
+            checkout: RelPath::new(".nx/cache").unwrap(),
+            volume: RelPath::new("nx/cache").unwrap(),
+        },
+        BuildStatePath {
+            checkout: RelPath::new(".nx/workspace-data").unwrap(),
+            volume: RelPath::new("nx/workspace-data").unwrap(),
+        },
+    ];
+    link::link_paths(&checkout, &before, &paths).unwrap();
+    supervisor_config.sandbox.build_volume_mount = Some(before.clone());
+    supervisor_config.build_volume_layout = Some(layout.clone());
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+
+    let first = h.spawned.recv().await.unwrap();
+    let SpawnCommand::Argv(first_argv) = &first.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(first_argv, &nx_daemon_start(&checkout));
+    // The first keeper job is still active. Pivot before completing it, with no exec
+    // between the pivot and the keeper's next start.
+    link::point(&checkout, &adopted).unwrap();
+    layout
+        .write_record(
+            &before_id,
+            &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
+        )
+        .unwrap();
+    complete(&first, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(first.request.job_id).await.unwrap();
+    let second = tokio::time::timeout(NX_PROBES, h.spawned.recv())
+        .await
+        .expect("the keeper restarts the daemon after the pivot")
+        .unwrap();
+    let SpawnCommand::Argv(second_argv) = &second.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(second_argv, &nx_daemon_start(&checkout));
+    assert_eq!(second.request.mode, RunSandboxMode::ReadWrite);
+    assert_ne!(second.request.job_id, first.request.job_id);
+    for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
+        let (first_config, first_profile) = first.request.policy.child(mode);
+        let (second_config, second_profile) = second.request.policy.child(mode);
+        assert_eq!(first_config.build_volume_mount.as_ref(), Some(&before));
+        assert_eq!(second_config.build_volume_mount.as_ref(), Some(&adopted));
+        assert!(first_profile.contains(before.to_str().unwrap()));
+        assert!(!first_profile.contains(adopted.to_str().unwrap()));
+        assert!(second_profile.contains(adopted.to_str().unwrap()));
+        assert!(!second_profile.contains(before.to_str().unwrap()));
+    }
+    complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(second.request.job_id).await.unwrap();
+    h.handle.retire().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
