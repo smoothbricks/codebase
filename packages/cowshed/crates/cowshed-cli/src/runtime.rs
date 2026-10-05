@@ -2803,8 +2803,11 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
                         .unwrap_or_default()
                 ));
             }
-            for check in &check.without_nx_run {
-                lines.push(format!("build volume `{check}` left no Nx run to judge"));
+            for unattributed in &check.unattributed {
+                lines.push(format!(
+                    "build volume: `{}` is not judged by {}: {}",
+                    unattributed.check, unattributed.cache, unattributed.reason
+                ));
             }
             for failed in &check.failed {
                 lines.push(format!(

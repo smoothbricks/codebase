@@ -504,7 +504,13 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                         inputs_digest: Sha256Digest::compute(b"inputs"),
                         inputs_error: None,
                     }],
-                    without_nx_run: vec!["cargo test".to_owned()],
+                    unattributed: vec![cowshed_core::api::dto::UnattributedCheck {
+                        check: "cargo test".to_owned(),
+                        cache: ".nx/cache".to_owned(),
+                        reason: cowshed_core::api::dto::UnattributedRun::BeganBeforeCheck {
+                            start: "2026-10-05T00:00:00.000Z".to_owned(),
+                        },
+                    }],
                     failed: vec![cowshed_core::api::dto::FailedCheck {
                         check: "bun nx run-many -t lint".to_owned(),
                         exit: Some(1),

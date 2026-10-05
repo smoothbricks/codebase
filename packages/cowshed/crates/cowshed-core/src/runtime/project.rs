@@ -3735,15 +3735,16 @@ impl NativeProjectRuntimeHost {
     }
 
     /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and
-    /// misses come from the run summary stock Nx writes into the target's cache directory; each
-    /// miss carries the inputs Nx hashes for it.
+    /// misses come from the run summary stock Nx writes into the target's cache directory, and
+    /// only from one attributed to the check itself (`nx::attribute`); each miss carries the
+    /// inputs Nx hashes for it.
     async fn check_adoption(
         &mut self,
         target: &WorkspaceName,
         mount: &Path,
         checks: &[String],
     ) -> Result<crate::api::dto::AdoptionCheck> {
-        use crate::build_volume::nx::{CacheStatus, run_within};
+        use crate::build_volume::nx::{Attribution, CacheStatus, attribute};
         let mut result = crate::api::dto::AdoptionCheck::default();
         let state = crate::build_volume::BuildVolumeState::read(
             &mount.join(crate::build_volume::BUILD_LINK),
@@ -3760,14 +3761,14 @@ impl NativeProjectRuntimeHost {
                         .and_then(Path::file_name)
                         .is_some_and(|name| name == ".nx")
             })
-            .map(|path| mount.join(path.checkout.as_path()))
+            .map(|path| path.checkout.as_path().to_owned())
             .collect::<Vec<_>>();
         let handle = self.ensure_supervisor(target).await?;
         for check in checks {
-            let started = std::time::SystemTime::now();
+            let spawned = std::time::SystemTime::now();
             let job = handle.exec(None, land_check_request(check)).await?;
             let info = handle.wait(job).await?;
-            let ended = std::time::SystemTime::now();
+            let exited = std::time::SystemTime::now();
             match info.exit {
                 Some(crate::api::dto::ExitStatus::Exited { code: 0 }) => {}
                 Some(crate::api::dto::ExitStatus::Exited { code }) => {
@@ -3781,32 +3782,34 @@ impl NativeProjectRuntimeHost {
                     exit: None,
                 }),
             }
-            let mut ran = false;
+            let mut unattributed = Vec::new();
+            let mut attributed = false;
             for cache in &caches {
-                let run = run_within(cache, started, ended).map_err(|error| {
-                    CowshedError::integrity(
-                        format!(
-                            "cannot read Nx's run summary in {}: {error}",
-                            cache.display()
-                        ),
-                        "cowshed doctor --json",
-                    )
-                })?;
-                let Some(run) = run else { continue };
-                ran = true;
-                for task in run.tasks {
-                    match task.cache {
-                        CacheStatus::LocalHit | CacheStatus::RemoteHit => result.hits += 1,
-                        CacheStatus::Miss => {
-                            result
-                                .misses
-                                .push(task_inputs(&handle, task.task_id, task.hash).await?);
+                match attribute(&mount.join(cache), check, spawned, exited) {
+                    Attribution::Ours(run) => {
+                        attributed = true;
+                        for task in run.tasks {
+                            match task.cache {
+                                CacheStatus::LocalHit | CacheStatus::RemoteHit => {
+                                    result.hits += 1;
+                                }
+                                CacheStatus::Miss => result
+                                    .misses
+                                    .push(task_inputs(&handle, task.task_id, task.hash).await?),
+                            }
                         }
+                    }
+                    Attribution::Unattributed(reason) => {
+                        unattributed.push(crate::api::dto::UnattributedCheck {
+                            check: check.clone(),
+                            cache: cache.to_string_lossy().into_owned(),
+                            reason,
+                        });
                     }
                 }
             }
-            if !ran {
-                result.without_nx_run.push(check.clone());
+            if !attributed {
+                result.unattributed.extend(unattributed);
             }
         }
         Ok(result)
@@ -12275,8 +12278,9 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
 }
 
 /// The inputs Nx hashes for the missed task `task` in the workspace `handle` serves, from
-/// `nx show target inputs <task> --json` run there, each category Nx names with its entries,
-/// and their digest. A task Nx cannot describe keeps its hash and says why.
+/// `nx show target inputs <task> --json` run there (`nx::task_inputs` pins its shape), and their
+/// digest. A task Nx cannot describe, or whose description cannot be read whole, keeps its hash
+/// and says why; nothing is inferred from partial output.
 #[cfg(target_os = "macos")]
 async fn task_inputs(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
@@ -12292,49 +12296,36 @@ async fn task_inputs(
     let info = handle.wait(job).await?;
     let mut stdout = Vec::new();
     let mut offset = 0_u64;
-    while let Ok(chunk) = handle
-        .log_read(job, StreamKind::Stdout, offset, false)
-        .await
-    {
-        stdout.extend_from_slice(&chunk.bytes);
-        offset = chunk.next_offset;
-        if chunk.eof {
-            break;
-        }
-    }
-    let mut inputs = std::collections::BTreeMap::new();
-    let inputs_error = match (
-        &info.exit,
-        serde_json::from_slice::<serde_json::Value>(&stdout),
-    ) {
-        (
-            Some(crate::api::dto::ExitStatus::Exited { code: 0 }),
-            Ok(serde_json::Value::Object(map)),
-        ) => {
-            for (category, entries) in map {
-                if let serde_json::Value::Array(entries) = entries {
-                    inputs.insert(
-                        category,
-                        entries
-                            .into_iter()
-                            .map(|entry| match entry {
-                                serde_json::Value::String(entry) => entry,
-                                other => other.to_string(),
-                            })
-                            .collect::<Vec<_>>(),
-                    );
+    let read = loop {
+        match handle
+            .log_read(job, StreamKind::Stdout, offset, false)
+            .await
+        {
+            Ok(chunk) => {
+                stdout.extend_from_slice(&chunk.bytes);
+                offset = chunk.next_offset;
+                if chunk.eof {
+                    break Ok(());
                 }
             }
-            None
+            Err(error) => break Err(error),
         }
-        (exit, parsed) => Some(format!(
-            "nx show target inputs {task} ended {exit:?}{}: {}",
-            parsed
-                .err()
-                .map(|error| format!(", output unreadable ({error})"))
-                .unwrap_or_default(),
+    };
+    let described = match (&info.exit, read) {
+        (_, Err(error)) => Err(format!(
+            "cannot read the output of nx show target inputs {task} at byte {offset}: {error}"
+        )),
+        (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(())) => {
+            crate::build_volume::nx::task_inputs(&task, &stdout)
+        }
+        (exit, Ok(())) => Err(format!(
+            "nx show target inputs {task} ended {exit:?}: {}",
             read_job_stderr_tail(handle, job).await
         )),
+    };
+    let (inputs, inputs_error) = match described {
+        Ok(inputs) => (inputs, None),
+        Err(error) => (std::collections::BTreeMap::new(), Some(error)),
     };
     let inputs_digest = crate::api::dto::Sha256Digest::compute(
         &serde_json::to_vec(&inputs).map_err(|error| CowshedError::internal(error.to_string()))?,

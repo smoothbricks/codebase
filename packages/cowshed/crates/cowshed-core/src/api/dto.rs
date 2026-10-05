@@ -2749,11 +2749,85 @@ pub struct AdoptionCheck {
     pub hits: u64,
     /// Each Nx task that missed: a defect in the project's build configuration.
     pub misses: Vec<CacheMiss>,
-    /// Checks after which no Nx run lay within the check: they ran no Nx in the target, or a
-    /// concurrent run replaced the summary, so they give no verdict.
-    pub without_nx_run: Vec<String>,
+    /// Checks whose run summary was not theirs (Land step 7): counted neither as hits nor as
+    /// misses.
+    pub unattributed: Vec<UnattributedCheck>,
     /// Checks that exited nonzero in the target.
     pub failed: Vec<FailedCheck>,
+}
+
+/// A landed check whose Nx run summary in one of the target's caches was not its own.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnattributedCheck {
+    pub check: String,
+    /// The cache, as the checkout spells it (`.nx/cache`).
+    pub cache: String,
+    pub reason: UnattributedRun,
+}
+
+/// Why a run summary is not the check's own (16_build_volumes.md, Land step 7).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum UnattributedRun {
+    /// The cache holds no run summary.
+    NoSummary,
+    /// The summary cannot be read as stock Nx writes it.
+    Unreadable { error: String },
+    /// Its run began before the check was spawned: the check ran no Nx there, or an earlier run
+    /// wrote last.
+    BeganBeforeCheck { start: String },
+    /// Its run ended after the check exited: another run wrote last.
+    EndedAfterCheck { end: String },
+    /// Its command is not one the check spells.
+    ForeignCommand { command: String },
+    /// It has no task for these targets its command names.
+    Uncovered { targets: Vec<String> },
+}
+
+impl UnattributedRun {
+    /// The stable name telemetry records for the reason.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NoSummary => "noSummary",
+            Self::Unreadable { .. } => "unreadable",
+            Self::BeganBeforeCheck { .. } => "beganBeforeCheck",
+            Self::EndedAfterCheck { .. } => "endedAfterCheck",
+            Self::ForeignCommand { .. } => "foreignCommand",
+            Self::Uncovered { .. } => "uncovered",
+        }
+    }
+}
+
+impl fmt::Display for UnattributedRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSummary => formatter.write_str("no Nx run summary"),
+            Self::Unreadable { error } => {
+                write!(formatter, "the run summary is unreadable: {error}")
+            }
+            Self::BeganBeforeCheck { start } => {
+                write!(
+                    formatter,
+                    "the last Nx run began before the check, at {start}"
+                )
+            }
+            Self::EndedAfterCheck { end } => {
+                write!(formatter, "the last Nx run ended after the check, at {end}")
+            }
+            Self::ForeignCommand { command } => {
+                write!(
+                    formatter,
+                    "the last Nx run was `{command}`, which the check does not spell"
+                )
+            }
+            Self::Uncovered { targets } => write!(
+                formatter,
+                "the last Nx run has no task for {}",
+                targets.join(", ")
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

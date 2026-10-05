@@ -174,6 +174,18 @@ same for main and for an integration workspace; "the target" is whichever one it
    missed task with its hash inputs as a typed finding (13_telemetry.md records it), and the land still succeeds,
    because the landed code was already checked. This is a free, continuous lint of the Nx configuration: a coordinator
    turns findings into fix work.
+
+   A check's counts come only from the run summary stock Nx writes into the target's cache (`cache/run.json`) when that
+   summary is the check's own: Nx's `run.startTime` is not before the check was spawned, its `run.endTime` is not after
+   the check exited, its command is one the check spells, and it has a task for every target that command names. Any
+   other summary leaves the check **unattributed**, with the reason, and counts neither a hit nor a miss. Why: stock Nx
+   records no pid or invocation in the summary and writes it once, at the end of a run, so the summary a check leaves is
+   the last one any Nx process in the target wrote. Step 7 runs under the target's repository lock right after the
+   target's daemon was stopped, so only a host shell in the target can run Nx then. A run that ended inside the window
+   before the check's own was overwritten by it, and every other interleaving fails one of the four conditions, except
+   one: a run of the same command that began after the check and ended between the check's Nx writing its summary and
+   the check exiting. That run hashes the same tree with the same tasks, so the hashes it reports are the check's.
+
 8. **Retire the workspace** (as today). Its build volume is now the target's and does not retire with it.
 
 ### Stacks and merge queues

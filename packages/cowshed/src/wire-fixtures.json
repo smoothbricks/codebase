@@ -984,7 +984,16 @@
                 "task": "widget:build"
               }
             ],
-            "withoutNxRun": ["cargo test"]
+            "unattributed": [
+              {
+                "cache": ".nx/cache",
+                "check": "cargo test",
+                "reason": {
+                  "kind": "beganBeforeCheck",
+                  "start": "2026-10-05T00:00:00.000Z"
+                }
+              }
+            ]
           },
           "elapsedMs": 3,
           "kind": "adopted"

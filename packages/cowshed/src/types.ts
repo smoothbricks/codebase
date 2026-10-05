@@ -307,9 +307,24 @@ export type AdoptionSkip =
 export interface AdoptionCheck {
   readonly hits: number;
   readonly misses: readonly CacheMiss[];
-  readonly withoutNxRun: readonly string[];
+  /** Checks whose Nx run summary was not their own: counted neither as hits nor as misses. */
+  readonly unattributed: readonly UnattributedCheck[];
   readonly failed: readonly { readonly check: string; readonly exit?: number }[];
 }
+
+export interface UnattributedCheck {
+  readonly check: string;
+  readonly cache: string;
+  readonly reason: UnattributedRun;
+}
+
+export type UnattributedRun =
+  | { readonly kind: 'noSummary' }
+  | { readonly kind: 'unreadable'; readonly error: string }
+  | { readonly kind: 'beganBeforeCheck'; readonly start: string }
+  | { readonly kind: 'endedAfterCheck'; readonly end: string }
+  | { readonly kind: 'foreignCommand'; readonly command: string }
+  | { readonly kind: 'uncovered'; readonly targets: readonly string[] };
 
 export interface CacheMiss {
   readonly task: string;
