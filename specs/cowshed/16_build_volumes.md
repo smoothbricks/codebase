@@ -208,6 +208,15 @@ resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<o
 path changes when a land swaps the checkout's volume and differs in every fork, so state keyed on its own absolute
 location must compare against the resolved path, not the checkout spelling, and treat a different one as moved.
 
+**A path-baking build is warm only within the checkout that built it.** Bun's CMake/Ninja tree records the resolved
+path, so a fork of main and main after a land each reconfigure it from scratch. Cargo's target directory is relocatable
+and is not affected. Declaring such a tree is still worth it: its multi-GiB churn stays off the source image, and a
+patch-development workspace stays warm for its own life. A stable per-checkout mountpoint would keep only main warm
+across lands, and was rejected. An atomic swap at one path would need mount stacking, and measured on APFS, a process
+whose working directory was entered under the covered volume reads the new one, and `diskutil unmount` of the covered
+device removed the top mount instead. The swap would therefore be an unmount and a mount, which must skip adoption
+whenever any process (rust-analyzer included) holds main's build volume, on every land.
+
 - **Enforced by**: a real-APFS test in which main's first touch discards a declared nested checkout and links the path,
   the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing a
   tracked, overlapping or escaping declaration with its remedy; migration tests linking a declared checkout and leaving
