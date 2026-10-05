@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { $ } from 'bun';
 import { decode } from '../lib/run.js';
 import type { ProjectTargets } from '../nx/index.js';
-import { stopFixtureNxDaemon } from '../release/__tests__/helpers/fixture-repo.js';
 import {
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
@@ -807,8 +806,9 @@ async function withOutputFixture(
 async function withNxRunManyFixture(
   run: (fixture: { root: string; artifact: string }) => Promise<void>,
 ): Promise<void> {
-  // Canonical, because a daemon never sees an edit made under a root named
-  // through macOS's /private temp symlink.
+  // Canonical, because macOS puts the temp directory behind a /private symlink.
+  // The Nx it runs is daemonless (src/bun/isolate-nx-env.ts), so the root holds
+  // nothing running once the run returns.
   const temp = await realpath(await mkdtemp(join(tmpdir(), 'smoo-empty-platform-output-')));
   const root = join(temp, 'repo');
   const artifact = join(temp, 'artifact');
@@ -845,11 +845,7 @@ async function withNxRunManyFixture(
 
     await run({ root, artifact });
   } finally {
-    try {
-      await stopFixtureNxDaemon(root);
-    } finally {
-      await rm(temp, { recursive: true, force: true });
-    }
+    await rm(temp, { recursive: true, force: true });
   }
 }
 

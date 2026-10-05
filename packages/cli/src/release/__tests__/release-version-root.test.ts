@@ -39,16 +39,19 @@ describe('release version against a workspace root named through another path', 
       const summary = join(scratch, 'summary.md');
       const output = join(scratch, 'output.txt');
       // The fixture owns its Nx state exactly as `runFixtureNx` gives it: no
-      // outer socket or daemon choice, cache and workspace data under the
-      // fixture. Only the root keeps the alias spelling -- the planted defect.
+      // outer socket, cache and workspace data under the fixture. Only the root
+      // keeps the alias spelling -- the planted defect. The daemon is on
+      // whatever CI says: daemon clients disagreeing on which workspace owns it
+      // is half of that defect, and the fixture stops it when it retires.
       const env = mergeEnv(
         {
           NX_WORKSPACE_ROOT_PATH: alias,
           NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
           NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
+          NX_DAEMON: 'true',
           GITHUB_STEP_SUMMARY: summary,
         },
-        ['NX_SOCKET_DIR', 'NX_DAEMON_SOCKET_DIR', 'NX_DAEMON', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'],
+        ['NX_SOCKET_DIR', 'NX_DAEMON_SOCKET_DIR', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'],
       );
       try {
         await smoo(root, env, ['release', 'version', '--bump', 'auto', '--projects', '', '--dry-run', 'true']);

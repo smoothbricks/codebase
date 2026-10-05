@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir, userInfo } from 'node:os';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { $ } from 'bun';
+import { nxDaemonProcesses, pidsWorkingIn, processTable } from '@smoothbricks/nx-plugin/testing';
 import {
   classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
@@ -13,14 +13,12 @@ import {
 } from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
-  fixtureNxDaemonProcesses,
   git,
   gitIsAncestor,
   gitOutput,
   gitReleaseTagsByCreatorDate,
   gitSucceeds,
   packageVersionAtRef,
-  processTable,
   runFixtureNx,
   tag,
   withFixtureRepo,
@@ -170,8 +168,8 @@ describe('release planning with fixture git repositories', () => {
       fixtureRoot = root;
       await writeWorkspace(root);
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await runFixtureNx(root, ['show', 'projects']);
-      daemonPids = (await fixtureNxDaemonProcesses(root)).map((entry) => entry.pid);
+      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
     });
 
     // The daemon and its plugin workers; fewer would prove nothing.
@@ -179,10 +177,27 @@ describe('release planning with fixture git repositories', () => {
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
 
+  it('leaves no process of its Nx daemon running once a fixture body throws', async () => {
+    let fixtureRoot = '';
+    let daemonPids: number[] = [];
+    const thrown = withFixtureRepo(async (root) => {
+      fixtureRoot = root;
+      await writeWorkspace(root);
+      await writeBuildablePackage(root, '@scope/a', 'packages/a');
+      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
+      throw new Error('the fixture body failed on purpose');
+    });
+
+    await expect(thrown).rejects.toThrow('the fixture body failed on purpose');
+    expect(daemonPids.length).toBeGreaterThan(1);
+    expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
+  });
+
   it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
     const { root, pids } = await abandonFixture(`
-      await runFixtureNx(root, ['show', 'projects']);
-      const daemon = await fixtureNxDaemonProcesses(root);
+      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      const daemon = await nxDaemonProcesses(root);
       console.log('ABANDONED_FIXTURE_PIDS ' + daemon.map((entry) => entry.pid).join(' '));
     `);
 
@@ -197,7 +212,7 @@ describe('release planning with fixture git repositories', () => {
     // and its log the only signal it gives, so the body polls for it. The
     // retirement kills the client, hence the catch.
     const { root } = await abandonFixture(`
-      void runFixtureNx(root, ['daemon', '--start']).catch(() => {});
+      void runFixtureNx(root, ['daemon', '--start'], { daemon: true }).catch(() => {});
       const log = join(root, '.nx', 'workspace-data', 'd', 'daemon.log');
       while (!(existsSync(log) && readFileSync(log, 'utf8').includes('Starting new daemon server in background'))) {
         await Bun.sleep(5);
@@ -432,6 +447,8 @@ describe('release planning with fixture git repositories', () => {
  */
 async function abandonFixture(body: string): Promise<{ root: string; pids: number[] }> {
   const helper = JSON.stringify(join(import.meta.dir, 'helpers', 'fixture-repo.ts'));
+  // The test file lives outside this package, where the package name does not resolve.
+  const testing = JSON.stringify(Bun.resolveSync('@smoothbricks/nx-plugin/testing', import.meta.dir));
   const scratch = await realpath(await mkdtemp(join(tmpdir(), 'smoo-abandoned-fixture-')));
   try {
     const testFile = join(scratch, 'abandoned.test.ts');
@@ -440,7 +457,8 @@ async function abandonFixture(body: string): Promise<{ root: string; pids: numbe
       `import { test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fixtureNxDaemonProcesses, runFixtureNx, withFixtureRepo, writeBuildablePackage, writeWorkspace } from ${helper};
+import { nxDaemonProcesses } from ${testing};
+import { runFixtureNx, withFixtureRepo, writeBuildablePackage, writeWorkspace } from ${helper};
 
 test('returns without its fixture body', async () => {
   const started = Promise.withResolvers();
@@ -487,45 +505,6 @@ async function survivors(root: string, pids: readonly number[]): Promise<string[
     .map((entry) => `${entry.pid} ${entry.command}`);
   const working = (await pidsWorkingIn(root)).map((pid) => `${pid} works in ${root}`);
   return [...running, ...working];
-}
-
-async function pidsWorkingIn(root: string): Promise<number[]> {
-  const under = (cwd: string) => cwd === root || cwd.startsWith(`${root}/`);
-  switch (process.platform) {
-    case 'linux': {
-      const pids = (await readdir('/proc')).filter((name) => /^\d+$/.test(name));
-      const found: number[] = [];
-      for (const pid of pids) {
-        const cwd = await readlink(`/proc/${pid}/cwd`).catch((error: unknown) => {
-          // Another user's process, or one that exited since the listing.
-          if (error instanceof Error && 'code' in error && (error.code === 'EACCES' || error.code === 'ENOENT')) {
-            return null;
-          }
-          throw error;
-        });
-        if (cwd !== null && under(cwd.replace(/ \(deleted\)$/, ''))) {
-          found.push(Number(pid));
-        }
-      }
-      return found;
-    }
-    case 'darwin': {
-      // lsof keeps naming a working directory after it has been deleted.
-      const fields = await $`lsof -nP -a -d cwd -u ${String(userInfo().uid)} -Fpn`.quiet().text();
-      const found: number[] = [];
-      let pid = 0;
-      for (const line of fields.split('\n')) {
-        if (line.startsWith('p')) {
-          pid = Number(line.slice(1));
-        } else if (line.startsWith('n') && under(line.slice(1))) {
-          found.push(pid);
-        }
-      }
-      return found;
-    }
-    default:
-      throw new Error(`No working-directory scan for ${process.platform}`);
-  }
 }
 
 function releaseFixturePackages(): ReleasePackageInfo[] {
