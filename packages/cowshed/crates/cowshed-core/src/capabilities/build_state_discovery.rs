@@ -279,10 +279,10 @@ fn driver_answers(output: &std::process::Output, count: usize) -> Vec<CargoAnswe
 
 /// Discovery's Cargo run straight on the host, in the test process's environment: the driver
 /// and its framing without a sandbox, for tests about what discovery does with the answers.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) struct HostCargo;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl CargoRunner for HostCargo {
     fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
         let Some(first) = queries.first() else {

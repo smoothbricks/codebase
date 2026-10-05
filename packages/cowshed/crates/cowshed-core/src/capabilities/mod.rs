@@ -13,7 +13,7 @@ use cache::{HostCache, SharedLayout, SharedToolHome};
 mod build_state;
 pub use build_state::{BuildStatePath, RelPath};
 mod build_state_discovery;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) use build_state_discovery::HostCargo;
 pub use build_state_discovery::{
     BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
