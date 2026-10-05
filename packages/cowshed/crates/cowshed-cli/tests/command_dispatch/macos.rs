@@ -7,7 +7,7 @@ use cowshed_core::api::dto::{Adoption, AdoptionSkip, DatabaseHolder, LandReport}
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::WorkspaceName;
+use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::ApfsSubstrateConfig;
@@ -301,22 +301,79 @@ async fn real_apfs_dispatch_project_deny_write_is_persisted_not_just_echoed() {
     service.shutdown().await.expect("shutdown reopened runtime");
 }
 
+/// Every macOS port block of `fixture`'s store claimed for this process except `kept`, exactly
+/// as a concurrent creator's reservation claims one; dropping it releases the claims.
+struct PortClaims(Vec<PathBuf>);
+
+impl PortClaims {
+    fn all_but(fixture: &Fixture, kept: PortBlock) -> Self {
+        let staging = fixture.storage.store().join(".staging");
+        fs::create_dir_all(&staging).expect("reservation directory");
+        let owner = std::process::id().to_string();
+        Self(
+            PortBlock::macos_candidates()
+                .filter(|block| *block != kept)
+                .map(|block| {
+                    let marker = staging.join(format!("port-{}.reservation", block.base()));
+                    std::os::unix::fs::symlink(&owner, &marker).expect("port reservation marker");
+                    marker
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for PortClaims {
+    fn drop(&mut self) {
+        for marker in &self.0 {
+            if let Err(error) = fs::remove_file(marker) {
+                eprintln!("port reservation {}: {error}", marker.display());
+            }
+        }
+    }
+}
+
+/// The highest macOS port block whose every port the host has free right now.
+fn highest_free_port_block() -> PortBlock {
+    let candidates: Vec<PortBlock> = PortBlock::macos_candidates().collect();
+    candidates
+        .into_iter()
+        .rev()
+        .find(|block| {
+            (block.base()..block.base() + block.size())
+                .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
+                .collect::<std::io::Result<Vec<_>>>()
+                .is_ok()
+        })
+        .expect("a macOS port block is free on the host")
+}
+
 #[tokio::test]
 async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_grants() {
     let mut fixture = Fixture::new();
+    // Main's block must be one no parallel test's store is also handed. Every store allocates
+    // from its lowest free block up and checks the host only when it allocates, so two tests can
+    // hold the same low block, and the other's gateway took this test's port before this test
+    // could ("claim published port: AddrInUse"). Adoption here is steered to the highest free
+    // block, which no other store reaches, by claiming every other block in this store.
+    let steered = highest_free_port_block();
+    let claims = PortClaims::all_but(&fixture, steered);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
-    let original_port = service
+    let original = service
         .grants("main")
         .await
         .expect("original durable block")
         .port_block
-        .expect("allocated macOS block")
-        .base();
+        .expect("allocated macOS block");
+    assert_eq!(original, steered);
+    let original_port = original.base();
     // Take the port after allocation and image publication, before gateway installation. This
     // cannot be solved by probing in the allocator: the listener must trigger a real bind refusal.
     let competing_listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, original_port)).expect("claim published port");
+    // The reallocation needs a block to move to.
+    drop(claims);
     fixture.start_gateway().await;
     service
         .reconcile_gateway()
