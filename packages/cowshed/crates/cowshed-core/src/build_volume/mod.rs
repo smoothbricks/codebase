@@ -44,6 +44,11 @@ const RECORD_SUFFIX: &str = ".json";
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
 const RECORD_VERSION: u32 = 1;
+/// The capacity of a build volume created from nothing, unless `.cowshed.toml` `[build] capacity`
+/// says otherwise (16_build_volumes.md, "Substrate"). Sparse: a cap on build-cache growth, not an
+/// allocation.
+pub const DEFAULT_BUILD_VOLUME_CAPACITY: crate::metadata::ImageCapacity =
+    crate::metadata::ImageCapacity::from_gibibytes(100);
 
 /// A build volume's identity: 32 lowercase hex digits, minted once and never reused.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

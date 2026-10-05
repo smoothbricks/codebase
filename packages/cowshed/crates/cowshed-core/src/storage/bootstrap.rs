@@ -76,6 +76,9 @@ pub struct CowshedConfig {
         crate::capabilities::CapabilityId,
         crate::capabilities::CapabilityOverride,
     >,
+    /// `[build] capacity`: the capacity of the build volumes this project creates from nothing
+    /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
+    build_capacity: Option<crate::metadata::ImageCapacity>,
 }
 
 impl CowshedConfig {
@@ -95,6 +98,13 @@ impl CowshedConfig {
     > {
         &self.capabilities
     }
+
+    /// The capacity a build volume created from nothing gets: `[build] capacity`, else
+    /// [`crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY`].
+    pub fn build_capacity(&self) -> crate::metadata::ImageCapacity {
+        self.build_capacity
+            .unwrap_or(crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +122,7 @@ impl SubstrateConfig {
 enum ConfigSection {
     Substrate,
     Sandbox,
+    Build,
     Capability(crate::capabilities::CapabilityId),
 }
 
@@ -120,6 +131,7 @@ impl ConfigSection {
         match self {
             Self::Substrate => "substrate",
             Self::Sandbox => "sandbox",
+            Self::Build => "build",
             Self::Capability(id) => id.section_name(),
         }
     }
@@ -131,15 +143,18 @@ struct ParsedCapability {
     directory: Option<PathBuf>,
 }
 
-/// Parse repository-owned storage, sandbox deny and convention-only capability overrides.
-/// Unknown or duplicated settings fail rather than silently changing project detection.
+/// Parse repository-owned storage, sandbox deny, build volume capacity and convention-only
+/// capability overrides. Unknown or duplicated settings fail rather than silently changing
+/// project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
     let mut saw_sandbox = false;
+    let mut saw_build = false;
     let mut kind = None;
     let mut pool = None;
     let mut sandbox_deny = None;
+    let mut build_capacity = None;
     let mut capabilities =
         std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
     for (index, original) in input.lines().enumerate() {
@@ -157,6 +172,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             let section = match name {
                 "substrate" => ConfigSection::Substrate,
                 "sandbox" => ConfigSection::Sandbox,
+                "build" => ConfigSection::Build,
                 other => {
                     let id = other
                         .strip_prefix("capabilities.")
@@ -175,6 +191,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             let seen = match section {
                 ConfigSection::Substrate => Some(&mut saw_substrate),
                 ConfigSection::Sandbox => Some(&mut saw_sandbox),
+                ConfigSection::Build => Some(&mut saw_build),
                 ConfigSection::Capability(_) => None,
             };
             if seen.is_some_and(|seen| std::mem::replace(seen, true)) {
@@ -209,6 +226,16 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                     section,
                     "deny",
                 )?;
+            }
+            (ConfigSection::Build, "capacity") => {
+                let value = parse_toml_string(value, section, line_number)?;
+                let capacity = crate::metadata::ImageCapacity::parse(&value).map_err(|reason| {
+                    ConfigError::InvalidBuildCapacity {
+                        line: line_number,
+                        reason,
+                    }
+                })?;
+                set_once(&mut build_capacity, capacity, section, "capacity")?;
             }
             (ConfigSection::Capability(id), "disabled") => {
                 let disabled = match value {
@@ -285,6 +312,12 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         Vec::new()
     };
+    if saw_build && build_capacity.is_none() {
+        return Err(ConfigError::MissingKey {
+            section: "build",
+            key: "capacity",
+        });
+    }
     let capabilities = capabilities
         .into_iter()
         .map(|(id, parsed)| {
@@ -301,6 +334,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         substrate,
         sandbox_deny,
         capabilities,
+        build_capacity,
     })
 }
 
@@ -403,6 +437,11 @@ pub enum ConfigError {
         section: &'static str,
         line: usize,
         reason: &'static str,
+    },
+    #[error("[build] capacity at line {line}: {reason}")]
+    InvalidBuildCapacity {
+        line: usize,
+        reason: crate::metadata::ImageCapacityError,
     },
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),

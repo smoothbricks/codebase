@@ -244,6 +244,42 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
     }
 }
 
+/// `[build] capacity` sets the capacity of a build volume created from nothing; without it a
+/// project gets 100 GiB. The value is an image capacity, so it refuses what an image refuses.
+#[test]
+fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
+    use cowshed_core::metadata::ImageCapacity;
+    assert_eq!(
+        parse_cowshed_config("").unwrap().build_capacity(),
+        ImageCapacity::from_gibibytes(100)
+    );
+    assert_eq!(
+        parse_cowshed_config("[build]\ncapacity = \"250g\" # cap on build-cache growth\n")
+            .unwrap()
+            .build_capacity(),
+        ImageCapacity::from_gibibytes(250)
+    );
+    let invalid = [
+        ("[build]\n", "missing [build] key \"capacity\""),
+        ("[build]\ncapacity = 100\n", "must be a quoted string"),
+        (
+            "[build]\ncapacity = \"lots\"\n",
+            "[build] capacity at line 2",
+        ),
+        ("[build]\ncapacity = \"1k\"\n", "[build] capacity at line 2"),
+        (
+            "[build]\ncapacity = \"1g\"\ncapacity = \"2g\"\n",
+            "duplicated",
+        ),
+        ("[build]\ncapacity = \"1g\"\n[build]\n", "duplicated"),
+        ("[build]\nsize = \"1g\"\n", "unknown [build] key"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
 #[test]
 fn capability_overrides_are_strict_convention_overrides() {
     use cowshed_core::capabilities::CapabilityId;
