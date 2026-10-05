@@ -982,41 +982,49 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
-    /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
-    /// new one cleanly. If stock Nx ever needs more than the signal, this fails.
+    /// A checkout of the repository's own stock Nx, its daemon enabled, under a scratch root:
+    /// whatever ends the test, the root's teardown ends every process working in it, the daemon
+    /// with the rest.
     #[cfg(target_os = "macos")]
-    #[test]
-    fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
-        // Read at run time: `env!` would compile this checkout's path into the test binary,
-        // and a test binary built in one checkout must not reach another's files.
-        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
-            .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
-        let package = PathBuf::from(manifest)
-            .join("../../../../node_modules/nx")
-            .canonicalize()
-            .expect("the repository's own Nx is installed");
-        let nx = package.join("dist/bin/nx.js");
-        let root = scratch("daemon");
-        let checkout = fs::canonicalize(&root).unwrap();
-        fs::write(
-            checkout.join("package.json"),
-            r#"{"name":"fixture","private":true}"#,
-        )
-        .unwrap();
-        fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":true}"#).unwrap();
-        fs::create_dir_all(checkout.join("node_modules")).unwrap();
-        std::os::unix::fs::symlink(&package, checkout.join("node_modules/nx")).unwrap();
-        let state = BuildVolumeState {
-            paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
-            fingerprint: None,
-        };
-        let daemon = |verb: &str| {
+    struct StockNx {
+        nx: PathBuf,
+        checkout: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl StockNx {
+        fn new(root: &crate::scratch_apfs::ScratchRoot) -> Self {
+            // Read at run time: `env!` would compile this checkout's path into the test binary,
+            // and a test binary built in one checkout must not reach another's files.
+            let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+            let package = PathBuf::from(manifest)
+                .join("../../../../node_modules/nx")
+                .canonicalize()
+                .expect("the repository's own Nx is installed");
+            let checkout = root.path().to_path_buf();
+            fs::write(
+                checkout.join("package.json"),
+                r#"{"name":"fixture","private":true}"#,
+            )
+            .unwrap();
+            fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":true}"#).unwrap();
+            fs::create_dir_all(checkout.join("node_modules")).unwrap();
+            std::os::unix::fs::symlink(&package, checkout.join("node_modules/nx")).unwrap();
+            Self {
+                nx: package.join("dist/bin/nx.js"),
+                checkout,
+            }
+        }
+
+        /// Run `nx daemon <verb>` in the checkout as a host shell does, without the caller's
+        /// `NX_*` or `CI`; it must exit 0. Answers what it printed.
+        fn daemon(&self, verb: &str) -> String {
             let mut command = std::process::Command::new("node");
             command
-                .arg(&nx)
+                .arg(&self.nx)
                 .args(["daemon", verb])
-                .current_dir(&checkout);
+                .current_dir(&self.checkout);
             for (key, _) in std::env::vars_os() {
                 if key.to_string_lossy().starts_with("NX_") || key == "CI" {
                     command.env_remove(key);
@@ -1035,9 +1043,28 @@ mod tests {
             );
             assert!(output.status.success(), "nx daemon {verb}: {text}");
             text
+        }
+
+        fn record(&self) -> PathBuf {
+            self.checkout
+                .join(".nx/workspace-data/d/server-process.json")
+        }
+    }
+
+    /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
+    /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
+    /// new one cleanly. If stock Nx ever needs more than the signal, this fails.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
+        let root = crate::scratch_apfs::ScratchRoot::new("nx-daemon").expect("scratch root");
+        let stock = StockNx::new(&root);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
+            fingerprint: None,
         };
-        let record = checkout.join(".nx/workspace-data/d/server-process.json");
-        daemon("--start");
+        let record = stock.record();
+        stock.daemon("--start");
         let first = crate::runtime::nx_daemon::live_pid(&record).expect("a live daemon");
         let socket = PathBuf::from(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&record).unwrap()).unwrap()
@@ -1046,21 +1073,51 @@ mod tests {
                 .unwrap(),
         );
         assert!(socket.exists());
-        assert_eq!(close(&checkout, &state).unwrap(), Ok(()));
+        assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
         // SAFETY: signal 0 only checks existence.
         assert_ne!(unsafe { libc::kill(first, 0) }, 0, "the daemon exited");
         // The daemon's own shutdown ran: it removed its record and its socket, as after
         // `nx daemon --stop`. A signal Nx did not handle would leave both behind.
         assert!(!record.exists(), "the daemon removed its record");
         assert!(!socket.exists(), "the daemon removed its socket");
-        let restarted = daemon("--start");
+        let restarted = stock.daemon("--start");
         assert!(
             !restarted.to_lowercase().contains("stale") && !restarted.contains("EADDRINUSE"),
             "{restarted}"
         );
         let second = crate::runtime::nx_daemon::live_pid(&record).expect("a new live daemon");
         assert_ne!(first, second);
-        assert_eq!(close(&checkout, &state).unwrap(), Ok(()));
-        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
+    }
+
+    /// A test that fails while its stock Nx daemon runs leaves no daemon behind. The daemon
+    /// detaches from the `nx daemon --start` that started it, so nothing but the fixture's own
+    /// teardown ever ends it: a failed assertion between `--start` and [`close`] left it running
+    /// in a deleted directory, watching files, for good.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_test_that_fails_with_a_live_nx_daemon_leaves_none_under_its_root() {
+        let root = crate::scratch_apfs::ScratchRoot::new("nx-daemon-failed").expect("scratch root");
+        let path = root.path().to_path_buf();
+        let daemon = std::cell::Cell::new(None);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let root = root;
+            let stock = StockNx::new(&root);
+            stock.daemon("--start");
+            daemon.set(crate::runtime::nx_daemon::live_pid(&stock.record()));
+            panic!("the test fails while its Nx daemon runs");
+        }));
+        assert!(failed.is_err(), "the test failed");
+        let daemon = daemon
+            .get()
+            .expect("the daemon was live when the test failed");
+        let left = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&path))
+            .expect("list the processes working under the root");
+        assert_eq!(
+            left,
+            [],
+            "daemon {daemon} or another process outlived the test"
+        );
+        assert!(!path.exists(), "{} was removed", path.display());
     }
 }
