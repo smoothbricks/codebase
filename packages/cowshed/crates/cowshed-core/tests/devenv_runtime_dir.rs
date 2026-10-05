@@ -1864,3 +1864,215 @@ async fn host_controller_a_bun_project_runs_bun_before_its_envrc_evaluates() {
     );
     assert_eq!(String::from_utf8_lossy(&stdout), "fixture-bun --version");
 }
+
+/// Nested modules still need the shared read-at-build caches (15_capabilities.md). Each
+/// operation runs independently so a denied Go cache does not conceal Cargo or Bun failures.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_caches() {
+    let caches = Path::new(cowshed_core::storage::bootstrap::CACHES_ROOT);
+    assert!(
+        caches.is_dir(),
+        "this host-controller rule requires the installed caches volume"
+    );
+    let root = scratch("shared-tool-caches");
+    let mut sandbox = workspace(&root, 42_592);
+    for (host, shared) in [
+        (".cargo/registry", "cargo/registry"),
+        (".cargo/git", "cargo/git"),
+        (".bun/install/cache", "bun/install/cache"),
+    ] {
+        let host = sandbox.home.join(host);
+        let shared = caches.join(shared);
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::os::unix::fs::symlink(shared, host).unwrap();
+    }
+    for name in cowshed_core::capabilities::cargo::STATE_FILES {
+        std::fs::write(sandbox.home.join(".cargo").join(name), "").unwrap();
+    }
+    for tool in ["go", "cargo", "rustc", "bun", "git"] {
+        install_real_tool(&sandbox, tool);
+    }
+    let mount = &sandbox.workspace_mount;
+    let module = mount.join("packages/go-probe");
+    std::fs::create_dir_all(&module).expect("nested module");
+    std::fs::write(
+        module.join("go.mod"),
+        "module example.com/cache-probe\n\ngo 1.24\n",
+    )
+    .expect("Go manifest");
+    std::fs::write(
+        module.join("probe.go"),
+        "package probe\nfunc Value() int { return 7 }\n",
+    )
+    .expect("Go source");
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "packages/go-probe/go.mod"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(mount)
+            .output_locked()
+            .expect("track nested module");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let dependency = mount.join("fetch-dependency");
+    std::fs::create_dir_all(dependency.join("src")).expect("git dependency");
+    std::fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"fetch-probe-dependency\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn value() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "Cargo.toml", "src/lib.rs"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "dependency",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dependency)
+            .output_locked()
+            .expect("prepare git dependency");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(mount.join("Cargo.toml"), format!(
+        "[package]\nname = \"fetch-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nfetch-probe-dependency = {{ git = \"file://{}\" }}\n", dependency.display())).unwrap();
+    std::fs::create_dir_all(mount.join("src")).unwrap();
+    std::fs::write(
+        mount.join("src/lib.rs"),
+        "pub fn value() -> u8 { fetch_probe_dependency::value() }\n",
+    )
+    .unwrap();
+    let package = mount.join("package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"install-probe-dependency","version":"1.0.0","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(package.join("index.js"), "module.exports = 7;\n").unwrap();
+    let packed = std::process::Command::new("/usr/bin/tar")
+        .args(["-czf", "dependency.tgz", "package"])
+        .current_dir(mount)
+        .output_locked()
+        .expect("pack Bun dependency");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    std::fs::write(
+        mount.join("package.json"),
+        r#"{"private":true,"dependencies":{"install-probe-dependency":"file:./dependency.tgz"}}"#,
+    )
+    .unwrap();
+    // Let Bun name its real lockfile before detection, without warming the shared cache
+    // the sandboxed install must use.
+    let locked = std::process::Command::new("bun")
+        .args([
+            "install",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--no-progress",
+        ])
+        .current_dir(mount)
+        .env("HOME", &sandbox.home)
+        .env("BUN_INSTALL_CACHE_DIR", root.join("lockfile-cache"))
+        .output_locked()
+        .expect("resolve Bun lockfile");
+    assert!(
+        locked.status.success(),
+        "Bun lockfile: {}",
+        String::from_utf8_lossy(&locked.stderr)
+    );
+    sandbox
+        .configure_capabilities()
+        .expect("detect tool conventions");
+    let mut outcomes = Vec::new();
+    for (tool, script) in [
+        (
+            "go",
+            r#"set -eu
+cache="$1/go/build"
+printf probe > "$cache/cowshed-probe-$$"
+rm "$cache/cowshed-probe-$$"
+test "$GOCACHE" = "$cache"
+test "$GOMODCACHE" = "$1/go/mod"
+cd packages/go-probe
+go build ./...
+"#,
+        ),
+        (
+            "cargo",
+            r#"set -eu
+test "$CARGO_HOME" = "$2/.cargo"
+cargo fetch
+"#,
+        ),
+        (
+            "bun",
+            r#"set -eu
+test "$BUN_INSTALL_CACHE_DIR" = "$2/.bun/install/cache"
+mkdir "$BUN_INSTALL_CACHE_DIR/cowshed-probe-$$"
+rmdir "$BUN_INSTALL_CACHE_DIR/cowshed-probe-$$"
+bun install --ignore-scripts --no-progress
+bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
+"#,
+        ),
+    ] {
+        let result = run_in_sandbox(
+            &sandbox,
+            &sandbox.workspace_mount,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                script.into(),
+                tool.into(),
+                caches.as_os_str().to_owned(),
+                sandbox.home.as_os_str().to_owned(),
+            ],
+        )
+        .await;
+        eprintln!(
+            "{tool} cache operation: {:?}\nstdout: {}\nstderr: {}",
+            result.0,
+            String::from_utf8_lossy(&result.1),
+            String::from_utf8_lossy(&result.2)
+        );
+        outcomes.push((tool, result));
+    }
+    std::fs::remove_dir_all(&root).expect("remove cache fixture");
+    for (tool, (exit, stdout, stderr)) in outcomes {
+        assert_eq!(
+            exit,
+            ExitStatus::Exited { code: 0 },
+            "{tool} must write its shared cache from the sandbox\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
