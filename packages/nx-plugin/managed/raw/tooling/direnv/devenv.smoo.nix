@@ -287,12 +287,14 @@ in {
   # devenv wraps the Python interpreter to find native libraries in
   # `languages.python.libraries`, whose default is this checkout's
   # `.devenv/profile`. That path then lands in the interpreter's store path, the
-  # profile that holds it and the uv environment built with it, so every clone
-  # evaluates and builds its own interpreter and profile on first entry, and its
-  # copied uv environment names another checkout's interpreter. Cleared, the
-  # interpreter is one store path in every checkout. devenv still adds the C++
-  # runtime; a wheel that needs another library names that library here.
-  languages.python.libraries = lib.mkIf uvProject (lib.mkDefault []);
+  # profile that holds it, PKG_CONFIG_PATH and the uv environment built with it,
+  # so every clone evaluates and builds its own interpreter and profile on first
+  # entry, every cache keyed on the build environment misses — ttsc hashes
+  # PKG_CONFIG_PATH into its plugin key and rebuilds the Go plugin per clone —
+  # and a copied uv environment names another checkout's interpreter. Cleared,
+  # the interpreter is one store path in every checkout. devenv still adds the
+  # C++ runtime; a wheel that needs another library names that library here.
+  languages.python.libraries = lib.mkDefault [];
 
   # The stdenv build variables the shell derivation leaks beyond the ones devenv
   # already drops: generic names (`name`, `system`) that collide with any
