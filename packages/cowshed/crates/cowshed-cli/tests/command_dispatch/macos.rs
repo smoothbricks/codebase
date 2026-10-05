@@ -737,6 +737,77 @@ async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without
     fixture.stop_gateway().await;
 }
 
+/// `rm` stops the checkout's Nx daemon as `detach` does. A daemon detaches from the job that
+/// started it, so stopping the supervisor leaves it running with its cwd on the checkout: the
+/// unmount was refused for its whole grace, then forced, and the daemon outlived the removal.
+#[tokio::test]
+async fn real_apfs_rm_stops_the_checkouts_nx_daemon_before_its_unmount() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut fixture = Fixture::new();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let topic = new_workspace(&mut service, "daemon-topic").await;
+    // A daemon as Nx's record names one: a live process whose socket accepts a connection, its
+    // cwd on the checkout. The record is Nx's own state, never the user's work.
+    let exclude = topic.join(".git/info/exclude");
+    let mut excluded = fs::read(&exclude).expect("the workspace's own exclude file");
+    excluded.extend_from_slice(b"/.nx/\n");
+    fs::write(&exclude, excluded).expect("exclude Nx state");
+    let socket = std::env::temp_dir().join(format!("cs-nxd-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket);
+    let mut daemon = Command::new("/usr/bin/nc")
+        .arg("-lkU")
+        .arg(&socket)
+        .current_dir(&topic)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a listening stand-in daemon");
+    eventually("the stand-in daemon listens", || socket.exists()).await;
+    let record = topic.join(".nx/workspace-data/d/server-process.json");
+    fs::create_dir_all(record.parent().expect("record directory")).expect("record directory");
+    fs::write(
+        &record,
+        serde_json::json!({
+            "processId": daemon.id(),
+            "socketPath": socket,
+            "nxVersion": "23.2.1",
+        })
+        .to_string(),
+    )
+    .expect("daemon record");
+
+    let (removed, _, stderr) = run(&mut service, ["rm", "daemon-topic"]).await;
+    assert_eq!(
+        removed.unwrap_or_else(|error| panic!("rm: {error}; {}", String::from_utf8_lossy(&stderr))),
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let mut exited = None;
+    eventually("rm stops the checkout's daemon", || {
+        exited = daemon.try_wait().expect("poll the stand-in daemon");
+        exited.is_some()
+    })
+    .await;
+    assert_eq!(
+        exited.and_then(|status| status.signal()),
+        Some(libc::SIGTERM),
+        "stopped as `nx daemon --stop` stops it; {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let _ = fs::remove_file(&socket);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// The repository's own Nx and the node that runs it, as absolute paths resolved at run time:
 /// `env!` would compile this checkout's path into the test binary.
 fn repository_nx() -> (PathBuf, PathBuf) {

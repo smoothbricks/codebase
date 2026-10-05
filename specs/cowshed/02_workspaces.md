@@ -828,7 +828,9 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 2. Stop the supervisor. Ordinary removal quiesces, letting running jobs finish before retirement. `--force` retires
    directly: TERM → grace → KILL across the workspace's descendant process trees (11_shell.md), without waiting for a
    job to complete. Teardown precedes image retirement — live children would otherwise hold the mount busy and keep
-   enforcing stale launch-time authority after the grants disappear.
+   enforcing stale launch-time authority after the grants disappear. The checkout's Nx daemon outlives its supervisor
+   (it detaches from the job that started it) and its cwd is the checkout, so it is stopped as `detach` stops it
+   (06_cli.md); anything else still holding the volume is left to step 5's grace and force, never a refusal.
 3. Remove the host-side state this workspace put in main's repository, before the image goes anywhere: its reverse
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed

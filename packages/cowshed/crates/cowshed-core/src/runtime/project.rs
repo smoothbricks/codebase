@@ -4686,8 +4686,26 @@ impl NativeProjectRuntimeHost {
     /// Host-side state goes before the image does. A remote naming a trashed mount is a broken
     /// fetch in the user's own checkout — the one piece of this teardown that lives where they can
     /// see it.
+    ///
+    /// The checkout's Nx daemon is stopped as `detach` stops it before the image's volume is
+    /// unmounted. Stopping the supervisor does not end it: the daemon detaches from the job that
+    /// started it, and its cwd is the checkout, so every removal of a shed waited out the whole
+    /// unmount grace and then forced (measured: 43 refused unmounts, 12.8 s, per `rm`). Anything
+    /// else holding the volume is still the unmount's to wait for and force, as removal always
+    /// has; it is named here instead of refused.
     async fn finish_retirement(&mut self, current: NativeWorkspace) -> Result<()> {
         let workspace = current.derived.workspace.name().clone();
+        if matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            let mount = self.workspace_mount_path(&workspace)?;
+            if let Err(busy) = close_checkout_nx(&workspace, &mount).await? {
+                eprintln!(
+                    "cowshed: {workspace}'s Nx state is in use: {busy}; its unmount waits, then forces"
+                );
+            }
+        }
         let git_worktree = is_git_worktree(&current.metadata);
         self.unregister_workspace_in_main(&workspace, git_worktree)
             .await?;
@@ -8681,8 +8699,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
-        ) {
-            close_checkout_nx(&workspace, &mount).await?;
+        ) && let Err(busy) = close_checkout_nx(&workspace, &mount).await?
+        {
+            return Err(CowshedError::conflict(
+                format!("{workspace} cannot detach while its Nx state is in use: {busy}"),
+                format!("stop those processes, then `cowshed detach {workspace}`"),
+            ));
         }
         self.substrate
             .unmount(&current.derived.workspace)
@@ -14242,8 +14264,13 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
 /// Stop the Nx daemon `workspace`'s checkout at `mount` records, as a land stops it, before its
 /// volume detaches: the daemon's cwd is the checkout, so a live one alone keeps it busy.
 /// `.nx/workspace-data` is read through the checkout, so a build-volume link is followed.
+/// [`crate::build_volume::nx::Busy`] is the caller's to judge: `detach` refuses on it, while a
+/// retirement unmounts with its grace and force as it always has.
 #[cfg(target_os = "macos")]
-async fn close_checkout_nx(workspace: &WorkspaceName, mount: &Path) -> Result<()> {
+async fn close_checkout_nx(
+    workspace: &WorkspaceName,
+    mount: &Path,
+) -> Result<std::result::Result<(), crate::build_volume::nx::Busy>> {
     let data = mount.join(".nx/workspace-data");
     let closed = {
         let data = data.clone();
@@ -14253,20 +14280,15 @@ async fn close_checkout_nx(workspace: &WorkspaceName, mount: &Path) -> Result<()
         .await
         .map_err(|error| CowshedError::internal(format!("Nx close task failed: {error}")))?
     };
-    match closed {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(busy)) => Err(CowshedError::conflict(
-            format!("{workspace} cannot detach while its Nx state is in use: {busy}"),
-            format!("stop those processes, then `cowshed detach {workspace}`"),
-        )),
-        Err(error) => Err(CowshedError::environment_missing(
+    closed.map_err(|error| {
+        CowshedError::environment_missing(
             format!(
                 "cannot close {workspace}'s Nx state at {}: {error}",
                 data.display()
             ),
             "cowshed doctor --json",
-        )),
-    }
+        )
+    })
 }
 
 /// The kernel refused to unmount `workspace` at `mount` because something holds it: name every
