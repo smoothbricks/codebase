@@ -76,8 +76,9 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
 - **Resize**: `cowshed resize <ws|main> --build <size>` grows the workspace's build volume exactly as a workspace image
   grows (01_storage.md "Detached growth"), and its seed with it, so every later fork of the workspace inherits the new
   capacity. The workspace's jobs and Nx daemon stop first, because the image has to leave the kernel; any other holder
-  of the volume refuses the resize before anything changes. A land adopts the landing volume at its own capacity, so a
-  workspace forked before its target grew lands smaller; resize it before it lands.
+  of the volume refuses the resize before anything changes. A land never shrinks its target: while the landing volume is
+  quiet (Land step 4) it grows to the target's capacity when it is smaller, before the seed is frozen from it, so the
+  target and every later fork end at the larger of the two capacities.
 - **ZFS**: a build volume is a dataset, `<pool>/cowshed/<owner>/<repo>/build/<id>`; a fork is `snapshot` + `clone`, and
   a seed is a snapshot (09_substrates.md).
 - A directory is never a build volume. Copying a Rust `target/` tree file by file with `clonefile`-backed `cp -c -p -R`
@@ -105,11 +106,23 @@ configuration file ever names a build volume directly.
 
 Mounting a checkout mounts the volume its link names only when that volume's sidecar records the checkout as its linker,
 or the volume has no sidecar yet (a creation in progress, whose sidecar is written last). Any other link is stale and is
-re-pointed at the one volume recorded as the checkout's; none or several refuses. Why: the link lives inside the source
-image, so a restored checkpoint carries the link it had when taken, and a land interrupted between renaming a target's
-link and updating the sidecars leaves the target naming the landing volume. Mounting such a link as found would let the
-checkout write a volume a target or another checkout owns, or one already collected. A restore therefore never rewinds
-the build volume.
+re-pointed at the one volume recorded as the checkout's. When the checkout owns none and the link names another
+checkout's live volume, a target adopted it from this checkout and a `land --no-retire` stopped before reforking it: the
+checkout takes a fresh clone of that target's latest seed, exactly as the refork would have. Anything else (several
+volumes, or none and no adopter's seed) refuses. Why: the link lives inside the source image, so a restored checkpoint
+carries the link it had when taken, and a land interrupted between renaming a target's link and updating the sidecars
+leaves the target naming the landing volume. Mounting such a link as found would let the checkout write a volume a
+target or another checkout owns, or one already collected. A restore therefore never rewinds the build volume.
+
+**Refresh.** Before a job of a checkout is admitted (exec, a land check, the adoption check), at adoption for main, and
+from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it fingerprints the
+tracked build inputs (Cargo manifests, `.cowshed.toml`, the build-state capabilities' markers) and, while the
+fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a real directory
+where the link belongs is discarded and relinked, never copied, and reported). When it moved, capability detection runs
+again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a checkout's build
+state): new paths join the volume, held ones never move. A checkout with build state and no volume gets its first one
+(its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
+A build-state path that holds tracked source refuses before anything is deleted.
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
@@ -129,10 +142,10 @@ build volume is written by whatever runs there (a developer's build, a reload, t
 mid-write would copy a Cargo unit or an Nx database half-written. A seed has no writer by construction, so its clone is
 consistent without any quiescence protocol.
 
-A target's seed is made when the target is created (a clone of the seed it was forked from) and again during every land
-into it (below), by cloning the landing workspace's build volume after that workspace has been quiesced and before the
-target adopts it, so neither side can be writing it. Each target keeps only its latest seed; a target's seed is deleted
-when the target retires.
+A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
+at its first touch) and again during every land into it (below), by cloning the landing workspace's build volume after
+that workspace has been quiesced and before the target adopts it, so neither side can be writing it. Each target keeps
+only its latest seed; a target's seed is deleted when the target retires.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
@@ -364,14 +377,17 @@ first. Every sandbox that uses the tool must be able to write them; a cache a sa
 
 ## Process lifetime across a swap
 
-Nothing pins anything. A process resolves paths through the links when it opens them:
+Nothing pins a path. A process resolves paths through the links when it opens them, inside the sandbox grant of the job
+it belongs to. Each job's sandbox grants exactly the build volume the controller resolved when the job was admitted
+(04_sandbox.md); the supervisor is never relaunched for a swap:
 
-- A command started after a swap uses the new build volume entirely.
-- A process that started before the swap and finishes without opening the Nx database again stays correct on the old
-  volume; the old volume stays attached until it exits (GC).
-- A long-running process that starts builds (a development server, a file watcher) starts each build as a new process,
-  which resolves the new volume. Such a process re-subscribes to Nx file events when the daemon it watched is stopped at
-  a swap (Nx reports `reconnecting`; the watcher reconnects through a new client, which starts a daemon).
+- A job admitted after a swap, and the Nx daemon the supervisor restarts after it, use the new build volume entirely.
+- A job admitted before the swap keeps its grant and stays on the old volume. The target's previous volume is released
+  without force, so it stays attached, busy, until the last such job exits; GC then deletes it. Nothing is killed.
+- A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
+  builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
+  denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the
+  daemon it watched is stopped at a swap (Nx reports `reconnecting`).
 
 ## Stacks and fragmentation
 
