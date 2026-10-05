@@ -355,6 +355,7 @@
         }
       },
       "cargo-thread-ffi": {
+        "//": "The shared library the Bun provider (src/bun/threadSpanBufferFfi.ts) dlopens by default. Compiled in the root workspace's target (its units are shared), then published by `cargo --artifact-dir` into `.cache/lmao-thread-ffi` at the checkout root, a plain directory: in a cowshed checkout `target/` links to the checkout's build volume, and Nx restoring a cached output beneath that link replaces it with a plain directory (specs/cowshed/16_build_volumes.md, 'Nx outputs never live in the build volume'), so no cached output may live below it. Cargo publishes only this host's file (lib*.dylib, lib*.so or *.dll), and the directory output restores whichever suffix it wrote. The relative `--artifact-dir` resolves against this project's cwd.",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -371,12 +372,10 @@
           "cargoToolchain"
         ],
         "outputs": [
-          "{workspaceRoot}/target/debug/liblmao_ffi_dylib.dylib",
-          "{workspaceRoot}/target/debug/liblmao_ffi_dylib.so",
-          "{workspaceRoot}/target/debug/lmao_ffi_dylib.dll"
+          "{workspaceRoot}/.cache/lmao-thread-ffi"
         ],
         "options": {
-          "command": "cargo build -p lmao-ffi-dylib",
+          "command": "cargo build -p lmao-ffi-dylib -Z unstable-options --artifact-dir ../../.cache/lmao-thread-ffi",
           "cwd": "{projectRoot}"
         }
       }

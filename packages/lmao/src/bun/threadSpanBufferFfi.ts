@@ -2,8 +2,8 @@
  * Bun's native provider for the shared per-thread span buffer.
  *
  * The shared library is loaded once when this Bun-only entrypoint is imported.
- * Development resolves the repository-root dev-profile artifact the nx
- * `cargo-thread-ffi` target builds; published consumers supply
+ * Development resolves the checkout-root `.cache/lmao-thread-ffi` library the nx
+ * `cargo-thread-ffi` target publishes; published consumers supply
  * `LMAO_THREAD_FFI_DYLIB` because npm packages do not ship platform-native
  * build output.
  *
@@ -42,7 +42,7 @@ const configuredPath = process.env.LMAO_THREAD_FFI_DYLIB;
 export const THREAD_SPAN_BUFFER_FFI_DYLIB_PATH =
   configuredPath && configuredPath.length > 0
     ? configuredPath
-    : fileURLToPath(new URL(`../../../../target/debug/${dylibName}`, import.meta.url));
+    : fileURLToPath(new URL(`../../../../.cache/lmao-thread-ffi/${dylibName}`, import.meta.url));
 
 const nativeSymbols = {
   thread_span_buffer_new: {
