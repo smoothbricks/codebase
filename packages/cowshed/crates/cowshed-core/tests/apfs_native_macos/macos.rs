@@ -10,8 +10,8 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
-    CommandRunError, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    MacOsApfsBackend, MountAccess, SystemCommandRunner,
+    CommandRunError, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, MountAccess,
+    SystemCommandRunner,
 };
 use cowshed_core::fork_lock::{Fenced, Run as _, Spawn as _};
 use cowshed_core::metadata::{
@@ -22,7 +22,7 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
-    RestoreFailpoint, SystemKernelMountSource,
+    RestoreFailpoint, SystemKernelMountSource, blank_template,
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
@@ -334,7 +334,6 @@ impl RealFixture {
     /// handed back detached: every verb that grows or replaces it next needs an image nothing
     /// holds. It is a clone of the run's blank image, not a mint of its own.
     fn blank_image(&self, image: &Path) {
-        std::fs::create_dir_all(image.parent().expect("image parent")).expect("image parent");
         blank_image::blank_image(image);
     }
 
@@ -4480,18 +4479,9 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
             .is_err(),
         "dirfd traversal must reject a symlinked owner"
     );
-    let request = CreateImageRequest {
-        staged_stem: layout
-            .project()
-            .project_root
-            .join(".staging/main-00000000000000000000000000000001"),
-        capacity: ImageCapacity::from_gibibytes(1),
-        volume_name: "cowshed.acme--widget.main".to_owned(),
-        owner_uid: 501,
-        owner_gid: 20,
-    };
     assert!(
-        host.create_attached(&request, canonical.image()).is_err(),
+        host.create_attached(ImageCapacity::from_gibibytes(1), canonical.image())
+            .is_err(),
         "command target validation must reject the same ancestor"
     );
     assert!(runner.requests().is_empty(), "no APFS command may spawn");

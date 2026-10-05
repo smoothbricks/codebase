@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_core::apfs::{CreateImageRequest, DetachIntent, MountAccess};
+use cowshed_core::apfs::{DetachIntent, MountAccess};
 use cowshed_core::metadata::{
-    GrantSet, IMAGE_EXTENSION, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
-    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, is_image_path,
+    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, is_image_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
@@ -266,22 +266,16 @@ impl ApfsExecutionHost for FakeHost {
 
     fn create_attached(
         &self,
-        request: &CreateImageRequest,
+        capacity: ImageCapacity,
         image: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
-        if !is_image_path(image)
-            || !request
-                .staged_stem
-                .with_extension(IMAGE_EXTENSION)
-                .components()
-                .any(|component| component.as_os_str() == ".staging")
-        {
+        if !is_image_path(image) {
             return Err(ApfsStorageError::Host(
-                "the blank is staged and the attached image is canonical".to_owned(),
+                "a mint lands on an image path".to_owned(),
             ));
         }
         self.record_path(image);
-        self.record(format!("create-attached+fsck:{}", request.capacity));
+        self.record(format!("create-attached+fsck:{capacity}"));
         Ok(FakeAttachment)
     }
 

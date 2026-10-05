@@ -8,13 +8,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{MacOsApfsExecutionHost, io_error, sync_parent_path};
-use crate::apfs::{
-    ApfsBackend, CommandRunner, CreateImageRequest, DetachIntent, MountAccess,
-    RecoveredImageAttachment,
-};
+use super::{MacOsApfsExecutionHost, io_error};
+use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord};
-use crate::metadata::{IMAGE_EXTENSION, ImageCapacity};
+use crate::metadata::ImageCapacity;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 
@@ -32,10 +29,12 @@ impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
-    /// Create the empty build volume `id` at `capacity` and mount it, without a record. The
+    /// Mint the empty build volume `id` at `capacity` and mount it, without a record: one
+    /// `clonefile` of the store's blank template and one attach (01_storage.md, "Images"). The
     /// caller writes the record last, once the volume holds what it should (a migration's copied
     /// build state); until then the volume is an interrupted creation, which collection deletes
-    /// unless a live build link names it.
+    /// unless a live build link names it. The volume keeps the template's label: a label is
+    /// human-facing only, and a build volume is mounted `nobrowse`.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -43,47 +42,9 @@ where
         capacity: ImageCapacity,
     ) -> Result<PathBuf, ApfsStorageError> {
         let image = layout.image(id);
-        let stem = layout.staged_stem(id);
         self.verify_controller_path(&image)?;
-        self.verify_controller_path(&stem)?;
         Self::ensure_parent(&image)?;
-        Self::ensure_parent(&stem)?;
-        let request = CreateImageRequest {
-            staged_stem: stem.clone(),
-            capacity,
-            volume_name: volume_name(id),
-            // SAFETY: `getuid`/`getgid` read this process's credentials; they take no pointers
-            // and cannot fail.
-            owner_uid: unsafe { libc::getuid() },
-            // SAFETY: as above.
-            owner_gid: unsafe { libc::getgid() },
-        };
-        let blank = stem.with_extension(IMAGE_EXTENSION);
-        if let Err(primary) = self.backend.create_blank_image(&request) {
-            return super::super::combine_cleanup(
-                "create blank build volume",
-                primary.into(),
-                self.backend.delete_image(&blank).map_err(Into::into),
-            );
-        }
-        if let Err(error) = fs::rename(&blank, &image) {
-            return super::super::combine_cleanup(
-                "publish blank build volume",
-                io_error("rename blank build volume into place", &image, error),
-                self.backend.delete_image(&blank).map_err(Into::into),
-            );
-        }
-        sync_parent_path(&image)?;
-        let attachment = match self.backend.format_attached(&image, &request) {
-            Ok(attachment) => attachment,
-            Err(primary) => {
-                return super::super::combine_cleanup(
-                    "format build volume",
-                    primary.into(),
-                    self.backend.delete_image(&image).map_err(Into::into),
-                );
-            }
-        };
+        let attachment = self.mint(capacity, &image)?;
         let mount = layout.mount(id);
         if let Err(primary) = self
             .backend
@@ -198,38 +159,25 @@ where
     ) -> Result<Release, ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
-        if image.exists() {
-            match self.backend.recovered_image_attachment(&image)? {
-                Some(RecoveredImageAttachment::Apfs(attachment)) => {
-                    let mounted = self
-                        .mount_source
-                        .mounts()?
-                        .into_iter()
-                        .any(|mount| mount.source_device == attachment.volume_device());
-                    if mounted
-                        && let Err(error) = self
-                            .backend
-                            .unmount_verified(&attachment, DetachIntent::WhenIdle)
-                    {
-                        return busy_or(error);
-                    }
-                    if let Err(error) = self.backend.detach(&attachment, DetachIntent::WhenIdle) {
-                        return busy_or(error);
-                    }
-                }
-                Some(RecoveredImageAttachment::Unformatted {
-                    image,
-                    whole_device,
-                }) => {
-                    if let Err(error) = self.backend.detach_unformatted_image(
-                        &image,
-                        &whole_device,
-                        DetachIntent::WhenIdle,
-                    ) {
-                        return busy_or(error);
-                    }
-                }
-                None => {}
+        // A minted volume is formatted before anything attaches it, so an attachment of a build
+        // image is an APFS one; anything else is refused, not released.
+        if image.exists()
+            && let Some(attachment) = self.backend.existing_attachment(&image)?
+        {
+            let mounted = self
+                .mount_source
+                .mounts()?
+                .into_iter()
+                .any(|mount| mount.source_device == attachment.volume_device());
+            if mounted
+                && let Err(error) = self
+                    .backend
+                    .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            {
+                return busy_or(error);
+            }
+            if let Err(error) = self.backend.detach(&attachment, DetachIntent::WhenIdle) {
+                return busy_or(error);
             }
         }
         self.backend.delete_image(&image)?;
@@ -243,34 +191,6 @@ where
             }
         }
         Ok(Release::Deleted)
-    }
-
-    /// Remove what an interrupted build-volume creation left in the staging directory.
-    pub fn sweep_build_volume_staging(
-        &self,
-        layout: &BuildVolumeLayout,
-    ) -> Result<(), ApfsStorageError> {
-        let staging = layout.staging();
-        let entries = match fs::read_dir(&staging) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(io_error("list build volume staging", &staging, error)),
-        };
-        for entry in entries {
-            let path = entry
-                .map_err(|error| io_error("list build volume staging", &staging, error))?
-                .path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == IMAGE_EXTENSION)
-            {
-                // A blank never attached: deleting it frees nothing anyone holds.
-                if self.backend.existing_attachment(&path)?.is_none() {
-                    self.backend.delete_image(&path)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The capacity build volume `id`'s image holds, attached or not.
@@ -303,9 +223,7 @@ where
             });
         }
         let was_mounted = self.mounted_at(&layout.mount(id))?.is_some();
-        if let Some(RecoveredImageAttachment::Apfs(attachment)) =
-            self.backend.recovered_image_attachment(&image)?
-        {
+        if let Some(attachment) = self.backend.existing_attachment(&image)? {
             if was_mounted {
                 self.backend
                     .unmount_verified(&attachment, DetachIntent::WhenIdle)?;
@@ -337,11 +255,6 @@ where
             capacity: observed,
         })
     }
-}
-
-/// The volume label: a label and nothing else (01_storage.md "Volume name").
-fn volume_name(id: &BuildVolumeId) -> String {
-    format!("cowshed build {}", &id.as_str()[..8])
 }
 
 /// A detach the image driver dissented from is the kernel saying "in use"; any other failure is
@@ -450,7 +363,6 @@ mod tests {
         let source = BuildVolumeId::mint();
         // Creation is proven by first touch (build_volume::migrate) and adoption; this test's
         // source is a clone of the run's blank image, mounted the way a fork's volume is.
-        fs::create_dir_all(layout.image(&source).parent().expect("image directory")).unwrap();
         crate::blank_image::blank_image(&layout.image(&source));
         let mount = host
             .mount_build_volume(&layout, &source)

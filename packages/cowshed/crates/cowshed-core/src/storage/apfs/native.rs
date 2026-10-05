@@ -18,8 +18,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
-    ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent,
-    MacOsApfsBackend, MountAccess, RecoveredImageAttachment,
+    ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
+    MountAccess, RecoveredImageAttachment,
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
@@ -56,7 +56,11 @@ use super::{
 };
 use crate::timing::timed;
 
+mod blank_template;
 mod build_volumes;
+pub use blank_template::{
+    BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
+};
 pub use build_volumes::Release as BuildVolumeRelease;
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -3537,10 +3541,9 @@ where
 
     fn create_attached(
         &self,
-        request: &CreateImageRequest,
+        capacity: ImageCapacity,
         image: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
-        self.verify_controller_path(&request.staged_stem)?;
         self.verify_controller_path(image)?;
         crate::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -3550,29 +3553,7 @@ where
                 image.display()
             )));
         }
-        Self::ensure_parent(&request.staged_stem)?;
-        Self::ensure_parent(image)?;
-        let blank = request.staged_stem.with_extension(IMAGE_EXTENSION);
-        if let Err(primary) = self.backend.create_blank_image(request) {
-            return super::combine_cleanup(
-                "create blank image",
-                primary.into(),
-                self.backend.delete_image(&blank).map_err(Into::into),
-            );
-        }
-        // Never attached under its staging name, the blank carries no attachment identity, so it
-        // can take the canonical name before the one attach that formats it.
-        if let Err(error) = fs::rename(&blank, image) {
-            return super::combine_cleanup(
-                "publish blank image",
-                io_error("rename blank image into place", image, error),
-                self.backend.delete_image(&blank).map_err(Into::into),
-            );
-        }
-        sync_parent_path(image)?;
-        self.backend
-            .format_attached(image, request)
-            .map_err(Into::into)
+        self.mint(capacity, image)
     }
 
     fn clone_image(
@@ -3752,17 +3733,8 @@ where
         workspace: &LifecycleWorkspace,
     ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
         self.verify_controller_path(image)?;
-        // Formatting is the attach that creation keeps, so an image the kernel still shows
-        // unformatted is one whose creation died before its volume existed: nothing was copied.
-        if let Some(RecoveredImageAttachment::Unformatted {
-            image,
-            whole_device,
-        }) = self.backend.recovered_image_attachment(image)?
-        {
-            self.backend
-                .detach_unformatted_image(&image, &whole_device, DetachIntent::Release)?;
-            return Ok(None);
-        }
+        // The canonical name only ever holds a clone of a formatted template, so the payload is
+        // an APFS volume from the moment it exists; one that does not verify is replaced.
         match self.attach_and_mount_resumable(image, mount_point, workspace) {
             Ok(attachment) => Ok(Some(attachment)),
             Err(ApfsStorageError::Apfs(

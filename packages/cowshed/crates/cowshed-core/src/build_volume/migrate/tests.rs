@@ -344,6 +344,11 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     write(&checkout, "source.rs", "source stays");
     git(&checkout, &["add", "source.rs"]);
     let (host, layout) = host(root.path());
+    // The mint clones the store's blank template: the run's, seeded here.
+    crate::blank_image::blank_image(&crate::storage::apfs::native::blank_template_path(
+        &root.path().join("store"),
+        crate::blank_image::CAPACITY,
+    ));
     let id = BuildVolumeId::mint();
     let mount = host
         .create_build_volume(&layout, &id, ImageCapacity::from_gibibytes(1))

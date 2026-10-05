@@ -1,17 +1,22 @@
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
-use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+use cowshed_core::apfs::{
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    SystemCommandRunner,
+};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{Adoption, AdoptionSkip, DatabaseHolder, LandReport};
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::{PortBlock, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::ApfsSubstrateConfig;
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_core::storage::apfs::native::{
+    MacOsApfsExecutionHost, blank_template, blank_template_path,
+};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{
@@ -27,6 +32,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "../../../cowshed-core/tests/support/blank_image.rs"]
+mod blank_image;
 #[path = "../../../cowshed-core/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
@@ -61,6 +68,9 @@ impl Fixture {
         for path in [&store, &caches, &granted] {
             fs::create_dir_all(path).expect("fixture directory");
         }
+        // Main and build volumes are minted from the store's blank template: the run's, seeded
+        // here, at the 1 GiB test cap both `adopt --capacity` and `.cowshed.toml` ask for.
+        blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
         clone_tree(&checkout_template(project), &checkout);
         let storage = ValidatedHostStorage::new(
             scratch.path().to_path_buf(),

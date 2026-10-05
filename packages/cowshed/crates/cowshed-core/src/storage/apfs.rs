@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::apfs::{ApfsError, CreateImageRequest, DetachIntent, MountAccess, timed_apfs_step};
+use crate::apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use crate::metadata::{
     IMAGE_EXTENSION, ImageCapacity, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
@@ -367,13 +367,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     type Attachment: Send + 'static;
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
-    /// Create `image` and hand it back attached, formatted and verified, but not mounted. The
-    /// blank file is written at `request.staged_stem.asif` and renamed to `image` before its
-    /// first attach, so the canonical name only ever holds a complete file, and the formatting
-    /// attach is the one the caller keeps: no detach and second attach follow it.
+    /// Mint `image`, which must not exist, and hand it back attached and verified but not
+    /// mounted: one `clonefile` of the store's formatted blank template at `capacity`, then one
+    /// attach (01_storage.md, "Images"). The clone takes the canonical name whole, so the name
+    /// only ever holds a complete, formatted volume; it carries the template's label until the
+    /// workspace's supervisor relabels it. A failure leaves no image and no attachment.
     fn create_attached(
         &self,
-        request: &CreateImageRequest,
+        capacity: ImageCapacity,
         image: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError>;
     /// Clone `source` to `destination` with the source's latest writes in it. `source_mount` is
@@ -2192,21 +2193,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                     host.reclaim_image(&image),
                 );
             }
-            // The blank is written under a staging name of its own, so a crash mid-write leaves
-            // only a staging orphan; the canonical name appears with a complete file.
-            let blank = staging_stem(config, repo, &main_name(), &incarnations.mint()?)?;
-            let request = CreateImageRequest {
-                staged_stem: blank,
-                capacity,
-                volume_name: volume_label(repo, &main_name()),
-                // SAFETY: `getuid`/`getgid` read this process's credentials;
-                // they take no pointers and cannot fail.
-                owner_uid: unsafe { libc::getuid() },
-                // SAFETY: `getgid` reads this process's credentials; it takes no
-                // pointers and cannot fail.
-                owner_gid: unsafe { libc::getgid() },
-            };
-            let attachment = match host.create_attached(&request, &image) {
+            let attachment = match host.create_attached(capacity, &image) {
                 Ok(attachment) => attachment,
                 // Creation releases what it attached; anything it could not is released here,
                 // before the image beneath it is removed.

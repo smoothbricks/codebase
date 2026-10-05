@@ -38,8 +38,6 @@ const IMAGES_DIRECTORY: &str = "build";
 /// Every project's build-volume mountpoints, beneath the host mount root and outside every
 /// workspace mount: `<host mount root>/.build/<owner>/<repo>/<id>`.
 const MOUNTS_DIRECTORY: &str = ".build";
-/// Unpublished images: created here, renamed into [`IMAGES_DIRECTORY`] only once complete.
-const STAGING_DIRECTORY: &str = ".staging";
 /// The record beside each image: `<id>.asif.json`.
 const RECORD_SUFFIX: &str = ".json";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
@@ -423,15 +421,6 @@ impl BuildVolumeLayout {
     pub fn record(&self, id: &BuildVolumeId) -> PathBuf {
         self.images
             .join(format!("{id}.{IMAGE_EXTENSION}{RECORD_SUFFIX}"))
-    }
-
-    /// The staged stem a new image is created at, without its extension.
-    pub fn staged_stem(&self, id: &BuildVolumeId) -> PathBuf {
-        self.images.join(STAGING_DIRECTORY).join(id.as_str())
-    }
-
-    pub fn staging(&self) -> PathBuf {
-        self.images.join(STAGING_DIRECTORY)
     }
 
     pub fn mount(&self, id: &BuildVolumeId) -> PathBuf {

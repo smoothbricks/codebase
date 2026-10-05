@@ -2,16 +2,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+use cowshed_core::apfs::{
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    SystemCommandRunner,
+};
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::{PortBlock, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::ApfsSubstrateConfig;
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_core::storage::apfs::native::{
+    MacOsApfsExecutionHost, blank_template, blank_template_path,
+};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::storage::recovery::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
@@ -20,6 +25,8 @@ use cowshed_core::storage::recovery::{
 use cowshed_core::{CowshedError, Result};
 use serde_json::{Value, json};
 
+#[path = "../support/blank_image.rs"]
+mod blank_image;
 #[path = "../support/scratch_apfs.rs"]
 mod scratch_apfs;
 
@@ -45,6 +52,8 @@ impl Fixture {
         for path in [&checkout, &store, &caches] {
             fs::create_dir_all(path).expect("fixture directory");
         }
+        // Adoption mints main from the store's blank template: the run's, seeded here.
+        blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
         git(&checkout, &["init", "-q", "-b", "main"]);
         fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
         fs::write(

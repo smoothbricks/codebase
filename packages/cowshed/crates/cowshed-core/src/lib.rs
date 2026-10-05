@@ -43,13 +43,16 @@ pub mod workspace_git_fetch;
 // sweep, one sequence, whichever module attaches the image; and one blank image template.
 #[cfg(all(test, target_os = "macos"))]
 use crate::apfs::{
-    ApfsBackend, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    MacOsApfsBackend, SystemCommandRunner,
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    SystemCommandRunner,
 };
 #[cfg(all(test, target_os = "macos"))]
 use crate::metadata::ImageCapacity;
 #[cfg(all(test, target_os = "macos"))]
-use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
+use crate::storage::apfs::{
+    ApfsSubstrateConfig,
+    native::{MacOsApfsExecutionHost, blank_template},
+};
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/support/blank_image.rs"]
 mod blank_image;

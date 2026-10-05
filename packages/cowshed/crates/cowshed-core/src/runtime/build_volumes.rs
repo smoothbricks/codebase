@@ -520,9 +520,6 @@ impl BuildVolumes {
     /// the kernel's words, beside what the plan itself deferred.
     pub async fn collect(&self, links: Links, dry_run: bool) -> Result<Collection> {
         self.blocking(move |host, layout| {
-            if !dry_run {
-                host.sweep_build_volume_staging(layout).map_err(storage)?;
-            }
             let plan = plan(layout, &links)?;
             let mut collection = Collection {
                 examined: plan.examined,
@@ -1051,7 +1048,7 @@ mod tests {
 
         // Main's volume at 1 GiB, linked from its checkout, with a seed cloned from it.
         let live = BuildVolumeId::mint();
-        let mount = test_cap_volume(&host, &layout, &live);
+        let mount = test_volume(&host, &layout, &live, 1);
         BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
@@ -1173,15 +1170,7 @@ mod tests {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
-            let mount = match gib {
-                1 => test_cap_volume(&self.host, &self.layout, &id),
-                // Other capacities are this module's own; a template minted for one test
-                // would cost a detach and a second attach over minting in place.
-                _ => self
-                    .host
-                    .create_build_volume(&self.layout, &id, ImageCapacity::from_gibibytes(gib))
-                    .expect("create a build volume"),
-            };
+            let mount = test_volume(&self.host, &self.layout, &id, gib);
             BuildVolumeState::default().write(&mount).unwrap();
             self.layout
                 .write_record(&id, &BuildVolumeRecord::new(None, linked(name)))
@@ -1200,19 +1189,28 @@ mod tests {
         }
     }
 
-    /// Build volume `id`, mounted, at the 1 GiB test cap: a clone of the run's blank image put
-    /// in place and mounted the way a fork's volume is, instead of a mint of its own. Creation is
-    /// not what these tests prove, and a mint queues twice on the host's disk service.
+    /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank
+    /// image put in place and mounted the way a fork's volume is. Creation is not what these
+    /// tests prove. Above the 1 GiB test cap only the clone's ASIF header grows and its container
+    /// stays the template's: these tests compare image capacities, which the header records, and
+    /// a mint at another capacity would cost the store a template of its own — a `diskutil image
+    /// create`, a formatting attach and a detach.
     #[cfg(target_os = "macos")]
-    fn test_cap_volume(host: &Host, layout: &BuildVolumeLayout, id: &BuildVolumeId) -> PathBuf {
+    fn test_volume(
+        host: &Host,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        gib: u64,
+    ) -> PathBuf {
+        use crate::apfs::{CommandRunner, SystemCommandRunner};
         let image = layout.image(id);
-        fs::create_dir_all(
-            image
-                .parent()
-                .expect("a build volume image has a directory"),
-        )
-        .unwrap();
         crate::blank_image::blank_image(&image);
+        let capacity = ImageCapacity::from_gibibytes(gib);
+        if capacity > crate::blank_image::CAPACITY {
+            SystemCommandRunner
+                .grow_image(&image, capacity)
+                .expect("grow the clone's image header");
+        }
         host.mount_build_volume(layout, id)
             .expect("mount a build volume")
     }

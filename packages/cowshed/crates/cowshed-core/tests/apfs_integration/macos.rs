@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    MountAccess, SystemCommandRunner, volume_name,
+    MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
 };
 use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{
@@ -19,11 +19,12 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
 use cowshed_core::storage::apfs::native::{
-    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
+    BLANK_TEMPLATE_LABEL, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
+    blank_template, blank_template_path, blank_template_staged_stem,
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource,
-    MetadataPolicy, TokioApfsBlockingLane, volume_label,
+    MetadataPolicy, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
@@ -31,10 +32,19 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 
+#[path = "../support/blank_image.rs"]
+mod blank_image;
 #[path = "../support/scratch_apfs.rs"]
 mod scratch_apfs;
 
+use blank_image::CAPACITY;
 use scratch_apfs::ScratchRoot;
+
+/// Give `store` the run's blank template where its mints look for theirs, so they clone it
+/// rather than mint one of the store's own.
+fn seed(store: &Path) {
+    blank_image::blank_image(&blank_template_path(store, CAPACITY));
+}
 
 struct DeterministicIncarnations(AtomicU64);
 
@@ -142,6 +152,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
     fs::create_dir_all(&store)?;
     fs::create_dir_all(&caches)?;
     fs::create_dir_all(&checkout_path)?;
+    seed(&store);
     let config = ApfsSubstrateConfig::new(&store, &caches, &checkout_path)
         .with_capacity(ImageCapacity::from_gibibytes(1));
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
@@ -207,10 +218,10 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
         assert_case_sensitive(&checkout_path)?;
-        // The label adoption gave main's volume, read from the kernel rather than from Disk
+        // Main is a clone of the store's blank template and carries its label until main's
+        // supervisor relabels it, off adoption's path. Read from the kernel rather than from Disk
         // Arbitration's cache.
-        let main_label = volume_label(&repo, &WorkspaceName::new("main")?);
-        assert_eq!(volume_name(&checkout_path)?, main_label.as_str());
+        assert_eq!(volume_name(&checkout_path)?, BLANK_TEMPLATE_LABEL);
 
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
@@ -271,7 +282,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         );
         // Provisioning leaves the label the clone inherited: relabelling is a Disk Arbitration
         // round trip the workspace's supervisor makes later, off the path that creates it.
-        assert_eq!(volume_name(&fork_mount)?, main_label.as_str());
+        assert_eq!(volume_name(&fork_mount)?, BLANK_TEMPLATE_LABEL);
 
         let checkpoint_plan = substrate.plan_checkpoint(
             &main,
@@ -508,6 +519,7 @@ fn assert_case_sensitive(mount: &Path) -> Result<(), Box<dyn Error>> {
 /// of what the dead process held.
 struct KillWindow {
     substrate: ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    store: PathBuf,
     checkout: PathBuf,
     pre_cowshed: PathBuf,
     repo: RepoId,
@@ -519,7 +531,15 @@ struct KillWindow {
 }
 
 impl KillWindow {
+    /// A kill window over a store seeded with the run's blank template.
     fn new(label: &str) -> Result<Self, Box<dyn Error>> {
+        let world = Self::unseeded(label)?;
+        seed(&world.store);
+        Ok(world)
+    }
+
+    /// A kill window over a store with no blank template yet: its first mint makes one.
+    fn unseeded(label: &str) -> Result<Self, Box<dyn Error>> {
         let root = ScratchRoot::new(label)?;
         let store = root.path().join("store");
         let caches = store.join("caches");
@@ -527,8 +547,7 @@ impl KillWindow {
         fs::create_dir_all(&caches)?;
         fs::create_dir_all(&checkout)?;
         fs::write(checkout.join("tracked"), b"original source\n")?;
-        let config = ApfsSubstrateConfig::new(&store, &caches, &checkout)
-            .with_capacity(ImageCapacity::from_gibibytes(1));
+        let config = ApfsSubstrateConfig::new(&store, &caches, &checkout).with_capacity(CAPACITY);
         let repo = RepoId::parse(&format!("cowshed/kill-{}", std::process::id()))?;
         let layout = StorageLayout::new(&store, &repo)?;
         let image = layout.main_image()?.image().to_owned();
@@ -568,6 +587,7 @@ impl KillWindow {
         );
         Ok(Self {
             substrate,
+            store,
             pre_cowshed: PathBuf::from(format!("{}.pre-cowshed", checkout.display())),
             checkout,
             repo,
@@ -581,17 +601,6 @@ impl KillWindow {
 
     fn host(&self) -> &MacOsApfsExecutionHost<SystemCommandRunner> {
         self.substrate.host()
-    }
-
-    fn request(&self, stem: PathBuf) -> CreateImageRequest {
-        CreateImageRequest {
-            staged_stem: stem,
-            capacity: ImageCapacity::from_gibibytes(1),
-            volume_name: volume_label(&self.repo, self.main.name()),
-            // SAFETY: `getuid`/`getgid` read this process's credentials and cannot fail.
-            owner_uid: unsafe { libc::getuid() },
-            owner_gid: unsafe { libc::getgid() },
-        }
     }
 
     /// Main's PendingFence sidecar, durable before any payload.
@@ -611,15 +620,7 @@ impl KillWindow {
     /// it: dropping the handle leaves the kernel's attachment exactly where it was.
     fn fenced_image(&self) -> Result<AttachedImage, Box<dyn Error>> {
         self.fence()?;
-        let blank = self
-            .image
-            .parent()
-            .ok_or("canonical image has no parent")?
-            .join(".staging")
-            .join(format!("main-{:032x}", 0xbe));
-        Ok(self
-            .host()
-            .create_attached(&self.request(blank), &self.image)?)
+        Ok(self.host().create_attached(CAPACITY, &self.image)?)
     }
 
     /// Everything adoption does before the checkout changes hands, killed at `swapped`: after
@@ -702,22 +703,71 @@ impl KillWindow {
     }
 }
 
-/// Killed inside image creation, after the blank took the canonical name and before its volume
-/// was formatted: the fenced payload never held a copy, so adoption discards it and starts over.
+/// Killed inside the mint, after the clone of the store's blank template took the canonical name
+/// and before its one attach: the payload is already a formatted, empty volume, so the next adopt
+/// attaches and verifies it and resumes the same incarnation into it.
 #[test]
-fn real_apfs_adopt_replaces_a_fenced_image_killed_before_its_volume_existed() {
-    let world = KillWindow::new("adopt-kill-unformatted").expect("kill window");
+fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
+    let world = KillWindow::new("adopt-kill-cloned").expect("kill window");
     world.fence().expect("fence");
-    world
-        .host()
-        .backend()
-        .create_blank_image(&world.request(world.image.with_extension("")))
-        .expect("blank image under the canonical name");
+    let backend = world.host().backend();
+    let template = blank_template(backend, &world.store, CAPACITY).expect("the seeded template");
+    backend
+        .clone_image(&template, &world.image)
+        .expect("the template cloned under the canonical name");
 
-    let adopted = world.adopt().expect("adopt starts over");
+    let adopted = world.adopt().expect("adopt resumes");
 
-    assert_ne!(adopted.incarnation(), world.main.incarnation());
+    assert_eq!(adopted.incarnation(), world.main.incarnation());
     world.assert_adopted().expect("adopted");
+}
+
+/// Killed while minting the store's first blank template, between formatting it and detaching
+/// it: the minter's staging image is still attached when the next adopt comes. That adopt's mint
+/// releases and removes it, mints the template afresh — verified, detached, renamed into place —
+/// and clones main from it.
+#[test]
+fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached() {
+    let world = KillWindow::unseeded("adopt-kill-template").expect("kill window");
+    let backend = world.host().backend();
+    let stem = blank_template_staged_stem(&world.store, CAPACITY);
+    let leftover = stem.with_extension("asif");
+    fs::create_dir_all(stem.parent().expect("a template has a directory"))
+        .expect("template directory");
+    let request = CreateImageRequest {
+        staged_stem: stem,
+        capacity: CAPACITY,
+        volume_name: BLANK_TEMPLATE_LABEL.to_owned(),
+        // SAFETY: `getuid`/`getgid` read this process's credentials and cannot fail.
+        owner_uid: unsafe { libc::getuid() },
+        owner_gid: unsafe { libc::getgid() },
+    };
+    backend
+        .create_blank_image(&request)
+        .expect("the template's blank image");
+    drop(
+        backend
+            .format_attached(&leftover, &request)
+            .expect("formatted and still attached"),
+    );
+
+    world.adopt().expect("adopt mints the template, then main");
+
+    world.assert_adopted().expect("adopted");
+    assert!(blank_template_path(&world.store, CAPACITY).is_file());
+    assert!(!leftover.exists(), "the killed minter's image is removed");
+    assert!(
+        SystemCommandRunner
+            .attached_disk_images()
+            .expect("kernel disk-image inventory")
+            .iter()
+            .all(|attached| attached.source != DiskImageSource::File(leftover.clone())),
+        "and released"
+    );
+    assert_eq!(
+        volume_name(&world.checkout).expect("main's label"),
+        BLANK_TEMPLATE_LABEL
+    );
 }
 
 /// Killed after the image's one attach and before its staging mount: the next adopt settles the
