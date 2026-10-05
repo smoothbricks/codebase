@@ -5,6 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +24,9 @@ pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
 /// process, so a run opens dozens of sweeps at once. Unserialized, each of them raced the others
 /// for the same abandoned images: every sweeper waited on the image lease another held for its
 /// detach (11.5 s measured), then found the volume already unmounted under it and failed. One
-/// sweep at a time does the work once; the sweeps queued behind it find nothing left. Its name
+/// sweep at a time does the work once. The file records when the last finished sweep started,
+/// and a sweep that started after a process asked to sweep has already seen every run that was
+/// dead when it asked, so the queue behind a sweep returns without sweeping again. Its name
 /// spells no pid, so no sweep ever reclaims it.
 const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
 
@@ -85,13 +88,21 @@ impl Drop for ScratchRoot {
 /// deleted backing file. Detaching therefore selects on the image path the kernel still holds,
 /// not on what is on disk now.
 fn sweep_dead_runs() {
-    let _sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
+    let asked = since_epoch();
+    let sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}");
             return;
         }
     };
+    let mut recorded = [0; 16];
+    if sweeping.read_at(&mut recorded, 0).ok() == Some(recorded.len())
+        && u128::from_be_bytes(recorded) >= asked
+    {
+        return;
+    }
+    let started = since_epoch();
     if let Err(error) =
         detach_images(|image| owner_pid(&image.to_string_lossy()).is_some_and(process_is_gone))
     {
@@ -112,6 +123,16 @@ fn sweep_dead_runs() {
             );
         }
     }
+    if let Err(error) = sweeping.write_all_at(&started.to_be_bytes(), 0) {
+        eprintln!("the next run sweeps again: record the sweep in {SWEEP_LOCK}: {error}");
+    }
+}
+
+/// Nanoseconds since the Unix epoch, which orders sweeps across processes.
+fn since_epoch() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 /// `path` opened (created if absent) and `flock`ed exclusively, waiting for any holder: the lock
@@ -120,6 +141,7 @@ pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(path)?;
     loop {
