@@ -354,9 +354,9 @@ pub enum RecoveryScope {
     /// `main`'s are replayed, and each failure fails the verb. Every other intent stays journaled,
     /// untouched.
     Workspaces(std::collections::BTreeSet<WorkspaceName>),
-    /// A named retirement: [`Self::Workspaces`] of its one target, which alone may leave its own
-    /// clone intent unreplayed while that clone's grants collide, so the retirement can repair
-    /// the duplicate endpoint.
+    /// A named retirement: [`Self::Workspaces`] of its one target, except that the target's own
+    /// unpublished create or fork is left for the retirement to retire rather than finished
+    /// first, so nothing that stopped the clone can also stop its removal.
     Removal(WorkspaceName),
     /// Inspection (`doctor` without `--repair`): the opening finishes nothing. No lifecycle intent
     /// is replayed, `main`'s included; no interrupted publication or restore is completed; no
@@ -3099,7 +3099,8 @@ impl NativeProjectRuntimeHost {
     /// its first mutation, and replaying it would create a workspace its caller was told failed
     /// (see [`Self::discard_unmutated_clone_intent`]). An unfinished intent whose lease another
     /// process holds is no residue at all: that process is running the operation right now, and
-    /// replaying it here would run it a second time beside the first. Only intents inside this
+    /// replaying it here would run it a second time beside the first. A removal never finishes its
+    /// own target's unpublished clone: the `rm` retires it instead. Only intents inside this
     /// opening's [`RecoveryScope`] are touched. Reports whether recovery mutated images or mounts,
     /// so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
@@ -3142,73 +3143,15 @@ impl NativeProjectRuntimeHost {
         if pending.is_empty() {
             return Ok(false);
         }
-        // A named retirement is the one operation that can repair a duplicate endpoint.
-        // Preserve unfinished clone intents without activating them while their stored
-        // grants collide; every other opening retains strict replay and the allocator and
-        // gateway still reject the duplicate. Any other inventory error remains a refusal.
-        let defer_conflicting_clones = if let Some(target) = self.recovery_scope.removal_target()
-            && pending.iter().any(|record| {
-                matches!(
-                    &record.operation,
-                    LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
-                )
-            }) {
-            let storage = self.descriptor.storage.clone();
-            match crate::gateway_inventory::NativeGatewayInventory::new(storage)
-                .all_reserved_port_blocks()
-                .await
-            {
-                Ok(_) => false,
-                Err(crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
-                    held,
-                    claimed,
-                }) => {
-                    let colliding =
-                        |block: crate::metadata::PortBlock| block == held || block == claimed;
-                    let active_block = match self.current(target).await {
-                        Ok(current) => current.metadata.grants.port_block,
-                        Err(error) if error.code == ErrorCode::NotFound => None,
-                        Err(error) => return Err(error),
-                    };
-                    let target_owns_block = active_block.is_some_and(colliding)
-                        || self.pending_metadata().await?.iter().any(|(_, metadata)| {
-                            &metadata.workspace == target
-                                && metadata.grants.port_block.is_some_and(colliding)
-                        });
-                    if !target_owns_block {
-                        return Err(native_integrity_error(
-                            crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
-                                held,
-                                claimed,
-                            },
-                        ));
-                    }
-                    // Every pending replay is deferred: even unrelated fresh creations need
-                    // store-wide allocation, which rightly refuses while this duplicate exists.
-                    // Their journal records remain intact, and only the named owner can retire.
-                    true
-                }
-                Err(error) => return Err(native_integrity_error(error)),
-            }
-        } else {
-            false
-        };
         for record in pending {
-            if defer_conflicting_clones
-                && matches!(
-                    &record.operation,
-                    LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
-                )
-            {
-                eprintln!(
-                    "cowshed: retaining unfinished clone {} until the duplicate port block is retired",
-                    record.operation.target()
-                );
-                continue;
-            }
             let workspace = record.operation.target().clone();
             let verb = record.operation.verb();
             let replay = self.recovery_scope.replay(&workspace);
+            // A named retirement retires its target's unpublished clone itself, from the pending
+            // image or the bare intent (`remove_contained_in`), and never finishes it first:
+            // whatever stopped the clone — a duplicate port block, a start revision the source
+            // lost — would stop the replay again, and the name could never be removed.
+            let retiring = self.recovery_scope.removal_target() == Some(&workspace);
             let replayed: Result<()> = async {
                 let phase = record.phase;
                 match record.operation {
@@ -3248,6 +3191,10 @@ impl NativeProjectRuntimeHost {
                                 if self.discard_unmutated_clone_intent(&workspace, None).await? {
                                     eprintln!(
                                         "cowshed: discarded the unfinished {verb} of {workspace}: it ended before changing anything, so nothing is left to finish"
+                                    );
+                                } else if retiring {
+                                    eprintln!(
+                                        "cowshed: leaving the unfinished {verb} of {workspace} to the rm retiring it"
                                     );
                                 } else {
                                     self.create(workspace, options).await?;
@@ -3291,6 +3238,10 @@ impl NativeProjectRuntimeHost {
                             if self.discard_unmutated_clone_intent(&destination, None).await? {
                                 eprintln!(
                                     "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
+                                );
+                            } else if retiring {
+                                eprintln!(
+                                    "cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it"
                                 );
                             } else {
                                 self.fork(source, destination).await?;
@@ -4289,6 +4240,40 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    /// The commit `revision` names in the repository a clone of `source` inherits.
+    ///
+    /// Read at the source's mount, so a detached source is refused by name instead of being
+    /// read as an empty directory. A revision that repository does not hold is refused here,
+    /// before `create` journals anything, because no later replay could ever branch from it.
+    async fn resolve_create_start(
+        &self,
+        source: &NativeWorkspace,
+        source_name: &WorkspaceName,
+        revision: &crate::api::dto::RevisionTarget,
+    ) -> Result<GitOid> {
+        let named = revision_target(revision);
+        match source.derived.mount_state {
+            crate::storage::lifecycle::MountState::Mounted { .. } => {}
+            crate::storage::lifecycle::MountState::Detached => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "--ref {named} is resolved in {source_name}'s repository, and {source_name} is detached"
+                    ),
+                    format!("cowshed attach {source_name}"),
+                ));
+            }
+        }
+        let mount = self.workspace_mount_path(source_name)?;
+        git_optional_ref_oid(&mount, &format!("{named}^{{commit}}"))
+            .await?
+            .ok_or_else(|| {
+                CowshedError::not_found(
+                    format!("--ref {named} names no commit in {source_name}'s repository"),
+                    format!("fetch {named} into {source_name}, or start from a revision it holds"),
+                )
+            })
+    }
+
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
         let info = WorkspaceInfo::from_current_metadata(
             &workspace.derived,
@@ -4762,6 +4747,51 @@ impl NativeProjectRuntimeHost {
                     std::mem::drop(tokio::spawn(async move {
                         let _ = substrate.reclaim(retired).await;
                     }));
+                    return Ok(report);
+                }
+                // An unfinished create or fork that left no clone — refused after binding its
+                // slot, or stopped before the clone's first write — has only its slot and its
+                // intent to retire. Under the intent lease no live creator is mid-clone, and the
+                // lookup is repeated there so a clone staged since is left for a retry to retire
+                // rather than orphaned. The retirement supersedes the clone intent, so no later
+                // open replays it.
+                if self
+                    .lifecycle_intents
+                    .get(&workspace)
+                    .is_some_and(|record| {
+                        record.completion.is_none()
+                            && matches!(
+                                record.operation,
+                                crate::storage::recovery::LifecycleIntent::Create { .. }
+                                    | crate::storage::recovery::LifecycleIntent::Fork { .. }
+                            )
+                    })
+                {
+                    if !self.claim_intent_lease(&workspace)? {
+                        return Err(another_process_is_running(&workspace));
+                    }
+                    if self
+                        .pending_metadata()
+                        .await?
+                        .iter()
+                        .any(|(_, metadata)| metadata.workspace == workspace)
+                    {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "an unfinished clone of {workspace} was staged while rm read it"
+                            ),
+                            format!("cowshed rm {workspace}"),
+                        ));
+                    }
+                    self.begin_lifecycle_intent(intent).await?;
+                    self.mark_lifecycle_intent_mutating(&workspace).await?;
+                    self.release_slot(&workspace).await?;
+                    let report = RemoveReport::default();
+                    self.complete_lifecycle_intent(
+                        &workspace,
+                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                    )
+                    .await?;
                     return Ok(report);
                 }
                 if was_pending {
@@ -7567,6 +7597,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 format!("cowshed new {workspace} --git-worktree"),
             ));
         }
+        // `--ref` is resolved before anything is journaled, in the repository the clone inherits:
+        // the source's, which for a git-worktree workspace is main's. A revision that repository
+        // does not hold is the caller's mistake, not an operation recovery could ever finish;
+        // journaled, every later replay re-ran the same failing `git switch` and wedged the name.
+        // The clone then branches from the resolved commit itself, so what was checked is what is
+        // used — after the clone drops its inherited remotes, a remote-tracking name would no
+        // longer resolve there.
+        let start = match options.revision.as_ref() {
+            Some(revision) => Some(
+                self.resolve_create_start(&source, &source_name, revision)
+                    .await?,
+            ),
+            None => None,
+        };
         // The slot is recorded before anything derives a mount path, because the record is what
         // decides where this workspace mounts. It is part of the durable lifecycle intent: an
         // exact retry binds it idempotently, while releasing it after a PendingFence clone exists
@@ -7630,7 +7674,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             } else {
                 crate::git::WorkspaceRepository::Standalone
             };
-            let start = options.revision.as_ref().map(revision_target);
+            let start = start.as_ref().map(GitOid::as_str);
             let destination = workspace.clone();
             if slot.is_none() {
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
@@ -7683,7 +7727,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                 main: &main_mount,
                             },
                             repository_shape,
-                            start.as_deref(),
+                            start,
                             stage.resuming,
                         )
                         .await

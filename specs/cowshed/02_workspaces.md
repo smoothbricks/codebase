@@ -301,9 +301,10 @@ fork `Prepared`, so those durable facts, not the phase, decide a `Prepared` inte
 startup discards it and names it on stderr instead of rerunning it. Reissuing the same call returns the recorded
 incarnation instead of creating a second workspace or reporting a false conflict.
 
-Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
-`--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--register` (see "The `main`
-remote"), `--git-worktree` (see "Git-worktree workspaces"), `--browse`.
+Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <commit>` instead of main's state, where `<commit>`
+is what `<rev>` names in the source's repository — resolved before the intent is journaled, so a revision the source
+does not hold is refused with nothing to replay), `--from <workspace>` (clone a session instead of main — sugar over
+`cowshed fork`), `--register` (see "The `main` remote"), `--git-worktree` (see "Git-worktree workspaces"), `--browse`.
 
 ### Publication and crash recovery
 
@@ -859,10 +860,12 @@ validated under its image lock, then receives the same dirty-state, HEAD-stabili
 workspace. A refusal preserves the image and original clone intent. Once retirement is authorized, its journal record
 retains the original clone source so an interrupted removal can recover.
 
-If the named target owns a duplicate port block, removal-scoped startup leaves unfinished clone intents intact instead
-of replaying them through the conflicting allocator. Only the named target is retired; its peers keep their grants.
-Other openings and unrelated integrity failures still refuse. The retired image is validated by its exact trash path,
-repository, format and incarnation; being unpublished before retirement does not invalidate that recovery fact.
+Removal-scoped startup never finishes the named target's own unpublished clone: it leaves the clone intent for the `rm`
+to retire, so whatever stopped the clone — a duplicate port block, a start revision the source no longer holds — cannot
+also stop its removal. An unfinished clone intent that left no pending image is retired the same way, with only its slot
+binding to release; under the intent lease, so a live creator is refused. Only the named target is retired; its peers
+keep their grants. The retired image is validated by its exact trash path, repository, format and incarnation; being
+unpublished before retirement does not invalidate that recovery fact.
 
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).
