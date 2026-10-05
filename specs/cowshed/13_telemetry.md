@@ -104,17 +104,17 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any
   of these decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
-  checkpoint, fork, restore) is emitted as one typed `ControllerCommitment` record to an audit sink. The records carry
-  existence, lifecycle/status, a writer-local order, lineage, byte counts, and expected hashes; they never contain
-  inline output, a protected artifact path, a redirect source, or any other raw stdout/stderr payload duplication.
-  **Nothing reads them for a decision.** The sink is selected when the project opens (`COWSHED_CONTINUITY_AUDIT`):
-  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `/private/cowshed/store/telemetry/`,
-  `off` discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
-  (routing the same records into its own durable log). A sink that refuses a record is a `doctor` finding
-  (`audit-sink`), never a reason to fail the act it describes. Job admission, terminal and checkpoint records come from
-  the workspace supervisors, which are processes of their own (11_shell.md): each records to the host's default sink,
-  and a controller with a sink of its own reads each supervisor's records after the last cursor it forwarded, records
-  them, and acknowledges them by cursor.
+  checkpoint, fork, restore, and each cache miss a land's adoption check found) is emitted as one typed
+  `ControllerCommitment` record to an audit sink. The records carry existence, lifecycle/status, a writer-local order,
+  lineage, byte counts, and expected hashes; they never contain inline output, a protected artifact path, a redirect
+  source, or any other raw stdout/stderr payload duplication. **Nothing reads them for a decision.** The sink is
+  selected when the project opens (`COWSHED_CONTINUITY_AUDIT`): `arrow` (default for the standalone CLI) writes sealed
+  per-writer segments under `/private/cowshed/store/telemetry/`, `off` discards, and a supervising runtime injects its
+  own sink through `ProjectRuntime::open_existing_with_audit` (routing the same records into its own durable log). A
+  sink that refuses a record is a `doctor` finding (`audit-sink`), never a reason to fail the act it describes. Job
+  admission, terminal and checkpoint records come from the workspace supervisors, which are processes of their own
+  (11_shell.md): each records to the host's default sink, and a controller with a sink of its own reads each
+  supervisor's records after the last cursor it forwarded, records them, and acknowledges them by cursor.
 - **Arrow audit segments** — one Arrow IPC batch containing one row per segment at
   `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
   calendar date, `writer_uuid` is the lowercase hyphenated UUID of the controller process that wrote it, and `order` is
@@ -230,6 +230,7 @@ enum ControllerCommitment {
     Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
+    LandAdoption(LandAdoptionCommitment),
 }
 struct WorkspaceIntroducedCommitment {
     version: u16, order: u64, repo_id: RepoId,
@@ -262,13 +263,33 @@ struct RestoreCommitment {
     source_incarnation: WorkspaceIncarnation, replaced_incarnation: WorkspaceIncarnation,
     destination_incarnation: WorkspaceIncarnation,
 }
+struct LandAdoptionCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    landing_incarnation: WorkspaceIncarnation, target_incarnation: WorkspaceIncarnation,
+    landed_head: GitOid, task: String, task_hash: String, inputs_digest: Sha256Digest,
+}
 ```
+
+A `LandAdoption` record is one Nx task that missed the cache when a land re-ran its check in the target on the build
+volume it adopted (16_build_volumes.md, Land step 7): one record per miss, never one per land. `task` is the Nx task id,
+`task_hash` the hash Nx computed in the target, and `inputs_digest` the SHA-256 of the task's hash inputs as
+`nx show target inputs` named them (the land report carries the inputs themselves). Why: every such miss is a defect in
+the project's Nx configuration (an input that differs between checkouts, an undeclared output, a nondeterministic step),
+and the land succeeds regardless, so the land report alone is read once and forgotten. As records, a coordinator queries
+every miss across lands and hosts, groups recurrences by `task` and `inputs_digest`, and turns them into fix work. The
+landing and target incarnations must differ, and `task` and `task_hash` must be non-empty.
 
 The flat controller Arrow columns are exactly `commitment_kind, commitment_version, commitment_order, repo_id` plus
 variant-selected
-`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint, output_limit_bytes, output_crossing_bytes, replaced_incarnation`.
-Non-selected fields are null and the tag controls required fields. Version 1 segments are intentionally incompatible
-with this clean schema cutover; no optional-field or legacy parser path exists.
+`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint, output_limit_bytes, output_crossing_bytes, replaced_incarnation, landed_head, task, task_hash, inputs_digest`.
+A `landAdoption` row carries its landing and target incarnations in `source_incarnation` and `destination_incarnation`;
+the last four columns (`landed_head`, `task`, `task_hash` as Utf8, `inputs_digest` as Binary) are its alone.
+Non-selected fields are null and the tag controls required fields. Segments sealed before `LandAdoption` existed carry
+only the first twenty-three columns; they are read as they are, every earlier kind decoding the same, because the four
+columns they lack are null for every kind but `landAdoption`. A `landAdoption` row in such a segment is malformed and
+refused. Why: sealed segments are never rewritten, and a refresh enumerates every one of them (below), so refusing the
+shorter layout would fail every host's history closed. Version 1 segments are intentionally incompatible with this clean
+schema cutover; no optional-field or legacy parser path exists for them.
 
 `order` is the writing controller's own positive, strictly increasing sequence from 1; across writers a segment is
 identified by `(order, writer_uuid)`, and nothing requires a host-global order because nothing replays the segments.
