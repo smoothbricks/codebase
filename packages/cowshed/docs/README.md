@@ -175,6 +175,15 @@ the protected paths. The next build repopulates the volume; a land freezes the w
 as `cargo clean` replaces a fixed link with a real directory, the next admission reports it, applies the same
 tracked-source guard, discards that rebuildable directory and restores the link. Files and foreign links refuse.
 
+**State no capability detects is declared.** `.cowshed.toml` `[build] state = ["vendor/upstream"]` puts each listed
+checkout path on the build volume too, for tool state no convention file names — a gitignored patch-development checkout
+of an upstream project and its multi-GiB incremental build tree is the case it exists for. The path must be untracked,
+inside the checkout and apart from every detected tool's state; anything else refuses with the remedy. It is
+rebuild-only like all build state: the first admission after you declare it discards the existing directory, so re-run
+whatever reconstructs it once; from then on it lives on the volume and every fork gets it warm. A declared path that
+does not exist stays absent (tools read its existence as meaning) and is linked at the first admission after something
+creates it.
+
 **The compile cache is for the work that is left.** When a workspace does have to compile something — its own edits, or
 whatever landed on main since the clone — the host compile-cache daemon can hand back an object another workspace or
 main already produced. That only works if the cache key ignores where the workspace happens to be mounted, because every

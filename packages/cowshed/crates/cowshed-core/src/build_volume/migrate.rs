@@ -6,16 +6,14 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState,
-    DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx,
+    DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
 };
 use crate::apfs::SystemCommandRunner;
 use crate::capabilities::BuildStatePath;
-use crate::fork_lock::Run;
 use crate::metadata::ImageCapacity;
 use crate::storage::apfs::native::MacOsApfsExecutionHost;
 use crate::{CowshedError, Result};
@@ -29,7 +27,8 @@ pub struct FirstTouch<'a> {
 }
 
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
-/// with every contributed path linked into it, and the real directories it discarded.
+/// with every contributed path linked into it (a declared one once it exists), and the real
+/// directories it discarded.
 pub fn first_touch(
     host: &MacOsApfsExecutionHost<SystemCommandRunner>,
     layout: &BuildVolumeLayout,
@@ -44,8 +43,8 @@ pub fn first_touch(
         capacity,
         record,
     } = migration;
-    let real = preflight(checkout, paths)?;
-    if let Some(refusal) = tracked_source(checkout, &real)? {
+    let found = preflight(checkout, paths)?;
+    if let Some(refusal) = tracked_source(checkout, &found.real)? {
         return Ok(Err(refusal));
     }
     let id = match link::linked(checkout)? {
@@ -74,7 +73,7 @@ pub fn first_touch(
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _) = previous.with_discovered(paths, fingerprint, &mount)?;
-    let displaced = adopt_preflighted(checkout, &mount, paths, &real)?;
+    let displaced = adopt_preflighted(checkout, &mount, paths, &found)?;
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.write_record(&id, &record)?;
@@ -82,25 +81,29 @@ pub fn first_touch(
 }
 
 /// Exact links are unchanged. Contributed real directories are discarded and relinked, never
-/// copied. Files and foreign links refuse before any build-state directory is removed.
+/// copied. Files and foreign links refuse before any build-state directory is removed. A
+/// declared path nothing occupies stays absent: tools read a directory's existence as meaning
+/// (a pin worktree is there or it is not), so its link and volume directory appear only once a
+/// tool has made the directory, at the next refresh after.
 pub fn adopt_paths(
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
 ) -> Result<std::result::Result<Vec<DisplacedBuildStateFinding>, TrackedBuildStateRefusal>> {
-    let real = preflight(checkout, paths)?;
-    if let Some(refusal) = tracked_source(checkout, &real)? {
+    let found = preflight(checkout, paths)?;
+    if let Some(refusal) = tracked_source(checkout, &found.real)? {
         return Ok(Err(refusal));
     }
-    adopt_preflighted(checkout, volume_root, paths, &real).map(Ok)
+    adopt_preflighted(checkout, volume_root, paths, &found).map(Ok)
 }
 
 fn adopt_preflighted(
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
-    real: &[&BuildStatePath],
+    found: &Found<'_>,
 ) -> Result<Vec<DisplacedBuildStateFinding>> {
+    let real = &found.real;
     if real
         .iter()
         .any(|state| BuildStateTool::of(state) == BuildStateTool::Nx)
@@ -132,7 +135,7 @@ fn adopt_preflighted(
     // background: a late writer lands in the aside tree or follows the new link, never in a
     // half-deleted path, and no job waits on the delete (`discard`).
     // Excluded first: a process that dies after a move aside leaves nothing `git status` shows.
-    link::exclude_links(checkout, paths)?;
+    link::exclude_links(checkout, &found.linked)?;
     let mut findings = Vec::with_capacity(real.len());
     for state in real {
         let source = state.checkout.as_path();
@@ -144,18 +147,38 @@ fn adopt_preflighted(
             likely_tool: BuildStateTool::of(state),
         });
     }
-    link::link_paths(checkout, volume_root, paths)?;
+    link::link_paths(checkout, volume_root, &found.linked)?;
     // Also whatever an earlier refresh moved aside and did not live to delete.
     discard::reap(checkout);
     Ok(findings)
 }
 
-fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Vec<&'a BuildStatePath>> {
+/// What preflight found at the build-state paths.
+struct Found<'a> {
+    /// Real directories: discarded, then linked.
+    real: Vec<&'a BuildStatePath>,
+    /// The paths to link: every one except a declared path nothing occupies yet.
+    linked: Vec<BuildStatePath>,
+}
+
+fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Found<'a>> {
     super::disjoint(paths).map_err(|(left, right)| {
         super::overlapping(&checkout.join(super::STATE_FILE), left, right)
     })?;
     let mut real = Vec::new();
+    let mut linked = Vec::with_capacity(paths.len());
     for state in paths {
+        if state.is_declared() {
+            // Looked at before `contained_parent`, which makes missing parents: an absent
+            // declared path makes nothing, its parents included.
+            let at = checkout.join(state.checkout.as_path());
+            match fs::symlink_metadata(&at) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error("inspect build state", &at, error)),
+                Ok(_) => {}
+            }
+        }
+        linked.push(state.clone());
         let (parent, name) =
             link::contained_parent(checkout, state.checkout.as_path()).map_err(|error| {
                 io_error(
@@ -188,48 +211,7 @@ fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Vec<&'a
             }
         }
     }
-    Ok(real)
-}
-
-fn tracked_source(
-    checkout: &Path,
-    real: &[&BuildStatePath],
-) -> Result<Option<TrackedBuildStateRefusal>> {
-    if real.is_empty() {
-        return Ok(None);
-    }
-    let output = crate::git::git_command_at(checkout)
-        .arg("--literal-pathspecs")
-        .args(["ls-files", "-z", "--"])
-        .args(real.iter().map(|state| state.checkout.as_path()))
-        .output_locked()
-        .map_err(|error| crate::git::git_spawn_error(&error))?;
-    if !output.status.success() {
-        return Err(CowshedError::environment_missing(
-            format!(
-                "cannot prove migration paths contain no tracked source: {}",
-                String::from_utf8_lossy(&output.stderr).trim_end()
-            ),
-            "repair the checkout's Git index and retry; nothing has been deleted",
-        ));
-    }
-    for state in real {
-        let tracked_files: Vec<PathBuf> = output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-            .map(|name| Path::new(std::ffi::OsStr::from_bytes(name)))
-            .filter(|path| path.starts_with(state.checkout.as_path()))
-            .map(Path::to_owned)
-            .collect();
-        if !tracked_files.is_empty() {
-            return Ok(Some(TrackedBuildStateRefusal {
-                path: state.checkout.as_path().to_owned(),
-                tracked_files,
-            }));
-        }
-    }
-    Ok(None)
+    Ok(Found { real, linked })
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> CowshedError {

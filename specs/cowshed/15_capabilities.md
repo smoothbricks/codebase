@@ -112,7 +112,13 @@ Each detector returns data through one `CapabilityContribution`:
   caches and main's `[caches] home` entries are shared.
 - **Build state:** `BuildStatePath` pairs a normalized checkout-relative tool path with its normalized volume-relative
   destination (16_build_volumes.md). Overlapping contributions fail; identical ones coalesce. The storage implementation
-  applies fixed relative links through the checkout's one `.cowshed/build` link.
+  applies fixed relative links through the checkout's one `.cowshed/build` link. Besides the detectors, the repository
+  contributes through the same contract: `.cowshed.toml` `[build] state` declares checkout paths whose state no
+  capability can detect, each held on the volume at `declared/<path>` (16_build_volumes.md, "Declared build state").
+  **Why**: some tool state has no convention a detector could read — a patch-development checkout of an upstream project
+  and its multi-GiB incremental build tree is just an ignored directory — yet it is exactly what belongs on the build
+  volume. A declaration overlapping a capability's build state, holding tracked source, or reaching outside the checkout
+  is refused with its remedy.
 - **Daemon isolation:** private directories to create and workspace-relative inherited state to discard at mint. The
   detector owns the convention-specific paths; the clone implementation only applies the returned paths.
 - **Unix sockets:** canonical, individually admitted host service sockets. No wildcard socket grants or in-sandbox
@@ -163,7 +169,8 @@ while sharing the checkout's writable build volume and Nx daemon/socket, not a p
 `directory = "relative/project"`. A directory is workspace-relative, normalized, contained, and inspected for that
 detector's convention. An override never activates an absent convention and never substitutes repository identity for
 detection. Unknown capability names, keys and invalid paths fail explicitly. No configuration is required for the
-conventions above or for a plain repository.
+conventions above or for a plain repository. `[build] state` is not an override: it adds build state beside what the
+detectors find and never changes a detector's contribution.
 
 Directory overrides also root repository-relative contribution paths at that directory: for example Nx's workspace root
 and inherited `.nx` rendezvous directory follow the selected Nx directory. Private environment state remains scoped to

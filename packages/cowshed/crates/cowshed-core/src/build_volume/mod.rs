@@ -250,28 +250,23 @@ impl BuildVolumeState {
     /// Every Nx `workspace-data` directory the volume holds, relative to its root: where Nx keeps
     /// its task database and its daemon's record (`d/`).
     pub fn nx_workspace_data(&self) -> impl Iterator<Item = &Path> {
-        self.paths.iter().filter_map(|state| {
-            let checkout = state.checkout.as_path();
-            (checkout.file_name() == Some(std::ffi::OsStr::new("workspace-data"))
-                && checkout
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == ".nx"))
-            .then(|| state.volume.as_path())
-        })
+        self.nx_named("workspace-data")
     }
 
     /// Every Nx cache directory the volume holds, relative to its root.
     pub fn nx_cache(&self) -> impl Iterator<Item = &Path> {
-        self.paths.iter().filter_map(|state| {
-            let checkout = state.checkout.as_path();
-            (checkout.file_name() == Some(std::ffi::OsStr::new("cache"))
-                && checkout
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == ".nx"))
-            .then(|| state.volume.as_path())
-        })
+        self.nx_named("cache")
+    }
+
+    /// Every Nx directory `.nx/<name>` the volume holds, relative to its root.
+    fn nx_named(&self, name: &'static str) -> impl Iterator<Item = &Path> {
+        self.paths
+            .iter()
+            .filter(move |state| {
+                BuildStateTool::of(state) == BuildStateTool::Nx
+                    && state.checkout.as_path().file_name() == Some(std::ffi::OsStr::new(name))
+            })
+            .map(|state| state.volume.as_path())
     }
 
     /// Every Cargo target directory the volume holds, relative to its root.
@@ -321,14 +316,19 @@ pub enum BuildStateTool {
     Cargo,
     Nx,
     Codegraph,
+    /// `.cowshed.toml` `[build] state`: a tool no capability detects.
+    Declared,
 }
 
 impl BuildStateTool {
-    /// The tool whose state `path` is: Nx's directories under `.nx`, the indexer's
-    /// `.codegraph`, and otherwise a Cargo target directory, the only other contribution.
+    /// The tool whose state `path` is: declared state by its own volume namespace, Nx's
+    /// directories under `.nx`, the indexer's `.codegraph`, and otherwise a Cargo target
+    /// directory, the only other contribution.
     pub fn of(path: &BuildStatePath) -> Self {
         let checkout = path.checkout.as_path();
-        if checkout
+        if path.is_declared() {
+            Self::Declared
+        } else if checkout
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name == ".nx")
@@ -358,6 +358,16 @@ impl std::fmt::Display for DisplacedBuildStateFinding {
             BuildStateTool::Cargo => "cargo clean or another Cargo command",
             BuildStateTool::Nx => "an Nx reset or cache command",
             BuildStateTool::Codegraph => "the indexer",
+            BuildStateTool::Declared => {
+                return write!(
+                    formatter,
+                    "discarded the real directory {} that .cowshed.toml [build] state declares \
+                     and linked it onto the build volume; declared state is rebuildable, so \
+                     re-run whatever reconstructs it once, and from then on it lives on the \
+                     volume and every fork inherits it warm",
+                    self.path.display()
+                );
+            }
         };
         write!(
             formatter,
@@ -386,6 +396,53 @@ impl std::fmt::Display for TrackedBuildStateRefusal {
         }
         Ok(())
     }
+}
+
+/// The first of `paths` that holds tracked source, with every tracked file under it, or `None`.
+/// One `git ls-files` query answers them all. Build state is discarded, never copied, so a path
+/// holding a tracked file is never build state: migration refuses it before anything is
+/// deleted, and discovery refuses to declare it.
+pub(crate) fn tracked_source(
+    checkout: &Path,
+    paths: &[&BuildStatePath],
+) -> crate::Result<Option<TrackedBuildStateRefusal>> {
+    use crate::fork_lock::Run as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let output = crate::git::git_command_at(checkout)
+        .arg("--literal-pathspecs")
+        .args(["ls-files", "-z", "--"])
+        .args(paths.iter().map(|state| state.checkout.as_path()))
+        .output_locked()
+        .map_err(|error| crate::git::git_spawn_error(&error))?;
+    if !output.status.success() {
+        return Err(crate::CowshedError::environment_missing(
+            format!(
+                "cannot prove build-state paths contain no tracked source: {}",
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ),
+            "repair the checkout's Git index and retry; nothing has been deleted",
+        ));
+    }
+    for state in paths {
+        let tracked_files: Vec<PathBuf> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| Path::new(std::ffi::OsStr::from_bytes(name)))
+            .filter(|path| path.starts_with(state.checkout.as_path()))
+            .map(Path::to_owned)
+            .collect();
+        if !tracked_files.is_empty() {
+            return Ok(Some(TrackedBuildStateRefusal {
+                path: state.checkout.as_path().to_owned(),
+                tracked_files,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// What refreshing a checkout's build state did (16_build_volumes.md, "One link per checkout"):

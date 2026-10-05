@@ -383,6 +383,7 @@ keys optional:
 capacity = "100g"              # image cap
 [build]
 capacity = "100g"              # build volume cap for a volume created from nothing; clones inherit theirs
+state = ["vendor/upstream"]    # declared build state no capability detects (16_build_volumes.md)
 [checkpoints]
 keep = 5
 [gateway]

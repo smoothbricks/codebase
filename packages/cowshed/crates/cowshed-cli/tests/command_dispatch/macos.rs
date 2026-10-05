@@ -163,6 +163,9 @@ enum Project<'a> {
         nx: Option<(&'a Path, &'a Path)>,
         rust: Option<&'a Path>,
     },
+    /// [`Project::Plain`] whose `.cowshed.toml` also declares [`DECLARED_STATE`] build state,
+    /// with an ignored, untracked nested Git checkout already there ([`write_declared_project`]).
+    Declared,
 }
 
 impl Project<'_> {
@@ -191,6 +194,7 @@ impl Project<'_> {
                 nx: None,
                 rust: None,
             } => "build",
+            Self::Declared => "declared",
         }
     }
 
@@ -211,6 +215,7 @@ impl Project<'_> {
                 git(checkout, &["commit", "-q", "-m", "nx project"]);
             }
             Self::Build { nx, rust } => write_build_project(checkout, nx, rust),
+            Self::Declared => write_declared_project(checkout),
         }
     }
 }
@@ -1410,6 +1415,81 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
             panic!("w2's Nx run left no summary of its own: {reason:?}")
         }
     }
+}
+
+/// The checkout path [`Project::Declared`] declares as build state.
+const DECLARED_STATE: &str = "upstream";
+
+/// Main's tree for the declared-build-state test: `.cowshed.toml` declares [`DECLARED_STATE`]
+/// as build state and `.gitignore` ignores it, committed; then, untracked, what an author's
+/// reconstruct script leaves there before cowshed ever saw it: a nested Git checkout of an
+/// upstream project and its build tree.
+fn write_declared_project(checkout: &Path) {
+    fs::write(
+        checkout.join(".cowshed.toml"),
+        format!("{FIXTURE_COWSHED_TOML}state = [\"{DECLARED_STATE}\"]\n"),
+    )
+    .unwrap();
+    fs::write(checkout.join(".gitignore"), format!("/{DECLARED_STATE}/\n")).unwrap();
+    git(checkout, &["add", ".cowshed.toml", ".gitignore"]);
+    git(checkout, &["commit", "-q", "-m", "declare build state"]);
+    let upstream = checkout.join(DECLARED_STATE);
+    fs::create_dir_all(upstream.join("build")).unwrap();
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    fs::write(upstream.join("build/build.ninja"), b"before cowshed\n").unwrap();
+}
+
+/// Declared build state (16_build_volumes.md, "Declared build state"): main's first touch
+/// discards the real directory at the declared path, rebuild-only, and links the path onto
+/// main's build volume. What the author's reconstruct script then writes there lives on the
+/// volume, and a fork of main gets it warm through the same fixed link.
+#[tokio::test]
+async fn real_apfs_declared_build_state_is_linked_at_first_touch_and_a_fork_gets_it_warm() {
+    let mut fixture = Fixture::with(Project::Declared);
+    assert!(fixture.checkout.join(DECLARED_STATE).join(".git").is_dir());
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let link = Path::new(".cowshed/build/declared").join(DECLARED_STATE);
+    assert_eq!(
+        fs::read_link(fixture.checkout.join(DECLARED_STATE)).expect("main's declared link"),
+        link
+    );
+    assert!(
+        !fixture
+            .checkout
+            .join(DECLARED_STATE)
+            .join("build/build.ninja")
+            .exists(),
+        "the first touch discards the old checkout and never copies it"
+    );
+    let layout = build_volumes(&fixture);
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    // The author's reconstruct script, run once more: from now on it lives on main's volume.
+    let warm = fixture.checkout.join(DECLARED_STATE).join("build");
+    fs::create_dir_all(&warm).unwrap();
+    fs::write(warm.join("build.ninja"), b"warm\n").unwrap();
+    assert_eq!(
+        git_stdout(
+            &fixture.checkout,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        "",
+        "the link is excluded, never source"
+    );
+
+    let w1 = new_workspace(&mut service, "w1").await;
+    assert_ne!(linked_volume(&layout, &w1), main_volume);
+    assert_eq!(
+        fs::read_link(w1.join(DECLARED_STATE)).expect("the fork's declared link"),
+        link
+    );
+    let forked = fs::read(w1.join(DECLARED_STATE).join("build/build.ninja"));
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert_eq!(
+        forked.expect("the fork's declared state"),
+        b"warm\n",
+        "a fork of main clones main's declared state warm"
+    );
 }
 
 /// A land freezes main's new seed from the landing volume at the landed tree, moves main's link

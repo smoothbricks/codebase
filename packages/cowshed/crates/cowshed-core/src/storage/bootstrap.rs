@@ -85,6 +85,9 @@ pub struct CowshedConfig {
     /// `[build] capacity`: the capacity of the build volumes this project creates from nothing
     /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
     build_capacity: Option<crate::metadata::ImageCapacity>,
+    /// `[build] state`: build state the repository declares for tools no capability detects
+    /// (16_build_volumes.md, "Declared build state"), sorted, pairwise disjoint.
+    build_state: Vec<crate::capabilities::BuildStatePath>,
 }
 
 impl CowshedConfig {
@@ -114,6 +117,11 @@ impl CowshedConfig {
     pub fn build_capacity(&self) -> crate::metadata::ImageCapacity {
         self.build_capacity
             .unwrap_or(crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY)
+    }
+
+    /// The build state `[build] state` declares; empty without it.
+    pub fn build_state(&self) -> &[crate::capabilities::BuildStatePath] {
+        &self.build_state
     }
 }
 
@@ -155,9 +163,9 @@ struct ParsedCapability {
     directory: Option<PathBuf>,
 }
 
-/// Parse repository-owned storage, sandbox deny, build volume capacity, repository cache and
-/// convention-only capability overrides. Unknown or duplicated settings fail rather than silently changing
-/// project detection.
+/// Parse repository-owned storage, sandbox deny, build volume capacity and declared state,
+/// repository cache and convention-only capability overrides. Unknown or duplicated settings fail
+/// rather than silently changing project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
@@ -169,6 +177,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut sandbox_deny = None;
     let mut build_capacity = None;
     let mut caches_home = None;
+    let mut build_state = None;
     let mut capabilities =
         std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
     for (index, original) in input.lines().enumerate() {
@@ -253,6 +262,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 })?;
                 set_once(&mut build_capacity, capacity, section, "capacity")?;
             }
+            (ConfigSection::Build, "state") => {
+                set_once(
+                    &mut build_state,
+                    parse_build_state(value, line_number)?,
+                    section,
+                    "state",
+                )?;
+            }
             (ConfigSection::Caches, "home") => {
                 set_once(
                     &mut caches_home,
@@ -336,11 +353,8 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         Vec::new()
     };
-    if saw_build && build_capacity.is_none() {
-        return Err(ConfigError::MissingKey {
-            section: "build",
-            key: "capacity",
-        });
+    if saw_build && build_capacity.is_none() && build_state.is_none() {
+        return Err(ConfigError::EmptySection("build"));
     }
     let caches_home = if saw_caches {
         caches_home.ok_or(ConfigError::MissingKey {
@@ -368,6 +382,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         caches_home,
         capabilities,
         build_capacity,
+        build_state: build_state.unwrap_or_default(),
     })
 }
 
@@ -449,6 +464,41 @@ fn parse_relative_paths(
     Ok(relative_paths)
 }
 
+/// `[build] state`: a TOML array of checkout-relative paths on one line, each a declared
+/// build-state path ([`crate::capabilities::BuildStatePath::declared`]), sorted and
+/// deduplicated, no two of which overlap: one inside another would link state through state.
+fn parse_build_state(
+    value: &str,
+    line: usize,
+) -> Result<Vec<crate::capabilities::BuildStatePath>, ConfigError> {
+    let paths = serde_json::from_str::<Vec<String>>(value)
+        .map_err(|_| ConfigError::ExpectedBuildStateArray { line })?;
+    let mut state = Vec::with_capacity(paths.len());
+    for path in paths {
+        state.push(
+            crate::capabilities::BuildStatePath::declared(&path)
+                .map_err(|reason| ConfigError::InvalidBuildState { line, path, reason })?,
+        );
+    }
+    state.sort();
+    state.dedup();
+    for (index, outer) in state.iter().enumerate() {
+        if let Some(inner) = state[index + 1..].iter().find(|inner| {
+            inner
+                .checkout
+                .as_path()
+                .starts_with(outer.checkout.as_path())
+        }) {
+            return Err(ConfigError::OverlappingBuildState {
+                line,
+                outer: outer.checkout.as_path().to_owned(),
+                inner: inner.checkout.as_path().to_owned(),
+            });
+        }
+    }
+    Ok(state)
+}
+
 fn strip_comment(line: &str) -> &str {
     let mut quoted = false;
     let mut escaped = false;
@@ -526,6 +576,26 @@ pub enum ConfigError {
         line: usize,
         reason: crate::metadata::ImageCapacityError,
     },
+    #[error("[build] state at line {line} must be an array of quoted checkout-relative paths")]
+    ExpectedBuildStateArray { line: usize },
+    #[error("[build] state entry {path:?} at line {line} {reason}")]
+    InvalidBuildState {
+        line: usize,
+        path: String,
+        reason: &'static str,
+    },
+    #[error(
+        "[build] state at line {line} declares {} inside {}; declare only the outer path",
+        inner.display(),
+        outer.display()
+    )]
+    OverlappingBuildState {
+        line: usize,
+        outer: PathBuf,
+        inner: PathBuf,
+    },
+    #[error("the [{0}] section sets nothing")]
+    EmptySection(&'static str),
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
 }

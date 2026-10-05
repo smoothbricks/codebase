@@ -381,6 +381,8 @@ impl CargoRunner for HostCargo {
     }
 }
 
+/// The build state of the checkout: what capability detection contributes, each Cargo target
+/// directory inside it, and what `.cowshed.toml` `[build] state` declares.
 pub fn discover_build_state(
     context: &DetectionContext<'_>,
     cargo: &mut dyn CargoRunner,
@@ -399,10 +401,92 @@ pub fn discover_build_state(
         &mut tracked,
     )?;
     merge_build_state(&mut result.paths, caches)?;
+    discover_cargo_targets(context, &config, &mut tracked, cargo, &mut result)?;
+    declare(context, config.build_state(), &mut result.paths)?;
     result.paths.sort();
+    result.paths.dedup();
+    Ok(result)
+}
+
+/// Join `declared` to the `discovered` paths. Declared state is discarded and rebuilt, never
+/// copied (16_build_volumes.md, "Declared build state"), so a declared path may not hold tracked
+/// source (the guard migration applies), may not reach outside the checkout through a symlinked
+/// parent, and may not overlap a tool's state, which its capability already links.
+fn declare(
+    context: &DetectionContext<'_>,
+    declared: &[BuildStatePath],
+    discovered: &mut Vec<BuildStatePath>,
+) -> Result<()> {
+    let root = context.workspace_root;
+    for state in declared {
+        let path = state.checkout.as_path();
+        super::validate_project_directory(root, &root.join(path.parent().unwrap_or(path)))
+            .map_err(|error| {
+                CowshedError::usage(
+                    format!(
+                        ".cowshed.toml [build] state declares {}, which is not inside the \
+                         checkout: {error}",
+                        path.display()
+                    ),
+                    "declare a path whose parent directories are real directories of the checkout",
+                )
+            })?;
+        if let Some(tool) = discovered.iter().find(|tool| {
+            tool.checkout.as_path().starts_with(path)
+                || path.starts_with(tool.checkout.as_path())
+                || tool.volume.as_path().starts_with(state.volume.as_path())
+                || state.volume.as_path().starts_with(tool.volume.as_path())
+        }) {
+            return Err(CowshedError::conflict(
+                format!(
+                    ".cowshed.toml [build] state declares {}, which overlaps {}, the {:?} build \
+                     state capability detection already keeps on the build volume",
+                    path.display(),
+                    tool.checkout.as_path().display(),
+                    crate::build_volume::BuildStateTool::of(tool),
+                ),
+                format!(
+                    "remove {} from [build] state: declare only tool state no capability detects",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let declared_refs: Vec<&BuildStatePath> = declared.iter().collect();
+    if let Some(refusal) = crate::build_volume::tracked_source(root, &declared_refs)? {
+        let mut files = String::new();
+        for file in &refusal.tracked_files {
+            files.push(' ');
+            files.push_str(&file.to_string_lossy());
+        }
+        return Err(CowshedError::usage(
+            format!(
+                ".cowshed.toml [build] state declares {}, which holds tracked source:{files}",
+                refusal.path.display()
+            ),
+            format!(
+                "declared build state is discarded at its first touch and rebuilt, never copied, \
+                 so it holds only untracked, rebuildable files: remove {} from [build] state, or \
+                 untrack it (`git rm -r --cached`) and ignore it",
+                refusal.path.display()
+            ),
+        ));
+    }
+    merge_build_state(discovered, declared.to_vec())
+}
+
+/// Each in-checkout Cargo target directory of the tracked Cargo workspaces, asked of `cargo`,
+/// and a finding for each workspace it could not answer for.
+fn discover_cargo_targets(
+    context: &DetectionContext<'_>,
+    config: &crate::storage::bootstrap::CowshedConfig,
+    tracked: &mut TrackedManifests,
+    cargo: &mut dyn CargoRunner,
+    result: &mut BuildStateDiscovery,
+) -> Result<()> {
     let cargo_override = config.capabilities().get(&CapabilityId::Cargo);
     if cargo_override.is_some_and(|setting| setting.disabled) {
-        return Ok(result);
+        return Ok(());
     }
     let selected = cargo_override
         .and_then(|setting| setting.directory.as_ref())
@@ -411,7 +495,7 @@ pub fn discover_build_state(
     super::validate_project_directory(context.workspace_root, &selected)?;
     let mut manifests = Vec::new();
     let mut queries = Vec::new();
-    for manifest in tracked_manifests(context.workspace_root, &selected, &mut tracked)? {
+    for manifest in tracked_manifests(context.workspace_root, &selected, tracked)? {
         let absolute = context.workspace_root.join(&manifest);
         if let Err(error) = super::validate_project_directory(
             context.workspace_root,
@@ -535,9 +619,7 @@ pub fn discover_build_state(
             }),
         }
     }
-    result.paths.sort();
-    result.paths.dedup();
-    Ok(result)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1160,6 +1242,134 @@ mod tests {
             before,
             tracked_manifest_fingerprint(&fixture.context()).unwrap(),
             "the package manager's convention decides whether any cache is build state"
+        );
+    }
+
+    /// A patch-development checkout of an upstream project and its build tree: a nested Git
+    /// checkout the repository ignores, which no capability can recognize as build state.
+    fn upstream_checkout(fixture: &Fixture) {
+        write(fixture, ".gitignore", "/vendor/upstream/\n");
+        git(fixture, &["add", ".gitignore"]);
+        write(fixture, "vendor/upstream/build/build.ninja", "rule cc\n");
+        let output = crate::git::git_command_at(&fixture.root.join("vendor/upstream"))
+            .args(["init", "--quiet"])
+            .output_locked()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn declared_build_state_joins_discovery_and_its_list_moves_the_fingerprint() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        upstream_checkout(&fixture);
+        fs::create_dir(fixture.root.join(".codegraph")).unwrap();
+        let undeclared = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+        );
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"vendor/upstream\"]\n",
+        );
+        let declared = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        assert_ne!(undeclared, declared, "a new declaration is rediscovered");
+        let state = cargo_paths(&fixture);
+        assert!(state.findings.is_empty(), "{:?}", state.findings);
+        assert_eq!(
+            state.paths,
+            [
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::declared("vendor/upstream").unwrap(),
+            ]
+        );
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"vendor/upstream\", \"tools/.pin\"]\n",
+        );
+        assert_ne!(
+            declared,
+            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            "a changed declaration is rediscovered"
+        );
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            [
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::declared("tools/.pin").unwrap(),
+                BuildStatePath::declared("vendor/upstream").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_state_holding_source_or_a_tool_s_state_or_escaping_is_refused_with_its_remedy() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        write(&fixture, "vendor/upstream/fix.patch", "tracked source\n");
+        git(&fixture, &["add", "vendor/upstream/fix.patch"]);
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"vendor/upstream\"]\n",
+        );
+        let refused = |fixture: &Fixture| {
+            discover_build_state(&fixture.context(), &mut HostCargo).unwrap_err()
+        };
+        let tracked = refused(&fixture);
+        assert_eq!(
+            tracked.message,
+            ".cowshed.toml [build] state declares vendor/upstream, which holds tracked source: \
+             vendor/upstream/fix.patch"
+        );
+        assert!(
+            tracked.hint.contains("rebuilt, never copied")
+                && tracked
+                    .hint
+                    .contains("remove vendor/upstream from [build] state"),
+            "{tracked:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("vendor/upstream/fix.patch")).unwrap(),
+            "tracked source\n",
+            "a refused declaration deletes nothing"
+        );
+
+        fs::create_dir_all(fixture.root.join(".codegraph/db")).unwrap();
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\".codegraph/db\"]\n",
+        );
+        let overlap = refused(&fixture);
+        assert_eq!(overlap.code, crate::ErrorCode::Conflict);
+        assert_eq!(
+            overlap.message,
+            ".cowshed.toml [build] state declares .codegraph/db, which overlaps .codegraph, the \
+             Codegraph build state capability detection already keeps on the build volume"
+        );
+        assert!(
+            overlap
+                .hint
+                .contains("remove .codegraph/db from [build] state"),
+            "{overlap:?}"
+        );
+
+        std::os::unix::fs::symlink("/tmp", fixture.root.join("escape")).unwrap();
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"escape/pin\"]\n",
+        );
+        let escape = refused(&fixture);
+        assert!(
+            escape.message.starts_with(
+                ".cowshed.toml [build] state declares escape/pin, which is not inside the checkout"
+            ),
+            "{escape:?}"
         );
     }
 }

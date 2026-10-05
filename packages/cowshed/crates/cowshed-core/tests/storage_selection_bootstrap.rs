@@ -260,7 +260,7 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
         ImageCapacity::from_gibibytes(250)
     );
     let invalid = [
-        ("[build]\n", "missing [build] key \"capacity\""),
+        ("[build]\n", "the [build] section sets nothing"),
         ("[build]\ncapacity = 100\n", "must be a quoted string"),
         (
             "[build]\ncapacity = \"lots\"\n",
@@ -335,6 +335,58 @@ fn caches_home_is_an_array_of_home_relative_paths() {
     }
 }
 
+/// `[build] state` declares build state no capability detects: checkout-relative, normalized,
+/// never Git's or cowshed's own, and never one path inside another. The volume keeps each under
+/// its own `declared/` namespace.
+#[test]
+fn build_state_declares_disjoint_checkout_relative_paths() {
+    use cowshed_core::capabilities::BuildStatePath;
+    assert_eq!(parse_cowshed_config("").unwrap().build_state(), []);
+    let config = parse_cowshed_config(
+        "[build]\nstate = [\"vendor/upstream\", \"tools/.pin\", \"vendor/upstream\"] # rebuildable\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.build_state(),
+        [
+            BuildStatePath::declared("tools/.pin").unwrap(),
+            BuildStatePath::declared("vendor/upstream").unwrap(),
+        ]
+    );
+    assert_eq!(
+        config.build_state()[0].volume.as_path(),
+        Path::new("declared/tools/.pin")
+    );
+    let invalid = [
+        ("[build]\nstate = \"a\"\n", "must be an array of quoted"),
+        (
+            "[build]\nstate = [\"/abs\"]\n",
+            "normalized checkout-relative",
+        ),
+        (
+            "[build]\nstate = [\"a/../b\"]\n",
+            "normalized checkout-relative",
+        ),
+        (
+            "[build]\nstate = [\"sub/.git\"]\n",
+            "must not name Git metadata",
+        ),
+        (
+            "[build]\nstate = [\".cowshed/x\"]\n",
+            "must not be inside cowshed's own",
+        ),
+        (
+            "[build]\nstate = [\"a\", \"a/b\"]\n",
+            "declares a/b inside a; declare only the outer path",
+        ),
+        ("[build]\nstate = []\nstate = []\n", "duplicated"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
 /// Main's `.cowshed.toml` is the only source of `[sandbox] deny` and `[caches] home`: an absent
 /// file declares nothing, and an invalid one refuses rather than run without the deny.
 #[test]
@@ -361,7 +413,6 @@ fn main_cowshed_config_reads_main_and_refuses_an_invalid_file() {
     assert_eq!(declared.caches_home(), [PathBuf::from(".cache/ttsc")]);
     assert_eq!(invalid.code.as_str(), "usage");
 }
-
 #[test]
 fn capability_overrides_are_strict_convention_overrides() {
     use cowshed_core::capabilities::CapabilityId;

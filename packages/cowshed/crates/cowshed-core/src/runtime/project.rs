@@ -3806,13 +3806,9 @@ impl NativeProjectRuntimeHost {
             .paths
             .iter()
             .filter(|path| {
-                path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new("cache"))
-                    && path
-                        .checkout
-                        .as_path()
-                        .parent()
-                        .and_then(Path::file_name)
-                        .is_some_and(|name| name == ".nx")
+                crate::build_volume::BuildStateTool::of(path)
+                    == crate::build_volume::BuildStateTool::Nx
+                    && path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new("cache"))
             })
             .map(|path| path.checkout.as_path().to_owned())
             .collect::<Vec<_>>();

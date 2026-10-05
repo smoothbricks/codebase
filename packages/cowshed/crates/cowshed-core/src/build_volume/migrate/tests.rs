@@ -1,9 +1,11 @@
 use super::*;
 use crate::build_volume::BuildVolumeRole;
+use crate::fork_lock::Run as _;
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
+use std::path::PathBuf;
 
 struct Scratch(PathBuf);
 
@@ -528,4 +530,115 @@ fn a_large_moved_aside_directory_does_not_hold_the_refresh() {
         "the background delete did not finish"
     );
     assert_eq!(status(&checkout), "", "{}", status(&checkout));
+}
+
+/// Declared build state is build state: a real directory at a declared path -- here a nested Git
+/// checkout of an upstream project and its build tree -- is moved aside, discarded in the
+/// background, never copied, and the path becomes its fixed link into the volume's `declared/`
+/// namespace. What is written through the link afterwards lives on the volume.
+#[test]
+fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    write(&checkout, "vendor/upstream/build/build.ninja", "stale tree");
+    git(&checkout.join("vendor/upstream"), &["init", "--quiet"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
+    let displaced = adopt_paths(&checkout, &scratch.volume(), &declared)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        displaced,
+        [DisplacedBuildStateFinding {
+            path: PathBuf::from("vendor/upstream"),
+            likely_tool: BuildStateTool::Declared,
+        }]
+    );
+    assert!(
+        displaced[0]
+            .to_string()
+            .contains("re-run whatever reconstructs it once"),
+        "{}",
+        displaced[0]
+    );
+    assert_eq!(
+        fs::read_link(checkout.join("vendor/upstream")).unwrap(),
+        Path::new("../.cowshed/build/declared/vendor/upstream")
+    );
+    assert!(
+        fs::read_dir(scratch.volume().join("declared/vendor/upstream"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "migration never copies the old checkout"
+    );
+    write(&checkout, "vendor/upstream/build/build.ninja", "rebuilt");
+    assert_eq!(
+        fs::read_to_string(
+            scratch
+                .volume()
+                .join("declared/vendor/upstream/build/build.ninja")
+        )
+        .unwrap(),
+        "rebuilt"
+    );
+    assert!(
+        adopt_paths(&checkout, &scratch.volume(), &declared)
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+        "the exact link is left alone"
+    );
+    assert!(
+        discards_drain(&checkout, std::time::Duration::from_secs(20)),
+        "the background delete did not finish"
+    );
+    assert_eq!(status(&checkout), "", "the link is excluded, never source");
+}
+
+/// Existence carries meaning: a tool asks whether a declared directory is there (a pin worktree
+/// or none). So a refresh never makes an absent declared path -- no link, no volume directory,
+/// no parent -- while every capability's path is linked at once. Once a tool makes the
+/// directory, the next refresh adopts it.
+#[test]
+fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let paths = vec![
+        BuildStatePath::new("target", "target").unwrap(),
+        BuildStatePath::declared("vendor/upstream").unwrap(),
+    ];
+    for _ in 0..2 {
+        assert!(
+            adopt_paths(&checkout, &scratch.volume(), &paths)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fs::symlink_metadata(checkout.join("target"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!checkout.join("vendor").exists(), "nothing made its parent");
+        assert!(!scratch.volume().join("declared").exists());
+    }
+    write(
+        &checkout,
+        "vendor/upstream/build/build.ninja",
+        "made by a tool",
+    );
+    let displaced = adopt_paths(&checkout, &scratch.volume(), &paths)
+        .unwrap()
+        .unwrap();
+    assert_eq!(displaced.len(), 1);
+    assert_eq!(displaced[0].likely_tool, BuildStateTool::Declared);
+    assert_eq!(
+        fs::read_link(checkout.join("vendor/upstream")).unwrap(),
+        Path::new("../.cowshed/build/declared/vendor/upstream")
+    );
+    assert!(scratch.volume().join("declared/vendor/upstream").is_dir());
 }

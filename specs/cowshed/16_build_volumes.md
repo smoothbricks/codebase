@@ -54,6 +54,7 @@ follow from that, and a second volume removes each of them.
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
 | Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                     | Cloned with the workspace image                           |
 | Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                      | Cloned at fork; adopted by main at land                   |
+| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                      | Build volume                      | Cloned at fork; adopted by main at land                   |
 | Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels       | Deleted from a build volume before main adopts it (below) |
 | Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md) | Written once, read by every checkout; never in any image  |
 
@@ -144,8 +145,8 @@ Capability detection names the build-state paths (15_capabilities.md, one contri
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
 `.nx/workspace-data`, a JavaScript package manager contributes the `node_modules/.cache` of every package it installed,
 and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/` whole. A capability that
-keeps no per-tree incremental state contributes none. A project with no build-state capability gets no build volume and
-pays nothing.
+keeps no per-tree incremental state contributes none. A project with no build-state capability and no declared build
+state gets no build volume and pays nothing.
 
 A tool's own per-checkout state that no capability names belongs inside one that is named, never in the source tree
 beside an output. Measured on a consumer repository over three hours, with sessions holding clones of main: nextest's
@@ -155,6 +156,51 @@ together 2.7 GB of the 5 GB written into main's source image. Both are content-k
 the nextest extraction now lives under the Cargo target directory (`<target_directory>/nextest-extracted`) and the trace
 sink under `node_modules/.cache/lmao`. A package's `.cache/` itself cannot be build state, because build tools declare
 their outputs there.
+
+### Declared build state
+
+`.cowshed.toml` `[build] state = ["<checkout-relative path>", ...]` declares build state no capability detects. The
+motivating case is a patch-development checkout of an upstream project plus its build tree, kept gitignored inside the
+repository: many GiB of incremental build output that no convention file names, so no detector can recognize it. Left in
+the source image, it is the largest thing a fork clones and the main source of main's fragmentation (Why two volumes);
+on the build volume it travels exactly as a Cargo target directory does.
+
+Each declared path is one more `BuildStatePath` contribution, `<path> -> declared/<path>` on the volume, merged into
+discovery after the capabilities'. The `declared/` namespace keeps it apart from every tool's own volume names, and
+tells cowshed it is declared rather than a tool's. The list is part of `.cowshed.toml`, which the discovery fingerprint
+already covers, so changing it rediscovers at the next refresh: a new path joins the volume, and a held path keeps its
+link. Validation refuses, before anything is deleted and with the remedy named:
+
+- a path that is not a normalized checkout-relative name, one naming `.git` or inside `.cowshed/`, and one declared
+  inside another (when `.cowshed.toml` is parsed);
+- a path reached through a symlinked parent that resolves outside the checkout;
+- a path that overlaps a capability's build state: the capability already links it;
+- a path holding tracked source: the same `git ls-files` guard migration applies.
+
+A real directory at a declared path is treated like any build state a capability contributes: moved aside, linked,
+deleted in the background, never copied (Refresh). For the upstream checkout that means the first touch after the path
+is declared discards it. That is deliberate: build state is rebuild-only, never migrated, and declared state is
+rebuildable by definition; copying many GiB out of the source image would cost the minutes this design exists to avoid.
+The author re-runs the checkout's reconstruct script once; from then on it lives on the volume, every fork inherits it
+warm, and a land carries it into main. The refresh reports the discard on stderr with that instruction.
+
+**A declared path is linked when it appears, never before.** A capability's path is linked at once, and its tool finds
+an empty directory it fills. A declared path's existence carries meaning to tools cowshed does not know: a build script
+that builds the upstream checkout when it is there, and takes a prebuilt artifact when it is not, would find an empty
+directory and try to build nothing. So a refresh makes nothing for a declared path nothing occupies, neither the link,
+the volume directory nor a missing parent; the volume's state still holds the path. Once a tool has made the directory,
+the next refresh adopts it as above. A reconstruct script that wants to fill the volume on its first run makes the empty
+directory, lets a refresh link it (any `cowshed exec`), and only then fills it.
+
+A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
+resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
+path changes when a land swaps the checkout's volume and differs in every fork, so state keyed on its own absolute
+location must compare against the resolved path, not the checkout spelling, and treat a different one as moved.
+
+- **Enforced by**: a real-APFS test in which main's first touch discards a declared nested checkout and links the path,
+  the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing a
+  tracked, overlapping or escaping declaration with its remedy; migration tests linking a declared checkout and leaving
+  an absent declared path absent until a tool makes it; and configuration parse tests.
 
 ### Targets and seeds
 
