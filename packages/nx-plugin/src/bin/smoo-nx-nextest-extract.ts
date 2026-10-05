@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { ensureNextestArchiveExtracted, extractWithNextest } from '../nextest-extraction.js';
+import { ensureNextestArchiveExtracted, extractWithNextest, nextestExtractionRoot } from '../nextest-extraction.js';
 
 // Prints the directory holding the archive's extraction on stdout, the only
 // thing a runner's `$(...)` captures. Everything said to a person goes to stderr.
@@ -12,7 +12,8 @@ if (archive === undefined || args.length !== 1 || archive.startsWith('-')) {
 const say = (line: string) => process.stderr.write(`smoo-nx-nextest-extract: ${line}\n`);
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 try {
-  const extraction = await ensureNextestArchiveExtracted(archive, extractWithNextest, (event) => {
+  const root = await nextestExtractionRoot(process.cwd());
+  const extraction = await ensureNextestArchiveExtracted(archive, root, extractWithNextest, (event) => {
     switch (event.kind) {
       case 'waiting':
         say(`${event.holder} is extracting ${archive}; waiting for it`);

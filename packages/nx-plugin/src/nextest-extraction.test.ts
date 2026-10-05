@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
   ensureNextestArchiveExtracted,
+  NEXTEST_EXTRACTION_DIRECTORY,
   type NextestArchiveExtractor,
   type NextestExtractionEvent,
   nextestArchiveKey,
   nextestExtractionPaths,
+  nextestExtractionRoot,
 } from './nextest-extraction.js';
 
 /** What nextest leaves behind: the two metadata files a reuse run reads. */
@@ -27,7 +30,7 @@ describe('ensureNextestArchiveExtracted', () => {
     try {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
-      const paths = nextestExtractionPaths(archive, await nextestArchiveKey(archive));
+      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
       // A holder killed mid-extraction (a bounded run's SIGKILL) leaves its
       // lock behind, and a pid in it that may since belong to anyone.
       await mkdir(paths.root, { recursive: true });
@@ -36,7 +39,13 @@ describe('ensureNextestArchiveExtracted', () => {
       await utimes(paths.lock, minuteAgo, minuteAgo);
 
       const events: NextestExtractionEvent[] = [];
-      const extraction = await ensureNextestArchiveExtracted(archive, unpack, (event) => events.push(event), FAST);
+      const extraction = await ensureNextestArchiveExtracted(
+        archive,
+        paths.root,
+        unpack,
+        (event) => events.push(event),
+        FAST,
+      );
 
       expect(extraction).toMatchObject({ kind: 'extracted', directory: paths.directory });
       expect(events).toEqual([{ kind: 'stale-lock', holder: `pid ${process.pid}`, ageMs: expect.any(Number) }]);
@@ -51,7 +60,7 @@ describe('ensureNextestArchiveExtracted', () => {
     try {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
-      const paths = nextestExtractionPaths(archive, await nextestArchiveKey(archive));
+      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
       // Unpacked from the old bytes, but the directory would be named for
       // them while the path now holds others: a later run hashing the new
       // bytes would never find it, and one hashing the old bytes again — the
@@ -61,12 +70,35 @@ describe('ensureNextestArchiveExtracted', () => {
         await writeFile(archive, 'rebuilt archive bytes');
       };
 
-      await expect(ensureNextestArchiveExtracted(archive, rebuiltMidway, () => {}, FAST)).rejects.toThrow(
+      await expect(ensureNextestArchiveExtracted(archive, paths.root, rebuiltMidway, () => {}, FAST)).rejects.toThrow(
         /changed while it was being extracted/,
       );
       // No directory under the old key, no staging left over, no lock held.
       expect(await readdir(paths.root)).toEqual([]);
       await expect(stat(paths.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('nextestExtractionRoot', () => {
+  it("extracts under the target directory Cargo reports, never beside the archive's Nx output", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'nextest-extraction-root-')));
+    try {
+      await writeFile(
+        join(root, 'Cargo.toml'),
+        '[package]\nname = "extraction-root-probe"\nversion = "0.1.0"\nedition = "2021"\n',
+      );
+      await mkdir(join(root, 'src'));
+      await writeFile(join(root, 'src/lib.rs'), '');
+      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root }).status).toBe(0);
+      expect(await nextestExtractionRoot(root)).toBe(join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY));
+
+      // A repository that moves Cargo's build tree moves its extractions with it.
+      await mkdir(join(root, '.cargo'));
+      await writeFile(join(root, '.cargo/config.toml'), '[build]\ntarget-dir = "out/cargo"\n');
+      expect(await nextestExtractionRoot(root)).toBe(join(root, 'out/cargo', NEXTEST_EXTRACTION_DIRECTORY));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

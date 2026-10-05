@@ -364,21 +364,24 @@ Concrete targets come from concrete files:
   edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s per-test timeout like
   `bun test --timeout=30000`) whose inputs include that crate and its path dependencies, and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
-  from the archive's one extraction. Runners therefore execute rather than build: they write nothing to cargo's build
+  from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`
-  hashes it and extracts it into `.cache/nextest/archive.tar.zst.extracted/<sha256>` unless a runner already did — one
+  hashes it and extracts it into `<target_directory>/nextest-extracted/<sha256>` unless a runner already did — one
   extracts, the others wait — so a workspace with ~200 test binaries and ~25 crates unpacks them once per archive
   instead of once per crate. The directory is keyed by the archive's bytes, so a rebuilt or cache-restored archive never
-  runs an older extraction's binaries, and publishing one removes the others; it is never an Nx output.
-  `--workspace-remap` is required — an archive records the producing tree's absolute paths, and without it a restored
-  archive hands tests another checkout's `CARGO_MANIFEST_DIR`. With it the archive is relocatable, so one cache entry
-  serves every checkout of the same commit; nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the
-  extracted binaries at runtime, but a test that reads them through the compile-time `env!` macro keeps the producing
-  tree's path. Per-crate runners accept an empty nextest selection because a valid workspace member may have no tests
-  and a hash partition may legitimately be empty. A crate in the project that builds the debug cdylib runs after
-  `napi-debug`, because its tests load that addon from `target/debug`. A crate declaring
-  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
-  project.
+  runs an older extraction's binaries, and publishing one removes the others. The target directory is the one
+  `cargo metadata` reports for the runner's Cargo workspace, so a `build.target-dir` setting moves the extractions with
+  the build tree. An extraction is per-checkout tool state like the rest of that tree, never an Nx output: it lives in
+  Cargo's build tree, which a checkout with a build volume keeps off its source tree, and it never sits under a declared
+  output such as `.cache/nextest`. `cargo clean` removes it. `--workspace-remap` is required — an archive records the
+  producing tree's absolute paths, and without it a restored archive hands tests another checkout's
+  `CARGO_MANIFEST_DIR`. With it the archive is relocatable, so one cache entry serves every checkout of the same commit;
+  nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the extracted binaries at runtime, but a test
+  that reads them through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an
+  empty nextest selection because a valid workspace member may have no tests and a hash partition may legitimately be
+  empty. A crate in the project that builds the debug cdylib runs after `napi-debug`, because its tests load that addon
+  from `target/debug`. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable
+  `cargo-wasm` output target in its owning project.
 - The plugin's own `nextest.toml` is passed as
   `--tool-config-file "smoo:$PWD/<to workspace root>/node_modules/@smoothbricks/nx-plugin/nextest.toml"`, so it is a
   layer BENEATH the repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository

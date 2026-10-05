@@ -1,11 +1,12 @@
 import { afterEach, expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { createNodesV2 } from './index.js';
+import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
 
 useFixtureCargoHome();
 
@@ -72,6 +73,12 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}"); }`).join
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
+  // The six runners shared one extraction, in Cargo's build tree: the archive's
+  // directory holds only the archive, the declared Nx output.
+  expect(await readdir(join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY))).toEqual([
+    await nextestArchiveKey(join(root, '.cache/nextest/archive.tar.zst')),
+  ]);
+  expect(await readdir(join(root, '.cache/nextest'))).toEqual(['archive.tar.zst']);
 });
 
 function command(targets: Readonly<Record<string, TargetConfiguration>>, name: string): string {

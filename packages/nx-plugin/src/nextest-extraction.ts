@@ -62,9 +62,19 @@ export async function nextestArchiveKey(archive: string): Promise<string> {
 }
 
 /**
- * One archive path's extractions live beside it, each under the hash of the
- * bytes it came from; the lock and staging directories of a key carry that
- * key as their prefix, so cleanup can tell them from another key's.
+ * The directory, inside the Cargo target directory, that holds a workspace's
+ * archive extractions. An extraction is content-keyed per-checkout tool state
+ * of the same kind as the rest of the target directory: rebuilt from an Nx
+ * output, reused by the next run, never an Nx output itself. It therefore lives
+ * wherever Cargo's build tree lives, which a checkout that keeps its build state
+ * on its own volume already keeps off its source tree.
+ */
+export const NEXTEST_EXTRACTION_DIRECTORY = 'nextest-extracted';
+
+/**
+ * A workspace's extractions live under one root, each under the hash of the
+ * bytes it came from; the lock and staging directories of a key carry that key
+ * as their prefix, so cleanup can tell them from another key's.
  */
 export interface NextestExtractionPaths {
   root: string;
@@ -73,8 +83,7 @@ export interface NextestExtractionPaths {
   stagingPrefix: string;
 }
 
-export function nextestExtractionPaths(archive: string, key: string): NextestExtractionPaths {
-  const root = `${archive}.extracted`;
+export function nextestExtractionPaths(root: string, key: string): NextestExtractionPaths {
   return {
     root,
     directory: join(root, key),
@@ -84,8 +93,40 @@ export function nextestExtractionPaths(archive: string, key: string): NextestExt
 }
 
 /**
- * The directory holding `archive`'s extraction, extracting it first if no
- * caller has yet.
+ * The extraction root of the Cargo workspace in `cwd`:
+ * `<target_directory>/nextest-extracted`, with the target directory Cargo itself
+ * reports, so a `build.target-dir` in the repository's Cargo config is honoured
+ * exactly as every build of the workspace honours it.
+ */
+export async function nextestExtractionRoot(cwd: string): Promise<string> {
+  const args = ['--frozen', 'metadata', '--no-deps', '--format-version', '1'];
+  const child = spawn('cargo', args, { cwd, stdio: ['ignore', 'pipe', 'inherit'] });
+  const chunks: Buffer[] = [];
+  child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+  // 'close', not 'exit': stdout may still hold unread metadata when the process exits.
+  const [code, signal]: unknown[] = await once(child, 'close');
+  if (code !== 0) {
+    throw new Error(
+      `cargo ${args.join(' ')} ${code === null ? `died of ${String(signal)}` : `exited with status ${String(code)}`}`,
+    );
+  }
+  return join(cargoTargetDirectory(Buffer.concat(chunks).toString('utf8')), NEXTEST_EXTRACTION_DIRECTORY);
+}
+
+/** `target_directory` from `cargo metadata --format-version 1` output. */
+function cargoTargetDirectory(metadata: string): string {
+  const parsed: unknown = JSON.parse(metadata);
+  const directory =
+    typeof parsed === 'object' && parsed !== null && 'target_directory' in parsed ? parsed.target_directory : undefined;
+  if (typeof directory !== 'string' || directory.length === 0) {
+    throw new Error('cargo metadata named no target_directory');
+  }
+  return directory;
+}
+
+/**
+ * The directory under `root` holding `archive`'s extraction, extracting it
+ * first if no caller has yet.
  *
  * Correctness does not rest on the lock. An extraction lands under the hash of
  * the bytes it came from by renaming a private staging directory into place,
@@ -96,20 +137,21 @@ export function nextestExtractionPaths(archive: string, key: string): NextestExt
  * runner of one Nx run from unpacking the same bytes side by side, which is the
  * cost it exists to remove.
  *
- * Publishing a key removes every other key's extraction of this archive path,
+ * Publishing a key removes every other key's extraction under `root`,
  * including stale locks and staging left by a holder that died. Leftovers of
  * the CURRENT key are not touched: a holder that took over a stale lock may
  * still be extracting into one.
  */
 export async function ensureNextestArchiveExtracted(
   archive: string,
+  root: string,
   extract: NextestArchiveExtractor,
   onEvent: (event: NextestExtractionEvent) => void,
   timing: NextestExtractionTiming = DEFAULT_TIMING,
 ): Promise<NextestExtraction> {
   const started = performance.now();
   const key = await nextestArchiveKey(archive);
-  const paths = nextestExtractionPaths(archive, key);
+  const paths = nextestExtractionPaths(root, key);
   if (await isDirectory(paths.directory)) {
     return { kind: 'reused', key, directory: paths.directory };
   }
