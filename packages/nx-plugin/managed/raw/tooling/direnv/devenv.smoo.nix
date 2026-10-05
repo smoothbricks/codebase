@@ -354,30 +354,11 @@ in {
     #    resolves its own GOROOT from its own binary, which makes "whose Go is
     #    whose" a property of which binary is invoked — the only thing that can
     #    actually be reasoned about.
-    # 8. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
-    #    -index-store-path); bun/node native addons find compilers through
-    #    node-gyp. CC/CXX are what xcodebuild reads, which is why they go rather
-    #    than being pointed somewhere else.
-    #
-    #    The Apple SDK is the same boundary, and dropping CC/CXX alone does not
-    #    hold it. An outer nix stdenv exports SDKROOT and DEVELOPER_DIR pointing
-    #    at nixpkgs' RECONSTRUCTED apple-sdk, so Xcode's own clang goes on to
-    #    compile against that sysroot. It is not a substitute for the licensed
-    #    SDK: apple-sdk-14.4 carries usr/include and the frameworks but NO libc++
-    #    whatsoever — no usr/include/c++/v1 and no usr/lib/libc++* — so any C++
-    #    build script that resolves the SDK by name dies at `ld: library 'c++'
-    #    not found`, which a CMake `*-sys` crate reaches before compiling a line
-    #    of the project. DEVELOPER_DIR is the half that hides: `xcrun
-    #    --show-sdk-path` honours it, so even code that correctly asks xcrun for
-    #    the SDK is handed the nix one, while `xcrun --find clang` and
-    #    `xcodebuild -version` keep reporting Xcode and look healthy. It also
-    #    defeats any later guard that unsets a nix SDKROOT and then re-resolves
-    #    it through xcrun, because xcrun answers with the same tree again.
-    #
-    #    Only a /nix/store value is dropped. An SDKROOT the operator exported
-    #    deliberately — the documented way to link Darwin from a Linux host — is
-    #    left exactly as given. Each drop is announced, so a shell never silently
-    #    swaps the SDK a build was compiled against.
+    # 8. On Darwin, Xcode answers for the Apple toolchain: nix CC/CXX, a
+    #    nix-store SDKROOT and DEVELOPER_DIR, and every store PATH entry carrying
+    #    nixpkgs xcbuild's `xcrun` are dropped, each one announced, so Xcode's
+    #    clang compiles against the licensed SDK and `xcrun` is Apple's.
+    #    tooling/direnv/apple-developer.sh does it and states why.
     # Nx's fallback includes HOME or TMPDIR, either of which can exceed the
     # Unix socket limit in a checkout. Reuse devenv's short runtime directory,
     # which is keyed on this checkout's devenv root and so is one per
@@ -418,19 +399,7 @@ in {
       # states why.
       . "$DEVENV_ROOT/nx-socket-dir.sh" /tmp
       ${lib.optionalString pkgs.stdenv.isDarwin ''
-        unset CC CXX
-        case "''${SDKROOT:-}" in
-          /nix/store/*)
-            echo "devenv: dropping nix-store SDKROOT ($SDKROOT); Xcode holds the licensed macOS SDK" >&2
-            unset SDKROOT NIX_APPLE_SDK_VERSION
-            ;;
-        esac
-        case "''${DEVELOPER_DIR:-}" in
-          /nix/store/*)
-            echo "devenv: dropping nix-store DEVELOPER_DIR ($DEVELOPER_DIR); xcrun must answer from Xcode" >&2
-            unset DEVELOPER_DIR NIX_APPLE_SDK_VERSION
-            ;;
-        esac
+        . "$DEVENV_ROOT/apple-developer.sh" /nix/store
       ''}
     '')
     # Epilogue, after every project step (a project's own enterShell may resolve

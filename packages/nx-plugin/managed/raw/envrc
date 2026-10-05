@@ -65,6 +65,7 @@ watch_file \
   "$project_root/tooling/direnv/repo-path" \
   "$project_root/tooling/direnv/shared-caches.sh" \
   "$project_root/tooling/direnv/nx-socket-dir.sh" \
+  "$project_root/tooling/direnv/apple-developer.sh" \
   "$project_root/tooling/direnv/setup-environment.ts" \
   "$project_root/tooling/direnv/secret-references.ts" \
   "$project_root/tooling/direnv/toolchain-stamp.ts" \

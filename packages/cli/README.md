@@ -422,6 +422,11 @@ nothing when nothing changed:
   `.cowshed/env` names a port base uses `/tmp/cs-<port base>/nx`, the literal path cowshed gives its sandboxed jobs, and
   creates that link if no job has yet. Host shells and sandboxed jobs then share one Nx daemon, and a sandboxed daemon's
   plugin workers can bind their sockets whichever side connected.
+- On Darwin, `tooling/direnv/apple-developer.sh` hands the Apple toolchain to Xcode: it unsets `CC`/`CXX`, drops a
+  `/nix/store` `SDKROOT` or `DEVELOPER_DIR`, and removes every `/nix/store` `PATH` entry that carries nixpkgs xcbuild's
+  `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is then
+  Apple's `/usr/bin/xcrun`, so `xcrun --sdk macosx --show-sdk-path` names the selected Xcode or Command Line Tools SDK
+  in host shells and sandboxed jobs alike. Each drop is announced; values outside the store stay as given.
 - The origin checkout's shell publishes a private `.devenv` evaluated export; after cowshed clones the image,
   `tooling/direnv/inherited-devenv.ts` can reuse that export in the new checkout. It checks the exact contents and
   executable bits of `tooling/direnv` and local `path:` inputs, devenv's watched inputs, the toolchain and the emitted

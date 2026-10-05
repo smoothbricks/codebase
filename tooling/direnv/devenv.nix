@@ -77,8 +77,8 @@ in {
   # module then adds an editor language server and a debugger by default. No C
   # is written here, so ccls serves nothing; and lldb is redundant on the one
   # platform devenv defaults to it, because this shell already defers to the
-  # Xcode command line tools for the SDK and the compiler (see the SDKROOT and
-  # DEVELOPER_DIR drops in devenv.smoo.nix) and those ship lldb too.
+  # Xcode command line tools for the SDK and the compiler (see
+  # tooling/direnv/apple-developer.sh) and those ship lldb too.
   #
   # 35.5 MB off every shell and every macOS CI store restore — ccls 1.6 MB plus
   # lldb and its tails 33.9 MB. clang-tools is the larger 149.2 MB share and

@@ -142,6 +142,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/apple-developer.sh',
+    target: 'tooling/direnv/apple-developer.sh',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/inherited-devenv.ts',
     target: 'tooling/direnv/inherited-devenv.ts',
     executable: true,
