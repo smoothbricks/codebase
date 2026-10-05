@@ -1097,7 +1097,10 @@ mod tests {
             "the remounted volume's filesystem grew: {}",
             filesystem_bytes(&mount)
         );
-        assert_eq!(volumes.linked(&main_checkout).unwrap(), Some(live.clone()));
+        assert_eq!(
+            volumes.layout.linked(&main_checkout).unwrap(),
+            Some(live.clone())
+        );
 
         // A fork made afterwards clones main's seed, and so starts at the new capacity.
         let topic = Owner {
@@ -1300,7 +1303,7 @@ mod tests {
             .unwrap()
             .expect("nothing holds the target's volume");
         assert_eq!(
-            scratch.volumes.linked(&main_checkout).unwrap(),
+            scratch.volumes.layout.linked(&main_checkout).unwrap(),
             Some(topic.clone())
         );
 
