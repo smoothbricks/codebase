@@ -1,6 +1,7 @@
 // Scaffold TypeScript libraries and Rust workspaces through one convention-owned generator.
 // CLI wiring: packages/cli/src/generate/index.ts (variant registry)
 import { readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
+import { renderCargoDevProfiles } from '../../cargo-dev-profile.js';
 
 import type { CreatePackageGeneratorSchema } from './schema.js';
 
@@ -199,6 +200,8 @@ function writeRustFiles(
     `license = ${JSON.stringify(rootPkg.license ?? 'UNLICENSED')}`,
     'publish = false',
     ...(repository === null ? [] : [`repository = ${JSON.stringify(repository)}`]),
+    '',
+    renderCargoDevProfiles(),
     '',
   ];
   tree.write(`${projectRoot}/Cargo.toml`, workspacePackage.join('\n'));

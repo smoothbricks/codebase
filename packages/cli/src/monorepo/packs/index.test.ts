@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { renderCargoDevProfiles } from '@smoothbricks/nx-plugin/cargo-dev-profile';
 import type { MonorepoPack } from './index.js';
 import { packsForTest, resolvedTargetsByProject, runValidatePacks } from './index.js';
 
@@ -227,7 +228,7 @@ describe('monorepo validation pack phases', () => {
       await mkdir(join(root, 'crates/alpha'), { recursive: true });
       await mkdir(join(root, 'crates/beta'), { recursive: true });
       await mkdir(join(root, 'tooling/direnv'), { recursive: true });
-      await writeFile(join(root, 'Cargo.toml'), '[workspace]\nmembers = ["crates/*"]\n');
+      await writeFile(join(root, 'Cargo.toml'), `[workspace]\nmembers = ["crates/*"]\n\n${renderCargoDevProfiles()}\n`);
       await writeFile(join(root, 'crates/alpha/Cargo.toml'), '[package]\nname = "alpha"\n');
       await writeFile(join(root, 'crates/beta/Cargo.toml'), '[package]\nname = "beta"\n');
       await writeFile(join(root, 'tooling/direnv/devenv.smoo.nix'), 'languages.rust = {\n  channel = "nightly";\n};\n');

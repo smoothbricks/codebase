@@ -145,6 +145,12 @@ describe('create-package generator', () => {
       expect(workspace).toContain('edition = "2024"');
       expect(workspace).toContain('license = "MIT"');
       expect(workspace).toContain('repository = "git+https://github.com/smoothbricks/codebase.git"');
+      expect(workspace).toContain('[profile.dev]\n# ');
+      expect(workspace).toContain('debug = "line-tables-only"');
+      expect(workspace).toContain('[profile.dev.build-override]');
+      expect(workspace).toContain('[profile.debugging]');
+      expect(workspace).toContain('inherits = "dev"');
+      expect(workspace).toContain('[profile.debugging.package."*"]');
 
       const crate = tree.read('packages/ferris/crates/ferris/Cargo.toml', 'utf-8');
       expect(crate).toContain('[package]');

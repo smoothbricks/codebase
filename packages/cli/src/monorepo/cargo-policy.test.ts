@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { renderCargoDevProfiles } from '@smoothbricks/nx-plugin/cargo-dev-profile';
 import type { ProjectTargets } from '../nx/index.js';
 import {
   applyCargoFeatureUnification,
@@ -73,8 +74,28 @@ function recordingHakari(
 
 const NIGHTLY_DEVENV = 'languages.rust = {\n  channel = "nightly";\n};\n';
 const UNIFIED_CONFIG = '[unstable]\nfeature-unification = true\n\n[resolver]\nfeature-unification = "workspace"\n';
+
+/**
+ * The dev and debugging profiles, spelled by hand rather than rendered, so the
+ * policy is checked against the documented TOML and not against itself.
+ */
+const DEV_PROFILE_TABLES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['profile.dev', ['debug = "line-tables-only"', 'split-debuginfo = "unpacked"']],
+  ['profile.dev.package."*"', ['debug = 0']],
+  ['profile.dev.build-override', ['debug = 0']],
+  ['profile.debugging', ['inherits = "dev"', 'debug = 2']],
+  ['profile.debugging.package."*"', ['debug = 2']],
+  ['profile.debugging.build-override', ['debug = 2']],
+];
+
+function devProfiles(edit: (table: string, lines: readonly string[]) => readonly string[] = (_, lines) => lines) {
+  return DEV_PROFILE_TABLES.map(([table, lines]) => [`[${table}]`, ...edit(table, lines), ''].join('\n')).join('\n');
+}
+
+const DEV_PROFILES = devProfiles();
+const WORKSPACE_ROOT = `[workspace]\nmembers = ["crates/*"]\n\n${DEV_PROFILES}`;
 const TWO_CRATE_WORKSPACE = {
-  'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+  'Cargo.toml': WORKSPACE_ROOT,
   'crates/alpha/Cargo.toml': '[package]\nname = "alpha"\n',
   'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
 };
@@ -95,7 +116,7 @@ describe('Cargo cache policy', () => {
   });
 
   it('lets the test profile inherit dev at every effective root', async () => {
-    const workspace = await check({ 'Cargo.toml': '[workspace]\nmembers = []\n' });
+    const workspace = await check({ 'Cargo.toml': `[workspace]\nmembers = []\n\n${DEV_PROFILES}` });
     expect(workspace.messages).toEqual([]);
 
     const standalone = await check({ 'Cargo.toml': '[package]\nname = "standalone"\n' });
@@ -118,7 +139,7 @@ describe('Cargo cache policy', () => {
 
   it('flags profile tables in workspace members but not standalone package roots', async () => {
     const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+      'Cargo.toml': WORKSPACE_ROOT,
       'crates/member/Cargo.toml': '[package]\nname = "member"\n\n[profile.dev]\nincremental = true\n',
     });
     expect(result.failures).toBe(1);
@@ -207,13 +228,88 @@ describe('Cargo cache policy', () => {
   });
 });
 
+describe('Cargo dev profile policy', () => {
+  it('accepts a workspace root carrying the dev and debugging profiles', async () => {
+    const result = await check({ 'Cargo.toml': WORKSPACE_ROOT });
+    expect(result.failures).toBe(0);
+    expect(result.messages).toEqual([]);
+  });
+
+  it('accepts what the package generator writes', async () => {
+    const result = await check({ 'Cargo.toml': `[workspace]\nmembers = []\n\n${renderCargoDevProfiles()}\n` });
+    expect(result.messages).toEqual([]);
+  });
+
+  it('compares debug by level, not by spelling', async () => {
+    const result = await check({
+      'Cargo.toml': `[workspace]\nmembers = []\n\n${devProfiles((table, lines) =>
+        lines.map((line) =>
+          line === 'debug = 0' ? (table.endsWith('"*"') ? 'debug = false' : 'debug = "none"') : line,
+        ),
+      )}`,
+    });
+    expect(result.messages).toEqual([]);
+  });
+
+  const elements = DEV_PROFILE_TABLES.flatMap(([table, lines]) => lines.map((line) => [table, line] as const));
+  it.each(elements)('refuses a root missing [%s] %s and names the TOML to add', async (table, missing) => {
+    const result = await check({
+      'Cargo.toml': `[workspace]\nmembers = []\n\n${devProfiles((current, lines) =>
+        current === table ? lines.filter((line) => line !== missing) : lines,
+      )}`,
+    });
+    const key = missing.slice(0, missing.indexOf(' ='));
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('Cargo.toml: ');
+    expect(result.messages[0]).toContain(`[${table}] ${key} is missing.`);
+    expect(result.messages[0]).toEndWith(`Fix it with:\n[${table}]\n${missing}`);
+  });
+
+  it('refuses a root with no profiles once per requirement', async () => {
+    const result = await check({ 'Cargo.toml': '[workspace]\nmembers = []\n' });
+    expect(result.failures).toBe(elements.length);
+  });
+
+  it('refuses a build-override whose debug level differs from the dependencies', async () => {
+    const result = await check({
+      'Cargo.toml': `[workspace]\nmembers = []\n\n${devProfiles((table, lines) =>
+        table === 'profile.dev.build-override' ? ['debug = "line-tables-only"'] : lines,
+      )}`,
+    });
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('[profile.dev.build-override] debug is "line-tables-only".');
+    expect(result.messages[0]).toContain('It must equal [profile.dev.package."*"] debug.');
+    expect(result.messages[0]).toContain('compiles it, and everything above it, twice');
+    expect(result.messages[0]).toEndWith('Fix it with:\n[profile.dev.build-override]\ndebug = 0');
+  });
+
+  it('refuses a dev profile that turns incremental compilation off', async () => {
+    const result = await check({
+      'Cargo.toml': `[workspace]\nmembers = []\n\n${devProfiles((table, lines) =>
+        table === 'profile.dev' ? [...lines, 'incremental = false'] : lines,
+      )}`,
+    });
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('[profile.dev] sets incremental = false');
+    expect(result.messages[0]).toContain('Fix it by deleting incremental = false');
+  });
+
+  it('leaves standalone package roots and ignored subtrees alone', async () => {
+    const result = await check({
+      'Cargo.toml': '[package]\nname = "standalone"\n',
+      'vendor/Cargo.toml': '# smoo-cargo-policy: ignore\n[workspace]\nmembers = []\n',
+    });
+    expect(result.failures).toBe(0);
+  });
+});
+
 describe('Cargo workspace feature unification', () => {
   it('leaves a single-crate workspace alone', async () => {
     // Nothing to unify: `feature-unification = "workspace"` and a workspace-hack
     // both exist to stop ONE dependency being built twice with different
     // features for two members, which needs two members.
     const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = ["crates/only"]\n',
+      'Cargo.toml': `[workspace]\nmembers = ["crates/only"]\n\n${DEV_PROFILES}`,
       'crates/only/Cargo.toml': '[package]\nname = "only"\n',
       'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
     });
@@ -275,7 +371,7 @@ describe('Cargo workspace feature unification', () => {
     const hakari = recordingHakari();
     const result = await check(
       {
-        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
+        'Cargo.toml': `[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n${DEV_PROFILES}`,
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml':
@@ -293,7 +389,7 @@ describe('Cargo workspace feature unification', () => {
   it('flags a crate that does not depend on the workspace-hack', async () => {
     const result = await check(
       {
-        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
+        'Cargo.toml': `[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n${DEV_PROFILES}`,
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
@@ -311,7 +407,7 @@ describe('Cargo workspace feature unification', () => {
   it('surfaces a stale workspace-hack that cargo hakari verify rejects', async () => {
     const result = await check(
       {
-        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
+        'Cargo.toml': `[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n${DEV_PROFILES}`,
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml':

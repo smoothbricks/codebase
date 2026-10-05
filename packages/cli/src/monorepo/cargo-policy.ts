@@ -1,17 +1,31 @@
 import { spawnSync } from 'node:child_process';
 import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  CARGO_DEV_PROFILE_REQUIREMENTS,
+  type CargoLocalProfile,
+  type CargoProfileScope,
+  cargoProfileAssignment,
+  cargoProfileTable,
+} from '@smoothbricks/nx-plugin/cargo-dev-profile';
 import { CARGO_TOOLCHAIN_NAMED_INPUT, isCargoToolchainInput } from '@smoothbricks/nx-plugin/cargo-toolchain-policy';
 import typia from 'typia';
 import { type NxJson, type NxTargetOptions, parseNxJsonText, parsePackageJsonText } from '../lib/json.js';
 import type { ProjectTargets } from '../nx/index.js';
 
-interface CargoProfile {
+type CargoProfileValue = boolean | number | string;
+
+interface CargoProfileSettings {
   inherits?: string;
   incremental?: boolean;
-  debug?: boolean | number | string;
+  debug?: CargoProfileValue;
   'split-debuginfo'?: string;
   'trim-paths'?: boolean | string | string[];
+}
+
+interface CargoProfile extends CargoProfileSettings {
+  package?: Record<string, CargoProfileSettings>;
+  'build-override'?: CargoProfileSettings;
 }
 
 interface CargoManifest {
@@ -497,6 +511,81 @@ function reportManifestPolicy(manifests: LoadedManifest[], workspaceRoots: Loade
   return failures;
 }
 
+/** Cargo's spellings of one debuginfo level, so `0`, `false` and `"none"` compare equal. */
+function debugLevel(value: CargoProfileValue): string {
+  switch (value) {
+    case 0:
+    case false:
+    case 'none':
+      return 'none';
+    case 1:
+    case 'limited':
+      return 'limited';
+    case 2:
+    case true:
+    case 'full':
+      return 'full';
+    default:
+      return String(value);
+  }
+}
+
+function profileSettings(
+  profiles: CargoManifest['profile'],
+  profile: CargoLocalProfile,
+  scope: CargoProfileScope,
+): CargoProfileSettings | undefined {
+  const table = profiles?.[profile];
+  switch (scope) {
+    case 'members':
+      return table;
+    case 'dependencies':
+      return table?.package?.['*'];
+    case 'build-override':
+      return table?.['build-override'];
+  }
+}
+
+/**
+ * Every workspace root carries the dev and debugging profiles the generator
+ * writes. Profiles live only at the root, so a root without them leaves every
+ * member on Cargo's defaults: full DWARF for every dependency, and units that
+ * split between build scripts and ordinary code. No opt-out: the requirements
+ * are what the dev loop measured, not a preference.
+ */
+function devProfilePolicy(workspaceRoots: LoadedManifest[]): number {
+  let failures = 0;
+  for (const root of workspaceRoots) {
+    const profiles = root.manifest.profile;
+    for (const requirement of CARGO_DEV_PROFILE_REQUIREMENTS) {
+      const actual = profileSettings(profiles, requirement.profile, requirement.scope)?.[requirement.key];
+      if (
+        actual !== undefined &&
+        (requirement.key === 'debug'
+          ? debugLevel(actual) === debugLevel(requirement.value)
+          : actual === requirement.value)
+      ) {
+        continue;
+      }
+      const table = cargoProfileTable(requirement.profile, requirement.scope);
+      const found = actual === undefined ? 'is missing' : `is ${JSON.stringify(actual)}`;
+      failures += report(
+        root.path,
+        `[${table}] ${requirement.key} ${found}. ${requirement.why} Fix it with:\n[${table}]\n${cargoProfileAssignment(requirement)}`,
+      );
+    }
+    if (profiles?.dev?.incremental === false) {
+      failures += report(
+        root.path,
+        '[profile.dev] sets incremental = false, so every edit recompiles each touched workspace crate from scratch. ' +
+          'Dev units stay incremental; shared lanes (test, release) are the ones that set incremental = false. ' +
+          'Fix it by deleting incremental = false from [profile.dev].',
+      );
+    }
+  }
+  return failures;
+}
+
 function resolvedPathIsOutsideRoot(root: string, path: string): boolean {
   const resolved = resolve(root, path);
   const relativePath = relative(root, resolved);
@@ -780,6 +869,7 @@ export function validateCargoCachePolicy(root: string, options: CargoPolicyOptio
 
   const workspaceRoots = manifests.filter((loaded) => loaded.manifest.workspace !== undefined);
   failures += reportManifestPolicy(manifests, workspaceRoots);
+  failures += devProfilePolicy(workspaceRoots);
   failures += featureUnificationPolicy(
     repositoryRoot,
     workspaceRoots,

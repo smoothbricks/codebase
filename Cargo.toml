@@ -51,6 +51,42 @@ tokio = { version = "1", features = [
   "time",
 ] }
 
+# `smoo monorepo validate` requires the dev and debugging profiles below at
+# every Cargo workspace root.
+#
+# dev is the edit-compile-test loop and stays incremental. Workspace crates get
+# file:line (backtraces, profilers) without full DWARF, and debuginfo stays in
+# the object files instead of being relinked into every binary.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# Dependencies carry no debuginfo: measured -57% target bytes at flat CPU.
+[profile.dev.package."*"]
+debug = 0
+
+# Same debug level as package."*": a crate that both build scripts or proc
+# macros and ordinary code use is one unit only while both see the same level;
+# otherwise Cargo compiles it, and everything above it, twice.
+[profile.dev.build-override]
+debug = 0
+
+# To debug: `cargo build --profile debugging` or `cargo test --profile
+# debugging`. It is dev with full DWARF everywhere, built into
+# target/debugging, so it never invalidates the dev units or their cache.
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+# A custom profile inherits dev's package."*" debug = 0; without this the
+# dependencies stay opaque to the debugger.
+[profile.debugging.package."*"]
+debug = 2
+
+# Same level as package."*", for the same one-unit reason as dev.
+[profile.debugging.build-override]
+debug = 2
+
 [profile.release]
 lto = true
 codegen-units = 1

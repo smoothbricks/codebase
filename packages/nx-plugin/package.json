@@ -73,6 +73,12 @@
       "import": "./dist/cargo-toolchain-policy.js",
       "default": "./dist/cargo-toolchain-policy.js"
     },
+    "./cargo-dev-profile": {
+      "types": "./dist/cargo-dev-profile.d.ts",
+      "development": "./src/cargo-dev-profile.ts",
+      "import": "./dist/cargo-dev-profile.js",
+      "default": "./dist/cargo-dev-profile.js"
+    },
     "./workspace-manifest": {
       "types": "./dist/workspace-manifest.d.ts",
       "development": "./src/workspace-manifest.ts",
