@@ -671,7 +671,8 @@ async fn succeed(
 }
 
 /// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
-/// default inputs include it). `declared` says whether `a:build` declares that output.
+/// default inputs include it). `declared` says whether `a:build` declares that output. Written,
+/// not committed: the caller commits once it has written all it adds.
 fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     let node = node.display();
     let outputs = if declared {
@@ -701,8 +702,6 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     .unwrap();
     fs::create_dir_all(checkout.join("node_modules")).unwrap();
     std::os::unix::fs::symlink(nx, checkout.join("node_modules/nx")).unwrap();
-    git(checkout, &["add", "-A"]);
-    git(checkout, &["commit", "-q", "-m", "nx project"]);
 }
 
 /// Every `landAdoption` commitment sealed under `telemetry`.
@@ -744,6 +743,8 @@ async fn land_nx_project(
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::new();
     write_nx_project(&fixture.checkout, &nx, &node, declared);
+    git(&fixture.checkout, &["add", "-A"]);
+    git(&fixture.checkout, &["commit", "-q", "-m", "nx project"]);
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
@@ -801,10 +802,13 @@ async fn land_nx_project(
 
 /// A task output Nx is not told about is a 2b miss (16_build_volumes.md, Land step 7), and each
 /// miss is a durable `landAdoption` commitment naming the task (13_telemetry.md). Declaring the
-/// output makes the miss, and the record, disappear.
-#[tokio::test]
+/// output makes the miss, and the record, disappear. The two projects are independent, each on
+/// its own scratch store, so they land side by side.
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment() {
-    let (adoptions, landed_head) = land_nx_project(false).await;
+    let undeclared = tokio::spawn(land_nx_project(false));
+    let declared = tokio::spawn(land_nx_project(true));
+    let (adoptions, landed_head) = undeclared.await.expect("undeclared-output land");
     assert_eq!(
         adoptions
             .iter()
@@ -819,7 +823,7 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment()
     );
     assert!(!adoptions[0].task_hash.is_empty());
 
-    let (adoptions, _) = land_nx_project(true).await;
+    let (adoptions, _) = declared.await.expect("declared-output land");
     assert_eq!(adoptions, [], "a declared output restores in main and hits");
 }
 
