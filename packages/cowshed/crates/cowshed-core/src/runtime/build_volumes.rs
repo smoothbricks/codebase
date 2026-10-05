@@ -483,7 +483,7 @@ impl BuildVolumes {
         checkout: PathBuf,
         capacity: ImageCapacity,
     ) -> Result<ResizeOutcome> {
-        let Some(id) = self.linked(&checkout)? else {
+        let Some(id) = self.layout.linked(&checkout)? else {
             return Err(CowshedError::not_found(
                 format!("workspace {} links no build volume", owner.name),
                 format!(
