@@ -202,6 +202,12 @@ pub enum MarkerKind {
     Directory,
 }
 
+#[derive(Clone, Copy)]
+pub enum ReachedConvention {
+    TrackedManifest(&'static str),
+    ProjectFile(fn(&Path, &Path) -> Result<bool>),
+}
+
 pub struct Detector {
     pub id: CapabilityId,
     pub marker_kind: MarkerKind,
@@ -212,13 +218,23 @@ pub struct Detector {
     pub any: &'static [&'static str],
     pub contribute: fn(&DetectionContext<'_>) -> Result<CapabilityContribution>,
     pub host_cache_homes: &'static [&'static SharedToolHome],
-    /// A convention another project file reaches when none of `any` is in the directory
-    /// itself: given the workspace and the directory, whether that file leads to the convention.
-    pub reached_from: Option<fn(&Path, &Path) -> Result<bool>>,
+    /// A convention reached through another project file or a tracked nested manifest.
+    pub reached_from: Option<ReachedConvention>,
 }
 
 impl Detector {
     pub fn detect(&self, context: &DetectionContext<'_>) -> Result<Option<CapabilityContribution>> {
+        self.detect_with(
+            context,
+            &mut build_state_discovery::TrackedManifests::default(),
+        )
+    }
+
+    fn detect_with(
+        &self,
+        context: &DetectionContext<'_>,
+        tracked: &mut build_state_discovery::TrackedManifests,
+    ) -> Result<Option<CapabilityContribution>> {
         if self.all.is_empty() && self.any.is_empty() {
             return Err(CowshedError::internal(
                 "a capability detector must name a convention file",
@@ -232,7 +248,7 @@ impl Detector {
                 .ancestors()
                 .take_while(|directory| directory.starts_with(context.workspace_root))
             {
-                if self.matches(context.workspace_root, directory)? {
+                if self.matches(context.workspace_root, directory, tracked)? {
                     let selected = DetectionContext {
                         project_root: directory,
                         ..*context
@@ -242,14 +258,19 @@ impl Detector {
             }
             return Ok(None);
         }
-        if self.matches(context.workspace_root, context.project_root)? {
+        if self.matches(context.workspace_root, context.project_root, tracked)? {
             (self.contribute)(context).map(Some)
         } else {
             Ok(None)
         }
     }
 
-    fn matches(&self, workspace: &Path, directory: &Path) -> Result<bool> {
+    fn matches(
+        &self,
+        workspace: &Path,
+        directory: &Path,
+        tracked: &mut build_state_discovery::TrackedManifests,
+    ) -> Result<bool> {
         let present = |path: &Path| match self.marker_kind {
             MarkerKind::File => convention_file(workspace, path),
             MarkerKind::Directory => convention_directory(workspace, path),
@@ -268,7 +289,10 @@ impl Detector {
             }
         }
         match self.reached_from {
-            Some(reached) => reached(workspace, directory),
+            Some(ReachedConvention::TrackedManifest(name)) => {
+                tracked.contains(workspace, directory, name)
+            }
+            Some(ReachedConvention::ProjectFile(reached)) => reached(workspace, directory),
             None => Ok(false),
         }
     }
@@ -322,6 +346,18 @@ pub fn detect(
     context: &DetectionContext<'_>,
     overrides: &BTreeMap<CapabilityId, CapabilityOverride>,
 ) -> Result<DetectedCapabilities> {
+    detect_with(
+        context,
+        overrides,
+        &mut build_state_discovery::TrackedManifests::default(),
+    )
+}
+
+fn detect_with(
+    context: &DetectionContext<'_>,
+    overrides: &BTreeMap<CapabilityId, CapabilityOverride>,
+    tracked: &mut build_state_discovery::TrackedManifests,
+) -> Result<DetectedCapabilities> {
     validate_project_directory(context.workspace_root, context.command_cwd)?;
     let mut result = DetectedCapabilities::default();
     let mut owners = BTreeMap::new();
@@ -340,7 +376,7 @@ pub fn detect(
             project_root: project.as_deref().unwrap_or(context.workspace_root),
             ..*context
         };
-        if let Some(contribution) = detector.detect(&selected)? {
+        if let Some(contribution) = detector.detect_with(&selected, tracked)? {
             merge(
                 &mut result.contribution,
                 &mut owners,

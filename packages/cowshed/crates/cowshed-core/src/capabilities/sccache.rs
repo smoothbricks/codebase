@@ -14,7 +14,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["Cargo.toml"],
     contribute,
     host_cache_homes: &[],
-    reached_from: Some(super::build_state_discovery::tracked_cargo_convention),
+    reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
 };
 
 pub fn server_socket() -> PathBuf {

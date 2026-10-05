@@ -102,9 +102,11 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
             .map(|directory| context.workspace_root.join(directory))
             .unwrap_or_else(|| context.workspace_root.to_owned());
         super::validate_project_directory(context.workspace_root, &project)?;
-        digest.update(&[u8::from(
-            detector.matches(context.workspace_root, &project)?,
-        )]);
+        digest.update(&[u8::from(detector.matches(
+            context.workspace_root,
+            &project,
+            &mut TrackedManifests::default(),
+        )?)]);
     }
     Ok(digest.finalize().to_hex().to_string())
 }
@@ -113,12 +115,13 @@ pub fn discover_build_state(
     context: &DetectionContext<'_>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> Result<BuildStateDiscovery> {
-    let detected = super::detect_for_workspace(context)?;
+    let config = super::workspace_config(context)?;
+    let mut tracked = TrackedManifests::default();
+    let detected = super::detect_with(context, config.capabilities(), &mut tracked)?;
     let mut result = BuildStateDiscovery {
         paths: detected.contribution.build_state,
         findings: Vec::new(),
     };
-    let config = super::workspace_config(context)?;
     let cargo_override = config.capabilities().get(&CapabilityId::Cargo);
     if cargo_override.is_some_and(|setting| setting.disabled) {
         return Ok(result);
@@ -129,7 +132,7 @@ pub fn discover_build_state(
         .unwrap_or_else(|| context.workspace_root.to_owned());
     super::validate_project_directory(context.workspace_root, &selected)?;
     let mut roots = BTreeSet::new();
-    for manifest in tracked_manifests(context.workspace_root, &selected)? {
+    for manifest in tracked_manifests(context.workspace_root, &selected, &mut tracked)? {
         let absolute = context.workspace_root.join(&manifest);
         let root = cargo_output(
             context.workspace_root,
@@ -258,8 +261,52 @@ fn cargo_output(
     }
 }
 
-pub(super) fn tracked_cargo_convention(workspace: &Path, directory: &Path) -> Result<bool> {
-    Ok(!tracked_manifests(workspace, directory)?.is_empty())
+#[derive(Default)]
+pub(super) struct TrackedManifests {
+    inputs: Option<Vec<u8>>,
+}
+
+impl TrackedManifests {
+    fn inputs(&mut self, workspace: &Path) -> Result<&[u8]> {
+        if self.inputs.is_none() {
+            self.inputs = Some(tracked_build_inputs(workspace)?);
+        }
+        Ok(self.inputs.as_deref().expect("snapshot was loaded"))
+    }
+
+    pub(super) fn contains(
+        &mut self,
+        workspace: &Path,
+        directory: &Path,
+        manifest: &str,
+    ) -> Result<bool> {
+        super::validate_project_directory(workspace, directory)?;
+        let prefix = directory
+            .strip_prefix(workspace)
+            .expect("directory was contained");
+        for name in self
+            .inputs(workspace)?
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let path = Path::new(std::ffi::OsStr::from_bytes(name));
+            if tracked_manifest(path, prefix, manifest)
+                && super::convention_file(workspace, &workspace.join(path))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn tracked_manifest(path: &Path, prefix: &Path, manifest: &str) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new(manifest))
+        && path.starts_with(prefix)
+        && (manifest != "Cargo.toml"
+            || !path
+                .components()
+                .any(|component| component.as_os_str() == "vendor"))
 }
 
 fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
@@ -274,15 +321,15 @@ fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
             "-z",
             "--",
             ":(glob)**/Cargo.toml",
-            ":(glob)**/.cargo/config",
-            ":(glob)**/.cargo/config.toml",
+            ":(glob)**/.cargo/config*",
+            ":(glob)**/go.mod",
         ])
         .output_locked()
         .map_err(|error| crate::git::git_spawn_error(&error))?;
     if !output.status.success() {
         return Err(CowshedError::environment_missing(
             format!(
-                "cannot fingerprint tracked Cargo inputs: {}",
+                "cannot enumerate tracked tool manifests: {}",
                 String::from_utf8_lossy(&output.stderr).trim_end()
             ),
             "repair the checkout's Git index and retry",
@@ -291,44 +338,23 @@ fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn tracked_manifests(workspace: &Path, directory: &Path) -> Result<Vec<PathBuf>> {
+fn tracked_manifests(
+    workspace: &Path,
+    directory: &Path,
+    tracked: &mut TrackedManifests,
+) -> Result<Vec<PathBuf>> {
     super::validate_project_directory(workspace, directory)?;
-    match fs::symlink_metadata(workspace.join(".git")) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(super::detection_error(&workspace.join(".git"), error)),
-    }
-    let output = crate::git::git_command_at(workspace)
-        .args([
-            "ls-files",
-            "-z",
-            "--",
-            ":(glob)**/Cargo.toml",
-            ":(exclude,glob)**/vendor/**",
-        ])
-        .output_locked()
-        .map_err(|error| crate::git::git_spawn_error(&error))?;
-    if !output.status.success() {
-        return Err(CowshedError::environment_missing(
-            format!(
-                "cannot discover tracked Cargo manifests: {}",
-                String::from_utf8_lossy(&output.stderr).trim_end()
-            ),
-            "repair the checkout's Git index and retry",
-        ));
-    }
+    let inputs = tracked.inputs(workspace)?;
     let prefix = directory
         .strip_prefix(workspace)
         .expect("directory was contained");
     let mut paths = Vec::new();
-    for name in output
-        .stdout
+    for name in inputs
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
         let path = Path::new(std::ffi::OsStr::from_bytes(name));
-        if path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) && path.starts_with(prefix)
-        {
+        if tracked_manifest(path, prefix, "Cargo.toml") {
             paths.push(path.to_owned());
         }
     }
@@ -360,6 +386,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cargo_go_and_sccache_share_one_lazy_tracked_manifest_snapshot() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        fixture.files(&[
+            "packages/rust/Cargo.toml",
+            "packages/rust/.cargo/config.toml",
+            "packages/go/go.mod",
+        ]);
+        git(&fixture, &["add", "packages"]);
+        let mut tracked = TrackedManifests::default();
+        assert!(tracked.inputs.is_none(), "the index query is lazy");
+        assert!(
+            super::super::cargo::DETECTOR
+                .detect_with(&fixture.context(), &mut tracked)
+                .unwrap()
+                .is_some()
+        );
+        assert!(tracked.inputs.is_some());
+        // A second query now sees an empty index. Go and sccache must instead use the
+        // exact snapshot Cargo loaded, including Go's nested module.
+        fs::remove_file(fixture.root.join(".git/index")).unwrap();
+        let detected =
+            super::super::detect_with(&fixture.context(), &BTreeMap::new(), &mut tracked).unwrap();
+        assert_eq!(
+            detected.active,
+            [CapabilityId::Cargo, CapabilityId::Go, CapabilityId::Sccache]
+        );
+        for detector in [
+            &super::super::go::DETECTOR,
+            &super::super::sccache::DETECTOR,
+        ] {
+            assert!(
+                detector
+                    .detect_with(&fixture.context(), &mut tracked)
+                    .unwrap()
+                    .is_some(),
+                "{} re-queried the index rather than sharing the snapshot",
+                detector.id.name(),
+            );
+            assert!(detector.detect(&fixture.context()).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn nested_go_detection_tracks_the_index_and_directory_overrides() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        fixture.files(&["packages/go/go.mod", "other/untracked/go.mod"]);
+        let detected = || super::super::detect_for_workspace(&fixture.context()).unwrap();
+        assert!(!detected().active.contains(&CapabilityId::Go));
+        git(&fixture, &["add", "packages/go/go.mod"]);
+        assert!(detected().active.contains(&CapabilityId::Go));
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.go]\ndirectory = \"other\"\n",
+        );
+        assert!(!detected().active.contains(&CapabilityId::Go));
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.go]\ndirectory = \"packages\"\n",
+        );
+        assert!(detected().active.contains(&CapabilityId::Go));
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.go]\ndisabled = true\n",
+        );
+        assert!(!detected().active.contains(&CapabilityId::Go));
+        fs::remove_file(fixture.root.join(".cowshed.toml")).unwrap();
+        fs::remove_file(fixture.root.join("packages/go/go.mod")).unwrap();
+        assert!(!detected().active.contains(&CapabilityId::Go));
+    }
+
     fn package(fixture: &Fixture, directory: &str, name: &str) {
         write(
             fixture,
@@ -371,6 +473,35 @@ mod tests {
             &format!("{directory}/src/lib.rs"),
             "pub fn value() -> u8 { 1 }\n",
         );
+    }
+
+    /// Own a short runtime name for this fixture, across concurrent tests and binaries.
+    /// The symlink creation is the reservation; no listener or timing probe is involved.
+    struct RuntimeLink(PathBuf);
+
+    impl RuntimeLink {
+        fn reserve(sandbox: &mut crate::sandbox::SandboxConfig) -> Self {
+            let runtime = crate::sandbox::sandbox_runtime_dir(sandbox);
+            fs::create_dir_all(&runtime).unwrap();
+            for base in (49_184..=65_520).step_by(16) {
+                sandbox.port_block = crate::metadata::PortBlock::new(base, 16).unwrap();
+                let link = crate::sandbox::sandbox_runtime_link(sandbox);
+                match std::os::unix::fs::symlink(&runtime, &link) {
+                    Ok(()) => return Self(link),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("reserve runtime link {}: {error}", link.display()),
+                }
+            }
+            panic!("all fixture runtime names are occupied");
+        }
+    }
+
+    impl Drop for RuntimeLink {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_file(&self.0) {
+                eprintln!("release fixture runtime link {}: {error}", self.0.display());
+            }
+        }
     }
 
     async fn cargo_paths(fixture: &Fixture) -> BuildStateDiscovery {
@@ -392,6 +523,7 @@ mod tests {
             build_volume_mount: None,
             capabilities: Default::default(),
         };
+        let _runtime_link = RuntimeLink::reserve(&mut sandbox);
         sandbox.configure_capabilities().unwrap();
         let caller = BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/tmp/x".to_owned())]);
         let environment = crate::runtime::supervisor::job_environment(&sandbox, &caller)
@@ -512,12 +644,13 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_tracks_worktree_bytes_of_all_tracked_cargo_inputs_not_untracked_files() {
+    fn fingerprint_tracks_worktree_bytes_of_all_tracked_tool_inputs_not_untracked_files() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         package(&fixture, "rust", "rust");
         write(&fixture, ".cargo/config", "[build]\n");
         write(&fixture, "rust/.cargo/config.toml", "[build]\n");
+        write(&fixture, "packages/go/go.mod", "module example.com/probe\n");
         git(
             &fixture,
             &[
@@ -525,11 +658,13 @@ mod tests {
                 "rust/Cargo.toml",
                 ".cargo/config",
                 "rust/.cargo/config.toml",
+                "packages/go/go.mod",
             ],
         );
         let mut fingerprint = tracked_manifest_fingerprint(&fixture.context()).unwrap();
         write(&fixture, "untracked/Cargo.toml", "not a manifest");
         write(&fixture, "untracked/.cargo/config.toml", "not a config");
+        write(&fixture, "untracked/go.mod", "not a module");
         assert_eq!(
             fingerprint,
             tracked_manifest_fingerprint(&fixture.context()).unwrap()
@@ -538,6 +673,7 @@ mod tests {
             "rust/Cargo.toml",
             ".cargo/config",
             "rust/.cargo/config.toml",
+            "packages/go/go.mod",
         ] {
             let at = fixture.root.join(path);
             let previous = fs::read_to_string(&at).unwrap();

@@ -32,7 +32,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["Cargo.toml"],
     scope: DetectionScope::Project,
     host_cache_homes: &[&HOME],
-    reached_from: Some(super::build_state_discovery::tracked_cargo_convention),
+    reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
     contribute,
 };
 

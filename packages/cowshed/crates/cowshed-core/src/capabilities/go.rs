@@ -1,4 +1,4 @@
-//! Go (`go.mod` or `go.work`): the module and build caches on the shared caches volume.
+//! Go (`go.mod`/`go.work` at the selected root, or a tracked nested `go.mod`): shared caches.
 //!
 //! Both caches are content-addressed, so every workspace on the host shares one of each, named
 //! directly through `GOMODCACHE` and `GOCACHE`; nothing on the host is relocated for them. A host
@@ -22,7 +22,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["go.mod", "go.work"],
     scope: DetectionScope::Project,
     host_cache_homes: &[],
-    reached_from: None,
+    reached_from: Some(super::ReachedConvention::TrackedManifest("go.mod")),
     contribute,
 };
 

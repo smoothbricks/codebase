@@ -15,7 +15,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["flake.nix", "devenv.nix"],
     contribute,
     host_cache_homes: &[&CACHE_HOME, &STATE_HOME],
-    reached_from: Some(reached_through_envrc),
+    reached_from: Some(super::ReachedConvention::ProjectFile(reached_through_envrc)),
 };
 pub static CACHE_HOME: SharedToolHome = SharedToolHome {
     variable: None,
