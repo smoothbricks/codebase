@@ -8,7 +8,7 @@ import { decode, printCommandOutput } from '../../../lib/run.js';
 import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
-const NX_DAEMON_STOP_TIMEOUT_MS = 10_000;
+const NX_EXIT_TIMEOUT_MS = 10_000;
 
 /**
  * Every fixture Nx process reports its own phases. A fixture Nx run has stalled
@@ -25,7 +25,7 @@ export const FIXTURE_NX_DIAGNOSTICS: Readonly<Record<string, string>> = {
 };
 
 // Isolate fixture git from the runner environment and skip fsync. These are
-// throwaway temp repos (deleted in withFixtureRepo's finally) so durability is
+// throwaway temp repos (deleted when the fixture retires) so durability is
 // irrelevant — fsync is pure cost. On GitHub Actions the ~20 sequential git
 // spawns in a push test otherwise sum past the 30s cap: fsync on the runner's
 // disk is the dominant cost, and inheriting the runner's global/system config
@@ -43,24 +43,44 @@ const GIT_FIXTURE_ENV: Record<string, string> = {
 };
 
 /**
+ * A fixture root while its test owns it. `nxRoots` names every Nx workspace
+ * under the root that an `nx` client ran in, the root itself included, and
+ * `clients` the pid of every `nx` client `runFixtureNx` still has running.
+ * Retirement reads both, so it needs nothing from a body that never returns.
+ */
+interface Fixture {
+  readonly root: string;
+  readonly nxRoots: Set<string>;
+  readonly clients: Set<number>;
+  retirement: Promise<void> | null;
+}
+
+/** Fixtures whose retirement has not begun. */
+const liveFixtures = new Set<Fixture>();
+
+/**
  * A temp git repository for one test. Bun moves on when a test times out but
- * does not cancel its body. The body can then finish later and delete the only
- * evidence of what stalled. So when the test finishes while the root still
- * exists, the fixture snapshots its Nx daemon log at that moment. A body
- * failure reports the same log before cleanup.
+ * does not cancel its body, and the run can exit before that body reaches its
+ * `finally`. The Nx daemon such a fixture started then outlives the run, with
+ * its working directory in a temp root nothing will clean up. So the fixture
+ * retires when the test finishes, whichever of the body or the test ends
+ * first: it snapshots the Nx daemon log, stops every Nx process it started and
+ * deletes the root. A body failure reports the same log first.
  */
 export async function withFixtureRepo(fn: (root: string) => Promise<void>): Promise<void> {
-  let heldRoot: string | null = null;
+  let fixture: Fixture | null = null;
   onTestFinished(async () => {
-    const root = heldRoot;
-    if (root !== null) {
-      await reportFixtureNxDaemon(root, 'the test finished while the fixture still existed');
+    if (fixture !== null && fixture.retirement === null) {
+      await reportFixtureNxDaemon(fixture.root, 'the test finished while the fixture still existed');
+      await retireFixture(fixture);
     }
   });
   // Canonical, because macOS puts the temp directory behind a /private symlink
   // and a daemon never sees an edit made under a root named through one.
   const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-release-test-')));
-  heldRoot = root;
+  const owned: Fixture = { root, nxRoots: new Set([root]), clients: new Set(), retirement: null };
+  fixture = owned;
+  liveFixtures.add(owned);
   try {
     await git(root, ['init', '-b', 'main']);
     await git(root, ['config', 'user.name', 'Test User']);
@@ -70,13 +90,33 @@ export async function withFixtureRepo(fn: (root: string) => Promise<void>): Prom
     await reportFixtureNxDaemon(root, 'the fixture body failed');
     throw error;
   } finally {
-    try {
-      await stopFixtureNxDaemon(root);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-      heldRoot = null;
-    }
+    await retireFixture(owned);
   }
+}
+
+/**
+ * Stop every Nx process a fixture started, wait until each has exited, then
+ * delete its root. The body's `finally` and the test's finish share one
+ * retirement. The `nx` clients go first, with everything they spawned: a
+ * client killed while it starts a daemon would otherwise leave that daemon
+ * running before it has recorded itself. A process that outlives its stop
+ * fails the retirement and keeps the root, so its working directory still
+ * names the fixture it came from.
+ */
+function retireFixture(fixture: Fixture): Promise<void> {
+  fixture.retirement ??= (async () => {
+    liveFixtures.delete(fixture);
+    const clients = withDescendants(await processTable(), [...fixture.clients]);
+    for (const client of clients) {
+      terminate(client.pid);
+    }
+    await awaitExit(clients, `nx clients of fixture ${fixture.root}`);
+    for (const nxRoot of fixture.nxRoots) {
+      await stopFixtureNxDaemon(nxRoot);
+    }
+    await rm(fixture.root, { recursive: true, force: true });
+  })();
+  return fixture.retirement;
 }
 
 /**
@@ -214,51 +254,176 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
  * daemon. Nx's own defaults decide whether a daemon runs: an inherited
  * `NX_DAEMON`, and the socket directory of whichever workspace launched this
  * process, never reach the fixture. Inheriting the outer task's locations
- * could select or overwrite another workspace.
+ * could select or overwrite another workspace. The root must lie in a live
+ * fixture, which then stops whatever this client starts.
  */
 export async function runFixtureNx(root: string, args: string[]): Promise<void> {
+  const fixture = [...liveFixtures].find((live) => root === live.root || root.startsWith(`${live.root}/`));
+  if (fixture === undefined) {
+    throw new Error(`runFixtureNx: no live withFixtureRepo fixture contains ${root}; its test has already finished`);
+  }
+  fixture.nxRoots.add(root);
+  const client = spawnFixtureNx(root, args);
+  fixture.clients.add(client.pid);
+  try {
+    await expectNxSuccess(args, client);
+  } finally {
+    fixture.clients.delete(client.pid);
+  }
+}
+
+function spawnFixtureNx(root: string, args: string[]): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
   const env = definedProcessEnv();
   delete env.NX_DAEMON;
   delete env.NX_SOCKET_DIR;
   delete env.NX_DAEMON_SOCKET_DIR;
-  const result = await $`nx ${args}`
-    .cwd(root)
-    .env({
+  return Bun.spawn(['nx', ...args], {
+    cwd: root,
+    env: {
       ...env,
       NX_WORKSPACE_ROOT_PATH: root,
       NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
       NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
       ...FIXTURE_NX_DIAGNOSTICS,
-    })
-    .quiet()
-    .nothrow();
-  if (result.exitCode !== 0) {
-    const stdout = decode(result.stdout);
-    const stderr = decode(result.stderr);
+    },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+}
+
+async function expectNxSuccess(args: string[], client: Bun.Subprocess<'ignore', 'pipe', 'pipe'>): Promise<void> {
+  const [exitCode, stdoutBytes, stderrBytes] = await Promise.all([
+    client.exited,
+    streamBytes(client.stdout),
+    streamBytes(client.stderr),
+  ]);
+  if (exitCode !== 0) {
+    const stdout = decode(stdoutBytes);
+    const stderr = decode(stderrBytes);
     printCommandOutput(stdout, stderr);
-    throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}\n${stdout}\n${stderr}`);
+    throw new Error(`nx ${args.join(' ')} failed with exit code ${exitCode}\n${stdout}\n${stderr}`);
   }
 }
 
 /**
- * Release the Nx daemon a fixture root started, through `nx daemon --stop`,
- * before the root is deleted. Nx records a started daemon in
- * `d/server-process.json` under the root's workspace-data directory, so a root
- * without that record never had one. The record goes when the daemon has shut
- * down; one that outlives the stop is reported, not buried by the delete.
+ * Release the Nx daemon a root started, through `nx daemon --stop`, and wait
+ * until the daemon and every process it ran have exited. Nx deletes the
+ * daemon's record before the daemon exits, so the record cannot say when the
+ * root is free to delete. The daemon also leaves what it spawned to end on its
+ * own: plugin workers once they see it gone, an editor extension probe never.
+ * Those get SIGTERM with it. A root without the record never had a daemon.
  */
 export async function stopFixtureNxDaemon(root: string): Promise<void> {
-  const record = join(root, '.nx', 'workspace-data', 'd', 'server-process.json');
-  if (!existsSync(record)) {
+  const [daemon, ...spawned] = await fixtureNxDaemonProcesses(root);
+  if (daemon === undefined) {
     return;
   }
-  await runFixtureNx(root, ['daemon', '--stop']);
-  const deadline = Date.now() + NX_DAEMON_STOP_TIMEOUT_MS;
-  while (existsSync(record)) {
+  await expectNxSuccess(['daemon', '--stop'], spawnFixtureNx(root, ['daemon', '--stop']));
+  for (const entry of spawned) {
+    terminate(entry.pid);
+  }
+  await awaitExit([daemon, ...spawned], `Nx daemon of ${root}`);
+}
+
+/**
+ * The Nx daemon a root runs, the daemon first, then every process it started.
+ * Empty when the root records no daemon or the recorded one is gone.
+ */
+export async function fixtureNxDaemonProcesses(root: string): Promise<ProcessEntry[]> {
+  const record = join(root, '.nx', 'workspace-data', 'd', 'server-process.json');
+  if (!existsSync(record)) {
+    return [];
+  }
+  const parsed: unknown = JSON.parse(await readFile(record, 'utf8'));
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    !('processId' in parsed) ||
+    typeof parsed.processId !== 'number' ||
+    !Number.isSafeInteger(parsed.processId)
+  ) {
+    throw new Error(`Nx daemon record ${record} names no process id`);
+  }
+  return withDescendants(await processTable(), [parsed.processId]);
+}
+
+export interface ProcessEntry {
+  pid: number;
+  ppid: number;
+  /** `ps` state; a leading `Z` is a zombie, which has exited. */
+  stat: string;
+  command: string;
+}
+
+/** Every process on the host, as `ps` lists it on macOS and Linux alike. */
+export async function processTable(): Promise<ProcessEntry[]> {
+  const text = await $`ps -A -o pid= -o ppid= -o stat= -o command=`.quiet().text();
+  return text
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => {
+      const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s?(.*)$/.exec(line);
+      if (match === null) {
+        throw new Error(`Unable to parse ps line: ${line}`);
+      }
+      const [, pid, ppid, stat, command] = match;
+      return { pid: Number(pid), ppid: Number(ppid), stat: stat ?? '', command: command ?? '' };
+    });
+}
+
+/** The listed processes among `pids`, and every process descending from one. */
+function withDescendants(table: readonly ProcessEntry[], pids: readonly number[]): ProcessEntry[] {
+  const found: ProcessEntry[] = [];
+  const pending = table.filter((entry) => pids.includes(entry.pid));
+  for (let entry = pending.pop(); entry !== undefined; entry = pending.pop()) {
+    found.push(entry);
+    const parent = entry.pid;
+    pending.push(...table.filter((child) => child.ppid === parent));
+  }
+  return found;
+}
+
+function terminate(pid: number): void {
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
+      throw error;
+    }
+  }
+}
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function awaitExit(processes: readonly ProcessEntry[], owner: string): Promise<void> {
+  const deadline = Date.now() + NX_EXIT_TIMEOUT_MS;
+  for (let waiting = processes.filter((entry) => isRunning(entry.pid)); waiting.length > 0; ) {
     if (Date.now() > deadline) {
-      throw new Error(`Nx daemon of ${root} still recorded ${NX_DAEMON_STOP_TIMEOUT_MS}ms after nx daemon --stop`);
+      // A signal probe also answers for a zombie, which has already exited.
+      const live = new Set(
+        (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid),
+      );
+      const survivors = waiting.filter((entry) => live.has(entry.pid));
+      if (survivors.length === 0) {
+        return;
+      }
+      throw new Error(
+        `${owner}: ${survivors.map((entry) => `${entry.pid} (${entry.command})`).join(', ')} still running ${NX_EXIT_TIMEOUT_MS}ms after it was stopped`,
+      );
     }
     await Bun.sleep(50);
+    waiting = waiting.filter((entry) => isRunning(entry.pid));
   }
 }
 

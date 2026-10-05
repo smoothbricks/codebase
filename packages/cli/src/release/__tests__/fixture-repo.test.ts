@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
+import { $ } from 'bun';
 import {
   classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
@@ -12,14 +13,15 @@ import {
 } from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
+  fixtureNxDaemonProcesses,
   git,
   gitIsAncestor,
   gitOutput,
   gitReleaseTagsByCreatorDate,
   gitSucceeds,
   packageVersionAtRef,
+  processTable,
   runFixtureNx,
-  stopFixtureNxDaemon,
   tag,
   withFixtureRepo,
   writeBuildablePackage,
@@ -161,6 +163,50 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
+  it('leaves no process of its Nx daemon running once the fixture retires', async () => {
+    let fixtureRoot = '';
+    let daemonPids: number[] = [];
+    await withFixtureRepo(async (root) => {
+      fixtureRoot = root;
+      await writeWorkspace(root);
+      await writeBuildablePackage(root, '@scope/a', 'packages/a');
+      await runFixtureNx(root, ['show', 'projects']);
+      daemonPids = (await fixtureNxDaemonProcesses(root)).map((entry) => entry.pid);
+    });
+
+    // The daemon and its plugin workers; fewer would prove nothing.
+    expect(daemonPids.length).toBeGreaterThan(1);
+    expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
+  });
+
+  it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
+    const { root, pids } = await abandonFixture(`
+      await runFixtureNx(root, ['show', 'projects']);
+      const daemon = await fixtureNxDaemonProcesses(root);
+      console.log('ABANDONED_FIXTURE_PIDS ' + daemon.map((entry) => entry.pid).join(' '));
+    `);
+
+    expect(pids.length).toBeGreaterThan(1);
+    expect(await survivors(root, pids)).toEqual([]);
+  });
+
+  it('stops an abandoned fixture nx client still starting its daemon, and that daemon', async () => {
+    // The client logs this line just before it spawns the daemon, which records
+    // itself only once it is up, so retiring now finds no record to stop by and
+    // the client lives on in the deleted root. The client is another process
+    // and its log the only signal it gives, so the body polls for it. The
+    // retirement kills the client, hence the catch.
+    const { root } = await abandonFixture(`
+      void runFixtureNx(root, ['daemon', '--start']).catch(() => {});
+      const log = join(root, '.nx', 'workspace-data', 'd', 'daemon.log');
+      while (!(existsSync(log) && readFileSync(log, 'utf8').includes('Starting new daemon server in background'))) {
+        await Bun.sleep(5);
+      }
+    `);
+
+    expect(await survivors(root, [])).toEqual([]);
+  });
+
   it('repairs multiple fetched remote targets from a runner clone with real git checkout and Nx build', async () => {
     await withFixtureRepo(async (author) => {
       await writeWorkspace(author);
@@ -194,56 +240,48 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['push', 'origin', 'main', '--tags']);
       await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
-      try {
-        await git(runner, ['config', 'user.name', 'Test User']);
-        await git(runner, ['config', 'user.email', 'test@example.com']);
-        await git(runner, ['fetch', '--tags', 'origin', 'main']);
-        const restoreRef = 'origin/main';
-        const packages = releaseFixturePackages();
-        const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0', '@scope/a@1.1.0']);
-        const githubReleases = new Set(['a@1.0.0', 'b@1.0.0']);
+      await git(runner, ['config', 'user.name', 'Test User']);
+      await git(runner, ['config', 'user.email', 'test@example.com']);
+      await git(runner, ['fetch', '--tags', 'origin', 'main']);
+      const restoreRef = 'origin/main';
+      const packages = releaseFixturePackages();
+      const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0', '@scope/a@1.1.0']);
+      const githubReleases = new Set(['a@1.0.0', 'b@1.0.0']);
 
-        const records = await collectOwnedReleaseTagRecords(packages, restoreRef, {
-          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
-          isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
-          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
-          durableTagState: async (pkg, tagName) => ({
-            npmPublished: npmPublished.has(`${pkg.name}@${pkg.version}`),
-            githubReleaseExists: githubReleases.has(tagName),
-          }),
-        });
-        const pending = pendingReleaseTargets(records, headSha);
+      const records = await collectOwnedReleaseTagRecords(packages, restoreRef, {
+        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+        durableTagState: async (pkg, tagName) => ({
+          npmPublished: npmPublished.has(`${pkg.name}@${pkg.version}`),
+          githubReleaseExists: githubReleases.has(tagName),
+        }),
+      });
+      const pending = pendingReleaseTargets(records, headSha);
 
-        expect(pending.map((target) => target.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
-        expect(pending[0]?.npmPackages).toEqual([]);
-        expect(pending[0]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/a@1.1.0']);
-        expect(pending[1]?.npmPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
-        expect(pending[1]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual([
-          '@scope/b@2.0.0-beta.1',
-        ]);
+      expect(pending.map((target) => target.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
+      expect(pending[0]?.npmPackages).toEqual([]);
+      expect(pending[0]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/a@1.1.0']);
+      expect(pending[1]?.npmPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
+      expect(pending[1]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
 
-        const shell = new LocalGitRepairShell(runner);
-        const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
+      const shell = new LocalGitRepairShell(runner);
+      const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
 
-        expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
-        expect(shell.devenvLoads).toBe(3);
-        expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
-        await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
-        expect(shell.builds).toEqual([['@scope/b']]);
-        expect(shell.publishes).toEqual([
-          { name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false },
-        ]);
-        expect(shell.githubCreates).toEqual([
-          { name: '@scope/a', version: '1.1.0', dryRun: false },
-          { name: '@scope/b', version: '2.0.0-beta.1', dryRun: false },
-        ]);
-        expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
-        expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
-        await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
-        await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
-      } finally {
-        await stopFixtureNxDaemon(runner);
-      }
+      expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
+      expect(shell.devenvLoads).toBe(3);
+      expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
+      await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
+      expect(shell.builds).toEqual([['@scope/b']]);
+      expect(shell.publishes).toEqual([{ name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false }]);
+      expect(shell.githubCreates).toEqual([
+        { name: '@scope/a', version: '1.1.0', dryRun: false },
+        { name: '@scope/b', version: '2.0.0-beta.1', dryRun: false },
+      ]);
+      expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
+      expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
+      await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
+      await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
     });
   });
 
@@ -302,39 +340,35 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['push', 'origin', 'main', '--tags']);
       await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
-      try {
-        await git(runner, ['config', 'user.name', 'Test User']);
-        await git(runner, ['config', 'user.email', 'test@example.com']);
-        await git(runner, ['fetch', '--tags', 'origin', 'main']);
+      await git(runner, ['config', 'user.name', 'Test User']);
+      await git(runner, ['config', 'user.email', 'test@example.com']);
+      await git(runner, ['fetch', '--tags', 'origin', 'main']);
 
-        const pkg: ReleasePackageInfo = {
-          name: '@scope/cli',
-          projectName: 'cli',
-          path: 'packages/cli',
-          version: '0.0.0',
-        };
-        const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
-          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
-          isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
-          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
-          durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
-        });
-        const pending = pendingReleaseTargets(records, 'not-head');
+      const pkg: ReleasePackageInfo = {
+        name: '@scope/cli',
+        projectName: 'cli',
+        path: 'packages/cli',
+        version: '0.0.0',
+      };
+      const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
+        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+        durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+      });
+      const pending = pendingReleaseTargets(records, 'not-head');
 
-        const shell = new LocalGitRepairShell(runner);
-        const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
+      const shell = new LocalGitRepairShell(runner);
+      const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
 
-        expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
-        expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
-        expect(shell.pushes).toEqual([['cli@0.2.0']]);
-        expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
-        expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
-        expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
-        await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/cli@0.2.0'])).resolves.toBe(true);
-        await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
-      } finally {
-        await stopFixtureNxDaemon(runner);
-      }
+      expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
+      expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
+      expect(shell.pushes).toEqual([['cli@0.2.0']]);
+      expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
+      expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
+      expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
+      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/cli@0.2.0'])).resolves.toBe(true);
+      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
     });
   });
 
@@ -387,6 +421,112 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 });
+
+/**
+ * Run a test file whose single test returns while its fixture body is still
+ * running, once `body` has run in that fixture. Bun ends a timed-out test
+ * without cancelling its body, and the run can exit before that body returns;
+ * a test that stops awaiting its fixture reaches the same state without
+ * waiting out a deadline. `body` sees `root` and may print the pids to check
+ * as `ABANDONED_FIXTURE_PIDS`.
+ */
+async function abandonFixture(body: string): Promise<{ root: string; pids: number[] }> {
+  const helper = JSON.stringify(join(import.meta.dir, 'helpers', 'fixture-repo.ts'));
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), 'smoo-abandoned-fixture-')));
+  try {
+    const testFile = join(scratch, 'abandoned.test.ts');
+    await writeFile(
+      testFile,
+      `import { test } from 'bun:test';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fixtureNxDaemonProcesses, runFixtureNx, withFixtureRepo, writeBuildablePackage, writeWorkspace } from ${helper};
+
+test('returns without its fixture body', async () => {
+  const started = Promise.withResolvers();
+  void withFixtureRepo(async (root) => {
+    await writeWorkspace(root);
+    await writeBuildablePackage(root, '@scope/a', 'packages/a');
+    ${body}
+    console.log('ABANDONED_FIXTURE_ROOT ' + root);
+    started.resolve();
+    await Promise.withResolvers().promise;
+  });
+  await started.promise;
+});
+`,
+    );
+    const run = Bun.spawn([process.execPath, 'test', testFile], {
+      cwd: join(import.meta.dir, '..', '..', '..'),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      run.exited,
+      new Response(run.stdout).text(),
+      new Response(run.stderr).text(),
+    ]);
+    const root = /^ABANDONED_FIXTURE_ROOT (.+)$/m.exec(stdout)?.[1];
+    if (exitCode !== 0 || root === undefined) {
+      throw new Error(`abandoned fixture test exited ${exitCode}\n${stdout}\n${stderr}`);
+    }
+    const pids = /^ABANDONED_FIXTURE_PIDS (.+)$/m.exec(stdout)?.[1]?.split(' ').map(Number) ?? [];
+    return { root, pids };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * What still runs of `pids`, and every process of this user whose working
+ * directory lies in `root`.
+ */
+async function survivors(root: string, pids: readonly number[]): Promise<string[]> {
+  const running = (await processTable())
+    .filter((entry) => !entry.stat.startsWith('Z') && pids.includes(entry.pid))
+    .map((entry) => `${entry.pid} ${entry.command}`);
+  const working = (await pidsWorkingIn(root)).map((pid) => `${pid} works in ${root}`);
+  return [...running, ...working];
+}
+
+async function pidsWorkingIn(root: string): Promise<number[]> {
+  const under = (cwd: string) => cwd === root || cwd.startsWith(`${root}/`);
+  switch (process.platform) {
+    case 'linux': {
+      const pids = (await readdir('/proc')).filter((name) => /^\d+$/.test(name));
+      const found: number[] = [];
+      for (const pid of pids) {
+        const cwd = await readlink(`/proc/${pid}/cwd`).catch((error: unknown) => {
+          // Another user's process, or one that exited since the listing.
+          if (error instanceof Error && 'code' in error && (error.code === 'EACCES' || error.code === 'ENOENT')) {
+            return null;
+          }
+          throw error;
+        });
+        if (cwd !== null && under(cwd.replace(/ \(deleted\)$/, ''))) {
+          found.push(Number(pid));
+        }
+      }
+      return found;
+    }
+    case 'darwin': {
+      // lsof keeps naming a working directory after it has been deleted.
+      const fields = await $`lsof -nP -a -d cwd -u ${String(userInfo().uid)} -Fpn`.quiet().text();
+      const found: number[] = [];
+      let pid = 0;
+      for (const line of fields.split('\n')) {
+        if (line.startsWith('p')) {
+          pid = Number(line.slice(1));
+        } else if (line.startsWith('n') && under(line.slice(1))) {
+          found.push(pid);
+        }
+      }
+      return found;
+    }
+    default:
+      throw new Error(`No working-directory scan for ${process.platform}`);
+  }
+}
 
 function releaseFixturePackages(): ReleasePackageInfo[] {
   return [
