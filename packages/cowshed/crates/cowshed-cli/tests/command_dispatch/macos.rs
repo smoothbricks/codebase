@@ -1138,6 +1138,62 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment()
     assert_eq!(adoptions, [], "a declared output restores in main and hits");
 }
 
+/// A real-Nx test that fails mid-way leaves no Nx daemon under its root. A daemon started in a
+/// fixture's checkout -- by a shed's keeper, by a check, by hand -- detaches from whatever started
+/// it, so the failed test's unwinding never reached it, and it kept running in the deleted tree.
+/// The fixture's scratch root ends every process working in its tree as the test unwinds, before
+/// it releases the fixture's images and removes the tree.
+#[test]
+fn real_apfs_a_failed_nx_test_leaves_no_daemon_under_its_root() {
+    let (nx, node) = repository_nx();
+    let started = std::cell::RefCell::new(None);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let fixture = Fixture::with(Project::Nx {
+            nx: &nx,
+            node: &node,
+            declared: true,
+        });
+        let mut start = Command::new(&node);
+        start
+            .args(["node_modules/nx/dist/bin/nx.js", "daemon", "--start"])
+            .current_dir(&fixture.checkout);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                start.env_remove(key);
+            }
+        }
+        let output = start.output().expect("node runs");
+        assert!(
+            output.status.success(),
+            "nx daemon --start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let record = fixture
+            .checkout
+            .join(".nx/workspace-data/d/server-process.json");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).expect("the daemon's record"))
+                .expect("the record is JSON");
+        *started.borrow_mut() = Some((
+            fixture._scratch.path().to_path_buf(),
+            record["processId"].clone(),
+        ));
+        panic!("the test fails while its fixture's Nx daemon runs");
+    }));
+    assert!(failed.is_err(), "the test failed");
+    let (root, daemon) = started
+        .into_inner()
+        .expect("the daemon started before the test failed");
+    let left = scratch_apfs::processes_in(|cwd| cwd.starts_with(&root))
+        .expect("list the processes working under the root");
+    assert_eq!(
+        left,
+        [],
+        "daemon {daemon} or another process outlived the test"
+    );
+    assert!(!root.exists(), "{} was removed", root.display());
+}
+
 /// How long any build-volume step may take before a test gives up on it: generous, because a
 /// loaded host slows every real build and detach, and a slow pass is not a failure.
 const PATIENCE: Duration = Duration::from_secs(300);
