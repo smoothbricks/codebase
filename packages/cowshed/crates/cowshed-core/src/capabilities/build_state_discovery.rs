@@ -16,6 +16,14 @@ use super::{BuildStatePath, CapabilityId, DetectionContext, merge_build_state};
 use crate::fork_lock::Run;
 use crate::{CowshedError, Result};
 
+#[cfg(all(test, target_os = "macos"))]
+use crate::metadata::PortBlock;
+#[cfg(all(test, target_os = "macos"))]
+use crate::sandbox::{SandboxConfig, sandbox_runtime_dir, sandbox_runtime_link};
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../tests/support/runtime_link.rs"]
+mod runtime_link;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CargoDiscoveryPhase {
@@ -366,6 +374,7 @@ fn tracked_manifests(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::test_support::Fixture;
+    use super::runtime_link::RuntimeLink;
     use super::*;
 
     fn write(fixture: &Fixture, relative: &str, content: &str) {
@@ -473,35 +482,6 @@ mod tests {
             &format!("{directory}/src/lib.rs"),
             "pub fn value() -> u8 { 1 }\n",
         );
-    }
-
-    /// Own a short runtime name for this fixture, across concurrent tests and binaries.
-    /// The symlink creation is the reservation; no listener or timing probe is involved.
-    struct RuntimeLink(PathBuf);
-
-    impl RuntimeLink {
-        fn reserve(sandbox: &mut crate::sandbox::SandboxConfig) -> Self {
-            let runtime = crate::sandbox::sandbox_runtime_dir(sandbox);
-            fs::create_dir_all(&runtime).unwrap();
-            for base in (49_184..=65_520).step_by(16) {
-                sandbox.port_block = crate::metadata::PortBlock::new(base, 16).unwrap();
-                let link = crate::sandbox::sandbox_runtime_link(sandbox);
-                match std::os::unix::fs::symlink(&runtime, &link) {
-                    Ok(()) => return Self(link),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => panic!("reserve runtime link {}: {error}", link.display()),
-                }
-            }
-            panic!("all fixture runtime names are occupied");
-        }
-    }
-
-    impl Drop for RuntimeLink {
-        fn drop(&mut self) {
-            if let Err(error) = fs::remove_file(&self.0) {
-                eprintln!("release fixture runtime link {}: {error}", self.0.display());
-            }
-        }
     }
 
     async fn cargo_paths(fixture: &Fixture) -> BuildStateDiscovery {

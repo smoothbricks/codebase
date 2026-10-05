@@ -34,6 +34,10 @@ use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
 
 use tokio::sync::mpsc;
+
+#[path = "support/runtime_link.rs"]
+mod runtime_link;
+
 /// `sun_path` on macOS is 104 bytes; devenv keeps its default runtime base short for exactly
 /// this reason (`resolve_runtime_dir`, devenv-core `paths.rs`). A base that leaves no room for
 /// the `devenv-<7 hex>` component plus a socket name is a base devenv cannot use.
@@ -1877,6 +1881,7 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
     );
     let root = scratch("shared-tool-caches");
     let mut sandbox = workspace(&root, 42_592);
+    let _runtime_link = runtime_link::RuntimeLink::reserve(&mut sandbox);
     for (host, shared) in [
         (".cargo/registry", "cargo/registry"),
         (".cargo/git", "cargo/git"),
