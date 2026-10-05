@@ -6,6 +6,7 @@ use crate::Result;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Direnv,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::CommandAncestors,
     all: &[".envrc"],
     any: &[],

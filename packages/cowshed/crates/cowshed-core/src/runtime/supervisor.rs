@@ -31,6 +31,7 @@ use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
+    shared_daemon_runtime_dir, shared_daemon_runtime_link,
 };
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
@@ -788,6 +789,7 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
 /// Prepare only generic private roots and the cache/daemon paths contributed by active detectors.
 fn prepare_private_environment(
     environment_root: &Path,
+    runtime: Option<(&Path, &Path)>,
     contribution: &crate::capabilities::CapabilityContribution,
 ) -> Result<AnchoredDirectory> {
     let environment =
@@ -845,13 +847,20 @@ fn prepare_private_environment(
         }
     }
     for path in &contribution.daemon_isolation.directories {
-        let relative = path.strip_prefix(environment_root).map_err(|_| {
-            CowshedError::integrity(
-                "capability daemon directory escapes the private environment",
+        if let Ok(relative) = path.strip_prefix(environment_root) {
+            private_directory(&environment, relative).map_err(private_environment_error)?;
+        } else if let Some((alias, directory)) = runtime
+            && let Ok(relative) = path.strip_prefix(alias)
+        {
+            let runtime =
+                AnchoredDirectory::create(directory).map_err(private_environment_error)?;
+            private_directory(&runtime, relative).map_err(private_environment_error)?;
+        } else {
+            return Err(CowshedError::integrity(
+                "capability daemon directory escapes the private environment and shared runtime",
                 "repair the daemon detector",
-            )
-        })?;
-        private_directory(&environment, relative).map_err(private_environment_error)?;
+            ));
+        }
     }
     Ok(environment)
 }
@@ -1043,6 +1052,15 @@ impl SandboxEnvironment {
     }
 }
 
+/// The same complete pre-activation environment used by a one-shot job. Controller-owned
+/// offline tool discovery uses this contract too, rather than inheriting the controller shell.
+pub async fn job_environment(
+    sandbox: &SandboxConfig,
+    caller: &BTreeMap<String, String>,
+) -> Result<BTreeMap<OsString, OsString>> {
+    Ok(sandbox_environment(sandbox, caller).await?.child(caller))
+}
+
 /// Prepare the workspace's private environment host-side and describe the child environment.
 ///
 /// The description is the whole job contract: every value is derived from the sandbox, the
@@ -1078,8 +1096,14 @@ pub(super) async fn sandbox_environment(
     let private_data = environment_root.join("data");
     let private_state = environment_root.join("state");
     let private_runtime = sandbox_runtime_dir(sandbox);
-    let environment =
-        prepare_private_environment(environment_root, &sandbox.capabilities.contribution)?;
+    let runtime_link = sandbox_runtime_link(sandbox);
+    let shared_runtime = shared_daemon_runtime_dir(sandbox);
+    let shared_alias = shared_daemon_runtime_link(sandbox);
+    let environment = prepare_private_environment(
+        environment_root,
+        Some((&shared_alias, &shared_runtime)),
+        &sandbox.capabilities.contribution,
+    )?;
     // TMPDIR must exist even when read-write environment state lives elsewhere.
     if sandbox.mode == crate::sandbox::RunSandboxMode::ReadWrite {
         AnchoredDirectory::create(&sandbox.exec_temp_dir).map_err(private_environment_error)?;
@@ -1108,6 +1132,16 @@ pub(super) async fn sandbox_environment(
         )
     })?;
     link_runtime_dir(sandbox, &private_runtime).await?;
+    if sandbox
+        .capabilities
+        .contribution
+        .daemon_isolation
+        .directories
+        .iter()
+        .any(|path| path.starts_with(&shared_alias))
+    {
+        point_runtime_link(&shared_alias, &shared_runtime).await?;
+    }
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
     // files. The Git directory probe runs under the narrower GitDiscovery child profile.
     // Refresh each spawn so revoked grants and relocated checkouts cannot leave stale routes.
@@ -1120,7 +1154,6 @@ pub(super) async fn sandbox_environment(
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
-    let runtime_link = sandbox_runtime_link(sandbox);
 
     // Local services already have a bounded direct-connect capability. Sending
     // them through the external gateway incorrectly requires an egress grant.
@@ -4892,8 +4925,12 @@ mod workspace_toolchain_tests {
             (RunSandboxMode::ReadOnly, sandbox.exec_temp_dir.clone()),
         ] {
             sandbox.mode = mode;
-            prepare_private_environment(&environment_root, &sandbox.capabilities.contribution)
-                .expect("prepare");
+            prepare_private_environment(
+                &environment_root,
+                None,
+                &sandbox.capabilities.contribution,
+            )
+            .expect("prepare");
             let link = environment_root.join("tools/bin/npm");
             assert_eq!(std::fs::read_link(&link).expect("command link"), target);
 
@@ -4911,6 +4948,7 @@ mod workspace_toolchain_tests {
 
             prepare_private_environment(
                 &environment_root,
+                None,
                 &crate::capabilities::CapabilityContribution::default(),
             )
             .expect("prepare without tools");
@@ -4961,12 +4999,11 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// One Nx state per checkout (04_sandbox.md): a read-write child's Nx state is the
-    /// checkout's own `.nx`, so its runs and every other boundary's fill one cache. Only a
-    /// read-only child, which may not write the checkout, keeps Nx state in its exec temp dir.
+    /// Every job shares the checkout's one Nx state and daemon. Read-only applies to source
+    /// files, not to a private second Nx cache or a different socket namespace.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_read_write_child_shares_the_checkouts_nx_state_and_a_read_only_one_cannot() {
+    fn all_child_modes_share_the_checkouts_nx_state_and_daemon() {
         let root = scratch("policy-read-only");
         let mount = root.join("workspace");
         std::fs::create_dir_all(&mount).expect("mount");
@@ -4990,15 +5027,32 @@ mod workspace_toolchain_tests {
             state(read_write, "NX_CACHE_DIRECTORY"),
             own(mount.join(".nx/cache"))
         );
-        let exec_temp = policy.ceiling().exec_temp_dir.clone();
         let read_only = crate::api::dto::RunSandboxMode::ReadOnly;
         assert_eq!(
             state(read_only, "NX_WORKSPACE_DATA_DIRECTORY"),
-            own(exec_temp.join("cache/nx/workspace-data"))
+            own(mount.join(".nx/workspace-data"))
         );
         assert_eq!(
             state(read_only, "NX_CACHE_DIRECTORY"),
-            own(exec_temp.join("cache/nx/cache"))
+            own(mount.join(".nx/cache"))
+        );
+        let (read_only_sandbox, _) = policy.child(read_only);
+        let (read_write_sandbox, _) = policy.child(read_write);
+        assert_ne!(
+            sandbox_runtime_dir(read_only_sandbox),
+            sandbox_runtime_dir(read_write_sandbox)
+        );
+        assert_ne!(
+            sandbox_runtime_link(read_only_sandbox),
+            sandbox_runtime_link(read_write_sandbox)
+        );
+        assert_eq!(
+            state(read_only, "NX_SOCKET_DIR"),
+            state(read_write, "NX_SOCKET_DIR")
+        );
+        assert_eq!(
+            state(read_only, "NX_DAEMON"),
+            Some(crate::capabilities::EnvAction::Unset)
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5374,7 +5428,7 @@ mod sandbox_environment_tests {
             },
             ..Default::default()
         };
-        prepare_private_environment(&environment, &contribution).unwrap();
+        prepare_private_environment(&environment, None, &contribution).unwrap();
         assert!(caches.join("go/mod").is_dir());
         assert!(caches.join("nix/state").is_dir());
         assert_eq!(
@@ -5391,11 +5445,81 @@ mod sandbox_environment_tests {
             }],
             ..Default::default()
         };
-        let error = prepare_private_environment(&environment, &escaping)
+        let error = prepare_private_environment(&environment, None, &escaping)
             .err()
             .expect("an escaping cache link is refused");
         assert_eq!(error.code, crate::error::ErrorCode::Integrity);
         assert!(!root.join("outside").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_daemon_directories_are_prepared_through_the_runtime_mapping_not_the_alias() {
+        let root = scratch("shared-daemon-environment");
+        let checkout_environment = root.join("checkout/.cowshed");
+        let read_only_environment = root.join("exec-temp");
+        let runtime = checkout_environment.join("run");
+        let alias = Path::new("/tmp/cs-49184");
+        let contribution = crate::capabilities::CapabilityContribution {
+            daemon_isolation: crate::capabilities::DaemonIsolation {
+                directories: vec![alias.join("nx")],
+                discard_at_mint: Vec::new(),
+            },
+            ..Default::default()
+        };
+        prepare_private_environment(
+            &checkout_environment,
+            Some((alias, &runtime)),
+            &contribution,
+        )
+        .unwrap();
+        std::fs::write(runtime.join("nx/preserved"), "shared").unwrap();
+        prepare_private_environment(
+            &read_only_environment,
+            Some((alias, &runtime)),
+            &contribution,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(runtime.join("nx/preserved")).unwrap(),
+            "shared"
+        );
+        assert!(
+            !read_only_environment.join("run/nx").exists(),
+            "no private second daemon state"
+        );
+
+        let outside = root.join("outside");
+        let escaping = crate::capabilities::CapabilityContribution {
+            daemon_isolation: crate::capabilities::DaemonIsolation {
+                directories: vec![outside.join("nx")],
+                discard_at_mint: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert!(
+            prepare_private_environment(&read_only_environment, Some((alias, &runtime)), &escaping)
+                .is_err()
+        );
+        assert!(
+            !outside.exists(),
+            "an unapproved alias never becomes a host-side write"
+        );
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(runtime.join("nx")).unwrap();
+        std::os::unix::fs::symlink(&outside, runtime.join("nx")).unwrap();
+        assert!(
+            prepare_private_environment(
+                &read_only_environment,
+                Some((alias, &runtime)),
+                &contribution
+            )
+            .is_err()
+        );
+        assert!(
+            !outside.join("preserved").exists(),
+            "anchored preparation refuses a runtime symlink"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5407,6 +5531,7 @@ mod sandbox_environment_tests {
         let environment = root.join("environment");
         prepare_private_environment(
             &environment,
+            None,
             &crate::capabilities::CapabilityContribution::default(),
         )
         .unwrap();

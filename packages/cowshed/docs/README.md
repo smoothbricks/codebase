@@ -158,9 +158,9 @@ exception for non-declarative hosts, never an automatic fallback after declarati
 
 Two different mechanisms save build time, and it helps to keep them apart.
 
-**The clone is why a workspace starts warm.** `cowshed new` copies main's image, `target/` included, so the compiler is
-never asked about code that did not change — the build tool simply finds its own previous output already there. Nothing
-is looked up in a cache for this; it is the copy-on-write clone doing the work.
+**The clone is why a workspace starts warm.** `cowshed new` clones the target's source image and its latest immutable
+build-volume seed. Cargo target directories, Nx state and per-tree indexers live in that separate private APFS image,
+reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land.
 
 **The compile cache is for the work that is left.** When a workspace does have to compile something — its own edits, or
 whatever landed on main since the clone — the host compile-cache daemon can hand back an object another workspace or
@@ -169,13 +169,13 @@ workspace sits at a different path.
 
 ### What cowshed contributes
 
-| Choice                                                    | Why it matters for reuse                                                                                                                                                       |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `target/` lives inside each workspace image               | Each agent gets a private warm build directory. A shared external build directory would serialise every build on one lock instead.                                             |
-| One host daemon owns the compile cache                    | `cowshed sccache start` pins the store path and the size cap. A build that starts its own server instead gets a small default cap and evicts what the next workspace came for. |
-| Cache keys are normalised relative to the build directory | This is what lets a workspace at one mount path use an object produced at another. `cowshed sccache status` reports whether it is working.                                     |
-| `--slot <n>` recycles a stable mount path                 | For any cache that is keyed by path rather than by content.                                                                                                                    |
-| Registry and module downloads are shared, read-only       | Dependencies are fetched once per host, never once per workspace.                                                                                                              |
+| Choice                                                    | Why it matters for reuse                                                                                                                                                          |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Build state lives in a private build-volume clone         | Each checkout has one mutable volume and one immutable latest seed; a land moves one link instead of copying caches. Shared build directories would serialise builds on one lock. |
+| One host daemon owns the compile cache                    | `cowshed sccache start` pins the store path and the size cap. A build that starts its own server instead gets a small default cap and evicts what the next workspace came for.    |
+| Cache keys are normalised relative to the build directory | This is what lets a workspace at one mount path use an object produced at another. `cowshed sccache status` reports whether it is working.                                        |
+| `--slot <n>` recycles a stable mount path                 | For any cache that is keyed by path rather than by content.                                                                                                                       |
+| Registry and module downloads are shared and writable     | Dependencies are fetched once per host; each detected tool may maintain its own cache safely from the sandbox. Gateway mirrors remain read-only.                                  |
 
 ### The rules that make it work for Rust
 
@@ -203,16 +203,16 @@ Ask three questions of any build cache before sharing it between workspaces:
 2. Is a reused artifact still correct at a different path?
 3. Does one process own the store and its size cap?
 
-| Toolchain           | How it lands                                                                                                                                                                                                                                                                                    |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. In a Go project (`go.mod` or `go.work`) every sandboxed job names both under `/private/cowshed/caches/go/{build,mod}` whenever that root exists.                      |
-| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries, outside `node_modules` so installs stay lean. Cowshed has no ttsc capability, so a sandbox writes no shared ttsc root: keep the cache inside the checkout (`.cache/ttsc`), where every clone inherits main's warm copy through the image. |
-| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                            |
-| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A clone enters with the environment it copied only if that environment is free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose path names no checkout.                              |
-| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                               |
-| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                                                                                                                                                    |
-| Nx                  | In an Nx project (`nx.json`) each sandboxed job gets its own Nx workspace-data directory and cache, together, under the private `XDG_CACHE_HOME`, per workspace and mode, so a clone inherits main's read-write hits through the image and no host client finds a sandboxed daemon.             |
-| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                   |
+| Toolchain           | How it lands                                                                                                                                                                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries. In a Go project (`go.mod` or `go.work`) every sandboxed job names both under `/private/cowshed/caches/go/{build,mod}` whenever that root exists.                                               |
+| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries, outside `node_modules` so installs stay lean. Cowshed has no ttsc capability, so a sandbox writes no shared ttsc root: keep the cache inside the checkout (`.cache/ttsc`), where every clone inherits main's warm copy through the image.                          |
+| Bun                 | Shared: the isolated linker writes `node_modules/.bun` as links into the install cache, so every checkout reaches it through `~/.bun/install/cache`.                                                                                                                                                                     |
+| Python via uv       | The cache is shared through `~/.cache/uv`, like Bun's. A clone enters with the environment it copied only if that environment is free of its path — relocatable scripts, editable installs relative to site-packages, an interpreter whose path names no checkout.                                                       |
+| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                                                                                                                                                                                        |
+| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                                                                                                                                                                             |
+| Nx                  | An Nx project (`nx.json`) has one `.nx/cache`, one `.nx/workspace-data` and one daemon/socket namespace across host, read-write and source-read-only jobs. Both state directories are fixed links into its private build volume. Caller Nx directory overrides never pass; inherited daemon records are deleted at fork. |
+| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory.                                                                                                                                                            |
 
 ## Documentation
 

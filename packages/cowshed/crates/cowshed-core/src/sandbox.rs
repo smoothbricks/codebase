@@ -210,8 +210,8 @@ impl SandboxConfig {
     /// The workspace's project capabilities for this sandbox's mode, for a command in the
     /// contained `command_cwd`. Project detectors read the project root whatever the cwd; only a
     /// command-scoped convention (a shell hook nearest the cwd) depends on it. The private
-    /// environment root and runtime link are the mode's own, so a read-only job's contribution
-    /// never names a read-write job's state.
+    /// environment root remains mode-private, while build state and the daemon/socket namespace
+    /// belong to the checkout and are shared by read-only and read-write jobs.
     pub fn detect_capabilities_for(
         &self,
         command_cwd: &Path,
@@ -230,7 +230,7 @@ impl SandboxConfig {
             RunSandboxMode::ReadOnly => self.exec_temp_dir.clone(),
             RunSandboxMode::ReadWrite => self.workspace_mount.join(".cowshed"),
         };
-        let runtime_dir = sandbox_runtime_link(self);
+        let runtime_dir = shared_daemon_runtime_link(self);
         let workspace_ca = self
             .workspace_mount
             .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
@@ -359,24 +359,29 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
     Ok(config)
 }
 
-/// Read-only jobs keep writable process state within the existing exec-temp carve-back.
+/// Read-only jobs keep generic process state in their own exec-temp carve-back.
 pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
     match sandbox.mode {
         RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("run"),
-        RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed/run"),
+        RunSandboxMode::ReadWrite => shared_daemon_runtime_dir(sandbox),
     }
 }
 
-/// A short socket namespace per workspace and mode. Distinct links prevent a
-/// read-only launch from retargeting a running read-write job's Unix sockets.
-/// macOS caps Unix socket paths at 104 bytes; the full mount path leaves no
-/// room for a tool's per-session socket name.
+/// Generic runtime aliases stay mode-private. Only a contributed daemon socket leaf is shared.
 pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
     let suffix = match sandbox.mode {
         RunSandboxMode::ReadOnly => "-ro",
         RunSandboxMode::ReadWrite => "",
     };
     PathBuf::from(format!("/tmp/cs-{}{suffix}", sandbox.port_block.base()))
+}
+
+pub(crate) fn shared_daemon_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
+    sandbox.workspace_mount.join(".cowshed/run")
+}
+
+pub(crate) fn shared_daemon_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
+    PathBuf::from(format!("/tmp/cs-{}", sandbox.port_block.base()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -616,14 +621,10 @@ pub fn seatbelt_profile(
     );
     // Unix sockets the workspace's own processes rendezvous over — devenv's and nx's in the
     // runtime dir, a test's in its temp dir, a tool's under the checkout — are admitted in the
-    // workspace's own tree and nowhere else: the exec temp dir, and for a read-write job the
-    // whole mount, which holds its runtime dir. A read-only job's runtime dir is in the exec
-    // temp dir, and the mount's sockets stay closed to it: read-write jobs' daemons listen
-    // there, and reaching one would let a read-only job write through it. The child reaches
-    // its runtime dir as the short `/tmp/cs-<port>` link; Seatbelt filters the path it is
-    // handed, so both spellings of the link are named too. `path-prefix` is a string prefix,
-    // so each tree is named with its trailing `/`: without it, `<dir>` also admits a sibling
-    // `<dir>-other/`.
+    // workspace's own tree and nowhere else: exec temp, and the whole source mount only for a
+    // read-write job. Generic rendezvous state stays private to the job mode; the contributed
+    // shared daemon leaf is granted separately below. `path-prefix` is a string prefix, so the
+    // trailing slash excludes sibling names.
     let runtime_link = sandbox_runtime_link(config);
     let private_runtime_link =
         PathBuf::from("/private").join(runtime_link.strip_prefix("/").unwrap_or(&runtime_link));
@@ -787,8 +788,48 @@ pub fn seatbelt_profile(
         Path::new("/dev/null"),
     )?;
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
-    // Short runtime links resolve to the workspace or the exec temp directory
-    // above. Only metadata on their exact names is allowed, never a /tmp listing.
+    // A contributed daemon leaf (Nx's run/nx) is shared across modes, never the surrounding
+    // generic runtime directory. The rest of a read-only job's rendezvous state stays private.
+    let shared_alias = shared_daemon_runtime_link(config);
+    let shared_runtime = shared_daemon_runtime_dir(config);
+    for alias in &config
+        .capabilities
+        .contribution
+        .daemon_isolation
+        .directories
+    {
+        let Ok(relative) = alias.strip_prefix(&shared_alias) else {
+            continue;
+        };
+        validate_path(alias)?;
+        if relative.as_os_str().is_empty() {
+            return Err(SandboxError::InvalidPath {
+                path: alias.clone(),
+                reason: "a shared daemon grant must name a leaf below its runtime root",
+            });
+        }
+        let directory = shared_runtime.join(relative);
+        push_readable_ancestors(&mut profile, &directory)?;
+        push_subpath_rule(&mut profile, "allow file-read* file-write*", &directory)?;
+        let canonical_alias = Path::new("/private").join(alias.strip_prefix("/").unwrap_or(alias));
+        for socket_tree in [&directory, alias, &canonical_alias] {
+            push_line(
+                &mut profile,
+                &format!(
+                    "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}/\")) (remote unix-socket (path-prefix \"{0}/\")))",
+                    sbpl_path(socket_tree)?
+                ),
+            );
+        }
+        for name in [
+            &shared_alias,
+            &Path::new("/private").join(shared_alias.strip_prefix("/").unwrap_or(&shared_alias)),
+        ] {
+            push_literal_rule(&mut profile, "allow file-read-metadata", name)?;
+        }
+    }
+    // Generic short runtime links resolve to the mode's own runtime directory. Only metadata
+    // on their exact names is allowed, never a /tmp listing.
     let runtime_name = runtime_link
         .file_name()
         .expect("runtime link has a file name");
@@ -1068,6 +1109,72 @@ mod tests {
             git_worktree_repository: None,
             capabilities: DetectedCapabilities::default(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_source_read_only_job_writes_only_its_shared_nx_leaf_not_other_checkout_runtime() {
+        let fixture = crate::capabilities::test_support::Fixture::new();
+        let mut sandbox = config(RunSandboxMode::ReadOnly);
+        sandbox.home = fixture.home.clone();
+        sandbox.mount_root = fixture.root.join("mounts");
+        sandbox.workspace_mount = sandbox.mount_root.join("workspace");
+        sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        let runtime = shared_daemon_runtime_dir(&sandbox);
+        for directory in [
+            runtime.join("nx"),
+            runtime.join("other"),
+            sandbox_runtime_dir(&sandbox),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        sandbox
+            .capabilities
+            .contribution
+            .daemon_isolation
+            .directories = vec![shared_daemon_runtime_link(&sandbox).join("nx")];
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let touch = |path: &Path| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/touch"])
+                .arg(path)
+                .output_locked()
+                .unwrap()
+        };
+        for path in [
+            runtime.join("nx/state"),
+            sandbox_runtime_dir(&sandbox).join("private-state"),
+        ] {
+            let output = touch(&path);
+            assert!(
+                output.status.success(),
+                "{}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(path.exists());
+        }
+        for path in [
+            runtime.join("other/state"),
+            sandbox.workspace_mount.join("source"),
+        ] {
+            let output = touch(&path);
+            assert!(
+                !output.status.success(),
+                "{} must remain read-only",
+                path.display()
+            );
+            assert!(!path.exists());
+        }
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-read* file-write* (subpath \"{}\"))",
+                runtime.display()
+            )),
+            "no grant opens the generic checkout runtime"
+        );
     }
 
     #[test]

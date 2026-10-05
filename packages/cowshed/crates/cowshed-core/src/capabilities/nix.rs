@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Nix,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::Project,
     all: &[],
     any: &["flake.nix", "devenv.nix"],

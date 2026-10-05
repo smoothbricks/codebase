@@ -38,6 +38,18 @@ impl BuildStatePath {
             volume: RelPath::new(volume)?,
         })
     }
+
+    pub fn from_paths(checkout: &Path, volume: &Path) -> Result<Self> {
+        fn utf8(path: &Path) -> Result<&str> {
+            path.to_str().ok_or_else(|| {
+                CowshedError::integrity(
+                    format!("build-state path {} is not UTF-8", path.display()),
+                    "use a UTF-8 capability directory",
+                )
+            })
+        }
+        Self::new(utf8(checkout)?, utf8(volume)?)
+    }
 }
 
 #[cfg(test)]

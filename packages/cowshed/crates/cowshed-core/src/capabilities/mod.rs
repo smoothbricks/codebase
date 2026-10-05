@@ -11,10 +11,16 @@ use crate::{CowshedError, Result};
 use cache::{HostCache, SharedLayout, SharedToolHome};
 
 mod build_state;
-mod bun;
 pub use build_state::{BuildStatePath, RelPath};
+mod build_state_discovery;
+pub use build_state_discovery::{
+    BuildStateDiscovery, BuildStateFinding, CargoDiscoveryPhase, discover_build_state,
+    tracked_manifest_fingerprint,
+};
+mod bun;
 pub mod cache;
 pub mod cargo;
+mod codegraph;
 mod direnv;
 pub mod go;
 mod gradle;
@@ -42,6 +48,7 @@ pub enum CapabilityId {
     Gradle,
     Nix,
     Sccache,
+    Codegraph,
 }
 
 impl CapabilityId {
@@ -59,6 +66,7 @@ impl CapabilityId {
             Self::Gradle => "gradle",
             Self::Nix => "nix",
             Self::Sccache => "sccache",
+            Self::Codegraph => "codegraph",
         }
     }
     pub const fn section_name(self) -> &'static str {
@@ -75,6 +83,7 @@ impl CapabilityId {
             Self::Gradle => "capabilities.gradle",
             Self::Nix => "capabilities.nix",
             Self::Sccache => "capabilities.sccache",
+            Self::Codegraph => "capabilities.codegraph",
         }
     }
 
@@ -82,7 +91,7 @@ impl CapabilityId {
         Self::ALL.into_iter().find(|id| id.name() == name)
     }
 
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Direnv,
         Self::Nx,
         Self::Cargo,
@@ -95,6 +104,7 @@ impl CapabilityId {
         Self::Gradle,
         Self::Nix,
         Self::Sccache,
+        Self::Codegraph,
     ];
 }
 
@@ -186,10 +196,17 @@ pub enum DetectionScope {
     CommandAncestors,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkerKind {
+    File,
+    Directory,
+}
+
 pub struct Detector {
     pub id: CapabilityId,
+    pub marker_kind: MarkerKind,
     pub scope: DetectionScope,
-    /// All of these files must exist.
+    /// All of these convention markers must exist.
     pub all: &'static [&'static str],
     /// At least one of these files must exist; an empty list adds no condition.
     pub any: &'static [&'static str],
@@ -233,8 +250,12 @@ impl Detector {
     }
 
     fn matches(&self, workspace: &Path, directory: &Path) -> Result<bool> {
+        let present = |path: &Path| match self.marker_kind {
+            MarkerKind::File => convention_file(workspace, path),
+            MarkerKind::Directory => convention_directory(workspace, path),
+        };
         for file in self.all {
-            if !convention_file(workspace, &directory.join(file))? {
+            if !present(&directory.join(file))? {
                 return Ok(false);
             }
         }
@@ -242,7 +263,7 @@ impl Detector {
             return Ok(true);
         }
         for file in self.any {
-            if convention_file(workspace, &directory.join(file))? {
+            if present(&directory.join(file))? {
                 return Ok(true);
             }
         }
@@ -253,7 +274,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 12] = [
+pub static DETECTORS: [&Detector; 13] = [
     &direnv::DETECTOR,
     &nx::DETECTOR,
     &cargo::DETECTOR,
@@ -266,6 +287,7 @@ pub static DETECTORS: [&Detector; 12] = [
     &gradle::DETECTOR,
     &nix::DETECTOR,
     &sccache::DETECTOR,
+    &codegraph::DETECTOR,
 ];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -275,19 +297,25 @@ pub struct DetectedCapabilities {
 }
 
 pub fn detect_for_workspace(context: &DetectionContext<'_>) -> Result<DetectedCapabilities> {
+    let config = workspace_config(context)?;
+    detect(context, config.capabilities())
+}
+
+fn workspace_config(
+    context: &DetectionContext<'_>,
+) -> Result<crate::storage::bootstrap::CowshedConfig> {
     let path = context.workspace_root.join(".cowshed.toml");
-    let config = if convention_file(context.workspace_root, &path)? {
+    if convention_file(context.workspace_root, &path)? {
         let source = fs::read_to_string(&path).map_err(|error| detection_error(&path, error))?;
         crate::storage::bootstrap::parse_cowshed_config(&source).map_err(|error| {
             CowshedError::usage(
                 format!("invalid {}: {error}", path.display()),
                 "repair the repository cowshed configuration",
             )
-        })?
+        })
     } else {
-        crate::storage::bootstrap::CowshedConfig::default()
-    };
-    detect(context, config.capabilities())
+        Ok(crate::storage::bootstrap::CowshedConfig::default())
+    }
 }
 
 pub fn detect(
@@ -578,6 +606,47 @@ pub fn convention_file(workspace: &Path, path: &Path) -> Result<bool> {
             }
             Ok(true)
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(detection_error(path, error)),
+    }
+}
+
+fn convention_directory(workspace: &Path, path: &Path) -> Result<bool> {
+    let parent = path.parent().ok_or_else(|| {
+        CowshedError::integrity(
+            "directory marker has no parent",
+            "repair the capability marker",
+        )
+    })?;
+    validate_project_directory(workspace, parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::read_link(path).map_err(|error| detection_error(path, error))?;
+            let relative_parent = parent
+                .strip_prefix(workspace)
+                .expect("parent was contained");
+            let resolved =
+                crate::inherited_links::resolve_in_source(workspace, relative_parent, &target);
+            if resolved.starts_with(workspace.join(".cowshed/build")) {
+                Ok(true)
+            } else {
+                Err(CowshedError::sandbox_denied(
+                    format!(
+                        "capability directory marker {} is not linked through .cowshed/build",
+                        path.display()
+                    ),
+                    "keep index state in the checkout's build volume",
+                ))
+            }
+        }
+        Ok(_) => Err(CowshedError::integrity(
+            format!(
+                "capability convention is not a directory: {}",
+                path.display()
+            ),
+            "replace the marker with the indexer's directory",
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(detection_error(path, error)),
     }

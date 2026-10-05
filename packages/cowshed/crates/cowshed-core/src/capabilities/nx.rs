@@ -7,8 +7,8 @@
 //! directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` or
 //! `NX_PROJECT_GRAPH_CACHE_DIRECTORY` moves the record, the database and the cache together.
 //! A sandbox that names its own directories therefore owns a second cache: a build that fills
-//! one leaves a gate reading the other cold, and every clone inherits both half-warm. So a
-//! read-write job names the checkout's own `.nx` — the directories a host shell's Nx uses — and
+//! one leaves a gate reading the other cold, and every clone inherits both half-warm. So
+//! every job names the checkout's own `.nx` — the directories a host shell's Nx uses — and
 //! every boundary of the checkout shares one record, one daemon, one database and one cache.
 //!
 //! Sharing the record works only when every boundary can reach the daemon's socket, so the socket
@@ -19,8 +19,8 @@
 //! host prepares the leaf before a child runs. Whether the daemon runs stays Nx's own decision, so
 //! a caller's `NX_DAEMON` never reaches the child.
 //!
-//! A read-only job cannot write the checkout, and Nx writes its database on every run, so its
-//! state lives in the job's exec temp dir: it is not a gate and its results warm nothing.
+//! A read-only job keeps the source tree read-only, but may write its checkout's build volume.
+//! It shares the same cache, task database and daemon as every other client of the checkout.
 //!
 //! A workspace is cloned from an image, so a daemon's rendezvous record arrives byte-identical and
 //! names the daemon still serving the source tree. It is discarded at mint; the warm cache,
@@ -37,6 +37,7 @@ use crate::{CowshedError, Result};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Nx,
+    marker_kind: super::MarkerKind::File,
     all: &["nx.json"],
     any: &[],
     scope: DetectionScope::Project,
@@ -55,14 +56,8 @@ const DAEMON_RECORD_FILE: &str = "server-process.json";
 const WORKSPACE_ROOT_ENV: &str = "NX_WORKSPACE_ROOT_PATH";
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
-    // A read-write job's private environment lives in the image; a read-only job's lives in its
-    // exec temp dir, outside the checkout it may not write.
-    let read_write = context.environment_root.starts_with(context.workspace_root);
-    let state = if read_write {
-        context.project_root.join(STATE)
-    } else {
-        context.environment_root.join("cache/nx")
-    };
+    let state = context.project_root.join(STATE);
+    let project = workspace_relative(context.workspace_root, context.project_root)?;
     let mut contribution = CapabilityContribution {
         env: [
             ("NX_SOCKET_DIR", own(context.runtime_dir.join("nx"))),
@@ -73,21 +68,24 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
             (WORKSPACE_ROOT_ENV, own(context.project_root.into())),
             ("NX_DAEMON", EnvAction::Unset),
+            ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
         ]
         .into(),
+        build_state: ["cache", "workspace-data"]
+            .into_iter()
+            .map(|name| {
+                super::BuildStatePath::from_paths(
+                    &project.join(STATE).join(name),
+                    &project.join("nx").join(name),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
         ..CapabilityContribution::default()
     };
-    if !read_write {
-        contribution
-            .daemon_isolation
-            .directories
-            .extend([state.join("workspace-data"), state.join("cache")]);
-    }
     contribution
         .daemon_isolation
         .directories
         .push(context.runtime_dir.join("nx"));
-    let project = workspace_relative(context.workspace_root, context.project_root)?;
     contribution
         .daemon_isolation
         .discard_at_mint
@@ -167,6 +165,7 @@ mod tests {
                 env: BTreeMap::from([
                     ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
                     ("NX_DAEMON", EnvAction::Unset),
+                    ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
                     ("NX_SOCKET_DIR", own(fixture.runtime.join("nx"))),
                     (
                         "NX_WORKSPACE_DATA_DIRECTORY",
@@ -178,6 +177,11 @@ mod tests {
                     directories: vec![fixture.runtime.join("nx")],
                     discard_at_mint: vec![PathBuf::from(".nx/workspace-data/d")],
                 },
+                build_state: vec![
+                    super::super::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                    super::super::BuildStatePath::new(".nx/workspace-data", "nx/workspace-data")
+                        .unwrap(),
+                ],
                 ..CapabilityContribution::default()
             }
         );
@@ -193,9 +197,9 @@ mod tests {
         }
     }
 
-    /// A read-only job may not write the checkout, so its Nx state is its exec temp dir's.
+    /// A read-only job shares the checkout's state and daemon without gaining source writes.
     #[test]
-    fn a_read_only_job_keeps_nx_state_in_its_exec_temp_dir() {
+    fn a_read_only_job_shares_the_checkouts_one_nx_state_and_daemon() {
         let fixture = Fixture::new();
         fixture.files(&["nx.json"]);
         let exec_temp =
@@ -206,7 +210,7 @@ mod tests {
             .detect(&context)
             .expect("detection")
             .expect("nx detected");
-        let state = exec_temp.join("cache/nx");
+        let state = fixture.root.join(".nx");
         assert_eq!(
             contribution.env.get("NX_WORKSPACE_DATA_DIRECTORY"),
             Some(&own(state.join("workspace-data")))
@@ -217,12 +221,15 @@ mod tests {
         );
         assert_eq!(
             contribution.daemon_isolation.directories,
-            vec![
-                state.join("workspace-data"),
-                state.join("cache"),
-                fixture.runtime.join("nx"),
-            ]
+            vec![fixture.runtime.join("nx")]
         );
+        assert_eq!(contribution.env.get("NX_DAEMON"), Some(&EnvAction::Unset));
+        assert_eq!(
+            contribution.env.get("NX_PROJECT_GRAPH_CACHE_DIRECTORY"),
+            Some(&EnvAction::Unset)
+        );
+        let read_write = DETECTOR.detect(&fixture.context()).unwrap().unwrap();
+        assert_eq!(contribution, read_write);
     }
 
     /// An override directory roots Nx in that project: its workspace root, its `.nx` and its

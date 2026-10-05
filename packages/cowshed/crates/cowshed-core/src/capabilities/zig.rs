@@ -14,6 +14,7 @@ pub static ZIG_HOME: SharedToolHome = SharedToolHome {
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Zig,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::Project,
     all: &["build.zig"],
     any: &[],

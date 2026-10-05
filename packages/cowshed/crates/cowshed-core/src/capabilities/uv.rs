@@ -14,6 +14,7 @@ pub static UV_HOME: SharedToolHome = SharedToolHome {
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Uv,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::Project,
     all: &[],
     any: &["pyproject.toml", "uv.lock"],

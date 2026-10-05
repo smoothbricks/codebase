@@ -17,6 +17,7 @@ use crate::Result;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Go,
+    marker_kind: super::MarkerKind::File,
     all: &[],
     any: &["go.mod", "go.work"],
     scope: DetectionScope::Project,

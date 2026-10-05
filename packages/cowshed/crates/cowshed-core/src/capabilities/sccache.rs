@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Sccache,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::Project,
-    all: &["Cargo.toml"],
-    any: &[],
+    all: &[],
+    any: &["Cargo.toml"],
     contribute,
     host_cache_homes: &[],
-    reached_from: None,
+    reached_from: Some(super::build_state_discovery::tracked_cargo_convention),
 };
 
 pub fn server_socket() -> PathBuf {

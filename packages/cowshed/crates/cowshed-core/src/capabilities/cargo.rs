@@ -27,11 +27,12 @@ use crate::{CowshedError, Result};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Cargo,
-    all: &["Cargo.toml"],
-    any: &[],
+    marker_kind: super::MarkerKind::File,
+    all: &[],
+    any: &["Cargo.toml"],
     scope: DetectionScope::Project,
     host_cache_homes: &[&HOME],
-    reached_from: None,
+    reached_from: Some(super::build_state_discovery::tracked_cargo_convention),
     contribute,
 };
 
@@ -77,6 +78,10 @@ const PROGRAMS: [&str; 4] = ["cargo", "rustc", "rustdoc", "rustup"];
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = super::shared_tool_contribution(context, &HOME)?;
+    // Build state follows the tracked tree's Cargo config, never a caller shell's target dir.
+    contribution
+        .env
+        .insert("CARGO_TARGET_DIR", EnvAction::Unset);
     contribution.env.insert(
         GIT_FETCH_WITH_CLI_ENV,
         EnvAction::Own(OsString::from("true")),
@@ -234,6 +239,7 @@ mod tests {
             contribution.env,
             BTreeMap::from([
                 ("CARGO_HOME", EnvAction::Unset),
+                ("CARGO_TARGET_DIR", EnvAction::Unset),
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
             ])
         );
@@ -285,6 +291,7 @@ mod tests {
             contribution.env,
             BTreeMap::from([
                 ("CARGO_HOME", EnvAction::Own(cargo_home.clone().into())),
+                ("CARGO_TARGET_DIR", EnvAction::Unset),
                 (CA_ENV, EnvAction::Default(bundle.clone().into())),
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
             ])

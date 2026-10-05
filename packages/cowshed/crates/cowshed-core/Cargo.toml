@@ -26,6 +26,7 @@ arrow-buffer = "56"
 arrow-ipc = "56"
 arrow-schema = "56"
 base64 = "0.22"
+blake3 = "1"
 async-trait = "0.1"
 bytes = "1"
 # The control-plane data model only. Reconciling the gateway's session table against host

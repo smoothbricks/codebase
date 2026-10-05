@@ -14,6 +14,7 @@ pub static BUN_HOME: SharedToolHome = SharedToolHome {
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Bun,
+    marker_kind: super::MarkerKind::File,
     scope: super::DetectionScope::Project,
     all: &["package.json"],
     any: &["bun.lock", "bun.lockb"],
