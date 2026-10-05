@@ -1052,8 +1052,10 @@ impl Drop for Holder {
 
 /// A fork clones its target's seed, so a fork of a warm main is warm: every Cargo unit is
 /// `Fresh` and every Nx task a local cache hit (16_build_volumes.md, "Fork", rules "Clones
-/// preserve mtimes" and "Hash inputs are the same in every checkout"). Main's first seed was
-/// frozen empty at first touch; a land is what warms it.
+/// preserve mtimes", "One Cargo environment on every path" and "Hash inputs are the same in
+/// every checkout"). The relocated host build starts with the agent harness's `CI=true` and
+/// sources the checkout's environment; the sandbox build must reuse those same units. Main's
+/// first seed was frozen empty at first touch; a land is what warms it.
 #[tokio::test]
 async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
     let (nx, node) = repository_nx();
@@ -1079,19 +1081,51 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
     let w2 = new_workspace(&mut service, "w2").await;
+    assert_ne!(
+        w1, w2,
+        "the warm build volume is cloned to another checkout path"
+    );
     assert_target_on_build_volume(&w2);
+    let host = Command::new("/bin/sh")
+        .args(["-ec", &format!(". .cowshed/env; exec {CARGO_BUILD}")])
+        .current_dir(&w2)
+        .env_clear()
+        .env("HOME", fixture.storage.home())
+        .env(
+            "PATH",
+            std::env::join_paths([rust.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap(),
+        )
+        .env("CI", "true")
+        .output()
+        .expect("host build of the relocated target");
+    let host_warm = cargo_artifacts(&host.stdout);
     let started = Instant::now();
     let warm = cargo_artifacts(&sh(&mut service, "w2", CARGO_BUILD).await);
     eprintln!("w2 cargo build: {:?}", started.elapsed());
-    assert_eq!(warm.len(), 2, "{warm:?}");
-    assert!(
-        warm.iter().all(|(_, fresh)| *fresh),
-        "every unit of a fork of a warm main is Fresh: {warm:?}"
-    );
     let spawned = SystemTime::now();
     sh(&mut service, "w2", &nx_check).await;
     let exited = SystemTime::now();
-    match nx::attribute(&w2.join(".nx/cache"), &nx_check, spawned, exited) {
+    let nx_run = nx::attribute(&w2.join(".nx/cache"), &nx_check, spawned, exited);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert!(
+        host.status.success(),
+        "host Cargo: {}",
+        String::from_utf8_lossy(&host.stderr)
+    );
+    assert_eq!(host_warm.len(), 2, "{host_warm:?}");
+    assert!(
+        host_warm.iter().all(|(_, fresh)| *fresh),
+        "the relocated host build with CI=true stays all-Fresh: {host_warm:?}\nstderr: {}",
+        String::from_utf8_lossy(&host.stderr)
+    );
+    assert_eq!(warm.len(), 2, "{warm:?}");
+    assert!(
+        warm.iter().all(|(_, fresh)| *fresh),
+        "the sandbox reuses every unit of the relocated host build: {warm:?}"
+    );
+    match nx_run {
         nx::Attribution::Ours(run) => {
             assert_eq!(run.tasks.len(), 2, "{run:?}");
             assert!(
@@ -1105,8 +1139,6 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
             panic!("w2's Nx run left no summary of its own: {reason:?}")
         }
     }
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
 }
 
 /// A land freezes main's new seed from the landing volume at the landed tree, moves main's link
