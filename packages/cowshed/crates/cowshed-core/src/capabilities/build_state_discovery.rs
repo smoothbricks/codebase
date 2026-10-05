@@ -785,7 +785,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: b"0\0/checkout/Cargo.toml\n\0\0101\0\0error: no workspace\n\0".to_vec(),
+            stdout: b"0\0/checkout/Cargo.toml\n\0\x00101\0\0error: no workspace\n\0".to_vec(),
             stderr: b"direnv: error .envrc failed\n".to_vec(),
         };
         assert_eq!(
