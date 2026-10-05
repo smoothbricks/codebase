@@ -32,10 +32,14 @@ use crate::launchd::RemovalOutcome;
 use crate::output::Output;
 use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
+use cowshed_core::AdoptedProject;
 use cowshed_core::api::EmptyResult;
+use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::capabilities::sccache::cache_directory;
 use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
+use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
+use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
@@ -77,7 +81,7 @@ const UNINSTALL_AUTHORIZATION_ANNOUNCEMENT: &str = "setup --uninstall will reque
 /// person no way to tell a mount from a reformat. Printed only when the plan's own actions support
 /// it, never as a default reassurance.
 const NON_DESTRUCTIVE_PROMISE: &str =
-    "no volumes will be created or deleted; existing data is untouched";
+    "no host store/cache volumes will be created or deleted; existing source data is untouched";
 
 /// What the volumes still hold, or why nobody could tell.
 ///
@@ -110,6 +114,19 @@ pub enum MainMounts {
     Unknown {
         reason: String,
     },
+}
+
+/// One adopted main's shared runtime refresh; a refusing project never hides the later ones.
+#[derive(Clone, Debug)]
+pub struct ProjectBuildState {
+    pub repo_id: RepoId,
+    pub result: Result<BuildStateRefresh>,
+}
+
+struct RepairReadiness<'a> {
+    mains: Option<&'a MainMounts>,
+    services: &'a [ServiceBinaryRefresh],
+    build_state: &'a [ProjectBuildState],
 }
 
 /// What setup could observe about the git identity each adopted checkout's workspaces inherit.
@@ -276,6 +293,10 @@ pub trait HostSetup: Send {
     /// Called only for `setup --imperative-host-setup`, after the volumes are up; a default run
     /// never moves anything out of the user's home.
     async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>>;
+    /// Enumerate adopted mains before announcing any rebuild-only migration.
+    async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>>;
+    /// Refresh one adopted main through the same runtime path jobs use.
+    async fn migrate_build_state(&mut self, project: &AdoptedProject) -> Result<BuildStateRefresh>;
     /// Reconcile installed host-service binaries with the build running this repair.
     ///
     /// Default-empty so test hosts modelling only the volume flows stay valid; the native host
@@ -442,6 +463,34 @@ impl HostSetup for NativeHostSetup {
             });
         }
         Ok(GitIdentity::Checked(observed))
+    }
+
+    async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>> {
+        let storage = validate_existing_host_storage(&self.home).await?;
+        NativeGatewayInventory::new(storage)
+            .adopted_projects()
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("could not enumerate adopted mains for build-state migration: {error}"),
+                    "repair the adopted-project records, then cowshed setup",
+                )
+            })
+    }
+
+    async fn migrate_build_state(&mut self, project: &AdoptedProject) -> Result<BuildStateRefresh> {
+        let runtime = ProjectRuntime::open_existing_at(
+            &project.project_root,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            validate_existing_host_storage(&self.home).await?,
+        )
+        .await?;
+        let result = runtime.refresh_build_state(&WorkspaceName::main()).await;
+        let teardown = runtime.shutdown().await;
+        match result {
+            Ok(result) => teardown.map(|()| result),
+            Err(error) => Err(crate::runtime::merge_primary(error, teardown.err())),
+        }
     }
 
     /// Remove both agents, then the cowshed binary copy and sccache's nix GC root.
@@ -788,6 +837,32 @@ where
         Some(_) => Vec::new(),
         None => setup.refresh_host_services().await?,
     };
+    let build_state = match &failure {
+        Some(_) => Vec::new(),
+        None => {
+            let projects = setup.build_state_projects().await?;
+            if !projects.is_empty() {
+                output.guidance(
+                    "build-state migration discards rebuildable incremental directories; tracked source files are protected and the next build repopulates the volume",
+                ).map_err(output_error)?;
+            }
+            let mut results = Vec::with_capacity(projects.len());
+            for project in projects {
+                let result = setup.migrate_build_state(&project).await;
+                results.push(ProjectBuildState {
+                    repo_id: project.repo_id,
+                    result,
+                });
+            }
+            results
+        }
+    };
+    let build_failure = build_state_failure(&build_state);
+    let readiness = RepairReadiness {
+        mains: mains.as_ref(),
+        services: &services,
+        build_state: &build_state,
+    };
     // Opt-in, and last: sccache's daemon caches onto the caches volume, so building and starting it
     // before the volumes are up would grow a cache on the boot disk under an empty mountpoint. A
     // run that stopped partway never reaches it at all.
@@ -804,21 +879,21 @@ where
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
         // answering `ok:true` over a failure is the one thing this must not do.
-        match &failure {
-            None => {
+        match (&failure, &build_failure) {
+            (None, None) => {
                 output.success(report).map_err(output_error)?;
                 // On stderr, so the frozen stdout envelope stays frozen and a conflict a person
                 // has to resolve still reaches them in a scripted run.
                 emit_sccache_client(sccache.as_ref(), output)?;
                 emit_sccache_install(&sccache_install, output)?;
+                emit_build_state(&build_state, output)?;
             }
-            Some(_) => render_repair(
+            _ => render_repair(
                 &plan,
                 &report,
-                mains.as_ref(),
+                &readiness,
                 sccache.as_ref(),
                 &sccache_install,
-                &services,
                 output,
             )?,
         }
@@ -826,10 +901,9 @@ where
         render_repair(
             &plan,
             &report,
-            mains.as_ref(),
+            &readiness,
             sccache.as_ref(),
             &sccache_install,
-            &services,
             output,
         )?;
     }
@@ -856,6 +930,9 @@ where
     // this exits non-zero. Someone who asked for sccache and did not get it must not read exit 0
     // as "installed" — the storage transaction succeeded, and that is exactly what the rows say.
     if let Some(failure) = sccache_install.failure() {
+        return Err(failure);
+    }
+    if let Some(failure) = build_failure {
         return Err(failure);
     }
     let unrelocated = relocations
@@ -926,6 +1003,74 @@ fn emit_host_caches<W: Write, E: Write>(
             Err(reason) => format!("left {host} where it is: {reason}"),
         };
         output.guidance(&line).map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn build_state_failure(projects: &[ProjectBuildState]) -> Option<CowshedError> {
+    let mut failures = projects.iter().filter_map(|project| {
+        project
+            .result
+            .as_ref()
+            .err()
+            .map(|error| (&project.repo_id, error))
+    });
+    let (repo_id, first) = failures.next()?;
+    let count = 1 + failures.count();
+    let mut failure = first.clone();
+    failure.message = format!(
+        "build-state migration failed for {count} project(s); first refusal in {repo_id}: {}",
+        failure.message,
+    );
+    Some(failure)
+}
+
+fn emit_build_state<W: Write, E: Write>(
+    projects: &[ProjectBuildState],
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    for project in projects {
+        match &project.result {
+            Ok(state) => {
+                let line = match &state.volume {
+                    Some(volume) if state.created => format!(
+                        "{}: created empty build volume {volume}; the next build repopulates it",
+                        project.repo_id,
+                    ),
+                    Some(volume) => format!("{}: build volume {volume} is linked", project.repo_id),
+                    None => format!("{}: no contributed build-state paths", project.repo_id),
+                };
+                output.guidance(&line).map_err(output_error)?;
+                for path in &state.added {
+                    output
+                        .guidance(&format!(
+                            "{}: linked build-state path {}",
+                            project.repo_id,
+                            path.display()
+                        ))
+                        .map_err(output_error)?;
+                }
+                for finding in &state.displaced {
+                    output
+                        .error(&format!("{}: {finding}", project.repo_id))
+                        .map_err(output_error)?;
+                }
+                for finding in &state.findings {
+                    output
+                        .error(&format!("{}: {finding}", project.repo_id))
+                        .map_err(output_error)?;
+                }
+            }
+            Err(error) => {
+                output
+                    .error(&format!(
+                        "{}: build-state migration refused: {}",
+                        project.repo_id, error.message
+                    ))
+                    .map_err(output_error)?;
+                output.hint(&error.hint).map_err(output_error)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1188,10 +1333,9 @@ fn decimal_size(bytes: u64) -> String {
 fn render_repair<W: Write, E: Write>(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
-    mains: Option<&MainMounts>,
+    readiness: &RepairReadiness<'_>,
     sccache: Option<&ConfigReport>,
     sccache_install: &SccacheInstall,
-    services: &[ServiceBinaryRefresh],
     output: &mut Output<W, E>,
 ) -> Result<()> {
     // The per-action outcomes come first and only when there is something to say: they are the
@@ -1219,7 +1363,7 @@ fn render_repair<W: Write, E: Write>(
     emit_sccache_install(sccache_install, output)?;
     // An exhaustive match, not an `if let`: an outcome this module does not render is an outcome
     // the host silently kept to itself, which is the one thing a repair report must never do.
-    for refresh in services {
+    for refresh in readiness.services {
         let line = match refresh {
             ServiceBinaryRefresh::Refreshed { service } => Some(format!(
                 "{service} had a stale binary or agent definition; refreshed and restarted"
@@ -1236,10 +1380,11 @@ fn render_repair<W: Write, E: Write>(
             output.guidance(&line).map_err(output_error)?;
         }
     }
+    emit_build_state(readiness.build_state, output)?;
     output
-        .guidance(&repair_status(plan, report, mains, services))
+        .guidance(&repair_status(plan, report, readiness))
         .map_err(output_error)?;
-    for refresh in services {
+    for refresh in readiness.services {
         match refresh {
             ServiceBinaryRefresh::Stale { remedy, .. }
             | ServiceBinaryRefresh::Refused { remedy, .. } => {
@@ -1471,8 +1616,7 @@ fn uninstall_fstab_phrase(fstab: &UninstallFstabOutcome) -> String {
 fn repair_status(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
-    mains: Option<&MainMounts>,
-    services: &[ServiceBinaryRefresh],
+    readiness: &RepairReadiness<'_>,
 ) -> String {
     if report.failure().is_some() {
         let done = count_outcomes(report, |result| matches!(result, HostActionResult::Done));
@@ -1484,6 +1628,16 @@ fn repair_status(
         return format!(
             "host storage is NOT set up: {done} {} done, {failed} failed, {not_attempted} not attempted",
             plural(done, "action", "actions"),
+        );
+    }
+    let failed = readiness
+        .build_state
+        .iter()
+        .filter(|project| project.result.is_err())
+        .count();
+    if failed > 0 {
+        return format!(
+            "host storage is set up, but build-state migration failed for {failed} project(s)"
         );
     }
     let unresolved = report
@@ -1500,19 +1654,34 @@ fn repair_status(
     // A stale service binary this run could not refresh falsifies every ready sentence the
     // same way an unmounted main does: the volumes may be fine, but the host is not what the
     // invoking build says it should be.
-    if let Some(ServiceBinaryRefresh::Stale { service, .. }) = services
+    if let Some(ServiceBinaryRefresh::Stale { service, .. }) = readiness
+        .services
         .iter()
         .find(|refresh| matches!(refresh, ServiceBinaryRefresh::Stale { .. }))
     {
         return format!("host storage is set up, but {service} runs a stale binary");
     }
-    let refreshed = services
+    let refreshed = readiness
+        .services
         .iter()
         .any(|refresh| matches!(refresh, ServiceBinaryRefresh::Refreshed { .. }));
-    let ready = if refreshed {
+    let ready = if readiness.build_state.iter().any(|project| {
+        project
+            .result
+            .as_ref()
+            .is_ok_and(|state| !state.findings.is_empty())
+    }) {
+        String::from("host storage is set up; build-state discovery has findings")
+    } else if refreshed {
         // The volumes needed nothing, but the host still drifted and was repaired; claiming
         // "already set up" over a service that just restarted would erase the one thing done.
         String::from("host services refreshed")
+    } else if readiness.build_state.iter().any(|project| {
+        project.result.as_ref().is_ok_and(|state| {
+            state.created || !state.added.is_empty() || !state.displaced.is_empty()
+        })
+    }) {
+        String::from("host storage is set up; build state refreshed")
     } else if plan.actions.is_empty() && !plan.requires_authorization {
         String::from("everything already set up")
     } else if report.authorized {
@@ -1520,7 +1689,7 @@ fn repair_status(
     } else {
         String::from("host storage is set up")
     };
-    match mains {
+    match readiness.mains {
         None => ready,
         Some(MainMounts::Checked(unmounted)) if unmounted.is_empty() => ready,
         Some(MainMounts::Checked(unmounted)) => format!(

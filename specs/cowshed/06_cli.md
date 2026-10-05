@@ -44,7 +44,14 @@ Two verbs own the host story, both runnable from any directory:
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
   (01_storage.md). It announces an authorization prompt before raising one, then performs everything that can require
-  elevation inside that single session. Running it on a healthy host changes nothing and says so.
+  elevation inside that single session. Once storage repair succeeds, it refreshes every adopted main's build state
+  through the same runtime path jobs use (16_build_volumes.md). Migration is rebuild-only: it announces the discard of
+  contributed incremental directories before acting, protects tracked source files, and links an empty build volume for
+  the next build to repopulate. No build state is copied. A project refusal is reported on stderr without hiding later
+  projects; the command exits with the first typed failure and the number of failed projects, never a success JSON
+  envelope first. Uninstall and a failed storage repair never run migration. A fully migrated healthy host changes
+  nothing and says so. The non-destructive storage promise applies to host store/cache volumes and source data, not to
+  rebuildable incremental state.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its

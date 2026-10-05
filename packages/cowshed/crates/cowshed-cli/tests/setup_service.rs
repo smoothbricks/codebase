@@ -17,9 +17,11 @@ use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
 use cowshed_cli::probe::GitIdentityGap;
 use cowshed_cli::setup_service::{
-    GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectIdentity, SccacheInstall,
-    WorkspaceCensus, dispatch as setup_dispatch,
+    GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectBuildState, ProjectIdentity,
+    SccacheInstall, WorkspaceCensus, dispatch as setup_dispatch,
 };
+use cowshed_core::AdoptedProject;
+use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::capabilities::cache::HostCache;
 use cowshed_core::host_caches::{HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
@@ -60,6 +62,7 @@ struct FakeHost {
     /// What `setup --imperative-host-setup` did to each host cache, so the rows and the exit are
     /// provable without moving anything out of a real home.
     relocations: Vec<HostCacheRelocation>,
+    build_state: Vec<ProjectBuildState>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -140,6 +143,7 @@ impl Default for FakeHost {
                 ),
             },
             relocations: Vec::new(),
+            build_state: Vec::new(),
         }
     }
 }
@@ -195,6 +199,29 @@ impl HostSetup for FakeHost {
     async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
         self.events.push(String::from("refresh-services"));
         Ok(self.services.clone())
+    }
+
+    async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>> {
+        self.events.push(String::from("build-state-projects"));
+        Ok(self
+            .build_state
+            .iter()
+            .map(|project| AdoptedProject {
+                repo_id: project.repo_id.clone(),
+                project_root: PathBuf::from(format!("/checkout/{}", project.repo_id)),
+            })
+            .collect())
+    }
+
+    async fn migrate_build_state(&mut self, project: &AdoptedProject) -> Result<BuildStateRefresh> {
+        self.events
+            .push(format!("migrate-build-state:{}", project.repo_id));
+        self.build_state
+            .iter()
+            .find(|result| result.repo_id == project.repo_id)
+            .expect("fake project was enumerated")
+            .result
+            .clone()
     }
 
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
@@ -381,7 +408,7 @@ async fn a_partial_run_reports_each_action_and_refuses_to_claim_success() {
     assert_eq!(
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
-         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: no host store/cache volumes will be created or deleted; existing source data is untouched\n\
          cowshed: cowshed.store exists (UUID UUID-A, 1.0 TB) and will be mounted at /private/cowshed/store\n\
          cowshed: cowshed.caches exists (UUID UUID-B, 2.0 TB) and will be mounted at /private/cowshed/caches\n\
          cowshed: /etc/fstab will pin UUID UUID-A at /private/cowshed/store so it mounts at every boot\n\
@@ -567,6 +594,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "build-state-projects",
             "census"
         ]
     );
@@ -802,6 +830,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "build-state-projects",
             "census"
         ]
     );
@@ -849,7 +878,7 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
     assert_eq!(
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
-         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: no host store/cache volumes will be created or deleted; existing source data is untouched\n\
          cowshed: cowshed.store exists (UUID 1D6F0E1A-0000-4000-8000-00000000AAAA, 1.0 TB) and will be mounted at /Users/dev/.cowshed\n\
          cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/dev/.cowshed so it mounts at every boot\n\
          cowshed: cowshed.store (store): present but not mounted -> mounted\n\
@@ -903,7 +932,7 @@ async fn a_plan_that_creates_a_volume_makes_no_safety_promise() {
     assert!(
         !streams
             .stderr
-            .contains("no volumes will be created or deleted")
+            .contains("no host store/cache volumes will be created or deleted")
     );
     assert!(streams.stderr.contains(
         "cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n"
@@ -921,7 +950,7 @@ async fn a_healthy_host_makes_no_safety_promise() {
     assert!(
         !streams
             .stderr
-            .contains("no volumes will be created or deleted")
+            .contains("no host store/cache volumes will be created or deleted")
     );
     assert!(
         streams
@@ -1026,7 +1055,7 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
     assert!(!streams.stderr.contains("authorization"));
     assert_eq!(
         streams.stderr,
-        "cowshed: no volumes will be created or deleted; existing data is untouched\n\
+        "cowshed: no host store/cache volumes will be created or deleted; existing source data is untouched\n\
          cowshed: cowshed.caches exists (UUID 1D6F0E1A-0000-4000-8000-00000000BBBB, 2.0 TB) and is mounted at /Volumes/cowshed.caches; it will be remounted at /private/cowshed/caches\n\
          cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
@@ -1865,7 +1894,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
     assert_eq!(streams.exit, 0);
     assert!(streams.stderr.starts_with(
         "cowshed: setup will request administrator authorization once, for the actions below\n\
-         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: no host store/cache volumes will be created or deleted; existing source data is untouched\n\
          cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login\n"
     ));
     assert_eq!(
@@ -1877,6 +1906,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "build-state-projects",
             "census"
         ]
     );
@@ -2096,5 +2126,203 @@ async fn a_host_cache_left_in_place_is_named_and_fails_the_run() {
             .contains(&String::from("relocate-host-caches")),
         "a default setup moved host caches: {:?}",
         default_host.events
+    );
+}
+
+fn build_state_result(repo: &str, result: Result<BuildStateRefresh>) -> ProjectBuildState {
+    ProjectBuildState {
+        repo_id: RepoId::parse(repo).unwrap(),
+        result,
+    }
+}
+
+#[tokio::test]
+async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
+    use cowshed_core::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
+    use cowshed_core::capabilities::{BuildStateFinding, CargoDiscoveryPhase};
+    let volume = BuildVolumeId::parse("0123456789abcdef0123456789abcdef").unwrap();
+    let mut host = FakeHost {
+        build_state: vec![
+            build_state_result(
+                "acme/api",
+                Ok(BuildStateRefresh {
+                    volume: Some(volume.clone()),
+                    created: true,
+                    added: vec![PathBuf::from("target"), PathBuf::from(".nx/cache")],
+                    displaced: vec![DisplacedBuildStateFinding {
+                        path: PathBuf::from("target"),
+                        likely_tool: BuildStateTool::Cargo,
+                    }],
+                    findings: vec![BuildStateFinding::CargoUnavailable {
+                        manifest: PathBuf::from("nested/Cargo.toml"),
+                        phase: CargoDiscoveryPhase::Metadata,
+                        cause: String::from("offline dependency unavailable"),
+                    }],
+                }),
+            ),
+            build_state_result("acme/web", Ok(BuildStateRefresh::default())),
+        ],
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stdout.is_empty());
+    assert!(
+        streams
+            .stderr
+            .contains("build-state migration discards rebuildable incremental directories")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains(&format!("acme/api: created empty build volume {volume}"))
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("acme/api: linked build-state path target")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("acme/api: linked build-state path .nx/cache")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("cargo clean or another Cargo command"),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams.stderr.contains("nested/Cargo.toml"),
+        "{}",
+        streams.stderr
+    );
+    assert!(streams.stderr.contains("offline dependency unavailable"));
+    assert!(
+        streams
+            .stderr
+            .contains("acme/web: no contributed build-state paths")
+    );
+    assert!(!streams.stderr.contains("everything already set up"));
+    let execute = host
+        .events
+        .iter()
+        .position(|event| event == "execute")
+        .unwrap();
+    let inventory = host
+        .events
+        .iter()
+        .position(|event| event == "build-state-projects")
+        .unwrap();
+    let first = host
+        .events
+        .iter()
+        .position(|event| event == "migrate-build-state:acme/api")
+        .unwrap();
+    let second = host
+        .events
+        .iter()
+        .position(|event| event == "migrate-build-state:acme/web")
+        .unwrap();
+    assert!(execute < inventory && inventory < first && first < second);
+    assert!(
+        streams.stderr.find("discards rebuildable").unwrap()
+            < streams.stderr.find("created empty build volume").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn build_state_migration_continues_after_refusal_and_preserves_first_failure_and_count() {
+    let mut host = FakeHost {
+        build_state: vec![
+            build_state_result(
+                "acme/api",
+                Err(CowshedError::conflict(
+                    "tracked source target/source.rs prevents deletion",
+                    "preserve target/source.rs, then retry setup",
+                )),
+            ),
+            build_state_result("acme/web", Ok(BuildStateRefresh::default())),
+            build_state_result(
+                "acme/worker",
+                Err(CowshedError::environment_missing(
+                    "volume unavailable",
+                    "attach the volume",
+                )),
+            ),
+        ],
+        ..FakeHost::default()
+    };
+    let (streams, error) = failing_run(&mut host, REPAIR, true).await;
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(streams.exit, ErrorCode::Conflict.exit_code() as i32);
+    assert!(error.message.contains("2 project(s)"));
+    assert!(error.message.contains("first refusal in acme/api"));
+    assert!(error.message.contains("target/source.rs"));
+    assert_eq!(error.hint, "preserve target/source.rs, then retry setup");
+    assert!(
+        streams.stdout.is_empty(),
+        "a failing run emitted a success envelope: {}",
+        streams.stdout
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("acme/api: build-state migration refused")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("acme/web: no contributed build-state paths")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("acme/worker: build-state migration refused")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("build-state migration failed for 2 project(s)")
+    );
+    assert!(!streams.stderr.contains("everything already set up"));
+    assert!(
+        host.events
+            .iter()
+            .any(|event| event == "migrate-build-state:acme/web")
+    );
+    assert!(
+        host.events
+            .iter()
+            .any(|event| event == "migrate-build-state:acme/worker")
+    );
+}
+
+#[tokio::test]
+async fn build_state_migration_never_runs_after_storage_failure_or_during_uninstall() {
+    let mut host = FakeHost {
+        execute_error: Some(CowshedError::environment_missing(
+            "host storage unavailable",
+            "repair storage",
+        )),
+        build_state: vec![build_state_result(
+            "acme/api",
+            Ok(BuildStateRefresh::default()),
+        )],
+        ..FakeHost::default()
+    };
+    failing_run(&mut host, REPAIR, false).await;
+    assert_eq!(host.events, ["plan", "execute"]);
+    host.execute_error = None;
+    host.events.clear();
+    run(&mut host, UNINSTALL, false, false).await;
+    assert!(
+        !host
+            .events
+            .iter()
+            .any(|event| event == "build-state-projects"
+                || event.starts_with("migrate-build-state:"))
     );
 }
