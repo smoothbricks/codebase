@@ -407,6 +407,82 @@ pub(crate) fn is_temp_artifact(file_name: &OsStr) -> bool {
     name.starts_with('.') && name.contains(".tmp.")
 }
 
+/// Remove a directory tree a sandboxed process wrote, read-only directories included.
+///
+/// Tools seal what they write: Go's module cache extracts every directory 0555, and
+/// content-addressed caches commonly do the same, so `remove_dir_all` gets `EACCES` unlinking a
+/// child of such a directory. As `go clean -modcache` does, a removal refused that way restores the
+/// owner's `rwx` bits on every directory in the tree this user owns, then removes it once more.
+/// Only this user's own directories are touched: one another user owns keeps its mode, so the
+/// second removal reports exactly what still refuses it. Symlinks are never followed.
+pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            grant_owner_directory_access(path)?;
+            fs::remove_dir_all(path)
+        }
+        removed => removed,
+    }
+}
+
+/// Add `u+rwx` to each directory beneath (and including) `root` that this user owns, top-down so
+/// each one is searchable before its children are visited. A directory another user owns is not
+/// descended into. An entry gone mid-walk was removed by someone else and is skipped.
+fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
+    let owner = unsafe { libc::geteuid() };
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() || metadata.uid() != owner {
+            continue;
+        }
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o700 != 0o700 {
+            let name = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "directory contains NUL")
+            })?;
+            let mode = libc::mode_t::try_from(mode | 0o700)
+                .expect("a permission mask below 0o7777 fits mode_t");
+            // SAFETY: `name` is NUL-terminated and outlives the call. AT_SYMLINK_NOFOLLOW makes
+            // a directory swapped for a symlink since the lstat change the link, never its target.
+            if unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    mode,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+                continue;
+            }
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open a directory and fsync it — the one durability barrier for directory entries. Opened with
 /// `O_DIRECTORY` so a path swapped for a file between derivation and sync fails instead of
 /// silently syncing the wrong object, and `O_CLOEXEC` so the descriptor never leaks into an
@@ -718,6 +794,51 @@ mod tests {
         assert!(!is_temp_artifact(OsStr::new("metadata.json")));
         assert!(!is_temp_artifact(OsStr::new("metadata.json.tmp.7")));
         assert!(!is_temp_artifact(OsStr::new(".gitignore")));
+    }
+
+    /// A sandboxed tool's sealed output — a 0555 directory holding 0444 files under a 0555
+    /// parent, as Go's module cache and content-addressed answer caches leave them — is removed
+    /// with the tree, and a symlink inside it is unlinked without its target's mode changing.
+    #[test]
+    fn owned_tree_removal_unseals_read_only_directories_without_following_links() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("fsio-sealed-{}", uuid::Uuid::new_v4()));
+        let tree = root.join("tmp/raven");
+        let sealed = tree.join(".tmpXYZ/ca96ba1b");
+        fs::create_dir_all(sealed.join("inner")).unwrap();
+        fs::write(sealed.join("answer.bin"), b"answer").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o500)).unwrap();
+        std::os::unix::fs::symlink(&outside, sealed.join("link")).unwrap();
+        for (path, mode) in [
+            (sealed.join("answer.bin"), 0o444),
+            (sealed.join("inner"), 0o555),
+            (sealed.clone(), 0o555),
+            (tree.join(".tmpXYZ"), 0o555),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        assert_eq!(
+            fs::remove_dir_all(&tree).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the fixture reproduces the refusal"
+        );
+
+        remove_owned_tree(&tree).unwrap();
+
+        assert_eq!(
+            fs::symlink_metadata(&tree).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::symlink_metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o500,
+            "a link's target keeps its mode"
+        );
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

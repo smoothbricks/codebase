@@ -76,7 +76,8 @@ layout root:
       <id>.asif                      # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
       <id>.asif.json                 # its sidecar: built-at tree, linking checkout, seed flag, created
     tmp/
-      <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image
+      <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
+                                     #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
     quarantine/                      # secrets relocated by `cowshed adopt --quarantine`, and keyless sidecars awaiting `rekey`
   gateway.sock                       # gateway unix socket (control plane; root-level keeps sun_path short)
   sccache.sock                       # the host sccache daemon's socket (03_caches.md)

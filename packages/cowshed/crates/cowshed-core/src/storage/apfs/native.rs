@@ -2267,14 +2267,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
             // The workspace's TMPDIR, named like its checkpoints, so the name's owner reclaims it.
             // A sandboxed process may have replaced it with a link: that is unlinked, never
-            // followed.
+            // followed. What its tools sealed read-only inside is made writable to remove it.
             let exec_temp = project
                 .join(EXEC_TEMP_DIRECTORY)
                 .join(authority.workspace().name().as_str());
             match fs::symlink_metadata(&exec_temp) {
                 Ok(metadata) => {
                     let removed = if metadata.is_dir() {
-                        fs::remove_dir_all(&exec_temp)
+                        crate::fsio::remove_owned_tree(&exec_temp)
                     } else {
                         fs::remove_file(&exec_temp)
                     };
