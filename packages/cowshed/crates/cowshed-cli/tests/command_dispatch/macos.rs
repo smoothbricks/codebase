@@ -2,6 +2,11 @@ use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+use cowshed_core::api::JsonEnvelope;
+use cowshed_core::api::dto::{Adoption, AdoptionSkip, DatabaseHolder, LandReport};
+use cowshed_core::build_volume::{
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
+};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
@@ -18,8 +23,9 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 #[path = "../../../cowshed-core/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
@@ -554,6 +560,54 @@ fn repository_nx() -> (PathBuf, PathBuf) {
     (nx, node)
 }
 
+/// The package-manager link directory the repository's Nx is installed through: the sandbox
+/// reads Nx there.
+fn nx_links(nx: &Path) -> PathBuf {
+    nx.ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "links"))
+        .unwrap_or(nx)
+        .to_path_buf()
+}
+
+/// Adopt the fixture's checkout as main, let every workspace read `reads` (the toolchains its
+/// jobs run) and `/nix/store`, and serve it through a real gateway.
+async fn serve_project(fixture: &mut Fixture, reads: &[PathBuf]) -> ActorBridge {
+    let mut service = fixture.open().await;
+    adopt(fixture, &mut service).await;
+    let mut grant = vec![OsString::from("grant"), OsString::from("--project-wide")];
+    for read in reads
+        .iter()
+        .map(PathBuf::as_path)
+        .chain([Path::new("/nix/store")])
+    {
+        grant.extend([OsString::from("--read"), read.as_os_str().to_os_string()]);
+    }
+    succeed(&mut service, grant).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    service
+}
+
+/// Dispatch one CLI command that must exit 0; answers its stdout and stderr.
+async fn succeed(
+    service: &mut ActorBridge,
+    args: impl IntoIterator<Item = impl Into<OsString>>,
+) -> (Vec<u8>, String) {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let (result, stdout, stderr) = run(service, args.clone()).await;
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    match result {
+        Ok(0) => (stdout, stderr),
+        other => panic!(
+            "cowshed {args:?}: {other:?}\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&stdout)
+        ),
+    }
+}
+
 /// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
 /// default inputs include it). `declared` says whether `a:build` declares that output.
 fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
@@ -628,37 +682,7 @@ async fn land_nx_project(
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::new();
     write_nx_project(&fixture.checkout, &nx, &node, declared);
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    let links = nx
-        .ancestors()
-        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "links"))
-        .unwrap_or(&nx)
-        .to_path_buf();
-    let (granted, _, stderr) = run(
-        &mut service,
-        [
-            OsString::from("grant"),
-            OsString::from("--project-wide"),
-            OsString::from("--read"),
-            links.into_os_string(),
-            OsString::from("--read"),
-            OsString::from("/nix/store"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        granted.unwrap_or_else(|error| panic!(
-            "grant Nx: {error}; {}",
-            String::from_utf8_lossy(&stderr)
-        )),
-        0
-    );
-    fixture.start_gateway().await;
-    service
-        .reconcile_gateway()
-        .await
-        .expect("serve the project");
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
@@ -735,4 +759,552 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment()
 
     let (adoptions, _) = land_nx_project(true).await;
     assert_eq!(adoptions, [], "a declared output restores in main and hits");
+}
+
+/// How long any build-volume step may take before a test gives up on it: generous, because a
+/// loaded host slows every real build and detach, and a slow pass is not a failure.
+const PATIENCE: Duration = Duration::from_secs(300);
+
+/// The Rust toolchain's `bin` directory the test itself builds with, resolved at run time like
+/// [`repository_nx`].
+fn rust_toolchain() -> PathBuf {
+    let cargo = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("cargo"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("cargo on the test's PATH")
+        .canonicalize()
+        .expect("cargo resolves");
+    let bin = cargo.parent().expect("cargo has a directory").to_path_buf();
+    assert!(
+        bin.join("rustc").is_file(),
+        "rustc beside {}",
+        cargo.display()
+    );
+    bin
+}
+
+/// Install `rust` where a host keeps its own toolchain, `~/.cargo/bin` of the fixture's home,
+/// so the Cargo capability finds it as it finds a real host's (15_capabilities.md, "Bootstrap
+/// executables"): every job then runs plain `cargo`, and build-state discovery asks that same
+/// Cargo for the target directory.
+fn install_rust(home: &Path, rust: &Path) {
+    let bin = home.join(".cargo/bin");
+    fs::create_dir_all(&bin).unwrap();
+    for program in ["cargo", "rustc", "rustdoc"] {
+        std::os::unix::fs::symlink(rust.join(program), bin.join(program)).unwrap();
+    }
+}
+
+/// A Cargo workspace of two path crates, `fixture-app` depending on `fixture-base`: libraries
+/// only, so building them links nothing. Its lockfile comes from the same Cargo the sandbox
+/// runs, so no build rewrites a tracked file.
+fn write_cargo_workspace(checkout: &Path, rust: &Path) {
+    fs::write(
+        checkout.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"base\", \"app\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    for (directory, manifest, source) in [
+        (
+            "base",
+            "[package]\nname = \"fixture-base\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            "pub fn base() -> u32 {\n    1\n}\n",
+        ),
+        (
+            "app",
+            "[package]\nname = \"fixture-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nfixture-base = { path = \"../base\" }\n",
+            "pub fn app() -> u32 {\n    fixture_base::base() + 1\n}\n",
+        ),
+    ] {
+        fs::create_dir_all(checkout.join(directory).join("src")).unwrap();
+        fs::write(checkout.join(directory).join("Cargo.toml"), manifest).unwrap();
+        fs::write(checkout.join(directory).join("src/lib.rs"), source).unwrap();
+    }
+    let lockfile = Command::new(rust.join("cargo"))
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(checkout)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("cargo generate-lockfile");
+    assert!(
+        lockfile.status.success(),
+        "cargo generate-lockfile: {}",
+        String::from_utf8_lossy(&lockfile.stderr)
+    );
+}
+
+/// Main's tree for the build-volume tests: the Nx project with its outputs declared and/or the
+/// Cargo workspace, with every build output and the tests' own control files ignored, so a
+/// retiring land finds the landing tree clean.
+fn write_build_project(fixture: &Fixture, nx: Option<(&Path, &Path)>, rust: Option<&Path>) {
+    let checkout = &fixture.checkout;
+    if let Some((nx, node)) = nx {
+        write_nx_project(checkout, nx, node, true);
+    }
+    if let Some(rust) = rust {
+        write_cargo_workspace(checkout, rust);
+        install_rust(fixture.storage.home(), rust);
+    }
+    fs::write(
+        checkout.join(".gitignore"),
+        "node_modules\n.nx\n/target\n/a/generated.txt\n/stop-ticking\n",
+    )
+    .unwrap();
+    git(checkout, &["add", "-A"]);
+    git(checkout, &["commit", "-q", "-m", "build volume fixture"]);
+}
+
+/// The Cargo build every checkout runs, spelled identically everywhere.
+const CARGO_BUILD: &str = "cargo build --message-format=json";
+
+/// Capability detection put `checkout`'s Cargo target directory on its build volume: `target`
+/// is the fixed link through `.cowshed/build` (16_build_volumes.md, "One link per checkout").
+fn assert_target_on_build_volume(checkout: &Path) {
+    assert_eq!(
+        fs::read_link(checkout.join("target"))
+            .unwrap_or_else(|error| panic!("{}/target is not a link: {error}", checkout.display())),
+        Path::new(".cowshed/build/target")
+    );
+}
+
+fn nx_run_many(node: &Path) -> String {
+    format!(
+        "{} node_modules/nx/dist/bin/nx.js run-many -t build test",
+        node.display()
+    )
+}
+
+/// Each `compiler-artifact` Cargo reported on `stdout`: its package id and whether it was fresh.
+fn cargo_artifacts(stdout: &[u8]) -> Vec<(String, bool)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .map(|message| {
+            (
+                message["package_id"]
+                    .as_str()
+                    .expect("an artifact names its package")
+                    .to_owned(),
+                message["fresh"]
+                    .as_bool()
+                    .expect("an artifact says whether it is fresh"),
+            )
+        })
+        .collect()
+}
+
+/// Run `script` with `/bin/sh` in `workspace`'s sandbox; it must exit 0. Answers its stdout.
+async fn sh(service: &mut ActorBridge, workspace: &str, script: &str) -> Vec<u8> {
+    succeed(service, ["exec", workspace, "--", "/bin/sh", "-c", script])
+        .await
+        .0
+}
+
+async fn new_workspace(service: &mut ActorBridge, name: &str) -> PathBuf {
+    succeed(service, ["new", name]).await;
+    service
+        .path(name, false)
+        .await
+        .unwrap_or_else(|error| panic!("{name} is mounted: {error}"))
+        .mount
+}
+
+/// `cowshed land --json <workspace>` with `checks`, retiring the workspace unless `retire` is
+/// false; answers the report the CLI printed.
+async fn land(
+    service: &mut ActorBridge,
+    workspace: &str,
+    retire: bool,
+    checks: &[&str],
+) -> LandReport {
+    let mut args = vec!["--json", "land", workspace];
+    if !retire {
+        args.push("--no-retire");
+    }
+    for check in checks {
+        args.extend(["--check", check]);
+    }
+    let (stdout, stderr) = succeed(service, args).await;
+    let envelope: JsonEnvelope<LandReport> =
+        serde_json::from_slice(&stdout).unwrap_or_else(|error| {
+            panic!(
+                "land --json printed no report ({error}): {}\n{stderr}",
+                String::from_utf8_lossy(&stdout)
+            )
+        });
+    envelope
+        .result()
+        .cloned()
+        .expect("a successful land report")
+}
+
+fn git_stdout(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .expect("git process");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git prints UTF-8")
+        .trim()
+        .to_owned()
+}
+
+/// The fixture project's build volumes, where the runtime keeps them.
+fn build_volumes(fixture: &Fixture) -> BuildVolumeLayout {
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    BuildVolumeLayout::new(storage.project()).expect("fixture build volume layout")
+}
+
+/// The build volume `checkout`'s `.cowshed/build` names.
+fn linked_volume(layout: &BuildVolumeLayout, checkout: &Path) -> BuildVolumeId {
+    let mount = link::linked(checkout)
+        .expect("read the build link")
+        .unwrap_or_else(|| panic!("{} links no build volume", checkout.display()));
+    layout.volume_at(&mount).unwrap_or_else(|| {
+        panic!(
+            "{} links {}, which is not under {}",
+            checkout.display(),
+            mount.display(),
+            layout.mounts().display()
+        )
+    })
+}
+
+/// Every seed whose target is main.
+fn seeds_of_main(layout: &BuildVolumeLayout) -> Vec<(BuildVolumeId, BuildVolumeRecord)> {
+    layout
+        .list()
+        .expect("list build volumes")
+        .into_iter()
+        .filter_map(|id| {
+            let record = layout.read_record_present(&id).expect("read a record")?;
+            matches!(&record.role, BuildVolumeRole::Seed { target, .. } if *target == WorkspaceName::main())
+                .then_some((id, record))
+        })
+        .collect()
+}
+
+async fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "{what}: not within {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Run `cowshed gc` until build volume `id`'s image is gone: collection never forces a detach,
+/// so a holder that is still exiting defers it to the next pass.
+async fn collected(service: &mut ActorBridge, layout: &BuildVolumeLayout, id: &BuildVolumeId) {
+    let started = Instant::now();
+    while layout.image(id).exists() {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "gc did not reclaim build volume {id} within {PATIENCE:?}"
+        );
+        let (_, stderr) = succeed(service, ["gc"]).await;
+        eprintln!("gc: {stderr}");
+        if layout.image(id).exists() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    assert!(
+        !layout.record(id).exists(),
+        "build volume {id}'s record outlives its image"
+    );
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// A host process (never the daemon) holding a file open, killed when dropped.
+struct Holder(std::process::Child);
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        // A holder that already exited cannot be killed again; reaping it is all that is left.
+        if let Err(error) = self.0.kill() {
+            eprintln!("holder {}: kill: {error}", self.0.id());
+        }
+        if let Err(error) = self.0.wait() {
+            eprintln!("holder {}: wait: {error}", self.0.id());
+        }
+    }
+}
+
+/// A fork clones its target's seed, so a fork of a warm main is warm: every Cargo unit is
+/// `Fresh` and every Nx task a local cache hit (16_build_volumes.md, "Fork", rules "Clones
+/// preserve mtimes" and "Hash inputs are the same in every checkout"). Main's first seed was
+/// frozen empty at first touch; a land is what warms it.
+#[tokio::test]
+async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
+    let (nx, node) = repository_nx();
+    let rust = rust_toolchain();
+    let mut fixture = Fixture::new();
+    write_build_project(&fixture, Some((&nx, &node)), Some(&rust));
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    assert_target_on_build_volume(&fixture.checkout);
+    let nx_check = nx_run_many(&node);
+
+    let w1 = new_workspace(&mut service, "w1").await;
+    fs::write(w1.join("a/src.txt"), b"src, changed\n").unwrap();
+    git(&w1, &["commit", "-q", "-am", "change a"]);
+    let cold = cargo_artifacts(&sh(&mut service, "w1", CARGO_BUILD).await);
+    assert_eq!(cold.len(), 2, "{cold:?}");
+    assert!(
+        cold.iter().all(|(_, fresh)| !fresh),
+        "w1 forks main's empty first seed, so it builds every unit: {cold:?}"
+    );
+    sh(&mut service, "w1", &nx_check).await;
+    let report = land(&mut service, "w1", true, &[&nx_check, CARGO_BUILD]).await;
+    assert!(report.build_volume.seeded, "{report:?}");
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+
+    let w2 = new_workspace(&mut service, "w2").await;
+    assert_target_on_build_volume(&w2);
+    let started = Instant::now();
+    let warm = cargo_artifacts(&sh(&mut service, "w2", CARGO_BUILD).await);
+    eprintln!("w2 cargo build: {:?}", started.elapsed());
+    assert_eq!(warm.len(), 2, "{warm:?}");
+    assert!(
+        warm.iter().all(|(_, fresh)| *fresh),
+        "every unit of a fork of a warm main is Fresh: {warm:?}"
+    );
+    let spawned = SystemTime::now();
+    sh(&mut service, "w2", &nx_check).await;
+    let exited = SystemTime::now();
+    match nx::attribute(&w2.join(".nx/cache"), &nx_check, spawned, exited) {
+        nx::Attribution::Ours(run) => {
+            assert_eq!(run.tasks.len(), 2, "{run:?}");
+            assert!(
+                run.tasks
+                    .iter()
+                    .all(|task| task.cache == nx::CacheStatus::LocalHit),
+                "every Nx task of a fork of a warm main is a local cache hit: {run:?}"
+            );
+        }
+        nx::Attribution::Unattributed(reason) => {
+            panic!("w2's Nx run left no summary of its own: {reason:?}")
+        }
+    }
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// A land freezes main's new seed from the landing volume at the landed tree, moves main's link
+/// onto that volume, releases main's previous volume, and re-runs the check in main: every task
+/// hits (16_build_volumes.md, Land steps 5–7).
+#[tokio::test]
+async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_reports_2b() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::new();
+    write_build_project(&fixture, Some((&nx, &node)), None);
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let layout = build_volumes(&fixture);
+    let previous = linked_volume(&layout, &fixture.checkout);
+
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change a"]);
+    let landing = linked_volume(&layout, &topic);
+    assert_ne!(landing, previous);
+    let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
+    let report = land(&mut service, "topic", true, &[&nx_run_many(&node)]).await;
+
+    assert!(report.retired, "{report:?}");
+    assert!(report.build_volume.seeded, "{report:?}");
+    match &report.build_volume.adoption {
+        Adoption::Adopted { check, .. } => {
+            assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
+            assert_eq!(check.misses, [], "{report:?}");
+            assert_eq!(check.failed, [], "{report:?}");
+            assert_eq!(check.unattributed, [], "{report:?}");
+        }
+        Adoption::Skipped { reason } => panic!("the adoption was skipped: {reason:?}"),
+    }
+    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
+    assert_eq!(
+        layout.read_record(&landing).expect("adopted record").role,
+        BuildVolumeRole::Linked {
+            checkout: WorkspaceName::main()
+        }
+    );
+    let seeds = seeds_of_main(&layout);
+    let [(seed, record)] = seeds.as_slice() else {
+        panic!("main keeps exactly its latest seed: {seeds:?}");
+    };
+    assert!(
+        *seed != landing && *seed != previous,
+        "{seed} is a new volume"
+    );
+    assert_eq!(
+        record.tree.as_ref().map(|tree| tree.as_str()),
+        Some(landed_tree.as_str()),
+        "the seed is frozen at the landed tree"
+    );
+    collected(&mut service, &layout, &previous).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// A process other than main's daemon holding main's Nx task database open makes the land skip
+/// the swap and name that process (16_build_volumes.md, "The adoption needs the target's Nx
+/// database closed"). The seed is still frozen; main keeps its own volume.
+#[tokio::test]
+async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::new();
+    write_build_project(&fixture, Some((&nx, &node)), None);
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let layout = build_volumes(&fixture);
+    let nx_check = nx_run_many(&node);
+
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change a"]);
+    // Main's own task database, written by a run in main.
+    sh(&mut service, "main", &nx_check).await;
+    let data = fixture.checkout.join(".nx/workspace-data");
+    let databases: Vec<PathBuf> = fs::read_dir(&data)
+        .expect("main's Nx workspace data")
+        .map(|entry| entry.expect("workspace data entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
+        .collect();
+    let [database] = databases.as_slice() else {
+        panic!("one task database in {}: {databases:?}", data.display());
+    };
+    let before = linked_volume(&layout, &fixture.checkout);
+
+    let holder = Holder(
+        Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(database)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn a database holder"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    eventually("tail holds the task database open", || {
+        nx::holders(database)
+            .expect("query the database's holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    })
+    .await;
+    let report = land(&mut service, "topic", true, &[&nx_check]).await;
+
+    assert!(
+        report.build_volume.seeded,
+        "forks still start from the new seed: {report:?}"
+    );
+    match report.build_volume.adoption {
+        Adoption::Skipped {
+            reason:
+                AdoptionSkip::TargetHeld {
+                    database: held,
+                    holders,
+                },
+        } => {
+            assert_eq!(
+                held.canonicalize().expect("the held database exists"),
+                database.canonicalize().expect("main's database exists")
+            );
+            assert_eq!(
+                holders,
+                [DatabaseHolder {
+                    pid,
+                    command: format!("/usr/bin/tail -f {}", database.display()),
+                }]
+            );
+        }
+        adoption => panic!("a held database skips the adoption: {adoption:?}"),
+    }
+    assert_eq!(linked_volume(&layout, &fixture.checkout), before);
+    drop(holder);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// A job admitted before an adoption keeps the volume it was admitted with: its working
+/// directory stays in main's previous volume, which therefore stays until the job exits. A job
+/// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
+/// lifetime across a swap", "Garbage collection").
+#[tokio::test]
+async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
+ {
+    let rust = rust_toolchain();
+    let mut fixture = Fixture::new();
+    write_build_project(&fixture, None, Some(&rust));
+    let mut service = serve_project(&mut fixture, &[]).await;
+    assert_target_on_build_volume(&fixture.checkout);
+    let layout = build_volumes(&fixture);
+    let old = linked_volume(&layout, &fixture.checkout);
+    let old_mount = layout.mount(&old);
+    let stop = fixture.checkout.join("stop-ticking");
+    let job = format!(
+        "mkdir -p target/ticking && cd target/ticking && \
+         while [ ! -e {} ]; do printf . >> ticks; sleep 0.1; done; printf done > exited",
+        stop.display()
+    );
+    succeed(
+        &mut service,
+        ["exec", "main", "--background", "--", "/bin/sh", "-c", &job],
+    )
+    .await;
+    let ticks = old_mount.join("target/ticking/ticks");
+    eventually("the job ticks in main's volume", || file_len(&ticks) > 0).await;
+
+    let workspace = new_workspace(&mut service, "w").await;
+    fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
+    git(&workspace, &["add", "notes.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "notes"]);
+    let landing = linked_volume(&layout, &workspace);
+    let report = land(&mut service, "w", true, &[CARGO_BUILD]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
+    let new_mount = layout.mount(&landing);
+
+    let at_swap = file_len(&ticks);
+    eventually("the job keeps ticking in the previous volume", || {
+        file_len(&ticks) > at_swap
+    })
+    .await;
+    assert!(!new_mount.join("target/ticking").exists());
+    sh(&mut service, "main", "touch target/after").await;
+    assert!(new_mount.join("target/after").is_file());
+    assert!(!old_mount.join("target/after").exists());
+    assert_eq!(
+        layout.read_record(&old).expect("previous record").role,
+        BuildVolumeRole::Unlinked
+    );
+    succeed(&mut service, ["gc"]).await;
+    assert!(
+        layout.image(&old).exists(),
+        "gc never forces away a volume a running job is in"
+    );
+
+    fs::write(&stop, b"").unwrap();
+    let exited = old_mount.join("target/ticking/exited");
+    eventually("the job exits", || exited.is_file()).await;
+    collected(&mut service, &layout, &old).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
 }
