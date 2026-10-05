@@ -448,9 +448,13 @@ mod tests {
         let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");
         let (host, layout) = fixture(root.path());
         let source = BuildVolumeId::mint();
+        // Creation is proven by first touch (build_volume::migrate) and adoption; this test's
+        // source is a clone of the run's blank image, mounted the way a fork's volume is.
+        fs::create_dir_all(layout.image(&source).parent().expect("image directory")).unwrap();
+        crate::blank_image::blank_image(&layout.image(&source));
         let mount = host
-            .create_build_volume(&layout, &source, ImageCapacity::from_gibibytes(1))
-            .expect("create a build volume");
+            .mount_build_volume(&layout, &source)
+            .expect("mount a build volume");
         layout.write_record(&source, &linked("main")).unwrap();
         assert_eq!(mount, layout.mount(&source));
         assert_eq!(

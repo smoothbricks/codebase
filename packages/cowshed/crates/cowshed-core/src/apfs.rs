@@ -5703,23 +5703,12 @@ mod tests {
     #[test]
     fn real_apfs_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
         let root = ScratchRoot::new("asif-resolution").expect("scratch root");
-        let stem = root.path().join("image");
-        let image = stem.with_extension(IMAGE_EXTENSION);
+        let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let mut cleanup = RealImageCleanup::new(&backend, image);
+        let mut cleanup = RealImageCleanup::new(&backend, image.clone());
         let result = (|| -> Result<(), ApfsError> {
-            let created = backend.create_staged_image(&CreateImageRequest {
-                staged_stem: stem,
-                capacity: capacity("64m"),
-                volume_name: "cowshed-asif-resolution".into(),
-                // SAFETY: `getuid`/`getgid` read this process's credentials;
-                // they take no pointers and cannot fail.
-                owner_uid: unsafe { libc::getuid() },
-                // SAFETY: `getgid` reads this process's credentials; it takes no
-                // pointers and cannot fail.
-                owner_gid: unsafe { libc::getgid() },
-            })?;
-            let attachment = backend.attach_verified(&created)?;
+            crate::blank_image::blank_image(&image);
+            let attachment = backend.attach_verified(&image)?;
             let attachment = cleanup.track(attachment);
             assert!(attachment.whole_device().starts_with("/dev/disk"));
             assert!(attachment.volume_device().starts_with("/dev/disk"));
@@ -5734,27 +5723,26 @@ mod tests {
     #[test]
     fn real_apfs_grow_refuses_an_attached_image_and_lands_once_detached() {
         let root = ScratchRoot::new("asif-grow").expect("scratch root");
-        let stem = root.path().join("image");
-        let image = stem.with_extension(IMAGE_EXTENSION);
+        let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let mut cleanup = RealImageCleanup::new(&backend, image);
+        let mut cleanup = RealImageCleanup::new(&backend, image.clone());
         let result = (|| -> Result<(), ApfsError> {
-            let created =
-                backend.create_staged_image(&lease_test_image(stem, "cowshed-asif-grow"))?;
-            let attachment = cleanup.track(backend.attach_verified(&created)?);
+            crate::blank_image::blank_image(&image);
+            let created = image.as_path();
+            let attachment = cleanup.track(backend.attach_verified(created)?);
             let refused = SystemCommandRunner
-                .grow_image(&created, capacity("128m"))
+                .grow_image(created, capacity("2g"))
                 .expect_err("an attached image's file is held exclusively");
             assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
             assert!(matches!(
-                backend.resize_image(&created, capacity("128m")),
+                backend.resize_image(created, capacity("2g")),
                 Err(ApfsError::FileOperation { operation: "grow ASIF image", source, .. })
                     if source.kind() == io::ErrorKind::WouldBlock
             ));
             backend.detach(attachment, DetachIntent::Release)?;
-            assert_eq!(backend.image_capacity(&created)?, capacity("64m"));
-            backend.resize_image(&created, capacity("128m"))?;
-            assert_eq!(backend.image_capacity(&created)?, capacity("128m"));
+            assert_eq!(backend.image_capacity(created)?, capacity("1g"));
+            backend.resize_image(created, capacity("2g"))?;
+            assert_eq!(backend.image_capacity(created)?, capacity("2g"));
             Ok(())
         })();
         finish_real_image_test(result, cleanup);
@@ -5921,9 +5909,11 @@ mod tests {
 
         let root = ScratchRoot::new("leases").expect("scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let stem_a = root.path().join("lease-held");
+        let image_a = root
+            .path()
+            .join("lease-held")
+            .with_extension(IMAGE_EXTENSION);
         let stem_b = root.path().join("lease-free");
-        let image_a = stem_a.with_extension(IMAGE_EXTENSION);
         let image_b = stem_b.with_extension(IMAGE_EXTENSION);
         let mount_b = root.path().join("lease-free-mount");
         let alias_parent = root.path().join("lease-alias-parent");
@@ -5939,9 +5929,8 @@ mod tests {
         let order = std::sync::Mutex::new(Vec::new());
         let mut cleanup_a = RealImageCleanup::new(&backend, image_a.clone());
         let result = (|| -> Result<(), ApfsError> {
-            let created =
-                backend.create_staged_image(&lease_test_image(stem_a, "cowshed-lease-held"))?;
-            let attachment = cleanup_a.track(backend.attach_verified(&created)?);
+            crate::blank_image::blank_image(&image_a);
+            let attachment = cleanup_a.track(backend.attach_verified(&image_a)?);
 
             std::os::unix::fs::symlink(image_a.parent().expect("temp parent"), &alias_parent)
                 .expect("symlinked-parent alias");
@@ -6148,18 +6137,16 @@ mod tests {
         if ending == "sweep" {
             return;
         }
-        let stem = root.path().join("image");
+        let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let mut cleanup = RealImageCleanup::new(&backend, stem.with_extension(IMAGE_EXTENSION));
-        let created = backend
-            .create_staged_image(&lease_test_image(stem, "cowshed-fixture-run"))
-            .expect("create the fixture image");
+        let mut cleanup = RealImageCleanup::new(&backend, image.clone());
+        crate::blank_image::blank_image(&image);
         cleanup.track(
             backend
-                .attach_verified(&created)
+                .attach_verified(&image)
                 .expect("attach the fixture image"),
         );
-        println!("{FIXTURE_IMAGE}{}", created.display());
+        println!("{FIXTURE_IMAGE}{}", image.display());
         if ending == "panic" {
             panic!("the fixture's run fails with its image attached");
         }

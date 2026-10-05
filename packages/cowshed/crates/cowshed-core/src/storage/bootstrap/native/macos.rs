@@ -3367,24 +3367,13 @@ mod tests {
 
     #[test]
     fn real_apfs_inventory_survives_concurrent_image_teardown() {
-        use crate::apfs::{
-            ApfsBackend, CreateImageRequest, DetachIntent, MacOsApfsBackend, SystemCommandRunner,
-        };
-        use crate::metadata::ImageCapacity;
+        use crate::apfs::{ApfsBackend, DetachIntent, MacOsApfsBackend, SystemCommandRunner};
 
         let root =
             crate::scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let image = backend
-            .create_staged_image(&CreateImageRequest {
-                staged_stem: root.path().join("transient"),
-                capacity: ImageCapacity::from_gibibytes(1),
-                volume_name: "cowshed-inventory-transient".to_owned(),
-                // SAFETY: getuid/getgid only read this process's credentials.
-                owner_uid: unsafe { libc::getuid() },
-                owner_gid: unsafe { libc::getgid() },
-            })
-            .expect("create a real case-sensitive ASIF image");
+        let image = root.path().join("transient.asif");
+        crate::blank_image::blank_image(&image);
 
         // Exercise the production read-only planner, not installation validation: a hosted
         // runner need not have cowshed.store/cowshed.caches. The actual home device and its

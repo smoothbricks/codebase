@@ -3,7 +3,8 @@
 //! Shared by every test binary that attaches real images (`#[path]`-included, not a crate): the
 //! cleanup protocol must be one protocol, or one binary's sweep reclaims what another still uses.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,9 +15,17 @@ use super::{
 };
 
 /// Every scratch root lives directly under this prefix and spells out the pid of the run that
-/// owns it. The pid is the whole cleanup protocol: a later run can tell a live root from an
-/// abandoned one without any lock file or shared state of its own.
-const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
+/// owns it. The pid is the whole ownership protocol: a later run can tell a live root from an
+/// abandoned one without any shared state of its own.
+pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
+
+/// Held while a run sweeps. Every test process sweeps once, and nextest gives every test its own
+/// process, so a run opens dozens of sweeps at once. Unserialized, each of them raced the others
+/// for the same abandoned images: every sweeper waited on the image lease another held for its
+/// detach (11.5 s measured), then found the volume already unmounted under it and failed. One
+/// sweep at a time does the work once; the sweeps queued behind it find nothing left. Its name
+/// spells no pid, so no sweep ever reclaims it.
+const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
 
 /// One test's disposable root: `/private/tmp/cowshed-itest-<pid>-<n>-<label>`.
 ///
@@ -76,6 +85,13 @@ impl Drop for ScratchRoot {
 /// deleted backing file. Detaching therefore selects on the image path the kernel still holds,
 /// not on what is on disk now.
 fn sweep_dead_runs() {
+    let _sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}");
+            return;
+        }
+    };
     if let Err(error) =
         detach_images(|image| owner_pid(&image.to_string_lossy()).is_some_and(process_is_gone))
     {
@@ -94,6 +110,26 @@ fn sweep_dead_runs() {
                 "abandoned scratch root {} was not removed: {error}",
                 path.display()
             );
+        }
+    }
+}
+
+/// `path` opened (created if absent) and `flock`ed exclusively, waiting for any holder: the lock
+/// lives as long as the returned file, and dies with its process however that process ends.
+pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    loop {
+        // SAFETY: `flock` takes a descriptor `file` keeps open for the call and touches no memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }

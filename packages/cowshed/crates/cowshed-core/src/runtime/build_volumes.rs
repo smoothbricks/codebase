@@ -1051,9 +1051,7 @@ mod tests {
 
         // Main's volume at 1 GiB, linked from its checkout, with a seed cloned from it.
         let live = BuildVolumeId::mint();
-        let mount = host
-            .create_build_volume(&layout, &live, ImageCapacity::from_gibibytes(1))
-            .expect("create main's build volume");
+        let mount = test_cap_volume(&host, &layout, &live);
         BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
@@ -1175,10 +1173,15 @@ mod tests {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
-            let mount = self
-                .host
-                .create_build_volume(&self.layout, &id, ImageCapacity::from_gibibytes(gib))
-                .expect("create a build volume");
+            let mount = match gib {
+                1 => test_cap_volume(&self.host, &self.layout, &id),
+                // Other capacities are this module's own; a template minted for one test
+                // would cost a detach and a second attach over minting in place.
+                _ => self
+                    .host
+                    .create_build_volume(&self.layout, &id, ImageCapacity::from_gibibytes(gib))
+                    .expect("create a build volume"),
+            };
             BuildVolumeState::default().write(&mount).unwrap();
             self.layout
                 .write_record(&id, &BuildVolumeRecord::new(None, linked(name)))
@@ -1195,6 +1198,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build volume `id`, mounted, at the 1 GiB test cap: a clone of the run's blank image put
+    /// in place and mounted the way a fork's volume is, instead of a mint of its own. Creation is
+    /// not what these tests prove, and a mint queues twice on the host's disk service.
+    #[cfg(target_os = "macos")]
+    fn test_cap_volume(host: &Host, layout: &BuildVolumeLayout, id: &BuildVolumeId) -> PathBuf {
+        let image = layout.image(id);
+        fs::create_dir_all(
+            image
+                .parent()
+                .expect("a build volume image has a directory"),
+        )
+        .unwrap();
+        crate::blank_image::blank_image(&image);
+        host.mount_build_volume(layout, id)
+            .expect("mount a build volume")
     }
 
     #[cfg(target_os = "macos")]

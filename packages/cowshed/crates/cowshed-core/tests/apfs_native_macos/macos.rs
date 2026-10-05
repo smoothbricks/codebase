@@ -10,8 +10,8 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
-    CommandRunError, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource, MountAccess,
-    SystemCommandRunner,
+    CommandRunError, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
+    MacOsApfsBackend, MountAccess, SystemCommandRunner,
 };
 use cowshed_core::fork_lock::{Fenced, Run as _, Spawn as _};
 use cowshed_core::metadata::{
@@ -35,6 +35,8 @@ use cowshed_core::storage::lifecycle::{
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 
+#[path = "../support/blank_image.rs"]
+mod blank_image;
 #[path = "../support/scratch_apfs.rs"]
 mod scratch_apfs;
 
@@ -328,29 +330,12 @@ impl RealFixture {
         StorageLayout::new(self.root(), &repo()).expect("layout")
     }
 
-    /// Mint a real one-volume ASIF image at `image` (which must end `.asif`) and nothing beside
-    /// it, handed back detached: every verb that grows or replaces it next needs an image nothing
-    /// holds.
+    /// A real one-volume ASIF image at `image` (which must end `.asif`) and nothing beside it,
+    /// handed back detached: every verb that grows or replaces it next needs an image nothing
+    /// holds. It is a clone of the run's blank image, not a mint of its own.
     fn blank_image(&self, image: &Path) {
         std::fs::create_dir_all(image.parent().expect("image parent")).expect("image parent");
-        let staged = self
-            .host()
-            .backend()
-            .create_staged_image(&CreateImageRequest {
-                staged_stem: image.with_extension(""),
-                capacity: ImageCapacity::from_gibibytes(1),
-                volume_name: "cowshed.acme--widget.main".to_owned(),
-                // SAFETY: getuid and getgid read this process's credentials and cannot fail.
-                owner_uid: unsafe { libc::getuid() },
-                owner_gid: unsafe { libc::getgid() },
-            })
-            .expect("real ASIF image");
-        assert_eq!(staged, image);
-        assert!(
-            !attached(image),
-            "staging left {} attached",
-            image.display()
-        );
+        blank_image::blank_image(image);
     }
 
     /// [`Self::blank_image`] published as [`workspace`]'s: its sidecar and CA key beside it.
