@@ -152,17 +152,20 @@ same for main and for an integration workspace; "the target" is whichever one it
 5. **Freeze the seed.** Clone the landing build volume's image as the target's new seed and delete the target's previous
    seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork of this target
    starts from exactly what is landing.
-6. **Adopt the build volume.** Under the same lock, if the target's current Nx task database has no open file
-   descriptors (one open-file query on one file; rule "The adoption needs the target's Nx database closed"):
-   1. stop the target's Nx daemon (`nx daemon --stop` through the target's checkout; it restarts on the next client);
-   2. delete `nx/workspace-data/d` in the landing build volume;
-   3. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
-   4. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
+6. **Adopt the build volume.** Under the same lock (rule "The adoption needs the target's Nx database closed"):
+   1. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
+      not the daemon named by the target's `nx/workspace-data/d` record, skip;
+   2. stop that daemon with stock `nx daemon --stop` through the target's checkout (it restarts on the next client;
+      cowshed never signals the pid itself);
+   3. query again; any holder at all, including a daemon a host client started in between, means skip;
+   4. delete `nx/workspace-data/d` in the landing build volume;
+   5. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
+   6. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
       below).
 
-   If the database is open, the swap is **skipped** and the land report says so with the holder's pid and command. The
-   target keeps its build volume and builds the landed delta incrementally the next time anything builds there; forks
-   still start from the new seed. A skipped swap is never wrong, only slower.
+   A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
+   and builds the landed delta incrementally the next time anything builds there; forks still start from the new seed. A
+   skipped swap is never wrong, only slower.
 
 7. **Check the adoption (2b).** Re-run the landed check in the target, now on the adopted build volume. For Nx it must
    be **100% cache hits**. Every miss is a defect in the project's build configuration, not a reason to build: an input
