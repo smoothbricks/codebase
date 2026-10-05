@@ -151,6 +151,13 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
         return Ok(finish(outcome, &mut output, json));
     }
+    if matches!(parsed.command, args::Command::BuildState) {
+        let outcome = match runtime::resolve_project_root(&parsed).await {
+            Ok(root) => crate::build_state::dispatch(&root, json, &mut output),
+            Err(error) => Err(error),
+        };
+        return Ok(finish(outcome, &mut output, json));
+    }
     if let args::Command::Gateway(action) = &parsed.command {
         let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json));

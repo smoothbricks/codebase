@@ -1,4 +1,5 @@
 pub mod args;
+pub mod build_state;
 pub mod capabilities;
 pub mod controller_service;
 pub mod credential_service;

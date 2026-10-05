@@ -190,6 +190,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Restore(_)
         | Command::List(_)
         | Command::Path(_)
+        | Command::BuildState
         | Command::Exec(_)
         | Command::Grant(_)
         | Command::Remove(_)
@@ -273,6 +274,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Rebase(args) => named([args.workspace.as_deref()]),
         Command::Adopt(_)
         | Command::List(_)
+        | Command::BuildState
         | Command::Doctor(_)
         | Command::Credential(_)
         | Command::Identity(_)
@@ -1591,6 +1593,9 @@ where
         )),
         Command::Controller => Err(CowshedError::internal(
             "the controller verb serves its own connection and is dispatched before the runtime bridge",
+        )),
+        Command::BuildState => Err(CowshedError::internal(
+            "build-state is read-only and must be dispatched before the runtime bridge",
         )),
         Command::Credential(_) => Err(CowshedError::internal(
             "credential commands must be dispatched by the host service entrypoint",

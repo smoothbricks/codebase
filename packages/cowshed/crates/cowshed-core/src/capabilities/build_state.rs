@@ -1,11 +1,13 @@
 //! The build-state contribution contract of spec 16: tools keep their own paths, while one
 //! checkout link selects the volume holding them. Neither spelling may escape its root.
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::{CowshedError, Result};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct RelPath(PathBuf);
 
 impl RelPath {
@@ -25,7 +27,7 @@ impl RelPath {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BuildStatePath {
     pub checkout: RelPath,
     pub volume: RelPath,

@@ -337,6 +337,10 @@ workspace root.
   its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
   root. A refusal names the target, output, and build-state path. Job admission and `cowshed doctor` never construct an
   Nx graph or execute repository plugins for this rule.
+- `cowshed build-state --json` reads the selected checkout's volume-state record and prints
+  `{paths:[{checkout,volume}]}` without opening the controller or store. It never rediscovers tools. A missing link or
+  state record refuses with `environment-missing` (exit 5): "this checkout has no build volume yet; run `cowshed setup`
+  (host) or any `cowshed exec` in it to migrate".
 
 ### Hash inputs are the same in every checkout
 

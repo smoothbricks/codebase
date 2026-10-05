@@ -169,11 +169,16 @@ struct PathWire {
 impl BuildVolumeState {
     /// The state written at `volume_root`, or the empty state for a volume never linked.
     pub fn read(volume_root: &Path) -> crate::Result<Self> {
+        Ok(Self::read_optional(volume_root)?.unwrap_or_default())
+    }
+
+    /// Read the recorded state without treating an uninitialized volume as an empty path set.
+    pub fn read_optional(volume_root: &Path) -> crate::Result<Option<Self>> {
         let path = volume_root.join(STATE_FILE);
         let wire = match read_json::<StateWire>(&path) {
             Ok(wire) => wire,
             Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                return Ok(None);
             }
             Err(error) => return Err(record_error(&path, &error)),
         };
@@ -186,10 +191,10 @@ impl BuildVolumeState {
             .map(path_from_wire)
             .collect::<crate::Result<Vec<_>>>()?;
         disjoint(&paths).map_err(|(left, right)| overlapping(&path, left, right))?;
-        Ok(Self {
+        Ok(Some(Self {
             paths,
             fingerprint: wire.fingerprint,
-        })
+        }))
     }
 
     pub fn write(&self, volume_root: &Path) -> crate::Result<()> {

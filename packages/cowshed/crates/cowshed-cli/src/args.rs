@@ -24,6 +24,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &RESTORE,
     &LIST,
     &PATH,
+    &BUILD_STATE,
     &EXEC,
     &GRANT,
     &REMOVE,
@@ -72,6 +73,8 @@ pub enum Command {
     Restore(RestoreArgs),
     List(ListArgs),
     Path(PathArgs),
+    /// Read the selected checkout's recorded build-state paths without opening its controller.
+    BuildState,
     Exec(ExecArgs),
     Grant(GrantArgs),
     Remove(RemoveArgs),
@@ -119,6 +122,7 @@ impl Command {
             | Self::Checkpoint(_)
             | Self::Restore(_)
             | Self::Path(_)
+            | Self::BuildState
             | Self::Exec(_)
             | Self::Grant(_)
             | Self::Remove(_)
@@ -725,6 +729,7 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .args([value("slot"), flag("no-attach")]),
         )
+        .subcommand(leaf("build-state"))
         .subcommand(
             leaf("exec")
                 .arg(positional("workspace", 0..=1))
@@ -945,6 +950,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "restore" => parse_restore(leaf)?,
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
+        "build-state" => Command::BuildState,
         "exec" => parse_exec(leaf)?,
         "grant" => parse_grant(leaf)?,
         "rm" => parse_remove(leaf)?,
@@ -2712,6 +2718,19 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const BUILD_STATE: CommandSpec = CommandSpec {
+    name: "build-state",
+    missing: "build-state takes no arguments",
+    args: "",
+    trailing: "",
+    summary: "read build-volume paths for lint",
+    about: &[
+        "Reads this checkout's .cowshed/build volume-state record without opening its controller or store and without discovering tools. With --json, prints {paths:[{checkout,volume}]} for the consuming repository's Nx output lint.",
+        "A checkout with no build volume or no recorded state refuses with environment-missing (exit 5): run `cowshed setup` on the host or any `cowshed exec` in the checkout to migrate.",
+    ],
+    options: &[],
+};
+
 const DOCTOR: CommandSpec = CommandSpec {
     name: "doctor",
     missing: "doctor requires an argument",
@@ -2781,6 +2800,19 @@ fn unknown_flag(flag: &str, usage: &'static CommandSpec) -> UsageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_state_is_read_only_checkout_scoped_and_rejects_positionals() {
+        let cli = parse_args(["build-state", "--json", "--project", "/checkout"]).unwrap();
+        assert_eq!(cli.command, Command::BuildState);
+        assert_eq!(cli.command.project_discovery(), ProjectDiscovery::Required);
+        assert!(cli.global.json);
+        assert_eq!(cli.global.project, Some(PathBuf::from("/checkout")));
+        assert!(parse_args(["build-state", "main"]).is_err());
+        let page = BUILD_STATE.page();
+        assert!(page.contains("environment-missing (exit 5)"));
+        assert!(page.contains("without discovering tools"));
+    }
 
     #[test]
     fn global_aliases_are_identical_and_can_follow_the_command() {
