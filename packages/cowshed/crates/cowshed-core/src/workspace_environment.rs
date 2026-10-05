@@ -12,6 +12,11 @@ pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// The workspace's current port block size: `base+1 … base+size-1` are its service ports.
 /// Capacity grants can grow it, so tools read the admitted size rather than assuming one.
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
+/// The sandbox's `TMPDIR` ([`crate::storage::StorageLayout::exec_temp_dir`]), exported to host
+/// shells too, so a host gate and a land gate of one workspace share one scratch directory and
+/// neither shares the machine's: Bun reads every ancestor directory of its working directory
+/// whole, and a user temp directory every concurrent gate fills holds each start for seconds.
+pub const TEMP_DIR_ENV: &str = "TMPDIR";
 
 /// Agent harnesses export `CI`; only a real runner may change local Cargo unit identities.
 pub(crate) const DEV_CI_POLICY: &str =
@@ -24,18 +29,24 @@ pub enum WorkspaceEnvironmentError {
         platform: Platform,
         port_block: Option<PortBlock>,
     },
+    #[error(
+        "workspace temp directory {0:?} cannot be exported: it must be an absolute UTF-8 path without a quote or newline"
+    )]
+    UnexportableTempDir(std::path::PathBuf),
     #[error(transparent)]
     Publication(#[from] MetadataError),
 }
 
 /// Atomically publish the source-able, workspace-local build environment inside an image. Its
 /// one caller is `workspace_credentials::publish_workspace_environment`, which reads the token
-/// the image publishes.
+/// the image publishes. `temp_dir` is the sandbox's `TMPDIR`, exported when the caller knows the
+/// store it lives in; the file names it single-quoted.
 pub(crate) fn write_workspace_environment(
     image_root: &Path,
     token: &Zeroizing<String>,
     platform: Platform,
     port_block: Option<PortBlock>,
+    temp_dir: Option<&Path>,
 ) -> Result<(), WorkspaceEnvironmentError> {
     match (platform, port_block) {
         (Platform::Macos, Some(block)) => {
@@ -54,12 +65,19 @@ pub(crate) fn write_workspace_environment(
             });
         }
     }
+    let temp_dir = temp_dir
+        .map(|path| {
+            path.to_str()
+                .filter(|text| path.is_absolute() && !text.contains(['\'', '\n']))
+                .ok_or_else(|| WorkspaceEnvironmentError::UnexportableTempDir(path.to_path_buf()))
+        })
+        .transpose()?;
     // Token alphabet is unpadded base64url (`A-Za-z0-9_-`), already shell-safe; it is pushed
     // into a Zeroizing buffer and never through an intermediate String. Capacity is sized so the
     // buffer cannot reallocate: 32 fixed bytes around the token, at most 68 for the port lines,
-    // plus the fixed development CI policy.
+    // 18 around the temp directory, plus the fixed development CI policy.
     let mut contents = Zeroizing::new(String::with_capacity(
-        128 + token.len() + DEV_CI_POLICY.len(),
+        128 + token.len() + DEV_CI_POLICY.len() + temp_dir.map_or(0, str::len),
     ));
     contents.push_str(DEV_CI_POLICY);
     contents.push_str("export ");
@@ -75,6 +93,10 @@ pub(crate) fn write_workspace_environment(
             block.size()
         )
         .expect("writing to a String cannot fail");
+    }
+    if let Some(temp_dir) = temp_dir {
+        writeln!(&mut *contents, "export {TEMP_DIR_ENV}='{temp_dir}'")
+            .expect("writing to a String cannot fail");
     }
 
     write_atomic_bytes(
@@ -93,6 +115,27 @@ mod tests {
         assert_eq!(WORKSPACE_TOKEN_ENV, "COWSHED_WORKSPACE_TOKEN");
         assert_eq!(PORT_BASE_ENV, "COWSHED_PORT_BASE");
         assert_eq!(PORT_BLOCK_SIZE_ENV, "COWSHED_PORT_BLOCK_SIZE");
+        assert_eq!(TEMP_DIR_ENV, "TMPDIR");
+    }
+
+    #[test]
+    fn a_temp_dir_that_would_not_survive_single_quotes_is_refused() {
+        for refused in [
+            "relative/tmp",
+            "/private/tmp/it's",
+            "/private/tmp/two\nlines",
+        ] {
+            assert!(matches!(
+                write_workspace_environment(
+                    Path::new("/nonexistent-image"),
+                    &Zeroizing::new("token".to_owned()),
+                    Platform::Linux,
+                    None,
+                    Some(Path::new(refused)),
+                ),
+                Err(WorkspaceEnvironmentError::UnexportableTempDir(path)) if path == Path::new(refused)
+            ));
+        }
     }
 
     #[test]
@@ -101,11 +144,13 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("cowshed-env-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".cowshed")).unwrap();
+        let temp_dir = root.join("exec temp");
         write_workspace_environment(
             &root,
             &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
+            Some(&temp_dir),
         )
         .unwrap();
         for marker in [None, Some(""), Some("false"), Some("true")] {
@@ -113,7 +158,7 @@ mod tests {
             command
                 .args([
                     "-c",
-                    ". \"$1\"; printf '%s\\n' \"${CI-unset}\" \"$CC_aarch64_apple_darwin\" \"$CXX_aarch64_apple_darwin\" \"$AR_aarch64_apple_darwin\"",
+                    ". \"$1\"; printf '%s\\n' \"${CI-unset}\" \"$CC_aarch64_apple_darwin\" \"$CXX_aarch64_apple_darwin\" \"$AR_aarch64_apple_darwin\" \"$TMPDIR\"",
                     "cowshed-env",
                 ])
                 .arg(root.join(WORKSPACE_ENVIRONMENT_PATH))
@@ -121,7 +166,8 @@ mod tests {
                 .env("CI", "true")
                 .env("CC_aarch64_apple_darwin", "/usr/bin/clang")
                 .env("CXX_aarch64_apple_darwin", "/usr/bin/clang++")
-                .env("AR_aarch64_apple_darwin", "/usr/bin/ar");
+                .env("AR_aarch64_apple_darwin", "/usr/bin/ar")
+                .env("TMPDIR", "/var/folders/machine/T");
             if let Some(marker) = marker {
                 command.env("GITHUB_ACTIONS", marker);
             }
@@ -134,7 +180,10 @@ mod tests {
             };
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                format!("{ci}\n/usr/bin/clang\n/usr/bin/clang++\n/usr/bin/ar\n"),
+                format!(
+                    "{ci}\n/usr/bin/clang\n/usr/bin/clang++\n/usr/bin/ar\n{}\n",
+                    temp_dir.display()
+                ),
                 "{marker:?}",
             );
         }

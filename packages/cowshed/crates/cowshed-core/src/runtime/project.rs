@@ -9574,6 +9574,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             &config.workspace_mount,
                             current.metadata.platform,
                             published.port_block,
+                            Some(&config.exec_temp_dir),
                         )
                         .map_err(|error| {
                             CowshedError::internal(format!(

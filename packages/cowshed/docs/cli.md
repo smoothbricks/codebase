@@ -590,6 +590,10 @@ is `base … base+size-1`. Its size is 64 for a new workspace, may be larger aft
 may hold 16-port blocks, so read it rather than assume it. devenv offsets can derive from the block. Linux configuration
 contains no block or sentinel values.
 
+Once a supervisor serves the workspace, `.cowshed/env` also exports `TMPDIR` as the workspace's own scratch directory in
+the project store: the same one every sandboxed job receives. A host shell that sources it runs with the temp directory
+a land gate runs with, never the machine's shared one, whose size every concurrent gate grows.
+
 ```
 $ cowshed exec raven -- sh -c 'echo $((COWSHED_PORT_BASE + 1))'
 40961

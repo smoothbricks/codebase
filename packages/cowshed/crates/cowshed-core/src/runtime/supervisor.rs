@@ -2229,12 +2229,16 @@ impl WorkspaceSupervisor {
         C: CommitmentSink + Send + 'static,
     {
         config.validate()?;
-        // A supervisor serves exactly the block its sandbox records, so this is where the
-        // workspace's `.cowshed/env` is brought up to date with its metadata.
+        // A supervisor serves exactly the block and TMPDIR its sandbox records, so this is where
+        // the workspace's `.cowshed/env` is brought up to date with its metadata. The TMPDIR it
+        // names exists before any host shell can source it.
+        AnchoredDirectory::create(&config.sandbox.exec_temp_dir)
+            .map_err(private_environment_error)?;
         crate::workspace_credentials::publish_workspace_environment(
             &config.sandbox.workspace_mount,
             crate::metadata::Platform::Macos,
             Some(config.sandbox.port_block),
+            Some(&config.sandbox.exec_temp_dir),
         )
         .map_err(|error| {
             CowshedError::integrity(
@@ -5392,6 +5396,8 @@ mod lifecycle_commitment_tests {
             default_cwd: None,
             sandbox: SandboxConfig {
                 workspace_mount: workspace_root.clone(),
+                // A start creates the TMPDIR `.cowshed/env` names, through no symlink.
+                exec_temp_dir: root.join("tmp"),
                 ..defaults.sandbox
             },
             build_volume_layout: None,
