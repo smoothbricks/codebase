@@ -121,17 +121,32 @@ fn adopt_preflighted(
             ));
         }
     }
+    // WHY rename first: a shell entering the checkout (its toolchain stamp) or a build can write
+    // into a build-state directory while it is being deleted, and a recursive delete of a
+    // directory something is still filling fails with "Directory not empty". `rename(2)` moves
+    // the whole tree aside atomically, the link takes the path at once, and the aside copy is
+    // deleted after: a late writer lands in the aside tree or follows the new link, never in
+    // a half-deleted path.
     let mut findings = Vec::with_capacity(real.len());
+    let mut aside = Vec::with_capacity(real.len());
     for state in real {
         let source = checkout.join(state.checkout.as_path());
-        fs::remove_dir_all(&source)
-            .map_err(|error| io_error("discard old build state", &source, error))?;
+        let mut name = source.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".cowshed-discard-{}", std::process::id()));
+        let moved = source.with_file_name(name);
+        fs::rename(&source, &moved)
+            .map_err(|error| io_error("move old build state aside", &source, error))?;
+        aside.push(moved);
         findings.push(DisplacedBuildStateFinding {
             path: state.checkout.as_path().to_owned(),
             likely_tool: tool(state),
         });
     }
     link::link_paths(checkout, volume_root, paths)?;
+    for moved in aside {
+        fs::remove_dir_all(&moved)
+            .map_err(|error| io_error("discard old build state", &moved, error))?;
+    }
     Ok(findings)
 }
 
