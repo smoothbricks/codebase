@@ -8962,6 +8962,36 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 candidates: candidates.into_iter().chain(build.candidates).collect(),
             });
         }
+        // Old build state a refresh moved aside and did not live to delete (`discard`): gc is
+        // the verb that waits for it, saying what it deletes.
+        for workspace in self.authoritative().await? {
+            if !matches!(
+                workspace.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            ) {
+                continue;
+            }
+            let mount = self.workspace_mount_path(workspace.derived.workspace.name())?;
+            let checkout = mount.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::build_volume::discard::finish(&checkout, |discard| {
+                    eprintln!("cowshed: deleting old build state {}", discard.display());
+                })
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("discard task failed: {error}")))?
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot delete old build state under {}: {error}",
+                        mount
+                            .join(crate::build_volume::discard::DISCARD_DIRECTORY)
+                            .display()
+                    ),
+                    "repair the named path, then cowshed gc",
+                )
+            })?;
+        }
         // Host-side state goes before the image does here too, for the same reason retirement
         // orders it that way: an image `gc` has already deleted leaves no authority to clean up
         // what it left behind in main. The authority is the retired image's own revalidated

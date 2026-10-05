@@ -131,6 +131,14 @@ state): new paths join the volume, held ones never move. A checkout with build s
 (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
 A build-state path that holds tracked source refuses before anything is deleted.
 
+A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
+excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
+without waiting for the delete, which runs in the background. A target directory can be tens of GiB, and no job waits on
+deleting it. A process that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout
+resumes the delete, and `cowshed gc` finishes it, naming each directory it deletes. A discovery job that has not
+answered within 10 seconds says on stderr every 10 seconds what it is waiting on: the processes holding the host Cargo
+home's package-cache locks, or none, in which case it is the shell's activation or Cargo itself.
+
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
 `.nx/workspace-data`, and the code-graph indexer (detected by its `.codegraph/` directory) contributes `.codegraph/`

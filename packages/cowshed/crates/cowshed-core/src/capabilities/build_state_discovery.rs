@@ -181,13 +181,35 @@ impl CargoRunner for JobCargo<'_> {
         let mut answers: Vec<Option<CargoAnswer>> = vec![None; queries.len()];
         for indices in shells.into_values() {
             let batch: Vec<&CargoQuery> = indices.iter().map(|index| &queries[*index]).collect();
-            let output = self
-                .runtime
-                .block_on(crate::runtime::supervisor::run_as_job(
-                    self.sandbox,
-                    &batch[0].directory,
-                    driver_argv(args, &batch),
-                ))?;
+            let directory = &batch[0].directory;
+            let job = crate::runtime::supervisor::run_as_job(
+                self.sandbox,
+                directory,
+                driver_argv(args, &batch),
+            );
+            let output = self.runtime.block_on(async {
+                tokio::pin!(job);
+                let started = std::time::Instant::now();
+                let mut report = tokio::time::interval_at(
+                    tokio::time::Instant::now() + WAIT_REPORT,
+                    WAIT_REPORT,
+                );
+                loop {
+                    tokio::select! {
+                        output = &mut job => break output,
+                        _ = report.tick() => eprintln!(
+                            "cowshed: build-state discovery has waited {}s on `cargo {}` in {} \
+                             ({} manifests, run as a job after the workspace shell's \
+                             activation); {}",
+                            started.elapsed().as_secs(),
+                            args.first().copied().unwrap_or_default(),
+                            directory.display(),
+                            batch.len(),
+                            cargo_lock_holders(&self.sandbox.home),
+                        ),
+                    }
+                }
+            })?;
             for (index, answer) in indices
                 .into_iter()
                 .zip(driver_answers(&output, batch.len()))
@@ -199,6 +221,51 @@ impl CargoRunner for JobCargo<'_> {
             .into_iter()
             .map(|answer| answer.expect("every query belongs to exactly one shell's batch"))
             .collect())
+    }
+}
+
+/// How often a discovery job that has not answered says what it waits on.
+const WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Who holds the host Cargo home's own locks open. Cargo blocks on its package-cache lock
+/// while another cargo resolves or builds, and discovery's Cargo shares that `$CARGO_HOME`
+/// ([`super::cargo::HOME`]), so a concurrent build is the usual reason a discovery job waits.
+fn cargo_lock_holders(home: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let cargo_home = home.join(".cargo");
+        let mut held = Vec::new();
+        for file in super::cargo::STATE_FILES {
+            let lock = cargo_home.join(file);
+            match crate::build_volume::nx::holders(&lock) {
+                Ok(holders) => held.extend(
+                    holders
+                        .into_iter()
+                        .map(|holder| format!("{} holds {}", holder, lock.display())),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => held.push(format!("{} cannot be inspected: {error}", lock.display())),
+            }
+        }
+        if held.is_empty() {
+            format!(
+                "no process holds Cargo's locks under {}, so the wait is the shell's activation \
+                 or Cargo itself",
+                cargo_home.display()
+            )
+        } else {
+            format!(
+                "Cargo waits for its package-cache lock: {}",
+                held.join("; ")
+            )
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!(
+            "a concurrent cargo holding the package-cache lock under {} is the usual reason",
+            home.join(".cargo").display()
+        )
     }
 }
 

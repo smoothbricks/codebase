@@ -12,6 +12,7 @@
 //! The record says what the link cannot: the tree the volume was last built at, whether it is a
 //! seed (a target's frozen build state, never written), and when it was made.
 
+pub mod discard;
 pub mod link;
 #[cfg(target_os = "macos")]
 pub mod migrate;

@@ -425,3 +425,106 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
         crate::storage::apfs::native::BuildVolumeRelease::Deleted
     );
 }
+
+fn target_only() -> Vec<BuildStatePath> {
+    vec![BuildStatePath::new("target", "target").unwrap()]
+}
+
+fn status(checkout: &Path) -> String {
+    let output = crate::git::git_command_at(checkout)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output_locked()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The background delete is observed, never assumed: poll until the checkout has no discard.
+fn discards_drain(checkout: &Path, within: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < within {
+        if discard::pending(checkout).unwrap().is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// A refresh that died after moving old build state aside -- a crash, or a setup that exited
+/// mid-delete -- left it in `.cowshed/discard`, invisible to Git; the next refresh deletes it.
+#[test]
+fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    write(&checkout, ".gitignore", "target/\n");
+    write(&checkout, "target/debug/unit", "old build state");
+    git(&checkout, &["add", ".gitignore"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    // The crash: excluded and moved aside, then nothing more.
+    link::exclude_links(&checkout, &target_only()).unwrap();
+    let moved = discard::move_aside(&checkout, Path::new("target")).unwrap();
+    assert!(moved.starts_with(checkout.join(discard::DISCARD_DIRECTORY)));
+    assert!(fs::read(moved.join("debug/unit")).is_ok());
+    assert_eq!(
+        status(&checkout),
+        "A  .gitignore\n",
+        "a pending discard is not source"
+    );
+
+    assert!(
+        adopt_paths(&checkout, &scratch.volume(), &target_only())
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+        "nothing real was at the path, so nothing new is displaced"
+    );
+    assert!(
+        fs::symlink_metadata(checkout.join("target"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(
+        discards_drain(&checkout, std::time::Duration::from_secs(20)),
+        "the refresh left {:?} pending",
+        discard::pending(&checkout).unwrap()
+    );
+    assert_eq!(status(&checkout), "A  .gitignore\n");
+}
+
+/// A refresh returns once the link is in place; the delete of what it moved aside runs behind
+/// it. 100k files stand in for a real target directory.
+#[test]
+fn a_large_moved_aside_directory_does_not_hold_the_refresh() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    for chunk in 0..100 {
+        let directory = checkout.join(format!("target/debug/deps/{chunk}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..1_000 {
+            fs::write(directory.join(file.to_string()), b"").unwrap();
+        }
+    }
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let displaced = adopt_paths(&checkout, &scratch.volume(), &target_only())
+        .unwrap()
+        .unwrap();
+    assert_eq!(displaced.len(), 1);
+    assert!(
+        fs::symlink_metadata(checkout.join("target"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(
+        discard::pending(&checkout).unwrap().len(),
+        1,
+        "the refresh returned only after deleting 100k files"
+    );
+    assert!(
+        discards_drain(&checkout, std::time::Duration::from_secs(25)),
+        "the background delete did not finish"
+    );
+    assert_eq!(status(&checkout), "", "{}", status(&checkout));
+}

@@ -128,7 +128,7 @@ const EXCLUDE_END: &str = "# end cowshed build-state links";
 /// managed block. Entries are only ever added: linked worktrees share the file, and an entry
 /// naming a path nothing occupies matches nothing. A checkout outside Git has no status to keep
 /// clean.
-fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result<()> {
+pub(crate) fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result<()> {
     use crate::fork_lock::Run as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     match fs::symlink_metadata(checkout.join(".git")) {
@@ -177,9 +177,13 @@ fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(exclude_error(&exclude, &error)),
     };
-    let wanted = std::iter::once(Path::new(BUILD_LINK))
-        .chain(paths.iter().map(|state| state.checkout.as_path()))
-        .map(exclude_pattern);
+    // `/.cowshed/` covers the build link and the discard directory a migration moves old build
+    // state into (`discard`): cowshed's namespace, never the source tree's.
+    let wanted = std::iter::once("/.cowshed/".to_owned()).chain(
+        std::iter::once(Path::new(BUILD_LINK))
+            .chain(paths.iter().map(|state| state.checkout.as_path()))
+            .map(exclude_pattern),
+    );
     let Some(updated) = with_excluded(&existing, wanted) else {
         return Ok(());
     };

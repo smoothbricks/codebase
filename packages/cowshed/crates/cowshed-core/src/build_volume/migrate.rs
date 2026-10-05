@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState,
-    DisplacedBuildStateFinding, TrackedBuildStateRefusal, link, nx,
+    DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx,
 };
 use crate::apfs::SystemCommandRunner;
 use crate::capabilities::BuildStatePath;
@@ -124,29 +124,26 @@ fn adopt_preflighted(
     // WHY rename first: a shell entering the checkout (its toolchain stamp) or a build can write
     // into a build-state directory while it is being deleted, and a recursive delete of a
     // directory something is still filling fails with "Directory not empty". `rename(2)` moves
-    // the whole tree aside atomically, the link takes the path at once, and the aside copy is
-    // deleted after: a late writer lands in the aside tree or follows the new link, never in
-    // a half-deleted path.
+    // the whole tree aside atomically, into `.cowshed/discard` on the same volume and outside
+    // the source tree, the link takes the path at once, and the aside copy is deleted in the
+    // background: a late writer lands in the aside tree or follows the new link, never in a
+    // half-deleted path, and no job waits on the delete (`discard`).
+    // Excluded first: a process that dies after a move aside leaves nothing `git status` shows.
+    link::exclude_links(checkout, paths)?;
     let mut findings = Vec::with_capacity(real.len());
-    let mut aside = Vec::with_capacity(real.len());
     for state in real {
-        let source = checkout.join(state.checkout.as_path());
-        let mut name = source.file_name().unwrap_or_default().to_os_string();
-        name.push(format!(".cowshed-discard-{}", std::process::id()));
-        let moved = source.with_file_name(name);
-        fs::rename(&source, &moved)
-            .map_err(|error| io_error("move old build state aside", &source, error))?;
-        aside.push(moved);
+        let source = state.checkout.as_path();
+        discard::move_aside(checkout, source).map_err(|error| {
+            io_error("move old build state aside", &checkout.join(source), error)
+        })?;
         findings.push(DisplacedBuildStateFinding {
-            path: state.checkout.as_path().to_owned(),
+            path: source.to_owned(),
             likely_tool: tool(state),
         });
     }
     link::link_paths(checkout, volume_root, paths)?;
-    for moved in aside {
-        fs::remove_dir_all(&moved)
-            .map_err(|error| io_error("discard old build state", &moved, error))?;
-    }
+    // Also whatever an earlier refresh moved aside and did not live to delete.
+    discard::reap(checkout);
     Ok(findings)
 }
 
