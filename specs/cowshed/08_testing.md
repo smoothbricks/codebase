@@ -205,14 +205,15 @@ empty root; it never drops the record and assumes a reserved volume is absent. A
 observation still finds a reserved volume in another container. Mutation planning refuses the incomplete first scan;
 exhausted reads, invalid device names, and partially populated records other than that observed shape remain errors.
 
-APFS diagnostics distinguish image-lease acquisition, blank-image creation and formatting, raw-device pinning,
-image/device identity inspection, attach, and fsck. Backend disk commands also report their operation and elapsed time,
-including attachment inventories and detach requests that previously appeared only as gaps between lifecycle spans.
-Adoption reports binding and inventory checks, identity ownership, intent publication, secret scanning, grant
-reservation, staged copy and credentials, inherited-state cleanup, Git environment wiring, and supervisor startup.
-Controller startup reports runtime creation and protocol connection/open separately. Checked land reports binding,
-source/target inspection, dirty checks, supervisor readiness, check dispatch/completion, and Git delivery. The real
-fixture also reports Git verb durations and elapsed phase boundaries; these diagnostics do not expose command payloads.
+APFS diagnostics distinguish image-lease acquisition, a mint (`<leg>/mint`, its `clonefile` and attach inside it),
+template minting (`template/mint`, with blank-image creation and formatting inside it), raw-device pinning, image/device
+identity inspection, attach, and fsck. Backend disk commands also report their operation and elapsed time, including
+attachment inventories and detach requests that previously appeared only as gaps between lifecycle spans. Adoption
+reports binding and inventory checks, identity ownership, intent publication, secret scanning, grant reservation, staged
+copy and credentials, inherited-state cleanup, Git environment wiring, and supervisor startup. Controller startup
+reports runtime creation and protocol connection/open separately. Checked land reports binding, source/target
+inspection, dirty checks, supervisor readiness, check dispatch/completion, and Git delivery. The real fixture also
+reports Git verb durations and elapsed phase boundaries; these diagnostics do not expose command payloads.
 
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a

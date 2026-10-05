@@ -75,9 +75,9 @@ not a best-effort script:
    behind a fence: its complete sibling host sidecar is written first, in publication state `PendingFence`, which keeps
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
-   blank file is written under a staging name and renamed into place before its first attach, so the canonical name only
-   ever holds a complete file. That attach formats the volume and is the only one main gets: the volume is verified with
-   `fsck_apfs -q` and mounted at a staging mountpoint.
+   image is minted (01_storage.md "Images"): one `clonefile` of the store's formatted blank template takes the canonical
+   name whole, so the name only ever holds a complete, formatted volume, and one attach verifies it with `fsck_apfs -q`.
+   That attach is the only one main gets; the volume is mounted at a staging mountpoint.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
@@ -152,8 +152,8 @@ cowshed never auto-deletes it.
 | Kill window                        | Durable state                                                    | Recovery action and guard                                                                                                                                      |
 | ---------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Before the sidecar                 | Intent only                                                      | Re-run adopt normally.                                                                                                                                         |
-| After the sidecar, before payload  | `PendingFence` sidecar, maybe a staging blank                    | Startup recovery removes the sidecar-only record; gc reclaims the orphan staging blank.                                                                        |
-| During creation, before format     | `PendingFence` + blank or unformatted canonical image            | The payload never held a copy: it is detached, reclaimed with its sidecar, and adoption starts over under a fresh incarnation.                                 |
+| After the sidecar, before payload  | `PendingFence` sidecar                                           | Startup recovery removes the sidecar-only record.                                                                                                              |
+| After the clone, before its attach | `PendingFence` + formatted, unattached canonical image           | The payload is a clone of the store's blank template, empty and formatted: the ordinary verified attach mounts it and the copy starts; same incarnation.       |
 | After attach, before staging mount | `PendingFence` + verified, unmounted attachment                  | The unmounted attachment is settled and the ordinary verified attach repeats before mounting; same incarnation.                                                |
 | During the copy or initializer     | `PendingFence` + staging mount of the canonical image            | An exact source device and canonical flags reuse the surviving mount; the delta copier resumes; credentials and marker are idempotent; the initializer reruns. |
 | After activation, before the swap  | `Active` main, attached or not, checkout still the original tree | Adopt's intent finishes it: the swap runs, then main mounts at the checkout, reusing or replacing the surviving attachment.                                    |

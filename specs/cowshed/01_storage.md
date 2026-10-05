@@ -45,6 +45,10 @@ layout root:
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
   host.json                          # host configuration: mount root, credential routes
   .staging/                          # port-block reservations held while a workspace's grants are minted
+  .blank/                            # blank templates every new image is cloned from (see "Images")
+    <bytes>-<uid>-<gid>.asif         # one formatted, verified, detached image per capacity and owner
+    <bytes>-<uid>-<gid>.lock         # flock held only while that template is minted
+    <bytes>-<uid>-<gid>-minting.asif # a template being minted; the next minter removes one a killed minter left
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
@@ -58,7 +62,7 @@ layout root:
     main.asif.grants.json            # controller-owned grants + detached metadata
     main.asif.ca.key                 # main's workspace CA private key, 0600
     main.asif.lock                   # flock target for lifecycle operations
-    .staging/                        # restore stages and adopt's not-yet-renamed blank file, never enumerated
+    .staging/                        # restore stages, never enumerated
     sessions/
       <workspace>.asif               # one image per workspace
       <workspace>.asif.grants.json   # grants + detached metadata (see 04_sandbox.md)
@@ -130,14 +134,28 @@ every clone automatically). Main and sessions use identical wiring; only the san
 
 - **Format**: one — an ASIF image (`.asif`) holding one case-sensitive APFS volume. There is no second format, no
   fallback, and no format field in any metadata: `.asif` is the only image extension anything enumerates, and macOS 26,
-  which introduced ASIF (`diskutil` documents it as the replacement for the legacy `.sparseimage`), is the floor.
-  Creation is four unprivileged steps:
-  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName <label> --fs None <image>`,
+  which introduced ASIF (`diskutil` documents it as the replacement for the legacy `.sparseimage`), is the floor. Every
+  image starts as a clone. Each store keeps one **blank template** per capacity and owner,
+  `.blank/<capacity-bytes>-<uid>-<gid>.asif`, and a **mint** — adopt's main image, a build volume's first touch — is one
+  `clonefile` of it to the image's canonical name plus one `diskutil image attach --nobrowse --noMount --plist`,
+  verified with `fsck_apfs -q` like every attach. The clone takes the canonical name whole, so the name only ever holds
+  a complete, formatted volume. A template is minted lazily, the first time a store mints at its capacity, in five
+  unprivileged steps:
+  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting.asif`,
   `diskutil image attach --nobrowse --noMount --plist <image>`,
-  `newfs_apfs -U <uid> -G <gid> -e -v <label> <whole-device>`, and `hdiutil detach <whole-device>`. The attaching user
-  owns the image's device nodes, so formatting needs no privilege, and `-U`/`-G` make the volume root the invoking
-  user's from the start. `diskutil`'s own `--fs APFS` is not used: it cannot ask for case sensitivity, and it leaves a
-  root-owned volume root that an `owners` mount cannot write and only root can hand over.
+  `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and
+  `hdiutil detach <whole-device>`; only then is it renamed to its name. Only minting takes the template's lock, and a
+  minter that finds the template once it holds the lock returns it, so concurrent first mints make one template and a
+  mint that finds it needs no lock at all. A minter killed partway leaves its `-minting` image, perhaps still attached;
+  the next minter detaches and removes it before it starts. The attaching user owns the image's device nodes, so
+  formatting needs no privilege, and `-U`/`-G` make the volume root the invoking user's from the start — which is why
+  the owner is part of the template's name. `diskutil`'s own `--fs APFS` is not used: it cannot ask for case
+  sensitivity, and it leaves a root-owned volume root that an `owners` mount cannot write and only root can hand over.
+  Like every clone, a minted volume shares its template's APFS volume and container UUIDs (nothing records or reads
+  them; see "Ownership, identity, and the volume label") and carries its label. A capacity gets a template of its own
+  rather than a clone of another grown to fit: growing the container is a `diskutil apfs resizeContainer`, a second
+  `storagekitd` call on every such mint (0.93–1.0 s measured on a loaded host), where a template costs one mint per
+  store and capacity (0.57–0.63 s measured).
 - **Case-sensitive, always**: `-e` is the entire cost — one flag at creation. Clones copy the volume as it is, so `new`,
   `fork`, `checkpoint`, and `restore` never repeat it, and case-sensitive ASIF measures the same as case-insensitive
   ASIF on every axis below within noise. A case-sensitive volume holds every path a repository can contain, including
@@ -191,7 +209,8 @@ every clone automatically). Main and sessions use identical wiring; only the san
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
   identity from it — renaming a volume by hand (`diskutil rename`) changes the label and nothing else. Identity comes
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
-  below.
+  below. A minted image carries its template's label, `[cowshed]`, until its workspace's supervisor relabels it off the
+  provisioning path; a build volume keeps it, since nothing mounts one browsable.
 - **Spotlight**: nothing to set. `diskutil image create` has no `-nospotlight`, `mdutil -i off` needs root, and a
   `nobrowse` mount is not indexed (measured: no `.Spotlight-V100` store appears after writes, and `mdutil -s` reports no
   indexing state). A `--browse` mount is an ordinary visible volume to Spotlight.
@@ -403,15 +422,21 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
 
 What the substrate does about each:
 
-- **Fewest storagekitd round-trips.** Production operations sit at their floor: a mint is one `image create` plus one
-  attach, a fork or cold mount is one attach, a land with no retire makes no disk-tool call, and a detach goes through
-  `hdiutil`. Values the image itself records come from the image, never from a `diskutil` query: an ASIF image's
-  capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses any layout other
-  than the measured one), and a mounted volume's from IORegistry.
+- **Fewest storagekitd round-trips.** Production operations sit at their floor: a mint is one `clonefile` of the store's
+  blank template plus one attach ("Images"), a fork or cold mount is one attach, a land with no retire makes no
+  disk-tool call, and a detach goes through `hdiutil`. The mint floor was one `image create` plus a formatting attach
+  and `newfs_apfs`. Measured on the same host and tests (CLI adopt and build-volume first touch, `apfs <leg>/mint`
+  spans), adopt's mint went from 537–705 ms to 303–345 ms and first touch from 565–756 ms to 312–317 ms on a quiet
+  queue; under a loaded parallel suite the old adopt mint took 10.6 s (create 2.4 s, attach 7.7 s) against 5.0 s for the
+  new one, all of it the one attach. Values the image itself records come from the image, never from a `diskutil` query:
+  an ASIF image's capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses
+  any layout other than the measured one), and a mounted volume's from IORegistry.
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
-  attach budget for as long as it stays attached.
+  attach budget for as long as it stays attached. A test run mints one blank template with the production minter and
+  clones every test image from it; a test store that mints is seeded with a clone of it, so the suite pays one template
+  mint per test process tree rather than one per store.
 - **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
   contention instead of reducing it; the fix is fewer calls.
 - **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.
