@@ -267,7 +267,10 @@ async fn run_in(
     session: Option<&SessionToken>,
     request: ExecRequest,
 ) -> Ran {
-    let job = handle.exec(session, request).await.expect("admit job");
+    let job = handle
+        .exec(session, None, request)
+        .await
+        .expect("admit job");
     let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
         .await
         .expect("job terminates")
@@ -413,7 +416,11 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
     let handle = workspace.supervisor(false);
     run(&handle, sh("true")).await.ok();
     let job = handle
-        .exec(None, sh("sleep 300 & printf '%s %s\\n' $$ $! > pids; wait"))
+        .exec(
+            None,
+            None,
+            sh("sleep 300 & printf '%s %s\\n' $$ $! > pids; wait"),
+        )
         .await
         .expect("admit");
     let pids = workspace.mount().join("pids");
@@ -463,7 +470,11 @@ async fn host_controller_a_kill_reaches_the_descendants_of_an_exited_leader() {
     let handle = workspace.supervisor(false);
     run(&handle, sh("true")).await.ok();
     let job = handle
-        .exec(None, sh("sleep 300 & printf '%s\\n' $! > pid; exit 3"))
+        .exec(
+            None,
+            None,
+            sh("sleep 300 & printf '%s\\n' $! > pid; exit 3"),
+        )
         .await
         .expect("admit");
     let pid = workspace.mount().join("pid");
@@ -670,7 +681,7 @@ async fn host_controller_a_concurrent_command_takes_the_prewarmed_spare() {
         "a spare is activated once a generation exists"
     );
     // One command holds the returned shell; the next takes the spare without activating.
-    let holding = handle.exec(None, sh("sleep 2")).await.expect("admit");
+    let holding = handle.exec(None, None, sh("sleep 2")).await.expect("admit");
     let second = run(&handle, sh("true")).await.ok();
     assert!(
         !second.stderr.contains("direnv: loading"),
@@ -692,7 +703,7 @@ async fn host_controller_orphan_helper_exits_while_an_activation_runs() {
     };
     let workspace = Workspace::from_root(PathBuf::from(root));
     let handle = workspace.supervisor(false);
-    let _job = handle.exec(None, sh("true")).await.expect("admit");
+    let _job = handle.exec(None, None, sh("true")).await.expect("admit");
     let pid_file = workspace.sandbox.exec_temp_dir.join("activation-pid");
     while !pid_file.exists() {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -806,6 +817,7 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
     let job = handle
         .exec(
             None,
+            None,
             script(
                 &["sleep 300 & (sleep 301; true) & printf '%s %s\\n' $$ $! > pids; wait"],
                 Vec::new(),
@@ -876,6 +888,7 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
     let gate = workspace.mount().join("gate");
     let running = handle
         .exec(
+            None,
             None,
             sh(&format!(
                 "while [ ! -e {} ]; do sleep 0.05; done; printf n > {granted_path}/during",

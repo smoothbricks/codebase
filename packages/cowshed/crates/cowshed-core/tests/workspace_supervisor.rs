@@ -669,7 +669,7 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
                 .map(CommandArg::from)
                 .collect(),
             );
-            let job = h.handle.exec(None, exec).await.unwrap();
+            let job = h.handle.exec(None, None, exec).await.unwrap();
             let spawned = h.spawned.recv().await.unwrap();
             // Run the admitted request through the production spawn checks and the
             // kernel. A profile-only probe misses the supervisor/child role boundary.
@@ -719,7 +719,7 @@ async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
     for code in [0, 143] {
         let job = h
             .handle
-            .exec(None, request(StdinSource::Empty))
+            .exec(None, None, request(StdinSource::Empty))
             .await
             .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
@@ -755,7 +755,7 @@ async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
         CommandArg::from(OsString::from_vec(raw.clone())),
         CommandArg::from("--flag"),
     ]);
-    let job = h.handle.exec(None, exec).await.unwrap();
+    let job = h.handle.exec(None, None, exec).await.unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let SpawnCommand::Argv(spawned_argv) = &spawned.request.command else {
         panic!("an argv job spawns an argv");
@@ -781,7 +781,7 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
     ] {
         let mut exec = request(StdinSource::Empty);
         exec.command = ExecCommand::Argv(vec![CommandArg::from(argument)]);
-        let error = h.handle.exec(None, exec).await.unwrap_err();
+        let error = h.handle.exec(None, None, exec).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(matches!(
             h.spawned.try_recv(),
@@ -802,17 +802,81 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
     }
 }
 
+/// A job runs with the build volume the controller resolved when it was admitted
+/// (16_build_volumes.md, "Process lifetime across a swap"): after an adoption moves the
+/// checkout's link, the next job gets the adopted volume while a job admitted before keeps the
+/// profile it was spawned with, and nothing is relaunched.
+#[tokio::test]
+async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
+    let supervisor_config = config();
+    let volumes = supervisor_config
+        .sandbox
+        .mount_root
+        .join(".build/acme/widget");
+    let before = volumes.join("a".repeat(32));
+    let adopted = volumes.join("b".repeat(32));
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let first = h
+        .handle
+        .exec(None, Some(before.clone()), request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let first_spawn = h.spawned.recv().await.unwrap();
+    let second = h
+        .handle
+        .exec(None, Some(adopted.clone()), request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let second_spawn = h.spawned.recv().await.unwrap();
+    let granted = |spawn: &Spawned, mode| {
+        spawn
+            .request
+            .policy
+            .child(mode)
+            .0
+            .build_volume_mount
+            .clone()
+    };
+    for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
+        assert_eq!(granted(&first_spawn, mode), Some(before.clone()));
+        assert_eq!(granted(&second_spawn, mode), Some(adopted.clone()));
+    }
+    let (_, first_profile) = first_spawn.request.policy.child(RunSandboxMode::ReadWrite);
+    assert!(first_profile.contains(before.to_str().unwrap()));
+    assert!(!first_profile.contains(adopted.to_str().unwrap()));
+    let (_, second_profile) = second_spawn.request.policy.child(RunSandboxMode::ReadWrite);
+    assert!(second_profile.contains(adopted.to_str().unwrap()));
+    assert!(!second_profile.contains(before.to_str().unwrap()));
+    // A checkout that links no volume grants none.
+    let third = h
+        .handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let third_spawn = h.spawned.recv().await.unwrap();
+    assert_eq!(granted(&third_spawn, RunSandboxMode::ReadWrite), None);
+    let completions = [
+        (first, &first_spawn),
+        (second, &second_spawn),
+        (third, &third_spawn),
+    ];
+    for (job, spawn) in completions {
+        complete(spawn, b"", b"", ExitStatus::Exited { code: 0 }).await;
+        h.handle.wait(job).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn monotonic_ids_and_simultaneous_completions_are_serialized() {
     let mut h = harness(41, 1024, false, false);
     let first = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let second = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     assert_eq!((first.get(), second.get()), (41, 42));
@@ -862,7 +926,7 @@ async fn exact_authority_and_session_identity_are_fenced() {
     let stale = old.list().await.unwrap_err();
     assert_eq!(stale.code, ErrorCode::Conflict);
     let stale_session = advanced
-        .exec(Some(&session), request(StdinSource::Empty))
+        .exec(Some(&session), None, request(StdinSource::Empty))
         .await
         .unwrap_err();
     assert_eq!(stale_session.code, ErrorCode::Conflict);
@@ -884,7 +948,7 @@ async fn disconnect_does_not_cancel_background_process() {
     let session = open_named(&h.handle, "daemon").await;
     let job = h
         .handle
-        .exec_background(Some(&session), request(StdinSource::Empty))
+        .exec_background(Some(&session), None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -901,7 +965,7 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -933,7 +997,11 @@ async fn stdin_write_observes_bounded_backpressure() {
     let (stream_writer, stream_reader) = tokio::io::duplex(8);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Stream(Box::pin(stream_reader))))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Stream(Box::pin(stream_reader))),
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -973,7 +1041,7 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
     let mut h = harness(1, 4, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1031,7 +1099,7 @@ async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
     let mut h = harness(7, 1024, true, false);
     let error = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::EnvironmentMissing);
@@ -1055,7 +1123,7 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), first)
+        .exec_background(Some(&session), None, first)
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1106,7 +1174,7 @@ async fn a_registered_credential_env_name_never_reaches_a_child() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), first)
+        .exec_background(Some(&session), None, first)
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1202,7 +1270,7 @@ async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
     let mut first = real_store_harness(supervisor_config.clone());
     let job = first
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = first.spawned.recv().await.unwrap();
@@ -1271,6 +1339,7 @@ async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully()
         .handle
         .exec(
             None,
+            None,
             ExecRequest {
                 stdout_copy: Some(OutputPublication {
                     path: WorkspacePath::new(".cowshed/leak").unwrap(),
@@ -1333,7 +1402,7 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
     let mut h = real_store_harness(supervisor_config);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1440,7 +1509,7 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
     )
     .unwrap();
     let job = handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = spawned.recv().await.unwrap();
@@ -1589,13 +1658,13 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
     };
 
     handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let first = birth(births.recv().await.unwrap());
     assert_eq!(ledger_leaders(&ledger), vec![(1, first)]);
     handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let second = birth(births.recv().await.unwrap());
@@ -1628,7 +1697,7 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().pid, Some(10_001));
@@ -1692,7 +1761,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
 
     let first = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     assert_eq!(carried(&ledger), vec![9]);
@@ -1718,7 +1787,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     }
     let second = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     assert_eq!(carried(&ledger), Vec::<u64>::new());
@@ -1734,7 +1803,7 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1781,7 +1850,7 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
     assert_eq!(terminal_count, 1);
     assert_eq!(
         h.handle
-            .exec(None, request(StdinSource::Empty))
+            .exec(None, None, request(StdinSource::Empty))
             .await
             .unwrap_err()
             .code,
@@ -1794,7 +1863,7 @@ async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1858,7 +1927,7 @@ async fn a_kill_after_the_leader_exits_reaches_the_group_still_holding_its_outpu
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1906,7 +1975,7 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1979,7 +2048,7 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1989,7 +2058,7 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
     assert!(!quiesce.is_finished());
     assert_eq!(
         h.handle
-            .exec(None, request(StdinSource::Empty))
+            .exec(None, None, request(StdinSource::Empty))
             .await
             .unwrap_err()
             .code,
@@ -2005,7 +2074,7 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     let mut h = harness(2, 1024, false, false);
     let first = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let first_spawned = h.spawned.recv().await.unwrap();
@@ -2013,7 +2082,7 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     assert_eq!(refused.code, ErrorCode::Conflict);
     let second = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .expect("busy refusal must leave admission open");
     let second_spawned = h.spawned.recv().await.unwrap();
@@ -2024,7 +2093,7 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     h.handle.quiesce_if_idle().await.unwrap();
     assert_eq!(
         h.handle
-            .exec(None, request(StdinSource::Empty))
+            .exec(None, None, request(StdinSource::Empty))
             .await
             .unwrap_err()
             .code,
@@ -2040,7 +2109,7 @@ async fn none_cwd_is_preserved_as_workspace_root_without_a_sentinel() {
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let mut exec = request(StdinSource::Empty);
     exec.cwd = None;
-    let job = h.handle.exec(None, exec).await.unwrap();
+    let job = h.handle.exec(None, None, exec).await.unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     assert!(spawned.request.cwd.as_os_str().is_empty());
     assert_eq!(h.handle.info(job).await.unwrap().cwd, None);
@@ -2056,7 +2125,7 @@ async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
     let mut h = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2137,7 +2206,7 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
     let mut h = harness_with_sealed_stdout(b"sealed".to_vec());
     let job = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2197,7 +2266,7 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
         let mut h = harness(1, 1024, false, false);
         let job = h
             .handle
-            .exec_background(None, request(StdinSource::Empty))
+            .exec_background(None, None, request(StdinSource::Empty))
             .await
             .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
@@ -2259,7 +2328,11 @@ async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
     let session = remote.open_session(Some("build".into())).await.unwrap();
     let stdin = Bytes::from_static(&[0xfe, 0x00, b'i', 0x80]);
     let job = remote
-        .exec(Some(&session), request(StdinSource::Inline(stdin.clone())))
+        .exec(
+            Some(&session),
+            None,
+            request(StdinSource::Inline(stdin.clone())),
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2307,7 +2380,7 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     let (remote, _path) = served(&h.handle).await;
     let (mut writer, reader) = tokio::io::duplex(1024);
     let job = remote
-        .exec(None, request(StdinSource::Stream(Box::pin(reader))))
+        .exec(None, None, request(StdinSource::Stream(Box::pin(reader))))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2347,7 +2420,7 @@ async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
         },
     );
     let refused = stale
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap_err();
     assert_eq!(refused.code, ErrorCode::Conflict);
@@ -2362,7 +2435,7 @@ async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
     let mut h = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2623,7 +2696,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     );
     let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
     let admitted = remote
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2649,7 +2722,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     ));
     let remote = supervisor_socket::connect(path.clone(), authority());
     let job = remote
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2661,7 +2734,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     );
     let refused = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match remote.exec(None, request(StdinSource::Empty)).await {
+            match remote.exec(None, None, request(StdinSource::Empty)).await {
                 Err(error) => return error,
                 // Admitted before the drain reached the actor: let it end and try again.
                 Ok(admitted) => {
@@ -2743,7 +2816,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
     ));
 
     let first = handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     complete(
@@ -2777,7 +2850,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         .await
         .unwrap();
     let second = handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     complete(
@@ -2807,7 +2880,7 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
     let mut h = real_store_harness(supervisor_config);
     let job_id = h
         .handle
-        .exec(None, request(StdinSource::Empty))
+        .exec(None, None, request(StdinSource::Empty))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();

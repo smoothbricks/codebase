@@ -3757,7 +3757,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<crate::api::dto::AdoptionCheck> {
         use crate::build_volume::nx::{Attribution, CacheStatus, attribute};
         let mut result = crate::api::dto::AdoptionCheck::default();
-        let (handle, _build_volume) = self.admit_build_state(target).await?;
+        let (handle, build_volume) = self.admit_build_state(target).await?;
         let state = crate::build_volume::BuildVolumeState::read(
             &mount.join(crate::build_volume::BUILD_LINK),
         )?;
@@ -3777,7 +3777,9 @@ impl NativeProjectRuntimeHost {
             .collect::<Vec<_>>();
         for check in checks {
             let spawned = std::time::SystemTime::now();
-            let job = handle.exec(None, land_check_request(check)).await?;
+            let job = handle
+                .exec(None, build_volume.clone(), land_check_request(check))
+                .await?;
             let info = handle.wait(job).await?;
             let exited = std::time::SystemTime::now();
             match info.exit {
@@ -3804,9 +3806,15 @@ impl NativeProjectRuntimeHost {
                                 CacheStatus::LocalHit | CacheStatus::RemoteHit => {
                                     result.hits += 1;
                                 }
-                                CacheStatus::Miss => result
-                                    .misses
-                                    .push(task_inputs(&handle, task.task_id, task.hash).await?),
+                                CacheStatus::Miss => result.misses.push(
+                                    task_inputs(
+                                        &handle,
+                                        build_volume.clone(),
+                                        task.task_id,
+                                        task.hash,
+                                    )
+                                    .await?,
+                                ),
                             }
                         }
                     }
@@ -3841,6 +3849,7 @@ impl NativeProjectRuntimeHost {
         let name = current.derived.workspace.name().clone();
         let main_mount = self.workspace_mount_path(&main_name())?;
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
+        let volumes = self.build_volumes()?;
         let sandbox = supervisor_sandbox(
             &self.home,
             &self.layout,
@@ -3849,8 +3858,8 @@ impl NativeProjectRuntimeHost {
             &grants,
             mount.to_owned(),
             main_mount.clone(),
+            volumes.grant(&name, mount)?,
         )?;
-        let volumes = self.build_volumes()?;
         let (fingerprint, recorded) = {
             let (sandbox, volumes, mount) = (sandbox.clone(), volumes.clone(), mount.to_owned());
             crate::storage::lifecycle::dispatch_blocking(move || {
@@ -5769,6 +5778,8 @@ impl NativeProjectRuntimeHost {
             &grants,
             mount.clone(),
             self.workspace_mount_path(&main_name())?,
+            // The volume the checkout links at start; each admitted job then carries its own.
+            self.build_volumes()?.grant(name, &mount)?,
         )?;
         let historical_incarnations = workspace_lineage(
             &mount,
@@ -6238,6 +6249,8 @@ impl NativeProjectRuntimeHost {
             &grants,
             self.workspace_mount_path(name)?,
             self.workspace_mount_path(&main_name())?,
+            self.build_volumes()?
+                .grant(name, &self.workspace_mount_path(name)?)?,
         )?;
         let served = self
             .served
@@ -9059,6 +9072,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         &effective,
                         mount,
                         main_mount,
+                        None,
                     )?;
                     validate_grant_sandbox(&config)?;
                     if current.metadata.grants == previous {
@@ -9193,6 +9207,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 &effective,
                 main_mount.clone(),
                 main_mount,
+                None,
             )?;
             validate_grant_sandbox(&config)?;
             let mut sibling = config;
@@ -9449,14 +9464,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             "land target",
         )?;
         let retire = options.retire;
-        let (handle, _build_volume) =
+        let (handle, build_volume) =
             timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
         let checks = options.check.unwrap_or_default();
         for check in &checks {
             let job_id = timed_async(
                 "land",
                 "check-exec",
-                handle.exec(None, land_check_request(check)),
+                handle.exec(None, build_volume.clone(), land_check_request(check)),
             )
             .await?;
             let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
@@ -10281,8 +10296,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();
-        let (handle, _build_volume) = self.admit_build_state(&workspace).await?;
-        handle.exec(token.as_ref(), request).await
+        let (handle, build_volume) = self.admit_build_state(&workspace).await?;
+        handle.exec(token.as_ref(), build_volume, request).await
     }
 
     async fn stdin_write(
@@ -11991,6 +12006,7 @@ mod removal_supervisor_tests {
         let job = supervisor
             .exec_background(
                 None,
+                None,
                 ExecRequest {
                     command: ExecCommand::Argv(vec![CommandArg::new("waiting-child")]),
                     cwd: None,
@@ -12561,6 +12577,7 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
 #[cfg(target_os = "macos")]
 async fn task_inputs(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
     task: String,
     hash: String,
 ) -> Result<crate::api::dto::CacheMiss> {
@@ -12569,7 +12586,7 @@ async fn task_inputs(
         "exec node_modules/.bin/nx show target inputs '{}' --json",
         task.replace('\'', "'\\''")
     ));
-    let job = handle.exec(None, request).await?;
+    let job = handle.exec(None, build_volume, request).await?;
     let info = handle.wait(job).await?;
     let mut stdout = Vec::new();
     let mut offset = 0_u64;
@@ -13292,7 +13309,10 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
     })
 }
 
+/// `build_volume_mount` is the checkout's build volume as resolved now
+/// ([`super::build_volumes::BuildVolumes::grant`]); a grant-only validation passes `None`.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn supervisor_sandbox(
     home: &Path,
     layout: &crate::storage::StorageLayout,
@@ -13301,6 +13321,7 @@ fn supervisor_sandbox(
     grants: &GrantSet,
     mount: PathBuf,
     main_mount: PathBuf,
+    build_volume_mount: Option<PathBuf>,
 ) -> Result<crate::sandbox::SandboxConfig> {
     let repository = main_cowshed_config(&main_mount)?;
     crate::sandbox::workspace_sandbox(crate::sandbox::WorkspaceSandbox {
@@ -13312,7 +13333,7 @@ fn supervisor_sandbox(
         grants,
         repository_deny: repository.sandbox_deny(),
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
-        build_volume_mount: None,
+        build_volume_mount,
         workspace_mount: mount,
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)

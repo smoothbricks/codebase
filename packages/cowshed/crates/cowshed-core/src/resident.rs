@@ -18,7 +18,11 @@
 //! What a resident answer does not re-check is what the serving supervisor already proved when
 //! it started: the project binding it opened under. A binding changes only through a cowshed
 //! verb, which changes the records read here; a Git remote edited by hand is reconciled by the
-//! next verb that opens the controller.
+//! next verb that opens the controller. Nor does it refresh the checkout's build state (the
+//! controller's `refresh_build_state`): it grants the volume the build link names when that
+//! volume's record says it is this workspace's and it is mounted, and declines otherwise. A
+//! build-state path discovered or displaced since the last controller verb is linked by the next
+//! one.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +69,9 @@ pub enum Decline {
     Unserved,
     /// The supervisor serves another incarnation or grant revision than the records name.
     ServesOtherAuthority,
+    /// The build link names a volume that is not this workspace's, or is not mounted: mounting
+    /// through the controller resolves it.
+    BuildVolume,
 }
 
 impl Decline {
@@ -80,6 +87,7 @@ impl Decline {
             Self::StaleMount => "the mounted image is not the workspace's active incarnation",
             Self::Unserved => "no supervisor serves the workspace",
             Self::ServesOtherAuthority => "the supervisor serves another authority",
+            Self::BuildVolume => "the build link needs the controller to resolve it",
         }
     }
 }
@@ -135,6 +143,9 @@ pub struct Resident {
     pub workspace: WorkspaceName,
     pub mount: PathBuf,
     pub base_commit: Option<GitOid>,
+    /// The mountpoint of the workspace's own build volume, the grant its jobs run with
+    /// (`WorkspaceSupervisorHandle::exec`); `None` when the checkout links none.
+    pub build_volume: Option<PathBuf>,
     /// Calls reach the serving supervisor under the authority it reported.
     pub supervisor: WorkspaceSupervisorHandle,
     socket: PathBuf,
@@ -267,6 +278,7 @@ pub async fn resolve(
         // call names the one it reports.
         lifecycle_revision: 0,
     };
+    let build_volume = build_volume_grant(project, workspace, &mount, probe)?;
     drop(workspace_span);
     let socket = supervisor_socket::socket_path(store_root, &repo, workspace);
     let hello = crate::timing::spanned("resident", "hello", probe.hello(&socket))
@@ -280,9 +292,41 @@ pub async fn resolve(
         workspace: workspace.clone(),
         mount,
         base_commit,
+        build_volume,
         supervisor: supervisor_socket::connect(socket.clone(), hello.authority),
         socket,
     })
+}
+
+/// The build-volume grant of `workspace` mounted at `mount`, as the controller would resolve it
+/// (`BuildVolumes::grant`): the volume its build link names, when that volume's record says it
+/// is the workspace's live volume and it is mounted. A link the controller would re-point, or a
+/// volume it would mount, declines.
+fn build_volume_grant(
+    project: &crate::repository::ProjectPaths,
+    workspace: &WorkspaceName,
+    mount: &Path,
+    probe: &impl LiveProbe,
+) -> Result<Option<PathBuf>, Decline> {
+    use crate::build_volume::{BuildVolumeLayout, BuildVolumeRole, link};
+    let Some(target) = link::linked(mount).map_err(|_| Decline::Records)? else {
+        return Ok(None);
+    };
+    let layout = BuildVolumeLayout::new(project).map_err(|_| Decline::Records)?;
+    let id = layout.volume_at(&target).ok_or(Decline::BuildVolume)?;
+    let record = layout
+        .read_record_present(&id)
+        .map_err(|_| Decline::Records)?
+        .ok_or(Decline::BuildVolume)?;
+    let volume = layout.mount(&id);
+    match record.role {
+        BuildVolumeRole::Linked { checkout } if checkout == *workspace => {}
+        _ => return Err(Decline::BuildVolume),
+    }
+    if !probe.mounted_at(&volume) {
+        return Err(Decline::BuildVolume);
+    }
+    Ok(Some(volume))
 }
 
 /// The nearest ancestor of `start` holding `.git`, as Git's discovery finds it: the walk stops

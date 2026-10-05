@@ -176,10 +176,16 @@ async fn run(
     stdout: &mut (dyn Write + Send),
     stderr: &mut (dyn Write + Send),
 ) -> Result<ExecResult> {
+    let build_volume = resident.build_volume.clone();
     let link = JobLink::new(resident);
     // Admission is where a refusal can still mean nothing ran; after it, every failure is this
     // job's and is reported, never retried through the controller.
-    let job = spanned("resident", "submit", link.handle.exec(None, request)).await?;
+    let job = spanned(
+        "resident",
+        "submit",
+        link.handle.exec(None, build_volume, request),
+    )
+    .await?;
     if background {
         let info = link.clone().info(job).await?;
         return Ok(ExecResult {

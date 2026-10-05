@@ -1967,31 +1967,41 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Admit `request` with `build_volume`, the mountpoint of the checkout's build volume the
+    /// controller resolved for this job (`None` when the checkout links none): the job's
+    /// sandbox grants exactly that volume (16_build_volumes.md, "Process lifetime across a
+    /// swap").
     pub async fn exec(
         &self,
         session: Option<&SessionToken>,
+        build_volume: Option<PathBuf>,
         request: ExecRequest,
     ) -> Result<JobId> {
-        self.exec_admitted(session, request, false).await
+        self.exec_admitted(session, build_volume, request, false)
+            .await
     }
 
     pub async fn exec_background(
         &self,
         session: Option<&SessionToken>,
+        build_volume: Option<PathBuf>,
         request: ExecRequest,
     ) -> Result<JobId> {
-        self.exec_admitted(session, request, true).await
+        self.exec_admitted(session, build_volume, request, true)
+            .await
     }
 
     async fn exec_admitted(
         &self,
         session: Option<&SessionToken>,
+        build_volume: Option<PathBuf>,
         request: ExecRequest,
         background: bool,
     ) -> Result<JobId> {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
             session: session.cloned(),
+            build_volume,
             request: Box::new(request),
             background,
             reply,
@@ -2280,6 +2290,7 @@ pub(super) enum Command {
     Exec {
         authority: WorkspaceAuthoritySnapshot,
         session: Option<SessionToken>,
+        build_volume: Option<PathBuf>,
         request: Box<ExecRequest>,
         background: bool,
         reply: oneshot::Sender<Result<JobId>>,
@@ -2637,12 +2648,13 @@ impl SupervisorActor {
             Command::Exec {
                 authority,
                 session,
+                build_volume,
                 request,
                 background,
                 reply,
             } => {
                 let result = self
-                    .admit_exec(authority, session, *request, background)
+                    .admit_exec(authority, session, build_volume, *request, background)
                     .await;
                 let _ = reply.send(result);
             }
@@ -2951,11 +2963,12 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// Admit and spawn one job.
+    /// Admit and spawn one job, granted `build_volume`.
     async fn admit_exec(
         &mut self,
         authority: WorkspaceAuthoritySnapshot,
         session: Option<SessionToken>,
+        build_volume: Option<PathBuf>,
         request: ExecRequest,
         background: bool,
     ) -> Result<JobId> {
@@ -2974,7 +2987,17 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
-
+        // The checkout's build volume moved (a land adopted another, a mount re-pointed a stale
+        // link): this job and every later one, the Nx daemon keeper's included, run with the
+        // volume the controller resolved. A running job keeps the profile it was spawned with,
+        // so it stays on its old volume until it exits; nothing is relaunched.
+        if build_volume != self.policy.ceiling().build_volume_mount {
+            let _span = crate::timing::span("admit", "build-volume-profile");
+            self.policy = SandboxPolicy::render(SandboxConfig {
+                build_volume_mount: build_volume,
+                ..self.policy.ceiling().clone()
+            })?;
+        }
         let ExecRequest {
             command,
             cwd,
@@ -3226,7 +3249,12 @@ impl SupervisorActor {
         }
         let authority = self.authority.clone();
         let started = match super::nx_daemon::start_request(&self.workspace_root, &project_root) {
-            Ok(request) => self.admit_exec(authority, None, request, true).await,
+            Ok(request) => {
+                // The daemon follows the volume the last controller-admitted job was granted.
+                let build_volume = self.policy.ceiling().build_volume_mount.clone();
+                self.admit_exec(authority, None, build_volume, request, true)
+                    .await
+            }
             Err(error) => Err(error),
         };
         match started {

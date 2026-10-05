@@ -251,6 +251,8 @@ enum Call {
     #[serde(rename_all = "camelCase")]
     Exec {
         session: Option<SessionWire>,
+        /// The build volume the caller resolved for this job (`WorkspaceSupervisorHandle::exec`).
+        build_volume: Option<PathBuf>,
         background: bool,
         request: Box<ExecWire>,
     },
@@ -1001,6 +1003,7 @@ async fn answer(
         }
         Call::Exec {
             session: wire,
+            build_volume,
             background,
             request,
         } => {
@@ -1034,9 +1037,13 @@ async fn answer(
             };
             let session = wire.map(session);
             let job_id = if background {
-                supervisor.exec_background(session.as_ref(), exec).await?
+                supervisor
+                    .exec_background(session.as_ref(), build_volume, exec)
+                    .await?
             } else {
-                supervisor.exec(session.as_ref(), exec).await?
+                supervisor
+                    .exec(session.as_ref(), build_volume, exec)
+                    .await?
             };
             if let Some(writer) = writer {
                 lock(streams).insert(job_id, writer);
@@ -1480,10 +1487,22 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         Command::Exec {
             authority,
             session,
+            build_volume,
             request,
             background,
             reply,
-        } => forward_exec(path, authority, session, *request, background, reply).await,
+        } => {
+            forward_exec(
+                path,
+                authority,
+                session,
+                build_volume,
+                *request,
+                background,
+                reply,
+            )
+            .await;
+        }
         Command::StdinWrite {
             authority,
             job_id,
@@ -1615,6 +1634,7 @@ async fn forward_exec(
     path: &Path,
     authority: WorkspaceAuthoritySnapshot,
     session: Option<SessionToken>,
+    build_volume: Option<PathBuf>,
     request: ExecRequest,
     background: bool,
     reply: oneshot::Sender<Result<JobId>>,
@@ -1635,6 +1655,7 @@ async fn forward_exec(
     };
     let call_request = Call::Exec {
         session: session.as_ref().map(SessionWire::from),
+        build_volume,
         background,
         request: Box::new(ExecWire {
             argv,
