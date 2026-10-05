@@ -779,6 +779,12 @@ pub fn seatbelt_profile(
     // stay hard denies, which follow every grant below.
     let contribution = &config.capabilities.contribution;
     for mount in &contribution.cache_mounts {
+        // Tools canonicalize new cache paths through these physical ancestors. Their
+        // metadata must not depend on another capability's socket grant; store data
+        // and all sibling subtrees remain denied.
+        for ancestor in mount.source.ancestors().skip(1) {
+            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
+        }
         push_subpath_rule(&mut profile, "allow file-read* file-write*", &mount.source)?;
     }
     for grant in &contribution.grants {
@@ -2212,6 +2218,26 @@ mod tests {
                 "{source} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn capability_cache_paths_are_resolvable_without_reading_the_store() {
+        let config = with_contribution(Vec::new(), &["/private/cowshed/caches/cargo/git"]);
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let deny = profile
+            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
+            .unwrap();
+        let metadata = profile
+            .find("(allow file-read-metadata (literal \"/private/cowshed\"))")
+            .expect("a tool must canonicalize its cache path without an unrelated socket grant");
+        assert!(
+            metadata > deny,
+            "cache ancestor metadata follows the store deny"
+        );
+        assert!(!profile.contains("(allow file-read* (literal \"/private/cowshed\"))"));
+        assert!(profile.contains(
+            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/git\"))"
+        ));
     }
 
     #[test]

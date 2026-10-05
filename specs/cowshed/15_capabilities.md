@@ -111,6 +111,11 @@ Host setup can relocate declared cache descriptors globally so host checkouts an
 spellings. Descriptor declarations live with their detectors; host preparation does not enable a capability in a
 repository. Cargo's cache locks remain part of its detector's host relocation operation.
 
+Shared cache mounts grant metadata-only access to their physical ancestors, after the store-wide deny. Cargo/libgit2
+canonicalizes a newly fetched Git cache path; a writable cache subtree is insufficient when `/private/cowshed` itself
+cannot be inspected. This authority comes from the cache mount, never an unrelated daemon socket, and does not allow
+reading or writing controller state.
+
 ## Ordering and conflicts
 
 The registry has a stable order: direnv, Nx, cargo, Go, Bun, npm, pnpm, uv, Zig, Gradle, Nix, sccache, codegraph.
