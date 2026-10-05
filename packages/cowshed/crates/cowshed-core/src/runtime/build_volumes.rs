@@ -16,9 +16,10 @@ use crate::api::dto::{
     AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, Sha256Digest,
 };
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState, link,
-    nx,
+    BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
+    BuildVolumeState, TrackedBuildStateRefusal, link, nx,
 };
+use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{BuildVolumeRelease, MacOsApfsExecutionHost};
@@ -49,6 +50,19 @@ pub(crate) struct Quiet {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
+}
+
+/// What capability detection says about a checkout's build state, for [`BuildVolumes::refresh`].
+#[derive(Clone, Debug)]
+pub(crate) enum Discovered {
+    /// The tracked build inputs still have the fingerprint the volume's state records.
+    Unchanged,
+    /// Discovery ran at `fingerprint` and named `paths`; a first volume gets `capacity`.
+    Changed {
+        paths: Vec<BuildStatePath>,
+        fingerprint: String,
+        capacity: ImageCapacity,
+    },
 }
 
 /// What collection found and did.
@@ -99,6 +113,124 @@ impl BuildVolumes {
         })
     }
 
+    /// The volume `checkout` links and the state written at its root, or `None` when it links
+    /// none. The checkout is mounted, which mounted its volume.
+    pub fn state_of(&self, checkout: &Path) -> Result<Option<(BuildVolumeId, BuildVolumeState)>> {
+        let Some(id) = self.linked(checkout)? else {
+            return Ok(None);
+        };
+        let state = BuildVolumeState::read(&self.layout.mount(&id))?;
+        Ok(Some((id, state)))
+    }
+
+    /// The mountpoint of the volume `workspace`'s mounted `checkout` links, verified as the
+    /// workspace's own by its record: the build-volume grant a job of the checkout runs with.
+    /// `None` when the checkout links no volume. Mounting already re-pointed a stale link, so
+    /// a link that still names a volume the workspace does not own is an integrity failure,
+    /// never a grant.
+    pub fn grant(&self, workspace: &WorkspaceName, checkout: &Path) -> Result<Option<PathBuf>> {
+        let Some(id) = self.linked(checkout)? else {
+            return Ok(None);
+        };
+        match self.layout.resolve_link(workspace, &id)? {
+            crate::build_volume::LinkResolution::Keep => Ok(Some(self.layout.mount(&id))),
+            resolution => Err(CowshedError::integrity(
+                format!(
+                    "{workspace}'s mounted build link names {id}, which mounting should have \
+                     resolved ({resolution:?})"
+                ),
+                format!("cowshed detach {workspace}, then retry"),
+            )),
+        }
+    }
+
+    /// Bring `checkout`'s build volume in line with what capability detection names now
+    /// (16_build_volumes.md, "One link per checkout"). With `Discovered::Unchanged` the held
+    /// paths are re-linked where a tool displaced them. With fresh discovery, new paths join the
+    /// volume's state (held ones never move), every path is linked, and the state records the new
+    /// fingerprint; a checkout that links no volume yet gets its first one at `capacity`, unless
+    /// nothing was discovered. A path that holds tracked source refuses before anything is
+    /// deleted.
+    pub async fn refresh(
+        &self,
+        workspace: WorkspaceName,
+        checkout: PathBuf,
+        discovered: Discovered,
+    ) -> Result<std::result::Result<BuildStateRefresh, TrackedBuildStateRefusal>> {
+        let linked = self.linked(&checkout)?;
+        self.blocking(move |host, layout| {
+            let (id, discovered) = match (linked, discovered) {
+                (Some(id), discovered) => (id, discovered),
+                (None, Discovered::Unchanged) => return Ok(Ok(BuildStateRefresh::default())),
+                (None, Discovered::Changed { paths, .. }) if paths.is_empty() => {
+                    return Ok(Ok(BuildStateRefresh::default()));
+                }
+                (
+                    None,
+                    Discovered::Changed {
+                        paths,
+                        fingerprint,
+                        capacity,
+                    },
+                ) => {
+                    let touched = crate::build_volume::migrate::first_touch(
+                        host,
+                        layout,
+                        crate::build_volume::migrate::FirstTouch {
+                            checkout: &checkout,
+                            paths: &paths,
+                            fingerprint,
+                            capacity,
+                            record: BuildVolumeRecord::new(
+                                None,
+                                BuildVolumeRole::Linked {
+                                    checkout: workspace,
+                                },
+                            ),
+                        },
+                    )?;
+                    return Ok(touched.map(|(id, displaced)| BuildStateRefresh {
+                        volume: Some(id),
+                        created: true,
+                        added: paths
+                            .iter()
+                            .map(|path| path.checkout.as_path().to_owned())
+                            .collect(),
+                        displaced,
+                        findings: Vec::new(),
+                    }));
+                }
+            };
+            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let held = BuildVolumeState::read(&mount)?;
+            let (state, added) = match discovered {
+                Discovered::Unchanged => (held.clone(), Vec::new()),
+                Discovered::Changed {
+                    paths, fingerprint, ..
+                } => held.with_discovered(&paths, fingerprint, &mount)?,
+            };
+            let displaced =
+                match crate::build_volume::migrate::adopt_paths(&checkout, &mount, &state.paths)? {
+                    Ok(displaced) => displaced,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+            if state != held {
+                state.write(&mount)?;
+            }
+            Ok(Ok(BuildStateRefresh {
+                volume: Some(id),
+                created: false,
+                added: added
+                    .iter()
+                    .map(|path| path.checkout.as_path().to_owned())
+                    .collect(),
+                displaced,
+                findings: Vec::new(),
+            }))
+        })
+        .await
+    }
+
     /// Fork (16_build_volumes.md, "Fork"): the checkout staged at `checkout`, which `destination`
     /// is about to become, gets its own clone of `source`'s latest seed, mounted, with no daemon
     /// record, and linked; and `destination` gets its own seed, a second clone of the same seed,
@@ -140,23 +272,18 @@ impl BuildVolumes {
                 ),
             )
             .map_err(storage)?;
-            let live = BuildVolumeId::mint();
-            host.clone_build_volume(
-                layout,
-                &seed,
-                &live,
-                &BuildVolumeRecord::new(
-                    record.tree,
-                    BuildVolumeRole::Linked {
-                        checkout: destination.name.clone(),
-                    },
-                ),
-            )
-            .map_err(storage)?;
-            let mount = host.mount_build_volume(layout, &live).map_err(storage)?;
-            let state = BuildVolumeState::read(&mount)?;
-            nx::discard_daemon_records(&mount, &state)
-                .map_err(|error| io("discard the seed's Nx daemon record", &mount, &error))?;
+            let (live, mount) = host
+                .fork_build_volume(
+                    layout,
+                    &seed,
+                    &BuildVolumeRecord::new(
+                        record.tree,
+                        BuildVolumeRole::Linked {
+                            checkout: destination.name.clone(),
+                        },
+                    ),
+                )
+                .map_err(storage)?;
             link::point(&checkout, &mount)?;
             crate::timing::event("build-volume", || {
                 format!(
@@ -171,24 +298,45 @@ impl BuildVolumes {
     }
 
     /// Land step 4, after the landing workspace's supervisor has stopped its jobs: the landing
-    /// volume's Nx daemon is stopped and its task database must have no holder left.
+    /// volume's Nx daemon is stopped and its task database must have no holder left. The quiet
+    /// volume then grows to the target's capacity when it is smaller, before the seed is frozen
+    /// from it, so an adoption never shrinks the target and the seed inherits the larger cap: a
+    /// workspace forked before a resize of its target lands at the target's capacity.
     pub async fn quiesce(
         &self,
         checkout: PathBuf,
+        target_checkout: PathBuf,
     ) -> Result<std::result::Result<Quiet, AdoptionSkip>> {
         let id = self.linked(&checkout)?;
+        let target = self.linked(&target_checkout)?;
         self.blocking(move |host, layout| {
             let Some(id) = id else {
                 return Ok(Err(AdoptionSkip::NoLandingVolume));
             };
             let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
-            match nx::close(&mount, &state)
+            if let Err(busy) = nx::close(&mount, &state)
                 .map_err(|error| io("close the landing volume's Nx state", &mount, &error))?
             {
-                Ok(()) => Ok(Ok(Quiet { id, mount, state })),
-                Err(busy) => Ok(Err(skip(busy, Side::Landing))),
+                return Ok(Err(skip(busy, Side::Landing)));
             }
+            if let Some(target) = target {
+                let capacity = host
+                    .build_volume_capacity(layout, &target)
+                    .map_err(storage)?;
+                match host.resize_build_volume(layout, &id, capacity) {
+                    Ok(_) | Err(ApfsStorageError::CapacityNotGrowing { .. }) => {}
+                    Err(ApfsStorageError::Apfs(error))
+                        if crate::apfs::detach_was_dissented(&error) =>
+                    {
+                        return Ok(Err(AdoptionSkip::LandingVolumeBusy {
+                            reason: error.to_string(),
+                        }));
+                    }
+                    Err(error) => return Err(storage(error)),
+                }
+            }
+            Ok(Ok(Quiet { id, mount, state }))
         })
         .await
     }
@@ -308,23 +456,18 @@ impl BuildVolumes {
                         seed_of.name
                     ))
                 })?;
-            let live = BuildVolumeId::mint();
-            host.clone_build_volume(
-                layout,
-                &seed,
-                &live,
-                &BuildVolumeRecord::new(
-                    record.tree,
-                    BuildVolumeRole::Linked {
-                        checkout: workspace,
-                    },
-                ),
-            )
-            .map_err(storage)?;
-            let mount = host.mount_build_volume(layout, &live).map_err(storage)?;
-            let state = BuildVolumeState::read(&mount)?;
-            nx::discard_daemon_records(&mount, &state)
-                .map_err(|error| io("discard the seed's Nx daemon record", &mount, &error))?;
+            let (_, mount) = host
+                .fork_build_volume(
+                    layout,
+                    &seed,
+                    &BuildVolumeRecord::new(
+                        record.tree,
+                        BuildVolumeRole::Linked {
+                            checkout: workspace,
+                        },
+                    ),
+                )
+                .map_err(storage)?;
             link::point(&checkout, &mount)
         })
         .await

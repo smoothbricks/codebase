@@ -33,6 +33,27 @@ pub enum BuildStateFinding {
     },
 }
 
+impl std::fmt::Display for BuildStateFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CargoUnavailable {
+                manifest,
+                phase,
+                cause,
+            } => write!(
+                formatter,
+                "Cargo could not name the {} of {}, so its target directory is not on the build \
+                 volume: {cause}",
+                match phase {
+                    CargoDiscoveryPhase::WorkspaceRoot => "workspace root",
+                    CargoDiscoveryPhase::Metadata => "target directory",
+                },
+                manifest.display()
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildStateDiscovery {
     pub paths: Vec<BuildStatePath>,

@@ -4179,6 +4179,20 @@ where
                 let mount = self.mount_build_volume(&layout, &own)?;
                 crate::build_volume::link::point(checkout, &mount).map_err(host)
             }
+            crate::build_volume::LinkResolution::Refork(seed) => {
+                let tree = layout.read_record(&seed).map_err(host)?.tree;
+                let (_, mount) = self.fork_build_volume(
+                    &layout,
+                    &seed,
+                    &crate::build_volume::BuildVolumeRecord::new(
+                        tree,
+                        crate::build_volume::BuildVolumeRole::Linked {
+                            checkout: workspace.name().clone(),
+                        },
+                    ),
+                )?;
+                crate::build_volume::link::point(checkout, &mount).map_err(host)
+            }
         }
     }
 

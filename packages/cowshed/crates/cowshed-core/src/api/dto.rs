@@ -2718,6 +2718,10 @@ pub enum AdoptionSkip {
     },
     /// The target's Nx daemon outlived its stop.
     TargetDaemonStayed { daemon: DatabaseHolder },
+    /// The landing volume had to grow to the target's capacity before the target adopts it,
+    /// and the kernel refused to let go of it: a process still has a file or its working
+    /// directory in it.
+    LandingVolumeBusy { reason: String },
 }
 
 impl AdoptionSkip {
@@ -2730,6 +2734,7 @@ impl AdoptionSkip {
             Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
             Self::TargetHeld { .. } => "targetHeld",
             Self::TargetDaemonStayed { .. } => "targetDaemonStayed",
+            Self::LandingVolumeBusy { .. } => "landingVolumeBusy",
         }
     }
 }
@@ -2780,6 +2785,10 @@ impl fmt::Display for AdoptionSkip {
                 },
                 daemon.pid,
                 daemon.command
+            ),
+            Self::LandingVolumeBusy { reason } => write!(
+                formatter,
+                "the landing build volume could not grow to the target's capacity: {reason}"
             ),
         }
     }

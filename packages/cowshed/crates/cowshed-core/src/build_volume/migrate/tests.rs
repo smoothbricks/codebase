@@ -384,7 +384,7 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     );
     fs::remove_file(mount.join(super::super::STATE_FILE)).unwrap();
     for _ in 0..2 {
-        let linked = first_touch(
+        let (linked, _) = first_touch(
             &host,
             &layout,
             FirstTouch {

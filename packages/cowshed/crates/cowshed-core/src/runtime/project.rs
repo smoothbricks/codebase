@@ -212,6 +212,18 @@ pub trait ProjectRuntimeHost: Send + 'static {
     ) -> Result<PushReport>;
     async fn repo_mirror(&mut self, workspace: WorkspaceName, url: Url) -> Result<MirrorInfo>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
+    /// Bring the mounted `workspace`'s build volume in line with what capability detection names
+    /// now (16_build_volumes.md, "One link per checkout"): its first volume when it has none,
+    /// newly discovered paths linked, displaced links restored. Exec, land checks and the
+    /// adoption check run it first; `cowshed setup` runs it for every mounted workspace.
+    async fn refresh_build_state(
+        &mut self,
+        _workspace: WorkspaceName,
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
+        Err(CowshedError::internal(
+            "build volumes are unavailable for this runtime host",
+        ))
+    }
 
     async fn open_worker(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot>;
     async fn open_session(
@@ -695,6 +707,33 @@ impl ProjectRuntime {
             .map(|_| ())
     }
 
+    /// Refresh the mounted `workspace`'s build state ([`ProjectRuntimeHost::refresh_build_state`]):
+    /// what `cowshed setup` runs for each mounted workspace.
+    pub async fn refresh_build_state(
+        &self,
+        workspace: &WorkspaceName,
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
+        let (result, _) = self
+            .router
+            .route(
+                ConnectionAuthority::Coordinator {
+                    repo_id: self.descriptor.repo_id.clone(),
+                },
+                "coordinator.refreshBuildState".to_owned(),
+                json!({
+                    "repoId": self.descriptor.repo_id,
+                    "workspace": workspace,
+                }),
+                None,
+                None,
+            )
+            .await?
+            .into_parts();
+        serde_json::from_value(result).map_err(|error| {
+            CowshedError::internal(format!("decode the build-state refresh: {error}"))
+        })
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         drop(self.router);
         self.actor
@@ -800,6 +839,7 @@ impl ProjectActor {
             "coordinator.resize" => self.coordinator_resize(request).await,
             "coordinator.defragment" => self.coordinator_defragment(request).await,
             "coordinator.detach" => self.coordinator_detach(request).await,
+            "coordinator.refreshBuildState" => self.coordinator_refresh_build_state(request).await,
             "coordinator.serveSupervisor" => self.coordinator_serve_supervisor(request).await,
             "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
             "coordinator.destroy" => self.coordinator_destroy(request).await,
@@ -1083,6 +1123,16 @@ impl ProjectActor {
         self.require_repo(&params.repo_id)?;
         self.host.serve_supervisor(params.workspace).await?;
         json_response(EmptyResult {})
+    }
+
+    async fn coordinator_refresh_build_state(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        json_response(self.host.refresh_build_state(params.workspace).await?)
     }
 
     async fn coordinator_resize(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -3644,11 +3694,16 @@ impl NativeProjectRuntimeHost {
         let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
         drop(stopped);
-        let quiet =
-            match timed_async("land", "quiesce", volumes.quiesce(landing.to_owned())).await? {
-                Ok(quiet) => quiet,
-                Err(reason) => return Ok(skipped(reason)),
-            };
+        let quiet = match timed_async(
+            "land",
+            "quiesce",
+            volumes.quiesce(landing.to_owned(), into.mount.clone()),
+        )
+        .await?
+        {
+            Ok(quiet) => quiet,
+            Err(reason) => return Ok(skipped(reason)),
+        };
         let tree = git_revision_oid(landing, "HEAD^{tree}").await?;
         let target = self.current(&into.name).await?;
         let owner = super::build_volumes::Owner {
@@ -3702,6 +3757,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<crate::api::dto::AdoptionCheck> {
         use crate::build_volume::nx::{Attribution, CacheStatus, attribute};
         let mut result = crate::api::dto::AdoptionCheck::default();
+        let (handle, _build_volume) = self.admit_build_state(target).await?;
         let state = crate::build_volume::BuildVolumeState::read(
             &mount.join(crate::build_volume::BUILD_LINK),
         )?;
@@ -3719,7 +3775,6 @@ impl NativeProjectRuntimeHost {
             })
             .map(|path| path.checkout.as_path().to_owned())
             .collect::<Vec<_>>();
-        let handle = self.ensure_supervisor(target).await?;
         for check in checks {
             let spawned = std::time::SystemTime::now();
             let job = handle.exec(None, land_check_request(check)).await?;
@@ -3769,6 +3824,114 @@ impl NativeProjectRuntimeHost {
             }
         }
         Ok(result)
+    }
+
+    /// Refresh `current`'s build state at its mounted checkout `mount`
+    /// ([`ProjectRuntimeHost::refresh_build_state`]). Detection reads the same canonical context
+    /// the supervisor's capability admission reads, and Cargo is asked in the same environment a
+    /// job gets, without the caller's: a `CARGO_TARGET_DIR` of the controller's shell names no
+    /// checkout's build state. Discovery runs only when the tracked build inputs' fingerprint
+    /// moved off the one the volume's state records; otherwise only displaced links are restored.
+    async fn refresh_build_state_for(
+        &self,
+        current: &NativeWorkspace,
+        mount: &Path,
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
+        use super::build_volumes::Discovered;
+        let name = current.derived.workspace.name().clone();
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
+        let sandbox = supervisor_sandbox(
+            &self.home,
+            &self.layout,
+            &self.telemetry_root,
+            current,
+            &grants,
+            mount.to_owned(),
+            main_mount.clone(),
+        )?;
+        let volumes = self.build_volumes()?;
+        let (fingerprint, recorded) = {
+            let (sandbox, volumes, mount) = (sandbox.clone(), volumes.clone(), mount.to_owned());
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let fingerprint = sandbox.with_detection_context(
+                    &mount,
+                    crate::capabilities::tracked_manifest_fingerprint,
+                )?;
+                Ok::<_, CowshedError>((fingerprint, volumes.state_of(&mount)?))
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("build state task failed: {error}"))
+            })??
+        };
+        let unchanged = recorded
+            .as_ref()
+            .is_some_and(|(_, state)| state.fingerprint.as_deref() == Some(fingerprint.as_str()));
+        let (discovered, findings) = if unchanged {
+            (Discovered::Unchanged, Vec::new())
+        } else {
+            let environment =
+                super::supervisor::job_environment(&sandbox, &std::collections::BTreeMap::new())
+                    .await?;
+            let discovery = {
+                let mount = mount.to_owned();
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    sandbox.with_detection_context(&mount, |context| {
+                        crate::capabilities::discover_build_state(context, &environment)
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("build state discovery failed: {error}"))
+                })??
+            };
+            (
+                Discovered::Changed {
+                    paths: discovery.paths,
+                    fingerprint,
+                    capacity: main_cowshed_config(&main_mount)?.build_capacity(),
+                },
+                discovery.findings,
+            )
+        };
+        let mut refresh = volumes
+            .refresh(name.clone(), mount.to_owned(), discovered)
+            .await?
+            .map_err(|refusal| {
+                CowshedError::conflict(
+                    format!("{name}: {refusal}"),
+                    "move the tracked files out of that build-state path, or configure the tool \
+                     to keep its state elsewhere, then retry",
+                )
+            })?;
+        refresh.findings = findings;
+        for displaced in &refresh.displaced {
+            eprintln!("cowshed: {name}: {displaced}");
+        }
+        for finding in &refresh.findings {
+            eprintln!("cowshed: {name}: {finding}");
+        }
+        Ok(refresh)
+    }
+
+    /// Before a job of `workspace` is admitted: its supervisor, its build state refreshed, and
+    /// the build-volume grant the job runs with, resolved now (16_build_volumes.md, "Process
+    /// lifetime across a swap"): a job keeps the volume it was admitted on, and one admitted
+    /// after an adoption gets the adopted one, without relaunching the supervisor.
+    async fn admit_build_state(
+        &mut self,
+        workspace: &WorkspaceName,
+    ) -> Result<(
+        super::supervisor::WorkspaceSupervisorHandle,
+        Option<PathBuf>,
+    )> {
+        let handle = self.ensure_supervisor(workspace).await?;
+        let current = self.current(workspace).await?;
+        let mount = self.workspace_mount_path(workspace)?;
+        self.refresh_build_state_for(&current, &mount).await?;
+        let grant = self.build_volumes()?.grant(workspace, &mount)?;
+        Ok((handle, grant))
     }
 
     /// Give `workspace` the stable mount path of `slot`.
@@ -9286,7 +9449,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             "land target",
         )?;
         let retire = options.retire;
-        let handle = timed_async("land", "supervisor", self.ensure_supervisor(&workspace)).await?;
+        let (handle, _build_volume) =
+            timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
         let checks = options.check.unwrap_or_default();
         for check in &checks {
             let job_id = timed_async(
@@ -9520,6 +9684,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
     async fn serve_supervisor(&mut self, workspace: WorkspaceName) -> Result<()> {
         self.serve_supervisor_until_retired(workspace).await
+    }
+
+    async fn refresh_build_state(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        // Mounting is the supervisor's (it advances the gateway revision of a workspace it
+        // attaches), so a detached workspace is refused rather than mounted behind its back.
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} is detached; its build link cannot be read"),
+                format!("cowshed attach {workspace}, then retry"),
+            ));
+        }
+        let mount = self.workspace_mount_path(&workspace)?;
+        self.refresh_build_state_for(&current, &mount).await
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
@@ -10096,10 +10281,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();
-        self.ensure_supervisor(&workspace)
-            .await?
-            .exec(token.as_ref(), request)
-            .await
+        let (handle, _build_volume) = self.admit_build_state(&workspace).await?;
+        handle.exec(token.as_ref(), request).await
     }
 
     async fn stdin_write(

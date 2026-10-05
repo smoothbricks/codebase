@@ -126,6 +126,25 @@ where
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
+    /// A new live volume cloned from `seed` with `record`, mounted, without the seed's Nx daemon
+    /// record (16_build_volumes.md, "Fork" steps 2 and 3): a daemon record names another
+    /// checkout's process. The caller points a checkout's link at the answered mountpoint.
+    pub fn fork_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+        record: &BuildVolumeRecord,
+    ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
+        let live = BuildVolumeId::mint();
+        self.clone_build_volume(layout, seed, &live, record)?;
+        let mount = self.mount_build_volume(layout, &live)?;
+        let state = crate::build_volume::BuildVolumeState::read(&mount)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        crate::build_volume::nx::discard_daemon_records(&mount, &state)
+            .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
+        Ok((live, mount))
+    }
+
     /// Mount build volume `id` at its mountpoint, attaching it first when the kernel holds no
     /// attachment of it. Idempotent: a volume already mounted there is left as it is.
     pub fn mount_build_volume(
@@ -252,6 +271,17 @@ where
             }
         }
         Ok(())
+    }
+
+    /// The capacity build volume `id`'s image holds, attached or not.
+    pub fn build_volume_capacity(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<ImageCapacity, ApfsStorageError> {
+        let image = layout.image(id);
+        self.verify_controller_path(&image)?;
+        Ok(self.backend.image_capacity(&image)?)
     }
 
     /// Grow build volume `id`'s image to `capacity`: detached without force, grown, attached,

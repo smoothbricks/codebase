@@ -9,66 +9,16 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-use super::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState, link, nx};
+use super::{
+    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState,
+    DisplacedBuildStateFinding, TrackedBuildStateRefusal, link, nx,
+};
 use crate::apfs::SystemCommandRunner;
 use crate::capabilities::BuildStatePath;
 use crate::fork_lock::Run;
 use crate::metadata::ImageCapacity;
 use crate::storage::apfs::native::MacOsApfsExecutionHost;
 use crate::{CowshedError, Result};
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BuildStateTool {
-    Cargo,
-    Nx,
-    Codegraph,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DisplacedBuildStateFinding {
-    pub path: PathBuf,
-    pub likely_tool: BuildStateTool,
-}
-
-impl std::fmt::Display for DisplacedBuildStateFinding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tool = match self.likely_tool {
-            BuildStateTool::Cargo => "cargo clean or another Cargo command",
-            BuildStateTool::Nx => "an Nx reset or cache command",
-            BuildStateTool::Codegraph => "the indexer",
-        };
-        write!(
-            formatter,
-            "discarded the real build-state directory {} and restored its volume link; {tool} may have displaced it; the next build rebuilds what is missing",
-            self.path.display()
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrackedBuildStateRefusal {
-    pub path: PathBuf,
-    pub tracked_files: Vec<PathBuf>,
-}
-
-impl std::fmt::Display for TrackedBuildStateRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "refused to discard build-state path {} because it contains tracked source:",
-            self.path.display()
-        )?;
-        for path in &self.tracked_files {
-            write!(formatter, " {}", path.display())?;
-        }
-        Ok(())
-    }
-}
 
 pub struct FirstTouch<'a> {
     pub checkout: &'a Path,
@@ -78,11 +28,15 @@ pub struct FirstTouch<'a> {
     pub record: BuildVolumeRecord,
 }
 
+/// The checkout's first build volume (or the one an interrupted first touch already linked),
+/// with every contributed path linked into it, and the real directories it discarded.
 pub fn first_touch(
     host: &MacOsApfsExecutionHost<SystemCommandRunner>,
     layout: &BuildVolumeLayout,
     migration: FirstTouch<'_>,
-) -> Result<std::result::Result<BuildVolumeId, TrackedBuildStateRefusal>> {
+) -> Result<
+    std::result::Result<(BuildVolumeId, Vec<DisplacedBuildStateFinding>), TrackedBuildStateRefusal>,
+> {
     let FirstTouch {
         checkout,
         paths,
@@ -120,13 +74,11 @@ pub fn first_touch(
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _) = previous.with_discovered(paths, fingerprint, &mount)?;
-    for finding in adopt_preflighted(checkout, &mount, paths, &real)? {
-        eprintln!("cowshed: {finding}");
-    }
+    let displaced = adopt_preflighted(checkout, &mount, paths, &real)?;
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.write_record(&id, &record)?;
-    Ok(Ok(id))
+    Ok(Ok((id, displaced)))
 }
 
 /// Exact links are unchanged. Contributed real directories are discarded and relinked, never

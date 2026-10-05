@@ -302,6 +302,72 @@ fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> cr
     )
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuildStateTool {
+    Cargo,
+    Nx,
+    Codegraph,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplacedBuildStateFinding {
+    pub path: PathBuf,
+    pub likely_tool: BuildStateTool,
+}
+
+impl std::fmt::Display for DisplacedBuildStateFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tool = match self.likely_tool {
+            BuildStateTool::Cargo => "cargo clean or another Cargo command",
+            BuildStateTool::Nx => "an Nx reset or cache command",
+            BuildStateTool::Codegraph => "the indexer",
+        };
+        write!(
+            formatter,
+            "discarded the real build-state directory {} and restored its volume link; {tool} may have displaced it; the next build rebuilds what is missing",
+            self.path.display()
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackedBuildStateRefusal {
+    pub path: PathBuf,
+    pub tracked_files: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for TrackedBuildStateRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "refused to discard build-state path {} because it contains tracked source:",
+            self.path.display()
+        )?;
+        for path in &self.tracked_files {
+            write!(formatter, " {}", path.display())?;
+        }
+        Ok(())
+    }
+}
+
+/// What refreshing a checkout's build state did (16_build_volumes.md, "One link per checkout"):
+/// the volume it links afterwards, whether that volume was created now (the checkout's first
+/// touch), the build-state paths linked for the first time, the real directories a tool left
+/// where a link belongs, and what discovery could not decide.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildStateRefresh {
+    pub volume: Option<BuildVolumeId>,
+    pub created: bool,
+    /// Checkout-relative.
+    pub added: Vec<PathBuf>,
+    pub displaced: Vec<DisplacedBuildStateFinding>,
+    pub findings: Vec<crate::capabilities::BuildStateFinding>,
+}
+
 /// What a checkout's build link should become before its volume is mounted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkResolution {
@@ -309,6 +375,11 @@ pub enum LinkResolution {
     Keep,
     /// The link is stale; it names this volume, the one recorded as the checkout's.
     Repoint(BuildVolumeId),
+    /// The link names a volume a target adopted, and the checkout owns none: a `land
+    /// --no-retire` that stopped between the adoption and the landing workspace's refork. The
+    /// checkout takes a fresh clone of this seed, the adopting target's latest, exactly as the
+    /// refork would have given it.
+    Refork(BuildVolumeId),
 }
 
 /// Where one project's build volumes live.
@@ -444,27 +515,42 @@ impl BuildVolumeLayout {
     /// whose record is written last). Otherwise the link is stale: a restored checkpoint carries
     /// the link it had when taken, and an interrupted land can leave a target naming the
     /// landing volume before its record moved. It is then re-pointed at the one volume recorded
-    /// as `checkout`'s; none, or several, refuses, so a checkout never writes a volume another
-    /// checkout, a target or a seed owns.
+    /// as `checkout`'s. When `checkout` owns none and `linked` is another checkout's live
+    /// volume, a target adopted it from this checkout before a `land --no-retire` reforked it:
+    /// the checkout reforks from that target's latest seed. Anything else refuses, so a checkout
+    /// never writes a volume another checkout, a target or a seed owns.
     pub fn resolve_link(
         &self,
         checkout: &WorkspaceName,
         linked: &BuildVolumeId,
     ) -> crate::Result<LinkResolution> {
         let owns = |record: &BuildVolumeRecord| matches!(&record.role, BuildVolumeRole::Linked { checkout: owner } if owner == checkout);
-        match self.read_record_present(linked)? {
+        let adopter = match self.read_record_present(linked)? {
             Some(record) if owns(&record) => return Ok(LinkResolution::Keep),
             None if self.image(linked).exists() => return Ok(LinkResolution::Keep),
-            _ => {}
-        }
+            Some(BuildVolumeRecord {
+                role: BuildVolumeRole::Linked { checkout: adopter },
+                ..
+            }) => Some(adopter),
+            _ => None,
+        };
         let mut owned = Vec::new();
+        let mut adopter_seeds = Vec::new();
         for id in self.list()? {
-            if self
-                .read_record_present(&id)?
-                .is_some_and(|record| owns(&record))
-            {
-                owned.push(id);
+            match self.read_record_present(&id)? {
+                Some(record) if owns(&record) => owned.push(id),
+                Some(BuildVolumeRecord {
+                    role: BuildVolumeRole::Seed { target, .. },
+                    created_at,
+                    ..
+                }) if adopter.as_ref() == Some(&target) => adopter_seeds.push((created_at, id)),
+                _ => {}
             }
+        }
+        if owned.is_empty()
+            && let Some((_, seed)) = adopter_seeds.into_iter().max()
+        {
+            return Ok(LinkResolution::Refork(seed));
         }
         match owned.as_slice() {
             [id] => Ok(LinkResolution::Repoint(id.clone())),
@@ -784,6 +870,45 @@ mod tests {
         }
         let orphan = WorkspaceName::new("orphan").unwrap();
         let error = layout.resolve_link(&orphan, &adopted).unwrap_err();
+        assert!(error.message.contains("0 build volumes"), "{error:?}");
+
+        // A `land --no-retire` that stopped after main adopted the orphan's volume and before
+        // the orphan's refork: the orphan reforks from main's latest seed instead of refusing.
+        let seed = |created_at: &str| {
+            let id = volume(None);
+            layout
+                .write_record(
+                    &id,
+                    &BuildVolumeRecord {
+                        created_at: created_at.to_owned(),
+                        ..BuildVolumeRecord::new(
+                            None,
+                            BuildVolumeRole::Seed {
+                                target: WorkspaceName::main(),
+                                incarnation: crate::metadata::WorkspaceIncarnation::new(
+                                    "0".repeat(32),
+                                )
+                                .unwrap(),
+                            },
+                        )
+                    },
+                )
+                .unwrap();
+            id
+        };
+        seed("2026-10-05T00:00:00Z");
+        let latest = seed("2026-10-05T00:00:01Z");
+        assert_eq!(
+            layout.resolve_link(&orphan, &adopted).unwrap(),
+            LinkResolution::Refork(latest)
+        );
+        // A checkout that owns a volume is re-pointed at it, never reforked.
+        assert_eq!(
+            layout.resolve_link(&topic, &adopted).unwrap(),
+            LinkResolution::Repoint(own.clone())
+        );
+        // A link to a seed or a collected volume never reforks: nobody adopted it from here.
+        let error = layout.resolve_link(&orphan, &collected).unwrap_err();
         assert!(error.message.contains("0 build volumes"), "{error:?}");
         fs::remove_dir_all(&root).unwrap();
     }
