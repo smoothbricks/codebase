@@ -2475,6 +2475,97 @@ pub struct DefragmentResult {
     pub bytes: u64,
 }
 
+/// What `cowshed reseed` did with a target's seed (16_build_volumes.md, "Targets and seeds").
+/// Every fork of the target does the same before it clones the seed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReseedResult {
+    pub workspace: WorkspaceName,
+    pub outcome: Reseed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Reseed {
+    /// The target links no build volume: it has no seed to keep up.
+    NoBuildVolume,
+    /// The seed already holds every write the target's live build volume has had.
+    Fresh,
+    /// The seed is now a clone of the live volume. It was frozen `behindMs` before the live
+    /// volume's last write, or the target had none (`behindMs` absent).
+    Reseeded {
+        #[serde(rename = "behindMs", skip_serializing_if = "Option::is_none")]
+        behind_ms: Option<u64>,
+        #[serde(rename = "elapsedMs")]
+        elapsed_ms: u64,
+    },
+    /// The seed stays behind: the live volume has a writer, and a clone of it could hold a
+    /// half-written Cargo unit or Nx database. The next fork tries again.
+    Skipped {
+        #[serde(rename = "behindMs", skip_serializing_if = "Option::is_none")]
+        behind_ms: Option<u64>,
+        reason: ReseedSkip,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ReseedSkip {
+    /// A process other than the target's Nx daemon holds its task database, or one opened it
+    /// while the seed was cloned (that clone is deleted).
+    Held {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The target's Nx daemon outlived its stop.
+    DaemonStayed { daemon: DatabaseHolder },
+    /// A Cargo build holds a target directory's build lock.
+    Building {
+        lock: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+}
+
+impl fmt::Display for ReseedSkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let holders = |formatter: &mut fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
+            for (index, holder) in holders.iter().enumerate() {
+                let separator = if index == 0 { "" } else { ", " };
+                write!(
+                    formatter,
+                    "{separator}pid {} ({})",
+                    holder.pid, holder.command
+                )?;
+            }
+            Ok(())
+        };
+        match self {
+            Self::Held {
+                database,
+                holders: held,
+            } => {
+                write!(formatter, "{} is open in ", database.display())?;
+                holders(formatter, held)
+            }
+            Self::DaemonStayed { daemon } => write!(
+                formatter,
+                "the Nx daemon pid {} ({}) did not exit after SIGTERM",
+                daemon.pid, daemon.command
+            ),
+            Self::Building {
+                lock,
+                holders: held,
+            } => {
+                write!(formatter, "a Cargo build holds {}", lock.display())?;
+                if !held.is_empty() {
+                    formatter.write_str(": ")?;
+                }
+                holders(formatter, held)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointOptions {
@@ -3135,6 +3226,7 @@ result_bodies!(
     RevisionResult,
     ResizeResult,
     DefragmentResult,
+    ReseedResult,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

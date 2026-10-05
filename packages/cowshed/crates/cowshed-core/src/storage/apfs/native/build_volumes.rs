@@ -7,6 +7,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
 use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
@@ -65,6 +66,11 @@ where
     /// Clone `source`'s image to the new volume `destination`, with `record`. The clone is not
     /// attached. A mounted source's volume is flushed first; the caller guarantees nothing
     /// writes it while it is cloned (a seed has no writer, a landing volume is quiesced).
+    ///
+    /// The clone keeps the modification time the source's image had when it was cloned, across
+    /// the first write below: an image's mtime is the instant of the last write it holds, so a
+    /// seed is behind its live volume exactly when the live image's mtime is the later one
+    /// (16_build_volumes.md, "Targets and seeds").
     pub fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -80,11 +86,43 @@ where
         let mounted = self.mounted_at(&mount)?.is_some();
         self.backend
             .sync_and_clone(&from, mounted.then_some(mount.as_path()), &to)?;
+        let written = written_at(&to)?;
         // The clone's own extent map, paid here rather than by its first write inside a mount.
         self.write_first(&to)?;
+        set_written(&to, written)?;
         layout
             .write_record(destination, record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
+    }
+
+    /// The instant of the last write build volume `id`'s image holds: its volume flushed first
+    /// when it is mounted, so a write still in the kernel's cache counts.
+    pub fn build_volume_written(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<SystemTime, ApfsStorageError> {
+        let image = layout.image(id);
+        self.verify_controller_path(&image)?;
+        let mount = layout.mount(id);
+        let mounted = self.mounted_at(&mount)?.is_some();
+        self.backend
+            .sync_for_freshness(&image, mounted.then_some(mount.as_path()))?;
+        written_at(&image)
+    }
+
+    /// Record that seed `seed` holds every write its target's live volume had at `written`: a
+    /// fork's own seed is a second clone of the seed its live volume came from, and holds
+    /// everything that volume does but the fork's mount and its dropped daemon record.
+    pub fn mark_seed_written(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+        written: SystemTime,
+    ) -> Result<(), ApfsStorageError> {
+        let image = layout.image(seed);
+        self.verify_controller_path(&image)?;
+        set_written(&image, written)
     }
 
     /// A new live volume cloned from `seed` with `record`, mounted, without the seed's Nx daemon
@@ -265,6 +303,27 @@ fn busy_or(error: crate::apfs::ApfsError) -> Result<Release, ApfsStorageError> {
     } else {
         Err(error.into())
     }
+}
+
+fn written_at(image: &Path) -> Result<SystemTime, ApfsStorageError> {
+    fs::metadata(image)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| {
+            io_error(
+                "read a build volume image's modification time",
+                image,
+                error,
+            )
+        })
+}
+
+/// Set `image`'s modification time without writing it: opening for write changes nothing.
+fn set_written(image: &Path, written: SystemTime) -> Result<(), ApfsStorageError> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(image)
+        .and_then(|file| file.set_modified(written))
+        .map_err(|error| io_error("set a build volume image's modification time", image, error))
 }
 
 fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {

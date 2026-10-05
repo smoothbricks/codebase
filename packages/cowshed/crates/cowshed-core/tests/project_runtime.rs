@@ -12,8 +12,9 @@ use cowshed_core::api::dto::{
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    PushReport, RebaseOptions, RemoveOptions, RemoveReport, Reseed, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState,
+    WorkspaceTarget,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -700,6 +701,14 @@ impl ProjectRuntimeHost for FakeHost {
             previous_extents: 2,
             extents: 1,
             bytes: 0,
+        })
+    }
+
+    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<ReseedResult> {
+        self.workspace(&workspace)?;
+        Ok(ReseedResult {
+            workspace,
+            outcome: Reseed::NoBuildVolume,
         })
     }
 

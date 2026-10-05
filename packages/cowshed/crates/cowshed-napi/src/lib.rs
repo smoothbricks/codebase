@@ -1064,6 +1064,7 @@ mod parity_tests {
             | Command::Mount(_)
             | Command::Rekey(_)
             | Command::Defrag(_)
+            | Command::Reseed(_)
             | Command::Version
             // A read-only lint helper over the checkout's recorded volume state; no controller call.
             | Command::BuildState
@@ -1115,6 +1116,7 @@ mod parity_tests {
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["rekey", "parity"], None),
         (&["defrag", "parity"], None),
+        (&["reseed", "parity"], None),
         (&["help"], None),
         (&["setup"], None),
         (&["build-state"], None),

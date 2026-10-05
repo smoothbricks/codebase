@@ -101,7 +101,10 @@ fn adopt_preflighted(
     paths: &[BuildStatePath],
     real: &[&BuildStatePath],
 ) -> Result<Vec<DisplacedBuildStateFinding>> {
-    if real.iter().any(|state| tool(state) == BuildStateTool::Nx) {
+    if real
+        .iter()
+        .any(|state| BuildStateTool::of(state) == BuildStateTool::Nx)
+    {
         let source_paths = paths
             .iter()
             .map(|state| {
@@ -138,7 +141,7 @@ fn adopt_preflighted(
         })?;
         findings.push(DisplacedBuildStateFinding {
             path: source.to_owned(),
-            likely_tool: tool(state),
+            likely_tool: BuildStateTool::of(state),
         });
     }
     link::link_paths(checkout, volume_root, paths)?;
@@ -227,24 +230,6 @@ fn tracked_source(
         }
     }
     Ok(None)
-}
-
-fn tool(state: &BuildStatePath) -> BuildStateTool {
-    let checkout = state.checkout.as_path();
-    if checkout
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == ".nx")
-    {
-        BuildStateTool::Nx
-    } else if checkout
-        .file_name()
-        .is_some_and(|name| name == ".codegraph")
-    {
-        BuildStateTool::Codegraph
-    } else {
-        BuildStateTool::Cargo
-    }
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> CowshedError {

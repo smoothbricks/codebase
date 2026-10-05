@@ -6,7 +6,9 @@ use cowshed_core::apfs::{
     SystemCommandRunner,
 };
 use cowshed_core::api::JsonEnvelope;
-use cowshed_core::api::dto::{Adoption, AdoptionSkip, DatabaseHolder, LandReport};
+use cowshed_core::api::dto::{
+    Adoption, AdoptionSkip, DatabaseHolder, LandReport, Reseed, ReseedResult,
+};
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
@@ -1400,6 +1402,134 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
     fixture.stop_gateway().await;
 }
 
+/// Run `nx_check` in `workspace` and answer the cache status of each task of that run.
+async fn nx_statuses(
+    service: &mut ActorBridge,
+    workspace: &str,
+    checkout: &Path,
+    nx_check: &str,
+) -> Vec<(String, nx::CacheStatus)> {
+    let spawned = SystemTime::now();
+    sh(service, workspace, nx_check).await;
+    let exited = SystemTime::now();
+    match nx::attribute(&checkout.join(".nx/cache"), nx_check, spawned, exited) {
+        nx::Attribution::Ours(run) => run
+            .tasks
+            .into_iter()
+            .map(|task| (task.task_id, task.cache))
+            .collect(),
+        nx::Attribution::Unattributed(reason) => {
+            panic!("{workspace}'s Nx run left no summary of its own: {reason:?}")
+        }
+    }
+}
+
+/// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
+/// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
+/// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
+/// main's run. Main then runs once more and the next fork reseeds on its own.
+#[tokio::test]
+async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let layout = build_volumes(&fixture);
+    let nx_check = nx_run_many(&node);
+    let main = fixture.checkout.clone();
+
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "land a"]);
+    let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
+    let report = land(&mut service, "topic", true, &[&nx_check]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
+
+    // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
+    fs::write(main.join("a/src.txt"), b"src, changed in main\n").unwrap();
+    git(&main, &["commit", "-q", "-am", "change a in main"]);
+    let ran = nx_statuses(&mut service, "main", &main, &nx_check).await;
+    assert!(
+        ran.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::Miss),
+        "main runs a:build and a:test itself: {ran:?}"
+    );
+
+    // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
+    let (_, stdout, _) = run(&mut service, ["--json", "doctor"]).await;
+    let doctor: serde_json::Value = serde_json::from_slice(&stdout).expect("doctor --json");
+    let behind = doctor["result"]["findings"]
+        .as_array()
+        .expect("doctor findings")
+        .iter()
+        .filter(|finding| finding["code"] == "seed-age")
+        .map(|finding| finding["message"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        behind
+            .iter()
+            .any(|message| message.starts_with(&format!("main's seed {landed_seed} "))),
+        "doctor reports main's seed behind its volume: {behind:?}"
+    );
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "reseed", "main"]).await;
+    let envelope: JsonEnvelope<ReseedResult> = serde_json::from_slice(&stdout)
+        .unwrap_or_else(|error| panic!("reseed --json ({error}): {stderr}"));
+    let reseeded = envelope.result().cloned().expect("a reseed result");
+    assert!(
+        matches!(
+            reseeded.outcome,
+            Reseed::Reseeded {
+                behind_ms: Some(_),
+                ..
+            }
+        ),
+        "{reseeded:?}"
+    );
+    let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
+    assert_ne!(seed, landed_seed, "the landed seed was replaced");
+    assert_eq!(
+        record.tree.as_ref().map(|tree| tree.as_str()),
+        Some(landed_tree.as_str()),
+        "the seed records the tree its volume was adopted at"
+    );
+    let (stdout, _) = succeed(&mut service, ["reseed", "main"]).await;
+    assert_eq!(stdout, b"fresh\n", "nothing wrote main's volume since");
+
+    let w1 = new_workspace(&mut service, "w1").await;
+    let hits = nx_statuses(&mut service, "w1", &w1, &nx_check).await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "a fork hits what main ran after the land: {hits:?}"
+    );
+
+    // Again with no reseed verb: the fork reseeds main itself.
+    fs::write(main.join("a/src.txt"), b"src, changed in main again\n").unwrap();
+    git(&main, &["commit", "-q", "-am", "change a in main again"]);
+    nx_statuses(&mut service, "main", &main, &nx_check).await;
+    let (_, stderr) = succeed(&mut service, ["new", "w2"]).await;
+    assert!(!stderr.contains("seed stays"), "{stderr}");
+    let w2 = service
+        .path("w2", false)
+        .await
+        .expect("w2 is mounted")
+        .mount;
+    let hits = nx_statuses(&mut service, "w2", &w2, &nx_check).await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "a fork reseeds main first and hits main's latest run: {hits:?}"
+    );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// A process other than main's daemon holding main's Nx task database open makes the land skip
 /// the swap and name that process (16_build_volumes.md, "The adoption needs the target's Nx
 /// database closed"). The seed is still frozen; main keeps its own volume.
@@ -1521,12 +1651,16 @@ async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
     let new_mount = layout.mount(&landing);
 
+    // `new w` reseeded main from the volume the job writes, so the adopted volume may hold a
+    // copy of the ticks as they were then; the job itself never writes it.
+    let copied = new_mount.join("target/ticking/ticks");
+    let copied_at_swap = file_len(&copied);
     let at_swap = file_len(&ticks);
     eventually("the job keeps ticking in the previous volume", || {
         file_len(&ticks) > at_swap
     })
     .await;
-    assert!(!new_mount.join("target/ticking").exists());
+    assert_eq!(file_len(&copied), copied_at_swap);
     sh(&mut service, "main", "touch target/after").await;
     assert!(new_mount.join("target/after").is_file());
     assert!(!old_mount.join("target/after").exists());

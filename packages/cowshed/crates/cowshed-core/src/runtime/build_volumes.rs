@@ -1,6 +1,7 @@
 //! The project side of build volumes (16_build_volumes.md): a fork clones its target's seed, a
 //! land quiesces the landing workspace, freezes the target's seed, and moves the target's one
-//! link, and collection deletes what nothing links.
+//! link, a reseed refreezes a target's seed from its own quiet volume, and collection deletes
+//! what nothing links.
 //!
 //! Every step here runs inside one process's project actor, so no two of that process's steps
 //! interleave; another cowshed process's can, which is why collection defers what a workspace
@@ -11,15 +12,16 @@ use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::apfs::SystemCommandRunner;
 use crate::api::dto::{
-    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, Sha256Digest,
+    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, Reseed, ReseedSkip,
+    Sha256Digest,
 };
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    BuildVolumeState, TrackedBuildStateRefusal, link, nx,
+    BuildVolumeState, TrackedBuildStateRefusal, cargo, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
@@ -55,6 +57,39 @@ pub(crate) struct Quiet {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
+}
+
+/// How far a target's latest seed is behind the live build volume it links, as the instant of
+/// the last write each image holds (16_build_volumes.md, "Targets and seeds").
+#[derive(Clone, Debug)]
+pub(crate) struct SeedAge {
+    pub live: BuildVolumeId,
+    /// The tree the live volume's record names: the one a reseed records.
+    pub tree: Option<GitOid>,
+    /// When the live volume's image was last written, after its volume was flushed.
+    pub written: SystemTime,
+    /// The latest seed and the instant of the last write it holds; `None` for a target that
+    /// has no seed.
+    pub seed: Option<(BuildVolumeId, SystemTime)>,
+}
+
+impl SeedAge {
+    /// Whether the live volume holds a write its seed does not.
+    pub fn stale(&self) -> bool {
+        self.seed
+            .as_ref()
+            .is_none_or(|(_, frozen)| self.written > *frozen)
+    }
+
+    /// How long before the live volume's last write the seed was frozen: `None` when the seed
+    /// holds it, or when there is no seed.
+    pub fn behind(&self) -> Option<Duration> {
+        let (_, frozen) = self.seed.as_ref()?;
+        self.written
+            .duration_since(*frozen)
+            .ok()
+            .filter(|behind| !behind.is_zero())
+    }
 }
 
 /// What capability detection says about a checkout's build state, for [`BuildVolumes::refresh`].
@@ -286,6 +321,11 @@ impl BuildVolumes {
                 )
                 .map_err(storage)?;
             link::point(&checkout, &mount)?;
+            // The own seed holds everything the live volume does but its mount's writes and the
+            // dropped daemon record, so it starts as fresh as the live volume.
+            let written = host.build_volume_written(layout, &live).map_err(storage)?;
+            host.mark_seed_written(layout, &own_seed, written)
+                .map_err(storage)?;
             crate::timing::event("build-volume", || {
                 format!(
                     "fork {} from seed {seed} in {:?}",
@@ -348,11 +388,10 @@ impl BuildVolumes {
         let source = quiet.id.clone();
         self.blocking(move |host, layout| {
             let previous = seeds_of(layout, &target)?;
-            let seed = BuildVolumeId::mint();
             host.clone_build_volume(
                 layout,
                 &source,
-                &seed,
+                &BuildVolumeId::mint(),
                 &BuildVolumeRecord::new(
                     Some(tree),
                     BuildVolumeRole::Seed {
@@ -362,23 +401,41 @@ impl BuildVolumes {
                 ),
             )
             .map_err(storage)?;
-            for old in previous {
-                // A seed is never mounted, so nothing can hold it.
-                if let BuildVolumeRelease::Busy(reason) =
-                    host.release_build_volume(layout, &old).map_err(storage)?
-                {
-                    return Err(CowshedError::integrity(
-                        format!(
-                            "seed {old} of {} is attached and in use: {reason}",
-                            target.name
-                        ),
-                        "cowshed doctor --json",
-                    ));
-                }
-            }
-            Ok(())
+            retire_seeds(host, layout, &target, previous)
         })
         .await
+    }
+
+    /// How far `target`'s seed is behind the live volume `checkout` links, or `None` when it
+    /// links none, or one an interrupted first touch left unpublished.
+    pub async fn seed_age(&self, target: Owner, checkout: PathBuf) -> Result<Option<SeedAge>> {
+        let live = self.layout.linked(&checkout)?;
+        self.blocking(move |host, layout| match live {
+            Some(live) => seed_age(host, layout, &target, live),
+            None => Ok(None),
+        })
+        .await
+    }
+
+    /// Reseed `target` from the live volume `checkout` links when that volume holds a write the
+    /// seed does not and has no writer. The caller holds `target`'s workspace lock, which every
+    /// fork of `target` holds while it clones the seed.
+    pub async fn reseed(&self, target: Owner, checkout: PathBuf) -> Result<Reseed> {
+        let this = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || this.reseed_now(&target, &checkout))
+            .await
+            .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
+    }
+
+    /// [`Self::reseed`] on the calling thread, for a caller already off the async runtime.
+    pub fn reseed_now(&self, target: &Owner, checkout: &Path) -> Result<Reseed> {
+        let Some(live) = self.layout.linked(checkout)? else {
+            return Ok(Reseed::NoBuildVolume);
+        };
+        match seed_age(&self.host, &self.layout, target, live)? {
+            Some(age) => reseed(&self.host, &self.layout, target, age),
+            None => Ok(Reseed::NoBuildVolume),
+        }
     }
 
     /// Land step 6: when nothing but the target's daemon holds its task database, stop that
@@ -787,6 +844,150 @@ fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolume
     Ok(seeds)
 }
 
+/// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted, so
+/// nothing can hold it.
+fn retire_seeds(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    previous: Vec<BuildVolumeId>,
+) -> Result<()> {
+    for old in previous {
+        if let BuildVolumeRelease::Busy(reason) =
+            host.release_build_volume(layout, &old).map_err(storage)?
+        {
+            return Err(CowshedError::integrity(
+                format!(
+                    "seed {old} of {} is attached and in use: {reason}",
+                    target.name
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `target`'s seed against its live volume `live`, or `None` when `live` is an interrupted
+/// first touch's, unpublished: only a fresh discovery finishes that one.
+fn seed_age(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    live: BuildVolumeId,
+) -> Result<Option<SeedAge>> {
+    let Some(record) = layout.read_record_present(&live)? else {
+        return Ok(None);
+    };
+    let written = host.build_volume_written(layout, &live).map_err(storage)?;
+    let seed = match layout.seed_of(&target.name, &target.incarnation)? {
+        Some((seed, _)) => {
+            let frozen = host.build_volume_written(layout, &seed).map_err(storage)?;
+            Some((seed, frozen))
+        }
+        None => None,
+    };
+    Ok(Some(SeedAge {
+        live,
+        tree: record.tree,
+        written,
+        seed,
+    }))
+}
+
+/// Refreeze `target`'s seed from its live volume when the seed is behind it and nothing writes
+/// it (16_build_volumes.md, "Targets and seeds"): the same quiesce rule as an adoption for Nx
+/// (only the target's daemon may hold its task database, and it is stopped), and every Cargo
+/// build lock taken, so no Cargo build runs or starts while the image is cloned. The task
+/// databases are looked at once more after the clone; a process that opened one meanwhile may
+/// have written it mid-clone, so that clone is deleted and the reseed skipped.
+fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge) -> Result<Reseed> {
+    if !age.stale() {
+        return Ok(Reseed::Fresh);
+    }
+    let behind_ms = age.behind().map(millis);
+    let started = Instant::now();
+    let mount = host
+        .mount_build_volume(layout, &age.live)
+        .map_err(storage)?;
+    let state = BuildVolumeState::read(&mount)?;
+    let skipped = |reason| Ok(Reseed::Skipped { behind_ms, reason });
+    if let Err(busy) = nx::close(&mount, &state)
+        .map_err(|error| io("close the target's Nx state", &mount, &error))?
+    {
+        return skipped(reseed_skip(busy));
+    }
+    let _builds = match cargo::hold(&mount, &state)
+        .map_err(|error| io("take the target's Cargo build locks", &mount, &error))?
+    {
+        Ok(held) => held,
+        Err(lock) => {
+            let holders = nx::holders(&lock)
+                .map_err(|error| io("list the Cargo build's processes", &lock, &error))?;
+            return skipped(ReseedSkip::Building {
+                lock,
+                holders: holders.into_iter().map(database_holder).collect(),
+            });
+        }
+    };
+    let previous = seeds_of(layout, target)?;
+    let seed = BuildVolumeId::mint();
+    host.clone_build_volume(
+        layout,
+        &age.live,
+        &seed,
+        &BuildVolumeRecord::new(
+            age.tree,
+            BuildVolumeRole::Seed {
+                target: target.name.clone(),
+                incarnation: target.incarnation.clone(),
+            },
+        ),
+    )
+    .map_err(storage)?;
+    if let Err(busy) = nx::held(&mount, &state)
+        .map_err(|error| io("look at the target's Nx state", &mount, &error))?
+    {
+        host.release_build_volume(layout, &seed).map_err(storage)?;
+        return skipped(reseed_skip(busy));
+    }
+    retire_seeds(host, layout, target, previous)?;
+    let elapsed_ms = millis(started.elapsed());
+    crate::timing::event("build-volume", || {
+        format!(
+            "reseed {} from {} in {elapsed_ms} ms",
+            target.name, age.live
+        )
+    });
+    Ok(Reseed::Reseeded {
+        behind_ms,
+        elapsed_ms,
+    })
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn database_holder(holder: nx::Holder) -> DatabaseHolder {
+    DatabaseHolder {
+        pid: holder.pid,
+        command: holder.command,
+    }
+}
+
+fn reseed_skip(busy: nx::Busy) -> ReseedSkip {
+    match busy {
+        nx::Busy::Held { database, holders } => ReseedSkip::Held {
+            database,
+            holders: holders.into_iter().map(database_holder).collect(),
+        },
+        nx::Busy::DaemonStayed { daemon } => ReseedSkip::DaemonStayed {
+            daemon: database_holder(daemon),
+        },
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Side {
     Landing,
@@ -794,24 +995,20 @@ enum Side {
 }
 
 fn skip(busy: nx::Busy, side: Side) -> AdoptionSkip {
-    let holder = |holder: nx::Holder| DatabaseHolder {
-        pid: holder.pid,
-        command: holder.command,
-    };
     match (busy, side) {
         (nx::Busy::Held { database, holders }, Side::Landing) => AdoptionSkip::LandingHeld {
             database,
-            holders: holders.into_iter().map(holder).collect(),
+            holders: holders.into_iter().map(database_holder).collect(),
         },
         (nx::Busy::Held { database, holders }, Side::Target) => AdoptionSkip::TargetHeld {
             database,
-            holders: holders.into_iter().map(holder).collect(),
+            holders: holders.into_iter().map(database_holder).collect(),
         },
         (nx::Busy::DaemonStayed { daemon }, Side::Landing) => AdoptionSkip::LandingDaemonStayed {
-            daemon: holder(daemon),
+            daemon: database_holder(daemon),
         },
         (nx::Busy::DaemonStayed { daemon }, Side::Target) => AdoptionSkip::TargetDaemonStayed {
-            daemon: holder(daemon),
+            daemon: database_holder(daemon),
         },
     }
 }
@@ -916,6 +1113,31 @@ mod tests {
             .iter()
             .map(|doomed| (doomed.id.clone(), doomed.reason))
             .collect()
+    }
+
+    /// A seed is behind exactly when the live volume was written after it was frozen; a
+    /// target with no seed is behind by no measurable amount, and still reseeds.
+    #[test]
+    fn a_seed_is_behind_only_when_the_live_volume_was_written_after_it() {
+        let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let age = |written: SystemTime, seed: Option<SystemTime>| SeedAge {
+            live: BuildVolumeId::mint(),
+            tree: None,
+            written,
+            seed: seed.map(|frozen| (BuildVolumeId::mint(), frozen)),
+        };
+        let fresh = age(frozen, Some(frozen));
+        assert!(!fresh.stale());
+        assert_eq!(fresh.behind(), None);
+        let older = age(frozen - Duration::from_secs(5), Some(frozen));
+        assert!(!older.stale(), "a seed newer than every write holds them");
+        assert_eq!(older.behind(), None);
+        let behind = age(frozen + Duration::from_millis(1_500), Some(frozen));
+        assert!(behind.stale());
+        assert_eq!(behind.behind(), Some(Duration::from_millis(1_500)));
+        let unseeded = age(frozen, None);
+        assert!(unseeded.stale());
+        assert_eq!(unseeded.behind(), None);
     }
 
     /// A live link is the proof of reachability, so it protects its volume before any record is

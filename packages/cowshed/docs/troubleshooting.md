@@ -191,9 +191,12 @@ a fresh clone, 208 of 208 units fresh, the incremental workspace crates included
 rebuilds, run the build with `CARGO_LOG=cargo::compiler::fingerprint=info` and read the `dirty:` reason of the first
 unit that rebuilt:
 
-- **No fingerprint at all** — main never built that unit. The usual cause is a `test` profile that differs from `dev`
-  (every dependency then has two units, and main held the other one) or a toolchain bump since main was last warmed: let
-  `test` inherit `dev`, and warm main with `cowshed exec main -- <canonical build>`.
+- **No fingerprint at all** — the seed the workspace cloned never held that unit. Either main never built it (the usual
+  cause is a `test` profile that differs from `dev`, so every dependency has two units and main held the other one, or a
+  toolchain bump since main was last warmed: let `test` inherit `dev`, and warm main with
+  `cowshed exec main -- <canonical build>`), or main built it after its seed was frozen and the fork's reseed was
+  skipped because something was writing main's build volume: `new` says so on stderr, `cowshed doctor` reports
+  `seed-age`, and `cowshed reseed main` refreezes the seed once main's build is done.
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
   print it relative to the package instead, which is how cargo resolves it.

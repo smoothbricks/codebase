@@ -160,7 +160,10 @@ Two different mechanisms save build time, and it helps to keep them apart.
 
 **The clone is why a workspace starts warm.** `cowshed new` clones the target's source image and its latest immutable
 build-volume seed. Cargo target directories, Nx state and per-tree indexers live in that separate private APFS image,
-reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land.
+reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land. A
+land freezes the seed from the landing workspace's volume; whatever the target runs afterwards reaches the seed when the
+next fork reseeds it first, which it does when the target's volume was written since and nothing (an Nx run, a Cargo
+build) is writing it. `cowshed reseed <ws>` does it on demand; `cowshed doctor` reports a seed that is behind.
 
 **Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
 volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.

@@ -148,6 +148,22 @@ pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
     Ok(Ok(()))
 }
 
+/// Whether any process holds one of the volume's task databases open, without stopping
+/// anything: the second look [`close`] takes, for a caller that has to know nothing opened one
+/// since.
+#[cfg(target_os = "macos")]
+pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
+    for data in state.nx_workspace_data() {
+        for database in task_databases_in(&volume.join(data))? {
+            let holders = holders(&database)?;
+            if !holders.is_empty() {
+                return Ok(Err(Busy::Held { database, holders }));
+            }
+        }
+    }
+    Ok(Ok(()))
+}
+
 fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
     let mut databases = Vec::new();
     let entries = match fs::read_dir(data) {

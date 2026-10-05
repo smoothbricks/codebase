@@ -691,6 +691,29 @@ and it keeps that space: clones and checkpoints taken earlier still share the ol
 as they are removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor`
 warns.
 
+### `cowshed reseed <name|main>`
+
+Refreeze a workspace's build-volume seed from its live build volume, and print what happened: `reseeded`, `fresh`,
+`skipped`, or `noBuildVolume`.
+
+```
+$ cowshed reseed main
+reseeded
+cowshed: main's seed was 1093412 ms behind its build volume and is a clone of it now (412 ms)
+```
+
+A fork clones its target's seed, never the target's live build volume, because something may be writing that. A land
+freezes the seed from the landing workspace's volume, so whatever the target runs afterwards — its own builds and gates,
+the land's adoption check — is in its live volume and not in the seed. Every `new` and `fork` reseeds its source first;
+this verb does the same on its own. A seed that already holds every write the live volume has had is left alone
+(`fresh`); `cowshed doctor` reports a seed that is behind as `seed-age`.
+
+The live volume must have no writer while it is cloned. The workspace's Nx daemon is stopped the way a land stops it (it
+restarts on the next Nx command); any other process holding the Nx task database, or a Cargo build holding a target
+directory's `.cargo-lock`, leaves the seed as it is and is named (`skipped`). A Cargo build that starts during the clone
+waits for it. The workspace must be attached, because its build link names the volume. `--json`:
+`ReseedResult { workspace, outcome: { kind: "noBuildVolume" | "fresh" | "reseeded" | "skipped", behindMs?, elapsedMs?, reason? } }`.
+
 ### `cowshed rekey <name|main>`
 
 Rebuild one keyless workspace's CA identity and print its name. The quarantined grants sidecar is republished beside the

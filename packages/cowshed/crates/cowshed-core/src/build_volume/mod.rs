@@ -12,6 +12,7 @@
 //! The record says what the link cannot: the tree the volume was last built at, whether it is a
 //! seed (a target's frozen build state, never written), and when it was made.
 
+pub mod cargo;
 pub mod discard;
 pub mod link;
 #[cfg(target_os = "macos")]
@@ -272,6 +273,14 @@ impl BuildVolumeState {
             .then(|| state.volume.as_path())
         })
     }
+
+    /// Every Cargo target directory the volume holds, relative to its root.
+    pub fn cargo_targets(&self) -> impl Iterator<Item = &Path> {
+        self.paths
+            .iter()
+            .filter(|state| BuildStateTool::of(state) == BuildStateTool::Cargo)
+            .map(|state| state.volume.as_path())
+    }
 }
 
 fn path_from_wire(wire: &PathWire) -> crate::Result<BuildStatePath> {
@@ -312,6 +321,28 @@ pub enum BuildStateTool {
     Cargo,
     Nx,
     Codegraph,
+}
+
+impl BuildStateTool {
+    /// The tool whose state `path` is: Nx's directories under `.nx`, the indexer's
+    /// `.codegraph`, and otherwise a Cargo target directory, the only other contribution.
+    pub fn of(path: &BuildStatePath) -> Self {
+        let checkout = path.checkout.as_path();
+        if checkout
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".nx")
+        {
+            Self::Nx
+        } else if checkout
+            .file_name()
+            .is_some_and(|name| name == ".codegraph")
+        {
+            Self::Codegraph
+        } else {
+            Self::Cargo
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

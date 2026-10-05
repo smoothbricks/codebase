@@ -3,8 +3,8 @@ use super::dto::{
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ResizeResult, ResizeVolume, RevisionResult, RunSandboxMode, SealedJob,
-    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionResult, RunSandboxMode,
+    SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1717,6 +1717,17 @@ impl Coordinator {
         call_typed(
             &self.runtime,
             "coordinator.defragment",
+            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
+        )
+        .await
+    }
+
+    /// Refreeze a target's seed from its live build volume when the seed is behind it and the
+    /// volume has no writer; a writer leaves the seed as it is and is named.
+    pub async fn reseed(&self, workspace: &str) -> Result<ReseedResult> {
+        call_typed(
+            &self.runtime,
+            "coordinator.reseed",
             json!({ "repoId": self.project.repo_id, "workspace": workspace }),
         )
         .await

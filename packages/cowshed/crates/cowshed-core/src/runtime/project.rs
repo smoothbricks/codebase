@@ -155,6 +155,9 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::DefragmentResult>;
+    /// Refreeze `workspace`'s seed from its live build volume when the seed is behind it and the
+    /// volume has no writer (16_build_volumes.md, "Targets and seeds").
+    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -838,6 +841,7 @@ impl ProjectActor {
             "coordinator.restore" => self.coordinator_restore(request).await,
             "coordinator.resize" => self.coordinator_resize(request).await,
             "coordinator.defragment" => self.coordinator_defragment(request).await,
+            "coordinator.reseed" => self.coordinator_reseed(request).await,
             "coordinator.detach" => self.coordinator_detach(request).await,
             "coordinator.refreshBuildState" => self.coordinator_refresh_build_state(request).await,
             "coordinator.serveSupervisor" => self.coordinator_serve_supervisor(request).await,
@@ -1151,6 +1155,14 @@ impl ProjectActor {
         let params: WorkspaceParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let result = self.host.defragment(params.workspace).await?;
+        json_response(result)
+    }
+
+    async fn coordinator_reseed(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let result = self.host.reseed(params.workspace).await?;
         json_response(result)
     }
 
@@ -7931,6 +7943,23 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         ),
                     )
                     .await?;
+                    // Under the source's image lock, which every fork of the source holds here:
+                    // the seed the next step clones is the source's own work up to now, unless
+                    // something still writes the source's volume.
+                    let reseed = timed_async(
+                        "new",
+                        "reseed",
+                        build_volumes.reseed(seed_source.clone(), source_mount.clone()),
+                    )
+                    .await?;
+                    if let crate::api::dto::Reseed::Skipped { behind_ms, reason } = &reseed {
+                        eprintln!(
+                            "cowshed: {}'s seed stays{} behind its build volume, so {destination} misses what {} built since: {reason}; the next fork retries",
+                            seed_source.name,
+                            behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
+                            seed_source.name,
+                        );
+                    }
                     timed_async(
                         "new",
                         "build-volume",
@@ -8765,6 +8794,40 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             extents: outcome.extents.get(),
             bytes: outcome.bytes,
         })
+    }
+
+    /// `cowshed reseed`: under `workspace`'s image lock, which every fork of it holds while it
+    /// clones the seed, so no fork clones a seed this deletes.
+    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult> {
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} is detached, so its build link cannot be read"),
+                format!("cowshed attach {workspace}, then retry the reseed"),
+            ));
+        }
+        let owner = super::build_volumes::Owner {
+            name: workspace.clone(),
+            incarnation: current.derived.workspace.incarnation().clone(),
+        };
+        let checkout = self.workspace_mount_path(&workspace)?;
+        let lock_path = self
+            .layout
+            .canonical_image(&workspace)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let volumes = self.build_volumes()?;
+        let outcome = self
+            .substrate
+            .dispatch_with_image_lock(lock_path, move || volumes.reseed_now(&owner, &checkout))
+            .await
+            .map_err(native_storage_error)??;
+        Ok(crate::api::dto::ReseedResult { workspace, outcome })
     }
 
     async fn checkpoint(
@@ -10139,6 +10202,29 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                         error,
                                     )),
                                 }
+                            }
+                            let owner = super::build_volumes::Owner {
+                                name: workspace_name.clone(),
+                                incarnation: workspace.derived.workspace.incarnation().clone(),
+                            };
+                            let age = match self.build_volumes() {
+                                Ok(volumes) => {
+                                    volumes.seed_age(owner, expected_mount.clone()).await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match age {
+                                Ok(Some(age)) => findings.extend(seed_age_finding(
+                                    &workspace_name,
+                                    &age,
+                                    expected_mount.clone(),
+                                )),
+                                Ok(None) => {}
+                                Err(error) => findings.push(native_finding(
+                                    "seed-age",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    error,
+                                )),
                             }
                         }
                     }
@@ -14721,6 +14807,52 @@ fn native_finding(
         hint: error.hint,
         path: None,
     }
+}
+
+/// Doctor's report of a target whose seed is behind its live build volume
+/// (16_build_volumes.md, "Targets and seeds"); a seed that holds every write is no finding.
+#[cfg(target_os = "macos")]
+fn seed_age_finding(
+    workspace: &WorkspaceName,
+    age: &super::build_volumes::SeedAge,
+    checkout: PathBuf,
+) -> Option<crate::api::dto::Finding> {
+    use crate::storage::deletion_log::rfc3339_utc;
+    if !age.stale() {
+        return None;
+    }
+    let hint = format!(
+        "cowshed reseed {workspace} refreezes it now; every fork of {workspace} does the same \
+         first, unless an Nx run or a Cargo build is writing the volume"
+    );
+    Some(match &age.seed {
+        Some((seed, frozen)) => crate::api::dto::Finding {
+            code: "seed-age".into(),
+            severity: crate::api::dto::FindingSeverity::Info,
+            message: format!(
+                "{workspace}'s seed {seed} holds its build volume {} as written at {}; the volume \
+                 was last written {:.1} s later, at {}, and a fork cloning the seed now misses \
+                 what ran in {workspace} since",
+                age.live,
+                rfc3339_utc(*frozen),
+                age.behind().unwrap_or_default().as_secs_f64(),
+                rfc3339_utc(age.written),
+            ),
+            hint,
+            path: Some(checkout),
+        },
+        None => crate::api::dto::Finding {
+            code: "seed-age".into(),
+            severity: crate::api::dto::FindingSeverity::Warning,
+            message: format!(
+                "{workspace} links build volume {} and has no seed: a fork of {workspace} freezes \
+                 one first when nothing writes the volume, and refuses otherwise",
+                age.live
+            ),
+            hint,
+            path: Some(checkout),
+        },
+    })
 }
 
 /// A stopped supervisor is not proof that every process it started has gone. Recovery may keep

@@ -557,6 +557,7 @@ capability_methods! {
     "coordinator.restore"
     "coordinator.resize"
     "coordinator.defragment"
+    "coordinator.reseed"
     "coordinator.detach"
     "coordinator.assignSlot"
     "coordinator.destroy"

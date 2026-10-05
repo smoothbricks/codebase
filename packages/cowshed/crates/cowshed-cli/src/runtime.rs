@@ -18,10 +18,10 @@ use cowshed_core::api::{
     ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions,
     GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
-    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, ResizeVolume, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
-    WorkspaceState, validate_command_argv,
+    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, Reseed,
+    ReseedResult, ResizeResult, ResizeVolume, RevisionResult, RevisionTarget, RunSandboxMode,
+    SccacheStatus, StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
@@ -125,6 +125,7 @@ pub trait CliService: Send {
         volume: ResizeVolume,
     ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
+    async fn reseed(&mut self, workspace: &str) -> Result<ReseedResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
         Err(CowshedError::environment_missing(
@@ -198,6 +199,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
+        | Command::Reseed(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -264,6 +266,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         },
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
         Command::Defrag(args) => named([Some(args.workspace.as_str())]),
+        Command::Reseed(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
         Command::Checkpoint(args) => named([args.workspace.as_deref()]),
@@ -623,6 +626,10 @@ impl CliService for ActorBridge {
 
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
         self.coordinator()?.defragment(workspace).await
+    }
+
+    async fn reseed(&mut self, workspace: &str) -> Result<ReseedResult> {
+        self.coordinator()?.reseed(workspace).await
     }
 
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
@@ -1415,6 +1422,56 @@ where
                     previous.first_write_cost()
                 ))
                 .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Reseed(args) => {
+            let result = service.reseed(&args.workspace).await?;
+            let (kind, guidance) = match &result.outcome {
+                Reseed::NoBuildVolume => (
+                    "noBuildVolume",
+                    format!(
+                        "workspace {} links no build volume, so it has no seed",
+                        result.workspace
+                    ),
+                ),
+                Reseed::Fresh => (
+                    "fresh",
+                    format!(
+                        "{}'s seed already holds every write its build volume has had",
+                        result.workspace
+                    ),
+                ),
+                Reseed::Reseeded {
+                    behind_ms,
+                    elapsed_ms,
+                } => (
+                    "reseeded",
+                    match behind_ms {
+                        Some(behind) => format!(
+                            "{}'s seed was {behind} ms behind its build volume and is a clone of it now ({elapsed_ms} ms)",
+                            result.workspace
+                        ),
+                        None => format!(
+                            "{} had no seed and has one now, a clone of its build volume ({elapsed_ms} ms)",
+                            result.workspace
+                        ),
+                    },
+                ),
+                Reseed::Skipped { behind_ms, reason } => (
+                    "skipped",
+                    format!(
+                        "{}'s seed stays{} behind its build volume, which has a writer: {reason}; retry once it is done",
+                        result.workspace,
+                        behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default()
+                    ),
+                ),
+            };
+            if json {
+                output.success(result).map_err(output_error)?;
+            } else {
+                output.bare_line(kind.as_bytes()).map_err(output_error)?;
+            }
+            output.guidance(&guidance).map_err(output_error)?;
             Ok(success())
         }
         Command::Rekey(args) => {

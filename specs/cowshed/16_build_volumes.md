@@ -11,8 +11,9 @@ exists, and how each is enforced. It is the one place these rules live; other sp
 
 - **Fork in milliseconds, warm.** `cowshed new` clones images (milliseconds; 01_storage.md "Images") and attaches them
   (≈0.2 s each, measured independent of how many images the host has attached: 0.17–0.39 s at 91–254 attached images).
-  Every Nx task main ran is a cache hit in the fork and every Cargo unit is `Fresh`. Only the fork's own edits
-  invalidate anything, and exactly what the same edit would invalidate on main.
+  Every Nx task main ran is a cache hit in the fork and every Cargo unit is `Fresh`: the fork reseeds main first when
+  main's volume holds work its seed does not (Targets and seeds). Only the fork's own edits invalidate anything, and
+  exactly what the same edit would invalidate on main.
 - **Land in milliseconds.** A land runs no build on main. The landing workspace has already built and checked the exact
   tree main moves to; main takes that workspace's build volume by one `rename(2)`.
 - **Nothing copied, nothing patched, nothing extra in the environment.** No cache entries are copied between checkouts.
@@ -158,24 +159,68 @@ mid-write would copy a Cargo unit or an Nx database half-written. A seed has no 
 consistent without any quiescence protocol.
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
-at its first touch) and again during every land into it (below), by cloning the landing workspace's build volume after
-that workspace has been quiesced and before the target adopts it, so neither side can be writing it. Each target keeps
-only its latest seed; a target's seed is deleted when the target retires.
+at its first touch), during every land into it (below), by cloning the landing workspace's build volume after that
+workspace has been quiesced and before the target adopts it, so neither side can be writing it, and again by a
+**reseed** whenever the target's live volume holds a write its seed does not. Each target keeps only its latest seed; a
+target's seed is deleted when the target retires.
+
+**Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
+runs afterwards (its own builds and gates, the land's adoption check, a developer's build in main) is written to its
+live volume and never reaches that seed. Measured: a fork made 18 minutes after a land missed 122 Nx tasks whose hashes
+equalled main's; the seed had no row for any of them, and main had executed each one after the seed was frozen. A fork
+of a target is meant to be warm for what the target ran, not only for what last landed in it, so the seed follows the
+live volume. Refreezing once more at the end of the land would not do it: it would capture only the adoption check,
+which hits by construction, and miss everything the target runs later.
+
+**Behind is one comparison of two modification times.** An image's modification time is the instant of the last write it
+holds: the image driver writes the image file as its volume is written, and a clone keeps its source's modification time
+(cowshed restores it after the clone's own first write). A seed is behind when the live volume's image, its volume
+flushed first, was modified after the seed's image. A fork sets its own seed's time to its new live volume's, so a new
+workspace starts with a fresh seed rather than one behind by its own mount.
+
+**A reseed clones the live volume only while it has no writer**, because a clone of a volume being written can hold a
+half-written Cargo unit or Nx database. It runs under the target's image lock, which every fork of the target holds
+while it clones the seed, so a reseed never deletes a seed a fork is cloning:
+
+1. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
+   step 6); any other holder, or a daemon that outlives its stop, skips the reseed;
+2. every Cargo build lock in the volume (`.cargo-lock` in each profile directory of a Cargo target directory, which a
+   running Cargo holds for its whole build) is taken without waiting; a held one skips the reseed, and holding them all
+   keeps a Cargo build from starting until the clone is cut (it waits on the lock as for any concurrent build);
+3. the live volume is cloned as the new seed, recording the live volume's tree;
+4. the task database is looked at once more: a process that opened it during the clone may have written it mid-clone, so
+   that clone is deleted and the reseed skipped; otherwise the previous seed is deleted.
+
+Only the two tools whose state a half-written copy corrupts are asked. A process that writes a build-state directory
+outside their protocols (a script appending to a file under `target/`) is not looked for: the seed holds its files as
+they were at the clone, as after a crash. The kernel's own idea of idle, no process with a file or working directory in
+the volume, would be stricter and would never come: an editor's rust-analyzer keeps proc-macro libraries from the target
+directory open for as long as it runs, and the code-graph indexer keeps its database open.
+
+Every fork reseeds its target first (Fork step 2). A skip names each holder and leaves the seed as it was: the fork is
+colder, never wrong, and the next fork tries again. `cowshed reseed <ws>` does the same on its own, and `cowshed doctor`
+reports each target whose seed is behind its live volume, with both instants (`seed-age`).
+
+- **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume, `cowshed reseed main`
+  refreezes its seed, and a fork of main hits that task; and unit tests of the Cargo lock walk and hold.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
 A fork names its target: `cowshed new <ws>` forks main, `cowshed fork <target> <ws>` forks an integration workspace (a
 lane base, a stack base).
 
-1. Clone the target's source image as today (02_workspaces.md).
-2. Clone **the target's** latest seed image to a new build volume owned by the new workspace, attach it, and point the
+1. Clone the target's source image as today (02_workspaces.md). The fork holds the target's image lock from here to the
+   end of step 3.
+2. **Reseed the target** when its seed is behind its live volume and the volume has no writer (Targets and seeds).
+3. Clone **the target's** latest seed image to a new build volume owned by the new workspace, attach it, and point the
    workspace's `.cowshed/build` at it. Clones preserve every file's bytes and mtime; Cargo freshness depends on that
    (rule "Clones preserve mtimes").
-3. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
+4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
    (rule "One Nx state per checkout").
 
-The fork is warm for the seed's tree. If the target's tree has moved past its seed's (a land skipped its swap, below),
-the fork is warm for the seed's tree and builds the difference incrementally, as an edit would.
+The fork is warm for everything the target's volume held when the seed was last frozen: at the latest land, or at the
+latest reseed, which is this fork's own step 2 unless the target's volume had a writer. If the target's tree has moved
+past its seed's (a land skipped its swap, below), the fork builds the difference incrementally, as an edit would.
 
 ## Land: `cowshed land`
 
@@ -193,7 +238,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    and reported, as for the target below. The landing volume now has no writer.
 5. **Freeze the seed.** Clone the landing build volume's image as the target's new seed and delete the target's previous
    seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork of this target
-   starts from exactly what is landing.
+   starts from at least what is landing. What the target itself runs on the adopted volume afterwards reaches the seed
+   by a reseed (Targets and seeds).
 6. **Adopt the build volume.** Under the same lock (rule "The adoption needs the target's Nx database closed"):
    1. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
       not the daemon named by the target's `nx/workspace-data/d` record, skip;
@@ -207,8 +253,9 @@ same for main and for an integration workspace; "the target" is whichever one it
       below).
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
-   and builds the landed delta incrementally the next time anything builds there; forks still start from the new seed. A
-   skipped swap is never wrong, only slower.
+   and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
+   the target's own volume is written again, and then from a reseed of that volume, which holds the target's own work
+   and builds the landed delta as the target does. A skipped swap is never wrong, only slower.
 
 7. **Check the adoption (2b).** Re-run the landed check in the target, now on the adopted build volume. For Nx it must
    be **100% cache hits**. Every miss is a defect in the project's build configuration, not a reason to build: an input
@@ -451,6 +498,10 @@ The decisions this spec records, in the order they were taken. It is kept so the
   Millisecond lands."); after the swap, main re-runs the check and asserts 100% Nx hits; minutes per land is
   unacceptable, so build volumes are images or datasets, never directories; Nx, Cargo and sccache stay unpatched; no
   extra environment variables; the daemon environment forwarding is accepted.
+- 2026-10-05: a fork made after a land missed 122 Nx tasks main had run after the seed was frozen, so a target's seed
+  follows its live volume: every fork reseeds its target first when the target's volume was written after its seed and
+  has no writer (Nx database closed, Cargo build locks free), `cowshed reseed` does the same on demand, and doctor
+  reports a seed that is behind.
 
 ## Open questions
 
