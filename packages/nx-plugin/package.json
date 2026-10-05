@@ -61,6 +61,12 @@
       "import": "./dist/ensure-built.js",
       "default": "./dist/ensure-built.js"
     },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "development": "./src/testing.ts",
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
+    },
     "./cross-check-policy": {
       "types": "./dist/cross-check-policy.d.ts",
       "development": "./src/cross-check-policy.ts",

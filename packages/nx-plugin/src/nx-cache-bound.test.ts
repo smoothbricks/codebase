@@ -102,7 +102,6 @@ it('bounds the default cache from its own filesystem without listing the host di
     // The cache directory does not exist yet, as on a checkout's first run.
     const { code, output } = await runNx(root, {
       ...fixtureNxEnv(root),
-      NX_DAEMON: 'false',
       NODE_OPTIONS: `--require ${join(root, 'forbid-disk-inventory.cjs')}`,
     });
     expect(output).not.toContain('Nx enumerated the host disks');

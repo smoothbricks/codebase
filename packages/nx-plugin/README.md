@@ -649,6 +649,23 @@ Only a leg that runs `bun test` must start in the project root or its `src/`, wh
 any other command (a cargo workspace's per-crate nextest legs run from the workspace root, a gate may run a script that
 lives in another project) may use any `cwd`.
 
+## Test Fixtures That Run Nx
+
+A test that runs real Nx in a temp workspace runs it daemonless unless the daemon is the behaviour under test: a
+daemonless Nx leaves nothing running once it exits. A daemon a fixture does start works in the fixture root, idling and
+watching files until something stops it, so `@smoothbricks/nx-plugin/testing` (used by this package's and the CLI's
+tests) owns those roots:
+
+- `ownedFixtureRoot(suite, prefix)` creates a root under `<tmpdir>/smoothbricks-fixtures/<suite>/run-<pid>`, the run
+  directory of the test process that owns it. The first root a process creates for a suite first reclaims every run of
+  that suite whose owner pid is gone: each process working in it gets SIGTERM (SIGKILL if it outlives 10 s), then the
+  run is deleted. A run whose owner is alive is never touched.
+- `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
+  `<workspace>/.nx/workspace-data/d/server-process.json`, and every process it started, has exited.
+
+A fixture retires on every exit path, a throwing body included: stop its daemon, then delete its root. A daemon that
+outlives the stop keeps the root, so the next run's sweep still finds it.
+
 ## Managed workspace files
 
 `nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as `smoo monorepo update`, without

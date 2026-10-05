@@ -9,7 +9,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -94,7 +94,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(overridden).toMatchObject({ exitCode: 0 });
       expect(overridden.output).toContain('explicit-lint');
     } finally {
-      await cleanupNxWorkspace(workspace);
+      await workspace.cleanup();
     }
   }, 120_000);
 
@@ -174,7 +174,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // would have claimed on the first run.
       expect(await artifact(), second.output).toBe('source\ntoolchain-2\n');
     } finally {
-      await cleanupNxWorkspace(workspace);
+      await workspace.cleanup();
     }
   }, 120_000);
 
@@ -2461,7 +2461,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const order = (await readFile(join(root, 'deploy-order.txt'), 'utf8')).trim().split('\n');
       expect(order).toEqual(['c', 'b', 'a']);
     } finally {
-      await cleanupNxWorkspace(workspace);
+      await workspace.cleanup();
     }
   }, 120_000);
 
@@ -2614,24 +2614,16 @@ async function createWorkspace(parent = tmpdir()): Promise<WorkspaceFixture> {
 }
 
 /**
- * A workspace that runs real Nx. It gets its own Git boundary, as every other
- * fixture here that runs Nx does: a daemon's ignore-aware watcher drops all of
- * a fixture's edits when an enclosing checkout ignores the temp directory.
+ * A workspace that runs real Nx, daemonless (`fixtureNxEnv`), so nothing runs
+ * in it once that Nx exits. It gets its own Git boundary, as every other
+ * fixture here that runs Nx does, so no enclosing checkout's ignore rules
+ * decide which of its files Nx sees.
  */
 async function createNxWorkspace(): Promise<WorkspaceFixture> {
   const workspace = await createWorkspace();
   const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace.context.workspaceRoot]);
   expect(initialized.exitCode).toBe(0);
   return workspace;
-}
-
-/** Release the fixture's own Nx daemon through Nx before its root is deleted. */
-async function cleanupNxWorkspace(workspace: WorkspaceFixture): Promise<void> {
-  try {
-    await stopFixtureNxDaemon(workspace.context.workspaceRoot);
-  } finally {
-    await workspace.cleanup();
-  }
 }
 
 interface WorkspaceFixture {

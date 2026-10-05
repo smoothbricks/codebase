@@ -9,7 +9,7 @@ import { stripVTControlCharacters } from 'node:util';
 import type { Task } from 'nx/src/config/task-graph';
 
 import { signalToCode } from 'nx/src/utils/exit-codes';
-import { stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
+import { nxFixtureRoot, retireNxFixture } from './__tests__/fixture-nx-env.js';
 import { cliExitOutcome, describeMiss, firstCacheMiss, parseTargetSelector, unvouched } from './ensure-built.js';
 
 function task(overrides: Partial<Task> & Pick<Task, 'id'>): Task {
@@ -285,9 +285,7 @@ describe('smoo-nx-exec', () => {
   const ships = () => `${workspace}-app-ships.log`;
 
   beforeAll(async () => {
-    // Realpath because macOS puts the temp directory behind a /private
-    // symlink, and a process's reported cwd is the resolved one.
-    workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-')));
+    workspace = await nxFixtureRoot('ensure-built-');
     // Cowshed's scratch is ignored by its enclosing Git checkout. This is an
     // independent Nx workspace: its own Git boundary keeps the daemon's
     // ignore-aware watcher from dropping all of its source changes.
@@ -378,8 +376,7 @@ describe('smoo-nx-exec', () => {
 
   afterAll(async () => {
     if (workspace) {
-      await stopFixtureNxDaemon(workspace);
-      await rm(workspace, { recursive: true, force: true });
+      await retireNxFixture({ root: workspace, workspace });
       await rm(builds(), { force: true });
       await rm(ships(), { force: true });
     }
@@ -697,10 +694,11 @@ describe('smoo-nx-exec signal forwarding', () => {
   // A workspace whose `nx` is a script that kills itself. A target that has
   // never run is a miss, and a miss spawns exactly that binary, so this is the
   // whole signal path end to end — and deterministic, unlike racing a real
-  // build with a kill. The probe ahead of the miss is the real daemon's, so the
-  // workspace carries the repository's own Nx beside the fake CLI.
+  // build with a kill. The daemon is off, so the probe hands the run straight
+  // to that CLI; the workspace still carries the repository's own Nx, whose
+  // daemon client the probe asks.
   beforeAll(async () => {
-    workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-signal-')));
+    workspace = await nxFixtureRoot('ensure-built-signal-');
     const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
     expect(initialized.exitCode).toBe(0);
     await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true });
@@ -725,16 +723,12 @@ describe('smoo-nx-exec signal forwarding', () => {
 
   afterAll(async () => {
     if (workspace) {
-      try {
-        await stopFixtureNxDaemon(workspace);
-      } finally {
-        await rm(workspace, { recursive: true, force: true });
-      }
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 
   it('re-raises the signal that killed nx instead of flattening it to a code', async () => {
-    const run = await runBin(workspace, ['app:build', '--', './report']);
+    const run = await runBin(workspace, ['app:build', '--', './report'], { NX_DAEMON: 'false' });
     expect(run.signal).toBe('SIGTERM');
     expect(run.stdout).not.toContain(MARKER);
   });
@@ -747,7 +741,7 @@ describe('smoo-nx-exec daemon socket', () => {
   const record = () => readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
 
   beforeAll(async () => {
-    workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-socket-')));
+    workspace = await nxFixtureRoot('ensure-built-socket-');
     // Under /tmp, not the platform temp directory: a socket path has a 95
     // character budget and macOS's temp directory spends half of it.
     socketDir = await mkdtemp(join('/tmp', 'eb-sock-'));
@@ -771,10 +765,9 @@ describe('smoo-nx-exec daemon socket', () => {
   afterAll(async () => {
     try {
       if (workspace) {
-        await stopFixtureNxDaemon(workspace);
+        await retireNxFixture({ root: workspace, workspace });
       }
     } finally {
-      await rm(workspace, { recursive: true, force: true });
       await rm(socketDir, { recursive: true, force: true });
       await rm(callerDir, { recursive: true, force: true });
     }

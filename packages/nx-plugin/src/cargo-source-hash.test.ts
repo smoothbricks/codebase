@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
@@ -434,11 +434,7 @@ await appendFile(${JSON.stringify(executions)}, result);
       expect(await readFile(output, 'utf8')).toBe('12\n');
       expect(await readFile(executions, 'utf8')).toBe('11\n12\n');
     } finally {
-      try {
-        await stopFixtureNxDaemon(join(root, 'workspace'));
-      } finally {
-        await rm(root, { recursive: true, force: true });
-      }
+      await rm(root, { recursive: true, force: true });
     }
   },
   120_000,

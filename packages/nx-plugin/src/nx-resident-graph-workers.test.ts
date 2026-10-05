@@ -1,10 +1,9 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
-import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the resident-worker hunk of `patches/nx@23.2.1.patch`, the local build
@@ -81,12 +80,10 @@ function pluginWorkers(daemon: number): number[] {
 }
 
 it('keeps the daemon graph plugin workers running from one tracked change to the next', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'nx-resident-workers-')));
-  // fixtureNxEnv runs plugins in process; this regression is about isolated
-  // workers. NX_DAEMON: the daemon is the host under test even when the
-  // enclosing gate runs with CI=true, where Nx would otherwise disable it.
-  const env = { ...fixtureNxEnv(root), NX_ISOLATE_PLUGINS: 'true', NX_DAEMON: 'true' };
-  try {
+  await withNxFixture('nx-resident-workers-', async ({ workspace: root }) => {
+    // fixtureNxEnv runs plugins in process and without a daemon; this
+    // regression is about isolated workers, and the daemon is their host.
+    const env = { ...fixtureNxEnv(root), NX_ISOLATE_PLUGINS: 'true', NX_DAEMON: 'true' };
     await mkdir(join(root, 'app'));
     await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
     await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
@@ -111,11 +108,5 @@ it('keeps the daemon graph plugin workers running from one tracked change to the
     expect(await showApp(root, env)).toMatchObject({ tags: ['second'] });
     expect(await readFile(join(root, '.nx/workspace-data/d/server-process.json'), 'utf8')).toBe(record);
     expect(pluginWorkers(daemon)).toEqual(afterFirstGraph);
-  } finally {
-    try {
-      await stopFixtureNxDaemon(root);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  }
+  });
 });

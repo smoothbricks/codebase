@@ -54,7 +54,7 @@ it('keeps the source-import edges when Nx is linked from the global store', asyn
     const graphFile = join(root, 'graph.json');
     const child = spawn('node', [join(repositoryRoot, 'node_modules/.bin/nx'), 'graph', `--file=${graphFile}`], {
       cwd: root,
-      env: { ...fixtureNxEnv(root), NX_DAEMON: 'false' },
+      env: fixtureNxEnv(root),
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });

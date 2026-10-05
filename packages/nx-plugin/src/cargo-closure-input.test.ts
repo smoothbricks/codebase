@@ -18,7 +18,7 @@ import {
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
 import { createNodesV2 } from './index.js';
 
@@ -101,7 +101,7 @@ await appendFile(${JSON.stringify(executions)}, result);
     stdio: 'pipe',
   });
 
-  /** A fresh Node CLI and normal daemon, loading the linked plugin through development exports. */
+  /** A fresh, daemonless Node CLI, loading the linked plugin through development exports. */
   async function compile(): Promise<void> {
     const child = Bun.spawn(['node', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:compile'], {
       cwd: workspace,
@@ -134,15 +134,6 @@ await appendFile(${JSON.stringify(executions)}, result);
   return { workspace, compile, edit, log };
 }
 
-/** Release the fixture's own Nx daemon through Nx, then delete the whole fixture root. */
-async function removeFixture(root: string): Promise<void> {
-  try {
-    await stopFixtureNxDaemon(join(root, 'workspace'));
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-}
-
 it('keys a custom target on exactly its Cargo closure, inside the workspace and out', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-')));
   try {
@@ -167,7 +158,7 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
     await compile();
     expect(await log()).toBe('11\n12\n22\n');
   } finally {
-    await removeFixture(root);
+    await rm(root, { recursive: true, force: true });
   }
 }, 120_000);
 
@@ -185,7 +176,7 @@ it('refuses a closure member in an ignored directory, which no fileset can see, 
     // No runtime hash of the whole workspace stands in for it.
     expect(JSON.stringify(failure.partialResults)).not.toContain('--include-workspace');
   } finally {
-    await removeFixture(root);
+    await rm(root, { recursive: true, force: true });
   }
 }, 120_000);
 
