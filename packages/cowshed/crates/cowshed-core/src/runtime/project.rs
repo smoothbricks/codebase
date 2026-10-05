@@ -149,6 +149,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
         capacity: String,
+        volume: crate::api::dto::ResizeVolume,
     ) -> Result<crate::api::dto::ResizeResult>;
     async fn defragment(
         &mut self,
@@ -1088,7 +1089,10 @@ impl ProjectActor {
         require_coordinator(request.authority())?;
         let params: ResizeParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
-        let result = self.host.resize(params.workspace, params.capacity).await?;
+        let result = self
+            .host
+            .resize(params.workspace, params.capacity, params.volume)
+            .await?;
         json_response(result)
     }
 
@@ -1589,6 +1593,7 @@ struct ResizeParams {
     repo_id: RepoId,
     workspace: WorkspaceName,
     capacity: String,
+    volume: crate::api::dto::ResizeVolume,
 }
 
 #[derive(Deserialize)]
@@ -8424,15 +8429,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_storage_error)
     }
 
-    /// Grow a workspace's image, restoring the mount state the verb found it in.
+    /// Grow a workspace's image, or its build volume and seed, restoring the mount state the
+    /// verb found it in.
     ///
     /// The supervisor is stopped first for the same reason `detach` stops it: the image has to
     /// leave the kernel for the resize, and a supervisor holding the mount would either keep it
-    /// busy or come back pointed at a volume that went away underneath it.
+    /// busy or come back pointed at a volume that went away underneath it. Its jobs and daemons
+    /// hold the build volume the same way. A build volume is reached through the checkout's
+    /// build link, so a detached workspace has to be attached first.
     async fn resize(
         &mut self,
         workspace: WorkspaceName,
         capacity: String,
+        volume: crate::api::dto::ResizeVolume,
     ) -> Result<crate::api::dto::ResizeResult> {
         use crate::storage::lifecycle::Substrate;
         self.validate_binding().await?;
@@ -8442,18 +8451,44 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
-        let stopped = self.stop_supervisor(&workspace).await?;
-        let outcome = self
-            .substrate
-            .resize(&current.derived.workspace, requested)
-            .await
-            .map_err(native_storage_error)?;
-        drop(stopped);
+        let outcome = match volume {
+            crate::api::dto::ResizeVolume::Workspace => {
+                let stopped = self.stop_supervisor(&workspace).await?;
+                let outcome = self
+                    .substrate
+                    .resize(&current.derived.workspace, requested)
+                    .await
+                    .map_err(native_storage_error)?;
+                drop(stopped);
+                outcome
+            }
+            crate::api::dto::ResizeVolume::Build => {
+                if !was_mounted {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "workspace {workspace} is detached, so its build link cannot be read"
+                        ),
+                        format!("cowshed attach {workspace}, then retry the resize"),
+                    ));
+                }
+                let checkout = self.workspace_mount_path(&workspace)?;
+                let owner = super::build_volumes::Owner {
+                    name: workspace.clone(),
+                    incarnation: current.derived.workspace.incarnation().clone(),
+                };
+                let volumes = self.build_volumes()?;
+                let stopped = self.stop_supervisor(&workspace).await?;
+                let outcome = volumes.resize(owner, checkout, requested).await?;
+                drop(stopped);
+                outcome
+            }
+        };
         if was_mounted {
             self.ensure_supervisor(&workspace).await?;
         }
         Ok(crate::api::dto::ResizeResult {
             workspace,
+            volume,
             previous_capacity: outcome.previous.to_string(),
             capacity: outcome.capacity.to_string(),
         })

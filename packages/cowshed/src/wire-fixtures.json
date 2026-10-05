@@ -1031,9 +1031,16 @@
     "imageOnly": {}
   },
   "ResizeResult": {
+    "buildGrown": {
+      "capacity": "300g",
+      "previousCapacity": "100g",
+      "volume": "build",
+      "workspace": "main"
+    },
     "grown": {
       "capacity": "200g",
       "previousCapacity": "100g",
+      "volume": "workspace",
       "workspace": "cs-seam"
     }
   },

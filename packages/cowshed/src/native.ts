@@ -35,7 +35,7 @@ export interface NativeCoordinatorHandle {
   land(workspace: string, optionsJson: string, into?: NativeWorkspaceRefHandle): Promise<string>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
-  resize(workspace: string, capacity: string): Promise<string>;
+  resize(workspace: string, capacity: string, volumeJson: string): Promise<string>;
   remove(workspace: string, optionsJson: string): Promise<string>;
   gc(optionsJson: string): Promise<string>;
   doctor(): Promise<string>;

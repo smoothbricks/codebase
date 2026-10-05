@@ -415,11 +415,13 @@ pub enum MountTarget {
     Main,
 }
 
-/// `resize <ws|main> <size>` — grow one workspace's image.
+/// `resize <ws|main> <size>` — grow one workspace's image; `resize <ws|main> --build <size>` —
+/// grow its build volume and seed instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResizeArgs {
     pub workspace: String,
     pub capacity: OsString,
+    pub volume: cowshed_core::api::dto::ResizeVolume,
 }
 
 /// `defrag <ws|main>` — rewrite one workspace's image contiguously.
@@ -784,7 +786,8 @@ fn cli_command() -> ClapCommand {
         .subcommand(
             leaf("resize")
                 .arg(positional("workspace", 0..=1))
-                .arg(positional("size", 0..=1)),
+                .arg(positional("size", 0..=1))
+                .arg(value_once("build")),
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
@@ -2470,19 +2473,36 @@ const RESIZE: CommandSpec = CommandSpec {
     missing: "resize requires a workspace",
     args: "<ws|main> <size>",
     trailing: "",
-    summary: "grow a workspace image",
+    summary: "grow a workspace image or build volume",
     about: &[
         "Grows one workspace's image. Sizes are binary units — 100g, 200g, 1t — at least a mebibyte and a whole number of the 4 KiB blocks the image tools resize in. The supervisor is stopped for the resize and restarted after, because the image has to leave the kernel.",
+        "With `--build <size>` instead of a positional size, grows the workspace's build volume and its seed, so every later fork of the workspace inherits the capacity. The workspace's jobs and Nx daemon stop first; any other holder of the volume refuses the resize before anything changes. The workspace must be attached, because its build link names the volume.",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--build <size>",
+        meaning: "grow the workspace's build volume and seed to this size instead of its image",
+    }],
 };
 
 fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
+    use cowshed_core::api::dto::ResizeVolume;
     const USAGE: &CommandSpec = &RESIZE;
+    let workspace = require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?;
+    let (capacity, volume) = match (os(matches, "size"), os(matches, "build")) {
+        (Some(size), None) => (size, ResizeVolume::Workspace),
+        (None, Some(size)) => (size, ResizeVolume::Build),
+        (None, None) => return Err(UsageError::new("resize requires a size", USAGE)),
+        (Some(_), Some(_)) => {
+            return Err(UsageError::new(
+                "resize takes one size: <size> for the image or --build <size> for the build volume",
+                USAGE,
+            ));
+        }
+    };
     Ok(Command::Resize(ResizeArgs {
-        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
-        capacity: os(matches, "size")
-            .ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
+        workspace,
+        capacity,
+        volume,
     }))
 }
 
@@ -3745,6 +3765,38 @@ mod tests {
         assert!(parse_args(["identity", "add", "forge", "origin"]).is_err());
         assert!(parse_args(["identity"]).is_err());
         assert!(parse_args(["identity", "rm", "forge"]).is_err());
+    }
+
+    #[test]
+    fn resize_grows_the_image_or_with_build_the_build_volume() {
+        use cowshed_core::api::dto::ResizeVolume;
+        let resize = |args: &[&str]| match parse_args(args).unwrap().command {
+            Command::Resize(args) => args,
+            other => panic!("expected resize, got {other:?}"),
+        };
+        assert_eq!(
+            resize(&["resize", "raven", "200g"]),
+            ResizeArgs {
+                workspace: "raven".to_owned(),
+                capacity: OsString::from("200g"),
+                volume: ResizeVolume::Workspace,
+            }
+        );
+        assert_eq!(
+            resize(&["resize", "main", "--build", "300g"]),
+            ResizeArgs {
+                workspace: "main".to_owned(),
+                capacity: OsString::from("300g"),
+                volume: ResizeVolume::Build,
+            }
+        );
+        for refused in [
+            &["resize", "raven"][..],
+            &["resize", "raven", "200g", "--build", "300g"],
+            &["resize", "raven", "--build", "1g", "--build", "2g"],
+        ] {
+            assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

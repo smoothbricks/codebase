@@ -67,11 +67,17 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.asif` with its sidecar
   `<id>.asif.json`. It is attached `nobrowse` at a store-side mountpoint, `<mount-root>/.build/<owner>/<repo>/<id>`,
   never inside another volume.
-- **Capacity**: 100 GiB by default, and resizable exactly as a workspace image is (01_storage.md "Detached growth";
-  override per project via `.cowshed.toml`). A sparse image costs only its written blocks, so the capacity is not an
-  allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with the volume
-  named, and the remedy is a resize or a prune, never an unbounded cache. A clone and a seed inherit their source's
-  capacity.
+- **Capacity**: 100 GiB by default for a build volume created from nothing; `.cowshed.toml`
+  `[build] capacity = "<size>"` overrides it per project. A sparse image costs only its written blocks, so the capacity
+  is not an allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with
+  the volume named, and the remedy is a resize or a prune, never an unbounded cache. A clone and a seed inherit their
+  source's capacity: an image clone carries its capacity, and configuration only ever names the capacity of a volume
+  nothing was cloned from.
+- **Resize**: `cowshed resize <ws|main> --build <size>` grows the workspace's build volume exactly as a workspace image
+  grows (01_storage.md "Detached growth"), and its seed with it, so every later fork of the workspace inherits the new
+  capacity. The workspace's jobs and Nx daemon stop first, because the image has to leave the kernel; any other holder
+  of the volume refuses the resize before anything changes. A land adopts the landing volume at its own capacity, so a
+  workspace forked before its target grew lands smaller; resize it before it lands.
 - **ZFS**: a build volume is a dataset, `<pool>/cowshed/<owner>/<repo>/build/<id>`; a fork is `snapshot` + `clone`, and
   a seed is a snapshot (09_substrates.md).
 - A directory is never a build volume. Copying a Rust `target/` tree file by file with `clonefile`-backed `cp -c -p -R`

@@ -18,7 +18,7 @@ use cowshed_core::{
     api::{
         AdoptOptions, AttachOptions, CheckpointOptions, CreateOptions, ExecRequest, GcOptions,
         GrantDelta, JobId, LandOptions, MAX_JOB_ID, OutputPublication, PushOptions, RebaseOptions,
-        RemoveOptions, RunSandboxMode, StdinSource, TraceContext, WorkspacePath,
+        RemoveOptions, ResizeVolume, RunSandboxMode, StdinSource, TraceContext, WorkspacePath,
     },
 };
 use napi::{
@@ -493,11 +493,18 @@ impl Coordinator {
         })
     }
     #[napi]
-    pub fn resize(&self, env: Env, workspace: String, capacity: String) -> napi::Result<JsObject> {
+    pub fn resize(
+        &self,
+        env: Env,
+        workspace: String,
+        capacity: String,
+        volume_json: String,
+    ) -> napi::Result<JsObject> {
         let coordinator = Arc::clone(&self.inner);
         spawn_promise(env, async move {
+            let volume = parse_json::<ResizeVolume>("resize volume", &volume_json)?;
             let result = coordinator
-                .resize(&workspace, &capacity)
+                .resize(&workspace, &capacity, volume)
                 .await
                 .map_err(AddonFailure::from)?;
             canonical_json("resize result", &result)

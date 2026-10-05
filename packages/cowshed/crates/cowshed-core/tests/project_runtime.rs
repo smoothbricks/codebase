@@ -12,8 +12,8 @@ use cowshed_core::api::dto::{
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RunSandboxMode,
-    StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, ResizeVolume,
+    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -678,10 +678,16 @@ impl ProjectRuntimeHost for FakeHost {
         self.persist()
     }
 
-    async fn resize(&mut self, workspace: WorkspaceName, capacity: String) -> Result<ResizeResult> {
+    async fn resize(
+        &mut self,
+        workspace: WorkspaceName,
+        capacity: String,
+        volume: ResizeVolume,
+    ) -> Result<ResizeResult> {
         self.workspace(&workspace)?;
         Ok(ResizeResult {
             workspace,
+            volume,
             previous_capacity: "100g".to_owned(),
             capacity,
         })

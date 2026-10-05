@@ -38,6 +38,7 @@ import {
   type RemoveOptions,
   type RemoveReport,
   type ResizeResult,
+  type ResizeVolume,
   type Session,
   type WorkspaceHandle,
   type WorkspaceInfo,
@@ -89,6 +90,7 @@ export {
   type RemoveOptions,
   type RemoveReport,
   type ResizeResult,
+  type ResizeVolume,
   type RevisionTarget,
   type RunSandboxMode,
   type ScriptCommand,
@@ -352,8 +354,10 @@ class CoordinatorImpl implements Coordinator {
   async detach(workspace: string): Promise<void> {
     await callNativeAsync(() => this.#native.detach(workspace));
   }
-  async resize(workspace: string, capacity: string): Promise<ResizeResult> {
-    return parseResizeResult(await callNativeAsync(() => this.#native.resize(workspace, capacity)));
+  async resize(workspace: string, capacity: string, volume: ResizeVolume): Promise<ResizeResult> {
+    return parseResizeResult(
+      await callNativeAsync(() => this.#native.resize(workspace, capacity, JSON.stringify(volume))),
+    );
   }
 
   async remove(workspace: string, options?: RemoveOptions): Promise<RemoveReport> {

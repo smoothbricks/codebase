@@ -3,8 +3,8 @@ use super::dto::{
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, SealedJob, StdinSource, StepReport,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveReport, ResizeResult, ResizeVolume, RevisionResult, RunSandboxMode, SealedJob,
+    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1690,8 +1690,14 @@ impl Coordinator {
         .await
     }
 
-    /// Grow a workspace's image. Capacity only ever goes up; a smaller request is refused.
-    pub async fn resize(&self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
+    /// Grow a workspace's image, or its build volume and seed. Capacity only ever goes up; a
+    /// smaller request is refused.
+    pub async fn resize(
+        &self,
+        workspace: &str,
+        capacity: &str,
+        volume: ResizeVolume,
+    ) -> Result<ResizeResult> {
         call_typed(
             &self.runtime,
             "coordinator.resize",
@@ -1699,6 +1705,7 @@ impl Coordinator {
                 "repoId": self.project.repo_id,
                 "workspace": workspace,
                 "capacity": capacity,
+                "volume": volume,
             }),
         )
         .await

@@ -19,8 +19,10 @@ use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState, link,
     nx,
 };
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
+use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{BuildVolumeRelease, MacOsApfsExecutionHost};
+use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
@@ -328,6 +330,52 @@ impl BuildVolumes {
         .await
     }
 
+    /// Resize (16_build_volumes.md, "Substrate"), after `owner`'s supervisor has stopped its
+    /// jobs: grow `owner`'s seed and then the build volume `checkout` links to `capacity`, so
+    /// every later fork of `owner` inherits it. The seed goes first: it has no holder, and a
+    /// linked volume that then refuses leaves only a seed larger than it, which a retry skips.
+    /// The volume's Nx daemon is stopped as a land stops it; another holder of its task
+    /// database, or of any file in it, refuses before its image changes. A seed already at least
+    /// `capacity` is left as it is. Answers the linked volume's previous capacity and the one
+    /// the kernel now reports.
+    pub async fn resize(
+        &self,
+        owner: Owner,
+        checkout: PathBuf,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome> {
+        let Some(id) = self.linked(&checkout)? else {
+            return Err(CowshedError::not_found(
+                format!("workspace {} links no build volume", owner.name),
+                format!(
+                    "cowshed resize {} <size> grows its image instead",
+                    owner.name
+                ),
+            ));
+        };
+        self.blocking(move |host, layout| {
+            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let state = BuildVolumeState::read(&mount)?;
+            if let Err(busy) = nx::close(&mount, &state)
+                .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
+            {
+                return Err(CowshedError::conflict(
+                    format!("build volume {id} of {} is in use: {busy}", owner.name),
+                    "stop what holds it, then retry the resize",
+                ));
+            }
+            if let Some((seed, _)) = layout.seed_of(&owner.name, &owner.incarnation)? {
+                match host.resize_build_volume(layout, &seed, capacity) {
+                    Ok(_) | Err(ApfsStorageError::CapacityNotGrowing { .. }) => {}
+                    Err(error) => return Err(resize_error(&owner.name, &seed, error)),
+                }
+            }
+            host.resize_build_volume(layout, &id, capacity)
+                .map_err(|error| resize_error(&owner.name, &id, error))
+        })
+        .await
+    }
+
     /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms when the kernel
     /// lets go of it. A volume the kernel refuses to detach is deferred to the next pass with
     /// the kernel's words, beside what the plan itself deferred.
@@ -587,6 +635,28 @@ fn skip(busy: nx::Busy, side: Side) -> AdoptionSkip {
     }
 }
 
+/// A resize that asked for no growth is the caller's mistake, and a volume the kernel would not
+/// let go of is in use; anything else is broken storage.
+fn resize_error(
+    workspace: &WorkspaceName,
+    id: &BuildVolumeId,
+    error: ApfsStorageError,
+) -> CowshedError {
+    match error {
+        error @ ApfsStorageError::CapacityNotGrowing { .. } => CowshedError::usage(
+            format!("build volume {id} of {workspace}: {error}"),
+            format!("cowshed resize {workspace} --build <capacity larger than the current one>"),
+        ),
+        ApfsStorageError::Apfs(error) if crate::apfs::detach_was_dissented(&error) => {
+            CowshedError::conflict(
+                format!("build volume {id} of {workspace} is in use: {error}"),
+                "stop what holds it, then retry the resize",
+            )
+        }
+        error => storage(error),
+    }
+}
+
 fn storage(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     CowshedError::environment_missing(
         format!("build volume storage failed: {error}"),
@@ -781,5 +851,163 @@ mod tests {
             matches!(deferral(&sizeless), Some(Deferral::SizeUnreadable(_))),
             "{plan:?}"
         );
+    }
+
+    /// The bytes the filesystem mounted at `mount` holds, as the kernel reports them.
+    #[cfg(target_os = "macos")]
+    fn filesystem_bytes(mount: &Path) -> u64 {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `statfs` writes only into `stat`, a zeroed plain-data struct of its own type,
+        // and reads `path`, a NUL-terminated string that outlives the call.
+        let mut stat = unsafe { std::mem::zeroed::<libc::statfs>() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), &raw mut stat) }, 0);
+        stat.f_blocks * u64::from(stat.f_bsize)
+    }
+
+    /// `cowshed resize --build` on real APFS: the linked volume grows, its seed grows with it, so
+    /// a fork made afterwards inherits the new capacity; a request that does not grow is the
+    /// caller's mistake, and a volume with a file open refuses and keeps its capacity.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it() {
+        use crate::apfs::SystemCommandRunner;
+        use crate::capabilities::BuildStatePath;
+        use crate::storage::apfs::ApfsSubstrateConfig;
+        const GIB: u64 = ImageCapacity::GIBIBYTE;
+
+        let root = crate::scratch_apfs::ScratchRoot::new("build-resize").expect("scratch root");
+        let store = root.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.path().join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let host = Arc::new(
+            MacOsApfsExecutionHost::new(
+                SystemCommandRunner,
+                ApfsSubstrateConfig::new(
+                    &store,
+                    root.path().join("caches"),
+                    root.path().join("checkout"),
+                ),
+            )
+            .unwrap(),
+        );
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
+        let main = Owner {
+            name: WorkspaceName::main(),
+            incarnation: WorkspaceIncarnation::new("0".repeat(32)).unwrap(),
+        };
+        let checkout = |name: &str| {
+            let checkout = root.path().join(name);
+            fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+            checkout
+        };
+        let main_checkout = checkout("main");
+
+        // Main's volume at 1 GiB, linked from its checkout, with a seed cloned from it.
+        let live = BuildVolumeId::mint();
+        let mount = host
+            .create_build_volume(&layout, &live, ImageCapacity::from_gibibytes(1))
+            .expect("create main's build volume");
+        BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
+            fingerprint: None,
+        }
+        .write(&mount)
+        .unwrap();
+        layout
+            .write_record(&live, &BuildVolumeRecord::new(None, linked("main")))
+            .unwrap();
+        link::point(&main_checkout, &mount).unwrap();
+        host.clone_build_volume(
+            &layout,
+            &live,
+            &BuildVolumeId::mint(),
+            &BuildVolumeRecord::new(
+                None,
+                BuildVolumeRole::Seed {
+                    target: main.name.clone(),
+                    incarnation: main.incarnation.clone(),
+                },
+            ),
+        )
+        .expect("seed main");
+        assert!(filesystem_bytes(&mount) <= GIB);
+
+        let grown = volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(2),
+            )
+            .await
+            .expect("grow main's build volume");
+        assert_eq!(grown.previous, ImageCapacity::from_gibibytes(1));
+        assert!(
+            grown.capacity >= ImageCapacity::from_gibibytes(2),
+            "{grown:?}"
+        );
+        assert!(
+            filesystem_bytes(&mount) > 3 * GIB / 2,
+            "the remounted volume's filesystem grew: {}",
+            filesystem_bytes(&mount)
+        );
+        assert_eq!(volumes.linked(&main_checkout).unwrap(), Some(live.clone()));
+
+        // A fork made afterwards clones main's seed, and so starts at the new capacity.
+        let topic = Owner {
+            name: WorkspaceName::new("topic").unwrap(),
+            incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+        };
+        let topic_checkout = checkout("topic");
+        let forked = volumes
+            .fork(main.clone(), topic, topic_checkout.clone())
+            .await
+            .expect("fork from main's seed")
+            .expect("main has a seed");
+        assert!(
+            filesystem_bytes(&layout.mount(&forked)) > 3 * GIB / 2,
+            "the fork inherited the grown seed: {}",
+            filesystem_bytes(&layout.mount(&forked))
+        );
+
+        let not_growing = volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(not_growing.code, crate::ErrorCode::Usage, "{not_growing}");
+
+        let held = fs::File::create(mount.join("held")).unwrap();
+        let busy = volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(3),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(busy.code, crate::ErrorCode::Conflict, "{busy}");
+        assert!(
+            filesystem_bytes(&mount) < 5 * GIB / 2,
+            "a refused resize keeps the capacity"
+        );
+        drop(held);
+
+        for id in layout.list().unwrap() {
+            assert_eq!(
+                host.release_build_volume(&layout, &id).unwrap(),
+                BuildVolumeRelease::Deleted
+            );
+        }
     }
 }

@@ -25,9 +25,10 @@ use cowshed_core::{
         EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
         GcReport, GitOid, GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits,
         OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
-        RemoveReport, RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
-        StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspaceIncarnation, WorkspaceInfo,
-        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        RemoveReport, RepoRule, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId,
+        StdinInfo, StdinKind, StreamInfo, TraceContext, TraceId, UtcTimestamp,
+        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
+        WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -636,8 +637,15 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
 
     let resize = ResizeResult {
         workspace: workspace_name("cs-seam"),
+        volume: ResizeVolume::Workspace,
         previous_capacity: "100g".to_owned(),
         capacity: "200g".to_owned(),
+    };
+    let resize_build = ResizeResult {
+        workspace: WorkspaceName::main(),
+        volume: ResizeVolume::Build,
+        previous_capacity: "100g".to_owned(),
+        capacity: "300g".to_owned(),
     };
 
     BTreeMap::from([
@@ -679,7 +687,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         ),
         (
             "ResizeResult",
-            BTreeMap::from([("grown", document("resize result", &resize))]),
+            BTreeMap::from([
+                ("grown", document("resize result", &resize)),
+                ("buildGrown", document("resize result", &resize_build)),
+            ]),
         ),
     ])
 }

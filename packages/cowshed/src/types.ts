@@ -24,6 +24,8 @@ export type WorkspaceState = 'attached' | 'detached';
 export type EgressMode = 'intercept' | 'opaque';
 export type SimVerb = 'openurl' | 'install';
 export type RunSandboxMode = 'readWrite' | 'readOnly';
+/** Which of a workspace's volumes `resize` grows: its image, or its build volume and seed. */
+export type ResizeVolume = 'workspace' | 'build';
 export type JobStream = 'stdout' | 'stderr';
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
 
@@ -188,6 +190,7 @@ export interface CheckpointOptions {
 
 export interface ResizeResult {
   readonly workspace: string;
+  readonly volume: ResizeVolume;
   readonly previousCapacity: string;
   readonly capacity: string;
 }
@@ -519,7 +522,7 @@ export interface Coordinator {
   land(workspace: string, options?: LandOptions): Promise<LandReport>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
-  resize(workspace: string, capacity: string): Promise<ResizeResult>;
+  resize(workspace: string, capacity: string, volume: ResizeVolume): Promise<ResizeResult>;
   remove(workspace: string, options?: RemoveOptions): Promise<RemoveReport>;
   gc(options?: GcOptions): Promise<GcReport>;
   doctor(): Promise<DoctorReport>;

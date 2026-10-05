@@ -16,6 +16,7 @@ use crate::apfs::{
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord};
 use crate::metadata::{IMAGE_EXTENSION, ImageCapacity};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
+use crate::storage::lifecycle::ResizeOutcome;
 
 /// What releasing a build volume did.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,12 +256,13 @@ where
 
     /// Grow build volume `id`'s image to `capacity`: detached without force, grown, attached,
     /// its container grown, and mounted again. A volume in use refuses before anything changes.
+    /// Answers the capacity it had and the one the kernel now reports.
     pub fn resize_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         capacity: ImageCapacity,
-    ) -> Result<ImageCapacity, ApfsStorageError> {
+    ) -> Result<ResizeOutcome, ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         let previous = self.backend.image_capacity(&image)?;
@@ -300,7 +302,10 @@ where
                 observed,
             });
         }
-        Ok(observed)
+        Ok(ResizeOutcome {
+            previous,
+            capacity: observed,
+        })
     }
 }
 

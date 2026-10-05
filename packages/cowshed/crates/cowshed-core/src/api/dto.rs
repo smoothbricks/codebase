@@ -2445,11 +2445,21 @@ pub struct AttachOptions {
     pub observed_path: Option<PathBuf>,
 }
 
+/// Which of a workspace's volumes `cowshed resize` grows: its image, or its build volume and the
+/// workspace's seed with it (16_build_volumes.md, "Substrate").
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResizeVolume {
+    Workspace,
+    Build,
+}
+
 /// What `cowshed resize` changed, with both capacities as the image itself reports them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeResult {
     pub workspace: WorkspaceName,
+    pub volume: ResizeVolume,
     pub previous_capacity: String,
     pub capacity: String,
 }

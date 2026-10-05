@@ -19,7 +19,7 @@ use cowshed_core::api::{
     GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
+    ResizeResult, ResizeVolume, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
     StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
     WorkspaceState, validate_command_argv,
 };
@@ -118,7 +118,12 @@ pub trait CliService: Send {
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
-    async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
+    async fn resize(
+        &mut self,
+        workspace: &str,
+        capacity: &str,
+        volume: ResizeVolume,
+    ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
@@ -603,8 +608,15 @@ impl CliService for ActorBridge {
         self.coordinator()?.detach(workspace).await.map(|_| ())
     }
 
-    async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
-        self.coordinator()?.resize(workspace, capacity).await
+    async fn resize(
+        &mut self,
+        workspace: &str,
+        capacity: &str,
+        volume: ResizeVolume,
+    ) -> Result<ResizeResult> {
+        self.coordinator()?
+            .resize(workspace, capacity, volume)
+            .await
     }
 
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
@@ -1352,7 +1364,9 @@ where
         }
         Command::Resize(args) => {
             let capacity = os_capacity(args.capacity)?;
-            let result = service.resize(&args.workspace, &capacity).await?;
+            let result = service
+                .resize(&args.workspace, &capacity, args.volume)
+                .await?;
             // Resize leaves the workspace mounted exactly as it found it, but the mount it comes
             // back on is a new attachment, so the gateway's view has to be refreshed.
             service.reconcile_gateway().await?;
@@ -1363,9 +1377,13 @@ where
                     .bare_line(result.capacity.as_bytes())
                     .map_err(output_error)?;
             }
+            let volume = match result.volume {
+                ResizeVolume::Workspace => "",
+                ResizeVolume::Build => "'s build volume",
+            };
             output
                 .guidance(&format!(
-                    "workspace {} grew from {} to {}",
+                    "workspace {}{volume} grew from {} to {}",
                     result.workspace, result.previous_capacity, result.capacity
                 ))
                 .map_err(output_error)?;
