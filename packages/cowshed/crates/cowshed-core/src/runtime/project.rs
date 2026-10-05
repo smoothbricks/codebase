@@ -3623,6 +3623,16 @@ impl NativeProjectRuntimeHost {
             self.ensure_supervisor(workspace.name()),
         )
         .await?;
+        // Main's first touch: its build state moves onto its first build volume, and main gets
+        // the seed its forks clone (16_build_volumes.md, "Targets and seeds").
+        let current = self.current(workspace.name()).await?;
+        let mount = self.workspace_mount_path(workspace.name())?;
+        timed_async(
+            "adopt",
+            "build-state",
+            self.refresh_build_state_for(&current, &mount),
+        )
+        .await?;
         timed_async("adopt", "snapshot", self.snapshot_named(workspace.name())).await
     }
 
@@ -3905,7 +3915,14 @@ impl NativeProjectRuntimeHost {
             )
         };
         let mut refresh = volumes
-            .refresh(name.clone(), mount.to_owned(), discovered)
+            .refresh(
+                super::build_volumes::Owner {
+                    name: name.clone(),
+                    incarnation: current.derived.workspace.incarnation().clone(),
+                },
+                mount.to_owned(),
+                discovered,
+            )
             .await?
             .map_err(|refusal| {
                 CowshedError::conflict(

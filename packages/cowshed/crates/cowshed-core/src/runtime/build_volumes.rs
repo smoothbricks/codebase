@@ -113,12 +113,16 @@ impl BuildVolumes {
         })
     }
 
-    /// The volume `checkout` links and the state written at its root, or `None` when it links
-    /// none. The checkout is mounted, which mounted its volume.
+    /// The published volume `checkout` links and the state written at its root, or `None` when
+    /// it links none or an interrupted first touch left its volume without a record (which only
+    /// a fresh discovery finishes). The checkout is mounted, which mounted its volume.
     pub fn state_of(&self, checkout: &Path) -> Result<Option<(BuildVolumeId, BuildVolumeState)>> {
         let Some(id) = self.linked(checkout)? else {
             return Ok(None);
         };
+        if self.layout.read_record_present(&id)?.is_none() {
+            return Ok(None);
+        }
         let state = BuildVolumeState::read(&self.layout.mount(&id))?;
         Ok(Some((id, state)))
     }
@@ -148,25 +152,36 @@ impl BuildVolumes {
     /// (16_build_volumes.md, "One link per checkout"). With `Discovered::Unchanged` the held
     /// paths are re-linked where a tool displaced them. With fresh discovery, new paths join the
     /// volume's state (held ones never move), every path is linked, and the state records the new
-    /// fingerprint; a checkout that links no volume yet gets its first one at `capacity`, unless
-    /// nothing was discovered. A path that holds tracked source refuses before anything is
-    /// deleted.
+    /// fingerprint. A checkout whose volume is not published yet (none, or an interrupted first
+    /// touch's) gets its first one at `capacity`, unless it links none and nothing was
+    /// discovered; `owner` then also gets its seed, a clone of that volume, when it has none, so
+    /// it is a target others fork from (16_build_volumes.md, "Targets and seeds"). A path that
+    /// holds tracked source refuses before anything is deleted.
     pub async fn refresh(
         &self,
-        workspace: WorkspaceName,
+        owner: Owner,
         checkout: PathBuf,
         discovered: Discovered,
     ) -> Result<std::result::Result<BuildStateRefresh, TrackedBuildStateRefusal>> {
         let linked = self.linked(&checkout)?;
         self.blocking(move |host, layout| {
+            let published = match &linked {
+                Some(id) => layout.read_record_present(id)?.is_some(),
+                None => false,
+            };
             let (id, discovered) = match (linked, discovered) {
-                (Some(id), discovered) => (id, discovered),
+                (Some(id), discovered) if published => (id, discovered),
                 (None, Discovered::Unchanged) => return Ok(Ok(BuildStateRefresh::default())),
+                (Some(id), Discovered::Unchanged) => {
+                    return Err(CowshedError::internal(format!(
+                        "build volume {id} is unpublished, so its state cannot be unchanged"
+                    )));
+                }
                 (None, Discovered::Changed { paths, .. }) if paths.is_empty() => {
                     return Ok(Ok(BuildStateRefresh::default()));
                 }
                 (
-                    None,
+                    _,
                     Discovered::Changed {
                         paths,
                         fingerprint,
@@ -184,12 +199,31 @@ impl BuildVolumes {
                             record: BuildVolumeRecord::new(
                                 None,
                                 BuildVolumeRole::Linked {
-                                    checkout: workspace,
+                                    checkout: owner.name.clone(),
                                 },
                             ),
                         },
                     )?;
-                    return Ok(touched.map(|(id, displaced)| BuildStateRefresh {
+                    let (id, displaced) = match touched {
+                        Ok(touched) => touched,
+                        Err(refusal) => return Ok(Err(refusal)),
+                    };
+                    if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
+                        host.clone_build_volume(
+                            layout,
+                            &id,
+                            &BuildVolumeId::mint(),
+                            &BuildVolumeRecord::new(
+                                None,
+                                BuildVolumeRole::Seed {
+                                    target: owner.name,
+                                    incarnation: owner.incarnation,
+                                },
+                            ),
+                        )
+                        .map_err(storage)?;
+                    }
+                    return Ok(Ok(BuildStateRefresh {
                         volume: Some(id),
                         created: true,
                         added: paths

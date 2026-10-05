@@ -92,6 +92,24 @@ fn discard_one(tree_root: &Path, state: &Path) -> Result<()> {
         let leaf = components.peek().is_none();
         if metadata.is_symlink() {
             if !leaf {
+                // A fixed build-state link (`.nx/workspace-data -> ../.cowshed/build/...`): the
+                // state lives on the checkout's build volume, whose fork drops the daemon record
+                // itself (16_build_volumes.md, "Fork" step 3). Nothing here is the source tree's.
+                let target = fs::read_link(&path).map_err(|source| {
+                    CowshedError::integrity(
+                        format!("could not read the link {}: {source}", path.display()),
+                        "check the workspace mount is readable, then retry",
+                    )
+                })?;
+                let relative_parent = path
+                    .parent()
+                    .and_then(|parent| parent.strip_prefix(tree_root).ok())
+                    .unwrap_or_else(|| Path::new(""));
+                if crate::inherited_links::resolve_in_source(tree_root, relative_parent, &target)
+                    .starts_with(tree_root.join(crate::build_volume::BUILD_LINK))
+                {
+                    return Ok(());
+                }
                 // Removing anything under here would delete from whatever tree the link names.
                 return Err(CowshedError::integrity(
                     format!(
@@ -233,6 +251,32 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&cleaned).ok();
+    }
+
+    /// A fixed build-state link puts the daemon directory on the checkout's build volume, whose
+    /// fork drops the record itself: the source-tree mint leaves the link and what it names.
+    #[test]
+    fn daemon_state_behind_a_fixed_build_link_is_left_to_the_build_volume() {
+        let root = tree("build-link");
+        let volume = root.join(".cowshed/build/nx/workspace-data/d");
+        fs::create_dir_all(&volume).expect("volume daemon directory");
+        fs::write(volume.join("server-process.json"), b"{}").expect("daemon record");
+        fs::create_dir_all(root.join(".nx")).expect(".nx");
+        std::os::unix::fs::symlink(
+            "../.cowshed/build/nx/workspace-data",
+            root.join(".nx/workspace-data"),
+        )
+        .expect("fixed link");
+
+        discard(&root, &nx_states()).expect("the build volume's state is not the tree's");
+        assert!(volume.join("server-process.json").exists());
+        assert!(
+            fs::symlink_metadata(root.join(".nx/workspace-data"))
+                .unwrap()
+                .is_symlink()
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// Nx owns that path as a directory. A regular file there is something else — possibly
