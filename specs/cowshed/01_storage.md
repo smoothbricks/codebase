@@ -361,6 +361,53 @@ For every mounted attachment:
   `WorkspaceRef`.
 - Personal workspaces may opt into Finder visibility with `--browse` at attach time.
 
+## How the APFS host degrades
+
+The image substrate rests on four host services, and each fails in its own way under the load cowshed generates. They
+are host facts, not cowshed bugs, and every rule that budgets disk-tool calls exists because of one of them.
+
+1. **`storagekitd` serializes every `diskutil` verb, host-wide.** `diskutil image create`, `attach`, `info` and `resize`
+   each make a synchronous XPC call to root `storagekitd` that re-syncs every disk on the host (`syncAllDisks`); an
+   attach makes two. `storagekitd` answers one caller at a time. Measured on macOS 26 with about 390 `/dev/disk*` nodes:
+   `diskutil info` costs about 40 ms of that serial queue and an APFS ASIF attach about 85 ms, so throughput stays flat
+   (about 24 info calls/s, 12 attaches/s) while latency grows with the number of concurrent callers: an attach takes
+   0.22 s alone, 1.2 s with 16 concurrent, and 2.5 s with 32. A parallel real-image test suite peaked at 37 concurrent
+   disk-tool processes and measured 2.5–8 s for single calls that take 0.2 s idle. CPU load changes none of this; the
+   number of concurrent disk-tool calls on the host does. `hdiutil detach`, `newfs_apfs`, `fsck_apfs`, `mount_apfs` and
+   IORegistry reads do not go through `storagekitd`.
+2. **AppleDiskImages2 does not give attach slots back.** Every attach sets up a kernel IO manager in AppleDiskImages2,
+   and detaching the image does not reliably return its slot. Each attach→detach cycle lowers the number of images the
+   host can attach until reboot. Past the ceiling, every `diskutil image attach` and `diskutil image info` of every
+   format fails with "error code 150" ("Failed to initialize IO manager: Driver returned error code -536870210",
+   `kIOReturnNoResources`), and so does every new workspace, build volume, checkpoint and cold mount; images already
+   attached keep working, and legacy `hdiutil attach` of UDIF still attaches. Measured: a host about 20,000 attaches
+   into its uptime held 330 images at once, then failed at 128 after about 300 more attach→detach cycles, then at 114,
+   100 and 98 as later cycles were spent. IORegistry devices and `hdiutil info` matched one to one (no zombie devices),
+   and every `diskimagesiod` instance was alive. The ceiling did not recover over 80 minutes or after detaching images,
+   and `launchctl` offers no restart that frees it. Only a reboot does. An attach is therefore a consumable: an
+   operation or test pays the fewest attach cycles that prove its behavior.
+3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
+   and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach
+   that followed 45.3 s. A held file anywhere in a volume keeps its image attached, so a stray process with a cwd inside
+   a workspace blocks its retirement.
+4. **Shared extents fragment the source, not the clone.** Writing an image while a clone shares its blocks moves every
+   rewritten block to a new run, and every later clone pays the extent map on its first write ("Images" above).
+
+What the substrate does about each:
+
+- **Fewest storagekitd round-trips.** Production operations sit at their floor: a mint is one `image create` plus one
+  attach, a fork or cold mount is one attach, a land with no retire makes no disk-tool call, and a detach goes through
+  `hdiutil`. Values the image itself records come from the image, never from a `diskutil` query: an ASIF image's
+  capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses any layout other
+  than the measured one), and a mounted volume's from IORegistry.
+- **No attach→detach→attach on a success path**, and no verify-by-reattach.
+- **Test images are 1 GiB** and a fixture detaches its images on every exit path, panic and kill included; a killed
+  run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
+  attach budget for as long as it stays attached.
+- **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
+  contention instead of reducing it; the fix is fewer calls.
+- **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.
+
 ## Ownership, identity, and the volume label
 
 Three questions, three authorities, none of them the volume label:
