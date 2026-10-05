@@ -613,6 +613,15 @@ What it wires:
 `@smoothbricks/nx-plugin:bounded-exec` runs a shell command with a timeout and force-kill grace period. Test targets use
 this executor so hung test processes fail predictably instead of blocking Nx indefinitely.
 
+On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
+per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
+detached when the last live lease ends, since its pages return only on detach. It is a legacy DiskImages RAM disk, so it
+spends none of the AppleDiskImages2 attach budget cowshed counts (`specs/cowshed/01_storage.md`). A lease whose task
+died is reclaimed by the next task, unless an image is still attached from a file below it: that image belongs to
+whoever attached it, so the lease and the volume are kept and every new task names them. A target's own `env.TMPDIR`
+wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its
+inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
+
 The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
 tools that need to normalize package JSON consistently.
 

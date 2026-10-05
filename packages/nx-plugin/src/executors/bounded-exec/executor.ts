@@ -1,6 +1,14 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
 
+import {
+  createHostCommands,
+  describeRamTempError,
+  RAM_TEMP_CAPACITY_BYTES,
+  type RamTempLease,
+  RamTempVolume,
+  ramTempPaths,
+} from './ram-temp.js';
 import type { BoundedExecOptions } from './schema.js';
 
 const DEFAULT_KILL_AFTER_MS = 10_000;
@@ -43,30 +51,72 @@ export interface ProcessTreeKiller {
   kill(pid: number, signal: NodeJS.Signals): Promise<void>;
 }
 
+/** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
+export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness'>;
+
 export default function boundedExecExecutor(
   options: BoundedExecOptions,
   context: BoundedExecContext,
 ): Promise<BoundedExecResult> {
-  return runBoundedExec(options, context, createProcessTreeKiller());
+  // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
+  const tempVolume =
+    process.platform === 'darwin'
+      ? new RamTempVolume(ramTempPaths(process.getuid?.() ?? 0), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
+      : null;
+  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume);
 }
 
 export async function runBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
   killer: ProcessTreeKiller,
+  tempVolume: TempVolume | null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const command = buildCommand(options);
   const timeoutMs = options.timeoutMs;
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
-  const startedAt = Date.now();
   const outputChunks: string[] = [];
   const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
 
+  let lease: RamTempLease | null = null;
+  if (tempVolume !== null) {
+    const acquired = await tempVolume.acquire();
+    if (!acquired.ok) {
+      const message = `${describeRamTempError(acquired.error)}\n`;
+      process.stderr.write(message);
+      return { success: false, terminalOutput: message };
+    }
+    if (acquired.value.kind === 'leased') {
+      lease = acquired.value.lease;
+      for (const held of acquired.value.held) {
+        const message = `RAM temp volume: dead lease ${held}\n`;
+        outputChunks.push(message);
+        process.stderr.write(message);
+      }
+    } else {
+      const message = `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`;
+      outputChunks.push(message);
+      process.stderr.write(message);
+    }
+  }
+  const releaseLease = async (): Promise<void> => {
+    if (lease === null) {
+      return;
+    }
+    const held = lease;
+    lease = null;
+    const released = await tempVolume?.release(held);
+    if (released && !released.ok) {
+      appendStderr(`${describeRamTempError(released.error)}\n`);
+    }
+  };
+
+  const startedAt = Date.now();
   const child = spawn(command, [], {
     cwd,
-    env: mergeEnv(options.env),
+    env: mergeEnv(lease, options.env),
     shell: true,
     detached: process.platform !== 'win32',
     windowsHide: true,
@@ -117,7 +167,9 @@ export async function runBoundedExec(
   };
   const onTerminationSignal = (signal: NodeJS.Signals): void => {
     removeSignalHandlers();
-    void killChildTree(false).finally(() => process.kill(process.pid, signal));
+    void killChildTree(false)
+      .finally(releaseLease)
+      .finally(() => process.kill(process.pid, signal));
   };
   const onSigint = (): void => onTerminationSignal('SIGINT');
   const onSigterm = (): void => onTerminationSignal('SIGTERM');
@@ -201,6 +253,13 @@ export async function runBoundedExec(
     appendStderr(`Timed out command exited after graceful termination: ${command}\n`);
   }
 
+  // A test that dies of ENOSPC rarely says where it was writing; the volume can.
+  const full = code !== 0 && lease !== null ? await tempVolume?.fullness(lease) : null;
+  if (full) {
+    appendStderr(`${describeRamTempError(full)}\n`);
+  }
+  await releaseLease();
+
   return {
     success: state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
@@ -254,8 +313,12 @@ function buildCommand(options: BoundedExecOptions): string {
   return parts.join(' ');
 }
 
-function mergeEnv(env: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  return env ? { ...process.env, ...env } : process.env;
+/** The lease's directory is the command's TMPDIR unless the target names one itself. */
+function mergeEnv(lease: RamTempLease | null, env: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  if (lease === null) {
+    return env ? { ...process.env, ...env } : process.env;
+  }
+  return { ...process.env, TMPDIR: lease.directory, ...env };
 }
 
 function signalToExitCode(signal: NodeJS.Signals | null): number {

@@ -8,7 +8,9 @@ import {
   createProcessTreeKiller,
   type ProcessTreeKiller,
   runBoundedExec,
+  type TempVolume,
 } from './executor.js';
+import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
 
 const workspaces: string[] = [];
 const originalStdoutWrite = process.stdout.write;
@@ -37,6 +39,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -51,6 +54,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "process.exit(7)"', timeoutMs: 5_000 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -68,6 +72,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: "node -e \"console.log('out-value'); console.error('err-value')\"", timeoutMs: 5_000 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -84,6 +89,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => {}, 5000)"', timeoutMs: 50, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -99,6 +105,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 30_000, idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -130,6 +137,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node chatty.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -157,6 +165,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node chatty-stderr.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -171,6 +180,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: 30_000, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -186,6 +196,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: 30_000 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -214,6 +225,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       killer,
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -251,6 +263,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       killer,
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -275,6 +288,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 50, killAfterMs: 10 },
       workspace.context,
       killer,
+      null,
     );
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(result.success).toBe(false);
@@ -305,6 +319,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
     const suppressed = await runBoundedExec(
       {
@@ -316,6 +331,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     expect(forwarded.success).toBe(true);
@@ -346,12 +362,91 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: `node spawn-child.js ${marker}`, timeoutMs: 50, killAfterMs: 50 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
     );
 
     await sleep(1_000);
 
     expect(result.success).toBe(false);
     expect(await exists(marker)).toBe(false);
+  });
+
+  it('runs the command with its RAM lease as TMPDIR, names held dead leases, and ends the lease after it exits', async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const held = '/v/9-abcdef is kept: /v/9-abcdef/x.asif (/dev/disk9) still attached from below it';
+    const volume = scriptedVolume({ ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [held] } });
+
+    const result = await runBoundedExec(
+      { command: 'node -e "console.log(process.env.TMPDIR)"', timeoutMs: 5_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain(directory);
+    expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${held}\n`);
+    expect(volume.released).toEqual([directory]);
+  });
+
+  it('keeps the inherited TMPDIR inside a sandbox and says so once', async () => {
+    const workspace = await createWorkspace();
+    const volume = scriptedVolume({ ok: true, value: { kind: 'sandboxed', detail: 'lock: EPERM' } });
+
+    const result = await runBoundedExec(
+      { command: `node -e 'console.log("tmp=" + process.env.TMPDIR)'`, timeoutMs: 5_000, env: { TMPDIR: '/shed/tmp' } },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('tmp=/shed/tmp');
+    expect(result.terminalOutput.match(/RAM temp volume unavailable in this sandbox \(lock: EPERM\)/g)).toHaveLength(1);
+    expect(volume.released).toEqual([]);
+  });
+
+  it('does not run the command when the volume cannot be provisioned', async () => {
+    const workspace = await createWorkspace();
+    const marker = join(workspace.root, 'ran');
+    const volume = scriptedVolume({
+      ok: false,
+      error: { kind: 'provision-failed', step: 'hdiutil attach', detail: 'exit 1: Device not configured' },
+    });
+
+    const result = await runBoundedExec(
+      { command: `touch ${marker}`, timeoutMs: 5_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toBe('RAM temp volume: hdiutil attach failed: exit 1: Device not configured\n');
+    expect(await exists(marker)).toBe(false);
+  });
+
+  it('names the full volume when a failed command left it without space', async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const volume = scriptedVolume(
+      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [] } },
+      { kind: 'volume-full', mountpoint: workspace.root, capacityBytes: 1024 * 1024 * 1024, freeBytes: 1024 * 1024 },
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node -e "process.exit(1)"', timeoutMs: 5_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain(`RAM temp volume ${workspace.root} is full: 1 MiB free of 1024 MiB`);
+    expect(volume.released).toEqual([directory]);
   });
 });
 
@@ -372,6 +467,27 @@ async function createWorkspace(): Promise<WorkspaceFixture> {
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, contents);
     },
+  };
+}
+
+function leaseAt(directory: string): RamTempLease {
+  return { directory, mountpoint: dirname(directory), capacityBytes: 1024 * 1024 * 1024 };
+}
+
+/** A temp volume whose answers are fixed, recording which leases were released. */
+function scriptedVolume(
+  acquisition: Result<RamTempAcquisition, RamTempError>,
+  full: RamTempError | null = null,
+): TempVolume & { released: string[] } {
+  const released: string[] = [];
+  return {
+    released,
+    acquire: () => Promise.resolve(acquisition),
+    release(lease) {
+      released.push(lease.directory);
+      return Promise.resolve({ ok: true, value: undefined });
+    },
+    fullness: () => Promise.resolve(full),
   };
 }
 

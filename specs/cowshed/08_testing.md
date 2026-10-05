@@ -173,6 +173,12 @@ with datasets destroyed and the pool exported on teardown; the Linux leg also ex
 Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
 both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
+Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
+one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the run's template stay under `/private/tmp`
+whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease; a clone
+reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
+runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
+
 The `real_apfs_*` tests are scheduled like every other test: nextest runs them in parallel within a run, and the hash
 partitions place them in whichever Nx shard falls out. No nextest test group, `parallelism` flag, process cap or other
 throttle orders them, and the cowshed CLI lane is unrestricted the same way. What keeps concurrent fixtures from
