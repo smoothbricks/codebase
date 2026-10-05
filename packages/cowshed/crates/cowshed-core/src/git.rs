@@ -2912,8 +2912,6 @@ mod tests {
                     .expect("common Git directory")
             ),
         );
-        fs::remove_dir_all(&workspace).expect("remove workspace");
-        fs::remove_dir_all(main).expect("remove main");
     }
 
     #[cfg(target_os = "macos")]
@@ -2952,30 +2950,74 @@ mod tests {
             "trusted source fetch: {}",
             String::from_utf8_lossy(&admitted.stderr)
         );
-        fs::remove_dir_all(main).expect("remove fixture");
     }
 
-    fn repository() -> PathBuf {
+    /// A committed Git repository inside a private scratch directory. Every tree a test derives
+    /// beside it (`with_extension`) lands inside that scratch too, and dropping the fixture
+    /// removes the scratch on every exit path: a failed assertion unwinds through this `Drop`
+    /// exactly as a passing test does.
+    struct Repository {
+        scratch: PathBuf,
+        root: PathBuf,
+    }
+
+    impl std::ops::Deref for Repository {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl AsRef<Path> for Repository {
+        fn as_ref(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for Repository {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.root.as_os_str()
+        }
+    }
+
+    impl Drop for Repository {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.scratch) {
+                eprintln!(
+                    "git test fixture {} was not removed: {error}",
+                    self.scratch.display()
+                );
+            }
+        }
+    }
+
+    fn repository() -> Repository {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let scratch = std::env::temp_dir().join(format!(
             "cowshed-git-test-{}-{suffix}-{id}",
             std::process::id()
         ));
-        fs::create_dir_all(&root).expect("create test repository");
+        let fixture = Repository {
+            root: scratch.join("repository"),
+            scratch,
+        };
+        fs::create_dir_all(&fixture.root).expect("create test repository");
+        let root = &fixture.root;
         let status = Command::new("git")
             .args(["init", "-q", "-b", "main"])
-            .arg(&root)
+            .arg(root)
             .status_locked()
             .expect("run git init");
         assert!(status.success());
         fs::write(root.join("README"), "test\n").expect("write fixture");
         let status = Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(root)
             .args([
                 "-c",
                 "user.name=Cowshed Test",
@@ -2989,7 +3031,7 @@ mod tests {
         assert!(status.success());
         let status = Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(root)
             .args([
                 "-c",
                 "user.name=Cowshed Test",
@@ -3002,7 +3044,7 @@ mod tests {
             .status_locked()
             .expect("run git commit");
         assert!(status.success());
-        root
+        fixture
     }
 
     fn command_output(exit_code: i32, stderr: &[u8]) -> Output {
@@ -3046,8 +3088,6 @@ mod tests {
         fs::write(root.join("bench/results/run-1/out.txt"), "1\n").expect("bench output");
         assert!(git.is_dirty().await.expect("own rules"));
         assert!(!git.is_dirty_by(Some(&main)).await.expect("main's rules"));
-        fs::remove_dir_all(main).expect("remove main fixture");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3096,9 +3136,6 @@ mod tests {
             [PathBuf::from("README")],
             "what blocks a rebase is the tracked change alone"
         );
-
-        fs::remove_dir_all(main).expect("remove main fixture");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// Enough ignored paths that git's answers overflow the stdout pipe many times over.
@@ -3117,7 +3154,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore rules");
         let paths = pipe_overflowing_paths();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let checkout = root.clone();
+        let checkout = root.to_path_buf();
         let asked = paths.clone();
         std::thread::spawn(move || {
             let borrowed: Vec<&[u8]> = asked.iter().map(Vec::as_slice).collect();
@@ -3127,7 +3164,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(120))
             .expect("check-ignore batch deadlocked");
         assert_eq!(ignored, paths);
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3143,7 +3179,6 @@ mod tests {
         .await
         .expect("check-ignore batch deadlocked");
         assert_eq!(ignored, paths);
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// Only a regular file whose exact bytes the repository already stores is held; a
@@ -3161,8 +3196,6 @@ mod tests {
         let held = held_by_repository_blocking(&root, &[&copy, &edited, &newline]);
         assert_eq!(held, vec![copy]);
         assert!(held_by_repository_blocking(&root, &[]).is_empty());
-        fs::remove_dir_all(root).expect("remove fixture");
-        fs::remove_dir_all(outside).expect("remove outside fixture");
     }
 
     #[tokio::test]
@@ -3188,14 +3221,12 @@ mod tests {
             )
             .await
             .expect("a plain Git repository requires no shell configuration");
-        for directory in [&root, &workspace] {
+        for directory in [&*root, workspace.as_path()] {
             assert!(!directory.join(".envrc").exists());
             assert!(!directory.join(".envrc-local").exists());
             assert!(!directory.join(".gitignore").exists());
             assert_eq!(git_stdout(directory, &["status", "--porcelain"]), "");
         }
-        fs::remove_dir_all(workspace).expect("remove workspace");
-        fs::remove_dir_all(root).expect("remove source");
     }
 
     #[tokio::test]
@@ -3243,8 +3274,6 @@ mod tests {
             }
             assert!(!workspace.join(".envrc-local").exists());
             assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
-            fs::remove_dir_all(workspace).expect("remove workspace");
-            fs::remove_dir_all(root).expect("remove source");
         }
     }
 
@@ -3264,7 +3293,6 @@ mod tests {
             .await
             .expect("detached HEAD is not an error");
         assert_eq!(branch, None);
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3279,7 +3307,6 @@ mod tests {
         assert_eq!(error.code.as_str(), "internal");
         assert!(error.message.starts_with("failed to read current branch:"));
         assert!(!error.message.ends_with(':'));
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -3324,7 +3351,6 @@ mod tests {
         assert!(!repo.is_dirty().await.expect("read clean status"));
         fs::write(root.join("untracked"), b"dirty\n").expect("write untracked file");
         assert!(repo.is_dirty().await.expect("read dirty status"));
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3344,7 +3370,6 @@ mod tests {
         fs::create_dir(root.join(".cowshed")).expect("runtime metadata");
         fs::create_dir(root.join(".fseventsd")).expect("APFS metadata");
         assert!(!repo.is_dirty().await.expect("runtime state is ignored"));
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3365,7 +3390,6 @@ mod tests {
             fs::read(&unrelated).expect("unrelated bytes"),
             b"preserve\n"
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -3399,8 +3423,7 @@ mod tests {
         let remotes = repo.remotes().await.expect("read remotes");
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].name, MAIN_REMOTE);
-        assert_eq!(Path::new(&remotes[0].url), root);
-        fs::remove_dir_all(root).expect("remove fixture");
+        assert_eq!(Path::new(&remotes[0].url), &*root);
     }
 
     #[tokio::test]
@@ -3433,7 +3456,6 @@ mod tests {
             .await
             .expect_err("fresh operation still refuses the existing branch");
         assert_eq!(error.code.as_str(), "conflict");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// Clone main's tree the way the substrate does — files and all, `.git` included — so the
@@ -3523,9 +3545,6 @@ mod tests {
             .unregister_linked_worktree("raven")
             .await
             .expect("second unregister is a no-op");
-
-        fs::remove_dir_all(main).expect("remove fixture");
-        fs::remove_dir_all(mount).expect("remove clone");
     }
 
     #[tokio::test]
@@ -3553,8 +3572,6 @@ mod tests {
         assert!(main.join(".git/worktrees/raven").is_dir());
         assert!(mount.join(".git").is_file());
         assert!(!mount.join(".cowshed/worktree-staging").exists());
-        fs::remove_dir_all(main).expect("remove main");
-        fs::remove_dir_all(mount).expect("remove workspace");
     }
 
     /// Where the source's `link:` dependency sits in every tree, relative to the tree root.
@@ -3564,7 +3581,8 @@ mod tests {
     /// what `bun install` leaves for a `link:` dependency — a relative link that climbs out of the
     /// tree into an immutable global install — beside an ordinary in-tree relative link.
     struct ThreeDepths {
-        base: PathBuf,
+        /// Owns every tree below: main is the seed repository moved inside it.
+        _scratch: Repository,
         main: PathBuf,
         source: PathBuf,
         destination: PathBuf,
@@ -3632,7 +3650,7 @@ mod tests {
                 "the inherited bytes must miss at the clone's depth, or this proves nothing"
             );
             Self {
-                base,
+                _scratch: seed,
                 main,
                 source,
                 destination,
@@ -3686,10 +3704,6 @@ mod tests {
                 "the main remote names main's canonical mount, not the tree the image came from"
             );
         }
-
-        fn remove(self) {
-            fs::remove_dir_all(self.base).expect("remove fixture");
-        }
     }
 
     /// Copy a tree the way the substrate clones an image: links as links, `.git` included.
@@ -3722,7 +3736,6 @@ mod tests {
             branch
         );
         assert_eq!(workspace.remotes().await.expect("fork remotes"), remotes);
-        trees.remove();
     }
 
     #[tokio::test]
@@ -3742,7 +3755,6 @@ mod tests {
             .expect("mint standalone workspace");
         trees.assert_links_follow_the_source();
         trees.assert_standalone_main_remote(&workspace).await;
-        trees.remove();
     }
 
     #[tokio::test]
@@ -3779,7 +3791,6 @@ mod tests {
             workspace.remotes().await.expect("remotes").is_empty(),
             "a linked worktree shares main's object store and has nothing to fetch"
         );
-        trees.remove();
     }
 
     #[tokio::test]
@@ -3829,7 +3840,6 @@ mod tests {
             .expect("resume mint");
         trees.assert_links_follow_the_source();
         trees.assert_standalone_main_remote(&workspace).await;
-        trees.remove();
     }
 
     /// Unregistering one workspace must leave every other registration alone — including one whose
@@ -3863,8 +3873,6 @@ mod tests {
             main.join(".git/worktrees/heron").exists(),
             "a detached workspace's registration must survive another workspace's retirement"
         );
-        fs::remove_dir_all(main).expect("remove fixture");
-        fs::remove_dir_all(raven).expect("remove clone");
     }
 
     /// `cowshed mv` moves main under direct mount, invalidating every gitdir pointer at once. The
@@ -3907,8 +3915,6 @@ mod tests {
             .head_oid()
             .await
             .expect("workspace git works again");
-        fs::remove_dir_all(moved).expect("remove fixture");
-        fs::remove_dir_all(mount).expect("remove clone");
     }
 
     /// A branch main already holds is main's, and the registration id is the workspace name, so
@@ -3932,9 +3938,6 @@ mod tests {
         assert_eq!(error.code.as_str(), "conflict");
         // Refused before anything was discarded: the image is still a repository.
         assert!(mount.join(".git").is_dir());
-
-        fs::remove_dir_all(main).expect("remove fixture");
-        fs::remove_dir_all(mount).expect("remove clone");
     }
 
     /// The three cases of `configure_main_remote`, witnessed by what the config actually holds
@@ -4015,7 +4018,6 @@ mod tests {
             Some(edited_again),
             "a remote the user has edited is never reclaimed, dead path or not"
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// The state a moved checkout leaves in every workspace minted before ownership was recorded:
@@ -4053,7 +4055,6 @@ mod tests {
             None,
             "no second remote is left behind"
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// `host` is an ordinary remote name: configuration adds cowshed's `main` beside a remote a
@@ -4080,7 +4081,6 @@ mod tests {
             repo.remote_url(MAIN_REMOTE).await.expect("read main"),
             Some(mount)
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// Reverse registration lives in main's repository and disappears with the workspace.
@@ -4118,7 +4118,6 @@ mod tests {
         main.register_workspace_remote("raven", Path::new("relative/path"))
             .await
             .expect_err("a registration must name an absolute mount");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4159,7 +4158,6 @@ mod tests {
                 .expect("idempotent re-run over a non-UTF-8 mount"),
             MainRemote::Canonical
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4177,7 +4175,6 @@ mod tests {
         );
 
         fs::remove_file(&loop_path).expect("remove symlink loop");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4273,9 +4270,6 @@ mod tests {
                 .await
                 .expect("preservation ref contains session commit")
         );
-
-        fs::remove_dir_all(session).expect("remove session fixture");
-        fs::remove_dir_all(host).expect("remove host fixture");
     }
 
     #[tokio::test]
@@ -4296,7 +4290,6 @@ mod tests {
                 .as_deref(),
             Some("MERGE_HEAD")
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4322,7 +4315,6 @@ mod tests {
                 .expect("read operation state"),
             Some("CHERRY_PICK_HEAD".to_owned())
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4349,7 +4341,6 @@ mod tests {
             !path.exists(),
             "dropping the cancelled future must remove its scratch"
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     /// Commit `label` on top of whatever is checked out in `root`, and answer the new head.
@@ -4417,7 +4408,6 @@ mod tests {
             .expect("read core.ignorecase");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"false\n");
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4477,7 +4467,6 @@ mod tests {
                 .await
                 .expect("landed work is contained by main")
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4506,7 +4495,6 @@ mod tests {
             repo.commits_ahead(None, "HEAD").await.expect("count all"),
             3
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4516,11 +4504,7 @@ mod tests {
         commit_on(&main, "old-one");
         let clone_time_main = commit_on(&main, "old-two");
 
-        let workspace = std::env::temp_dir().join(format!(
-            "cowshed-git-test-history-diverged-{}-{}",
-            std::process::id(),
-            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
+        let workspace = main.with_extension("history-diverged");
         let status = Command::new("git")
             .args(["clone", "-q"])
             .arg(&main)
@@ -4587,11 +4571,7 @@ mod tests {
             .expect_err("an oid tip produces a ref-less bundle git will not write");
         assert!(refless.message.contains("empty bundle"), "{refless:?}");
 
-        let recovery = std::env::temp_dir().join(format!(
-            "cowshed-git-test-empty-recovery-{}-{}",
-            std::process::id(),
-            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
+        let recovery = main.with_extension("empty-recovery");
         fs::create_dir_all(&recovery).expect("create empty recovery");
         git(&recovery, &["init", "-q", "--bare", "."]);
         let verify = Command::new("git")
@@ -4641,10 +4621,6 @@ mod tests {
             restored.stdout, claimed.stdout,
             "bundle must yield exactly the oids claimed against live main after history rewrite"
         );
-
-        fs::remove_dir_all(recovery).expect("remove recovery fixture");
-        fs::remove_dir_all(workspace).expect("remove workspace fixture");
-        fs::remove_dir_all(main).expect("remove main fixture");
     }
 
     #[tokio::test]
@@ -4693,8 +4669,6 @@ mod tests {
             Some("cowshed/history-diverged".to_owned()),
             "verification failure must leave workspace refs untouched"
         );
-
-        fs::remove_dir_all(workspace).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4729,8 +4703,6 @@ mod tests {
             first,
             "a retry keeps the verified bundle rather than writing a second one over it"
         );
-
-        fs::remove_dir_all(workspace).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -4763,9 +4735,6 @@ mod tests {
         let remotes = repo.remotes().await.expect("list remotes");
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].name, "main");
-
-        fs::remove_dir_all(workspace).expect("remove workspace");
-        fs::remove_dir_all(main_mount).expect("remove main");
     }
 
     #[tokio::test]
@@ -4807,13 +4776,10 @@ mod tests {
             .await
             .expect("inspect after repair");
         assert_eq!(after.remote_name, MAIN_REMOTE);
-        assert_eq!(after.url.as_deref(), Some(main_mount.as_path()));
+        assert_eq!(after.url.as_deref(), Some(&*main_mount));
         assert!(
             after.repository,
             "configure_main_remote must retarget cowshed's remote"
         );
-
-        fs::remove_dir_all(workspace).expect("remove workspace");
-        fs::remove_dir_all(main_mount).expect("remove main");
     }
 }

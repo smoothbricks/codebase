@@ -402,7 +402,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    fn temp_tree(label: &str) -> PathBuf {
+    /// A scratch tree removed when dropped, so a failed assertion — or the deliberate panic one
+    /// test provokes — unwinds through the cleanup a passing test runs.
+    struct TempTree(PathBuf);
+
+    impl std::ops::Deref for TempTree {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "inherited-links test tree {} was not removed: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    fn temp_tree(label: &str) -> TempTree {
         let root = std::env::temp_dir().join(format!(
             "cowshed-inherited-links-{label}-{}-{:?}",
             std::process::id(),
@@ -410,7 +433,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp tree");
-        root
+        TempTree(root)
     }
 
     #[test]

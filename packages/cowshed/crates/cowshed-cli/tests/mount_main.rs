@@ -138,6 +138,19 @@ impl Fixture {
     }
 }
 
+/// The scratch root goes with the fixture, so a failed assertion unwinds through the same
+/// cleanup a passing test runs.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root) {
+            eprintln!(
+                "mount-main fixture {} was not removed: {error}",
+                self.root.display()
+            );
+        }
+    }
+}
+
 struct FakeBackend {
     calls: Mutex<Vec<String>>,
     stale: bool,

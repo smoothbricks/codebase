@@ -544,12 +544,41 @@ mod tests {
         StorageLayout::new(root, &RepoId::parse("acme/widget").unwrap()).unwrap()
     }
 
-    fn temp_store(name: &str) -> PathBuf {
+    /// A scratch store root removed when dropped, so a failed assertion unwinds through the
+    /// cleanup a passing test runs.
+    struct TempStore(PathBuf);
+
+    impl std::ops::Deref for TempStore {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempStore {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "layout test store {} was not removed: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    fn temp_store(name: &str) -> TempStore {
         let root =
             std::env::temp_dir().join(format!("cowshed-layout-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        root
+        TempStore(root)
     }
 
     #[test]
@@ -647,10 +676,7 @@ mod tests {
     #[test]
     fn configured_host_root_changes_only_workspace_mount_derivation() {
         let root = temp_store("configured-mount-root");
-        let mount_root = root
-            .parent()
-            .unwrap()
-            .join(format!("cowshed-custom-mounts-{}", std::process::id()));
+        let mount_root = temp_store("configured-mount-root-mounts");
         let plan = host_config::plan_mount_root_change(&root, &mount_root, []).unwrap();
         host_config::execute_mount_root_change(&plan).unwrap();
 
@@ -660,11 +686,8 @@ mod tests {
             layout.workspace_mount(&raven).unwrap(),
             mount_root.join("acme/widget/raven")
         );
-        assert_eq!(layout.project().host_mount_root, mount_root);
+        assert_eq!(layout.project().host_mount_root, *mount_root);
         assert_eq!(layout.project().project_root, root.join("acme/widget"));
-
-        fs::remove_dir_all(&root).unwrap();
-        fs::remove_dir_all(layout.project().host_mount_root.clone()).unwrap();
     }
 
     #[test]

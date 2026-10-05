@@ -33,26 +33,51 @@ const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 const QUARANTINED_REVISION: u64 = 7;
 const LIVE_REVISION: u64 = 5;
 
+/// The fixture's private scratch directory, removed when the fixture drops: a failed assertion
+/// unwinds through the same cleanup a passing test runs.
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(case: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-rekey-{case}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root");
+        // Owned before canonicalizing, so even that failure removes the directory.
+        let mut owned = Self(root);
+        owned.0 = fs::canonicalize(&owned.0).expect("canonical temp root");
+        owned
+    }
+
+    fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.0.join(path)
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            eprintln!(
+                "rekey fixture {} was not removed: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
 struct Fixture {
+    root: TempRoot,
     layout: StorageLayout,
     workspace: WorkspaceName,
     incarnation: WorkspaceIncarnation,
     image: PathBuf,
     mount_point: PathBuf,
     entry: Option<PathBuf>,
-}
-
-fn temp_root(case: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "cowshed-rekey-{case}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    fs::create_dir_all(&root).expect("temp root");
-    fs::canonicalize(&root).expect("canonical temp root")
 }
 
 fn sidecar(
@@ -88,8 +113,8 @@ fn sidecar(
     }
 }
 
-fn base_fixture(case: &str, name: &str) -> (PathBuf, Fixture) {
-    let root = temp_root(case);
+fn base_fixture(case: &str, name: &str) -> Fixture {
+    let root = TempRoot::new(case);
     let store = root.join("store");
     let mounts = root.join("mnt");
     fs::create_dir_all(&store).expect("store");
@@ -132,21 +157,19 @@ fn base_fixture(case: &str, name: &str) -> (PathBuf, Fixture) {
     )
     .expect("marker");
 
-    (
+    Fixture {
         root,
-        Fixture {
-            layout,
-            workspace,
-            incarnation,
-            image,
-            mount_point,
-            entry: None,
-        },
-    )
+        layout,
+        workspace,
+        incarnation,
+        image,
+        mount_point,
+        entry: None,
+    }
 }
 
 fn quarantined_fixture(case: &str, name: &str) -> Fixture {
-    let (root, mut fixture) = base_fixture(case, name);
+    let mut fixture = base_fixture(case, name);
     let paths = fixture.layout.project().clone();
     assert!(
         !sidecar_path(&fixture.image).exists(),
@@ -160,7 +183,7 @@ fn quarantined_fixture(case: &str, name: &str) -> Fixture {
         &fixture.workspace,
         &fixture.incarnation,
         QUARANTINED_REVISION,
-        &root.join("checkout"),
+        &fixture.root.join("checkout"),
     )
     .write_for_image(&entry.join(format!("{name}.asif")))
     .expect("quarantined sidecar");
@@ -188,13 +211,13 @@ fn quarantined_fixture(case: &str, name: &str) -> Fixture {
 }
 
 fn live_keyless_fixture(case: &str, name: &str) -> Fixture {
-    let (root, fixture) = base_fixture(case, name);
+    let fixture = base_fixture(case, name);
     sidecar(
         &RepoId::parse("acme/widget").expect("repo"),
         &fixture.workspace,
         &fixture.incarnation,
         LIVE_REVISION,
-        &root.join("checkout"),
+        &fixture.root.join("checkout"),
     )
     .write_for_image(&fixture.image)
     .expect("live sidecar");
@@ -262,7 +285,7 @@ fn rekey_preserves_revision_when_the_sidecar_never_left() {
 
 #[test]
 fn rekey_refuses_a_workspace_that_is_already_keyed() {
-    let (root, fixture) = base_fixture("keyed", "raven");
+    let fixture = base_fixture("keyed", "raven");
     let repo = RepoId::parse("acme/widget").expect("repo");
     let block = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block");
     sidecar(
@@ -270,7 +293,7 @@ fn rekey_refuses_a_workspace_that_is_already_keyed() {
         &fixture.workspace,
         &fixture.incarnation,
         LIVE_REVISION,
-        &root.join("checkout"),
+        &fixture.root.join("checkout"),
     )
     .write_for_image(&fixture.image)
     .expect("live sidecar");
