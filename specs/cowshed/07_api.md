@@ -89,6 +89,9 @@ impl WorkspaceRef {
     pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet);
     pub async fn refresh_info(&self) -> Result<WorkspaceInfo, CowshedError>;
     pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>;
+    /// The volume a job of this incarnation would be granted now (16_build_volumes.md); `None` when
+    /// the checkout links none. Coordinator-only; refuses a detached workspace and a recreated name.
+    pub async fn build_volume(&self) -> Result<Option<PathBuf>, CowshedError>;
     pub async fn attach(&self, opts: AttachOptions) -> Result<(), CowshedError>;
 }
 ```

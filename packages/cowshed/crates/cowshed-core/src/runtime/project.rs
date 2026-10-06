@@ -23,7 +23,7 @@ use crate::api::dto::{
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
     RemoveProjectReport, RemoveReport, RemovedWorkspace, RevisionResult, RunSandboxMode, SealedJob,
-    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -231,6 +231,16 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         _workspace: WorkspaceName,
     ) -> Result<crate::build_volume::BuildStateRefresh> {
+        Err(CowshedError::internal(
+            "build volumes are unavailable for this runtime host",
+        ))
+    }
+
+    /// The build volume a job of the mounted `workspace` admitted now is granted
+    /// ([`crate::build_volume::BuildVolumeLayout::grant`]), read without refreshing anything;
+    /// `None` when its checkout links none. The router has already proven the workspace mounted
+    /// at the caller's incarnation.
+    async fn build_volume(&mut self, _workspace: WorkspaceName) -> Result<Option<PathBuf>> {
         Err(CowshedError::internal(
             "build volumes are unavailable for this runtime host",
         ))
@@ -833,6 +843,7 @@ impl ProjectActor {
             "workspace.info" => self.workspace_info(request).await,
             "workspace.attach" => self.workspace_attach(request).await,
             "workspace.grants" => self.workspace_grants(request).await,
+            "workspace.buildVolume" => self.workspace_build_volume(request).await,
             "coordinator.adopt" => self.coordinator_adopt(request).await,
             "coordinator.create" => self.coordinator_create(request).await,
             "coordinator.fork" => self.coordinator_fork(request).await,
@@ -983,6 +994,38 @@ impl ProjectActor {
         let snapshot = find_workspace(&snapshots, &params.workspace)?;
         self.validate_worker_snapshot(request.authority(), snapshot)?;
         json_response(&snapshot.grants)
+    }
+
+    /// The build volume a job of the workspace would be granted now: what a coordinator that
+    /// confines its own reads to a workspace follows the checkout's build link into
+    /// (16_build_volumes.md, "Process lifetime across a swap"). Coordinator-only, and fenced on
+    /// the incarnation, so a name recreated meanwhile never answers for the one the caller holds.
+    async fn workspace_build_volume(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkerScope = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let snapshots = self.host.snapshots().await?;
+        let snapshot = find_workspace(&snapshots, &params.workspace)?;
+        if snapshot.info.workspace_incarnation != params.workspace_incarnation {
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::IncarnationMoved {
+                    workspace: params.workspace,
+                    observed: snapshot.info.workspace_incarnation.clone(),
+                },
+                "workspace incarnation is stale",
+                "resolve the workspace again and retry",
+            ));
+        }
+        if snapshot.info.state != WorkspaceState::Attached {
+            return Err(CowshedError::conflict(
+                format!(
+                    "workspace {} is detached; its build link cannot be read",
+                    params.workspace
+                ),
+                format!("cowshed attach {}, then retry", params.workspace),
+            ));
+        }
+        json_response(self.host.build_volume(params.workspace).await?)
     }
 
     async fn coordinator_adopt(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -10220,6 +10263,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         let mount = self.workspace_mount_path(&workspace)?;
         self.refresh_build_state_for(&current, &mount).await
+    }
+
+    async fn build_volume(&mut self, workspace: WorkspaceName) -> Result<Option<PathBuf>> {
+        let mount = self.workspace_mount_path(&workspace)?;
+        self.build_volume_layout()?.grant(&workspace, &mount)
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {

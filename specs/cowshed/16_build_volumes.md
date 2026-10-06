@@ -617,10 +617,15 @@ it belongs to. Each job's sandbox grants exactly the build volume the controller
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the
   daemon it watched is stopped at a swap (Nx reports `reconnecting`).
+- A coordinator that reads a workspace's files itself, outside any sandbox, follows the build link only into the volume
+  the controller answers for it (`WorkspaceRef::build_volume`, `workspace.buildVolume`): the grant a job admitted now
+  would get, fenced on the incarnation the coordinator holds. It compares what the link names against that answer, so a
+  link a job repointed never widens what the coordinator reads.
 
 - **Enforced by**: a paused-clock supervisor test pivots the build link while its first keeper job runs, admits no
   intervening user job, and requires the restarted daemon's grant to name only the adopted volume while the old job's
-  profile still names only the previous volume.
+  profile still names only the previous volume; a router test answers `workspace.buildVolume` with the host's grant only
+  for an attached workspace at the incarnation the coordinator holds.
 
 ## Stacks and fragmentation
 

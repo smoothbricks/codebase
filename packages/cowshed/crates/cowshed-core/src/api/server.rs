@@ -541,6 +541,7 @@ capability_methods! {
     "workspace.info"
     "workspace.attach"
     worker "workspace.grants"
+    "workspace.buildVolume"
     "coordinator.rename"
     "coordinator.adopt"
     "coordinator.create"

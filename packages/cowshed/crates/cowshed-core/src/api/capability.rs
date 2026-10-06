@@ -889,6 +889,24 @@ impl WorkspaceRef {
         )
         .await
     }
+
+    /// The build volume a job of this workspace incarnation would be granted now
+    /// (16_build_volumes.md, "Process lifetime across a swap"), or `None` when its checkout links
+    /// none. A land renames the build link, so the answer holds until the next one; a caller that
+    /// follows the link compares what it names against this. Refuses a detached workspace and a
+    /// name recreated since this reference was resolved.
+    pub async fn build_volume(&self) -> Result<Option<PathBuf>> {
+        call_typed(
+            &self.runtime,
+            "workspace.buildVolume",
+            json!({
+                "repoId": self.info.repo_id,
+                "workspace": self.info.workspace,
+                "workspaceIncarnation": self.info.workspace_incarnation,
+            }),
+        )
+        .await
+    }
 }
 
 impl fmt::Debug for WorkspaceRef {

@@ -516,6 +516,16 @@ impl ProjectRuntimeHost for FakeHost {
             .collect())
     }
 
+    async fn build_volume(&mut self, workspace: WorkspaceName) -> Result<Option<PathBuf>> {
+        Ok(Some(
+            self.descriptor
+                .storage
+                .store()
+                .join(".build")
+                .join(workspace.as_str()),
+        ))
+    }
+
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
         let matches = self
             .state
@@ -2151,6 +2161,71 @@ async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
     .await
     .expect_err("overlapping active mounts must be ambiguous");
     assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+/// A coordinator reads the build volume a job of the workspace would be granted, fenced on the
+/// incarnation it holds and refused once the workspace is detached, when no build link is read.
+#[tokio::test]
+async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation() {
+    let root = test_root();
+    let (runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let created = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "built", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    let held = created["info"]["workspaceIncarnation"].clone();
+    let ask = |incarnation: Value| json!({ "repoId": repo, "workspace": "built", "workspaceIncarnation": incarnation });
+
+    let volume = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.buildVolume",
+        ask(held.clone()),
+    )
+    .await
+    .expect("build volume of the attached incarnation");
+    let expected = runtime
+        .descriptor()
+        .storage
+        .store()
+        .join(".build")
+        .join("built");
+    assert_eq!(volume, json!(expected));
+
+    let stale = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.buildVolume",
+        ask(json!(incarnation(9_999))),
+    )
+    .await
+    .expect_err("another incarnation is never answered for");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+    assert!(stale.fence_source().is_some(), "{stale:?}");
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.detach",
+        json!({ "repoId": repo, "workspace": "built" }),
+    )
+    .await
+    .expect("detach");
+    let detached = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.buildVolume",
+        ask(held),
+    )
+    .await
+    .expect_err("a detached checkout's link is not read");
+    assert_eq!(detached.code, ErrorCode::Conflict);
+    assert!(detached.fence_source().is_none(), "{detached:?}");
 }
 
 #[tokio::test]
