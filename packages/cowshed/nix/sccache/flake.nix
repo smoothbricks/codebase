@@ -100,6 +100,13 @@
         #    cannot poison subsequent requests from another workspace.
         #    Its Rust key epoch rejects entries poisoned by an older daemon
         #    executing a repointed alias under another compiler's identity.
+        # 4. embedded-inputs: a C-family key covers the files the assembler and `#embed` read,
+        #    which no preprocessor line marker names. Assembler source keys the bytes of every
+        #    `.incbin`/`.include` file, resolved as gas and LLVM both resolve it (the cwd, each
+        #    driver `-I`, each `-Wa,-I`); a directive it cannot resolve exactly, and any in C
+        #    inline assembly, compiles without lookup or store. Direct mode is off for a
+        #    translation unit that `#embed`s or asks `__has_embed`, whose preprocessed text then
+        #    carries the bytes. Present in the build iff `strings` finds `cowshed-asm-inputs-v1`.
         #
         # This directory is the only copy of these patches. Every `.patch` file beside this flake must
         # appear in this list and every entry must exist: nix ignores an unreferenced patch in
@@ -108,6 +115,7 @@
           ./sccache-basedir.patch
           ./sccache-singleflight.patch
           ./sccache-compiler-executable.patch
+          ./sccache-embedded-inputs.patch
         ];
 
         sccache = pkgs.sccache.overrideAttrs (finalAttrs: previousAttrs: {

@@ -1,0 +1,1198 @@
+diff --git a/src/compiler/assembler.rs b/src/compiler/assembler.rs
+new file mode 100644
+index 0000000..097d273
+--- /dev/null
++++ b/src/compiler/assembler.rs
+@@ -0,0 +1,418 @@
++//! Files an assembler opens by itself. `.incbin` and `.include` name a file the C
++//! preprocessor never reads, so neither the preprocessed text nor direct mode's include list
++//! holds its bytes, and a key built from those alone serves the object of a file's old bytes
++//! after the file changes.
++//!
++//! Directives are found by their names, as an assembler matches them: without regard to case.
++//! A name an assembler macro assembles from pieces (`.inc\()\kind`) is not found; nothing
++//! short of running the assembler finds it.
++
++use crate::compiler::Language;
++use crate::util::{Digest, decode_path};
++use std::collections::HashMap;
++use std::fs::{self, File};
++use std::io::Read;
++use std::path::{Path, PathBuf};
++
++/// How the text a C hasher keys on reaches an assembler.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AssemblerText {
++    /// It is assembler source: `.s` as written, `.S` after preprocessing. Its directives are
++    /// resolved and their files keyed.
++    Source,
++    /// It may hold inline assembly, which the compiler hands its assembler with a search path
++    /// of its own (clang: every `-I`, `-iquote` and `-isystem`, under the sysroot). Its
++    /// directives are refused.
++    Inline,
++    /// No assembler reads it.
++    Opaque,
++}
++
++impl AssemblerText {
++    pub fn of(language: Language) -> Self {
++        match language {
++            Language::Assembler | Language::AssemblerToPreprocess => Self::Source,
++            Language::C
++            | Language::Cxx
++            | Language::GenericHeader
++            | Language::CHeader
++            | Language::CPreprocessed
++            | Language::CxxHeader
++            | Language::CxxPreprocessed
++            | Language::ObjectiveC
++            | Language::ObjectiveCHeader
++            | Language::ObjectiveCPreprocessed
++            | Language::ObjectiveCxx
++            | Language::ObjectiveCxxPreprocessed
++            | Language::ObjectiveCxxHeader
++            | Language::Cuda
++            | Language::CudaFE
++            | Language::Hip
++            | Language::CxxModule => Self::Inline,
++            Language::Ptx | Language::Cubin | Language::Rust => Self::Opaque,
++        }
++    }
++}
++
++/// The content digest of every file the assembler opens for `text`, in the order the text
++/// names them, `.include`d sources followed into; empty when it opens none. `Err` says why
++/// the files cannot be named exactly as the assembler finds them, and the compile must not be
++/// cached. `search_path` is asked only when a relative path needs it.
++pub fn assembler_inputs(
++    text_kind: AssemblerText,
++    text: &[u8],
++    cwd: &Path,
++    search_path: impl FnOnce() -> Result<Vec<PathBuf>, String>,
++) -> Result<Vec<String>, String> {
++    match text_kind {
++        AssemblerText::Opaque => Ok(vec![]),
++        AssemblerText::Inline => match inline_directive(text) {
++            None => Ok(vec![]),
++            Some((at, name)) => Err(format!(
++                "inline assembly `.{}` at byte {at}",
++                String::from_utf8_lossy(name)
++            )),
++        },
++        AssemblerText::Source => {
++            if source_directives(text).next().is_none() {
++                return Ok(vec![]);
++            }
++            let mut reader = SourceReader {
++                cwd,
++                search_path: search_path()?,
++                digests: HashMap::new(),
++                keyed: vec![],
++            };
++            reader.read(text, 0)?;
++            Ok(reader.keyed)
++        }
++    }
++}
++
++const INCBIN: &[u8] = b"incbin";
++const INCLUDE: &[u8] = b"include";
++const ALTMACRO: &[u8] = b"altmacro";
++
++/// A source that includes itself would be followed without end; no real one nests this deep.
++const MAX_INCLUDE_DEPTH: usize = 32;
++
++fn is_symbol_byte(byte: u8) -> bool {
++    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
++}
++
++/// Each `.<name>` in `text` that ends where a symbol would: `(offset of the dot, offset past
++/// the name, name)`.
++fn directive_names<'a>(
++    text: &'a [u8],
++    names: &'static [&'static [u8]],
++) -> impl Iterator<Item = (usize, usize, &'static [u8])> + 'a {
++    memchr::memchr_iter(b'.', text).filter_map(move |dot| {
++        let rest = &text[dot + 1..];
++        names.iter().find_map(|&name| {
++            let end = dot + 1 + name.len();
++            (rest.len() >= name.len()
++                && rest[..name.len()].eq_ignore_ascii_case(name)
++                && text.get(end).is_none_or(|&byte| !is_symbol_byte(byte)))
++            .then_some((dot, end, name))
++        })
++    })
++}
++
++/// The first `.incbin` or `.include` in C text whose operand starts a string inside a string
++/// literal: `.incbin "f"`, `.incbin \"f\"` or `.incbin\t\"f\"`. Whatever precedes the dot is
++/// ignored, because in a literal it is usually the `n` of `\n`.
++fn inline_directive(text: &[u8]) -> Option<(usize, &'static [u8])> {
++    directive_names(text, &[INCBIN, INCLUDE]).find_map(|(dot, end, name)| {
++        let mut rest = &text[end..];
++        loop {
++            match rest {
++                [b' ' | b'\t', tail @ ..] | [b'\\', b't', tail @ ..] => rest = tail,
++                [b'"', ..] | [b'\\', b'"', ..] => return Some((dot, name)),
++                _ => return None,
++            }
++        }
++    })
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum Operand<'a> {
++    /// A string with no escape and no character a macro substitutes.
++    Path(&'a [u8]),
++    /// Anything else: an escape, a macro parameter, a symbol, a missing string.
++    Opaque,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct Directive<'a> {
++    at: usize,
++    name: &'static [u8],
++    operand: Operand<'a>,
++}
++
++/// The `.incbin` and `.include` directives of assembler source. A directive starts a
++/// statement, so a dot following a symbol byte (`data.include`) is part of that symbol.
++fn source_directives(text: &[u8]) -> impl Iterator<Item = Directive<'_>> {
++    directive_names(text, &[INCBIN, INCLUDE])
++        .filter(|&(dot, _, _)| dot == 0 || !is_symbol_byte(text[dot - 1]))
++        .map(|(at, end, name)| {
++            let rest = &text[end..];
++            let rest = &rest[rest
++                .iter()
++                .position(|&byte| byte != b' ' && byte != b'\t')
++                .unwrap_or(rest.len())..];
++            let operand = match rest.split_first() {
++                Some((b'"', string)) => match string
++                    .iter()
++                    .position(|&byte| matches!(byte, b'"' | b'\\' | b'$' | b'\n'))
++                {
++                    // `\` escapes or names a macro parameter; `$0` is a Darwin one.
++                    Some(close) if string[close] == b'"' => Operand::Path(&string[..close]),
++                    _ => Operand::Opaque,
++                },
++                _ => Operand::Opaque,
++            };
++            Directive { at, name, operand }
++        })
++}
++
++struct SourceReader<'a> {
++    cwd: &'a Path,
++    search_path: Vec<PathBuf>,
++    /// Digests by resolved path: Bun's blob is named by two `.incbin`s and hashed once.
++    digests: HashMap<PathBuf, String>,
++    keyed: Vec<String>,
++}
++
++impl SourceReader<'_> {
++    fn read(&mut self, text: &[u8], depth: usize) -> Result<(), String> {
++        let mut directives = source_directives(text).peekable();
++        if directives.peek().is_none() {
++            return Ok(());
++        }
++        // In alternate macro mode a parameter is substituted without a `\`, inside strings too.
++        if directive_names(text, &[ALTMACRO]).next().is_some() {
++            return Err("`.altmacro` with a file-reading directive".to_owned());
++        }
++        for directive in directives {
++            let name = String::from_utf8_lossy(directive.name);
++            let Operand::Path(operand) = directive.operand else {
++                return Err(format!(
++                    "`.{name}` at byte {} without a plain string operand",
++                    directive.at
++                ));
++            };
++            let (path, mut file) = self.resolve(operand)?;
++            let unreadable = |e: std::io::Error| format!("reading `{}`: {e}", path.display());
++            if directive.name == INCLUDE {
++                if depth == MAX_INCLUDE_DEPTH {
++                    return Err(format!("`.include` nested past {MAX_INCLUDE_DEPTH}"));
++                }
++                let mut source = vec![];
++                file.read_to_end(&mut source).map_err(unreadable)?;
++                let mut digest = Digest::new();
++                digest.update(&source);
++                self.keyed.push(digest.finish());
++                self.read(&source, depth + 1)?;
++            } else {
++                let digest = match self.digests.get(&path) {
++                    Some(digest) => digest.clone(),
++                    None => {
++                        let digest = Digest::reader_sync(file)
++                            .map_err(|e| format!("reading `{}`: {e}", path.display()))?;
++                        self.digests.insert(path, digest.clone());
++                        digest
++                    }
++                };
++                self.keyed.push(digest);
++            }
++        }
++        Ok(())
++    }
++
++    /// The file both gas (`search_and_open`) and LLVM (`SourceMgr::OpenIncludeFile`) open for
++    /// `operand`: the path as written, against the cwd, then each search directory in turn,
++    /// skipping any path that does not open. Where the two differ this is an `Err`.
++    fn resolve(&self, operand: &[u8]) -> Result<(PathBuf, File), String> {
++        let name = decode_path(operand).map_err(|e| format!("assembler path: {e}"))?;
++        if let Some(found) = opens(&self.cwd.join(&name))? {
++            return Ok(found);
++        }
++        if name.is_absolute() {
++            // LLVM goes on to append it to every search directory; gas stops.
++            return Err(format!("`{}` does not open", name.display()));
++        }
++        for dir in &self.search_path {
++            if let Some(found) = opens(&self.cwd.join(dir).join(&name))? {
++                return Ok(found);
++            }
++        }
++        Err(format!(
++            "`{}` is in neither the cwd nor an assembler `-I` directory",
++            name.display()
++        ))
++    }
++}
++
++/// `Some` for a regular file that opens; `None` for a path that does not open, which both
++/// assemblers pass over; `Err` for one only gas opens, a directory or other non-file.
++fn opens(path: &Path) -> Result<Option<(PathBuf, File)>, String> {
++    match fs::metadata(path) {
++        Err(_) => Ok(None),
++        Ok(meta) if !meta.is_file() => Err(format!("`{}` is not a regular file", path.display())),
++        Ok(_) => Ok(File::open(path).ok().map(|file| (path.to_owned(), file))),
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use super::*;
++
++    fn digest(bytes: &[u8]) -> String {
++        let mut digest = Digest::new();
++        digest.update(bytes);
++        digest.finish()
++    }
++
++    fn source(text: &str) -> Vec<Directive<'_>> {
++        source_directives(text.as_bytes()).collect()
++    }
++
++    #[test]
++    fn source_directives_match_names_as_assemblers_do() {
++        let text = "x: .INCBIN \"a.bin\", 0, 4\n\t.include\t\"b.s\"\n.incbin\"c\"\n";
++        let found: Vec<_> = source(text)
++            .into_iter()
++            .map(|d| (d.name, d.operand))
++            .collect();
++        assert_eq!(
++            found,
++            [
++                (INCBIN, Operand::Path(b"a.bin")),
++                (INCLUDE, Operand::Path(b"b.s")),
++                (INCBIN, Operand::Path(b"c")),
++            ]
++        );
++        // Symbols, longer names and strings are no directives.
++        assert!(source("data.incbin \"a\"\n.incbin2 \"a\"\n.ascii \"x.incbin\"\n").is_empty());
++    }
++
++    #[test]
++    fn source_operands_a_macro_could_rewrite_are_opaque() {
++        for text in [
++            ".incbin \"\\name\"",
++            ".incbin \\name",
++            ".incbin \"$0\"",
++            ".incbin \"a\\\"b\"",
++            ".incbin \"unterminated\n\"",
++            ".incbin",
++        ] {
++            let found = source(text);
++            assert_eq!(found.len(), 1, "{text}");
++            assert_eq!(found[0].operand, Operand::Opaque, "{text}");
++        }
++    }
++
++    #[test]
++    fn inline_directives_are_found_inside_string_literals() {
++        for text in [
++            "asm(\"nop\\n.incbin \\\"f\\\"\");",
++            "asm(\".incbin\\t\\\"f\\\"\");",
++            "asm(R\"(.Include \"f\")\");",
++            "asm(\".incbin\" \" \\\"f\\\"\");",
++        ] {
++            assert!(inline_directive(text.as_bytes()).is_some(), "{text}");
++        }
++        for text in ["range.include(x);", "s.incbin = 1;", "x.included \"f\""] {
++            assert!(inline_directive(text.as_bytes()).is_none(), "{text}");
++        }
++    }
++
++    #[test]
++    fn languages_without_directives_read_nothing() {
++        let cwd = tempfile::tempdir().unwrap();
++        let unused = || -> Result<Vec<PathBuf>, String> { panic!("search path asked for") };
++        assert_eq!(
++            assembler_inputs(AssemblerText::Source, b".text\nnop\n", cwd.path(), unused),
++            Ok(vec![])
++        );
++        assert_eq!(
++            assembler_inputs(AssemblerText::Opaque, b".incbin \"x\"", cwd.path(), unused),
++            Ok(vec![])
++        );
++        assert!(
++            assembler_inputs(
++                AssemblerText::Inline,
++                b"asm(\".incbin \\\"x\\\"\");",
++                cwd.path(),
++                unused
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn resolution_follows_the_assembler_search_order() {
++        let root = tempfile::tempdir().unwrap();
++        let cwd = root.path();
++        for dir in ["first", "second", "isdir/blob.bin"] {
++            fs::create_dir_all(cwd.join(dir)).unwrap();
++        }
++        fs::write(cwd.join("second/blob.bin"), "second").unwrap();
++        let text = b".incbin \"blob.bin\"\n.incbin \"blob.bin\"\n";
++        let search = || Ok(vec![PathBuf::from("first"), PathBuf::from("second")]);
++        let read = || assembler_inputs(AssemblerText::Source, text, cwd, search);
++        assert_eq!(read(), Ok(vec![digest(b"second"); 2]));
++        fs::write(cwd.join("first/blob.bin"), "first").unwrap();
++        assert_eq!(read(), Ok(vec![digest(b"first"); 2]));
++        fs::write(cwd.join("blob.bin"), "cwd").unwrap();
++        assert_eq!(read(), Ok(vec![digest(b"cwd"); 2]));
++
++        // gas opens a directory and fails; LLVM passes over it.
++        let dir = || Ok(vec![PathBuf::from("isdir")]);
++        fs::remove_file(cwd.join("blob.bin")).unwrap();
++        assert!(assembler_inputs(AssemblerText::Source, text, cwd, dir).is_err());
++        // A file found nowhere, an absolute one missing, and an unmodeled search path refuse.
++        let none = || Ok(vec![]);
++        assert!(assembler_inputs(AssemblerText::Source, text, cwd, none).is_err());
++        let absent = format!(".incbin \"{}/absent\"\n", cwd.display());
++        assert!(assembler_inputs(AssemblerText::Source, absent.as_bytes(), cwd, search).is_err());
++        let unmodeled = || Err("unmodeled".to_owned());
++        assert_eq!(
++            assembler_inputs(AssemblerText::Source, text, cwd, unmodeled),
++            Err("unmodeled".to_owned())
++        );
++    }
++
++    #[test]
++    fn include_is_keyed_and_followed() {
++        let root = tempfile::tempdir().unwrap();
++        let cwd = root.path();
++        fs::create_dir(cwd.join("inc")).unwrap();
++        let nested = ".incbin \"blob.bin\"\n";
++        fs::write(cwd.join("inc/nested.s"), nested).unwrap();
++        fs::write(cwd.join("inc/blob.bin"), "blob").unwrap();
++        let search = || Ok(vec![PathBuf::from("inc")]);
++        assert_eq!(
++            assembler_inputs(
++                AssemblerText::Source,
++                b".include \"nested.s\"\n",
++                cwd,
++                search
++            ),
++            Ok(vec![digest(nested.as_bytes()), digest(b"blob")])
++        );
++        fs::write(cwd.join("self.s"), ".include \"self.s\"\n").unwrap();
++        assert!(
++            assembler_inputs(AssemblerText::Source, b".include \"self.s\"\n", cwd, search).is_err()
++        );
++        assert!(
++            assembler_inputs(
++                AssemblerText::Source,
++                b".altmacro\n.include \"inc/nested.s\"\n",
++                cwd,
++                search
++            )
++            .is_err()
++        );
++    }
++}
+diff --git a/src/compiler/c.rs b/src/compiler/c.rs
+index 881241f..12a174b 100644
+--- a/src/compiler/c.rs
++++ b/src/compiler/c.rs
+@@ -13,10 +13,13 @@
+ // limitations under the License.
+ 
+ use crate::cache::{FileObjectSource, Storage};
+-use crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key;
++use crate::compiler::assembler::{AssemblerText, assembler_inputs};
++use crate::compiler::preprocessor_cache::{
++    EmbedFinder, finds_embed, preprocessor_cache_entry_hash_key,
++};
+ use crate::compiler::{
+-    Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
+-    CompilerKind, DepInfo, HashResult, Language, PathPin, request_basedir,
++    CacheKey, Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments,
++    CompilerHasher, CompilerKind, DepInfo, HashResult, Language, PathPin, request_basedir,
+ };
+ #[cfg(feature = "dist-client")]
+ use crate::compiler::{DistPackagers, NoopOutputsRewriter};
+@@ -177,6 +180,17 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
+     fn kind(&self) -> CCompilerKind;
+     /// Return true iff this is g++ or clang++.
+     fn plusplus(&self) -> bool;
++    /// The directories this compiler's assembler searches, after the cwd, for a relative
++    /// `.incbin` or `.include` path given `parsed_args`, or why they cannot be named exactly.
++    fn assembler_search_path(
++        &self,
++        _parsed_args: &ParsedArguments,
++    ) -> std::result::Result<Vec<PathBuf>, String> {
++        Err(format!(
++            "the assembler search path of {:?} is not modeled",
++            self.kind()
++        ))
++    }
+     /// Return the compiler version reported by the compiler executable.
+     fn version(&self) -> Option<String>;
+     /// Determine whether `arguments` are supported by this compiler.
+@@ -457,7 +471,14 @@ where
+             false
+         };
+ 
+-        let mut preprocessor_key = if use_preprocessor_cache_mode {
++        // A `-D` can expand to `__has_embed`, whose answer no recorded file holds.
++        let embed_argument = preprocessor_and_arch_args
++            .iter()
++            .find(|arg| finds_embed(arg.as_encoded_bytes()));
++        if let (true, Some(arg)) = (use_preprocessor_cache_mode, embed_argument) {
++            debug!("generate_hash_key: Disabling preprocessor cache because of {arg:?}");
++        }
++        let mut preprocessor_key = if use_preprocessor_cache_mode && embed_argument.is_none() {
+             preprocessor_cache_entry_hash_key(
+                 &self.executable_digest,
+                 self.parsed_args.language,
+@@ -521,7 +542,7 @@ where
+                                     self.executable_digest
+                                 );
+                                 return Ok(HashResult {
+-                                    key,
++                                    key: CacheKey::Key(key),
+                                     compilation: Box::new(CCompilation {
+                                         parsed_args: self.parsed_args.clone(),
+                                         is_locally_preprocessed: false,
+@@ -635,6 +656,49 @@ where
+             )
+         };
+ 
++        // A compiler binary may be a symlink to another and so has the same digest, but that means
++        // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
++        // executable path to try and prevent this
++        let weak_toolchain_key = format!(
++            "{}-{}",
++            self.executable.to_string_lossy(),
++            self.executable_digest
++        );
++
++        // The assembler opens `.incbin` and `.include` files itself: the text above names them,
++        // and holds none of their bytes.
++        let assembler_inputs = match assembler_inputs(
++            AssemblerText::of(self.parsed_args.language),
++            &preprocessor_output,
++            &cwd,
++            || self.compiler.assembler_search_path(&self.parsed_args),
++        ) {
++            Ok(digests) => digests,
++            Err(reason) => {
++                return Ok(HashResult {
++                    key: CacheKey::Uncacheable(reason),
++                    compilation: Box::new(CCompilation {
++                        parsed_args: self.parsed_args.clone(),
++                        is_locally_preprocessed: true,
++                        #[cfg(feature = "dist-client")]
++                        preprocessed_input: preprocessor_output,
++                        executable: self.executable.clone(),
++                        compiler: self.compiler.clone(),
++                        cwd,
++                        env_vars,
++                    }),
++                    weak_toolchain_key,
++                    path_pin: None,
++                });
++            }
++        };
++        if !assembler_inputs.is_empty() {
++            // A preprocessor cache entry would replay this key against the source and headers
++            // alone.
++            debug!("Disabling preprocessor cache mode: the assembler reads files");
++            preprocessor_key = None;
++        }
++
+         // Create an argument vector containing both common and arch args, to
+         // use in creating a hash key
+         let mut common_and_arch_args = self.parsed_args.common_args.clone();
+@@ -648,7 +712,8 @@ where
+         )
+         .with_extra_hashes(&extra_hashes)
+         .with_env_vars(&env_vars)
+-        .with_plusplus(self.compiler.plusplus());
++        .with_plusplus(self.compiler.plusplus())
++        .with_assembler_inputs(&assembler_inputs);
+         // A request base directory (SCCACHE_BASEDIR, the checkout root above the build
+         // directory cmake and ninja compile from) is omitted from the key alongside the
+         // server's SCCACHE_BASEDIRS: from the preprocessed text, whose line markers name every
+@@ -722,16 +787,8 @@ where
+             }
+         }
+ 
+-        // A compiler binary may be a symlink to another and so has the same digest, but that means
+-        // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
+-        // executable path to try and prevent this
+-        let weak_toolchain_key = format!(
+-            "{}-{}",
+-            self.executable.to_string_lossy(),
+-            self.executable_digest
+-        );
+         Ok(HashResult {
+-            key,
++            key: CacheKey::Key(key),
+             compilation: Box::new(CCompilation {
+                 parsed_args: self.parsed_args.clone(),
+                 is_locally_preprocessed: true,
+@@ -767,7 +824,6 @@ where
+ const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
+ const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
+ const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
+-const INCBIN_DIRECTIVE: &[u8] = b".incbin";
+ 
+ /// Remember the include files in the preprocessor output if it can be cached.
+ /// Returns `false` if preprocessor cache mode should be disabled.
+@@ -845,19 +901,6 @@ fn process_preprocessed_file(
+                     continue;
+                 }
+             }
+-        } else if slice
+-            .strip_prefix(INCBIN_DIRECTIVE)
+-            .filter(|slice| {
+-                slice.starts_with(b"\"") || slice.starts_with(b" \"") || slice.starts_with(b" \\\"")
+-            })
+-            .is_some()
+-        {
+-            // An assembler .inc bin (without the space) statement, which could be
+-            // part of inline assembly, refers to an external file. If the file
+-            // changes, the hash should change as well, but finding out what file to
+-            // hash is too hard for sccache, so just bail out.
+-            debug!("Found potential unsupported .inc bin directive in source code");
+-            return Ok(false);
+         } else if slice.starts_with(b"___________") && (start == 0 || bytes[start - 1] == b'\n') {
+             // Unfortunately the distcc-pump wrapper outputs standard output lines:
+             // __________Using distcc-pump from /usr/bin
+@@ -1181,28 +1224,32 @@ fn remember_include_file(
+         }
+     };
+ 
+-    let (file_digest, finder) = if config.ignore_time_macros {
+-        match Digest::reader_sync(file) {
+-            Ok(file_digest) => (file_digest, TimeMacroFinder::new()),
+-            Err(e) => {
+-                debug!("Failed to read header file {}: {}", path.display(), e);
+-                return Ok(false);
+-            }
++    let mut time_macros = TimeMacroFinder::new();
++    let mut embed = EmbedFinder::default();
++    let file_digest = match Digest::reader_sync_with(file, |chunk| {
++        if !config.ignore_time_macros {
++            time_macros.find_time_macros(chunk);
+         }
+-    } else {
+-        match Digest::reader_sync_time_macros(file) {
+-            Ok((file_digest, finder)) => (file_digest, finder),
+-            Err(e) => {
+-                debug!("Failed to read header file {}: {}", path.display(), e);
+-                return Ok(false);
+-            }
++        embed.visit(chunk);
++    }) {
++        Ok(digest) => digest.finish(),
++        Err(e) => {
++            debug!("Failed to read header file {}: {}", path.display(), e);
++            return Ok(false);
+         }
+     };
+ 
+-    if finder.found_time() {
++    if time_macros.found_time() {
+         debug!("Found __TIME__ in header file {}", path.display());
+         return Ok(false);
+     }
++    if embed.found() {
++        debug!(
++            "Found #embed or __has_embed in header file {}",
++            path.display()
++        );
++        return Ok(false);
++    }
+ 
+     included_files.insert(path, file_digest);
+ 
+@@ -1566,6 +1613,7 @@ pub struct HashKeyParams<'a> {
+     basedirs: &'a [Vec<u8>],
+     argument_basedirs: &'a [Vec<u8>],
+     scheme: &'a [u8],
++    assembler_inputs: &'a [String],
+ }
+ 
+ impl<'a> HashKeyParams<'a> {
+@@ -1595,6 +1643,7 @@ impl<'a> HashKeyParams<'a> {
+             basedirs: &[],
+             argument_basedirs: &[],
+             scheme: &[],
++            assembler_inputs: &[],
+         }
+     }
+ 
+@@ -1635,6 +1684,13 @@ impl<'a> HashKeyParams<'a> {
+         self
+     }
+ 
++    /// Sets the content digests of the files the assembler opens (`.incbin`, `.include`),
++    /// which the preprocessed text names without holding.
++    pub fn with_assembler_inputs(mut self, assembler_inputs: &'a [String]) -> Self {
++        self.assembler_inputs = assembler_inputs;
++        self
++    }
++
+     /// Computes the hash key based on the configured parameters.
+     ///
+     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
+@@ -1683,6 +1739,13 @@ impl<'a> HashKeyParams<'a> {
+         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
+ 
+         m.update(&preprocessor_output_to_hash);
++        // Absent, the key is the one a compile without assembler inputs always had.
++        if !self.assembler_inputs.is_empty() {
++            m.update(b"cowshed-asm-inputs-v1");
++            for digest in self.assembler_inputs {
++                m.update(digest.as_bytes());
++            }
++        }
+         m.finish()
+     }
+ }
+diff --git a/src/compiler/clang.rs b/src/compiler/clang.rs
+index bd7a980..bf717b1 100644
+--- a/src/compiler/clang.rs
++++ b/src/compiler/clang.rs
+@@ -104,6 +104,12 @@ impl CCompilerImpl for Clang {
+             self.kind(),
+         )
+     }
++    fn assembler_search_path(
++        &self,
++        parsed_args: &ParsedArguments,
++    ) -> std::result::Result<Vec<PathBuf>, String> {
++        gcc::assembler_search_path(parsed_args, (&gcc::ARGS[..], &ARGS[..]))
++    }
+ 
+     #[allow(clippy::too_many_arguments)]
+     async fn preprocess<T>(
+diff --git a/src/compiler/compiler.rs b/src/compiler/compiler.rs
+index 22d12c8..44f1ae9 100644
+--- a/src/compiler/compiler.rs
++++ b/src/compiler/compiler.rs
+@@ -567,11 +567,39 @@ where
+                 };
+             }
+             Ok(HashResult {
+-                key,
++                key: CacheKey::Key(key),
+                 compilation,
+                 weak_toolchain_key,
+                 path_pin,
+             }) => (key, compilation, weak_toolchain_key, path_pin),
++            Ok(HashResult {
++                key: CacheKey::Uncacheable(reason),
++                compilation,
++                weak_toolchain_key,
++                path_pin: _,
++            }) => {
++                // No key names what the outputs depend on, so no entry may answer this
++                // compile, including one stored by a daemon that keyed it without that input.
++                debug!("[{}]: not cacheable: {}", out_pretty, reason);
++                let start = Instant::now();
++                let (_, dist_type, compiler_result) = dist_or_local_compile(
++                    service,
++                    dist_client,
++                    creator,
++                    cwd,
++                    compilation,
++                    weak_toolchain_key,
++                    out_pretty,
++                )
++                .await?;
++                let duration = start.elapsed();
++                let result = if compiler_result.status.success() {
++                    CompileResult::NotCacheable(dist_type, duration)
++                } else {
++                    CompileResult::CompileFailed(dist_type, duration)
++                };
++                return Ok((result, compiler_result));
++            }
+         };
+         debug!("[{}]: Hash key: {}", out_pretty, key);
+         // If `ForceRecache` is enabled, we won't check the cache.
+@@ -709,9 +737,7 @@ where
+ 
+         let mut inflight_owner = None;
+         let lookup = match lookup {
+-            CacheLookupResult::Miss(MissType::Normal)
+-                if cache_control == CacheControl::Default =>
+-            {
++            CacheLookupResult::Miss(MissType::Normal) if cache_control == CacheControl::Default => {
+                 match service.inflight_join(&key).await {
+                     server::InflightJoin::Waiter => match storage.get(&key).await {
+                         Ok(Cache::Hit(mut entry)) => {
+@@ -1260,13 +1286,23 @@ impl OutputsRewriter for NoopOutputsRewriter {
+     }
+ }
+ 
++/// What a compile's outputs may be cached under.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum CacheKey {
++    /// The hash of every input the outputs depend on.
++    Key(String),
++    /// The outputs depend on an input the hasher cannot name, for the stated reason. The
++    /// compile runs without a lookup and its outputs are not stored.
++    Uncacheable(String),
++}
++
+ /// Result of generating a hash from a compiler command.
+ pub struct HashResult<T>
+ where
+     T: CommandCreatorSync,
+ {
+     /// The hash key of the inputs.
+-    pub key: String,
++    pub key: CacheKey,
+     /// An object to use for the actual compilation, if necessary.
+     pub compilation: Box<dyn Compilation<T> + 'static>,
+     /// A weak key that may be used to identify the toolchain
+diff --git a/src/compiler/gcc.rs b/src/compiler/gcc.rs
+index 8a832b5..56c8fd0 100644
+--- a/src/compiler/gcc.rs
++++ b/src/compiler/gcc.rs
+@@ -60,6 +60,12 @@ impl CCompilerImpl for Gcc {
+     ) -> CompilerArguments<ParsedArguments> {
+         parse_arguments(arguments, cwd, &ARGS[..], self.gplusplus, self.kind())
+     }
++    fn assembler_search_path(
++        &self,
++        parsed_args: &ParsedArguments,
++    ) -> std::result::Result<Vec<PathBuf>, String> {
++        assembler_search_path(parsed_args, &ARGS[..])
++    }
+ 
+     #[allow(clippy::too_many_arguments)]
+     async fn preprocess<T>(
+@@ -1196,6 +1202,94 @@ fn split_gnu_response_file_args(contents: &str) -> Vec<OsString> {
+     args
+ }
+ 
++/// The directories the assembler searches, after the cwd, for a relative `.incbin` or
++/// `.include` path, as gcc and clang hand them to it: every driver `-I`, then every `-I`
++/// passed through `-Wa,` or `-Xassembler`, each in command-line order, whatever order the two
++/// kinds were written in. gcc's `asm_options` spec emits `%{I*}` ahead of `%Y`; clang's
++/// assembler job adds `OPT_I_Group` ahead of `CollectArgsForIntegratedAssembler`. Neither
++/// forwards `-iquote`, `-isystem`, `-idirafter` or `CPATH`.
++///
++/// `parsed_args` must come from `parse_arguments` with the same `arg_info`. An argument that
++/// changes the search in a way this does not model is an `Err` naming it.
++pub fn assembler_search_path<S>(
++    parsed_args: &ParsedArguments,
++    arg_info: S,
++) -> std::result::Result<Vec<PathBuf>, String>
++where
++    S: SearchableArgInfo<ArgData>,
++{
++    let mut search_path = vec![];
++    let mut passed: Vec<String> = vec![];
++    let arguments = parsed_args
++        .preprocessor_args
++        .iter()
++        .chain(&parsed_args.common_args)
++        .cloned();
++    for arg in ArgsIter::new(arguments, arg_info) {
++        let arg = arg.map_err(|e| format!("argument parse: {e}"))?;
++        match (arg.flag_str(), arg.get_data()) {
++            (Some("-I"), Some(PreprocessorArgumentPath(dir))) => {
++                let bytes = dir.as_os_str().as_encoded_bytes();
++                // `-I-` splits the quote path; `=` and `$SYSROOT` name the sysroot to the
++                // preprocessor but reach the assembler verbatim; an empty directory is the
++                // root to gas and the cwd to LLVM.
++                if bytes.is_empty()
++                    || bytes == b"-"
++                    || bytes.starts_with(b"=")
++                    || bytes.starts_with(b"$SYSROOT")
++                {
++                    return Err(format!("assembler search through `-I{}`", dir.display()));
++                }
++                search_path.push(dir.clone());
++            }
++            (Some("-Xassembler"), Some(PassThrough(value))) => passed.push(
++                value
++                    .to_str()
++                    .ok_or_else(|| format!("non-UTF-8 `-Xassembler {value:?}`"))?
++                    .to_owned(),
++            ),
++            _ => {
++                if let Argument::UnknownFlag(flag) = &arg {
++                    let flag = flag.to_string_lossy();
++                    if let Some(values) = flag.strip_prefix("-Wa,") {
++                        passed.extend(values.split(',').map(str::to_owned));
++                    } else if [
++                        "--include-directory",
++                        "-Xclangas",
++                        "-working-directory",
++                        "--config",
++                    ]
++                    .iter()
++                    .any(|unmodeled| flag.starts_with(unmodeled))
++                    {
++                        return Err(format!("assembler search through `{flag}`"));
++                    }
++                }
++            }
++        }
++    }
++    // Both drivers flatten every `-Wa,` and `-Xassembler` value into one assembler argv, so
++    // a bare `-I` takes the next value even across flags.
++    let mut passed = passed.into_iter();
++    while let Some(value) = passed.next() {
++        let dir = match value.strip_prefix("-I") {
++            Some("") => passed
++                .next()
++                .ok_or("`-Wa,-I` without a directory".to_owned())?,
++            Some(dir) => dir.to_owned(),
++            None if value.starts_with('@') => {
++                return Err(format!("assembler response file `{value}`"));
++            }
++            None => continue,
++        };
++        if dir.is_empty() {
++            return Err("`-Wa,-I` with an empty directory".to_owned());
++        }
++        search_path.push(PathBuf::from(dir));
++    }
++    Ok(search_path)
++}
++
+ #[cfg(test)]
+ mod test {
+     use fs::File;
+@@ -1233,6 +1327,58 @@ mod test {
+         )
+     }
+ 
++    fn parsed(arguments: Vec<String>) -> ParsedArguments {
++        match parse_arguments_(arguments, false) {
++            CompilerArguments::Ok(parsed) => parsed,
++            other => panic!("{other:?}"),
++        }
++    }
++
++    #[test]
++    fn test_assembler_search_path_is_driver_then_assembler_dirs() {
++        let parsed = parsed(stringvec![
++            "-c",
++            "x.S",
++            "-Wa,-Ipassed",
++            "-I",
++            "first",
++            "-Xassembler",
++            "-I",
++            "-Xassembler",
++            "split",
++            "-Isecond",
++            "-iquote",
++            "quote",
++            "-isystem",
++            "system",
++            "-Wa,-I,comma"
++        ]);
++        assert_eq!(
++            assembler_search_path(&parsed, &ARGS[..]),
++            Ok(["first", "second", "passed", "split", "comma"]
++                .map(PathBuf::from)
++                .to_vec())
++        );
++    }
++
++    #[test]
++    fn test_assembler_search_path_refuses_what_it_does_not_model() {
++        for unmodeled in [
++            "-I-",
++            "-I=/inc",
++            "-I$SYSROOT/inc",
++            "--include-directory=inc",
++            "-Wa,@options",
++            "-Wa,-I",
++        ] {
++            let parsed = parsed(stringvec!["-c", "x.S", unmodeled]);
++            assert!(
++                assembler_search_path(&parsed, &ARGS[..]).is_err(),
++                "{unmodeled}"
++            );
++        }
++    }
++
+     #[test]
+     fn test_parse_arguments_simple() {
+         let args = stringvec!["-c", "foo.c", "-o", "foo.o"];
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index d633a8c..9291712 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -14,6 +14,7 @@
+ 
+ #[macro_use]
+ mod args;
++mod assembler;
+ mod c;
+ mod cicc;
+ mod clang;
+diff --git a/src/compiler/preprocessor_cache.rs b/src/compiler/preprocessor_cache.rs
+index 61cc889..4ddd707 100644
+--- a/src/compiler/preprocessor_cache.rs
++++ b/src/compiler/preprocessor_cache.rs
+@@ -34,14 +34,21 @@ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+     config::PreprocessorCacheModeConfig,
+-    util::{Digest, HashToDigest, MetadataCtimeExt, Timestamp, encode_path, strip_basedirs},
++    util::{
++        Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path,
++        strip_basedirs,
++    },
+ };
+ 
+ use super::Language;
+ 
+ /// The current format is 1 header byte for the version + bincode encoding
+ /// of the [`PreprocessorCacheEntry`] struct.
+-const FORMAT_VERSION: u8 = 0;
++///
++/// 1: entries recorded for a translation unit that `#embed`s or asks `__has_embed`, or whose
++/// assembler source `.incbin`s, replayed a result against files that do not name the resource;
++/// version 0 entries may be such entries, and the version keys them away.
++const FORMAT_VERSION: u8 = 1;
+ const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
+ const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
+ 
+@@ -422,21 +429,90 @@ pub fn preprocessor_cache_entry_hash_key(
+     let reader = std::fs::File::open(input_file)
+         .with_context(|| format!("while hashing the input file '{}'", input_file.display()))?;
+ 
+-    let digest = if config.ignore_time_macros {
+-        Digest::reader_sync(reader)?
+-    } else {
+-        let (digest, finder) = Digest::reader_sync_time_macros(reader)?;
+-        if finder.found_time() {
+-            // Disable preprocessor cache mode
+-            debug!("Found __TIME__ in {}", input_file.display());
+-            return Ok(None);
++    let mut time_macros = TimeMacroFinder::new();
++    let mut embed = EmbedFinder::default();
++    let digest = Digest::reader_sync_with(reader, |chunk| {
++        if !config.ignore_time_macros {
++            time_macros.find_time_macros(chunk);
+         }
+-        digest
+-    };
++        embed.visit(chunk);
++    })?
++    .finish();
++    if time_macros.found_time() {
++        // Disable preprocessor cache mode
++        debug!("Found __TIME__ in {}", input_file.display());
++        return Ok(None);
++    }
++    if embed.found() {
++        debug!("Found #embed or __has_embed in {}", input_file.display());
++        return Ok(None);
++    }
+     m.update(digest.as_bytes());
+     Ok(Some(m.finish()))
+ }
+ 
++const EMBED: &[u8] = b"embed";
++const HAS_EMBED_PREFIX: &[u8] = b"__has_";
++/// The longest match with its context: `__has_`, `embed`, and the byte after.
++const EMBED_WINDOW: usize = HAS_EMBED_PREFIX.len() + EMBED.len() + 1;
++
++fn is_identifier_byte(byte: u8) -> bool {
++    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
++}
++
++/// Whether `text` holds the identifier `embed` (as in `#embed`, `# embed`, `#/**/embed`) or
++/// `__has_embed`. A match at either edge of `text`, where its neighbor is unknown, counts.
++pub fn finds_embed(text: &[u8]) -> bool {
++    memchr::memmem::find_iter(text, EMBED).any(|at| {
++        let before =
++            at == 0 || !is_identifier_byte(text[at - 1]) || text[..at].ends_with(HAS_EMBED_PREFIX);
++        let after = text
++            .get(at + EMBED.len())
++            .is_none_or(|&byte| !is_identifier_byte(byte));
++        before && after
++    })
++}
++
++/// Finds, read by read, what makes the preprocessor open a file no line marker names: an
++/// `#embed` directive or a `__has_embed` operator. Direct mode records a result against the
++/// line-marked files alone, so a translation unit holding either must be preprocessed every
++/// time; its preprocessed text then carries the embedded bytes (clang and gcc both expand them
++/// under `-E`), and the key with it.
++///
++/// The identifier `embed` anywhere counts, a variable named so too: that costs direct mode for
++/// the translation unit and nothing else. A line splice inside the word (`em\` newline `bed`)
++/// is missed, as [`TimeMacroFinder`] misses one inside `__TIME__`.
++#[derive(Debug, Default)]
++pub struct EmbedFinder {
++    /// The last `EMBED_WINDOW - 1` bytes read, for a match that straddles two reads.
++    tail: Vec<u8>,
++    found: bool,
++}
++
++impl EmbedFinder {
++    pub fn visit(&mut self, read: &[u8]) {
++        if self.found {
++            return;
++        }
++        let mut seam = std::mem::take(&mut self.tail);
++        seam.extend_from_slice(&read[..read.len().min(EMBED_WINDOW)]);
++        self.found = finds_embed(&seam) || finds_embed(read);
++        let keep = EMBED_WINDOW - 1;
++        if read.len() >= keep {
++            seam.clear();
++            seam.extend_from_slice(&read[read.len() - keep..]);
++        } else {
++            // The seam is the old tail and all of this short read.
++            seam.drain(..seam.len().saturating_sub(keep));
++        }
++        self.tail = seam;
++    }
++
++    pub fn found(&self) -> bool {
++        self.found
++    }
++}
++
+ /// Corresponds to a cached include file used in the pre-processor stage
+ #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+ pub struct IncludeEntry {
+@@ -492,6 +568,47 @@ mod test {
+ 
+     use super::*;
+ 
++    #[test]
++    fn test_finds_embed_by_identifier() {
++        for text in [
++            "#embed \"a\"",
++            "  #  embed <a>",
++            "#/**/embed \"a\"",
++            "#if __has_embed(\"a\")",
++            "embed",
++            // Over-matching costs direct mode, nothing else.
++            "#include \"embed.h\"",
++        ] {
++            assert!(finds_embed(text.as_bytes()), "{text}");
++        }
++        for text in ["embedded", "imbed", "x_embed", "embed_t", "$embed"] {
++            assert!(!finds_embed(text.as_bytes()), "{text}");
++        }
++    }
++
++    #[test]
++    fn test_embed_finder_across_reads() {
++        let text = b"int a;\n#if __has_embed(\"x\")\n#endif\n";
++        let at = memchr::memmem::find(text, b"embed").unwrap();
++        // Split at every offset through the match and its context, and read one byte at a time.
++        for split in at - HAS_EMBED_PREFIX.len() - 1..=at + EMBED.len() + 1 {
++            let mut finder = EmbedFinder::default();
++            finder.visit(&text[..split]);
++            finder.visit(&text[split..]);
++            assert!(finder.found(), "split at {split}");
++        }
++        let mut finder = EmbedFinder::default();
++        text.iter()
++            .for_each(|byte| finder.visit(std::slice::from_ref(byte)));
++        assert!(finder.found());
++        let mut finder = EmbedFinder::default();
++        b"x_emb"
++            .iter()
++            .chain(b"edded")
++            .for_each(|byte| finder.visit(&[*byte]));
++        assert!(!finder.found());
++    }
++
+     #[test]
+     fn test_find_time_macros_empty_file() {
+         let buf: Vec<u8> = vec![];
+diff --git a/src/compiler/rust.rs b/src/compiler/rust.rs
+index 645ae96..5f71b36 100644
+--- a/src/compiler/rust.rs
++++ b/src/compiler/rust.rs
+@@ -15,7 +15,7 @@
+ use crate::cache::{FileObjectSource, Storage};
+ use crate::compiler::args::*;
+ use crate::compiler::{
+-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
++    CCompileCommand, CacheKey, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
+     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, DepInfo, HashResult, Language,
+     PathPin, RequestBase, SingleCompileCommand, c::ArtifactDescriptor, request_basedir,
+ };
+@@ -1901,7 +1901,7 @@ where
+         };
+ 
+         Ok(HashResult {
+-            key,
++            key: CacheKey::Key(key),
+             compilation: Box::new(RustCompilation {
+                 executable: self.executable.clone(),
+                 host: self.host.clone(),
+@@ -3973,7 +3973,7 @@ proc_macro false
+         f.tempdir.path().hash(&mut HashToDigest { digest: &mut m });
+         TEST_RUSTC_VERSION.hash(&mut HashToDigest { digest: &mut m });
+         let digest = m.finish();
+-        assert_eq!(res.key, digest);
++        assert_eq!(res.key, CacheKey::Key(digest));
+         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
+         out.sort();
+         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+@@ -4023,7 +4023,7 @@ proc_macro false
+ 
+         mock_dep_info(&creator, &["foo.rs"]);
+         mock_file_names(&creator, &["foo.rlib"]);
+-        hasher
++        let result = hasher
+             .generate_hash_key(
+                 &creator,
+                 f.tempdir.path().to_owned(),
+@@ -4035,8 +4035,11 @@ proc_macro false
+                 CacheControl::Default,
+             )
+             .wait()
+-            .unwrap()
+-            .key
++            .unwrap();
++        match result.key {
++            CacheKey::Key(key) => key,
++            uncacheable => panic!("{uncacheable:?}"),
++        }
+     }
+ 
+     #[allow(clippy::unnecessary_unwrap)]

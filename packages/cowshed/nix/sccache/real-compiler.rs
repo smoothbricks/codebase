@@ -160,6 +160,11 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
+        Self::start_with(false)
+    }
+
+    /// Start a private daemon, with preprocessor cache ("direct") mode on or off.
+    fn start_with(preprocessor_cache_mode: bool) -> Self {
         let root = tempfile::Builder::new()
             .prefix("sc-")
             .tempdir_in(runtime_directory())
@@ -168,7 +173,7 @@ impl Daemon {
             root.path().join("socket").as_os_str().as_bytes().len() < 104,
             "set XDG_RUNTIME_DIR to a writable short path for the private Unix socket"
         );
-        let config = harness::sccache_client_cfg(root.path(), false);
+        let config = harness::sccache_client_cfg(root.path(), preprocessor_cache_mode);
         harness::write_json_cfg(root.path(), "config.json", &config);
         let log = File::create(root.path().join("daemon.log")).unwrap();
         // Own the actual server process: never ask sccache to fork a daemon.
@@ -984,4 +989,206 @@ fn c_object_naming_its_checkout_stays_with_it() {
     assert!(names(&a.join("value.o"), &checkouts.a));
     let stats = daemon.stats().stats;
     assert_eq!((stats.cache_misses.all(), stats.cache_hits.all()), (2, 1));
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Write `contents` with an mtime a minute old: direct mode refuses to record a file modified
+/// during the compile, and these tests need it to record every one.
+fn write_settled(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).unwrap();
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+}
+
+impl Daemon {
+    /// Compile `args` (a source and its flags) with `clang` through sccache in the daemon root,
+    /// and return the bytes of the object it produced.
+    fn object(&self, clang: &Path, args: &[&str]) -> Vec<u8> {
+        let out = self.root.path().join("out.o");
+        if out.exists() {
+            fs::remove_file(&out).unwrap();
+        }
+        run(self
+            .command()
+            .arg(clang)
+            .args(args)
+            .args(["-c", "-o", "out.o"]));
+        fs::read(out).unwrap()
+    }
+
+    fn hits_and_misses(&self) -> (u64, u64) {
+        let stats = self.stats().stats;
+        (stats.cache_hits.all(), stats.cache_misses.all())
+    }
+}
+
+/// The assembler, not the preprocessor, opens a `.incbin` file, so the preprocessed text names
+/// it and nothing more. Bun's builtin-module blob is found this way, through an `-I` directory
+/// below the build directory. The key holds the bytes of the file the assembler reads: the
+/// first match of the cwd, then each `-I`, then each `-Wa,-I`.
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn incbin_keys_the_file_the_assembler_reads() {
+    let clang = real_clang();
+    let daemon = Daemon::start();
+    let root = daemon.root.path();
+    fs::create_dir(root.join("gen")).unwrap();
+    fs::create_dir(root.join("later")).unwrap();
+    fs::write(
+        root.join("blob.S"),
+        ".data\n.globl blob\nblob:\n.incbin \"blob.bin\", 0, 8\n.incbin \"blob.bin\", 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("gen/blob.bin"), "first-blob-bytes").unwrap();
+    fs::write(root.join("later/blob.bin"), "shadowed-one").unwrap();
+    let args = ["blob.S", "-Wa,-Ilater", "-Igen"];
+
+    assert!(contains(&daemon.object(&clang, &args), b"first-blob-bytes"));
+    daemon.wait_for_writes(1);
+    // The assembler stops at gen/, so the copy it never reaches is no input.
+    fs::write(root.join("later/blob.bin"), "shadowed-two").unwrap();
+    assert!(contains(&daemon.object(&clang, &args), b"first-blob-bytes"));
+    assert_eq!(daemon.hits_and_misses(), (1, 1));
+
+    fs::write(root.join("gen/blob.bin"), "other-blob-bytes").unwrap();
+    assert!(
+        contains(&daemon.object(&clang, &args), b"other-blob-bytes"),
+        "a changed .incbin file was served the object of its old bytes"
+    );
+    daemon.wait_for_writes(2);
+    // A copy in the cwd is found before any -I directory.
+    fs::write(root.join("blob.bin"), "local-blob-bytes").unwrap();
+    assert!(contains(&daemon.object(&clang, &args), b"local-blob-bytes"));
+    daemon.wait_for_writes(3);
+    fs::remove_file(root.join("blob.bin")).unwrap();
+    fs::write(root.join("gen/blob.bin"), "first-blob-bytes").unwrap();
+    assert!(contains(&daemon.object(&clang, &args), b"first-blob-bytes"));
+    assert_eq!(daemon.hits_and_misses(), (2, 3));
+}
+
+/// A `.incbin` whose file the hasher cannot name exactly is compiled every time, never
+/// looked up or stored: an operand built by an assembler macro, and one in C inline assembly,
+/// which the C compiler hands its own assembler with its own search path.
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn incbin_the_hasher_cannot_resolve_is_not_cached() {
+    let clang = real_clang();
+    let daemon = Daemon::start();
+    let root = daemon.root.path();
+    fs::write(
+        root.join("macro.S"),
+        ".macro blob_of name\n.incbin \"\\name\"\n.endm\n.data\nblob_of blob.bin\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("inline.c"),
+        "__asm__(\".data\\n.incbin \\\"blob.bin\\\"\\n.text\\n\");\n",
+    )
+    .unwrap();
+    for source in ["macro.S", "inline.c"] {
+        fs::write(root.join("blob.bin"), "first-blob-bytes").unwrap();
+        assert!(contains(
+            &daemon.object(&clang, &[source]),
+            b"first-blob-bytes"
+        ));
+        fs::write(root.join("blob.bin"), "other-blob-bytes").unwrap();
+        assert!(
+            contains(&daemon.object(&clang, &[source]), b"other-blob-bytes"),
+            "{source}: a changed .incbin file was served the object of its old bytes"
+        );
+    }
+    let stats = daemon.stats().stats;
+    assert_eq!((stats.cache_hits.all(), stats.cache_misses.all()), (0, 0));
+    assert_eq!(stats.non_cacheable_compilations, 4);
+    assert_eq!(stats.cache_writes, 0);
+}
+
+/// Direct mode replays a result recorded against the source and every header the
+/// preprocessor's line markers name. `#embed` and `__has_embed` read a file no line marker
+/// names, so a translation unit using either must be preprocessed every time; the
+/// preprocessed text then carries the embedded bytes, and the key with it.
+fn assert_direct_mode_sees(
+    files: &[(&str, &str)],
+    changed: (&str, &str),
+    before: &str,
+    after: &str,
+) {
+    let clang = real_clang();
+    let daemon = Daemon::start_with(true);
+    let root = daemon.root.path();
+    for (name, contents) in files {
+        write_settled(&root.join(name), contents.as_bytes());
+    }
+    let args = ["-std=c23", "unit.c"];
+    assert!(contains(&daemon.object(&clang, &args), before.as_bytes()));
+    daemon.wait_for_writes(1);
+    write_settled(&root.join(changed.0), changed.1.as_bytes());
+    assert!(
+        contains(&daemon.object(&clang, &args), after.as_bytes()),
+        "direct mode served the object of a resource that changed: {}",
+        daemon.log()
+    );
+}
+
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn embed_in_the_source_defeats_direct_mode() {
+    assert_direct_mode_sees(
+        &[
+            ("unit.h", "typedef int unit_t;\n"),
+            (
+                "unit.c",
+                "#include \"unit.h\"\nconst unsigned char data[] = {\n#embed \"data.bin\"\n};\n",
+            ),
+            ("data.bin", "first-embedded-bytes"),
+        ],
+        ("data.bin", "other-embedded-bytes"),
+        "first-embedded-bytes",
+        "other-embedded-bytes",
+    );
+}
+
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn embed_in_a_header_defeats_direct_mode() {
+    assert_direct_mode_sees(
+        &[
+            (
+                "unit.h",
+                "const unsigned char data[] = {\n#embed \"data.bin\"\n};\n",
+            ),
+            ("unit.c", "#include \"unit.h\"\n"),
+            ("data.bin", "first-embedded-bytes"),
+        ],
+        ("data.bin", "other-embedded-bytes"),
+        "first-embedded-bytes",
+        "other-embedded-bytes",
+    );
+}
+
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn has_embed_defeats_direct_mode() {
+    assert_direct_mode_sees(
+        &[
+            (
+                "unit.h",
+                "#if __has_embed(\"optional.bin\")\nconst char flag[] = \"has-optional\";\n\
+                 #else\nconst char flag[] = \"lacks-optional\";\n#endif\n",
+            ),
+            ("unit.c", "#include \"unit.h\"\n"),
+        ],
+        ("optional.bin", "x"),
+        "lacks-optional",
+        "has-optional",
+    );
 }

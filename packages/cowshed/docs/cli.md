@@ -1171,6 +1171,18 @@ half is `cowshed-path-v2:c-request-basedir`.
 Concurrent misses of one cache key wait for the first compile (`patches/sccache-singleflight.patch`; prove with
 `nm sccache | grep inflight_join`). Without it, parallel `cargo` processes compile the same crate N times.
 
+A C-family key also covers the files a compile reads that no preprocessor line marker names
+(`patches/sccache-embedded-inputs.patch`; prove with `strings sccache | grep cowshed-asm-inputs-v1`). Upstream keys a
+`.S` on its preprocessed text, which holds a `.incbin` file's name and none of its bytes, so a changed blob is served
+its old object; Bun's builtin-module blob is one. Assembler source keys the bytes of every `.incbin` and `.include`
+file, found as gas and LLVM both find it: as written against the cwd, then each driver `-I`, then each `-Wa,-I`. A
+directive it cannot resolve exactly (an operand built by an assembler macro, `.altmacro`, a file missing, a directory,
+`-I-` or `-I=`) and any in C inline assembly, which the compiler assembles with a search path of its own, compiles
+without a lookup or a store and counts as non-cacheable. Direct mode is off for a translation unit whose source or
+headers hold `#embed` or `__has_embed`: its line markers do not name the resource, while its preprocessed text carries
+the bytes. Directive names an assembler macro assembles from pieces are not found. Draft upstream report:
+[`sccache-upstream-assembler-inputs.md`](sccache-upstream-assembler-inputs.md).
+
 Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
 
 - `SCCACHE_CACHE_SIZE` — the cap. sccache's own default is 10 GiB, which is smaller than one debug graph of a project
