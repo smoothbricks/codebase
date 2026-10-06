@@ -691,9 +691,11 @@ task id and the hash it ran at:
 
 The report needs no target configuration. When the command runs exactly one `bun test` or `nextest run`, the executor
 asks that runner for a JUnit report in the task's directory: `bun test` through `--reporter=junit --reporter-outfile`,
-nextest through a one-key tool config (nextest takes the report path only from configuration). A script that spawns the
-runner itself passes `--reporter=junit --reporter-outfile="$BOUNDED_EXEC_JUNIT"` on; the variable is set for every task.
-A command with no runner, or with two (they would write one report), is judged by its exit alone.
+nextest through a one-key tool config (nextest takes the report path only from configuration). A `bun` is any unquoted
+command word whose basename is `bun`, so `../bun-runtime/.runtime/bun test` is the runner too, and the rewrite keeps the
+binary the target named. A script that spawns the runner itself passes
+`--reporter=junit --reporter-outfile="$BOUNDED_EXEC_JUNIT"` on; the variable is set for every task. A command with no
+runner, or with two (they would write one report), is judged by its exit alone.
 
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in the Nx cache directory) against those records
 and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for that task's

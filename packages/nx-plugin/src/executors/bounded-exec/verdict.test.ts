@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { type BoundedExecContext, createProcessTreeKiller, runBoundedExec } from './executor.js';
 import {
@@ -36,15 +36,23 @@ async function workspace(): Promise<{ root: string; data: string; context: Bound
   };
 }
 
-/** Run `command` as task app:test and answer the verdict bounded-exec recorded for it. */
+/**
+ * Run `command` as task app:test and answer the verdict bounded-exec recorded for it. `links` name
+ * files of the workspace that link to the given targets.
+ */
 async function verdictOf(
   command: string,
   bounds: { timeoutMs: number; idleTimeoutMs?: number },
   files: Record<string, string> = {},
+  links: Record<string, string> = {},
 ): Promise<BoundedExecVerdict | undefined> {
   const { root, context } = await workspace();
   for (const [name, contents] of Object.entries(files)) {
     await writeFile(join(root, name), contents);
+  }
+  for (const [name, target] of Object.entries(links)) {
+    await mkdir(dirname(join(root, name)), { recursive: true });
+    await symlink(target, join(root, name));
   }
   process.stdout.write = () => true;
   process.stderr.write = () => true;
@@ -69,6 +77,17 @@ describe('bounded-exec verdicts', () => {
       bound: 'test',
       tests: ['slow'],
     });
+  });
+
+  it('records a path-pinned bun run whose only failure is a per-test timeout as a bound', async () => {
+    expect(
+      await verdictOf(
+        '.runtime/bun test --timeout=100 ./slow.test.ts',
+        { timeoutMs: 60_000 },
+        { 'slow.test.ts': SLOW_TEST },
+        { '.runtime/bun': process.execPath },
+      ),
+    ).toEqual({ outcome: 'bound', bound: 'test', tests: ['slow'] });
   });
 
   it('records an assertion as a failure even beside a timeout', async () => {
@@ -144,6 +163,32 @@ running 1 test
     );
     expect(await withJunitReport('bun test a && bun test b', directory)).toBe('bun test a && bun test b');
     expect(await withJunitReport('bun scripts/test-shard.ts 1', directory)).toBe('bun scripts/test-shard.ts 1');
+  });
+
+  it('finds bun by its basename, keeps the binary the target chose, and leaves lookalikes alone', async () => {
+    const { context } = await workspace();
+    const directory = context.record?.directory ?? '';
+    await mkdir(directory, { recursive: true });
+    const flags = `--reporter=junit --reporter-outfile='${join(directory, JUNIT_FILE)}'`;
+    expect(await withJunitReport('../bun-runtime/.runtime/bun test --timeout=30000 --shard=1/4', directory)).toBe(
+      `../bun-runtime/.runtime/bun test ${flags} --timeout=30000 --shard=1/4`,
+    );
+    expect(
+      await withJunitReport(
+        'BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test --timeout=30000 tests',
+        directory,
+      ),
+    ).toBe(`BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test ${flags} --timeout=30000 tests`);
+    expect(await withJunitReport('cd pkg && $RUNTIME/bun test src', directory)).toBe(
+      `cd pkg && $RUNTIME/bun test ${flags} src`,
+    );
+    expect(await withJunitReport('../x/.runtime/bun test a && $HOME/.bun/bin/bun test b', directory)).toBe(
+      '../x/.runtime/bun test a && $HOME/.bun/bin/bun test b',
+    );
+    // The basename must be exactly `bun`, and an assignment is not a command word.
+    expect(await withJunitReport('../x/debug-bun test src', directory)).toBe('../x/debug-bun test src');
+    expect(await withJunitReport('../x/bun-test test src', directory)).toBe('../x/bun-test test src');
+    expect(await withJunitReport('BUN_EXE=../x/bun test', directory)).toBe('BUN_EXE=../x/bun test');
   });
 
   it('calls a failed run bound only when every failed task has a bound verdict for its hash', async () => {

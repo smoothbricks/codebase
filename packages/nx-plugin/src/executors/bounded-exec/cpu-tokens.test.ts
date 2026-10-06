@@ -46,6 +46,11 @@ describe('cowshed CPU budget client', () => {
       want: 3,
     });
     expect(runnerDemand('bun test --parallel ./a.test.ts', undefined, 18)).toEqual({ kind: 'bun-parallel', want: 18 });
+    // A runtime pinned by path is the same runner.
+    expect(runnerDemand('../bun-runtime/.runtime/bun test --parallel=5', undefined, 18)).toEqual({
+      kind: 'bun-parallel',
+      want: 5,
+    });
     // One bun process: `test.concurrent` inside it is not another CPU.
     expect(runnerDemand('bun test --timeout=30000 native.test.ts', undefined, 18)).toEqual({
       kind: 'process',

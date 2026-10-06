@@ -174,8 +174,13 @@ const NEXTEST_REPORT_CONFIG_FILE = 'nextest-report.toml';
 /**
  * `bun test`, or nextest's `nextest run` under any cargo spelling, as one shell word sequence.
  * Global, for `match` and `replace`; `search` ignores the flag where only presence matters.
+ *
+ * `bun` is any unquoted command word whose basename is `bun`, so a runtime pinned by path
+ * (`../bun-runtime/.runtime/bun test`) is the runner too. Capture group 1 is that word, which
+ * a rewrite must keep: it is the binary the target chose. An assignment (`BUN_EXE=../x/bun test`
+ * runs the command `test`) and a longer basename (`debug-bun test`) are not it.
  */
-export const BUN_TEST = /(?<=^|[\s;&|()])bun\s+test(?=\s|$)/g;
+export const BUN_TEST = /(?<=^|[\s;&|()])((?:[^\s;&|()<>'"`\\=]*\/)?bun)\s+test(?=\s|$)/g;
 export const NEXTEST_RUN = /(?<=^|[\s;&|()-])nextest\s+run(?=\s|$)/g;
 
 /**
@@ -197,7 +202,10 @@ export async function withJunitReport(command: string, directory: string): Promi
   if (bun === 1) {
     return /(^|\s)--reporter(=|\s|$)/.test(command)
       ? command
-      : command.replace(BUN_TEST, () => `bun test --reporter=junit --reporter-outfile=${shellQuote(report)}`);
+      : command.replace(
+          BUN_TEST,
+          (_match, runtime: string) => `${runtime} test --reporter=junit --reporter-outfile=${shellQuote(report)}`,
+        );
   }
   const config = join(directory, NEXTEST_REPORT_CONFIG_FILE);
   await writeFile(config, `[profile.default.junit]\npath = ${JSON.stringify(report)}\n`);
