@@ -202,9 +202,11 @@ fn empty_copy(from: &Path, into: &Path) -> io::Result<()> {
     let result = (|| {
         Connection::open(from)?.execute("VACUUM INTO ?1", &[&partial.to_string_lossy()])?;
         let copy = Connection::open(&partial)?;
-        copy.execute("DELETE FROM cache_outputs", &[])?;
-        copy.execute("DELETE FROM running_tasks", &[])?;
-        copy.execute("DELETE FROM task_invocations", &[])?;
+        for table in ["cache_outputs", "running_tasks", "task_invocations"] {
+            if table_definition(&copy, "main", table)?.is_some() {
+                copy.execute(&format!("DELETE FROM {table}"), &[])?;
+            }
+        }
         drop(copy);
         fs::rename(&partial, into)
     })();
@@ -284,14 +286,38 @@ fn stage_database(database: &mut StagedDatabase) -> Result<(), String> {
     Ok(())
 }
 
-/// Open the landing database with the target's attached as `previous`.
+/// Open the landing database with the target's attached as `previous`. Stock Nx creates
+/// `cache_outputs` only once a task runs through its cache (`CREATE TABLE IF NOT EXISTS` in
+/// `native/cache/cache.rs`), so a database whose checkout never ran one lacks it: the landing
+/// side then takes each table the carry writes from the target's own definition, which is the
+/// one its Nx wrote.
 fn attached(into_database: &Path, from_database: &Path) -> io::Result<Connection> {
     let connection = Connection::open(into_database)?;
     connection.execute(
         "ATTACH DATABASE ?1 AS previous",
         &[&from_database.to_string_lossy()],
     )?;
+    for table in ["task_details", "cache_outputs"] {
+        if table_definition(&connection, "main", table)?.is_none()
+            && let Some(definition) = table_definition(&connection, "previous", table)?
+        {
+            connection.execute(&definition, &[])?;
+        }
+    }
     Ok(connection)
+}
+
+/// The `CREATE TABLE` statement of `table` in the attached `schema`, if it has the table.
+fn table_definition(
+    connection: &Connection,
+    schema: &str,
+    table: &str,
+) -> io::Result<Option<String>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT sql FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"
+    ))?;
+    statement.bind(&[table])?;
+    Ok(statement.step()?.then(|| statement.text(0)))
 }
 
 /// The target's rows the landing database lacks ([`MISSING`]).
@@ -300,8 +326,12 @@ fn missing(into_database: &Path, from_database: &Path) -> io::Result<Vec<Row>> {
     rows(&connection)
 }
 
+/// [`MISSING`]: none when the target's database has no `cache_outputs`, so indexes nothing.
 fn rows(connection: &Connection) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
+    if table_definition(connection, "previous", "cache_outputs")?.is_none() {
+        return Ok(rows);
+    }
     let mut statement = connection.prepare(MISSING)?;
     while statement.step()? {
         rows.push(Row {
