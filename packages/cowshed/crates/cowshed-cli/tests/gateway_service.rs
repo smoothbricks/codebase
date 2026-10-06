@@ -480,8 +480,12 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
     // The remedy must name a build that this guard accepts. `nx run cowshed:build` builds the
     // platform `cli-*` target in its default configuration, which is a debug build: a hint
     // naming it sent the operator straight back here.
+    // Resolved at run time: `env!` would compile the building checkout's path into the binary,
+    // and an archive replayed from the cache into another checkout reads a path that is gone.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
     let package: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../package.json"))
+        &fs::read_to_string(Path::new(&manifest).join("../../package.json"))
             .expect("cowshed package.json"),
     )
     .expect("package.json is JSON");
