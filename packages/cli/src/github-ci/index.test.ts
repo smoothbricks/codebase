@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
@@ -8,6 +8,7 @@ import type { ProjectTargets } from '../nx/index.js';
 import {
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
+  type GithubCiNxRunManyDependencies,
   githubCiNxDeploy,
   githubCiNxRunMany,
   githubCommitStatusesWritable,
@@ -230,13 +231,14 @@ describe('collected Nx outputs', () => {
   });
 
   it('collects an empty artifact when selected projects have no matching target', async () => {
-    await withNxRunManyFixture(async ({ root, artifact }) => {
-      const expanded = await githubCiNxRunMany(root, {
-        targets: '*-linux',
-        projects: 'app',
-        collectOutputs: artifact,
-      });
+    await withNxRunManyFixture(async ({ root, artifact, nx, runs }) => {
+      const expanded = await githubCiNxRunMany(
+        root,
+        { targets: '*-linux', projects: 'app', collectOutputs: artifact },
+        nx,
+      );
       expect(expanded.runs).toEqual([]);
+      expect(runs).toEqual([]);
 
       const sourceSha = await readGitHeadSha(root);
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
@@ -249,7 +251,7 @@ describe('collected Nx outputs', () => {
   });
 
   it('records the declared source sha when the collecting job commits after checkout', async () => {
-    await withNxRunManyFixture(async ({ root, artifact }) => {
+    await withNxRunManyFixture(async ({ root, artifact, nx }) => {
       const dispatchSha = await readGitHeadSha(root);
       // Every release-candidate job commits its version bump before building, so
       // HEAD stops naming the commit the publishing job validates against. Matrix
@@ -259,12 +261,11 @@ describe('collected Nx outputs', () => {
       await $`git -c user.name=Test -c user.email=test@example.com commit -q -m bump`.cwd(root).quiet();
       expect(await readGitHeadSha(root)).not.toBe(dispatchSha);
 
-      await githubCiNxRunMany(root, {
-        targets: '*-linux',
-        projects: 'app',
-        collectOutputs: artifact,
-        collectOutputsSourceSha: dispatchSha,
-      });
+      await githubCiNxRunMany(
+        root,
+        { targets: '*-linux', projects: 'app', collectOutputs: artifact, collectOutputsSourceSha: dispatchSha },
+        nx,
+      );
 
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
         version: 3,
@@ -276,23 +277,13 @@ describe('collected Nx outputs', () => {
   });
 
   it('runs test for projects selected by platform target ownership', async () => {
-    let fixtureCacheRun = '';
-    await withNxRunManyFixture(async ({ root }) => {
-      await writeFile(join(root, 'packages/app/test-target.ts'), "await Bun.write('test-ran.txt', 'tested');\n");
-      await writeFile(join(root, 'packages/app/build-target.ts'), "throw new Error('build must not run here');\n");
+    await withNxRunManyFixture(async ({ root, nx, runs }) => {
+      const expanded = await githubCiNxRunMany(root, { targets: 'test', projectsWithTargets: '*-macos,*-ios' }, nx);
 
-      const expanded = await githubCiNxRunMany(root, {
-        targets: 'test',
-        projectsWithTargets: '*-macos,*-ios',
-      });
-      fixtureCacheRun = join(root, '.nx/cache/run.json');
-      expect(await Bun.file(fixtureCacheRun).exists()).toBe(true);
+      // `lib` has a test but no platform target, and the platform target that selected `app` does not run.
       expect(expanded.runs.map((run) => run.projects.map((project) => project.project))).toEqual([['app']]);
-
-      await expect(readFile(join(root, 'test-ran.txt'), 'utf8')).resolves.toBe('tested');
-      await expect(readFile(join(root, 'build-ran.txt'), 'utf8')).rejects.toThrow();
+      expect(runs).toEqual([['run-many', '-t', 'test', '--projects=app', '--parallel=100%']]);
     });
-    expect(await Bun.file(fixtureCacheRun).exists()).toBe(false);
   });
 
   it('applies an empty manifest after artifact transport omits its empty workspace directory', async () => {
@@ -803,47 +794,40 @@ async function withOutputFixture(
   }
 }
 
+/**
+ * A committed checkout, the project graph `githubCiNxRunMany` reads, and every
+ * `nx` argument list it hands to `runNx`.
+ */
 async function withNxRunManyFixture(
-  run: (fixture: { root: string; artifact: string }) => Promise<void>,
+  run: (fixture: {
+    root: string;
+    artifact: string;
+    nx: GithubCiNxRunManyDependencies;
+    runs: string[][];
+  }) => Promise<void>,
 ): Promise<void> {
-  // Canonical, because macOS puts the temp directory behind a /private symlink.
-  // The Nx it runs is daemonless (src/bun/isolate-nx-env.ts), so the root holds
-  // nothing running once the run returns.
-  const temp = await realpath(await mkdtemp(join(tmpdir(), 'smoo-empty-platform-output-')));
+  const temp = await mkdtemp(join(tmpdir(), 'smoo-run-many-'));
   const root = join(temp, 'repo');
   const artifact = join(temp, 'artifact');
+  const projects: ProjectTargets[] = [
+    { project: 'app', root: 'packages/app', targets: ['build-macos', 'test'] },
+    { project: 'lib', root: 'packages/lib', targets: ['test'] },
+  ];
+  const runs: string[][] = [];
+  const nx: GithubCiNxRunManyDependencies = {
+    readProjectTargets: async () => projects,
+    runNx: async (args) => {
+      runs.push(args);
+    },
+  };
   try {
-    await mkdir(join(root, 'packages/app'), { recursive: true });
-    await symlink(join(import.meta.dir, '../../../../node_modules'), join(root, 'node_modules'), 'dir');
-    await writeFile(
-      join(root, 'package.json'),
-      JSON.stringify({ name: '@fixture/root', private: true, workspaces: ['packages/*'] }),
-    );
-    await writeFile(join(root, 'nx.json'), JSON.stringify({ cacheDirectory: '.nx/cache' }));
-    await writeFile(
-      join(root, 'packages/app/package.json'),
-      JSON.stringify({
-        name: '@fixture/app',
-        nx: {
-          name: 'app',
-          targets: {
-            'build-macos': {
-              executor: 'nx:run-commands',
-              options: { command: 'bun packages/app/build-target.ts', cwd: '.' },
-            },
-            test: {
-              executor: 'nx:run-commands',
-              options: { command: 'bun packages/app/test-target.ts', cwd: '.' },
-            },
-          },
-        },
-      }),
-    );
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, 'readme.md'), 'fixture\n');
     await $`git init --quiet`.cwd(root);
     await $`git add .`.cwd(root).quiet();
     await $`git -c user.name=Test -c user.email=test@example.com commit --quiet -m fixture`.cwd(root);
 
-    await run({ root, artifact });
+    await run({ root, artifact, nx, runs });
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

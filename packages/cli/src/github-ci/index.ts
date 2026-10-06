@@ -250,13 +250,25 @@ export async function readGitHeadSha(root: string): Promise<string> {
   return (await runText('git', ['rev-parse', 'HEAD'], root)).trim();
 }
 
-export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<ExpandedNxTargetRuns> {
-  const expanded = expandNxTargetRuns(await readProjectTargets(root), options);
+/** The Nx boundary of {@link githubCiNxRunMany}: where its project graph comes from, and what runs the run-many. */
+export interface GithubCiNxRunManyDependencies {
+  readProjectTargets?: (root: string) => Promise<ProjectTargets[]>;
+  runNx?: (args: string[], root: string) => Promise<void>;
+}
+
+export async function githubCiNxRunMany(
+  root: string,
+  options: NxRunManyOptions,
+  dependencies: GithubCiNxRunManyDependencies = {},
+): Promise<ExpandedNxTargetRuns> {
+  const projects = await (dependencies.readProjectTargets ?? readProjectTargets)(root);
+  const expanded = expandNxTargetRuns(projects, options);
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
   if (expanded.runs.length > 0) {
-    await run('nx', nxRunManyBatchArgs(expanded.runs, options.configuration), root);
+    const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => run('nx', args, commandRoot));
+    await runNx(nxRunManyBatchArgs(expanded.runs, options.configuration), root);
   }
   if (options.collectOutputs) {
     const { collectNxOutputs } = await loadOutputBoundary();
