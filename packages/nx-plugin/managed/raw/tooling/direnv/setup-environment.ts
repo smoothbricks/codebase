@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
-import { keepDeveloperLinks, reportDeveloperLinks } from './developer-links.ts';
+import { applyDeclaredLinks, keepDeveloperLinks, planDeclaredLinks, reportDeveloperLinks } from './developer-links.ts';
 import {
   type DeferredSecret,
   dependentGroups,
@@ -131,9 +131,19 @@ const POST_COMMIT_BLOCK = [
 // (cargoFetcher) live in smoo's user cache and count only while CARGO_HOME
 // names the directory they were fetched into, which no checkout-relative
 // change detection can see.
+// `--links` points the packages `smoo.developerLinks` declares at their local
+// checkouts (developer-links.ts): devenv's smoo:developer-links task, whose
+// `status` is `--links --check`. A status, not a file list, because what it
+// keeps is the trees' own state: a checkout whose links an install or a clone
+// lost has changed no file devenv could name.
 // Declared above the bootstrap block for the same hoisting reason as above.
 const { values: flags } = parseArgs({
-  options: { python: { type: 'string' }, cargo: { type: 'boolean' }, check: { type: 'boolean' } },
+  options: {
+    python: { type: 'string' },
+    cargo: { type: 'boolean' },
+    links: { type: 'boolean' },
+    check: { type: 'boolean' },
+  },
 });
 const cargoMode = flags.cargo === true;
 
@@ -145,6 +155,19 @@ const CARGO_WORKSPACE = /^\s*\[workspace\]/m;
 process.chdir(projectRoot);
 
 try {
+  if (flags.links === true) {
+    // CI builds against the published packages its lockfile names; a
+    // declaration is for developer machines, so a runner links nothing.
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      process.exit(0);
+    }
+    if (flags.check === true) {
+      process.exit(planDeclaredLinks(projectRoot).changes.length === 0 ? 0 : 1);
+    }
+    // Under the install lock: an install another entry runs replaces the same entries.
+    await withInstallLock(async () => applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot)));
+    process.exit(0);
+  }
   // Bootstrap only: install deps + wire local git hooks/config.
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.

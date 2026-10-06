@@ -238,6 +238,13 @@ export interface PackageSecretCommand {
   group?: SecretGroupName;
 }
 
+/**
+ * A local checkout's directory, relative to the project's main checkout: a
+ * cowshed workspace resolves it from the main checkout its marker names, so
+ * one declaration means one directory in every checkout of the project.
+ */
+export type DeveloperLinkDirectory = string & typia.tags.MinLength<1> & typia.tags.Pattern<'^[^/]'>;
+
 export interface PackageSmooConfig {
   github?: PackageSmooGithub;
   privateNpm?: PackagePrivateNpmConfig;
@@ -245,6 +252,16 @@ export interface PackageSmooConfig {
   remoteCache?: PackageRemoteCacheConfig;
   /** Provider-neutral local secret commands. CI supplies these variables externally. */
   secrets?: Record<string, PackageSecretCommand>;
+  /**
+   * Packages a developer machine runs from local checkouts (`name` or
+   * `@scope/name` → its checkout directory) instead of the published
+   * version the lockfile names: what `bun link` does by hand, declared once so
+   * every checkout gets it. Shell entry links each tree that installed the
+   * package, a directory the machine lacks keeps the installed version, and CI
+   * links nothing (tooling/direnv/developer-links.ts, which validates the same
+   * shape at runtime).
+   */
+  developerLinks?: Record<string, DeveloperLinkDirectory>;
 }
 
 export interface PackageWorkspacesObject {

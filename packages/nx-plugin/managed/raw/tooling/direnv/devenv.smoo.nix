@@ -367,6 +367,12 @@ in {
   # and no checkout path can name, so it is gated by `status` (exit 0 when
   # CARGO_HOME holds them) rather than execIfModified.
   #
+  # smoo:developer-links points the packages the root package.json's
+  # `smoo.developerLinks` declares at their local checkouts, after an install
+  # and in every tree that installed them (tooling/direnv/developer-links.ts).
+  # Gated by `status` too: a clone or an install can lose a link without any
+  # file devenv watches changing. A runner links nothing.
+  #
   # A failed task does not fail shell entry (devenv reports it and the shell
   # still loads, so the tools to repair it stay available). CI runs both with
   # `devenv tasks run`, which does fail; setup-environment.ts is strict there.
@@ -399,6 +405,14 @@ in {
       description = "cargo fetch --locked into CARGO_HOME for each Cargo workspace";
       exec = "${setup} --cargo";
       status = "${setup} --cargo --check";
+      before = ["devenv:enterShell"];
+      showOutput = true;
+    };
+    "smoo:developer-links" = {
+      description = "link the packages smoo.developerLinks declares to their local checkouts";
+      exec = "${setup} --links";
+      status = "${setup} --links --check";
+      after = ["smoo:install"];
       before = ["devenv:enterShell"];
       showOutput = true;
     };

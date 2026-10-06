@@ -38,6 +38,18 @@
  * the install starts has nothing to put back, and a named link that dangled
  * is removed first, as for any install.
  *
+ * A repository can also DECLARE such links, so every checkout of it on a
+ * developer machine gets them without anyone running `bun link`: the root
+ * package.json's `smoo.developerLinks` maps a package name to the directory
+ * of its local checkout, relative to the project's main checkout (see
+ * `linkAnchor`). `planDeclaredLinks` says what the trees lack and
+ * `applyDeclaredLinks` makes it so: in every node_modules tree that has the
+ * package installed, the entry becomes a link to that directory, unless a
+ * developer already pointed it at a checkout of their own. A declared
+ * directory this machine does not have leaves the installed version, said so.
+ * CI never applies them: it builds against the published packages the
+ * lockfile names (setup-environment.ts `--links`).
+ *
  * Like secret-references.ts, this is a managed raw script: shell entry imports
  * it before anything is installed, and `smoo monorepo update` loads the copy
  * the nx-plugin ships. Because both use the one implementation, the shell and
@@ -47,6 +59,7 @@
 import {
   type Dirent,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -230,4 +243,162 @@ function restoreLink(root: string, link: DeveloperLink): void {
   rmSync(at, { recursive: true, force: true });
   mkdirSync(path.dirname(at), { recursive: true });
   symlinkSync(link.target, at);
+}
+
+/** One tree entry a declaration wants pointed at its package's local checkout. */
+export interface DeclaredLinkChange {
+  /** Where the entry is, relative to the project root. */
+  readonly path: string;
+  /** The checkout directory it should link to, absolute. */
+  readonly target: string;
+}
+
+/** A declaration this machine cannot honour: its checkout directory is not there to link to. */
+export interface UnavailableDeclaredLink {
+  readonly name: string;
+  readonly target: string;
+  readonly reason: string;
+}
+
+export interface DeclaredLinksPlan {
+  readonly changes: readonly DeclaredLinkChange[];
+  readonly unavailable: readonly UnavailableDeclaredLink[];
+}
+
+/**
+ * What `smoo.developerLinks` asks of the trees under `root` that they do not
+ * already hold. An entry needs a change when the package is installed there
+ * (as the store link or directory bun made) and is not already a link to the
+ * declared directory. An entry a developer pointed at another checkout of
+ * their own stays theirs, and a tree without the package gains nothing: a
+ * declaration links what the manifests depend on, never adds a dependency.
+ */
+export function planDeclaredLinks(root: string): DeclaredLinksPlan {
+  const declared = readDeclaredLinks(root);
+  if (declared.length === 0) {
+    return { changes: [], unavailable: [] };
+  }
+  const anchor = linkAnchor(root);
+  const trees = nodeModulesTrees(root);
+  const changes: DeclaredLinkChange[] = [];
+  const unavailable: UnavailableDeclaredLink[] = [];
+  for (const [name, relative] of declared) {
+    const target = path.resolve(anchor, relative);
+    const reason = unavailableReason(target);
+    if (reason !== null) {
+      unavailable.push({ name, target, reason });
+      continue;
+    }
+    for (const tree of trees) {
+      const entry = path.join(tree, name);
+      const at = path.join(root, entry);
+      const stats = lstatSync(at, { throwIfNoEntry: false });
+      if (stats === undefined) {
+        continue;
+      }
+      if (stats.isSymbolicLink()) {
+        const current = resolvedTarget(root, { path: entry, target: readlinkSync(at) });
+        const inside = path.relative(root, current);
+        if (current === target || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+          continue;
+        }
+      }
+      changes.push({ path: entry, target });
+    }
+  }
+  return { changes, unavailable };
+}
+
+/**
+ * Makes `plan`'s changes and says what it linked, once per package, and
+ * which declarations this machine cannot honour.
+ */
+export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void {
+  for (const { name, target, reason } of plan.unavailable) {
+    console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
+  }
+  const counts = new Map<string, number>();
+  for (const change of plan.changes) {
+    const at = path.join(root, change.path);
+    rmSync(at, { recursive: true, force: true });
+    symlinkSync(change.target, at);
+    const named = `${packageName(change)} -> ${change.target}`;
+    counts.set(named, (counts.get(named) ?? 0) + 1);
+  }
+  if (counts.size > 0) {
+    const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));
+    console.error(`linked declared packages to local checkouts: ${entries.join(', ')}`);
+  }
+}
+
+/** Why `target` cannot be linked to, or null when it is a directory this process can reach. */
+function unavailableReason(target: string): string | null {
+  try {
+    return statSync(target).isDirectory() ? null : 'is not a directory';
+  } catch (error) {
+    if (error instanceof Error && 'code' in error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        return 'does not exist on this machine';
+      }
+      if (error.code === 'EACCES' || error.code === 'EPERM') {
+        return 'cannot be read here';
+      }
+    }
+    throw error;
+  }
+}
+
+/** A package name as npm spells one: `name` or `@scope/name`, one segment each. */
+const PACKAGE_NAME = /^(?:@[^/@\s.][^/\s]*\/)?[^/@\s.][^/\s]*$/;
+
+/**
+ * `smoo.developerLinks` from the root manifest: each package name with its
+ * checkout directory, relative. Hand-validated, like secret-references.ts
+ * validates `smoo.secrets`: this runs before anything is installed. The shape
+ * is `PackageSmooConfig.developerLinks` in the nx-plugin's workspace-manifest.ts.
+ */
+function readDeclaredLinks(root: string): [string, string][] {
+  const manifestPath = path.join(root, 'package.json');
+  const manifest: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const smoo = typeof manifest === 'object' && manifest !== null ? Reflect.get(manifest, 'smoo') : undefined;
+  const declared = typeof smoo === 'object' && smoo !== null ? Reflect.get(smoo, 'developerLinks') : undefined;
+  if (declared === undefined) {
+    return [];
+  }
+  if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) {
+    throw new Error(`${manifestPath}: smoo.developerLinks must map package names to checkout directories`);
+  }
+  return Object.entries(declared).map(([name, directory]) => {
+    if (!PACKAGE_NAME.test(name)) {
+      throw new Error(`${manifestPath}: smoo.developerLinks key ${JSON.stringify(name)} is not a package name`);
+    }
+    if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
+      throw new Error(
+        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to the main checkout, not ${JSON.stringify(directory)}`,
+      );
+    }
+    return [name, directory];
+  });
+}
+
+/**
+ * What declared directories are relative to: the project's main checkout.
+ * That is `root` itself, unless `root` is a cowshed workspace, a clone of
+ * the main checkout at another path whose marker (`.cowshed/workspace.json`)
+ * names the main checkout as its `projectRoot`. Every checkout of one project
+ * then resolves a declaration to the same directory, however deep its own
+ * path lies.
+ */
+function linkAnchor(root: string): string {
+  let marker: unknown;
+  try {
+    marker = JSON.parse(readFileSync(path.join(root, '.cowshed', 'workspace.json'), 'utf8'));
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return root;
+    }
+    throw error;
+  }
+  const projectRoot = typeof marker === 'object' && marker !== null ? Reflect.get(marker, 'projectRoot') : undefined;
+  return typeof projectRoot === 'string' && path.isAbsolute(projectRoot) ? projectRoot : root;
 }

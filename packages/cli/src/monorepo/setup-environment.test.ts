@@ -42,6 +42,8 @@ type EntryOptions = {
   readonly ciSecrets?: Readonly<Record<string, string>>;
   /** devenv's smoo:cargo-fetch task: `--cargo`, and its `status`, `--cargo --check`. */
   readonly cargo?: boolean;
+  /** devenv's smoo:developer-links task: `--links`, and its `status`, `--links --check`. */
+  readonly links?: boolean;
   readonly check?: boolean;
 } & (
   | {
@@ -94,6 +96,8 @@ interface RepositoryOptions {
   readonly files?: Readonly<Record<string, string>>;
   /** How long each `git config` write lingers before it runs, to widen a race between entries. */
   readonly gitWriteSeconds?: number;
+  /** The root manifest's `smoo.developerLinks`. */
+  readonly developerLinks?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -138,6 +142,7 @@ async function withManagedRepository(
             SMOO_NPM_TOKEN: { command: counter('SMOO_NPM_TOKEN', ledgers) },
             SMOO_TOKEN: { command: counter('SMOO_TOKEN', ledgers) },
           },
+          ...(options.developerLinks === undefined ? {} : { developerLinks: options.developerLinks }),
         },
       }),
     );
@@ -301,6 +306,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
       join(root, 'tooling', 'direnv', 'setup-environment.ts'),
       ...(options.python === undefined ? [] : ['--python', options.python]),
       ...(options.cargo === true ? ['--cargo'] : []),
+      ...(options.links === true ? ['--links'] : []),
       ...(options.check === true ? ['--check'] : []),
     ],
     cwd: root,
@@ -649,6 +655,96 @@ describe('what shell entry keeps linked', () => {
       await touchManifest(root);
       expect((await enter()).exitCode).toBe(0);
       expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+    });
+  });
+
+  describe('as smoo.developerLinks declares them', () => {
+    /** A local checkout of a package: a directory holding its manifest. */
+    async function checkout(at: string, name: string): Promise<string> {
+      await mkdir(at, { recursive: true });
+      await writeFile(join(at, 'package.json'), JSON.stringify({ name, version: '9.9.9' }));
+      return at;
+    }
+
+    it('links each tree that installed a declared package, relative to the main checkout a cowshed marker names', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          // This checkout is a cowshed workspace: a clone of the main checkout, at a path of its own.
+          const main = join(dirname(root), 'projects', 'main');
+          await mkdir(main, { recursive: true });
+          await mkdir(join(root, '.cowshed'), { recursive: true });
+          await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
+          const local = await checkout(join(dirname(root), 'projects', 'local-lib'), '@fixture/lib');
+
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          const linked = await enter({ links: true });
+          expect(linked.exitCode).toBe(0);
+          expect(linked.stderr).toContain(`linked declared packages to local checkouts: @fixture/lib -> ${local}`);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect(readlinkSync(join(root, UNLINKED))).toBe('../../util');
+          // The root depends on neither, so its tree gains nothing.
+          expect(existsSync(join(root, 'node_modules', '@fixture', 'lib'))).toBe(false);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+
+          // An install that reinstalls the package keeps the link.
+          await touchManifest(root);
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+        },
+      );
+    });
+
+    it("keeps a developer's own link, and the installed version where this machine lacks the checkout", async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib', util: '../declared-util' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          await checkout(join(dirname(root), 'declared-util'), 'util');
+          const mine = await checkout(join(dirname(root), 'my-util'), 'util');
+          await rm(join(root, UNLINKED));
+          symlinkSync(mine, join(root, UNLINKED));
+
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          const entered = await enter({ links: true });
+          expect(entered.exitCode).toBe(0);
+          expect(entered.stderr).toContain(
+            `! smoo.developerLinks @fixture/lib: ${join(dirname(root), 'absent-lib')} does not exist on this machine; the installed version stays`,
+          );
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+        },
+      );
+    });
+
+    it('links nothing on a CI runner, which builds against the published packages', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          const runner = { SMOO_NPM_TOKEN: 'npm', SMOO_TOKEN: 'token' };
+          expect(await enter({ links: true, check: true, ciSecrets: runner })).toEqual(HEALTHY);
+          expect(await enter({ links: true, ciSecrets: runner })).toEqual(HEALTHY);
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+        },
+      );
+    });
+
+    it('refuses a declaration whose directory is absolute', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '/opt/lib' } },
+        async ({ enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const refused = await enter({ links: true, check: true });
+          expect(refused.exitCode).toBe(1);
+          expect(refused.stderr).toContain(
+            'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
+          );
+        },
+      );
     });
   });
 
