@@ -2195,7 +2195,7 @@ async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation
         .store()
         .join(".build")
         .join("built");
-    assert_eq!(volume, json!(expected));
+    assert_eq!(volume, json!({ "volume": expected }));
 
     let stale = route(
         &router,

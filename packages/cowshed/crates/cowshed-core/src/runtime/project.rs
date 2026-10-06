@@ -1025,7 +1025,9 @@ impl ProjectActor {
                 format!("cowshed attach {}, then retry", params.workspace),
             ));
         }
-        json_response(self.host.build_volume(params.workspace).await?)
+        // An object, never a bare `null`: an RPC envelope carries no result for a null one.
+        let volume = self.host.build_volume(params.workspace).await?;
+        json_response(json!({ "volume": volume }))
     }
 
     async fn coordinator_adopt(&mut self, request: RouterRequest) -> Result<RouterResponse> {

@@ -658,6 +658,12 @@ struct WorkspaceWire {
     grants: GrantSet,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BuildVolumeWire {
+    volume: Option<PathBuf>,
+}
+
 /// Explicit cowshed client. Its sealed runtime delegates to a single-owner controller actor.
 pub struct Cowshed {
     runtime: Arc<dyn ControllerRuntime>,
@@ -896,7 +902,7 @@ impl WorkspaceRef {
     /// follows the link compares what it names against this. Refuses a detached workspace and a
     /// name recreated since this reference was resolved.
     pub async fn build_volume(&self) -> Result<Option<PathBuf>> {
-        call_typed(
+        let wire: BuildVolumeWire = call_typed(
             &self.runtime,
             "workspace.buildVolume",
             json!({
@@ -905,7 +911,8 @@ impl WorkspaceRef {
                 "workspaceIncarnation": self.info.workspace_incarnation,
             }),
         )
-        .await
+        .await?;
+        Ok(wire.volume)
     }
 }
 
@@ -2520,6 +2527,37 @@ mod tests {
             "raven"
         );
         assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The answer travels wrapped: a bare `null` for a checkout linking no volume would be an
+    /// envelope without a result, which the client refuses as invalid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_volume_is_fenced_and_answers_a_volume_or_none() {
+        let (runtime, mut server) = actor_pair();
+        let workspace = workspace_ref(runtime);
+        let server_task = tokio::spawn(async move {
+            for volume in [json!("/mnt/.build/acme/widget/0123"), Value::Null] {
+                let (_, request) = read_rpc_request(&mut server).await;
+                assert_eq!(request["method"], "workspace.buildVolume");
+                assert_eq!(
+                    request["params"],
+                    json!({
+                        "repoId": "acme/widget",
+                        "workspace": "raven",
+                        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    })
+                );
+                let id = request["id"].as_u64().unwrap();
+                write_rpc_success(&mut server, id, json!({ "volume": volume }), None).await;
+            }
+        });
+        assert_eq!(
+            workspace.build_volume().await.expect("linked"),
+            Some(PathBuf::from("/mnt/.build/acme/widget/0123"))
+        );
+        assert_eq!(workspace.build_volume().await.expect("unlinked"), None);
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]
