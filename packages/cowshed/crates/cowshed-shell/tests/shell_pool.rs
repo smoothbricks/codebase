@@ -71,11 +71,14 @@ impl Workspace {
         }
     }
 
+    /// HOME and the mount root are siblings, as on a real host: the mount root is a hard deny
+    /// (sibling workspaces), so a HOME beneath it would refuse every capability's HOME grant.
     fn sandbox_at(root: &Path, port_base: u16) -> SandboxConfig {
+        let mount_root = root.join("mounts");
         SandboxConfig {
             home: root.join("home"),
-            mount_root: root.to_path_buf(),
-            workspace_mount: root.join("workspace"),
+            workspace_mount: mount_root.join("workspace"),
+            mount_root,
             exec_temp_dir: root.join("tmp"),
             port_block: PortBlock::new(port_base, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
@@ -100,7 +103,7 @@ impl Workspace {
         std::fs::create_dir_all(&alias).expect("scratch root");
         // Seatbelt matches resolved paths; `/var/folders` is a symlink into `/private/var`.
         let root = std::fs::canonicalize(&alias).expect("canonical scratch root");
-        let mount = root.join("workspace");
+        let mount = root.join("mounts/workspace");
         std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
         std::fs::write(
             mount.join(WORKSPACE_TOKEN_PATH),
