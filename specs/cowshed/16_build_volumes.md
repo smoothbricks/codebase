@@ -16,8 +16,10 @@ exists, and how each is enforced. It is the one place these rules live; other sp
   exactly what the same edit would invalidate on main.
 - **Land in milliseconds.** A land runs no build on main. The landing workspace has already built and checked the exact
   tree main moves to; main takes that workspace's build volume by one `rename(2)`.
-- **Nothing copied, nothing patched, nothing extra in the environment.** No cache entries are copied between checkouts.
-  Nx, Cargo and sccache run unmodified. A process learns nothing about cowshed: it reads the same paths it always reads.
+- **Nothing copied but what a land would lose, nothing patched, nothing extra in the environment.** No cache entries are
+  copied between checkouts, with one exception: a land copies into the landing volume the target's Nx cache entries it
+  lacks (Land, "Carry"), because adopting the volume would otherwise discard them. Nx, Cargo and sccache run unmodified.
+  A process learns nothing about cowshed: it reads the same paths it always reads.
 - **Generic.** Build volumes come from capability detection (15_capabilities.md), not from a project's configuration. A
   project that uses Nx, Cargo, Go, ttsc, zig or none of them gets exactly the build state its tools have.
 - **Bounded.** Every build volume and every cache inside one has an owner that deletes it. Nothing grows without bound.
@@ -260,7 +262,7 @@ half-written Cargo unit or Nx database. It runs under the target's image lock, w
 while it clones the seed, so a reseed never deletes a seed a fork is cloning:
 
 1. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
-   step 6); any other holder, or a daemon that outlives its stop, skips the reseed;
+   step 5); any other holder, or a daemon that outlives its stop, skips the reseed;
 2. every Cargo build lock in the volume (`.cargo-lock` in each profile directory of a Cargo target directory, which a
    running Cargo holds for its whole build) is taken without waiting; a held one skips the reseed, and holding them all
    keeps a Cargo build from starting until the clone is cut (it waits on the lock as for any concurrent build);
@@ -313,20 +315,29 @@ same for main and for an integration workspace; "the target" is whichever one it
 4. **Quiesce the landing workspace.** Its supervisor stops the workspace's jobs and its sandboxed Nx daemon, and the
    landing build volume's Nx task database must have no open file descriptors. If it still does, adoption is **skipped**
    and reported, as for the target below. The landing volume now has no writer.
-5. **Freeze the seed.** Clone the landing build volume's image as the target's new seed and delete the target's previous
-   seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork of this target
-   starts from at least what is landing. What the target itself runs on the adopted volume afterwards reaches the seed
-   by a reseed (Targets and seeds).
-6. **Adopt the build volume.** Under the same lock (rule "The adoption needs the target's Nx database closed"):
-   1. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
+5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
+   database closed"):
+   1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
+      entries it lacks, indexing none of them yet;
+   2. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
       not the daemon named by the target's `nx/workspace-data/d` record, skip;
-   2. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
+   3. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
       verified it live, and wait for its exit on a process-exit event (it restarts on the next client). A test with a
       real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
-   3. query again; any holder at all, including a daemon a host client started in between, means skip;
-   4. delete `nx/workspace-data/d` in the landing build volume;
-   5. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
-   6. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
+   4. query again; any holder at all, including a daemon a host client started in between, means skip;
+   5. **commit the carry**: index what was staged, and copy what the target indexed since;
+   6. clone the landing build volume's image as the target's new seed and delete the target's previous seed. Nothing
+      writes the volume while it is cloned, so the seed is consistent, and the next fork of this target starts from at
+      least what is landing and what the target held. What the target itself runs on the adopted volume afterwards
+      reaches the seed by a reseed (Targets and seeds).
+
+   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap.
+
+6. **Adopt the build volume.** Still under the lock:
+   1. query the target's task database once more: a holder that opened it since 5.4 means skip;
+   2. delete `nx/workspace-data/d` in the landing build volume;
+   3. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
+   4. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
       below).
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
@@ -353,6 +364,47 @@ same for main and for an integration workspace; "the target" is whichever one it
    the check exiting. That run hashes the same tree with the same tasks, so the hashes it reports are the check's.
 
 8. **Retire the workspace** (as today). Its build volume is now the target's and does not retire with it.
+
+### Carry
+
+A landing volume holds what its workspace forked from and what it ran since. The target's volume also holds what other
+lands and the target itself ran in the meantime. Adopting the landing volume as it is discards all of that, though Nx's
+entries are content-addressed and every one is a correct hit for any tree that computes its hash. Measured on a consumer
+repository: a fork made right after a land hit 78 of 108 tasks, and among the misses were tasks main's previous volume
+held at that very tree. So before the target adopts the landing volume, every Nx cache entry the target's task database
+indexes and the landing volume's does not is copied into the landing volume and indexed there. Only Nx's state is
+carried: a Cargo target directory is per tree and mtime-fresh, so the landing volume's is the one that matches the
+landed tree.
+
+Stock Nx (pinned 23.2.1, `native/cache/cache.rs`) keeps an entry in three places: the directory `<cache>/<hash>` with
+the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a `cache_outputs` row in the task database
+`<workspace-data>/<machine>-v<schema>.db`, which references a `task_details` row. `put` writes the files first and the
+row last, and `get` answers a hit only for a row. The carry keeps that order in two phases, so the target's database is
+closed only for as long as it was before:
+
+- **Stage**, while the target runs (5.1): one SQLite read of the target's database (its write-ahead log included) names
+  the rows the landing database lacks, most recently used first; each entry's files are copied with `copyfile(3)`
+  (bytes, mode and times) into the landing volume's `.carry/` staging directory, outside every tool's namespace. Nothing
+  indexes them, so nothing reads them.
+- **Commit**, once the target is closed (5.5): a staged entry whose row (code, size, creation time) is unchanged moves
+  into the cache by `rename(2)`. Nx rewrites an entry only by deleting its directory, rewriting it and re-stamping its
+  row, and evicts one by deleting its row first, so an unchanged row proves the staged copy whole; any other staged
+  entry is dropped. Rows the target indexed after the stage are copied now, nothing writing either side. Every placed
+  entry's `task_details` and `cache_outputs` rows are inserted in one transaction, as the target holds them, its
+  `accessed_at` included, so Nx's own age and size eviction treats them as it would have in the target. `.carry/` is
+  then deleted.
+
+Entries cross from one image to another, so they are copied, never cloned. Their volume is the delta of what other lands
+and the target ran since the landing workspace forked, which is what a fork would otherwise rebuild. Copies run before
+the target's database is closed and cost no window; a failed copy (a full volume) stops the carry, keeps every entry
+carried until then, and is reported (`carried.stopped`); the land still succeeds. A landing Nx state with no task
+database never ran Nx, and first takes a copy of the target's database without its cache rows (`VACUUM INTO`, one
+consistent snapshot), so the carry has a schema Nx wrote to index into; one whose database has another name runs an Nx
+of another schema and gets nothing. A carry that crashes leaves only `.carry/`, which the next stage on that volume
+deletes before it starts.
+
+- **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
+  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
 
 ### Stacks and merge queues
 
@@ -386,7 +438,10 @@ again at any level above it.
   to a volume nobody owned.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
-  database indexes. Cargo's target directory is bounded by the tree it builds; cowshed does not prune it.
+  database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in
+  the target, and the carry indexes every entry it places, so nothing it writes escapes Nx's eviction; its staging
+  directory is its own to delete (Land, "Carry"). Gc never opens a volume's contents. Cargo's target directory is
+  bounded by the tree it builds; cowshed does not prune it.
 - A workspace's build volume retires with the workspace (`cowshed rm`), unless main adopted it.
 
 ## Rules that keep it warm
@@ -510,8 +565,9 @@ links afterwards, so it reads rows from the old volume and files from the new on
 the new cache lacks, stock Nx reports a hit and restores nothing (measured): the task "succeeds" with its outputs
 missing. A run that started on the old tree and stays entirely on the old volume is correct; only the mix is wrong. The
 land therefore swaps only when no process holds the target's current task database open, and otherwise skips the swap
-(Land step 6). The daemon is stopped at the swap because it also keeps the database open (it records task history). The
-landing workspace is quiesced first (Land step 4) for the same reason on its side.
+(Land steps 5 and 6). The daemon is stopped before the swap because it also keeps the database open (it records task
+history), and the carry commits while the database is closed. The landing workspace is quiesced first (Land step 4) for
+the same reason on its side.
 
 A run that started on the old tree and stays wholly on the old volume is correct even when it hits; the hazard is only
 the mix.
@@ -579,6 +635,10 @@ The decisions this spec records, in the order they were taken. It is kept so the
   follows its live volume: every fork reseeds its target first when the target's volume was written after its seed and
   has no writer (Nx database closed, Cargo build locks free), `cowshed reseed` does the same on demand, and doctor
   reports a seed that is behind.
+- 2026-10-06: a fork made right after a land hit 78 of 108 Nx tasks: adopting the landing volume had discarded the
+  entries main's previous volume held, though they were content-addressed. A land now carries the target's Nx cache
+  entries the landing volume lacks into it before the swap, copying while the target runs and indexing while its
+  database is closed, so the swap's window stays as short as before.
 
 ## Open questions
 

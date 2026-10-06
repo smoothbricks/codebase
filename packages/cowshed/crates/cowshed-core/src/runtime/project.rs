@@ -3788,8 +3788,9 @@ impl NativeProjectRuntimeHost {
         Ok(links)
     }
 
-    /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, freeze the
-    /// target's seed from its volume, move the target's build link onto it, and re-run the
+    /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
+    /// target's Nx state and carry the target's cache entries into the landing volume, freeze
+    /// the target's seed from that volume, move the target's build link onto it, and re-run the
     /// landed checks in the target, where every Nx task should hit.
     async fn land_build_volume(
         &mut self,
@@ -3832,16 +3833,50 @@ impl NativeProjectRuntimeHost {
             name: into.name.clone(),
             incarnation: target.derived.workspace.incarnation().clone(),
         };
+        // The carry's copies run while the target still runs; only its commit needs the
+        // target closed. Both precede the seed, so the seed holds what was carried.
+        let staging = timed_async(
+            "land",
+            "carry-stage",
+            volumes.stage(&quiet, into.mount.clone()),
+        )
+        .await?;
+        let closed = timed_async(
+            "land",
+            "close-target",
+            volumes.close_target(into.mount.clone()),
+        )
+        .await?;
+        let carried = match closed {
+            Ok(closed) => {
+                let carried =
+                    timed_async("land", "carry-commit", volumes.commit(staging, &quiet)).await?;
+                Ok((closed, carried))
+            }
+            Err(reason) => {
+                volumes.unstage(&quiet).await?;
+                Err(reason)
+            }
+        };
         timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&quiet, owner.clone(), tree.clone()),
         )
         .await?;
+        let (closed, carried) = match carried {
+            Ok(carried) => carried,
+            Err(reason) => {
+                return Ok(LandBuildVolume {
+                    seeded: true,
+                    adoption: Adoption::Skipped { reason },
+                });
+            }
+        };
         let adoption = match timed_async(
             "land",
             "adopt",
-            volumes.adopt(&quiet, into.name.clone(), into.mount.clone(), tree),
+            volumes.adopt(&quiet, closed, into.name.clone(), into.mount.clone(), tree),
         )
         .await?
         {
@@ -3858,7 +3893,11 @@ impl NativeProjectRuntimeHost {
                     self.check_adoption(&into.name, &into.mount, checks),
                 )
                 .await?;
-                Adoption::Adopted { elapsed_ms, check }
+                Adoption::Adopted {
+                    elapsed_ms,
+                    carried,
+                    check,
+                }
             }
         };
         Ok(LandBuildVolume {

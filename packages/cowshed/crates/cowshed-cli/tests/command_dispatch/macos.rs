@@ -1860,6 +1860,56 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     fixture.stop_gateway().await;
 }
 
+/// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
+/// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
+/// and changing nothing `a` hashes, lands next without running them. Main then adopts `b`'s
+/// volume, which never held `a`'s entries, and a fork of main still hits both.
+#[tokio::test]
+async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let nx_check = nx_run_many(&node);
+
+    let b = new_workspace(&mut service, "b").await;
+    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
+    git(&b, &["add", "unrelated.txt"]);
+    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
+
+    let a = new_workspace(&mut service, "a").await;
+    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
+    git(&a, &["commit", "-q", "-am", "change a"]);
+    let report = land(&mut service, "a", true, &[&nx_check]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+
+    succeed(&mut service, ["rebase", "b"]).await;
+    let report = land(&mut service, "b", true, &[]).await;
+    match &report.build_volume.adoption {
+        Adoption::Adopted { carried, .. } => {
+            assert_eq!(carried.stopped, None, "{report:?}");
+            assert!(
+                carried.entries >= 2,
+                "a:build and a:test, which main held and b's volume did not: {report:?}"
+            );
+        }
+        Adoption::Skipped { reason } => panic!("the adoption was skipped: {reason:?}"),
+    }
+
+    let fork = new_workspace(&mut service, "fork").await;
+    let hits = nx_statuses(&mut service, "fork", &fork, &nx_check).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "a fork of main hits what a's land ran, though b's land adopted a volume without it: {hits:?}"
+    );
+}
+
 /// A process other than main's daemon holding main's Nx task database open makes the land skip
 /// the swap and name that process (16_build_volumes.md, "The adoption needs the target's Nx
 /// database closed"). The seed is still frozen; main keeps its own volume.

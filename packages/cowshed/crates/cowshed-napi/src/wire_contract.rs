@@ -494,6 +494,12 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             seeded: true,
             adoption: cowshed_core::api::dto::Adoption::Adopted {
                 elapsed_ms: 3,
+                carried: cowshed_core::api::dto::NxCarry {
+                    entries: 7,
+                    bytes: 4096,
+                    elapsed_ms: 12,
+                    stopped: Some("stage entry 42: No space left on device".to_owned()),
+                },
                 check: cowshed_core::api::dto::AdoptionCheck {
                     hits: 41,
                     misses: vec![cowshed_core::api::dto::CacheMiss {

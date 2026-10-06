@@ -2783,10 +2783,12 @@ pub struct LandBuildVolume {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Adoption {
-    /// The target's build link names the landing volume now (step 6); `check` is step 7.
+    /// The target's build link names the landing volume now (step 6), which first took the
+    /// target's Nx cache entries it lacked (`carried`); `check` is step 7.
     Adopted {
         #[serde(rename = "elapsedMs")]
         elapsed_ms: u64,
+        carried: NxCarry,
         check: AdoptionCheck,
     },
     /// The target kept its own volume and builds the landed delta itself. Never wrong, only
@@ -2798,6 +2800,22 @@ impl Adoption {
     pub fn is_adopted(&self) -> bool {
         matches!(self, Self::Adopted { .. })
     }
+}
+
+/// Step 5: the Nx cache entries the target's previous volume indexed and the landing volume did
+/// not, carried into the landing volume before the target adopted it (16_build_volumes.md,
+/// "Carry"). Nx's entries are content-addressed, so another land's work stays a hit.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NxCarry {
+    pub entries: u64,
+    /// The bytes Nx recorded for those entries.
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+    /// Why the carry stopped before every missing entry was carried. Each entry carried until
+    /// then is whole and indexed; the rest are misses the target rebuilds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2814,7 +2832,7 @@ pub enum AdoptionSkip {
     },
     /// The landing workspace's Nx daemon outlived its stop.
     LandingDaemonStayed { daemon: DatabaseHolder },
-    /// A process holds the target's Nx task database (step 6).
+    /// A process holds the target's Nx task database (steps 5 and 6).
     TargetHeld {
         database: PathBuf,
         holders: Vec<DatabaseHolder>,

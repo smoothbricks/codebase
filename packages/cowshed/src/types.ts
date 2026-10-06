@@ -290,8 +290,22 @@ export interface LandReport {
 export interface LandBuildVolume {
   readonly seeded: boolean;
   readonly adoption:
-    | { readonly kind: 'adopted'; readonly elapsedMs: number; readonly check: AdoptionCheck }
+    | {
+        readonly kind: 'adopted';
+        readonly elapsedMs: number;
+        readonly carried: NxCarry;
+        readonly check: AdoptionCheck;
+      }
     | { readonly kind: 'skipped'; readonly reason: AdoptionSkip };
+}
+
+/** The target's Nx cache entries carried into the landing volume before adoption (16_build_volumes.md, "Carry"). */
+export interface NxCarry {
+  readonly entries: number;
+  readonly bytes: number;
+  readonly elapsedMs: number;
+  /** Why the carry stopped before every missing entry was carried. */
+  readonly stopped?: string;
 }
 
 export interface DatabaseHolder {

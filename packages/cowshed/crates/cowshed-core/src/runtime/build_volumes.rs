@@ -16,12 +16,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::apfs::SystemCommandRunner;
 use crate::api::dto::{
-    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, Reseed, ReseedSkip,
-    Sha256Digest,
+    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry, Reseed,
+    ReseedSkip, Sha256Digest,
 };
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    BuildVolumeState, TrackedBuildStateRefusal, cargo, link, nx,
+    BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
@@ -57,6 +57,22 @@ pub(crate) struct Quiet {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
+}
+
+/// The target's volume once its Nx state is closed (Land step 5): its daemon stopped and its
+/// task database held by nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct Closed {
+    id: BuildVolumeId,
+    mount: PathBuf,
+    state: BuildVolumeState,
+}
+
+/// A carry's first phase, done while the target still ran (Land step 5, "Carry").
+#[derive(Debug)]
+pub(crate) struct Staging {
+    staged: carry::Staged,
+    elapsed: Duration,
 }
 
 /// How far a target's latest seed is behind the live build volume it links, as the instant of
@@ -438,28 +454,113 @@ impl BuildVolumes {
         }
     }
 
-    /// Land step 6: when nothing but the target's daemon holds its task database, stop that
-    /// daemon, drop the landing volume's daemon record, and rename the target's build link onto
-    /// the landing volume. The target's previous volume is unlinked and released when idle.
-    /// Answers how long the move took.
+    /// Land step 5.2–5.4: when nothing but the target's daemon holds its task database,
+    /// stop that daemon. Answers the target's volume, closed, for [`Self::commit`] and
+    /// [`Self::adopt`].
+    pub async fn close_target(
+        &self,
+        target_checkout: PathBuf,
+    ) -> Result<std::result::Result<Closed, AdoptionSkip>> {
+        let previous = self.layout.linked(&target_checkout)?;
+        self.blocking(move |host, layout| {
+            let Some(id) = previous else {
+                return Ok(Err(AdoptionSkip::NoTargetVolume));
+            };
+            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let state = BuildVolumeState::read(&mount)?;
+            if let Err(busy) = nx::close(&mount, &state)
+                .map_err(|error| io("close the target's Nx state", &mount, &error))?
+            {
+                return Ok(Err(skip(busy, Side::Target)));
+            }
+            Ok(Ok(Closed { id, mount, state }))
+        })
+        .await
+    }
+
+    /// Land step 5.1, carry phase 1 (16_build_volumes.md, "Carry"), while the target still runs:
+    /// stage in the quiet landing volume every Nx cache entry the target's volume indexes and
+    /// the landing volume lacks.
+    pub async fn stage(&self, quiet: &Quiet, target_checkout: PathBuf) -> Result<Staging> {
+        let target = self.layout.linked(&target_checkout)?;
+        let quiet = quiet.clone();
+        self.blocking(move |host, layout| {
+            let started = Instant::now();
+            let staged = match target {
+                Some(target) => {
+                    let mount = host.mount_build_volume(layout, &target).map_err(storage)?;
+                    let state = BuildVolumeState::read(&mount)?;
+                    carry::stage(&mount, &state, &quiet.mount, &quiet.state)
+                }
+                None => carry::Staged::default(),
+            };
+            Ok(Staging {
+                staged,
+                elapsed: started.elapsed(),
+            })
+        })
+        .await
+    }
+
+    /// Land step 5.5, carry phase 2, once the target is closed: index in the landing volume what
+    /// [`Self::stage`] staged and the target did not change since, with what the target indexed
+    /// after it.
+    pub async fn commit(&self, staging: Staging, quiet: &Quiet) -> Result<NxCarry> {
+        let quiet = quiet.clone();
+        self.blocking(move |_, _| {
+            let started = Instant::now();
+            let carried = carry::commit(staging.staged, &quiet.mount);
+            let carry = NxCarry {
+                entries: carried.entries,
+                bytes: carried.bytes,
+                elapsed_ms: millis(staging.elapsed + started.elapsed()),
+                stopped: carried.stopped,
+            };
+            crate::timing::event("build-volume", || {
+                format!(
+                    "carried {} Nx entries ({} bytes) into {} in {} ms",
+                    carry.entries, carry.bytes, quiet.id, carry.elapsed_ms
+                )
+            });
+            Ok(carry)
+        })
+        .await
+    }
+
+    /// Delete what [`Self::stage`] staged in the landing volume, for a land whose target could
+    /// not be closed: no row will index it, so nothing would ever delete it.
+    pub async fn unstage(&self, quiet: &Quiet) -> Result<()> {
+        let mount = quiet.mount.clone();
+        self.blocking(move |_, _| {
+            carry::unstage(&mount).map_err(|error| io("unstage the carry", &mount, &error))
+        })
+        .await
+    }
+
+    /// Land step 6: when nothing opened the closed target's task database since
+    /// [`Self::close_target`], drop the landing volume's daemon record and rename the target's
+    /// build link onto the landing volume. The target's previous volume is unlinked and
+    /// released when idle. Answers how long the move took.
     pub async fn adopt(
         &self,
         quiet: &Quiet,
+        previous: Closed,
         target: WorkspaceName,
         target_checkout: PathBuf,
         tree: GitOid,
     ) -> Result<std::result::Result<u64, AdoptionSkip>> {
-        let previous = self.layout.linked(&target_checkout)?;
+        let linked = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |host, layout| {
-            let Some(previous) = previous else {
-                return Ok(Err(AdoptionSkip::NoTargetVolume));
-            };
             let started = Instant::now();
-            let previous_mount = host.mount_build_volume(layout, &previous).map_err(storage)?;
-            let previous_state = BuildVolumeState::read(&previous_mount)?;
-            if let Err(busy) = nx::close(&previous_mount, &previous_state)
-                .map_err(|error| io("close the target's Nx state", &previous_mount, &error))?
+            if linked.as_ref() != Some(&previous.id) {
+                return Err(CowshedError::internal(format!(
+                    "{target}'s build link moved off {} while its land held the target",
+                    previous.id
+                )));
+            }
+            if let Err(busy) = nx::held(&previous.mount, &previous.state)
+                .map_err(|error| io("look at the target's Nx state", &previous.mount, &error))?
             {
                 return Ok(Err(skip(busy, Side::Target)));
             }
@@ -477,6 +578,7 @@ impl BuildVolumes {
                     ..layout.read_record(&quiet.id)?
                 },
             )?;
+            let previous = previous.id;
             layout.write_record(
                 &previous,
                 &BuildVolumeRecord {
@@ -492,7 +594,7 @@ impl BuildVolumes {
                     "cowshed: {target}'s previous build volume {previous} stays until it is idle ({reason}); `cowshed gc` reclaims it then"
                 );
             }
-            Ok(Ok(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)))
+            Ok(Ok(millis(elapsed)))
         })
         .await
     }
@@ -1733,12 +1835,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(capacity(&seed) >= ImageCapacity::from_gibibytes(2));
-        scratch
+        let closed = scratch
             .volumes
-            .adopt(&quiet, WorkspaceName::main(), main_checkout.clone(), tree)
+            .close_target(main_checkout.clone())
             .await
             .unwrap()
             .expect("nothing holds the target's volume");
+        scratch
+            .volumes
+            .adopt(
+                &quiet,
+                closed,
+                WorkspaceName::main(),
+                main_checkout.clone(),
+                tree,
+            )
+            .await
+            .unwrap()
+            .expect("nothing opened the target's volume since");
         assert_eq!(
             scratch.volumes.layout.linked(&main_checkout).unwrap(),
             Some(topic.clone())

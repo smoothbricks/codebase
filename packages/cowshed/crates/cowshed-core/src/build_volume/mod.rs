@@ -13,11 +13,15 @@
 //! seed (a target's frozen build state, never written), and when it was made.
 
 pub mod cargo;
+#[cfg(target_os = "macos")]
+pub mod carry;
 pub mod discard;
 pub mod link;
 #[cfg(target_os = "macos")]
 pub mod migrate;
 pub mod nx;
+#[cfg(target_os = "macos")]
+mod sqlite;
 
 use std::fs;
 use std::io;

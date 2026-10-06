@@ -966,6 +966,12 @@
     "retired": {
       "buildVolume": {
         "adoption": {
+          "carried": {
+            "bytes": 4096,
+            "elapsedMs": 12,
+            "entries": 7,
+            "stopped": "stage entry 42: No space left on device"
+          },
           "check": {
             "failed": [
               {

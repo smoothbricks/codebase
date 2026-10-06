@@ -1,6 +1,6 @@
 //! Nx's state inside a build volume: who holds its task database open, its daemon, and the
 //! run summary stock Nx writes after every run (16_build_volumes.md, "The adoption needs the
-//! target's Nx database closed", Land steps 4, 6 and 7).
+//! target's Nx database closed", Land steps 4 to 7).
 
 use std::fs;
 use std::io;

@@ -2907,7 +2907,21 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
         Adoption::Skipped { reason } => {
             lines.push(format!("build volume adoption skipped: {reason}"));
         }
-        Adoption::Adopted { elapsed_ms, check } => {
+        Adoption::Adopted {
+            elapsed_ms,
+            carried,
+            check,
+        } => {
+            lines.push(format!(
+                "build volume: carried {} Nx cache entr{} ({} bytes) the target held into the landed volume in {} ms",
+                carried.entries,
+                if carried.entries == 1 { "y" } else { "ies" },
+                carried.bytes,
+                carried.elapsed_ms
+            ));
+            if let Some(stopped) = &carried.stopped {
+                lines.push(format!("build volume: the carry stopped short: {stopped}"));
+            }
             lines.push(format!(
                 "build volume adopted by the target in {elapsed_ms} ms"
             ));
