@@ -1,12 +1,15 @@
 use crate::args::GatewayCommand;
+use crate::build_record::{BuildRecord, downgrade_refusal, is_downgrade};
 use crate::launchd::{
-    COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
+    COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
-    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome,
+    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink,
     kickstart_hint, plan_executable_install, plan_executable_remove, plan_install, plan_remove,
+    replace_symlink,
 };
 use crate::output::Output;
+use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
@@ -473,7 +476,7 @@ where
 {
     match action {
         GatewayCommand::Start => {
-            let status = start_service(output).await?;
+            let status = start_service(output, Downgrade::Refuse).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
@@ -507,7 +510,10 @@ where
     Ok(0)
 }
 
-async fn start_service<W, E>(output: &mut Output<W, E>) -> Result<CliGatewayStatus>
+async fn start_service<W, E>(
+    output: &mut Output<W, E>,
+    downgrade: Downgrade,
+) -> Result<CliGatewayStatus>
 where
     W: Write + Send,
     E: Write + Send,
@@ -519,9 +525,11 @@ where
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     // The candidate path is derived first because the plist has to name it before the agent can be
     // activated, and the install-then-activate pair is what has to be undoable as a whole.
-    let source = supervisable_running_executable()?;
-    let candidate = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let spec = LaunchAgentSpec::gateway(&candidate).map_err(launchd_error)?;
+    let candidate = Candidate::of(supervisable_running_executable()?, BuildRecord::running())?;
+    let executable =
+        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    refuse_downgrade(&executable, &candidate, downgrade)?;
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
     let plan = plan_install(
         &spec,
@@ -535,8 +543,8 @@ where
     );
     let uid = effective_uid();
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
-    install_and_activate_gateway(&mut executor, &home, &source, &spec, written)?;
-    let cli_sha256 = executable_sha256(&source)?;
+    install_and_activate_gateway(&mut executor, &home, &candidate, &spec, written)?;
+    let cli_sha256 = candidate.digest.to_string();
 
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     let mut progress = StartProgress::new();
@@ -693,19 +701,69 @@ pub fn remove_launch_agent(target: &LaunchAgentTarget) -> Result<RemovalOutcome>
     })
 }
 
-/// Delete the host-stable copy a LaunchAgent ran. Only ever called once its agent is gone: the
-/// gateway agent is `KeepAlive`, so removing the binary under a loaded agent would leave launchd
-/// respawning a path that no longer resolves.
+/// Delete the installed cowshed a LaunchAgent ran: the stable name first, then every stored copy
+/// with its build record. Only ever called once its agent is gone: the gateway agent is
+/// `KeepAlive`, so removing the binary under a loaded agent would leave launchd respawning a path
+/// that no longer resolves.
 pub fn remove_host_stable_executable(executable: &HostStableExecutable) -> Result<RemovalOutcome> {
-    let installed = fs::symlink_metadata(executable.path()).is_ok();
+    let present = installed_files(executable)?;
     LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand)
-        .execute_install(&plan_executable_remove(executable, installed))
+        .execute_install(&plan_executable_remove(executable, &present))
         .map_err(launchd_error)?;
-    Ok(if installed {
-        RemovalOutcome::Removed
-    } else {
+    Ok(if present.is_empty() {
         RemovalOutcome::AlreadyAbsent
+    } else {
+        RemovalOutcome::Removed
     })
+}
+
+/// Everything an install of cowshed leaves in the host-stable directory, in the order to remove
+/// it: the stable name, so nothing launchd could start dangles, then each stored copy and the
+/// build record beside it.
+pub(crate) fn installed_files(executable: &HostStableExecutable) -> Result<Vec<PathBuf>> {
+    let mut present = Vec::new();
+    if inspect_existing(executable.path())?.is_some() {
+        present.push(executable.path().to_path_buf());
+    }
+    present.extend(stored_files(executable, |_| true)?);
+    Ok(present)
+}
+
+/// The stored copies in the host-stable directory, each beside its build record, for the builds
+/// `selected` picks.
+fn stored_files(
+    executable: &HostStableExecutable,
+    mut selected: impl FnMut(&ExecutableDigest) -> bool,
+) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(executable.directory()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "could not list {}: {error}",
+                executable.directory().display()
+            )));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CowshedError::internal(format!(
+                "could not list {}: {error}",
+                executable.directory().display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let digest = executable.stored_digest(&name).or_else(|| {
+            let stem = name.to_str()?.strip_suffix(BUILD_RECORD_SUFFIX)?;
+            executable.stored_digest(std::ffi::OsStr::new(stem))
+        });
+        if digest.is_some_and(|digest| selected(&digest)) {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// The gateway agent's own spec, resolved from the canonical home rather than the running binary.
@@ -718,7 +776,8 @@ pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, Launch
     Ok((executable, spec))
 }
 
-/// Stop the gateway; with `purge`, also delete the installed binary it ran.
+/// Stop the gateway; with `purge`, also delete the installed cowshed it ran — and the links on
+/// `PATH` that name it, which would otherwise answer `command not found` from the next shell.
 ///
 /// Without `purge` the copy stays: it is host state rather than agent state, and leaving it makes
 /// the next `start` a plist write instead of a fresh multi-megabyte copy.
@@ -727,9 +786,28 @@ fn stop_service(purge: bool) -> Result<RemovalOutcome> {
     let (executable, spec) = gateway_launch_agent(&home)?;
     remove_launch_agent(spec.target())?;
     if purge {
+        remove_path_entries(executable.path())?;
         return remove_host_stable_executable(&executable);
     }
     Ok(RemovalOutcome::AlreadyAbsent)
+}
+
+/// Remove the entries on the operator's `PATH` that name the installed cowshed, before it goes:
+/// a link that outlived its target would answer `command not found` in the middle of the next
+/// shell's work. Links that merely happen to arrive there are not cowshed's to remove.
+pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let removed = crate::path_entry::remove_pointing_at(&path, stable).map_err(|error| {
+        CowshedError::internal(format!(
+            "could not remove the cowshed link on PATH that names {}: {error}",
+            stable.display()
+        ))
+    })?;
+    Ok(if removed.is_empty() {
+        RemovalOutcome::AlreadyAbsent
+    } else {
+        RemovalOutcome::Removed
+    })
 }
 
 /// Stop the gateway while setup moves its mirrors; the installed binary stays.
@@ -739,9 +817,9 @@ pub(crate) fn stop_for_host_move() -> Result<()> {
 
 /// Start the gateway again after setup moved its mirrors, saying nothing: setup reports the
 /// move itself, and the gateway's own start output belongs to `cowshed gateway start`.
-pub(crate) async fn start_after_host_move() -> Result<()> {
+pub(crate) async fn start_after_host_move(downgrade: Downgrade) -> Result<()> {
     let mut quiet = Output::new(io::sink(), io::sink(), true);
-    start_service(&mut quiet).await.map(|_| ())
+    start_service(&mut quiet, downgrade).await.map(|_| ())
 }
 
 pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
@@ -766,8 +844,13 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     } else {
         None
     };
-    let cli_sha256 = executable_sha256(&running_executable()?)?;
-    Ok(cli_status(installed, socket, status.as_ref(), &cli_sha256))
+    let cli_sha256 = executable_digest(&running_executable()?)?;
+    Ok(cli_status(
+        installed,
+        socket,
+        status.as_ref(),
+        cli_sha256.as_str(),
+    ))
 }
 
 async fn run_daemon() -> Result<()> {
@@ -811,7 +894,7 @@ async fn run_daemon() -> Result<()> {
     );
     let recovery = manager.recovery();
     let config = GatewayConfig {
-        executable_sha256: Some(executable_sha256(&executable)?),
+        executable_sha256: Some(executable_digest(&executable)?.to_string()),
         startup: Some(Arc::new(DaemonStartup {
             heal: Arc::clone(&heal),
             manager: Arc::clone(&manager),
@@ -996,12 +1079,12 @@ fn cli_status(
     }
 }
 
-/// The remedy for a daemon running other bytes than the CLI: a plain `stop` keeps the installed
-/// copy and `start` does not restart a process whose plist did not change.
-const STALE_DAEMON_REMEDY: &str = "cowshed gateway stop --purge && cowshed gateway start";
+/// The remedy for a daemon running other bytes than the CLI: `setup` installs one build as the
+/// CLI on `PATH` and the daemon together, and restarts a daemon that runs another.
+const STALE_DAEMON_REMEDY: &str = "cowshed setup";
 
-/// SHA-256 of an executable's contents, lowercase hex.
-pub(crate) fn executable_sha256(path: &Path) -> Result<String> {
+/// SHA-256 of an executable's contents.
+pub(crate) fn executable_digest(path: &Path) -> Result<ExecutableDigest> {
     let mut file = open_for_compare(path)?;
     let mut hasher = Sha256::new();
     let mut chunk = vec![0u8; COMPARE_CHUNK_BYTES];
@@ -1012,11 +1095,7 @@ pub(crate) fn executable_sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&chunk[..read]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(ExecutableDigest::from_bytes(&hasher.finalize().into()))
 }
 
 pub fn emit_gateway_status<W: Write, E: Write>(
@@ -1076,11 +1155,43 @@ pub fn emit_gateway_status<W: Write, E: Write>(
     Ok(())
 }
 
-/// Install `source` at the host-stable path launchd will run, and answer with that path.
+/// The build an install would put in place: its bytes, what they hash to, and what the build
+/// says of itself.
 ///
-/// The plist names a copy on the volume that carries the plist itself, so the agent
-/// starts after the build that installed it is gone. The source may live in a workspace
-/// or the nix store: those paths are unreadable at boot, but the copy is not.
+/// The digest is the stored copy's name, so it is taken once, from the bytes about to be copied,
+/// and carried through the install rather than read again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Candidate {
+    pub source: PathBuf,
+    pub digest: ExecutableDigest,
+    pub record: Option<BuildRecord>,
+}
+
+impl Candidate {
+    pub fn of(source: PathBuf, record: Option<BuildRecord>) -> Result<Self> {
+        Ok(Self {
+            digest: executable_digest(&source)?,
+            source,
+            record,
+        })
+    }
+}
+
+/// Whether an install may replace the installed cowshed with an older build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Downgrade {
+    Refuse,
+    Allow,
+}
+
+/// Install `source` as the host's cowshed: a copy of its bytes named for their digest, and the
+/// stable name launchd runs and the operator's `PATH` reaches as a link to that copy.
+///
+/// The plist names the stable name on the volume that carries the plist itself, so the agent
+/// starts after the build that installed it is gone. The source may live in a workspace or the
+/// nix store: those paths are unreadable at boot, but the copy is not. A copy is written once and
+/// never rewritten, so what runs from it is exactly those bytes for as long as it exists, and
+/// the stable name moves from one whole build to the next in one rename.
 pub fn install_host_stable_executable<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
@@ -1091,16 +1202,24 @@ where
     F: LaunchdFilesystem,
 {
     let executable = HostStableExecutable::new(home, name).map_err(launchd_error)?;
-    if source == executable.path() {
-        // Already the installed copy: this is the steady state on a host launchd started, and
-        // copying a file onto itself is the one publication the plan cannot express.
-        return Ok(executable);
-    }
-    let state = observe_executable_install(&executable, source)?;
-    executor
-        .execute_install(&plan_executable_install(&executable, source, state))
-        .map_err(launchd_error)?;
+    install_stored_executable(executor, &executable, &executable_digest(source)?, source)?;
     Ok(executable)
+}
+
+fn install_stored_executable<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
+    source: &Path,
+) -> Result<()>
+where
+    F: LaunchdFilesystem,
+{
+    let state = observe_executable_install(executable, digest, source)?;
+    executor
+        .execute_install(&plan_executable_install(executable, digest, source, &state))
+        .map_err(launchd_error)?;
+    Ok(())
 }
 
 /// Where the provenance of the installed cowshed is written down.
@@ -1110,9 +1229,6 @@ where
 /// binary with no recorded origin is unanswerable — "which build is this host running" had, until
 /// this file, no answer other than a size comparison against a checkout that may have moved on.
 const INSTALLED_SOURCE_RECORD: &str = "cowshed-source";
-
-/// The hard link retained across one activation, so a failed `launchctl` can be undone.
-const RETAINED_SUFFIX: &str = ".previous";
 
 /// Refuse to hand launchd a build that must not be supervised.
 ///
@@ -1186,52 +1302,205 @@ fn record_installed_source(executable: &HostStableExecutable, source: &Path) {
     }
 }
 
-/// Retain the binary an install is about to replace, as a hard link beside it.
+/// What a stored copy's build record is named: the copy's own name and this suffix.
+const BUILD_RECORD_SUFFIX: &str = ".build";
+
+/// Where the build record of the stored copy of `digest` is written, beside the copy.
+fn build_record_path(executable: &HostStableExecutable, digest: &ExecutableDigest) -> PathBuf {
+    let mut path = executable.stored(digest).into_os_string();
+    path.push(BUILD_RECORD_SUFFIX);
+    PathBuf::from(path)
+}
+
+/// Write down which build the stored copy is, so a later install can tell whether it would move
+/// the host to an older one ([`refuse_downgrade`]). A build that records nothing writes nothing:
+/// the copy then has no record, and a copy with none is never refused a replacement.
 ///
-/// A hard link rather than a copy: it is O(1) whatever the binary's size, and it keeps the old
-/// inode alive through the atomic rename that replaces the path — so the retained name still reads
-/// the exact bytes the host was running. `None` means there was nothing installed to retain, which
-/// is a first install and has nothing to roll back to.
-pub fn retain_previous_executable(executable: &HostStableExecutable) -> Result<Option<PathBuf>> {
-    let retained = retained_path(executable);
-    if inspect_existing(executable.path())?.is_none() {
+/// Best effort like [`record_installed_source`], and said out loud for the same reason.
+fn record_installed_build(executable: &HostStableExecutable, candidate: &Candidate) {
+    let Some(record) = &candidate.record else {
+        return;
+    };
+    let path = build_record_path(executable, &candidate.digest);
+    let written = serde_json::to_vec(record)
+        .map_err(io::Error::other)
+        .and_then(|bytes| fs::write(&path, bytes));
+    if let Err(error) = written {
+        eprintln!(
+            "cowshed: could not record the installed build in {}: {error}; a later setup cannot \
+             tell whether a build it installs is older",
+            path.display()
+        );
+    }
+}
+
+/// The build the stable name runs, and what it recorded of itself.
+struct InstalledBuild {
+    digest: ExecutableDigest,
+    record: Option<BuildRecord>,
+}
+
+/// What the stable name runs now. `None` when nothing is installed, or the install is one from
+/// before copies were content-addressed, which records nothing.
+fn installed_build(executable: &HostStableExecutable) -> Result<Option<InstalledBuild>> {
+    let Some(metadata) = inspect_existing(executable.path())? else {
+        return Ok(None);
+    };
+    if !metadata.file_type().is_symlink() {
         return Ok(None);
     }
-    // A leftover from an earlier interrupted run is stale by definition: the live binary is the
-    // authority, and linking onto an existing name fails.
-    match fs::remove_file(&retained) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(CowshedError::internal(format!(
-                "could not remove stale retained executable {}: {error}",
-                retained.display()
-            )));
-        }
-    }
-    fs::hard_link(executable.path(), &retained).map_err(|error| {
+    let target = fs::read_link(executable.path()).map_err(|error| {
         CowshedError::internal(format!(
-            "could not retain {} as {}: {error}",
-            executable.path().display(),
-            retained.display()
+            "could not read the link {}: {error}",
+            executable.path().display()
         ))
     })?;
-    Ok(Some(retained))
+    let Some(digest) = target
+        .file_name()
+        .and_then(|name| executable.stored_digest(name))
+    else {
+        return Ok(None);
+    };
+    let path = build_record_path(executable, &digest);
+    let record = match fs::read(&path) {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "the installed cowshed's build record {} is unreadable: {error}",
+                    path.display()
+                ),
+                "delete the record, or run `cowshed setup --downgrade` from the build to install",
+            )
+        })?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "could not read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    Ok(Some(InstalledBuild { digest, record }))
 }
 
-fn retained_path(executable: &HostStableExecutable) -> PathBuf {
-    let mut name = executable.name().to_owned();
-    name.push_str(RETAINED_SUFFIX);
-    executable.directory().join(name)
+/// Refuse to move the host to a build older than the installed one, unless `downgrade` allows it.
+///
+/// This exists because it happened twice in an afternoon: `cowshed setup` run through a launcher
+/// that resolved to a checkout's stale build put an older gateway back, removing a landed feature
+/// from a host that was running it, and every gate after ran without it. The check compares the
+/// commit times the two builds record ([`BuildRecord`]); an installed build that records nothing
+/// has nothing to compare, and the same bytes are never a downgrade of themselves.
+pub(crate) fn refuse_downgrade(
+    executable: &HostStableExecutable,
+    candidate: &Candidate,
+    downgrade: Downgrade,
+) -> Result<()> {
+    if downgrade == Downgrade::Allow {
+        return Ok(());
+    }
+    let Some(installed) = installed_build(executable)? else {
+        return Ok(());
+    };
+    match installed.record {
+        Some(record)
+            if installed.digest != candidate.digest
+                && is_downgrade(candidate.record.as_ref(), &record) =>
+        {
+            Err(downgrade_refusal(
+                &candidate.source,
+                candidate.record.as_ref(),
+                &record,
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
-/// Put the retained binary back, and say whether the host was left as it was found.
+/// Keep the build the stable name runs now through the install that replaces it, and name its
+/// stored copy.
+///
+/// A stored copy already is that: no install removes a copy until it is two builds old, so the
+/// failed activation that has to put the previous build back finds it where it was. The install
+/// from before copies were content-addressed left the binary itself at the stable name, and the
+/// install replaces that name with a link; so that binary is stored under its digest first,
+/// through the same copy-and-rename an install makes — written whole before anything names it,
+/// and needing nothing a sandboxed or unprivileged process may not do. `None` means there was
+/// nothing installed to retain, which is a first install and has nothing to roll back to.
+pub fn retain_previous_executable<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    executable: &HostStableExecutable,
+) -> Result<Option<PathBuf>>
+where
+    F: LaunchdFilesystem,
+{
+    let Some(metadata) = inspect_existing(executable.path())? else {
+        return Ok(None);
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(executable.path()).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not read the link {}: {error}",
+                executable.path().display()
+            ))
+        })?;
+        let stored = executable.directory().join(target);
+        return Ok(inspect_existing(&stored)?.map(|_| stored));
+    }
+    let digest = executable_digest(executable.path())?;
+    install_stored_executable(executor, executable, &digest, executable.path())?;
+    Ok(Some(executable.stored(&digest)))
+}
+
+/// Remove the stored copies an install has made redundant: every one but the new build and the
+/// one it replaced. The replaced build stays so a workspace supervisor of that build, still
+/// draining its jobs, can start the shells those jobs need from the path it started from; the
+/// next install removes it.
+///
+/// Said out loud and never fatal: an install that succeeded is not undone for 30 MB it could not
+/// reclaim.
+fn prune_superseded<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    executable: &HostStableExecutable,
+    current: &ExecutableDigest,
+    previous: Option<&Path>,
+) where
+    F: LaunchdFilesystem,
+{
+    let previous = previous
+        .and_then(Path::file_name)
+        .and_then(|name| executable.stored_digest(name));
+    let pruned = stored_files(executable, |digest| {
+        digest != current && previous.as_ref() != Some(digest)
+    })
+    .and_then(|superseded| {
+        executor
+            .execute_install(&plan_executable_remove(executable, &superseded))
+            .map(|_| ())
+            .map_err(launchd_error)
+    });
+    if let Err(error) = pruned {
+        eprintln!(
+            "cowshed: could not remove superseded copies of cowshed: {}",
+            error.message
+        );
+    }
+}
+
+/// Put the build `retained` names back as what the stable name runs, and say whether the host
+/// was left as it was found.
 ///
 /// Reported in the returned sentence rather than raised: the caller already has the failure that
 /// prompted the rollback, and a rollback that itself failed must not replace that failure with a
 /// second one — it must be appended to it, because the two together are the host's actual state.
 pub fn restore_previous_executable(executable: &HostStableExecutable, retained: &Path) -> String {
-    match fs::rename(retained, executable.path()) {
+    let restored = fs::symlink_metadata(retained).and_then(|_| match retained.file_name() {
+        Some(name) => replace_symlink(Path::new(name), executable.path()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the retained copy names no file",
+        )),
+    });
+    match restored {
         Ok(()) => format!(
             "the previous {} was restored; this host is as it was found",
             executable.path().display()
@@ -1243,7 +1512,7 @@ pub fn restore_previous_executable(executable: &HostStableExecutable, retained: 
     }
 }
 
-/// Install the running build, activate its agent, and undo the install if activation fails.
+/// Install the candidate, activate its agent, and undo the install if activation fails.
 ///
 /// The whole point is the last clause. `launchctl` failing after the copy is what left this host
 /// running a debug gateway with no agent: the binary had already been replaced, and nothing put it
@@ -1253,7 +1522,7 @@ pub fn restore_previous_executable(executable: &HostStableExecutable, retained: 
 fn install_and_activate_gateway<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
-    source: &Path,
+    candidate: &Candidate,
     spec: &LaunchAgentSpec,
     plist: InstallOutcome,
 ) -> Result<HostStableExecutable>
@@ -1261,17 +1530,19 @@ where
     F: LaunchdFilesystem,
     C: LaunchctlCommand,
 {
-    let candidate = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let retained = retain_previous_executable(&candidate)?;
-    let executable = install_host_stable_executable(executor, home, COWSHED_BINARY_NAME, source)?;
-    record_installed_source(&executable, source);
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let retained = retain_previous_executable(executor, &executable)?;
+    install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
+    record_installed_source(&executable, &candidate.source);
+    record_installed_build(&executable, candidate);
     match activate_launch_agent(executor, effective_uid(), spec.target(), plist) {
         Ok(()) => {
-            // The retained link is only good for the length of one activation: keeping it would
-            // leave a second multi-megabyte copy nobody reclaims, and a stale one at that.
-            if let Some(retained) = retained {
-                let _ = fs::remove_file(retained);
-            }
+            prune_superseded(
+                executor,
+                &executable,
+                &candidate.digest,
+                retained.as_deref(),
+            );
             Ok(executable)
         }
         Err(error) => Err(match retained {
@@ -1328,37 +1599,64 @@ pub enum ServiceBinaryRefresh {
         reason: String,
         remedy: String,
     },
+    /// The installed cowshed is newer than the invoking build, and the run was not asked to go
+    /// back. Reported like a refusal, and ends the run non-zero: the install was the point.
+    Downgrade {
+        service: String,
+        reason: String,
+        remedy: String,
+    },
 }
 
-/// Whether the observed installed binary needs refreshing from the invoking build.
-pub fn installed_binary_is_stale(state: &ExecutableInstallState) -> bool {
-    !state.is_current()
+/// Whether the stable name does not yet run the candidate's stored copy.
+pub fn installed_binary_is_stale(
+    executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
+    state: &ExecutableInstallState,
+) -> bool {
+    !state.is_current(executable, digest)
 }
 
 /// Reconcile the gateway's stable binary and generated agent definition with this command.
 ///
-/// Setup never refuses to repair a host. `None` means no gateway agent is installed, or both
-/// installed artifacts already match. Plist drift is repaired even when the invoking build is
-/// byte-identical to the installed copy, including when setup runs from that copy itself.
-/// Binary drift uses the same atomic install and activation rollback as `gateway start`.
+/// Setup never refuses to repair a host. `None` means no gateway agent is installed, or the
+/// installed artifacts already match and the daemon runs them. Plist drift is repaired even when
+/// the invoking build is byte-identical to the installed copy, including when setup runs from
+/// that copy itself. Binary drift uses the same atomic install and activation rollback as
+/// `gateway start`; so does a daemon that answers while running other bytes than the installed
+/// copy, which launchd keeps for as long as the process lives — restarting it is what makes the
+/// CLI on `PATH` and the daemon one artifact again.
 ///
-/// The build has to be fit to supervise *before* anything is copied, and a failed activation puts
-/// the old binary back: this is the function that, unguarded, replaced a host's supervised gateway
-/// with a debug build and then stranded it with no loaded agent.
-pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh>> {
+/// The build has to be fit to supervise, and not older than the installed one, *before* anything
+/// is copied, and a failed activation puts the old binary back: this is the function that,
+/// unguarded, replaced a host's supervised gateway with a debug build and then stranded it with
+/// no loaded agent.
+pub async fn refresh_gateway_binary(
+    home: &Path,
+    downgrade: Downgrade,
+) -> Result<Option<ServiceBinaryRefresh>> {
+    let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
+    let daemon = match GatewayControlClient::new(control_socket_path()) {
+        Ok(client) => client.status().await.ok(),
+        Err(_) => None,
+    };
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     refresh_gateway_from(
         home,
-        running_executable()?,
+        &candidate,
         cfg!(debug_assertions),
+        downgrade,
+        daemon.as_ref(),
         &mut executor,
     )
 }
 
 fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
-    source: PathBuf,
+    candidate: &Candidate,
     debug_build: bool,
+    downgrade: Downgrade,
+    daemon: Option<&GatewayStatus>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
@@ -1377,32 +1675,148 @@ fn refresh_gateway_from<C: LaunchctlCommand>(
             }),
         },
     );
-    let state = observe_executable_install(&executable, &source)?;
-    let binary_is_stale = installed_binary_is_stale(&state);
-    if !binary_is_stale && plan.is_noop() {
+    let state = observe_executable_install(&executable, &candidate.digest, &candidate.source)?;
+    let binary_is_stale = installed_binary_is_stale(&executable, &candidate.digest, &state);
+    let daemon_is_stale = daemon.is_some_and(|status| {
+        status.executable_sha256.as_deref() != Some(candidate.digest.as_str())
+    });
+    if !binary_is_stale && !daemon_is_stale && plan.is_noop() {
         return Ok(None);
     }
-    // Refuse only a binary replacement: reconciling an agent definition does not install this
-    // invocation's bytes. Preserve the existing supervised binary when it already matches.
-    if binary_is_stale
-        && let Err(refusal) = refuse_unsupervisable_build(source.clone(), debug_build)
-    {
-        return Ok(Some(ServiceBinaryRefresh::Refused {
-            service: spec.label().to_owned(),
-            reason: refusal.message,
-            remedy: refusal.hint,
-        }));
+    // Refuse only a binary replacement: reconciling an agent definition, or restarting a daemon
+    // onto the copy already installed, does not install this invocation's bytes. Preserve the
+    // existing supervised binary when it already matches.
+    if binary_is_stale {
+        if let Err(refusal) = refuse_unsupervisable_build(candidate.source.clone(), debug_build) {
+            return Ok(Some(ServiceBinaryRefresh::Refused {
+                service: spec.label().to_owned(),
+                reason: refusal.message,
+                remedy: refusal.hint,
+            }));
+        }
+        if let Err(refusal) = refuse_downgrade(&executable, candidate, downgrade) {
+            return Ok(Some(ServiceBinaryRefresh::Downgrade {
+                service: spec.label().to_owned(),
+                reason: refusal.message,
+                remedy: refusal.hint,
+            }));
+        }
     }
     let plist = executor.execute_install(&plan).map_err(launchd_error)?;
     if binary_is_stale {
         // Binary drift requires a restart even when the agent definition itself did not change.
-        install_and_activate_gateway(executor, home, &source, &spec, InstallOutcome::Changed)?;
+        install_and_activate_gateway(executor, home, candidate, &spec, InstallOutcome::Changed)?;
+    } else if daemon_is_stale {
+        activate_launch_agent(
+            executor,
+            effective_uid(),
+            spec.target(),
+            InstallOutcome::Changed,
+        )?;
     } else {
         activate_launch_agent(executor, effective_uid(), spec.target(), plist)?;
     }
     Ok(Some(ServiceBinaryRefresh::Refreshed {
         service: spec.label().to_owned(),
     }))
+}
+
+/// What `setup` did about the `cowshed` the operator types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CliInstall {
+    /// The invoking build is the installed cowshed, and the first `cowshed` on `PATH` was
+    /// reconciled with it.
+    Installed {
+        /// The stable name: what the `PATH` entry names and the gateway agent runs.
+        stable: PathBuf,
+        /// This run copied the build in or moved the stable name to it. `false` when the stable
+        /// name already ran it — including when the gateway refresh of the same run did so.
+        replaced: bool,
+        /// The invoking binary is itself a stored copy of the installed cowshed, so a setup from
+        /// it can install nothing new.
+        from_installed_copy: bool,
+        path_entry: PathEntryOutcome,
+    },
+    /// The invoking build must not be installed ([`refuse_unsupervisable_build`]).
+    Refused { reason: String, remedy: String },
+    /// The invoking build is older than the installed one, and the run was not asked to go back.
+    Downgrade { reason: String, remedy: String },
+}
+
+/// Make the invoking build the host's cowshed, and the first `cowshed` on `path` reach it.
+///
+/// The gateway's own refresh ([`refresh_gateway_binary`]) has already installed this build when an
+/// agent is installed — with the rollback an agent needs — and this finds that install current.
+/// On a host with no gateway agent this is the install: the copy, the stable name, the record.
+pub fn install_cli(
+    home: &Path,
+    downgrade: Downgrade,
+    path: &std::ffi::OsStr,
+) -> Result<CliInstall> {
+    let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
+    install_cli_from(
+        home,
+        &candidate,
+        cfg!(debug_assertions),
+        downgrade,
+        path,
+        &mut LaunchdExecutor::native(),
+    )
+}
+
+fn install_cli_from<F, C>(
+    home: &Path,
+    candidate: &Candidate,
+    debug_build: bool,
+    downgrade: Downgrade,
+    path: &std::ffi::OsStr,
+    executor: &mut LaunchdExecutor<F, C>,
+) -> Result<CliInstall>
+where
+    F: LaunchdFilesystem,
+{
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let state = observe_executable_install(&executable, &candidate.digest, &candidate.source)?;
+    let replaced = installed_binary_is_stale(&executable, &candidate.digest, &state);
+    if replaced {
+        if let Err(refusal) = refuse_unsupervisable_build(candidate.source.clone(), debug_build) {
+            return Ok(CliInstall::Refused {
+                reason: refusal.message,
+                remedy: refusal.hint,
+            });
+        }
+        if let Err(refusal) = refuse_downgrade(&executable, candidate, downgrade) {
+            return Ok(CliInstall::Downgrade {
+                reason: refusal.message,
+                remedy: refusal.hint,
+            });
+        }
+        let retained = retain_previous_executable(executor, &executable)?;
+        install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
+        record_installed_source(&executable, &candidate.source);
+        record_installed_build(&executable, candidate);
+        prune_superseded(
+            executor,
+            &executable,
+            &candidate.digest,
+            retained.as_deref(),
+        );
+    }
+    let from_installed_copy = candidate
+        .source
+        .parent()
+        .is_some_and(|directory| directory == executable.directory())
+        && candidate
+            .source
+            .file_name()
+            .and_then(|name| executable.stored_digest(name))
+            .is_some();
+    Ok(CliInstall::Installed {
+        stable: executable.path().to_path_buf(),
+        replaced,
+        from_installed_copy,
+        path_entry: crate::path_entry::point_at(path, executable.path()),
+    })
 }
 
 fn is_user_owned(metadata: &fs::Metadata, want_dir: bool) -> bool {
@@ -1425,33 +1839,69 @@ fn inspect_existing(path: &Path) -> Result<Option<fs::Metadata>> {
     }
 }
 
-/// What the host has at the stable path, and whether it is already this source.
+/// What the host has under the stable name's directory, and whether the stored copy of the
+/// source is already there and the stable name already runs it.
 fn observe_executable_install(
     executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
     source: &Path,
 ) -> Result<ExecutableInstallState> {
-    let installed = match inspect_existing(executable.path())? {
+    let stored_path = executable.stored(digest);
+    let stored = match inspect_existing(&stored_path)? {
         Some(metadata) if is_user_owned(&metadata, false) => Some(InstalledExecutable {
             mode: metadata.permissions().mode() & 0o777,
-            matches_source: source == executable.path()
-                || same_contents(source, executable.path(), metadata.len())?,
+            matches_source: source == stored_path
+                || same_contents(source, &stored_path, metadata.len())?,
         }),
         Some(_) => {
             return Err(CowshedError::integrity(
                 format!(
-                    "the installed {} binary is not a user-owned regular file: {}",
+                    "the stored {} copy is not a user-owned regular file: {}",
                     executable.name(),
-                    executable.path().display()
+                    stored_path.display()
                 ),
                 "remove it and rerun the service start command",
             ));
         }
         None => None,
     };
+    let link = match inspect_existing(executable.path())? {
+        None => StableLink::Absent,
+        Some(metadata) if metadata.uid() != effective_uid() => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the installed {} is not owned by this user: {}",
+                    executable.name(),
+                    executable.path().display()
+                ),
+                "remove it and rerun the service start command",
+            ));
+        }
+        Some(metadata) if metadata.file_type().is_symlink() => {
+            StableLink::To(fs::read_link(executable.path()).map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not read the link {}: {error}",
+                    executable.path().display()
+                ))
+            })?)
+        }
+        Some(metadata) if metadata.is_file() => StableLink::Foreign,
+        Some(_) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the installed {} is not a regular file or a link: {}",
+                    executable.name(),
+                    executable.path().display()
+                ),
+                "remove it and rerun the service start command",
+            ));
+        }
+    };
     Ok(ExecutableInstallState {
         support_directory_mode: private_directory_mode(executable.support_directory())?,
         binary_directory_mode: private_directory_mode(executable.directory())?,
-        installed,
+        stored,
+        link,
     })
 }
 
@@ -1622,46 +2072,133 @@ mod tests {
     use super::*;
     use crate::launchd::STABLE_BINARY_MODE;
 
+    type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
+
+    /// A build file under `home` with a record of the commit it was made from, as a release
+    /// binary carries one.
+    fn build(home: &Path, name: &str, bytes: &[u8], commit_time: Option<u64>) -> Candidate {
+        let directory = home.join("builds");
+        fs::create_dir_all(&directory).expect("builds directory");
+        let path = directory.join(name);
+        fs::write(&path, bytes).expect("build");
+        Candidate::of(
+            path,
+            commit_time.map(|commit_time| BuildRecord {
+                commit: format!("{commit_time:040x}"),
+                commit_time,
+            }),
+        )
+        .expect("candidate")
+    }
+
+    /// A home whose gateway agent is installed with a current plist and no binary yet.
+    fn host_with_agent(label: &str) -> (PathBuf, HostStableExecutable, LaunchAgentSpec) {
+        let home = scratch_root(label);
+        let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).unwrap();
+        let spec = LaunchAgentSpec::gateway(&executable).unwrap();
+        let mut filesystem = NativeFilesystem::new();
+        for directory in [
+            executable.support_directory(),
+            executable.directory(),
+            spec.launch_agents_directory(),
+        ] {
+            filesystem
+                .ensure_directory(directory, PRIVATE_DIRECTORY_MODE)
+                .unwrap();
+        }
+        fs::write(spec.plist_path(), spec.plist_bytes()).unwrap();
+        fs::set_permissions(
+            spec.plist_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(crate::launchd::PRIVATE_PLIST_MODE),
+        )
+        .unwrap();
+        (home, executable, spec)
+    }
+
+    /// The stored copies in the host-stable directory, as their digests' first eight digits.
+    fn stored(executable: &HostStableExecutable) -> Vec<String> {
+        let mut copies: Vec<String> = fs::read_dir(executable.directory())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name();
+                let digest = executable.stored_digest(&name)?;
+                Some(digest.as_str()[..8].to_owned())
+            })
+            .collect();
+        copies.sort();
+        copies
+    }
+
+    fn short(candidate: &Candidate) -> String {
+        candidate.digest.as_str()[..8].to_owned()
+    }
+
+    fn sorted(mut copies: Vec<String>) -> Vec<String> {
+        copies.sort();
+        copies
+    }
+
     /// The Aug drift in one test: a binary installed days earlier, byte-different from the build
-    /// running setup, observed as exactly that — stale — while identical bytes are current. This
-    /// is the decision `refresh_gateway_binary` acts on; the observation is pure filesystem, so
-    /// it is provable without launchd.
+    /// running setup, observed as exactly that — stale — and the plain binary an install from
+    /// before copies were content-addressed left at the stable name stale even when its bytes are
+    /// the build's, because the stable name must be a link to a stored copy. This is the decision
+    /// `refresh_gateway_binary` acts on; the observation is pure filesystem, so it is provable
+    /// without launchd.
     #[test]
-    fn planted_binary_drift_is_observed_as_stale_and_identical_bytes_as_current() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let home =
-            std::env::temp_dir().join(format!("cowshed-drift-{}-{nonce}", std::process::id()));
+    fn planted_binary_drift_is_observed_as_stale_until_the_stable_name_runs_the_build() {
+        let home = scratch_root("drift");
         let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("executable");
         fs::create_dir_all(executable.directory()).expect("bin directory");
-        let source = home.join("fresh-build");
-        fs::write(&source, b"the build running setup").expect("source");
+        let candidate = build(&home, "fresh-build", b"the build running setup", None);
+        let stale = |candidate: &Candidate| {
+            let state =
+                observe_executable_install(&executable, &candidate.digest, &candidate.source)
+                    .expect("observe");
+            installed_binary_is_stale(&executable, &candidate.digest, &state)
+        };
 
         // Nothing installed at all is stale: there is no current copy to be running.
-        let state = observe_executable_install(&executable, &source).expect("observe absent");
-        assert!(installed_binary_is_stale(&state));
+        assert!(stale(&candidate));
 
-        // Drifted bytes at the stable path are stale.
+        // Drifted bytes at the stable path — the old layout — are stale.
         fs::write(executable.path(), b"the binary from days ago").expect("plant drift");
         fs::set_permissions(
             executable.path(),
             std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
         )
         .expect("stable mode");
-        let state = observe_executable_install(&executable, &source).expect("observe drift");
-        assert!(installed_binary_is_stale(&state));
+        assert!(stale(&candidate));
 
-        // Identical bytes are current, so a repair plans nothing for them.
+        // So are identical bytes in that layout: the install moves the stable name onto a stored
+        // copy, so the CLI on PATH and the daemon change together from then on.
         fs::write(executable.path(), b"the build running setup").expect("refresh");
-        fs::set_permissions(
-            executable.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        assert!(stale(&candidate));
+
+        install_host_stable_executable(
+            &mut LaunchdExecutor::native(),
+            &home,
+            COWSHED_BINARY_NAME,
+            &candidate.source,
         )
-        .expect("stable mode");
-        let state = observe_executable_install(&executable, &source).expect("observe current");
-        assert!(!installed_binary_is_stale(&state));
+        .expect("install");
+        assert!(!stale(&candidate), "the installed build is current");
+        assert_eq!(
+            fs::read_link(executable.path()).expect("the stable name is a link"),
+            executable.stored_link(&candidate.digest)
+        );
+        assert_eq!(
+            fs::read(executable.path()).expect("through the link"),
+            b"the build running setup"
+        );
+
+        // Another build's bytes are stale again, and the same bytes from another file are not.
+        assert!(stale(&build(&home, "newer", b"a newer build", None)));
+        assert!(!stale(&build(
+            &home,
+            "same-bytes-elsewhere",
+            b"the build running setup",
+            None
+        )));
 
         fs::remove_dir_all(&home).ok();
     }
@@ -1693,27 +2230,20 @@ mod tests {
 
     #[test]
     fn setup_refresh_rewrites_an_old_plist_with_a_matching_installed_binary() {
-        let home = scratch_root("plist-drift");
-        let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).unwrap();
-        let spec = LaunchAgentSpec::gateway(&executable).unwrap();
-        let mut filesystem = NativeFilesystem::new();
-        for directory in [
-            executable.support_directory(),
-            executable.directory(),
-            spec.launch_agents_directory(),
-        ] {
-            filesystem
-                .ensure_directory(directory, PRIVATE_DIRECTORY_MODE)
-                .unwrap();
-        }
-        fs::write(executable.path(), b"the already installed release").unwrap();
-        fs::set_permissions(
-            executable.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        let (home, executable, spec) = host_with_agent("plist-drift");
+        let candidate = build(
+            &home,
+            "matching-build",
+            b"the already installed release",
+            None,
+        );
+        install_host_stable_executable(
+            &mut LaunchdExecutor::native(),
+            &home,
+            COWSHED_BINARY_NAME,
+            &candidate.source,
         )
         .unwrap();
-        let source = home.join("matching-build");
-        fs::copy(executable.path(), &source).unwrap();
         let desired = spec.plist_bytes();
         let desired_text = std::str::from_utf8(&desired).unwrap();
         let limits_start = desired_text
@@ -1724,17 +2254,29 @@ mod tests {
         legacy.replace_range(limits_start..limits_end, "");
         assert_ne!(legacy.as_bytes(), desired);
         fs::write(spec.plist_path(), &legacy).unwrap();
-        fs::set_permissions(
-            spec.plist_path(),
-            std::os::unix::fs::PermissionsExt::from_mode(crate::launchd::PRIVATE_PLIST_MODE),
-        )
-        .unwrap();
-        let installed_inode = fs::metadata(executable.path()).unwrap().ino();
-        let mut executor = LaunchdExecutor::new(filesystem, RecordingGatewayLaunchctl::default());
+        let stored_inode = fs::metadata(executable.stored(&candidate.digest))
+            .unwrap()
+            .ino();
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
 
-        for source in [source, executable.path().to_path_buf()] {
-            let refreshed =
-                refresh_gateway_from(&home, source.clone(), true, &mut executor).unwrap();
+        // An external build of the same bytes, and setup run from the installed copy itself.
+        for source in [
+            candidate.source.clone(),
+            executable.stored(&candidate.digest),
+        ] {
+            let candidate = Candidate::of(source, None).unwrap();
+            let refreshed = refresh_gateway_from(
+                &home,
+                &candidate,
+                false,
+                Downgrade::Refuse,
+                None,
+                &mut executor,
+            )
+            .unwrap();
             assert_eq!(
                 refreshed,
                 Some(ServiceBinaryRefresh::Refreshed {
@@ -1743,20 +2285,270 @@ mod tests {
             );
             assert_eq!(fs::read(spec.plist_path()).unwrap(), desired);
             assert_eq!(
-                fs::metadata(executable.path()).unwrap().ino(),
-                installed_inode
+                fs::metadata(executable.stored(&candidate.digest))
+                    .unwrap()
+                    .ino(),
+                stored_inode,
+                "a stored copy is never rewritten"
             );
             assert_eq!(
-                refresh_gateway_from(&home, source, true, &mut executor).unwrap(),
+                refresh_gateway_from(
+                    &home,
+                    &candidate,
+                    false,
+                    Downgrade::Refuse,
+                    None,
+                    &mut executor
+                )
+                .unwrap(),
                 None
             );
-            // Exercise setup invoked from the stable binary too, not just an identical external build.
             fs::write(spec.plist_path(), &legacy).unwrap();
         }
         let (_, command) = executor.into_parts();
         assert_eq!(command.argv.len(), 6);
         assert_eq!(command.argv[2][0], "bootstrap");
         assert_eq!(command.argv[5][0], "bootstrap");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The installed artifact is authoritative: a daemon that answers while running other bytes
+    /// than the installed copy — launchd keeps the process it has until it exits, whatever the
+    /// stable name now says — is restarted by `setup`, so the refusal that names `cowshed setup`
+    /// is one that `cowshed setup` ends.
+    #[test]
+    fn setup_restarts_a_daemon_that_runs_other_bytes_than_the_installed_copy() {
+        let (home, _, _) = host_with_agent("daemon-drift");
+        let candidate = build(&home, "release", b"the installed release", None);
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+        let refresh = |executor: &mut RecordingExecutor, daemon: Option<&GatewayStatus>| {
+            refresh_gateway_from(
+                &home,
+                &candidate,
+                false,
+                Downgrade::Refuse,
+                daemon,
+                executor,
+            )
+            .unwrap()
+        };
+        // The first run installs the build.
+        assert!(matches!(
+            refresh(&mut executor, None),
+            Some(ServiceBinaryRefresh::Refreshed { .. })
+        ));
+
+        // A daemon on the installed bytes, and no daemon at all, are nothing to do.
+        let current = daemon(false, None, Some(candidate.digest.as_str()));
+        assert_eq!(refresh(&mut executor, Some(&current)), None);
+        assert_eq!(refresh(&mut executor, None), None);
+
+        // A daemon on other bytes, or one too old to say, is restarted onto the installed copy.
+        for stale in [daemon(false, None, Some("aa")), daemon(false, None, None)] {
+            assert_eq!(
+                refresh(&mut executor, Some(&stale)),
+                Some(ServiceBinaryRefresh::Refreshed {
+                    service: GATEWAY_LABEL.to_owned(),
+                })
+            );
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The incident: `cowshed setup` through a launcher that resolved to a checkout's stale build
+    /// put an older gateway back over a newer one, and nothing said so. A build older than the
+    /// installed one — or one that records nothing, which cannot show it is not older — is refused
+    /// with the binary named and the host untouched; `--downgrade` installs it, and the build it
+    /// replaced stays one install longer for a supervisor still draining on it.
+    #[test]
+    fn setup_refuses_a_build_older_than_the_installed_one_unless_told_to_downgrade() {
+        let (home, executable, _) = host_with_agent("downgrade");
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+        let mut refresh = |candidate: &Candidate, downgrade: Downgrade| {
+            refresh_gateway_from(&home, candidate, false, downgrade, None, &mut executor).unwrap()
+        };
+        let installed = build(&home, "installed", b"installed at t=2000", Some(2_000));
+        let older = build(&home, "older", b"stale checkout build", Some(1_000));
+        let blind = build(&home, "blind", b"records nothing", None);
+        let newer = build(&home, "newer", b"built at t=3000", Some(3_000));
+        let link = || fs::read_link(executable.path()).unwrap();
+
+        assert!(matches!(
+            refresh(&installed, Downgrade::Refuse),
+            Some(ServiceBinaryRefresh::Refreshed { .. })
+        ));
+        assert_eq!(link(), executable.stored_link(&installed.digest));
+
+        for refused in [&older, &blind] {
+            let Some(ServiceBinaryRefresh::Downgrade {
+                service,
+                reason,
+                remedy,
+            }) = refresh(refused, Downgrade::Refuse)
+            else {
+                panic!("{} must be refused", refused.source.display());
+            };
+            assert_eq!(service, GATEWAY_LABEL);
+            assert!(
+                reason.contains(refused.source.to_str().unwrap()),
+                "the refusal names the binary it would have installed: {reason}"
+            );
+            assert!(remedy.contains("--downgrade"), "{remedy}");
+            assert_eq!(
+                link(),
+                executable.stored_link(&installed.digest),
+                "a refused install changes nothing"
+            );
+            assert_eq!(stored(&executable), [short(&installed)]);
+        }
+
+        // The installed build again is no downgrade of itself, and a newer one installs.
+        assert_eq!(refresh(&installed, Downgrade::Refuse), None);
+        assert!(matches!(
+            refresh(&newer, Downgrade::Refuse),
+            Some(ServiceBinaryRefresh::Refreshed { .. })
+        ));
+        assert_eq!(link(), executable.stored_link(&newer.digest));
+        // Each install keeps the build it replaced, and prunes the one before.
+        assert_eq!(
+            stored(&executable),
+            sorted(vec![short(&installed), short(&newer)])
+        );
+
+        // Going back needs the flag, and then it is just an install.
+        assert!(matches!(
+            refresh(&older, Downgrade::Allow),
+            Some(ServiceBinaryRefresh::Refreshed { .. })
+        ));
+        assert_eq!(link(), executable.stored_link(&older.digest));
+        assert_eq!(
+            stored(&executable),
+            sorted(vec![short(&newer), short(&older)]),
+            "the build before the replaced one is pruned"
+        );
+        assert!(
+            !build_record_path(&executable, &installed.digest).exists(),
+            "a pruned copy takes its build record with it"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// An installed cowshed that records nothing — one from before records existed, or the plain
+    /// binary of the old layout — has nothing to compare, so it is never an obstacle: the first
+    /// install of a build that records is how the host starts having records at all.
+    #[test]
+    fn an_installed_cowshed_that_records_nothing_refuses_no_replacement() {
+        let (home, executable, _) = host_with_agent("legacy-install");
+        fs::write(executable.path(), b"installed before records existed").unwrap();
+        fs::set_permissions(
+            executable.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        )
+        .unwrap();
+        let candidate = build(&home, "old-checkout", b"an old build", Some(10));
+        refuse_downgrade(&executable, &candidate, Downgrade::Refuse)
+            .expect("the plain binary of the old layout records nothing");
+
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+        assert!(matches!(
+            refresh_gateway_from(
+                &home,
+                &candidate,
+                false,
+                Downgrade::Refuse,
+                None,
+                &mut executor
+            )
+            .unwrap(),
+            Some(ServiceBinaryRefresh::Refreshed { .. })
+        ));
+        assert_eq!(
+            fs::read_link(executable.path()).unwrap(),
+            executable.stored_link(&candidate.digest),
+            "the plain binary is replaced by a link"
+        );
+        assert_eq!(
+            stored(&executable).len(),
+            2,
+            "the plain binary survives as the stored copy of the build it was"
+        );
+
+        // And the install wrote its record, so the next older build is refused.
+        let older = build(&home, "older", b"older than the old checkout", Some(5));
+        assert!(refuse_downgrade(&executable, &older, Downgrade::Refuse).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A failed activation must leave the host exactly as it was found: the stable name runs the
+    /// build it ran, and the copy of the build the failed install brought is no one's business.
+    #[test]
+    fn a_failed_activation_puts_the_previous_build_back() {
+        struct RefusingLaunchctl;
+        impl LaunchctlCommand for RefusingLaunchctl {
+            fn run(
+                &mut self,
+                _: &Path,
+                arguments: &[std::ffi::OsString],
+            ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                Ok(crate::launchd::LaunchctlOutput {
+                    status: match arguments[0].to_str() {
+                        Some("print") => crate::launchd::CommandStatus::ExitCode(113),
+                        Some("bootstrap") => crate::launchd::CommandStatus::ExitCode(37),
+                        _ => crate::launchd::CommandStatus::Success,
+                    },
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let (home, executable, spec) = host_with_agent("rollback");
+        let first = build(&home, "first", b"the supervised release build", Some(100));
+        let second = build(
+            &home,
+            "second",
+            b"a build whose agent will not load",
+            Some(200),
+        );
+        install_host_stable_executable(
+            &mut LaunchdExecutor::native(),
+            &home,
+            COWSHED_BINARY_NAME,
+            &first.source,
+        )
+        .unwrap();
+        let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), RefusingLaunchctl);
+
+        let error = install_and_activate_gateway(
+            &mut executor,
+            &home,
+            &second,
+            &spec,
+            InstallOutcome::Changed,
+        )
+        .expect_err("launchctl refuses");
+        assert!(
+            error.message.contains("this host is as it was found"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            fs::read_link(executable.path()).unwrap(),
+            executable.stored_link(&first.digest),
+            "the stable name runs the build it ran"
+        );
+        assert_eq!(
+            fs::read(executable.path()).unwrap(),
+            b"the supervised release build"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -3,12 +3,12 @@ use cowshed_cli::args::{Command, GatewayCommand, parse_args};
 use cowshed_cli::gateway_service::{
     GatewayDrain, GatewayPaths, RELEASE_CLI_TARGET, activate_launch_agent, drain_after_shutdown,
     emit_gateway_status, install_host_stable_executable, refuse_unsupervisable_build,
-    restore_previous_executable, retain_previous_executable,
+    remove_host_stable_executable, restore_previous_executable, retain_previous_executable,
 };
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandStatus, HostStableExecutable, InstallOutcome, LaunchAgentSpec,
-    LaunchctlCommand, LaunchctlOutput, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
-    STABLE_BINARY_MODE,
+    COWSHED_BINARY_NAME, CommandStatus, ExecutableDigest, HostStableExecutable, InstallOutcome,
+    LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdExecutor, NativeFilesystem,
+    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
 use cowshed_core::api::GatewayStatus as CliGatewayStatus;
@@ -346,12 +346,19 @@ fn scratch_home(label: &str) -> PathBuf {
     home.canonicalize().expect("canonical scratch home")
 }
 
+/// The digest of `bytes`, as the stored copy's name spells it.
+fn digest_of(bytes: &[u8]) -> ExecutableDigest {
+    use sha2::Digest as _;
+    ExecutableDigest::from_bytes(&sha2::Sha256::digest(bytes).into())
+}
+
 /// `gateway start` runs from wherever the user's cowshed happens to live — a nix store path, a
 /// global npm prefix, a build directory — and launchd has to keep working after that path is
-/// gone. The binary is copied onto the volume that carries the plist, and a second start reuses
-/// that copy rather than rewriting the file launchd is running.
+/// gone. The build is copied onto the volume that carries the plist under the name its digest
+/// gives it, the stable name the plist and the operator's PATH name becomes a link to that copy,
+/// and a second start reuses the copy rather than rewriting the file launchd is running.
 #[test]
-fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
+fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it() {
     let home = scratch_home("install");
     let source = home.join("build/cowshed");
     fs::create_dir_all(source.parent().expect("build directory")).expect("build directory");
@@ -366,14 +373,25 @@ fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
         executable.path(),
         home.join("Library/Application Support/dev.cowshed/bin/cowshed")
     );
-    let installed = fs::symlink_metadata(executable.path()).expect("installed binary");
-    assert!(installed.is_file());
-    assert_eq!(installed.permissions().mode() & 0o777, STABLE_BINARY_MODE);
+    let first = executable.stored(&digest_of(b"#!/bin/sh\nexit 0\n"));
     assert_eq!(
-        fs::read(executable.path()).expect("installed bytes"),
+        fs::read_link(executable.path()).expect("the stable name is a link"),
+        first.file_name().map(PathBuf::from).expect("a file name"),
+        "the stable name says which build it runs"
+    );
+    let stored = fs::symlink_metadata(&first).expect("stored copy");
+    assert!(stored.is_file());
+    assert_eq!(stored.permissions().mode() & 0o777, STABLE_BINARY_MODE);
+    assert_eq!(
+        fs::read(executable.path()).expect("installed bytes through the link"),
         b"#!/bin/sh\nexit 0\n"
     );
-    // The plist launchd reads names exactly this path.
+    assert_eq!(
+        fs::canonicalize(executable.path()).expect("resolves"),
+        fs::canonicalize(&first).expect("resolves"),
+        "what the daemon and the PATH entry run is the stored copy"
+    );
+    // The plist launchd reads names the stable name, which never changes with the build.
     let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
@@ -383,29 +401,34 @@ fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
             .expect("second install succeeds");
     assert_eq!(reinstalled.path(), executable.path());
     assert_eq!(
-        fs::symlink_metadata(executable.path())
-            .expect("installed binary")
-            .ino(),
-        installed.ino()
+        fs::symlink_metadata(&first).expect("stored copy").ino(),
+        stored.ino()
     );
 
-    // A newer build replaces it, and the replacement is a different file: launchd never sees a
-    // partially written binary at the path it runs.
+    // A newer build is a different file under a different name, and the stable name moves to it
+    // in one rename: launchd never sees a partially written binary or a missing name, and the
+    // build that is replaced is not rewritten under a process still running it.
     fs::write(&source, b"#!/bin/sh\nexit 1\n").expect("newer source binary");
     install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
         .expect("upgrade succeeds");
+    let second = executable.stored(&digest_of(b"#!/bin/sh\nexit 1\n"));
+    assert_ne!(first, second);
     assert_eq!(
         fs::read(executable.path()).expect("installed bytes"),
         b"#!/bin/sh\nexit 1\n"
     );
-    assert_ne!(
-        fs::symlink_metadata(executable.path())
-            .expect("installed binary")
-            .ino(),
-        installed.ino()
+    assert_eq!(
+        fs::read(&first).expect("the replaced copy"),
+        b"#!/bin/sh\nexit 0\n",
+        "the build it replaced is untouched"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&first).expect("stored copy").ino(),
+        stored.ino()
     );
 
-    // Installing the copy from itself is the steady state and touches nothing.
+    // Installing the stable name from itself is the steady state and touches nothing.
+    let before = fs::symlink_metadata(&second).expect("stored copy").ino();
     let same = install_host_stable_executable(
         &mut executor,
         &home,
@@ -414,6 +437,10 @@ fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
     )
     .expect("self install succeeds");
     assert_eq!(same.path(), executable.path());
+    assert_eq!(
+        fs::symlink_metadata(&second).expect("stored copy").ino(),
+        before
+    );
 
     fs::remove_dir_all(&home).expect("remove scratch home");
 }
@@ -441,13 +468,18 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
         fs::read(executable.path()).expect("installed bytes"),
         b"#!/bin/sh\nexit 0\n"
     );
+    let stored = executable.stored(&digest_of(b"#!/bin/sh\nexit 0\n"));
     assert_eq!(
-        fs::symlink_metadata(executable.path())
+        fs::symlink_metadata(&stored)
             .expect("installed metadata")
             .permissions()
             .mode()
             & 0o777,
         STABLE_BINARY_MODE
+    );
+    assert!(
+        !stored.starts_with(home.join(".cowshed")),
+        "nothing under the workspace is named"
     );
     let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
@@ -520,66 +552,74 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
     );
 }
 
-/// A failed activation must leave the host exactly as it was found. The retained hard link is what
-/// makes that possible: it keeps the old inode alive through the atomic rename that replaces the
-/// path, so the restore reads the exact bytes launchd was running rather than a re-copy.
+/// A failed activation must leave the host exactly as it was found. The previous build is kept as
+/// a stored copy under its digest — the plain binary the old layout left at the stable name
+/// included, stored whole before the stable name is replaced by a link — so the restore points
+/// the stable name at the exact bytes launchd was running rather than a re-copy.
 #[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_a_failed_activation_restores_the_binary_it_replaced() {
+fn a_failed_activation_restores_the_binary_it_replaced() {
     let home = scratch_home("rollback");
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("host-stable path");
     fs::create_dir_all(executable.directory()).expect("bin directory");
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
 
     // Nothing installed yet: there is nothing to retain and nothing to roll back to, which is a
     // first install rather than a regression.
     assert_eq!(
-        retain_previous_executable(&executable).expect("retain on an empty host"),
+        retain_previous_executable(&mut executor, &executable).expect("retain on an empty host"),
         None
     );
 
+    // The plain binary of the old layout is stored under its digest, and the stable name already
+    // runs that copy: the host is as it was, in the new layout.
     fs::write(executable.path(), b"the supervised release build\n").expect("installed binary");
-    let original = fs::symlink_metadata(executable.path())
-        .expect("installed")
-        .ino();
-    let retained = retain_previous_executable(&executable)
+    fs::set_permissions(
+        executable.path(),
+        fs::Permissions::from_mode(STABLE_BINARY_MODE),
+    )
+    .expect("mode");
+    let retained = retain_previous_executable(&mut executor, &executable)
         .expect("retain succeeds")
         .expect("an installed binary is retained");
-    // A hard link, not a copy: same inode, so retaining costs nothing whatever the binary's size.
     assert_eq!(
-        fs::symlink_metadata(&retained).expect("retained").ino(),
-        original
+        retained,
+        executable.stored(&digest_of(b"the supervised release build\n"))
+    );
+    assert_eq!(
+        fs::read(&retained).expect("retained bytes"),
+        b"the supervised release build\n"
     );
 
-    // The install replaces the path the way `plan_executable_install` does — a temporary beside it,
-    // then a rename — so the old inode survives only via the retained link. `write` in place would
-    // truncate the very bytes the link points at, which is exactly why the plan renames.
-    let temporary = executable.directory().join(".cowshed.incoming");
-    fs::write(&temporary, b"a debug build nobody asked for\n").expect("replacement");
-    fs::rename(&temporary, executable.path()).expect("atomic replacement");
-    assert_ne!(
-        fs::symlink_metadata(executable.path())
-            .expect("replaced")
-            .ino(),
-        original
+    // A link to a stored copy is retained as it is: the copy is already what a restore needs.
+    assert_eq!(
+        retain_previous_executable(&mut executor, &executable).expect("retain again"),
+        Some(retained.clone())
     );
 
-    restore_previous_executable(&executable, &retained);
+    // The install moves the stable name to another build; the restore moves it back.
+    let other = home.join("other-build");
+    fs::write(&other, b"a build whose agent will not load\n").expect("replacement");
+    install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &other)
+        .expect("install");
+    assert_eq!(
+        fs::read(executable.path()).expect("replaced bytes"),
+        b"a build whose agent will not load\n"
+    );
+
+    let sentence = restore_previous_executable(&executable, &retained);
+    assert!(
+        sentence.contains("this host is as it was found"),
+        "got {sentence}"
+    );
     assert_eq!(
         fs::read(executable.path()).expect("restored bytes"),
         b"the supervised release build\n"
     );
     assert_eq!(
-        fs::symlink_metadata(executable.path())
-            .expect("restored")
-            .ino(),
-        original,
-        "rollback restores the original inode, not a copy"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&retained).unwrap_err().kind(),
-        io::ErrorKind::NotFound,
-        "the retained link is consumed by the restore"
+        fs::canonicalize(executable.path()).expect("resolves"),
+        fs::canonicalize(&retained).expect("resolves"),
+        "rollback runs the original copy, not a re-copy"
     );
 
     // A rollback that cannot happen is reported, never silently swallowed: the caller's own
@@ -597,12 +637,52 @@ fn retention_inspection_failure_is_not_an_empty_host() {
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("host-stable path");
     let library = home.join("Library");
     fs::write(&library, b"not a directory").expect("blocked ancestor");
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
 
     assert_eq!(
         fs::symlink_metadata(executable.path()).unwrap_err().kind(),
         io::ErrorKind::NotADirectory
     );
-    retain_previous_executable(&executable).expect_err("inspection failure must abort retention");
+    retain_previous_executable(&mut executor, &executable)
+        .expect_err("inspection failure must abort retention");
     assert_eq!(fs::read(&library).unwrap(), b"not a directory");
+    fs::remove_dir_all(&home).unwrap();
+}
+
+/// Uninstall and `gateway stop --purge` remove everything an install leaves — the stable name,
+/// every stored copy, the build record beside each — and leave the directory and whatever else
+/// lives in it; a second removal finds nothing to remove.
+#[test]
+fn removing_the_installed_cowshed_takes_the_stable_name_every_copy_and_every_record() {
+    let home = scratch_home("remove-installed");
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let mut executable = None;
+    for build in [&b"first build\n"[..], b"second build\n"] {
+        let source = home.join("build");
+        fs::write(&source, build).expect("build");
+        executable = Some(
+            install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+                .expect("install"),
+        );
+    }
+    let executable = executable.expect("installed");
+    let first = executable.stored(&digest_of(b"first build\n"));
+    fs::write(format!("{}.build", first.display()), b"{}").expect("a build record");
+    let neighbour = executable.directory().join("sccache");
+    fs::write(&neighbour, b"another service's binary").expect("neighbour");
+
+    assert_eq!(
+        remove_host_stable_executable(&executable).expect("remove"),
+        RemovalOutcome::Removed
+    );
+    let left: Vec<_> = fs::read_dir(executable.directory())
+        .expect("directory")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(left, [OsString::from("sccache")]);
+    assert_eq!(
+        remove_host_stable_executable(&executable).expect("remove again"),
+        RemovalOutcome::AlreadyAbsent
+    );
     fs::remove_dir_all(&home).unwrap();
 }

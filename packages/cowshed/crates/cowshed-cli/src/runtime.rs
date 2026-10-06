@@ -183,6 +183,75 @@ enum RuntimeOpenMode {
     IdentityChange,
 }
 
+/// Whether the verb changes workspace or lifecycle state, or runs a job, through workspace
+/// supervisors — which only the host daemon starts, and which it starts only for a cowshed of
+/// its own build.
+///
+/// Exhaustive, so a verb added later is placed on purpose. The ones that answer `false` must keep
+/// working while the two disagree: `doctor` is how the disagreement is diagnosed, `setup` and
+/// `gateway` are what ends it, the rest read, or never reach a supervisor.
+fn needs_daemon_of_this_build(command: &Command) -> bool {
+    match command {
+        Command::Adopt(_)
+        | Command::New(_)
+        | Command::Fork(_)
+        | Command::Move(_)
+        | Command::Checkpoint(_)
+        | Command::Restore(_)
+        | Command::Path(_)
+        | Command::Exec(_)
+        | Command::Grant(_)
+        | Command::Remove(_)
+        | Command::Attach(_)
+        | Command::Detach(_)
+        | Command::Resize(_)
+        | Command::Defrag(_)
+        | Command::Reseed(_)
+        | Command::Rekey(_)
+        | Command::Gc(_)
+        | Command::Push(_)
+        | Command::Rebase(_)
+        | Command::Land(_) => true,
+        Command::List(_)
+        | Command::BuildState
+        | Command::Mount(_)
+        | Command::Setup(_)
+        | Command::Gateway(_)
+        | Command::Controller
+        | Command::Credential(_)
+        | Command::Identity(_)
+        | Command::Sccache(_)
+        | Command::Skill(_)
+        | Command::Version
+        | Command::Help(_)
+        | Command::Doctor(_) => false,
+    }
+}
+
+/// Refuse, before `command` changes anything, a host daemon that runs another build than this
+/// cowshed.
+///
+/// The daemon refuses another build's requests by name at the first supervisor a verb asks for.
+/// By then a removal has stopped its workspace's supervisor and journaled its intent, and the
+/// refusal arrives again on the path that would put that back — "state restoration also failed",
+/// a workspace half removed. Asking first leaves the host as it was, with the refusal that names
+/// `cowshed setup`.
+pub async fn require_daemon_of_this_build(command: &Command) -> Result<()> {
+    require_daemon_of_this_build_at(
+        Path::new(cowshed_core::storage::bootstrap::STORE_ROOT),
+        command,
+    )
+    .await
+}
+
+async fn require_daemon_of_this_build_at(store_root: &Path, command: &Command) -> Result<()> {
+    if needs_daemon_of_this_build(command) {
+        cowshed_core::runtime::supervisor_manager::require_same_build(store_root).await
+    } else {
+        Ok(())
+    }
+}
+
 fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
     match command {
         Command::Adopt(_) => RuntimeOpenMode::Provision,
@@ -3787,7 +3856,7 @@ fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
                 stale.daemon_sha256.as_deref().unwrap_or("unreported"),
                 stale.cli_sha256
             ),
-            hint: "cowshed gateway stop --purge && cowshed gateway start".into(),
+            hint: "cowshed setup".into(),
             path: Some(status.socket.clone()),
         });
     }
@@ -4484,6 +4553,158 @@ mod tests {
     use cowshed_core::storage::bootstrap::VolumeOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// The defect: a daemon of another build refused `cowshed rm`'s supervisor ensure *after* the
+    /// removal had stopped the workspace's supervisor and journaled its intent, and the path that
+    /// would put that back was refused too — "state restoration also failed", a workspace half
+    /// removed. The verbs that change state or run a job are asked about the daemon's build before
+    /// they begin; the ones that diagnose or repair must keep working under the disagreement.
+    #[test]
+    fn only_verbs_that_change_state_or_run_jobs_ask_the_daemon_for_its_build() {
+        let needs = |argv: &[&str]| {
+            let cli = crate::args::parse_args(argv.iter().copied()).expect("a valid command line");
+            needs_daemon_of_this_build(&cli.command)
+        };
+        for argv in [
+            &["rm", "raven"][..],
+            &["rm", "raven", "--force"],
+            &["exec", "raven", "--", "true"],
+            &["new", "raven"],
+            &["fork", "raven", "crow"],
+            &["mv", "raven", "crow"],
+            &["checkpoint", "raven", "before"],
+            &["restore", "raven", "before"],
+            &["path", "raven"],
+            &["attach", "raven"],
+            &["detach", "raven"],
+            &["resize", "raven", "200g"],
+            &["land", "raven", "--target", "main"],
+            &["rebase", "raven"],
+            &["push", "raven", "--branch", "review"],
+            &["gc"],
+        ] {
+            assert!(needs(argv), "{argv:?} changes state through the daemon");
+        }
+        for argv in [
+            &["doctor"][..],
+            &["doctor", "--repair"],
+            &["ls"],
+            &["ls", "--all"],
+            &["setup"],
+            &["setup", "--downgrade"],
+            &["gateway", "status"],
+            &["gateway", "start"],
+            &["build-state"],
+            &["sccache", "status"],
+            &["skill", "install"],
+        ] {
+            assert!(!needs(argv), "{argv:?} must work while the builds disagree");
+        }
+    }
+
+    /// A manager that answers every call with the refusal a daemon of another build gives, and
+    /// reports what it was asked.
+    fn manager_of_another_build(
+        store: &Path,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let run = store.join("run");
+        fs::create_dir_all(&run).expect("run directory");
+        let listener = tokio::net::UnixListener::bind(run.join("manager.sock")).expect("bind");
+        let refusal = CowshedError::other_build(cowshed_core::OtherBuild {
+            daemon: serde_json::from_value(serde_json::json!("daemon-build")).unwrap(),
+            caller: Some(serde_json::from_value(serde_json::json!("this-build")).unwrap()),
+        });
+        let answer = serde_json::to_vec(&serde_json::json!({ "refused": refusal })).unwrap();
+        let (asked, questions) = tokio::sync::mpsc::unbounded_channel();
+        let served = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut length = [0_u8; 4];
+                stream.read_exact(&mut length).await.expect("a length");
+                let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut request).await.expect("a request");
+                asked
+                    .send(String::from_utf8(request).expect("a JSON request"))
+                    .expect("the test listens");
+                stream
+                    .write_all(&(answer.len() as u32).to_be_bytes())
+                    .await
+                    .expect("answer length");
+                stream.write_all(&answer).await.expect("answer");
+            }
+        });
+        (served, questions)
+    }
+
+    /// The refusal arrives before the verb does anything — it is the answer to the first thing
+    /// asked — and names the install that ends the disagreement. A verb that diagnoses never asks.
+    #[tokio::test]
+    async fn a_removal_is_refused_up_front_by_a_daemon_of_another_build_naming_setup() {
+        let store = std::env::temp_dir().join(format!("cs-gate-{}", std::process::id()));
+        let (served, mut asked) = manager_of_another_build(&store);
+        let remove = crate::args::parse_args(["rm", "raven"]).unwrap().command;
+        let doctor = crate::args::parse_args(["doctor"]).unwrap().command;
+        let setup = crate::args::parse_args(["setup"]).unwrap().command;
+
+        require_daemon_of_this_build_at(&store, &doctor)
+            .await
+            .expect("doctor diagnoses the disagreement");
+        require_daemon_of_this_build_at(&store, &setup)
+            .await
+            .expect("setup ends the disagreement");
+        assert!(
+            asked.try_recv().is_err(),
+            "a verb that diagnoses or repairs does not ask the daemon anything"
+        );
+
+        let error = require_daemon_of_this_build_at(&store, &remove)
+            .await
+            .expect_err("a daemon of another build refuses the removal before it begins");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.other_build_source().is_some(), "{error:?}");
+        assert!(
+            error
+                .message
+                .contains("the cowshed daemon is build daemon-build")
+                && error.message.contains("this cowshed is build this-build"),
+            "{}",
+            error.message
+        );
+        assert!(error.hint.contains("`cowshed setup`"), "{}", error.hint);
+        let first = asked.try_recv().expect("the build check was asked");
+        assert!(
+            first.contains(r#""verb":"sameBuild""#),
+            "the first thing asked is the build check: {first}"
+        );
+        assert!(asked.try_recv().is_err(), "and nothing after it, no ensure");
+
+        served.abort();
+        fs::remove_dir_all(&store).ok();
+    }
+
+    /// With no daemon answering there is nothing to disagree: the verbs that need one report that
+    /// themselves, and `adopt` on a fresh host must not be refused for a daemon that is not there.
+    #[tokio::test]
+    async fn no_daemon_is_no_disagreement() {
+        let store = std::env::temp_dir().join(format!("cs-none-{}", std::process::id()));
+        fs::create_dir_all(store.join("run")).expect("run directory");
+        for argv in [
+            &["rm", "raven"][..],
+            &["adopt"],
+            &["exec", "raven", "--", "true"],
+        ] {
+            let command = crate::args::parse_args(argv.iter().copied())
+                .unwrap()
+                .command;
+            require_daemon_of_this_build_at(&store, &command)
+                .await
+                .expect("nothing answers the manager socket");
+        }
+        fs::remove_dir_all(&store).ok();
+    }
 
     /// `cowshed exec`'s foreground relay against a real controller connection, whose router
     /// answers for one scripted job.
@@ -5598,10 +5819,7 @@ mod tests {
             .find(|finding| finding.code == "gateway-stale-binary")
             .expect("stale binary finding");
         assert_eq!(stale.severity, FindingSeverity::Warning);
-        assert_eq!(
-            stale.hint,
-            "cowshed gateway stop --purge && cowshed gateway start"
-        );
+        assert_eq!(stale.hint, "cowshed setup");
         assert!(stale.message.contains("13f1eec0") && stale.message.contains("b4223cd0"));
     }
 

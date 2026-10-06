@@ -197,12 +197,23 @@ async fn read_start_report(report: io::PipeReader) -> Option<CowshedError> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// One call to the manager. Every call names the caller's build first, and the manager refuses
+/// another build's by name before it reads the rest ([`same_build`]); the verb says what the
+/// caller asks once the builds agree.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EnsureRequest {
-    build: BuildId,
-    project_root: PathBuf,
-    authority: AuthorityWire,
+#[serde(tag = "verb", rename_all = "camelCase", deny_unknown_fields)]
+enum ManagerRequest {
+    /// The supervisor serving a workspace, started if nothing serves it.
+    Ensure {
+        build: BuildId,
+        #[serde(rename = "projectRoot")]
+        project_root: PathBuf,
+        authority: AuthorityWire,
+    },
+    /// Nothing but whether the manager runs the caller's build: what a verb asks before it
+    /// changes anything, so a build the manager would refuse is refused up front rather than
+    /// after the verb's first step ([`require_same_build`]).
+    SameBuild { build: BuildId },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -213,6 +224,8 @@ enum EnsureResponse {
         pid: u32,
         authority: AuthorityWire,
     },
+    /// The answer to [`ManagerRequest::SameBuild`] from the manager's own build.
+    SameBuild,
     Refused(CowshedError),
 }
 
@@ -925,22 +938,27 @@ pub async fn serve(
 async fn serve_ensure(mut stream: UnixStream, manager: &SupervisorManager) -> Result<()> {
     verify_peer(&stream)?;
     let request: serde_json::Value = read_json(&mut stream).await?;
-    let ensured = async {
+    let answered = async {
         same_build(&request)?;
-        let request: EnsureRequest = serde_json::from_value(request)
-            .map_err(|error| protocol_error(format!("malformed ensure: {error}")))?;
-        manager
-            .ensure(&request.project_root, &request.authority.into())
-            .await
+        let request: ManagerRequest = serde_json::from_value(request)
+            .map_err(|error| protocol_error(format!("malformed request: {error}")))?;
+        match request {
+            ManagerRequest::Ensure {
+                project_root,
+                authority,
+                ..
+            } => {
+                let ensured = manager.ensure(&project_root, &authority.into()).await?;
+                Ok(EnsureResponse::Serving {
+                    socket: ensured.socket,
+                    pid: ensured.pid,
+                    authority: (&ensured.authority).into(),
+                })
+            }
+            ManagerRequest::SameBuild { .. } => Ok(EnsureResponse::SameBuild),
+        }
     };
-    let response = match ensured.await {
-        Ok(ensured) => EnsureResponse::Serving {
-            socket: ensured.socket,
-            pid: ensured.pid,
-            authority: (&ensured.authority).into(),
-        },
-        Err(error) => EnsureResponse::Refused(error),
-    };
+    let response = answered.await.unwrap_or_else(EnsureResponse::Refused);
     write_json(&mut stream, &response).await
 }
 
@@ -978,7 +996,7 @@ pub async fn ensure(
     })?;
     write_json(
         &mut stream,
-        &EnsureRequest {
+        &ManagerRequest::Ensure {
             build: BuildId::current()?.clone(),
             project_root: project_root.to_path_buf(),
             authority: authority.into(),
@@ -1002,6 +1020,48 @@ pub async fn ensure(
             authority: authority.into(),
         }),
         EnsureResponse::Refused(error) => Err(error),
+        EnsureResponse::SameBuild => Err(protocol_error(
+            "the supervisor manager answered an ensure with a build check",
+        )),
+    }
+}
+
+/// How long the manager may take to answer a build check: it answers before it does anything
+/// else, so a manager that takes longer is not serving.
+const SAME_BUILD_BOUND: Duration = Duration::from_secs(10);
+
+/// Refuse, before a verb changes anything, a manager that runs another build than this one.
+///
+/// Every call a verb makes to a workspace's supervisor goes through the manager, which refuses
+/// another build's by name ([`same_build`]). A verb that learns this at its first such call has
+/// already done what came before it — a removal has taken its workspace's supervisor down and
+/// marked its intent — and the refusal then arrives again where it would put that state back. So
+/// the verb asks first. The error is the manager's own refusal, both builds as data
+/// ([`OtherBuild`]), whose hint names the install that ends the disagreement.
+///
+/// No manager answering is not a disagreement: there is no other build to refuse this one, and
+/// the verbs that need a daemon say so themselves.
+pub async fn require_same_build(store_root: &Path) -> Result<()> {
+    let path = manager_socket_path(store_root);
+    let Ok(mut stream) = UnixStream::connect(&path).await else {
+        return Ok(());
+    };
+    write_json(
+        &mut stream,
+        &ManagerRequest::SameBuild {
+            build: BuildId::current()?.clone(),
+        },
+    )
+    .await?;
+    let response: EnsureResponse = tokio::time::timeout(SAME_BUILD_BOUND, read_json(&mut stream))
+        .await
+        .map_err(|_| protocol_error("the supervisor manager did not answer a build check"))??;
+    match response {
+        EnsureResponse::SameBuild => Ok(()),
+        EnsureResponse::Refused(error) => Err(error),
+        EnsureResponse::Serving { .. } => Err(protocol_error(
+            "the supervisor manager answered a build check with a supervisor",
+        )),
     }
 }
 
@@ -1119,6 +1179,58 @@ mod tests {
                 caller: Some(serde_json::from_value(serde_json::json!("another build")).unwrap()),
             })
         );
+        served.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// A verb asks the manager whether it runs this build before it changes anything: the
+    /// manager's own build is answered, another build's is refused with both builds as data and a
+    /// hint that names the install, and no manager at all is no disagreement.
+    #[tokio::test]
+    async fn a_build_check_is_answered_for_this_build_and_refused_for_another() {
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-check-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        require_same_build(&store)
+            .await
+            .expect("nothing answers, so nothing disagrees");
+
+        let socket = manager_socket_path(&store);
+        let listener = supervisor_socket::bind(&socket)
+            .await
+            .expect("bind the manager");
+        let served = tokio::spawn(serve(
+            listener,
+            SupervisorManager::new(&store, Box::new(NoSpawner), healed()),
+        ));
+        require_same_build(&store)
+            .await
+            .expect("the manager runs this build");
+
+        let mut stream = UnixStream::connect(&socket)
+            .await
+            .expect("reach the manager");
+        write_json(
+            &mut stream,
+            &serde_json::json!({"verb": "sameBuild", "build": "another build"}),
+        )
+        .await
+        .expect("ask");
+        let response: EnsureResponse = read_json(&mut stream).await.expect("answer");
+        let EnsureResponse::Refused(error) = response else {
+            panic!("a build check from another build must be refused");
+        };
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.other_build_source(),
+            Some(&OtherBuild {
+                daemon: BuildId::current().expect("this build").clone(),
+                caller: Some(serde_json::from_value(serde_json::json!("another build")).unwrap()),
+            })
+        );
+        assert!(error.hint.contains("cowshed setup"), "{}", error.hint);
         served.abort();
         std::fs::remove_dir_all(store).expect("cleanup");
     }

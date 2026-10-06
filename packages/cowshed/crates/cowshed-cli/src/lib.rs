@@ -1,4 +1,5 @@
 pub mod args;
+pub mod build_record;
 pub mod build_state;
 pub mod capabilities;
 pub mod controller_service;
@@ -9,6 +10,7 @@ pub mod identity_service;
 pub mod launchd;
 pub mod mount_main;
 pub mod output;
+pub mod path_entry;
 pub mod probe;
 pub mod rekey;
 pub mod resident;

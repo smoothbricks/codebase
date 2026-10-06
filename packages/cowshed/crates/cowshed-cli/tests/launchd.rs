@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
-    ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
+    ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE,
     LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
     PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle,
-    StoreBackedProgram, plan_executable_install, plan_install, plan_remove,
+    StableLink, StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
+    plan_remove, replace_symlink,
 };
 use cowshed_core::metadata::ImageCapacity;
 
@@ -459,6 +460,11 @@ enum FilesystemEvent {
         source: PathBuf,
         mode: u32,
     },
+    CreateSymlink {
+        directory: PathBuf,
+        name_prefix: String,
+        target: PathBuf,
+    },
     SyncFile(PathBuf),
     Rename(PathBuf, PathBuf),
     Remove(PathBuf),
@@ -533,6 +539,21 @@ impl LaunchdFilesystem for FakeFilesystem {
             mode,
         });
         self.result(FilesystemOperation::CopyTemporaryFile)?;
+        Ok(directory.join(".exclusive-no-follow-temp"))
+    }
+
+    fn symlink_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        target: &Path,
+    ) -> io::Result<PathBuf> {
+        self.events.push(FilesystemEvent::CreateSymlink {
+            directory: directory.to_path_buf(),
+            name_prefix: name_prefix.to_owned(),
+            target: target.to_path_buf(),
+        });
+        self.result(FilesystemOperation::CreateTemporarySymlink)?;
         Ok(directory.join(".exclusive-no-follow-temp"))
     }
 
@@ -1042,17 +1063,53 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     }
 }
 
-/// A host without the copy gets one, and a host that already has it is left alone: the source is
-/// tens of megabytes, and every `start` would otherwise rewrite the binary launchd is running.
+/// The digest of the build installed in the plans below: what names its stored copy.
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn digest() -> ExecutableDigest {
+    ExecutableDigest::parse(DIGEST).expect("a sha-256 digest")
+}
+
+/// What the stable name says when it runs [`DIGEST`]'s stored copy.
+fn stored_name() -> PathBuf {
+    PathBuf::from(format!("cowshed-{DIGEST}"))
+}
+
+fn stored_path() -> PathBuf {
+    PathBuf::from(BINARY_DIRECTORY).join(stored_name())
+}
+
+/// A host that already runs the build: copy and link both current, directories private.
+fn current_install() -> ExecutableInstallState {
+    ExecutableInstallState {
+        support_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
+        binary_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
+        stored: Some(InstalledExecutable {
+            mode: STABLE_BINARY_MODE,
+            matches_source: true,
+        }),
+        link: StableLink::To(stored_name()),
+    }
+}
+
+/// A copy of the build is stored once under the name its bytes give it, and the stable name moves
+/// to it in one rename: the daemon and the `cowshed` on PATH, both reaching the stable name, change
+/// together and only here. A host that already runs the build is left alone, because the source is
+/// tens of megabytes and every `start` would otherwise rewrite the binary launchd is running.
 #[test]
-fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
+fn stable_binary_install_plan_stores_a_copy_and_moves_the_stable_name_to_it() {
     let executable = cowshed_binary();
     let source = Path::new("/nix/store/abc-cowshed/bin/cowshed");
     let binary_directory = PathBuf::from(BINARY_DIRECTORY);
 
     assert_eq!(
-        plan_executable_install(&executable, source, ExecutableInstallState::default())
-            .operations(),
+        plan_executable_install(
+            &executable,
+            &digest(),
+            source,
+            &ExecutableInstallState::default()
+        )
+        .operations(),
         [
             Mutation::EnsureDirectory {
                 path: PathBuf::from(SUPPORT_DIRECTORY),
@@ -1070,6 +1127,14 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
             },
             Mutation::SyncTemporaryFile,
             Mutation::RenameTemporaryFile {
+                destination: stored_path(),
+            },
+            Mutation::CreateTemporarySymlink {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed.link.".into(),
+                target: stored_name(),
+            },
+            Mutation::RenameTemporaryFile {
                 destination: PathBuf::from(EXECUTABLE),
             },
             Mutation::SyncDirectory {
@@ -1078,18 +1143,15 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
         ]
     );
 
-    let current = ExecutableInstallState {
-        support_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
-        binary_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
-        installed: Some(InstalledExecutable {
-            mode: STABLE_BINARY_MODE,
-            matches_source: true,
-        }),
-    };
-    assert!(plan_executable_install(&executable, source, current).is_noop());
+    assert!(
+        current_install().is_current(&executable, &digest()),
+        "the build is installed when its copy is current and the stable name names it"
+    );
+    assert!(plan_executable_install(&executable, &digest(), source, &current_install()).is_noop());
 
-    // A newer build at the source, and an installed copy that lost its exec bit, both reinstall.
-    for installed in [
+    // A copy whose bytes differ from the source, or that lost its exec bit, is written again — and
+    // the stable name, which already names it, is not touched.
+    for stored in [
         InstalledExecutable {
             mode: STABLE_BINARY_MODE,
             matches_source: false,
@@ -1101,10 +1163,11 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
     ] {
         let plan = plan_executable_install(
             &executable,
+            &digest(),
             source,
-            ExecutableInstallState {
-                installed: Some(installed),
-                ..current
+            &ExecutableInstallState {
+                stored: Some(stored),
+                ..current_install()
             },
         );
         assert!(matches!(
@@ -1121,14 +1184,52 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
         ));
     }
 
+    // The stable name moves to the build from whatever it was — another build's copy, the plain
+    // binary an install from before copies were content-addressed left there, or nothing — without
+    // copying a build that is already stored.
+    for link in [
+        StableLink::To(PathBuf::from(
+            "cowshed-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )),
+        StableLink::Foreign,
+        StableLink::Absent,
+    ] {
+        assert_eq!(
+            plan_executable_install(
+                &executable,
+                &digest(),
+                source,
+                &ExecutableInstallState {
+                    link,
+                    ..current_install()
+                },
+            )
+            .operations(),
+            [
+                Mutation::CreateTemporarySymlink {
+                    directory: binary_directory.clone(),
+                    name_prefix: ".cowshed.link.".into(),
+                    target: stored_name(),
+                },
+                Mutation::RenameTemporaryFile {
+                    destination: PathBuf::from(EXECUTABLE),
+                },
+                Mutation::SyncDirectory {
+                    path: binary_directory.clone(),
+                },
+            ]
+        );
+    }
+
     // A world-readable directory is tightened without recopying a current binary.
     assert_eq!(
         plan_executable_install(
             &executable,
+            &digest(),
             source,
-            ExecutableInstallState {
+            &ExecutableInstallState {
                 binary_directory_mode: Some(0o755),
-                ..current
+                ..current_install()
             },
         )
         .operations(),
@@ -1144,13 +1245,58 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
     );
 }
 
-/// Binary installs ride the same temporary-file discipline as plists: launchd polls a KeepAlive
-/// service hard enough that it must never observe a half-written binary at the path it runs.
+/// A stored copy's name can only be a digest, so no string — a traversal, an uppercase twin of a
+/// copy already stored — becomes part of a path under the host-stable directory, and the files a
+/// prune or an uninstall enumerates are exactly the copies.
 #[test]
-fn executor_publishes_a_binary_copy_through_a_temporary_file() {
+fn only_a_digest_names_a_stored_copy() {
+    let executable = cowshed_binary();
+
+    assert_eq!(ExecutableDigest::parse(DIGEST), Some(digest()));
+    for refused in [
+        "",
+        "0123",
+        "../../../../../../../../../../../../../../../../../../../../../../../etc/passwd0",
+        &DIGEST.to_uppercase(),
+        &format!("{}g", &DIGEST[1..]),
+    ] {
+        assert_eq!(ExecutableDigest::parse(refused), None, "{refused}");
+    }
+
+    assert_eq!(executable.stored(&digest()), stored_path());
+    assert_eq!(
+        executable.stored_digest(stored_name().as_os_str()),
+        Some(digest())
+    );
+    for other in [
+        "cowshed".to_owned(),
+        "cowshed.previous".to_owned(),
+        format!("cowshed-{DIGEST}.build"),
+        format!("sccache-{DIGEST}"),
+        format!(".cowshed.{DIGEST}"),
+        format!("cowshed-{}", DIGEST.to_uppercase()),
+    ] {
+        assert_eq!(
+            executable.stored_digest(std::ffi::OsStr::new(&other)),
+            None,
+            "{other}"
+        );
+    }
+}
+
+/// Binary installs ride the same temporary-file discipline as plists: launchd polls a KeepAlive
+/// service hard enough that it must never observe a half-written binary, or a missing name, at
+/// the path it runs. The copy and the link are each made under a temporary name and renamed.
+#[test]
+fn executor_publishes_the_copy_and_then_the_link_through_temporary_files() {
     let executable = cowshed_binary();
     let source = PathBuf::from("/nix/store/abc-cowshed/bin/cowshed");
-    let plan = plan_executable_install(&executable, &source, ExecutableInstallState::default());
+    let plan = plan_executable_install(
+        &executable,
+        &digest(),
+        &source,
+        &ExecutableInstallState::default(),
+    );
     let binary_directory = PathBuf::from(BINARY_DIRECTORY);
     let temporary = binary_directory.join(".exclusive-no-follow-temp");
 
@@ -1176,6 +1322,12 @@ fn executor_publishes_a_binary_copy_through_a_temporary_file() {
                 mode: STABLE_BINARY_MODE,
             },
             FilesystemEvent::SyncFile(temporary.clone()),
+            FilesystemEvent::Rename(temporary.clone(), stored_path()),
+            FilesystemEvent::CreateSymlink {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed.link.".into(),
+                target: stored_name(),
+            },
             FilesystemEvent::Rename(temporary.clone(), PathBuf::from(EXECUTABLE)),
             FilesystemEvent::SyncDirectory(binary_directory),
         ]
@@ -1188,6 +1340,26 @@ fn executor_publishes_a_binary_copy_through_a_temporary_file() {
     let error = executor.execute_install(&plan).unwrap_err();
     assert_eq!(error.operation(), FilesystemOperation::CopyTemporaryFile);
 
+    // A link that cannot be made leaves the stable name on the build it ran, and the copy it
+    // already stored is harmless: nothing names it.
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::failing(FilesystemOperation::CreateTemporarySymlink),
+        FakeCommand::default(),
+    );
+    let error = executor.execute_install(&plan).unwrap_err();
+    assert_eq!(
+        error.operation(),
+        FilesystemOperation::CreateTemporarySymlink
+    );
+    let (filesystem, _) = executor.into_parts();
+    assert!(
+        !filesystem.events.contains(&FilesystemEvent::Rename(
+            temporary.clone(),
+            PathBuf::from(EXECUTABLE)
+        )),
+        "the stable name is not renamed when its link was never made"
+    );
+
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::failing(FilesystemOperation::RenameTemporaryFile),
         FakeCommand::default(),
@@ -1199,6 +1371,64 @@ fn executor_publishes_a_binary_copy_through_a_temporary_file() {
         filesystem.events.last(),
         Some(&FilesystemEvent::Remove(temporary))
     );
+}
+
+/// The same discipline on the real filesystem: the stable name is replaced by a rename, so a
+/// reader meets the old build or the new one and never an absence, and what it replaces may be a
+/// link or the plain binary an older install left there.
+#[test]
+fn replacing_the_stable_name_is_one_rename_over_a_link_or_a_plain_binary() {
+    let directory = std::env::temp_dir().join(format!(
+        "cowshed-replace-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let stable = directory.join("cowshed");
+    fs::write(&stable, b"the plain binary an older install left").unwrap();
+
+    replace_symlink(Path::new("cowshed-first"), &stable).unwrap();
+    assert_eq!(fs::read_link(&stable).unwrap(), Path::new("cowshed-first"));
+    replace_symlink(Path::new("cowshed-second"), &stable).unwrap();
+    assert_eq!(fs::read_link(&stable).unwrap(), Path::new("cowshed-second"));
+    let left: Vec<_> = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        left,
+        [std::ffi::OsString::from("cowshed")],
+        "no temporary link is left"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+/// An uninstall removes the stable name before the copies it names, so nothing launchd could
+/// start dangles; a host with nothing installed plans nothing, which is what makes the second
+/// uninstall a no-op.
+#[test]
+fn executable_removal_removes_the_named_files_in_order_and_nothing_when_none() {
+    let executable = cowshed_binary();
+    let present = [PathBuf::from(EXECUTABLE), stored_path()];
+
+    assert_eq!(
+        plan_executable_remove(&executable, &present).operations(),
+        [
+            Mutation::RemoveFile {
+                path: PathBuf::from(EXECUTABLE),
+            },
+            Mutation::RemoveFile {
+                path: stored_path(),
+            },
+            Mutation::SyncDirectory {
+                path: PathBuf::from(BINARY_DIRECTORY),
+            },
+        ]
+    );
+    assert!(plan_executable_remove(&executable, &[]).is_noop());
 }
 
 fn scratch(label: &str) -> PathBuf {

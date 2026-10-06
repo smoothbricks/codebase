@@ -248,11 +248,11 @@ shared store is serving nothing, and the 0% is the consequence rather than the f
 resolved configuration without starting a server, so this is safe to run against a live host.
 
 The fix is `cowshed setup`, which writes and owns the `[cache.disk]` table in sccache's own config file (see
-[cli.md](cli.md#cowshed-setup---uninstall---force---mount-root-dir)). Run it and look at the line it prints about that
-file. If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to overwrite
-it; the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or delete
-the `[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
-deliberately is not cowshed's to move.
+[cli.md](cli.md#cowshed-setup---uninstall---force---mount-root-dir---downgrade)). Run it and look at the line it prints
+about that file. If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to
+overwrite it; the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or
+delete the `[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody
+chose deliberately is not cowshed's to move.
 
 Two symptoms of the same cause worth recognising. **Orphaned stores**: every directory that was ever a wrong destination
 keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in the directories its config
@@ -306,9 +306,16 @@ admits a supervisor or job. No state should accept both tokens; `cowshed doctor`
 Workspace supervisors are processes the cowshed daemon starts and keeps, through its supervisor manager at
 `/private/cowshed/store/run/manager.sock`; a command that runs work in a workspace asks it for the workspace's
 supervisor. `cowshed gateway status` shows whether the daemon runs, and `cowshed gateway start` installs and starts it.
-A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/daemon-stderr.log`. A refusal naming two
-cowshed builds means the daemon and the `cowshed` you ran are different binaries: run `cowshed gateway start` from the
-one you mean to use.
+A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/daemon-stderr.log`.
+
+## A command says "the cowshed daemon is build X; this cowshed is build Y"
+
+The daemon and the `cowshed` you ran are different builds. Every command that would change a workspace or run work in
+one asks the daemon first and stops before it changes anything, so nothing was half done. Run `cowshed setup` from the
+cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on your `PATH`. To install a
+checkout's build, run its own `packages/cowshed/bin/cowshed setup`; a plain `cowshed setup` runs the installed copy and
+installs nothing new. A `cowshed` on `PATH` that is a link into a checkout runs whatever that checkout last built, which
+is how the two drift apart; setup repoints such a link at the installed copy.
 
 ## `cowshed exec` says a workspace supervisor is another cowshed build
 

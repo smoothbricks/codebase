@@ -25,11 +25,12 @@ use crate::capabilities::sccache::service::{
     derived_capacity, remove_stale_socket, sccache_launch_agent, start_service,
 };
 use crate::gateway_service::{
-    ServiceBinaryRefresh, canonical_home, gateway_launch_agent, output_error,
-    remove_host_stable_executable, remove_launch_agent,
+    CliInstall, Downgrade, ServiceBinaryRefresh, canonical_home, gateway_launch_agent,
+    output_error, remove_host_stable_executable, remove_launch_agent, remove_path_entries,
 };
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
+use crate::path_entry::PathEntryOutcome;
 use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
 use cowshed_core::AdoptedProject;
@@ -129,6 +130,7 @@ pub struct ProjectBuildState {
 struct RepairReadiness<'a> {
     mains: Option<&'a MainMounts>,
     services: &'a [ServiceBinaryRefresh],
+    cli: Option<&'a CliInstall>,
     build_state: &'a [ProjectBuildState],
 }
 
@@ -307,17 +309,27 @@ pub trait HostSetup: Send {
     async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
         Ok(Vec::new())
     }
+    /// Install the invoking build as the `cowshed` the operator's shell runs, and point the shell's
+    /// entry at it (05_gateway.md "The installed cowshed").
+    ///
+    /// `None` for a test host that models only the volume flows; the native host answers always.
+    async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
+        Ok(None)
+    }
 }
 
 /// The real host, rooted at the canonical home every other host verb resolves.
 pub struct NativeHostSetup {
     home: PathBuf,
+    /// Whether this run may install a build older than the installed cowshed.
+    downgrade: Downgrade,
 }
 
 impl NativeHostSetup {
-    pub fn for_canonical_home() -> Result<Self> {
+    pub fn for_canonical_home(downgrade: Downgrade) -> Result<Self> {
         Ok(Self {
             home: canonical_home()?,
+            downgrade,
         })
     }
 }
@@ -341,9 +353,17 @@ impl HostSetup for NativeHostSetup {
     }
 
     async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
-        Ok(crate::gateway_service::refresh_gateway_binary(&self.home)?
-            .into_iter()
-            .collect())
+        Ok(
+            crate::gateway_service::refresh_gateway_binary(&self.home, self.downgrade)
+                .await?
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        crate::gateway_service::install_cli(&self.home, self.downgrade, &path).map(Some)
     }
 
     /// Count what the store holds, or say why it could not be counted.
@@ -518,6 +538,10 @@ impl HostSetup for NativeHostSetup {
                 remove_launch_agent(&sccache_agent)?,
             ),
             HostArtifactRemoval::new(
+                "cowshed on PATH",
+                remove_path_entries(gateway_binary.path())?,
+            ),
+            HostArtifactRemoval::new(
                 "installed cowshed binary",
                 remove_host_stable_executable(&gateway_binary)?,
             ),
@@ -601,7 +625,7 @@ impl HostSetup for NativeHostSetup {
                 })?;
         // Restarted whatever the moves did: a writer left stopped is a host setup broke.
         if gateway {
-            crate::gateway_service::start_after_host_move().await?;
+            crate::gateway_service::start_after_host_move(self.downgrade).await?;
         }
         if sccache_running {
             start_service(None).await?;
@@ -752,7 +776,11 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let mut host = NativeHostSetup::for_canonical_home()?;
+    let mut host = NativeHostSetup::for_canonical_home(if args.downgrade {
+        Downgrade::Allow
+    } else {
+        Downgrade::Refuse
+    })?;
     dispatch(&mut host, args, json, output).await
 }
 
@@ -887,6 +915,11 @@ where
         Some(_) => Vec::new(),
         None => setup.refresh_host_services().await?,
     };
+    // The same bytes the gateway runs, reachable as the `cowshed` the operator types.
+    let cli = match &failure {
+        Some(_) => None,
+        None => setup.install_cli().await?,
+    };
     let build_state = match &failure {
         Some(_) => Vec::new(),
         None => {
@@ -907,10 +940,14 @@ where
             results
         }
     };
-    let build_failure = build_state_failure(&build_state);
+    // A refused downgrade is a failure of the run exactly as a refusing project is: everything
+    // else was repaired, and the install the caller ran this for was not done.
+    let build_failure =
+        build_state_failure(&build_state).or_else(|| downgrade_failure(&services, cli.as_ref()));
     let readiness = RepairReadiness {
         mains: mains.as_ref(),
         services: &services,
+        cli: cli.as_ref(),
         build_state: &build_state,
     };
     // Opt-in, and last: sccache's daemon listens in the store volume, so building and starting it
@@ -1495,6 +1532,11 @@ fn render_repair<W: Write, E: Write>(
             } => Some(format!(
                 "{service} still runs its installed binary: {reason}"
             )),
+            ServiceBinaryRefresh::Downgrade {
+                service, reason, ..
+            } => Some(format!(
+                "{service} still runs its installed binary: {reason}"
+            )),
             // Its remedy is a hint below the status line, where every other next step lives.
             ServiceBinaryRefresh::Stale { .. } => None,
         };
@@ -1502,20 +1544,153 @@ fn render_repair<W: Write, E: Write>(
             output.guidance(&line).map_err(output_error)?;
         }
     }
+    emit_cli_install(readiness, output)?;
     emit_build_state(readiness.build_state, output)?;
     output
         .guidance(&repair_status(plan, report, readiness))
         .map_err(output_error)?;
-    for refresh in readiness.services {
-        match refresh {
+    let mut hinted: Vec<&str> = Vec::new();
+    let cli_hints = readiness.cli.map(cli_hints).unwrap_or_default();
+    for remedy in readiness
+        .services
+        .iter()
+        .filter_map(|refresh| match refresh {
             ServiceBinaryRefresh::Stale { remedy, .. }
-            | ServiceBinaryRefresh::Refused { remedy, .. } => {
-                output.hint(remedy).map_err(output_error)?;
-            }
-            ServiceBinaryRefresh::Refreshed { .. } => {}
+            | ServiceBinaryRefresh::Refused { remedy, .. }
+            | ServiceBinaryRefresh::Downgrade { remedy, .. } => Some(remedy.as_str()),
+            ServiceBinaryRefresh::Refreshed { .. } => None,
+        })
+        .chain(cli_hints.iter().map(String::as_str))
+    {
+        // The gateway row and the CLI row of one refusal name the same remedy: say it once.
+        if !hinted.contains(&remedy) {
+            hinted.push(remedy);
+            output.hint(remedy).map_err(output_error)?;
         }
     }
     Ok(())
+}
+
+/// What setup did about the `cowshed` the operator types: the install, the entry on their `PATH`,
+/// and why either was left alone. Nothing at all when there is nothing to say — an install that
+/// was already current, reached by an entry that already named it.
+fn emit_cli_install<W: Write, E: Write>(
+    readiness: &RepairReadiness<'_>,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    let Some(cli) = readiness.cli else {
+        return Ok(());
+    };
+    // The gateway row of the same refusal already carries the reason; it is not said twice.
+    let said = |reason: &str| {
+        readiness.services.iter().any(|refresh| match refresh {
+            ServiceBinaryRefresh::Refused { reason: said, .. }
+            | ServiceBinaryRefresh::Downgrade { reason: said, .. } => said == reason,
+            ServiceBinaryRefresh::Refreshed { .. } | ServiceBinaryRefresh::Stale { .. } => false,
+        })
+    };
+    let mut lines = Vec::new();
+    match cli {
+        CliInstall::Refused { reason, .. } | CliInstall::Downgrade { reason, .. } => {
+            if !said(reason) {
+                lines.push(format!("the installed cowshed was kept: {reason}"));
+            }
+        }
+        CliInstall::Installed {
+            stable,
+            replaced,
+            from_installed_copy,
+            path_entry,
+        } => {
+            if *replaced {
+                lines.push(format!(
+                    "installed this cowshed as {}: the daemon and the cowshed on PATH run it",
+                    stable.display()
+                ));
+            }
+            match path_entry {
+                PathEntryOutcome::AlreadyInstalled { .. } => {}
+                PathEntryOutcome::Repointed { entry, was } => lines.push(format!(
+                    "{} said {}; it now names the installed cowshed, so the cowshed you type and the daemon are one binary",
+                    entry.display(),
+                    was.display()
+                )),
+                PathEntryOutcome::NotALink { entry } => lines.push(format!(
+                    "the cowshed on your PATH, {}, is a program rather than a link, so it was not replaced and may not be the daemon's build",
+                    entry.display()
+                )),
+                PathEntryOutcome::Missing => lines.push(String::from(
+                    "no cowshed is on your PATH, so nothing there reaches the installed cowshed",
+                )),
+                PathEntryOutcome::Failed { entry, reason } => lines.push(format!(
+                    "could not point {} at the installed cowshed: {reason}",
+                    entry.display()
+                )),
+            }
+            if *from_installed_copy {
+                lines.push(String::from(
+                    "this cowshed is the installed copy itself, so setup installed nothing: to install another build, run that build's own `cowshed setup` (a checkout's packages/cowshed/bin/cowshed)",
+                ));
+            }
+        }
+    }
+    for line in lines {
+        output.guidance(&line).map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// The commands that finish what setup could not do for the `PATH` entry, and the remedy of a
+/// refusal.
+fn cli_hints(cli: &CliInstall) -> Vec<String> {
+    match cli {
+        CliInstall::Refused { remedy, .. } | CliInstall::Downgrade { remedy, .. } => {
+            vec![remedy.clone()]
+        }
+        CliInstall::Installed {
+            stable, path_entry, ..
+        } => match path_entry {
+            PathEntryOutcome::NotALink { entry } | PathEntryOutcome::Failed { entry, .. } => {
+                vec![format!(
+                    "ln -sf {} {}",
+                    shell_quoted(stable),
+                    shell_quoted(entry)
+                )]
+            }
+            PathEntryOutcome::Missing => vec![format!(
+                "ln -s {} <a directory on your PATH>/cowshed",
+                shell_quoted(stable)
+            )],
+            PathEntryOutcome::AlreadyInstalled { .. } | PathEntryOutcome::Repointed { .. } => {
+                Vec::new()
+            }
+        },
+    }
+}
+
+/// `path` as one shell word: the installed cowshed lives under `Application Support`.
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// The conflict a refused downgrade ends the run with: the first one, gateway row before CLI row.
+fn downgrade_failure(
+    services: &[ServiceBinaryRefresh],
+    cli: Option<&CliInstall>,
+) -> Option<CowshedError> {
+    let from_services = services.iter().find_map(|refresh| match refresh {
+        ServiceBinaryRefresh::Downgrade { reason, remedy, .. } => Some((reason, remedy)),
+        ServiceBinaryRefresh::Refreshed { .. }
+        | ServiceBinaryRefresh::Stale { .. }
+        | ServiceBinaryRefresh::Refused { .. } => None,
+    });
+    let from_cli = match cli {
+        Some(CliInstall::Downgrade { reason, remedy }) => Some((reason, remedy)),
+        Some(CliInstall::Installed { .. } | CliInstall::Refused { .. }) | None => None,
+    };
+    from_services
+        .or(from_cli)
+        .map(|(reason, remedy)| CowshedError::conflict(reason.clone(), remedy.clone()))
 }
 
 fn emit_sccache_client<W: Write, E: Write>(
@@ -1783,10 +1958,26 @@ fn repair_status(
     {
         return format!("host storage is set up, but {service} runs a stale binary");
     }
-    let refreshed = readiness
+    if readiness
         .services
         .iter()
-        .any(|refresh| matches!(refresh, ServiceBinaryRefresh::Refreshed { .. }));
+        .any(|refresh| matches!(refresh, ServiceBinaryRefresh::Downgrade { .. }))
+        || matches!(readiness.cli, Some(CliInstall::Downgrade { .. }))
+    {
+        return String::from(
+            "host storage is set up, but the installed cowshed was kept: the invoking build is older than it",
+        );
+    }
+    let cli_changed = matches!(
+        readiness.cli,
+        Some(CliInstall::Installed { replaced, path_entry, .. })
+            if *replaced || matches!(path_entry, PathEntryOutcome::Repointed { .. })
+    );
+    let refreshed = cli_changed
+        || readiness
+            .services
+            .iter()
+            .any(|refresh| matches!(refresh, ServiceBinaryRefresh::Refreshed { .. }));
     let ready = if readiness.build_state.iter().any(|project| {
         project
             .result

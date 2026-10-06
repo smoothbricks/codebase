@@ -266,7 +266,7 @@ impl CowshedError {
         Self {
             code: ErrorCode::Conflict,
             message,
-            hint: "run `cowshed gateway start` from the cowshed you mean to use".to_owned(),
+            hint: "run `cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH".to_owned(),
             other_build: Some(Box::new(other)),
             recovering: None,
             healing: None,

@@ -48,13 +48,25 @@ are versioned and published together.
 
 ```sh
 bunx @smoothbricks/cowshed doctor      # one-off
-bun add --global @smoothbricks/cowshed # `cowshed` on PATH
+bun add --global @smoothbricks/cowshed # put the package's `cowshed` on PATH
+cowshed setup                          # install that build; `cowshed` on PATH now runs the installed copy
 ```
 
-From a checkout of this repository, run `nx build cowshed -c production`, then `bun link` the package. The production
-configuration builds the host's release CLI into `dist/bin/<platform>/cowshed`, which the linked `cowshed` trampoline
-runs; the default configuration builds cargo's dev profile, which is for tests and local iteration, not for the binary
-on `PATH`. The same build prepares the TypeScript library and host Node-API addon.
+`cowshed setup` installs the build it runs from as the host's cowshed: a content-addressed copy under
+`~/Library/Application Support/dev.cowshed/bin`, which the gateway daemon runs and which the first `cowshed` on your
+`PATH` is pointed at when that entry is a symbolic link. The daemon and the `cowshed` you type are then the same bytes,
+and only another install changes them ([gateway.md](gateway.md#start-at-login-launchd)). A later `cowshed setup` typed
+at the shell runs that installed copy, so it repairs the host but installs nothing new.
+
+From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-<platform>:production`
+(`cli-arm64-macos` on Apple silicon; `nx build cowshed -c production` builds it too, with the TypeScript library and
+host Node-API addon), which writes `dist/bin/<platform>/cowshed`, then run that build's own setup:
+`packages/cowshed/bin/cowshed setup`. After that, `cowshed` on `PATH` is the installed copy, not the checkout: a later
+rebuild changes nothing there until you run the checkout's `setup` again. Do not put a link to the checkout's
+`bin/cowshed` on `PATH` — it would run whatever the checkout last built, under a daemon still running the build setup
+installed, and the daemon refuses another build's commands. The default `cli-*` configuration builds cargo's dev
+profile, which is for tests and local iteration, and setup refuses to install it; setup also refuses a build of an older
+commit than the installed one unless you pass `--downgrade`.
 
 ### The agent skill
 

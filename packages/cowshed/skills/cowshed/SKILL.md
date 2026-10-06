@@ -27,9 +27,11 @@ a blast radius that ends at `cowshed rm`.
 1. Adopt once with the warm build cache included and capacity sized for growth:
    `cowshed adopt <path> --capacity <size>`.
 2. If host storage is missing, run `cowshed doctor` (it mutates nothing), then follow its `next:` command, usually
-   `cowshed setup`. `cowshed setup` also refreshes the gateway service binary from the invoking build — run it from a
-   release build. A daemon running a binary from before that build is host drift the repair ends, not a state it reports
-   as set up.
+   `cowshed setup`. `cowshed setup` also installs the build it runs from as the installed cowshed — the gateway daemon
+   and the `cowshed` on `PATH` alike, one binary. `cowshed setup` typed at a shell runs that installed copy and installs
+   nothing new; to install a checkout's release build, run its own `packages/cowshed/bin/cowshed setup`. Never link
+   `cowshed` on `PATH` into a checkout. Setup refuses a build of an older commit than the installed one (a `conflict`
+   naming both builds); `--downgrade` installs it anyway, only when going back is intended.
 3. Create one workspace per agent. Work in that workspace, never in shared `main`.
 4. Retire finished workspaces and run `cowshed gc` on a cadence. Storage grows with divergence, not clone count.
 
@@ -116,3 +118,5 @@ direnv users need nothing extra.
   a store path). The store is intact and no grant helps; rerun the verb from a shell whose sandbox allows writing the
   store. Any other `sandbox-denied` names its own refusal (a grant that would intersect a protected root, a shell input
   that escapes the workspace): follow its hint.
+- "the cowshed daemon is build X; this cowshed is build Y" means the daemon and this `cowshed` are different builds. The
+  command stopped before changing anything. Run `cowshed setup` from the cowshed you mean to use, then retry.

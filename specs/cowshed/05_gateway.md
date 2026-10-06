@@ -24,7 +24,8 @@ The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the fin
 `HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful
 to tools that close inherited descriptors. Workspace supervisors, warm shell hosts, and jobs inherit these limits
 naturally; child-spawn code does not change them. Kernel-wide descriptor capacity still applies. `cowshed setup`
-reconciles the generated plist as well as the binary, including on hosts whose installed binary already matches.
+reconciles the generated plist as well as the installed cowshed (below), including on hosts whose installed copy already
+matches.
 
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
 `/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable
@@ -80,6 +81,89 @@ machine-parsable grant hint naming both remedies, the standing one first:
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".
+
+## The installed cowshed
+
+The gateway daemon and the `cowshed` an operator types are one artifact: the installed cowshed, under
+`~/Library/Application Support/dev.cowshed/bin`, on the volume that carries `~/Library/LaunchAgents` itself, so launchd
+reaches it after a reboot whatever volume the build came from (a workspace image, the nix store, a checkout).
+
+| Name in `bin`            | What it is                                                                                     |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `cowshed`                | The stable name: a symbolic link saying `cowshed-<sha256>`, relative to `bin`.                 |
+| `cowshed-<sha256>`       | A stored copy, named for the SHA-256 of its bytes (64 lowercase hex digits), mode 0755.        |
+| `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
+
+`cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
+
+**Content-addressed copies, one moving name.** A copy is written once: the build's bytes go into an exclusive temporary
+file in `bin`, are synced, and are renamed to the copy's name. A copy whose bytes and mode already match is never
+rewritten, so whatever runs from it runs exactly that build for as long as it exists. The stable name moves from one
+whole build to the next in one rename of a temporary link, so launchd, which restarts a `KeepAlive` service the moment
+it exits, never finds a half-written binary or a missing name there. The gateway plist names the stable name, so the
+plist never changes with the build; an install moves the link and restarts the agent onto it. Installing a build the
+stable name already runs changes nothing.
+
+**The `PATH` entry.** `setup` points the first `cowshed` on the operator's `PATH` at the stable name: the first absolute
+`PATH` directory holding a symbolic link or an executable file of that name. A symbolic link — what `bun link`,
+`bun add --global` or a link made by hand leaves — is replaced by a link saying the stable path, unless it already
+resolves to it (judged by where both end, so the operator's own chain of links to it is left alone). A program that is
+not a link is not cowshed's to replace: setup reports it, with `ln -sf '<stable path>' '<entry>'` as the hint, and the
+same hint follows a link it could not replace. With no `cowshed` on `PATH` the hint is
+`ln -s '<stable path>' <a directory on your PATH>/cowshed`.
+
+**One artifact.** The daemon runs the stable name and the typed `cowshed` reaches it, so they are the same bytes, and
+only an install changes them: `setup`, or `gateway start`, which installs the running build the same way but leaves the
+`PATH` entry alone. A rebuild in a checkout changes nothing on `PATH` until a setup runs from that build. This exists
+because `~/.bun/bin/cowshed` was once a hand-made link to a checkout's `packages/cowshed/bin/cowshed`, the launcher that
+runs that checkout's build (06_cli.md "Launcher"): every rebuild there changed the CLI every agent used while the daemon
+kept the build setup had installed, the daemon then refused the CLI's verbs ("the cowshed daemon is build X; this
+cowshed is build Y", 11_shell.md), and a removal refused half-way failed its own state restoration too.
+
+`cowshed setup` typed at a shell therefore runs the installed copy itself, and installs nothing: it says so, and names
+the remedy. To install another build, run that build's own binary — a checkout's `packages/cowshed/bin/cowshed setup`,
+or its `dist/bin/<platform>/cowshed setup`. Such a run still repairs everything else, the plist included, and restarts a
+gateway that answers while running other bytes than the build it leaves installed (status `executableSha256`): launchd
+keeps a running process whatever the stable name now says, so this is what ends the disagreement the build refusal
+names.
+
+**Install order and rollback.** An install that replaces the running build refuses a debug build and a downgrade (below)
+before anything is installed. With the gateway agent installed it then writes the plist if it changed, and retains the
+previous build: when the stable name is a link, the copy it names is already stored; when it is the plain binary the
+layout before content-addressed copies left, that binary is first stored under its own digest through the same copy and
+rename. It stores the new copy, moves the stable name, records the source and the build record, and activates the agent.
+A failed activation points the stable name back at the retained copy, records `cowshed-source` as restored, and loads
+the agent again; the error says what failed and whether the restore and the reload did. A first install has nothing to
+roll back to and keeps its copy. A setup on a host with no gateway agent installs the same way without the activation.
+Setup installs only after its storage repair succeeded.
+
+**Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
+the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
+of that build, still draining its jobs (11_shell.md "Draining a supervisor of another build"), starts the shells those
+jobs need from the path it started from. A failed prune is reported on stderr and never fails the install.
+
+**Build records and downgrades.** A release build records the commit `HEAD` names and that commit's committer time
+(`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
+clone records it too. A debug build, and a build made where git cannot answer (a source archive, a nix build), records
+nothing. The installing build writes its record beside its stored copy, so the installed build's record is read from a
+file and nothing is executed to learn it; a record that cannot be written is said on stderr and does not fail the
+install. An install that would replace the installed build is refused when the installed build has a record and the
+candidate's commit time is older, or the candidate records nothing (it cannot show it is not older). Equal commit times
+are not ordered, so neither is older; the same bytes are never a downgrade of themselves; an installed build with no
+record — installed before records existed, or the plain binary of the old layout — is never an obstacle. The refusal is
+`Conflict` naming the binary it would have installed and both builds (`commit <12 hex>, committed <RFC 3339 UTC>`), with
+the hint "run `cowshed setup` from a build of a newer commit; `cowshed setup --downgrade` from this build installs it
+anyway". `setup` reports it once for the gateway and the CLI, repairs everything else, and exits non-zero with that
+`Conflict`; `gateway start` refuses before it installs anything. `setup --downgrade` installs the invoking build anyway,
+and is valid only for a run that installs: not with `--uninstall`, `--force` or `--mount-root`. An unreadable installed
+record is `Integrity`. This exists because twice a `cowshed setup` run through a launcher that resolved to a stale
+checkout build put back a gateway without a landed feature, and nothing said so.
+
+**Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the stable name first (so
+nothing launchd could start dangles), then every stored copy with its `.build` record, and every `cowshed` on `PATH`
+that is a link saying exactly the stable path — the entries setup made, and no other link that merely arrives there. A
+plain `gateway stop` keeps all of it: it is host state rather than agent state, and the next `start` is then a plist
+write.
 
 ## Egress modes
 

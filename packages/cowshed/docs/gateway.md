@@ -102,15 +102,27 @@ cowshed gateway start
 cowshed gateway status --json
 ```
 
-`start` installs the agent's binary before its plist. The plist may only name
-`~/Library/Application Support/dev.cowshed/bin/cowshed`, on the volume that carries `~/Library/LaunchAgents` itself, so
-launchd can still reach the program after a reboot; `start` copies the running executable there when the bytes differ,
-streamed into an exclusive temporary file and renamed, and leaves a current binary untouched. The source may be anywhere
-— the store tree, a mounted workspace image, the nix store, a global npm prefix — because the plist never names it: it
-names the copy. That is what stops the agent exiting 78 in a `KeepAlive` loop when the volume the build came from is not
-mounted at boot. `stop` and `status` derive the same path rather than the running executable.
+`start` installs the agent's binary with the same install `cowshed setup` makes: the running build becomes the installed
+cowshed under `~/Library/Application Support/dev.cowshed/bin`, on the volume that carries `~/Library/LaunchAgents`
+itself, so launchd can still reach the program after a reboot. The build is copied to `cowshed-<sha256>`, named for the
+SHA-256 of its bytes, mode 0755, streamed into an exclusive temporary file and renamed, and never rewritten once there;
+the stable name `cowshed` beside it is a symbolic link to that copy, moved from one build to the next in one rename. The
+plist names only the stable name, so it never changes with the build. The source may be anywhere — the store tree, a
+mounted workspace image, the nix store, a global npm prefix — because the plist never names it. That is what stops the
+agent exiting 78 in a `KeepAlive` loop when the volume the build came from is not mounted at boot. `stop` and `status`
+derive the same path rather than the running executable.
 
-`start` then atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with that binary
+The `cowshed` on your `PATH` is the same artifact: `cowshed setup` points the first `cowshed` on `PATH` at the stable
+name when that entry is a symbolic link, so the daemon and the `cowshed` you type run the same bytes and only an install
+changes them. `start` installs without touching that entry. The previous build's copy is kept for one more install,
+because a workspace supervisor of that build still draining its jobs may start shells from its path; older copies are
+removed once the new build's agent is active. If activation fails, the stable name is pointed back at the previous copy
+and the agent is loaded again. A release build records its commit beside its copy (`cowshed-<sha256>.build`), and
+`start` and `setup` refuse to replace the installed cowshed with a build of an older commit, or one that records none,
+naming the binary and both builds; `cowshed setup --downgrade` installs it anyway. The full rules are in the spec,
+`specs/cowshed/05_gateway.md` "The installed cowshed".
+
+`start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the stable name
 followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures go only to
 `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
 `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
@@ -118,7 +130,8 @@ already-loaded/not-loaded states idempotently. A plist this run rewrote is boote
 kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits until
 the daemon reports itself healthy — answering, not draining, and done starting — saying every few seconds what it is
 waiting on in the daemon's own count. `cowshed gateway stop` boots out the agent and removes its plist; the installed
-binary stays, as host state rather than agent state.
+cowshed stays, as host state rather than agent state. `cowshed gateway stop --purge` also deletes the stable name, every
+stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
 `/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an
@@ -139,10 +152,13 @@ workspace is served. Each drain is logged as a `supervisor-recovery drain <socke
 An audit failure closes the gateway: it cuts in-flight streams, refuses every new session, reports `draining` with the
 failure as its cause, and exits once its drain completes, so `KeepAlive` restarts it instead of leaving a daemon that
 answers its control socket while serving nothing. `cowshed gateway status` and `doctor` call the gateway healthy only
-when the daemon answers, is not draining, and runs the same bytes as the CLI asking. Every build reports package version
-0.1.0, so the daemon reports the SHA-256 of its own executable instead, and a mismatch names the remedy
-`cowshed gateway stop --purge && cowshed gateway start` (a plain `stop` keeps the installed copy). `start` restarts a
-daemon it finds running other bytes once, and refuses with that remedy if the mismatch survives the restart.
+when the daemon answers, is not draining, and runs the same bytes as the CLI asking. Builds of one version all report
+the same package version, so the daemon reports the SHA-256 of its own executable instead, and a mismatch names the
+remedy `cowshed setup`, run from the cowshed you mean to use: it installs that build and restarts a gateway that runs
+other bytes. `start` restarts a daemon it finds running other bytes once, and refuses with that remedy if the mismatch
+survives the restart. A daemon of another build also refuses every command that would reach a workspace supervisor
+(`exec`, `rm`, `new`, `land`, …): the CLI asks it before the command changes anything, so the refusal — "the cowshed
+daemon is build X; this cowshed is build Y" — leaves the host as it was, and its hint is the same `cowshed setup`.
 
 Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed

@@ -11,10 +11,11 @@ use cowshed_cli::capabilities::sccache::client_config::{
     ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
 };
 use cowshed_cli::capabilities::sccache::nix::BuildRefusal;
-use cowshed_cli::gateway_service::ServiceBinaryRefresh;
+use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
+use cowshed_cli::path_entry::PathEntryOutcome;
 use cowshed_cli::probe::GitIdentityGap;
 use cowshed_cli::setup_service::{
     GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectBuildState, ProjectIdentity,
@@ -57,6 +58,8 @@ struct FakeHost {
     /// What reconciling the installed service binaries found, so the drift sentences are
     /// provable without launchd or a real installed copy.
     services: Vec<ServiceBinaryRefresh>,
+    /// What installing the invoking build as the `cowshed` on PATH did.
+    cli: Option<CliInstall>,
     /// What `setup --sccache` found, so the opt-in rows and the non-zero exit are provable without
     /// nix, a flake, or launchd.
     sccache_install: SccacheInstall,
@@ -139,6 +142,7 @@ impl Default for FakeHost {
             execute_error: None,
             mount_root_error: None,
             services: Vec::new(),
+            cli: None,
             sccache_install: SccacheInstall::Running {
                 program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
                 gc_root: PathBuf::from(
@@ -207,6 +211,10 @@ impl HostSetup for FakeHost {
         Ok(self.services.clone())
     }
 
+    async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
+        Ok(self.cli.clone())
+    }
+
     async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>> {
         self.events.push(String::from("build-state-projects"));
         Ok(self
@@ -261,6 +269,7 @@ const REPAIR: SetupArgs = SetupArgs {
     mount_root: None,
     sccache: false,
     retire_caches_volume: false,
+    downgrade: false,
 };
 const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
     uninstall: false,
@@ -268,6 +277,7 @@ const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
     mount_root: None,
     sccache: true,
     retire_caches_volume: false,
+    downgrade: false,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
@@ -275,6 +285,7 @@ const UNINSTALL: SetupArgs = SetupArgs {
     mount_root: None,
     sccache: false,
     retire_caches_volume: false,
+    downgrade: false,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
@@ -282,6 +293,7 @@ const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     mount_root: None,
     sccache: false,
     retire_caches_volume: false,
+    downgrade: false,
 };
 
 struct Streams {
@@ -669,6 +681,222 @@ async fn a_stale_service_binary_falsifies_the_ready_sentence_and_names_the_remed
         streams.stderr
     );
     assert!(!streams.stderr.contains("everything already set up"));
+}
+
+/// The incident behind `--downgrade`: `cowshed setup` through a launcher that resolved to a stale
+/// checkout build put an older gateway back, quietly, and every later gate ran without the
+/// feature. A refused downgrade repairs everything else — the volumes, the build state — and then
+/// fails the run: the install was the point, and exit 0 would say it happened. The row names the
+/// binary and both builds; the remedy is said once, though the gateway row and the CLI row carry
+/// it.
+#[tokio::test]
+async fn a_refused_downgrade_repairs_the_rest_and_then_fails_the_run_naming_the_binary() {
+    let reason = String::from(
+        "/Users/dev/checkout/dist/bin/darwin-arm64/cowshed would replace the installed cowshed with an older build: it is commit aaaaaaaaaaaa, committed 2026-10-06T15:00:00Z, and the installed cowshed is commit bbbbbbbbbbbb, committed 2026-10-06T16:00:00Z",
+    );
+    let remedy = String::from("run `cowshed setup` from a build of a newer commit");
+    let mut host = FakeHost {
+        services: vec![ServiceBinaryRefresh::Downgrade {
+            service: String::from("dev.cowshed.gateway"),
+            reason: reason.clone(),
+            remedy: remedy.clone(),
+        }],
+        cli: Some(CliInstall::Downgrade {
+            reason: reason.clone(),
+            remedy: remedy.clone(),
+        }),
+        ..FakeHost::default()
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR, false).await;
+
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, reason);
+    assert_eq!(error.hint, remedy);
+    assert!(
+        host.events.contains(&String::from("execute"))
+            && host.events.contains(&String::from("build-state-projects")),
+        "everything else was repaired first: {:?}",
+        host.events
+    );
+    assert!(
+        streams.stderr.contains(&format!(
+            "cowshed: dev.cowshed.gateway still runs its installed binary: {reason}\n"
+        )),
+        "{}",
+        streams.stderr
+    );
+    assert_eq!(
+        streams.stderr.matches(reason.as_str()).count(),
+        1,
+        "the CLI row of the same refusal is not a second sentence: {}",
+        streams.stderr
+    );
+    assert_eq!(
+        streams.stderr.matches(&format!("next: {remedy}\n")).count(),
+        1,
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams.stderr.contains(
+            "cowshed: host storage is set up, but the installed cowshed was kept: the invoking build is older than it\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(!streams.stderr.contains("everything already set up"));
+
+    // The frozen envelope answers `ok:false` for it, never a success followed by an error.
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Downgrade { reason, remedy }),
+        ..FakeHost::default()
+    };
+    let (streams, _) = failing_run(&mut host, REPAIR, true).await;
+    assert_eq!(
+        streams.stdout, "",
+        "no success envelope for a refused install"
+    );
+    assert!(streams.stderr.contains("the installed cowshed was kept: "));
+}
+
+/// A `bun link` of the package leaves `~/.bun/bin/cowshed` pointing into a checkout, so a rebuild
+/// there changes the CLI under a daemon still running the installed build. Setup points the entry
+/// at the installed copy and says what it was, so the operator learns the link was theirs to lose.
+#[tokio::test]
+async fn a_repointed_path_entry_is_reported_with_what_it_said_and_owns_the_status_line() {
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Installed {
+            stable: PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed"),
+            replaced: true,
+            from_installed_copy: false,
+            path_entry: PathEntryOutcome::Repointed {
+                entry: PathBuf::from("/Users/dev/.bun/bin/cowshed"),
+                was: PathBuf::from("/Users/dev/smoothbricks/packages/cowshed/bin/cowshed"),
+            },
+        }),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: installed this cowshed as /Users/dev/Library/Application Support/dev.cowshed/bin/cowshed: the daemon and the cowshed on PATH run it\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams.stderr.contains(
+            "cowshed: /Users/dev/.bun/bin/cowshed said /Users/dev/smoothbricks/packages/cowshed/bin/cowshed; it now names the installed cowshed, so the cowshed you type and the daemon are one binary\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("cowshed: host services refreshed\n"),
+        "{}",
+        streams.stderr
+    );
+}
+
+/// Run from the installed copy, setup installs nothing — and says so, with the way to install
+/// another build, because `cowshed setup` typed at the shell now reaches the installed copy
+/// rather than whatever was last built.
+#[tokio::test]
+async fn setup_run_from_the_installed_copy_says_it_installed_nothing_and_how_to_install_a_build() {
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Installed {
+            stable: PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed"),
+            replaced: false,
+            from_installed_copy: true,
+            path_entry: PathEntryOutcome::AlreadyInstalled {
+                entry: PathBuf::from("/Users/dev/.bun/bin/cowshed"),
+            },
+        }),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: this cowshed is the installed copy itself, so setup installed nothing: to install another build, run that build's own `cowshed setup` (a checkout's packages/cowshed/bin/cowshed)\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("cowshed: everything already set up\n"),
+        "{}",
+        streams.stderr
+    );
+}
+
+/// An entry that is a program rather than a link is somebody's file: it is reported and left, with
+/// the command that would replace it — quoted, because the installed copy lives under
+/// `Application Support`. A host with no `cowshed` on PATH is told the same.
+#[tokio::test]
+async fn a_path_entry_setup_cannot_repoint_is_reported_with_the_command_that_would() {
+    let stable = PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed");
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Installed {
+            stable: stable.clone(),
+            replaced: false,
+            from_installed_copy: false,
+            path_entry: PathEntryOutcome::NotALink {
+                entry: PathBuf::from("/usr/local/bin/cowshed"),
+            },
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert!(
+        streams.stderr.contains(
+            "cowshed: the cowshed on your PATH, /usr/local/bin/cowshed, is a program rather than a link, so it was not replaced and may not be the daemon's build\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams.stderr.contains(
+            "next: ln -sf '/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed' '/usr/local/bin/cowshed'\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Installed {
+            stable,
+            replaced: false,
+            from_installed_copy: false,
+            path_entry: PathEntryOutcome::Missing,
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert!(
+        streams.stderr.contains(
+            "cowshed: no cowshed is on your PATH, so nothing there reaches the installed cowshed\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams.stderr.contains(
+            "next: ln -s '/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed' <a directory on your PATH>/cowshed\n"
+        ),
+        "{}",
+        streams.stderr
+    );
 }
 
 /// The defect this line exists for: an sccache client that inherited no cowshed environment
@@ -1616,6 +1844,7 @@ async fn setup_mount_root_prints_the_configured_path() {
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
         retire_caches_volume: false,
+        downgrade: false,
     };
     let streams = run(&mut host, args, false, false).await;
     assert_eq!(streams.exit, 0);
@@ -1643,6 +1872,7 @@ async fn setup_mount_root_json_is_empty_success() {
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
         retire_caches_volume: false,
+        downgrade: false,
     };
     let streams = run(&mut host, args, true, false).await;
     assert_eq!(streams.exit, 0);
@@ -1664,6 +1894,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
         retire_caches_volume: false,
+        downgrade: false,
     };
     let error = refusal(&mut host, args).await;
     assert_eq!(error.code, ErrorCode::Conflict);

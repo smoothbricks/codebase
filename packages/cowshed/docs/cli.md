@@ -73,7 +73,7 @@ repairs an adopted identity with `cowshed mv main --repo-id`.
 
 ## Lifecycle
 
-### `cowshed setup [--uninstall] [--force] [--mount-root <dir>]`
+### `cowshed setup [--uninstall] [--force] [--mount-root <dir>] [--downgrade]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates an
 absent store volume, remounts a detached or mis-mounted one at its canonical path, FileVault-encrypts an unencrypted
@@ -86,6 +86,43 @@ reads each passphrase from System.keychain, runs `diskutil apfs unlockVolume -no
 volume: existing volumes are encrypted in place, and the only volume it ever deletes is a retired caches volume, under
 `--retire-caches-volume` (below). On a healthy host it changes nothing and says so. Every storage error in the CLI
 points here — a host with no volumes has no checkout to adopt.
+
+Once storage repair succeeds, setup installs the build it runs from as the host's cowshed — the gateway daemon's binary
+and the `cowshed` you type, as one artifact. The build is copied to a content-addressed file,
+`~/Library/Application Support/dev.cowshed/bin/cowshed-<sha256>`; the stable name `cowshed` beside it becomes a link to
+that copy; the gateway agent runs the stable name; and the first `cowshed` on your `PATH`, when it is a symbolic link —
+what `bun link` of the package, `bun add --global` or a link made by hand leaves — is pointed at it too. An entry that
+is a program rather than a link is reported with the `ln -sf` command that would point it there, and a `PATH` with no
+`cowshed` gets the `ln -s` command. A gateway still running other bytes is restarted onto the installed copy. The daemon
+and the `cowshed` you type are then the same bytes, and only an install changes them: a rebuild in a checkout changes
+nothing on `PATH` until a setup runs from that build. The details are in
+[gateway.md](gateway.md#start-at-login-launchd).
+
+`cowshed setup` typed at a shell therefore runs the installed copy, and installs nothing new (it says so). To install
+another build, run that build's own setup: a checkout's `packages/cowshed/bin/cowshed setup`, or its
+`dist/bin/<platform>/cowshed setup`. A debug build is never installed.
+
+Release builds record the commit they were built from. Setup refuses to replace the installed cowshed with a build of an
+older commit, or with one that records no commit (it cannot show it is not older), naming the binary it would have
+installed and both builds; it repairs everything else, prints the reason and the remedy, and exits non-zero with a
+`conflict`. An installed cowshed that records nothing — installed before builds recorded their commit — never blocks an
+install. `--downgrade` installs the invoking build anyway; it is refused with `--uninstall`, `--force` and
+`--mount-root`, which install nothing.
+
+The commands that change a workspace or run work in one — `adopt`, `new`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
+`exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`, `land` — first
+ask the daemon whether it runs their build, before they open the project or change anything. A daemon of another build
+refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
+
+```
+$ cowshed rm raven
+cowshed: the cowshed daemon is build X; this cowshed is build Y
+next: run `cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH
+```
+
+`ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`, `credential`, `identity`, `sccache`, `skill`,
+`--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon answering is
+not a disagreement.
 
 `--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
@@ -258,8 +295,9 @@ cowshed: cowshed.caches (UUID 1D6F0E1A-…-BBBB) at /private/cowshed/caches hold
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
 the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` item in
 `/Library/Keychains/System.keychain` (and a retired volume's `cowshed.caches` item, if one is still there), the
-`dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the installed cowshed binary, and sccache's nix GC root —
-and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It
+`dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the `cowshed` links on your `PATH` that name the installed
+cowshed, the installed cowshed itself (its stable name, every stored copy and their build records), and sccache's nix GC
+root — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It
 therefore refuses while the volumes still hold workspaces, or while their occupancy cannot be established at all (an
 unmounted store looks empty to every cheap check), until `--force` says the caller means it anyway. There is no
 interactive prompt — the refusal is the prompt, and its hint is the completed command line:
@@ -273,15 +311,15 @@ next: cowshed setup --uninstall --force
 
 With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
 and every service artifact it touched, in the order it touched them (system daemon, then each System.keychain item it
-removed, then both user agents, then the cowshed binary and sccache's GC root). A teardown that found nothing installed
-reports an empty `services` list rather than omitting the field:
+removed, then both user agents, then the `cowshed` links on `PATH`, the installed cowshed and sccache's GC root). A
+teardown that found nothing installed reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"sccache nix GC root","outcome":"already-absent"}]}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"cowshed on PATH","outcome":"removed"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"sccache nix GC root","outcome":"already-absent"}]}}
 ```
 
 `outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
@@ -965,15 +1003,24 @@ next: cowshed exec raven -- git status
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.gateway`, then waits until its authenticated Unix
 control socket is healthy. The generated mode-0600 plist names `~/Library/Application Support/dev.cowshed/bin/cowshed`,
 `RunAtLoad`, `KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. That path is on
-the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot: `start`
-copies the running executable there when the bytes differ, whatever volume that executable came from. A build inside a
-workspace or the nix store is copied rather than refused — the copy is precisely what makes the agent independent of a
-path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the plist, leaving the
-installed binary — that copy is host state rather than agent state, and keeping it makes the next `start` a plist write
-instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done with the gateway rather
-than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed cowshed
-binary and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with nothing installed says so
-rather than failing.
+the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot. It is the
+stable name of the installed cowshed: a symbolic link to `cowshed-<sha256>` beside it, a content-addressed copy of a
+build. `start` installs the running executable the way
+[`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir---downgrade) does — copying it in when no stored
+copy holds its bytes, whatever volume it came from, and moving the link to it in one rename — but leaves the `cowshed`
+on your `PATH` alone. A build inside a workspace or the nix store is copied rather than refused — the copy is precisely
+what makes the agent independent of a path that only exists once cowshed has mounted it. A debug build is refused, and
+so is a build of an older commit than the installed one (or one that records no commit), before anything is installed;
+`start` has no `--downgrade`, which is `setup`'s. A failed activation puts the previous build back. `stop` boots out the
+agent and removes the plist, leaving the installed cowshed — host state rather than agent state, and keeping it makes
+the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name,
+every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a host
+that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon,
+both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these are
+idempotent, and a `--purge` with nothing installed says so rather than failing.
+
+`status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
+running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 
@@ -1170,10 +1217,11 @@ the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and
 daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
 
 A client with no export set at all is `cowshed setup`'s business rather than this verb's: it reads sccache's own config
-file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir) above).
-`sccache --show-stats` run from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the
-check that the file took effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`.
-It reports the resolved configuration without starting a server, so it is safe to run against a live host.
+file, which `setup` writes and owns (see
+[`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir---downgrade) above). `sccache --show-stats` run
+from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the check that the file took
+effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`. It reports the resolved
+configuration without starting a server, so it is safe to run against a live host.
 
 ### `cowshed controller`
 

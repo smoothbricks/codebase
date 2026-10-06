@@ -24,12 +24,19 @@ make that possible and they are absolute:
 ## Launcher
 
 The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host:
-`sccache` (the one daemon-control verb) runs the host-stable install launchd runs when it exists; everything else runs
-`dist/bin/<platform>/cowshed`, restoring an execute bit a publish dropped, or else `target/release/cowshed` of the
-workspace a linked checkout sits in. A host with none of them gets exit 5 naming every path looked in. It is a shell
-script rather than Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest
-verbs take in total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The
-library's `runCli` runs the CLI through the same script, so one rule picks the binary.
+`sccache` (the one daemon-control verb) runs the installed cowshed launchd runs when it exists; everything else runs the
+package's own build — `dist/bin/<platform>/cowshed`, restoring an execute bit a publish dropped, or else
+`target/release/cowshed` of the workspace a linked checkout sits in — `setup` and `gateway` included, since they install
+the invoking build. A host with none of them gets exit 5 naming every path looked in. It is a shell script rather than
+Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in
+total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`
+runs the CLI through the same script, so one rule picks the binary.
+
+The launcher is how a build that is not installed yet is run — a checkout's `packages/cowshed/bin/cowshed setup`
+installs that checkout's build — and not the `cowshed` on `PATH`. After `setup`, the `cowshed` on `PATH` is the
+installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on `PATH` at it when that
+entry is a symbolic link, which is what `bun link` of the package or `bun add --global` leaves. A `PATH` entry left on
+the launcher would run whatever a checkout last built, under a daemon still running the build setup installed.
 
 ## Onboarding and repair
 
@@ -46,17 +53,33 @@ Two verbs own the host story, both runnable from any directory:
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
   (01_storage.md). It announces an authorization prompt before raising one, then performs everything that can require
-  elevation inside that single session. Once storage repair succeeds, it refreshes every adopted main's build state
-  through the same runtime path jobs use (16_build_volumes.md). Migration is rebuild-only: it announces the discard of
-  contributed incremental directories before acting, protects tracked source files, and links an empty build volume for
-  the next build to repopulate. No build state is copied. A project refusal is reported on stderr without hiding later
-  projects; the command exits with the first typed failure and the number of failed projects, never a success JSON
-  envelope first. Uninstall and a failed storage repair never run migration. A fully migrated healthy host changes
-  nothing and says so. The non-destructive storage promise applies to the host store volume, layer-3 caches and source
-  data, not to rebuildable incremental state. On a host that still has the retired caches volume, setup moves what the
-  volume holds to the host HOME without authorization, and `setup --retire-caches-volume` deletes the emptied volume,
-  its `/etc/fstab` pin and its mount-service entry inside that same single session, refusing while anything but the
-  marker is left (03_caches.md "Retiring the caches volume").
+  elevation inside that single session. Once storage repair succeeds, it installs the invoking build as the installed
+  cowshed — the gateway's binary and the `cowshed` on `PATH` alike — restarting a gateway that runs other bytes, and
+  points the first `cowshed` on `PATH` at it when that entry is a symbolic link (05_gateway.md "The installed cowshed").
+  Run from the installed copy it installs nothing and says so; another build is installed by running that build's own
+  `setup`. It refuses to replace the installed build with one of an older commit, or one that records no commit, naming
+  the binary and both builds, repairs everything else, and exits non-zero; `setup --downgrade` installs it anyway. It
+  then refreshes every adopted main's build state through the same runtime path jobs use (16_build_volumes.md).
+  Migration is rebuild-only: it announces the discard of contributed incremental directories before acting, protects
+  tracked source files, and links an empty build volume for the next build to repopulate. No build state is copied. A
+  project refusal is reported on stderr without hiding later projects; the command exits with the first typed failure
+  and the number of failed projects, never a success JSON envelope first. Uninstall and a failed storage repair never
+  run migration. A fully migrated healthy host changes nothing and says so. The non-destructive storage promise applies
+  to the host store volume, layer-3 caches and source data, not to rebuildable incremental state. On a host that still
+  has the retired caches volume, setup moves what the volume holds to the host HOME without authorization, and
+  `setup --retire-caches-volume` deletes the emptied volume, its `/etc/fstab` pin and its mount-service entry inside
+  that same single session, refusing while anything but the marker is left (03_caches.md "Retiring the caches volume").
+
+The verbs that change workspace or lifecycle state or run a job through a workspace supervisor — `adopt`, `new`, `fork`,
+`mv`, `checkpoint`, `restore`, `path`, `exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`,
+`gc`, `push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs this CLI's build
+(`sameBuild`, 11_shell.md), before the project is opened, so not even recovery mutates anything. A daemon of another
+build is refused up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint "run
+`cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH";
+no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`,
+`credential`, `identity`, `sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses the
+disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
+`cowshed setup` as the remedy for a daemon running other bytes than the CLI.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its

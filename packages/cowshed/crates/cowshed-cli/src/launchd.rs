@@ -91,6 +91,75 @@ impl HostStableExecutable {
             .parent()
             .expect("derived paths always have a parent")
     }
+
+    /// The content-addressed copy of the build whose bytes hash to `digest`: `<name>-<digest>`,
+    /// beside the stable name. It is written once, by the install that first meets those bytes,
+    /// and never rewritten, so whatever runs from it runs exactly that build for as long as it
+    /// exists.
+    pub fn stored(&self, digest: &ExecutableDigest) -> PathBuf {
+        self.directory().join(self.stored_name(digest))
+    }
+
+    /// What the stable name's link says when it names [`Self::stored`]: the copy's file name,
+    /// relative to the directory they share, so the pair means the same thing wherever the home
+    /// is.
+    pub fn stored_link(&self, digest: &ExecutableDigest) -> PathBuf {
+        PathBuf::from(self.stored_name(digest))
+    }
+
+    fn stored_name(&self, digest: &ExecutableDigest) -> String {
+        format!("{}-{digest}", self.name)
+    }
+
+    /// The build a file name in [`Self::directory`] is the stored copy of, or `None` for any
+    /// other name: the stable name itself, a retained or temporary file, another service's
+    /// binary.
+    pub fn stored_digest(&self, file_name: &std::ffi::OsStr) -> Option<ExecutableDigest> {
+        file_name
+            .to_str()?
+            .strip_prefix(self.name.as_str())?
+            .strip_prefix('-')
+            .and_then(ExecutableDigest::parse)
+    }
+}
+
+/// The SHA-256 of an executable's bytes: 64 lowercase hex digits.
+///
+/// The one spelling a stored copy's name can take, so a string that is not a digest — a path
+/// separator, a `..`, an uppercase twin of a copy already stored — can never become part of a
+/// path under the host-stable directory.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutableDigest(String);
+
+impl ExecutableDigest {
+    /// The digest a hasher finished with.
+    pub fn from_bytes(digest: &[u8; 32]) -> Self {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            write!(hex, "{byte:02x}").expect("writing into a String cannot fail");
+        }
+        Self(hex)
+    }
+
+    /// `hex` when it is a digest as [`Self::from_bytes`] spells one.
+    pub fn parse(hex: &str) -> Option<Self> {
+        (hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| Self(hex.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecutableDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// A program launchd runs straight out of the nix store, and the GC root that keeps it there.
@@ -541,6 +610,14 @@ pub enum Mutation {
         source: PathBuf,
         mode: u32,
     },
+    /// A fresh symbolic link to `target` in `directory`, made the active temporary file so the
+    /// `RenameTemporaryFile` that follows swaps it over its destination atomically. A link has no
+    /// contents to sync: the directory sync that ends the plan makes it durable.
+    CreateTemporarySymlink {
+        directory: PathBuf,
+        name_prefix: String,
+        target: PathBuf,
+    },
     SyncTemporaryFile,
     RenameTemporaryFile {
         destination: PathBuf,
@@ -626,23 +703,41 @@ pub fn plan_remove(target: &LaunchAgentTarget, installed: bool) -> InstallPlan {
     InstallPlan { operations }
 }
 
-/// What the host currently has at a [`HostStableExecutable`] path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// What the host currently has under a [`HostStableExecutable`]'s name and directory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutableInstallState {
     /// Mode of `~/Library/Application Support/dev.cowshed`; `None` when it does not exist.
     pub support_directory_mode: Option<u32>,
     /// Mode of that directory's `bin`; `None` when it does not exist.
     pub binary_directory_mode: Option<u32>,
-    /// The binary already at the path, when a regular file is there.
-    pub installed: Option<InstalledExecutable>,
+    /// The stored copy of the source, when a regular file is there.
+    pub stored: Option<InstalledExecutable>,
+    /// What the stable name is.
+    pub link: StableLink,
+}
+
+/// What a [`HostStableExecutable`]'s stable name is on the host.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum StableLink {
+    #[default]
+    Absent,
+    /// Anything but a symbolic link: before copies were content-addressed, the installed binary
+    /// itself.
+    Foreign,
+    /// A symbolic link saying this.
+    To(PathBuf),
 }
 
 impl ExecutableInstallState {
-    /// The installed binary is the source at [`STABLE_BINARY_MODE`].
-    pub fn is_current(&self) -> bool {
-        self.installed.is_some_and(|installed| {
-            installed.mode == STABLE_BINARY_MODE && installed.matches_source
-        })
+    /// The stored copy holds the source's bytes at [`STABLE_BINARY_MODE`].
+    pub fn stored_is_current(&self) -> bool {
+        self.stored
+            .is_some_and(|stored| stored.mode == STABLE_BINARY_MODE && stored.matches_source)
+    }
+
+    /// The stable name already runs the stored copy of `digest`, and that copy is current.
+    pub fn is_current(&self, executable: &HostStableExecutable, digest: &ExecutableDigest) -> bool {
+        self.stored_is_current() && self.link == StableLink::To(executable.stored_link(digest))
     }
 }
 
@@ -653,16 +748,21 @@ pub struct InstalledExecutable {
     pub matches_source: bool,
 }
 
-/// Plan the copy that makes `source` runnable from the host-stable path.
+/// Plan the copy that makes `source` — the build whose bytes hash to `digest` — what the stable
+/// name runs.
 ///
-/// The copy is published by renaming a temporary file within the destination directory: launchd
-/// restarts a `KeepAlive` service the moment it exits, so it must never observe a half-written
-/// binary at the path it runs. A binary that already matches plans nothing — the source is tens
-/// of megabytes and every `start` would otherwise rewrite the file launchd is running.
+/// Two publications, each a temporary beside its destination renamed over it: the copy of the
+/// bytes, under the name its digest gives it, and then the stable name as a link to that copy.
+/// launchd restarts a `KeepAlive` service the moment it exits, so it must never observe a
+/// half-written binary or a missing name at the path it runs, and the name moves from one whole
+/// build to the next in one rename. A copy that already matches plans nothing — the source is
+/// tens of megabytes — and a stable name that already names it plans nothing either, so an
+/// installed build is touched by nothing but the install of another.
 pub fn plan_executable_install(
     executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
     source: &Path,
-    state: ExecutableInstallState,
+    state: &ExecutableInstallState,
 ) -> InstallPlan {
     let mut operations = Vec::new();
     for (directory, mode) in [
@@ -674,7 +774,7 @@ pub fn plan_executable_install(
         }
     }
 
-    if !state.is_current() {
+    if !state.stored_is_current() {
         operations.push(Mutation::CopyToTemporaryFile {
             directory: executable.directory().to_path_buf(),
             name_prefix: format!(".{}.", executable.name()),
@@ -682,6 +782,18 @@ pub fn plan_executable_install(
             mode: STABLE_BINARY_MODE,
         });
         operations.push(Mutation::SyncTemporaryFile);
+        operations.push(Mutation::RenameTemporaryFile {
+            destination: executable.stored(digest),
+        });
+    }
+
+    let link = executable.stored_link(digest);
+    if state.link != StableLink::To(link.clone()) {
+        operations.push(Mutation::CreateTemporarySymlink {
+            directory: executable.directory().to_path_buf(),
+            name_prefix: format!(".{}.link.", executable.name()),
+            target: link,
+        });
         operations.push(Mutation::RenameTemporaryFile {
             destination: executable.path().to_path_buf(),
         });
@@ -696,14 +808,27 @@ pub fn plan_executable_install(
     InstallPlan { operations }
 }
 
-/// Plan the removal of the host-stable copy, symmetric with [`plan_executable_install`].
+/// Plan the removal of `present`: files of the host-stable directory, in the order given.
 ///
-/// Only the binary: the enclosing directories are removed by nothing, because
+/// Serves the uninstall, which removes the stable name before the copies it names so nothing
+/// launchd could start dangles, and the pruning of copies an install has replaced. Only those
+/// files: the enclosing directories are removed by nothing, because
 /// `~/Library/Application Support/dev.cowshed` is shared by every service and an empty directory
-/// costs nothing. A binary that is not there plans nothing, which is what makes a second
-/// uninstall a no-op rather than a failure.
-pub fn plan_executable_remove(executable: &HostStableExecutable, installed: bool) -> InstallPlan {
-    let operations = plan_remove_file(executable.path(), executable.directory(), installed);
+/// costs nothing. No file to remove plans nothing, which is what makes a second uninstall a
+/// no-op rather than a failure.
+pub fn plan_executable_remove(
+    executable: &HostStableExecutable,
+    present: &[PathBuf],
+) -> InstallPlan {
+    let mut operations: Vec<Mutation> = present
+        .iter()
+        .map(|path| Mutation::RemoveFile { path: path.clone() })
+        .collect();
+    if !operations.is_empty() {
+        operations.push(Mutation::SyncDirectory {
+            path: executable.directory().to_path_buf(),
+        });
+    }
 
     InstallPlan { operations }
 }
@@ -736,6 +861,14 @@ pub trait LaunchdFilesystem {
         source: &Path,
         mode: u32,
     ) -> io::Result<PathBuf>;
+    /// Create a symbolic link to `target` at a fresh exclusive name in `directory`, and answer
+    /// that name.
+    fn symlink_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        target: &Path,
+    ) -> io::Result<PathBuf>;
     fn sync_file(&mut self, path: &Path) -> io::Result<()>;
     fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()>;
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
@@ -751,6 +884,32 @@ pub struct NativeFilesystem {
 impl NativeFilesystem {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a symbolic link to `target` at a fresh name in `directory`. `symlink(2)` fails with
+    /// `EEXIST` rather than replace or follow whatever holds the name, which is the exclusivity
+    /// the temporary file's `O_CREAT | O_EXCL` gives a file.
+    fn create_temporary_symlink(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        target: &Path,
+    ) -> io::Result<PathBuf> {
+        for _ in 0..128 {
+            let id = self.next_temporary_id;
+            self.next_temporary_id = self.next_temporary_id.wrapping_add(1);
+            let path = directory.join(format!("{name_prefix}{}.{}", std::process::id(), id));
+            match std::os::unix::fs::symlink(target, &path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an exclusive launchd temporary symlink",
+        ))
     }
 
     /// Open a fresh exclusive temporary file in `directory` with exactly `mode`.
@@ -865,6 +1024,15 @@ impl LaunchdFilesystem for NativeFilesystem {
         Self::published(path, file, written)
     }
 
+    fn symlink_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        target: &Path,
+    ) -> io::Result<PathBuf> {
+        self.create_temporary_symlink(directory, name_prefix, target)
+    }
+
     fn sync_file(&mut self, path: &Path) -> io::Result<()> {
         let file = open_existing_no_follow(path, true)?;
         require_file_kind(&file, "temporary path", FileKind::RegularFile)?;
@@ -935,11 +1103,35 @@ fn wrong_file_kind(subject: &'static str, expected: FileKind) -> io::Error {
     )
 }
 
+/// Make `destination` a symbolic link saying `target`, in one rename: a temporary link beside it
+/// replaces whatever is there — a link to another build, a regular file — so a reader of
+/// `destination` meets the old answer or the new one and never an absence.
+pub fn replace_symlink(target: &Path, destination: &Path) -> io::Result<()> {
+    let (Some(directory), Some(name)) = (
+        destination.parent(),
+        destination.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no file in a directory", destination.display()),
+        ));
+    };
+    let temporary = NativeFilesystem::new().create_temporary_symlink(
+        directory,
+        &format!(".{name}.link."),
+        target,
+    )?;
+    fs::rename(&temporary, destination).inspect_err(|_| {
+        let _ = fs::remove_file(&temporary);
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilesystemOperation {
     EnsureDirectory,
     SetPermissions,
     CreateTemporaryFile,
+    CreateTemporarySymlink,
     CopyTemporaryFile,
     SyncTemporaryFile,
     RenameTemporaryFile,
@@ -1324,6 +1516,33 @@ impl<F: LaunchdFilesystem, C> LaunchdExecutor<F, C> {
                         }
                         Err(source) => (
                             FilesystemOperation::CreateTemporaryFile,
+                            directory.as_path(),
+                            Err(source),
+                        ),
+                    }
+                }
+                Mutation::CreateTemporarySymlink {
+                    directory,
+                    name_prefix,
+                    target,
+                } => {
+                    if temporary_file.is_some() {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::CreateTemporarySymlink,
+                            reason: "a temporary file is already active",
+                        });
+                    }
+                    match self.filesystem.symlink_exclusive_no_follow(
+                        directory,
+                        name_prefix,
+                        target,
+                    ) {
+                        Ok(path) => {
+                            temporary_file = Some(path);
+                            continue;
+                        }
+                        Err(source) => (
+                            FilesystemOperation::CreateTemporarySymlink,
                             directory.as_path(),
                             Err(source),
                         ),

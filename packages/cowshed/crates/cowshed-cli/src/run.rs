@@ -210,6 +210,11 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json));
     }
+    // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
+    // is after the verb's first step. Ask it now, before anything is changed.
+    if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
+        return Ok(finish(Err(error), &mut output, json));
+    }
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
     // The long-running services above own their signals, so only this section is interruptible.

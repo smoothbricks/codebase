@@ -148,9 +148,9 @@ so no job inherits it), and the ensure — so the command that needed the worksp
 not with a pointer to the daemon's log. The supervisor itself never evaluates `.envrc`, sources shell startup, or runs
 repository hooks; it reads only the watch list an activation reports. Before a spawn it refreshes the convention-gated
 capability snapshot (15_capabilities.md) and compiles the matching child profile if that snapshot changed. Every exec
-host, one-shot command and descendant starts beneath that restriction, in its job's own process group. The child
-profile denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the
-private exec-temp roots.
+host, one-shot command and descendant starts beneath that restriction, in its job's own process group. The child profile
+denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the private
+exec-temp roots.
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.
@@ -216,12 +216,22 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   the binary's contents (the SHA-256 of the executable on Linux): no number anybody has to remember to bump, so a change
   nobody announced still counts. The manager refuses an ensure from another build the same way, and its refusal carries
   both builds as data — `otherBuild: { daemon, caller }` on the `Conflict` — so a client tells a controller the daemon
-  will no longer serve from every other conflict without reading the sentence. The controller client notes the first
-  such answer on its connection (`Coordinator::other_build`, 07_api.md); a supervisor of the controller's own build that
-  still drains its jobs keeps answering the calls that reach it. A program that links cowshed as a library is another
-  build whatever revision it links, so it opens no project in-process: it runs its controller as `cowshed controller`
-  (06_cli.md), a process of the host's own build, and speaks the controller protocol to it over the socket it hands that
-  process; after an install has started the daemon of a new build, it starts that verb again for its new work.
+  will no longer serve from every other conflict without reading the sentence. Its sentence is "the cowshed daemon is
+  build X; this cowshed is build Y", and its hint "run `cowshed setup` from the cowshed you mean to use: it installs
+  that build as both the daemon and the `cowshed` on PATH" (05_gateway.md "The installed cowshed"). A refusal at the
+  first ensure comes after a verb's first step — a removal has by then stopped its workspace's supervisor and journaled
+  its intent, and the refusal comes again on the path that would put that back, "state restoration also failed" — so
+  every CLI verb that needs a supervisor first sends the manager `sameBuild`, a request carrying nothing but the
+  caller's build, before it opens the project (06_cli.md "Onboarding and repair" lists the verbs). The manager checks
+  the build before it reads the rest of any request, answers `sameBuild` before any other work, and refuses another
+  build's with the same `Conflict`, so the verb is refused before its first step and the host is left as it was. No
+  manager answering is not a disagreement: there is no other build to refuse the caller, and a verb that needs the
+  daemon says so itself. The controller client notes the first other-build refusal on its connection
+  (`Coordinator::other_build`, 07_api.md); a supervisor of the controller's own build that still drains its jobs keeps
+  answering the calls that reach it. A program that links cowshed as a library is another build whatever revision it
+  links, so it opens no project in-process: it runs its controller as `cowshed controller` (06_cli.md), a process of the
+  host's own build, and speaks the controller protocol to it over the socket it hands that process; after an install has
+  started the daemon of a new build, it starts that verb again for its new work.
 - **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its
