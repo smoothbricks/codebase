@@ -74,7 +74,7 @@ describe('cowshed disk-lifecycle lease client', () => {
     const lease = await takeDiskLease(socket, 'namespace', '/sbin/umount /x', QUICK);
     expect(lease).toEqual({
       granted: false,
-      absent: false,
+      cause: 'predates',
       reason:
         'the gateway predates disk leases (invalid-request: unknown gateway control operation); restart it with `cowshed setup`',
     });
@@ -82,8 +82,7 @@ describe('cowshed disk-lifecycle lease client', () => {
 
   it('runs unleased, said as absent, when no gateway listens', async () => {
     const lease = await takeDiskLease(`/private/tmp/smoo-dl-${process.pid}-none.sock`, 'storage', 'x', QUICK);
-    expect(lease.granted).toBe(false);
-    expect(lease.granted === false && lease.absent).toBe(true);
+    expect(lease.granted === false && lease.cause).toBe('absent');
   });
 
   it('runs unleased when the grant never comes', async () => {
@@ -91,6 +90,6 @@ describe('cowshed disk-lifecycle lease client', () => {
       client.once('data', () => client.write('{"ok":true,"lease":"queued"}\n'));
     });
     const lease = await takeDiskLease(socket, 'storage', 'x', QUICK);
-    expect(lease).toEqual({ granted: false, absent: false, reason: 'the gateway granted nothing within 500 ms' });
+    expect(lease).toEqual({ granted: false, cause: 'other', reason: 'the gateway granted nothing within 500 ms' });
   });
 });

@@ -42,8 +42,16 @@ export interface LeaseBounds {
   grantMs: number;
 }
 
+/**
+ * Why a command runs without a lease: no gateway listens, the gateway predates leases, or any
+ * other refusal, silence or breakage.
+ */
+export type UnleasedCause = 'absent' | 'predates' | 'other';
+
 /** A granted lease, held until released, or why the command runs without one. */
-export type LeaseOutcome = { granted: true; release: () => void } | { granted: false; reason: string; absent: boolean };
+export type LeaseOutcome =
+  | { granted: true; release: () => void }
+  | { granted: false; cause: UnleasedCause; reason: string };
 
 /**
  * Ask the gateway at `socket` for a `diskClass` lease for `command`: one request line, no
@@ -78,7 +86,7 @@ export function takeDiskLease(
     }
     resolve(outcome);
   };
-  const unleased = (reason: string, absent = false) => settle({ granted: false, reason, absent });
+  const unleased = (reason: string, cause: UnleasedCause = 'other') => settle({ granted: false, cause, reason });
   const wait = (ms: number, onExpiry: () => void) => {
     clearTimeout(timer);
     timer = setTimeout(onExpiry, ms);
@@ -96,11 +104,11 @@ export function takeDiskLease(
     const lease = field('lease');
     if (field('ok') !== true) {
       const why = `${String(field('code') ?? 'refused')}: ${String(field('error') ?? '')}`;
-      unleased(
-        state === 'half-closed'
-          ? `the gateway predates disk leases (${why}); restart it with \`cowshed setup\``
-          : `the gateway refused the lease (${why})`,
-      );
+      if (state === 'half-closed') {
+        unleased(`the gateway predates disk leases (${why}); restart it with \`cowshed setup\``, 'predates');
+      } else {
+        unleased(`the gateway refused the lease (${why})`);
+      }
     } else if (state === 'half-closed') {
       unleased('the gateway did not queue the request in time; it is alive but overloaded');
     } else if (state === 'asked' && lease === 'queued') {
@@ -130,11 +138,11 @@ export function takeDiskLease(
     }
   });
   connection.on('error', (error) => {
-    const absent = state === 'connecting';
-    unleased(
-      absent ? `the gateway's control socket ${socket} does not answer (${error.message})` : error.message,
-      absent,
-    );
+    if (state === 'connecting') {
+      unleased(`the gateway's control socket ${socket} does not answer (${error.message})`, 'absent');
+    } else {
+      unleased(error.message);
+    }
   });
   connection.on('close', () => unleased('the gateway closed the lease connection'));
   return promise;

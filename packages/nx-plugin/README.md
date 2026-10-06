@@ -664,7 +664,8 @@ Every `hdiutil` and `diskutil` the volume runs takes cowshed's host disk-lifecyc
 answers at `/private/cowshed/store/gateway.sock` (`specs/cowshed/05_gateway.md`): storage calls and mount-table changes
 never overlap on the host, because an attach does not finish while the mount table keeps changing. The lease wait comes
 before the command's deadline. Without a grant the command runs unleased and stderr says why; a gateway that is not
-running is said once per process.
+running is said once per process. A gateway from before disk leases answers only after 2 s of silence, so once one is
+found the process stops asking it for a minute, as cowshed's own commands do.
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:

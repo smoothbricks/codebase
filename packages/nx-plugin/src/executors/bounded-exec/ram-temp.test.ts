@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 
@@ -260,6 +261,34 @@ describe('RAM temp volume on this host', () => {
     // Gone, or a zombie its new parent has yet to reap: either way no longer running.
     const state = await createHostCommands().run('/bin/ps', ['-o', 'stat=', '-p', spawned]);
     expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
+  });
+
+  it('asks a gateway that predates disk leases once, not before every disk command', async () => {
+    // Such a gateway answers only after 2 s of silence; asking it before each of a volume's
+    // dozen hdiutil and diskutil calls once pushed a test shard past its 120 s bound.
+    const socket = `/private/tmp/smoo-rt-${process.pid}.sock`;
+    rmSync(socket, { force: true });
+    let asked = 0;
+    const server = createServer({ allowHalfOpen: true }, (client) => {
+      asked += 1;
+      client.resume();
+      client.on('end', () =>
+        client.end('{"ok":false,"code":"invalid-request","error":"unknown gateway control operation"}\n'),
+      );
+    });
+    const { promise: listening, resolve: listened } = Promise.withResolvers<void>();
+    server.listen(socket, listened);
+    await listening;
+    try {
+      const host = createHostCommands(10_000, socket);
+      // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
+      expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
+      expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
+      expect(asked).toBe(1);
+    } finally {
+      server.close();
+      rmSync(socket, { force: true });
+    }
   });
 });
 

@@ -615,11 +615,20 @@ const HOST_COMMAND_DEADLINE_MS = 120_000;
 let gatewayAbsenceSaid = false;
 
 /**
+ * How long this process stops asking a gateway that predates leases before it asks again: each
+ * ask costs that gateway's 2 s of silence, and `cowshed setup` may replace it meanwhile.
+ */
+const PREDATES_RECHECK_MS = 60_000;
+
+/** When this process last found the gateway at each control socket predating leases. */
+const predatesSeenAt = new Map<string, number>();
+
+/**
  * Every disk tool runs under cowshed's host disk-lifecycle lease when the gateway answers
  * (`disk-lease.ts`): its attaches and mounts then never starve cowshed's, nor cowshed's them. The
  * lease wait comes before the deadline starts, and the lease is released once the command is
  * answered. Without a grant the command runs unleased and stderr says why; an absent gateway is
- * said once per process.
+ * said once per process, and one that predates leases is said and not asked again for a minute.
  */
 export function createHostCommands(
   deadlineMs: number = HOST_COMMAND_DEADLINE_MS,
@@ -628,7 +637,8 @@ export function createHostCommands(
   return {
     async run(file, args) {
       const diskClass = diskClassOf(file);
-      if (diskClass === null) {
+      const predatesSince = predatesSeenAt.get(gatewaySocket);
+      if (diskClass === null || (predatesSince !== undefined && Date.now() - predatesSince < PREDATES_RECHECK_MS)) {
         return runBounded(file, args, deadlineMs);
       }
       const lease = await takeDiskLease(gatewaySocket, diskClass, [file, ...args].join(' '), {
@@ -636,9 +646,14 @@ export function createHostCommands(
         afterCloseMs: 5_000,
         grantMs: deadlineMs,
       });
-      if (!lease.granted && !(lease.absent && gatewayAbsenceSaid)) {
-        gatewayAbsenceSaid ||= lease.absent;
-        process.stderr.write(`RAM temp volume: ${file} runs without cowshed's disk lease: ${lease.reason}\n`);
+      if (!lease.granted) {
+        if (lease.cause === 'predates') {
+          predatesSeenAt.set(gatewaySocket, Date.now());
+        }
+        if (!(lease.cause === 'absent' && gatewayAbsenceSaid)) {
+          gatewayAbsenceSaid ||= lease.cause === 'absent';
+          process.stderr.write(`RAM temp volume: ${file} runs without cowshed's disk lease: ${lease.reason}\n`);
+        }
       }
       try {
         return await runBounded(file, args, deadlineMs);
