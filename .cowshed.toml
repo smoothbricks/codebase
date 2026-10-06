@@ -1,0 +1,17 @@
+# Repository-owned cowshed settings (specs/cowshed/06_cli.md "Configuration").
+
+[build]
+# Build state no capability detects, kept on the build volume instead of the source image
+# (specs/cowshed/16_build_volumes.md "Declared build state"): cloned at fork, adopted by main at
+# land. `.cache/ttsc` is the shell's TTSC_CACHE_DIR (devenv.smoo.nix): ttsc's native plugin
+# binaries and the Go build cache that compiles them. A plugin's key hashes its sources by
+# relative path plus the ttsc/tsgo versions, platform and Go environment, never the checkout, and
+# GOFLAGS=-trimpath keeps paths out of the Go cache, so an entry built in any checkout is valid in
+# every fork. On the source image a fork gets only main's copy, which no land writes, so its first
+# compile rebuilds every plugin main never built.
+#
+# Not declared: `.cache/nextest` and `.cache/lmao-thread-ffi` are Nx task outputs, which never
+# live on the build volume (16_build_volumes.md "Nx outputs never live in the build volume"); the
+# Nx cache restores them. `.cache/statebus-packages` is an uncached verification run's report,
+# read back by nothing, and its consumer lockfiles name the checkout.
+state = [".cache/ttsc"]
