@@ -2061,14 +2061,14 @@ impl Drop for PortGrantReservation {
     }
 }
 
+/// Whether the process owning a reservation marker has not exited; a zombie owner has, and its
+/// cell is reclaimed. An owner whose state cannot be read keeps its cell.
 #[cfg(target_os = "macos")]
 fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
-    // SAFETY: signal 0 does not deliver a signal; it only asks the kernel whether the PID exists.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    crate::process::running(pid).unwrap_or(true)
 }
 
 #[cfg(target_os = "macos")]

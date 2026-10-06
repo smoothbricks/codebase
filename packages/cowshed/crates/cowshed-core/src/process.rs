@@ -1,6 +1,67 @@
 use std::ffi::OsStr;
 use std::fmt;
+use std::io;
 use std::process::{ExitStatus, Output};
+
+/// Whether the process `pid` names has not exited. A zombie -- exited, not yet reaped by its
+/// parent -- has: the null signal is never asked, because `kill(pid, 0)` succeeds on a zombie
+/// (POSIX requires it), and a daemon reparented to launchd stays one until launchd gets round to
+/// reaping it. A process this one may not inspect still runs, as far as anyone here can tell.
+#[cfg(target_os = "macos")]
+pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(io::Error::other)?;
+    // Argument 0 asks for live processes only: the kernel answers `ESRCH` for a zombie exactly
+    // as for a reaped pid.
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == size {
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        return Ok(unsafe { info.assume_init() }.pbi_status != libc::SZOMB);
+    }
+    if written > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("proc_pidinfo returned {written} bytes, expected {size}"),
+        ));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
+/// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
+/// (dead) has exited.
+#[cfg(target_os = "linux")]
+pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // An unmounted procfs proves nothing about `pid`.
+            std::fs::metadata("/proc/self/stat")?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    // The command name is parenthesized and may hold anything; the state follows the last ')'.
+    let state = stat
+        .rfind(')')
+        .and_then(|closing| stat[closing + 1..].split_whitespace().next())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat has no state"))?;
+    Ok(!matches!(state, "Z" | "X"))
+}
 
 /// How a child process terminated, without collapsing signals into a synthetic exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +250,41 @@ impl fmt::Display for DiagnosticBytes<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exited child its parent has not reaped is a zombie: the null signal still reaches it,
+    /// and it has exited all the same. Reaped, it is gone. This process itself runs.
+    #[test]
+    fn a_zombie_has_exited_though_the_null_signal_still_reaches_it() {
+        let mut child =
+            crate::fork_lock::Spawn::spawn_locked(&mut std::process::Command::new("/usr/bin/true"))
+                .expect("spawn");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid");
+        // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // Block until the child has exited, leaving it unreaped.
+        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child waitable.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid.cast_unsigned(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        // SAFETY: signal 0 only checks existence.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the zombie answers the null signal"
+        );
+        assert!(!running(pid).unwrap(), "a zombie has exited");
+        child.wait().expect("reap");
+        assert!(!running(pid).unwrap(), "a reaped pid has exited");
+        assert!(running(libc::pid_t::try_from(std::process::id()).unwrap()).unwrap());
+        // Launchd's: not this user's to inspect, and running.
+        assert!(running(1).unwrap());
+    }
 
     #[test]
     fn diagnostic_bytes_trim_edges_and_preserve_invalid_bytes() {

@@ -33,8 +33,9 @@ use crate::sandbox::SandboxConfig;
 
 /// How often a shed's supervisor probes its Nx daemon. Short, because from the daemon's death to
 /// the next probe a host client finds no daemon and starts its own outside the sandbox, and a
-/// probe is one small file read, one `kill(pid, 0)` and one local connect. Not shorter, because
-/// a start job takes Nx's own startup, seconds, and no probe starts another while one runs.
+/// probe is one small file read, one process-state query and one local connect. Not shorter,
+/// because a start job takes Nx's own startup, seconds, and no probe starts another while one
+/// runs.
 pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The daemon of an Nx project, as its rendezvous record and the world agree on it.
@@ -115,15 +116,11 @@ fn read_and_probe(record: &Path) -> (Probe, Option<libc::pid_t>) {
     }
 }
 
-/// Whether the process `pid` exists, by the null signal: nothing is delivered.
+/// Whether the process `pid` has not exited ([`crate::process::running`]): a daemon that exited
+/// and is still a zombie awaiting its reaper is gone. A process whose state cannot be read is
+/// left for the socket to judge.
 fn running(pid: libc::pid_t) -> bool {
-    // SAFETY: signal 0 performs only the existence and permission checks, and `pid` is positive,
-    // so it names one process and never a group.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    // A process this one may not signal still exists.
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    crate::process::running(pid).unwrap_or(true)
 }
 
 /// The Nx project whose daemon a supervisor keeps: the project Nx is rooted at under the
@@ -262,7 +259,8 @@ mod tests {
     }
 
     /// The daemon is live only while its record names a running process whose socket accepts:
-    /// an absent record, a dead pid and a socket nobody listens on are each a daemon to start.
+    /// an absent record, a dead pid -- an exited one its reaper has not yet reaped included --
+    /// and a socket nobody listens on are each a daemon to start.
     #[test]
     fn a_daemon_is_live_only_while_its_recorded_process_runs_and_its_socket_accepts() {
         // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
@@ -285,8 +283,17 @@ mod tests {
             crate::fork_lock::Spawn::spawn_locked(&mut std::process::Command::new("/usr/bin/true"))
                 .expect("spawn");
         let dead = exited.id();
-        exited.wait().expect("reap");
+        // Exited, not yet reaped: a zombie, which the null signal still reaches. The socket is
+        // still served, so only the process's own state can tell it is gone.
+        // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child waitable.
+        let waited =
+            unsafe { libc::waitid(libc::P_PID, dead, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
         write_record(&record, dead, &socket);
+        assert_eq!(probe(&record), Probe::Dead, "a zombie daemon is gone");
+        exited.wait().expect("reap");
         assert_eq!(probe(&record), Probe::Dead);
 
         // The socket file outlives its listener, so only a connect tells it is served.

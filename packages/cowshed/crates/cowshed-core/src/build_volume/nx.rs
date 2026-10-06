@@ -1074,8 +1074,12 @@ mod tests {
         );
         assert!(socket.exists());
         assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
-        // SAFETY: signal 0 only checks existence.
-        assert_ne!(unsafe { libc::kill(first, 0) }, 0, "the daemon exited");
+        // Exited, though launchd may not have reaped it yet: a zombie, which `kill(pid, 0)`
+        // still reaches.
+        assert!(
+            !crate::process::running(first).unwrap(),
+            "the daemon exited"
+        );
         // The daemon's own shutdown ran: it removed its record and its socket, as after
         // `nx daemon --stop`. A signal Nx did not handle would leave both behind.
         assert!(!record.exists(), "the daemon removed its record");
