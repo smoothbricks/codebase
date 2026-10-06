@@ -349,7 +349,8 @@ use the old path, or may be absent; cowshed does not inspect or rewrite it.
 ### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
 
 Clones a live image from the repository selected by cwd or `--project`, then mounts it. The source is that repository's
-`main` by default:
+`main` by default. A clone of main starts at main's committed `HEAD`: main's uncommitted edits and untracked files stay
+in main, while ignored paths (installed dependencies, build outputs, build state) arrive warm:
 
 ```sh
 cd ~/src/api

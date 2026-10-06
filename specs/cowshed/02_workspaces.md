@@ -22,8 +22,14 @@ worktree:
 - No `.env` files. Credentials exist only inside cowshed-gateway (Keychain-backed, 05_gateway.md).
 - Environment wiring (`.cowshed/env`, sourced by `.envrc`) exports build-configuration variables only, never secrets.
 
-Everything else in main — uncommitted source changes, installed dependencies, warm build state — is exactly what makes a
-clone useful.
+Everything else in main — installed dependencies, build outputs, warm build state — is exactly what makes a clone
+useful. Main's uncommitted source changes are not: they belong to main's user. A clone of main starts at main's
+committed `HEAD`. Before any other mint step, cowshed resets tracked changes in the clone from `HEAD` and deletes the
+untracked files and directories Git does not ignore. Ignored paths stay, every build-state link with them. The reset
+rewrites only files that differ, so every other mtime survives and the clone stays warm. **Why:** a clone that inherited
+a Markdown edit or a stray export from main gated a tree that was not its commit, so Nx missed, and its land then
+refused it as dirty. A fork of another workspace (`--from`, `cowshed fork`) still carries that workspace's live state,
+which is the point of a handoff fork (below).
 
 ### Secrets enforcement
 
@@ -449,11 +455,11 @@ gains three steps between attach and publication:
    retirement has to find the registration from the name alone.
 3. Refill the index from `HEAD` with a mixed reset, then `git switch -c cowshed/<name>` as usual. `--no-checkout` leaves
    the index empty, and an empty index against a full tree reads as the wholesale deletion of every file; the reset
-   restores the reading a standalone clone gives — main's uncommitted edits present and modified. The branch is created
-   in main's ref namespace, so it is visible from main immediately — with no fetch, and no `main` remote, which a
-   git-worktree workspace does not get: there is nothing to fetch from when the object store is already shared. For the
-   same reason `cowshed rebase` defaults to replaying onto `main` itself rather than onto a remote-tracking ref, and
-   fetches nothing first.
+   restores the reading a standalone clone gives: the tree at `HEAD`, since main's uncommitted edits were already
+   discarded at the start of the mint. The branch is created in main's ref namespace, so it is visible from main
+   immediately — with no fetch, and no `main` remote, which a git-worktree workspace does not get: there is nothing to
+   fetch from when the object store is already shared. For the same reason `cowshed rebase` defaults to replaying onto
+   `main` itself rather than onto a remote-tracking ref, and fetches nothing first.
 
 A workspace's mode is not only requested, it is **inherited**. `cowshed fork`, `cowshed new --from`, and the fork half
 of `cowshed mv` all clone an image whose only git state is a pointer file naming the _source's_ registration, so a clone

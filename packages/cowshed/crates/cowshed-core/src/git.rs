@@ -1480,6 +1480,9 @@ impl GitRepository {
         start: Option<&str>,
         resuming: bool,
     ) -> Result<()> {
+        if origin.source == origin.main {
+            timed_async("new", "head", self.discard_uncommitted()).await?;
+        }
         // Before any branch is checked out, so only what the clone inherited is judged. On resume
         // every link still holds either the source's bytes or the absolute target an earlier pass
         // derived from those same bytes, so the source remains the producer to resolve against.
@@ -1502,6 +1505,25 @@ impl GitRepository {
         // `includeIf gitdir:` rules, and a fork of a workspace that already inherited one no
         // longer needs the operator's global file at all.
         timed_async("new", "identity", self.inherit_identity_from(origin.source)).await
+    }
+
+    /// A clone of main starts at main's committed `HEAD` (02_workspaces.md, "The
+    /// safe-to-clone-main invariant"): main's uncommitted edits belong to main's user. Tracked
+    /// changes are reset from `HEAD`, and untracked files and directories Git does not ignore are
+    /// deleted. Ignored paths stay, so installed dependencies, build outputs and every build-state
+    /// link the clone inherited stay warm; a reset rewrites only the files that differ, so every
+    /// other mtime is kept.
+    ///
+    /// Runs against the clone's own `.git` directory, before a linked worktree replaces it; once
+    /// it is a pointer, an earlier pass of this resumed mint already ran it.
+    async fn discard_uncommitted(&self) -> Result<()> {
+        if !self.root.join(".git").is_dir() {
+            return Ok(());
+        }
+        let reset = self.run(["reset", "-q", "--hard", "HEAD"]).await?;
+        ensure_git_success("reset main's uncommitted edits in the clone", reset)?;
+        let clean = self.run(["clean", "-q", "-f", "-d"]).await?;
+        ensure_git_success("delete main's untracked files in the clone", clean)
     }
 
     /// Configure local-only workspace Git. A fresh preparation refuses an existing branch; it
@@ -3227,6 +3249,68 @@ mod tests {
             assert!(!directory.join(".gitignore").exists());
             assert_eq!(git_stdout(directory, &["status", "--porcelain"]), "");
         }
+    }
+
+    /// A clone of main starts at main's committed `HEAD`: main's tracked edits, deletions and
+    /// untracked files stay in main and never reach the workspace, while what Git ignores (build
+    /// outputs, installed dependencies) arrives warm. A workspace that inherited main's dirt
+    /// gated a tree that was not its commit, and its land then refused it as dirty.
+    #[tokio::test]
+    async fn a_clone_of_main_starts_at_mains_committed_head() {
+        let root = repository();
+        fs::write(root.join(".gitignore"), "/ignored/\n").expect("ignore rules");
+        fs::write(root.join("kept.txt"), "committed\n").expect("tracked file");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "ignore build output"]);
+        fs::write(root.join("README"), "edited in main\n").expect("tracked edit");
+        fs::remove_file(root.join("kept.txt")).expect("tracked deletion");
+        fs::write(root.join("stray.ts"), "export const stray = 1;\n").expect("untracked file");
+        fs::create_dir_all(root.join("notes/deep")).expect("untracked directory");
+        fs::write(root.join("notes/deep/draft.md"), "draft\n").expect("untracked nested file");
+        fs::create_dir_all(root.join("ignored")).expect("ignored directory");
+        fs::write(root.join("ignored/build.out"), "warm\n").expect("ignored output");
+        let main_status = git_stdout(&root, &["status", "--porcelain"]);
+        let workspace = root.with_extension("clean-workspace");
+        copy_tree(&root, &workspace);
+        let repository = GitRepository::from_root(&workspace);
+        repository
+            .ensure_cowshed_excludes()
+            .await
+            .expect("private metadata exclusion");
+        repository
+            .mint_workspace(
+                "clean",
+                CloneOrigin {
+                    source: &root,
+                    main: &root,
+                },
+                WorkspaceRepository::Standalone,
+                None,
+                false,
+            )
+            .await
+            .expect("mint from a dirty main");
+        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
+        assert_eq!(
+            fs::read_to_string(workspace.join("README")).unwrap(),
+            "test\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("kept.txt")).unwrap(),
+            "committed\n"
+        );
+        assert!(!workspace.join("stray.ts").exists());
+        assert!(!workspace.join("notes").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.join("ignored/build.out")).unwrap(),
+            "warm\n",
+            "ignored build output stays warm"
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            main_status,
+            "main keeps its own edits"
+        );
     }
 
     #[tokio::test]
