@@ -861,6 +861,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "toml",
  "url",
  "uuid",
  "walkdir",

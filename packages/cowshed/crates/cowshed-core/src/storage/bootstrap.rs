@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -8,7 +9,9 @@ use async_trait::async_trait;
 use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use toml::Spanned;
 
+use crate::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
 use crate::process::fmt_command_failure;
 
 use super::fstab::FstabPin;
@@ -137,253 +140,143 @@ impl SubstrateConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConfigSection {
-    Substrate,
-    Sandbox,
-    Build,
-    Caches,
-    Capability(crate::capabilities::CapabilityId),
+/// `.cowshed.toml` as TOML spells it: every section and key cowshed reads, and nothing else. The
+/// TOML parser refuses a duplicated key or table and serde an unknown one, so a setting cannot
+/// silently change project detection; the spans locate each value for the validation in
+/// [`parse_cowshed_config`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    substrate: Option<SubstrateSection>,
+    sandbox: Option<SandboxSection>,
+    build: Option<BuildSection>,
+    caches: Option<CachesSection>,
+    #[serde(default)]
+    capabilities: BTreeMap<CapabilityId, CapabilitySection>,
 }
 
-impl ConfigSection {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Substrate => "substrate",
-            Self::Sandbox => "sandbox",
-            Self::Build => "build",
-            Self::Caches => "caches",
-            Self::Capability(id) => id.section_name(),
-        }
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubstrateSection {
+    kind: ExplicitSubstrate,
+    pool: Spanned<String>,
 }
 
-#[derive(Default)]
-struct ParsedCapability {
-    disabled: Option<bool>,
-    directory: Option<PathBuf>,
+/// `[substrate] kind`: only an explicit ZFS pool overrides the filesystem evidence.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ExplicitSubstrate {
+    Zfs,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxSection {
+    deny: Vec<Spanned<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildSection {
+    capacity: Option<Spanned<String>>,
+    state: Option<Vec<Spanned<String>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachesSection {
+    home: Vec<Spanned<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilitySection {
+    #[serde(default)]
+    disabled: bool,
+    directory: Option<Spanned<String>>,
 }
 
 /// Parse repository-owned storage, sandbox deny, build volume capacity and declared state,
 /// repository cache and convention-only capability overrides. Unknown or duplicated settings fail
 /// rather than silently changing project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
-    let mut current = None;
-    let mut saw_substrate = false;
-    let mut saw_sandbox = false;
-    let mut saw_build = false;
-    let mut saw_caches = false;
-    let mut kind = None;
-    let mut pool = None;
-    let mut sandbox_deny = None;
-    let mut build_capacity = None;
-    let mut caches_home = None;
-    let mut build_state = None;
-    let mut capabilities =
-        std::collections::BTreeMap::<crate::capabilities::CapabilityId, ParsedCapability>::new();
-    for (index, original) in input.lines().enumerate() {
-        let line_number = index + 1;
-        let line = strip_comment(original).trim();
-        if line.is_empty() {
-            continue;
+    let file: ConfigFile = toml::from_str(input).map_err(|error| ConfigError::Malformed {
+        line: error.span().map(|span| line_at(input, span.start)),
+        message: error.message().to_owned(),
+    })?;
+    let substrate = match file.substrate {
+        Some(SubstrateSection {
+            kind: ExplicitSubstrate::Zfs,
+            pool,
+        }) => {
+            let pool = pool.into_inner();
+            validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
+            Some(SubstrateConfig { pool })
         }
-        if line.starts_with('[') {
-            let name = line
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                .ok_or(ConfigError::MalformedLine { line: line_number })?
-                .trim();
-            let section = match name {
-                "substrate" => ConfigSection::Substrate,
-                "sandbox" => ConfigSection::Sandbox,
-                "build" => ConfigSection::Build,
-                "caches" => ConfigSection::Caches,
-                other => {
-                    let id = other
-                        .strip_prefix("capabilities.")
-                        .and_then(crate::capabilities::CapabilityId::parse)
-                        .ok_or_else(|| ConfigError::UnknownSection(other.to_owned()))?;
-                    if capabilities
-                        .insert(id, ParsedCapability::default())
-                        .is_some()
-                    {
-                        return Err(ConfigError::DuplicateSection(id.section_name()));
-                    }
-                    ConfigSection::Capability(id)
-                }
-            };
-            // A capability section is deduplicated by its insertion above.
-            let seen = match section {
-                ConfigSection::Substrate => Some(&mut saw_substrate),
-                ConfigSection::Sandbox => Some(&mut saw_sandbox),
-                ConfigSection::Build => Some(&mut saw_build),
-                ConfigSection::Caches => Some(&mut saw_caches),
-                ConfigSection::Capability(_) => None,
-            };
-            if seen.is_some_and(|seen| std::mem::replace(seen, true)) {
-                return Err(ConfigError::DuplicateSection(section.name()));
-            }
-            current = Some(section);
-            continue;
-        }
-
-        let section = current.ok_or(ConfigError::MalformedLine { line: line_number })?;
-        let (key, value) = line
-            .split_once('=')
-            .ok_or(ConfigError::MalformedLine { line: line_number })?;
-        let value = value.trim();
-        match (section, key.trim()) {
-            (ConfigSection::Substrate, "kind") => set_once(
-                &mut kind,
-                parse_toml_string(value, section, line_number)?,
-                section,
-                "kind",
-            )?,
-            (ConfigSection::Substrate, "pool") => set_once(
-                &mut pool,
-                parse_toml_string(value, section, line_number)?,
-                section,
-                "pool",
-            )?,
-            (ConfigSection::Sandbox, "deny") => {
-                set_once(
-                    &mut sandbox_deny,
-                    parse_relative_paths(value, line_number, section, "deny", "workspace")?,
-                    section,
-                    "deny",
-                )?;
-            }
-            (ConfigSection::Build, "capacity") => {
-                let value = parse_toml_string(value, section, line_number)?;
-                let capacity = crate::metadata::ImageCapacity::parse(&value).map_err(|reason| {
-                    ConfigError::InvalidBuildCapacity {
-                        line: line_number,
-                        reason,
-                    }
-                })?;
-                set_once(&mut build_capacity, capacity, section, "capacity")?;
-            }
-            (ConfigSection::Build, "state") => {
-                set_once(
-                    &mut build_state,
-                    parse_build_state(value, line_number)?,
-                    section,
-                    "state",
-                )?;
-            }
-            (ConfigSection::Caches, "home") => {
-                set_once(
-                    &mut caches_home,
-                    parse_relative_paths(value, line_number, section, "home", "HOME")?,
-                    section,
-                    "home",
-                )?;
-            }
-            (ConfigSection::Capability(id), "disabled") => {
-                let disabled = match value {
-                    "true" => true,
-                    "false" => false,
-                    _ => {
-                        return Err(ConfigError::ExpectedBoolean {
-                            section: section.name(),
-                            line: line_number,
-                        });
-                    }
-                };
-                set_once(
-                    &mut capabilities
-                        .get_mut(&id)
-                        .expect("section records its capability")
-                        .disabled,
-                    disabled,
-                    section,
-                    "disabled",
-                )?;
-            }
-            (ConfigSection::Capability(id), "directory") => {
-                let value = parse_toml_string(value, section, line_number)?;
-                let directory =
-                    crate::capabilities::validate_override_directory(&value).map_err(|reason| {
-                        ConfigError::InvalidCapabilityDirectory {
-                            section: section.name(),
-                            line: line_number,
+        None => None,
+    };
+    let sandbox_deny = match file.sandbox {
+        Some(section) => relative_paths(input, section.deny, "sandbox", "deny", "workspace")?,
+        None => Vec::new(),
+    };
+    let caches_home = match file.caches {
+        Some(section) => relative_paths(input, section.home, "caches", "home", "HOME")?,
+        None => Vec::new(),
+    };
+    let (build_capacity, build_state) = match file.build {
+        None => (None, Vec::new()),
+        Some(BuildSection {
+            capacity: None,
+            state: None,
+        }) => return Err(ConfigError::EmptySection("build")),
+        Some(BuildSection { capacity, state }) => (
+            capacity
+                .map(|capacity| {
+                    crate::metadata::ImageCapacity::parse(capacity.get_ref()).map_err(|reason| {
+                        ConfigError::InvalidBuildCapacity {
+                            line: line_of(input, &capacity),
                             reason,
                         }
-                    })?;
-                set_once(
-                    &mut capabilities
-                        .get_mut(&id)
-                        .expect("section records its capability")
-                        .directory,
-                    directory,
-                    section,
-                    "directory",
-                )?;
-            }
-            (_, other) => {
-                return Err(ConfigError::UnknownKey {
-                    section: section.name(),
-                    key: other.to_owned(),
-                });
-            }
-        }
-    }
-
-    let substrate = if saw_substrate {
-        let kind = kind.ok_or(ConfigError::MissingKey {
-            section: "substrate",
-            key: "kind",
-        })?;
-        if kind != "zfs" {
-            return Err(ConfigError::UnsupportedKind(kind));
-        }
-        let pool = pool.ok_or(ConfigError::MissingKey {
-            section: "substrate",
-            key: "pool",
-        })?;
-        validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
-        Some(SubstrateConfig { pool })
-    } else {
-        None
+                    })
+                })
+                .transpose()?,
+            match state {
+                Some(entries) => build_state(input, entries)?,
+                None => Vec::new(),
+            },
+        ),
     };
-    let sandbox_deny = if saw_sandbox {
-        sandbox_deny.ok_or(ConfigError::MissingKey {
-            section: "sandbox",
-            key: "deny",
-        })?
-    } else {
-        Vec::new()
-    };
-    if saw_build && build_capacity.is_none() && build_state.is_none() {
-        return Err(ConfigError::EmptySection("build"));
-    }
-    let caches_home = if saw_caches {
-        caches_home.ok_or(ConfigError::MissingKey {
-            section: "caches",
-            key: "home",
-        })?
-    } else {
-        Vec::new()
-    };
-    let capabilities = capabilities
-        .into_iter()
-        .map(|(id, parsed)| {
-            (
-                id,
-                crate::capabilities::CapabilityOverride {
-                    disabled: parsed.disabled.unwrap_or(false),
-                    directory: parsed.directory,
-                },
-            )
-        })
-        .collect();
+    let capabilities =
+        file.capabilities
+            .into_iter()
+            .map(|(id, section)| {
+                let directory = section
+                    .directory
+                    .map(|directory| {
+                        crate::capabilities::validate_override_directory(directory.get_ref())
+                            .map_err(|reason| ConfigError::InvalidCapabilityDirectory {
+                                section: id.section_name(),
+                                line: line_of(input, &directory),
+                                reason,
+                            })
+                    })
+                    .transpose()?;
+                Ok((
+                    id,
+                    CapabilityOverride {
+                        disabled: section.disabled,
+                        directory,
+                    },
+                ))
+            })
+            .collect::<Result<_, ConfigError>>()?;
     Ok(CowshedConfig {
         substrate,
         sandbox_deny,
         caches_home,
         capabilities,
         build_capacity,
-        build_state: build_state.unwrap_or_default(),
+        build_state,
     })
 }
 
@@ -412,162 +305,121 @@ pub fn main_cowshed_config(main_mount: &Path) -> crate::Result<CowshedConfig> {
     })
 }
 
-fn set_once<T>(
-    slot: &mut Option<T>,
-    value: T,
-    section: ConfigSection,
-    key: &'static str,
-) -> Result<(), ConfigError> {
-    if slot.replace(value).is_some() {
-        return Err(ConfigError::DuplicateKey {
-            section: section.name(),
-            key,
-        });
-    }
-    Ok(())
+/// The 1-based line `value` starts on in `input`.
+fn line_of<T>(input: &str, value: &Spanned<T>) -> usize {
+    line_at(input, value.span().start)
 }
 
-/// `[sandbox] deny` and `[caches] home`: a TOML array of paths on one line, each relative to
-/// `base` (the workspace, or HOME) and a non-empty path of plain components — no root, no `.` or
-/// `..` — sorted and deduplicated.
-fn parse_relative_paths(
-    value: &str,
-    line: usize,
-    section: ConfigSection,
+/// The 1-based line of byte `offset` in `input`.
+fn line_at(input: &str, offset: usize) -> usize {
+    input
+        .bytes()
+        .take(offset)
+        .filter(|&byte| byte == b'\n')
+        .count()
+        + 1
+}
+
+/// `[sandbox] deny` and `[caches] home`: paths, each relative to `base` (the workspace, or HOME)
+/// and a non-empty path of plain components — no root, no `.` or `..` — sorted and deduplicated.
+fn relative_paths(
+    input: &str,
+    entries: Vec<Spanned<String>>,
+    section: &'static str,
     key: &'static str,
     base: &'static str,
 ) -> Result<Vec<PathBuf>, ConfigError> {
-    let paths =
-        serde_json::from_str::<Vec<String>>(value).map_err(|_| ConfigError::ExpectedPathArray {
-            section: section.name(),
-            key,
-            line,
-        })?;
-    let mut relative_paths = Vec::with_capacity(paths.len());
-    for path in paths {
-        let relative = Path::new(&path);
-        if path.is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(ConfigError::InvalidRelativePath {
-                section: section.name(),
-                key,
-                base,
-                path,
-            });
-        }
-        relative_paths.push(relative.components().collect::<PathBuf>());
-    }
-    relative_paths.sort();
-    relative_paths.dedup();
-    Ok(relative_paths)
+    let mut paths = entries
+        .into_iter()
+        .map(|entry| {
+            let line = line_of(input, &entry);
+            let path = entry.into_inner();
+            let relative = Path::new(&path);
+            if path.is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(ConfigError::InvalidRelativePath {
+                    section,
+                    key,
+                    base,
+                    line,
+                    path,
+                });
+            }
+            Ok(relative.components().collect::<PathBuf>())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
-/// `[build] state`: a TOML array of checkout-relative paths or patterns on one line, each a
-/// [`crate::capabilities::DeclaredState`], sorted and deduplicated, no spelling inside another:
-/// one inside another would link state through state. A pattern's expansion is checked again
-/// at discovery, where its matches are known.
-fn parse_build_state(
-    value: &str,
-    line: usize,
-) -> Result<Vec<crate::capabilities::DeclaredState>, ConfigError> {
-    let paths = serde_json::from_str::<Vec<String>>(value)
-        .map_err(|_| ConfigError::ExpectedBuildStateArray { line })?;
-    let mut state = Vec::with_capacity(paths.len());
-    for path in paths {
-        state.push(
-            crate::capabilities::DeclaredState::parse(&path)
-                .map_err(|reason| ConfigError::InvalidBuildState { line, path, reason })?,
-        );
-    }
+/// `[build] state`: checkout-relative paths or patterns, each a [`DeclaredState`], sorted and
+/// deduplicated, no spelling inside another: one inside another would link state through state.
+/// A pattern's expansion is checked again at discovery, where its matches are known.
+fn build_state(
+    input: &str,
+    entries: Vec<Spanned<String>>,
+) -> Result<Vec<DeclaredState>, ConfigError> {
+    let mut state = entries
+        .into_iter()
+        .map(|entry| {
+            let line = line_of(input, &entry);
+            let path = entry.into_inner();
+            DeclaredState::parse(&path)
+                .map(|declared| (declared, line))
+                .map_err(|reason| ConfigError::InvalidBuildState { line, path, reason })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Sorting by (entry, line) keeps a repeated entry's first line.
     state.sort();
-    state.dedup();
-    let spellings: Vec<PathBuf> = state.iter().map(|entry| entry.spelling()).collect();
-    for (index, outer) in spellings.iter().enumerate() {
-        if let Some(inner) = spellings
+    state.dedup_by(|later, earlier| later.0 == earlier.0);
+    let spellings: Vec<(PathBuf, usize)> = state
+        .iter()
+        .map(|(entry, line)| (entry.spelling(), *line))
+        .collect();
+    for (index, (outer, _)) in spellings.iter().enumerate() {
+        if let Some((inner, line)) = spellings
             .iter()
             .enumerate()
-            .find(|(other, inner)| *other != index && inner.starts_with(outer))
+            .find(|(other, (inner, _))| *other != index && inner.starts_with(outer))
             .map(|(_, inner)| inner)
         {
             return Err(ConfigError::OverlappingBuildState {
-                line,
+                line: *line,
                 outer: outer.clone(),
                 inner: inner.clone(),
             });
         }
     }
-    Ok(state)
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, byte) in line.bytes().enumerate() {
-        match byte {
-            b'\\' => escaped = !escaped,
-            b'"' if !escaped => quoted = !quoted,
-            b'#' if !quoted => return &line[..index],
-            _ => escaped = false,
-        }
-    }
-    line
-}
-
-fn parse_toml_string(
-    value: &str,
-    section: ConfigSection,
-    line: usize,
-) -> Result<String, ConfigError> {
-    serde_json::from_str(value).map_err(|_| ConfigError::ExpectedQuotedString {
-        section: section.name(),
-        line,
-    })
+    Ok(state.into_iter().map(|(entry, _)| entry).collect())
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ConfigError {
-    #[error("malformed configuration at line {line}")]
-    MalformedLine { line: usize },
-    #[error("the [{0}] section is duplicated")]
-    DuplicateSection(&'static str),
-    #[error("the [{section}] key {key:?} is duplicated")]
-    DuplicateKey {
-        section: &'static str,
-        key: &'static str,
-    },
-    #[error("unknown configuration section [{0}]")]
-    UnknownSection(String),
-    #[error("unknown [{section}] key {key:?}")]
-    UnknownKey { section: &'static str, key: String },
-    #[error("missing [{section}] key {key:?}")]
-    MissingKey {
-        section: &'static str,
-        key: &'static str,
-    },
-    #[error("unsupported substrate kind {0:?}; only explicit zfs is accepted")]
-    UnsupportedKind(String),
-    #[error("[{section}] value at line {line} must be a quoted string")]
-    ExpectedQuotedString { section: &'static str, line: usize },
-    #[error("[{section}] {key} at line {line} must be an array of quoted paths")]
-    ExpectedPathArray {
-        section: &'static str,
-        key: &'static str,
-        line: usize,
+    /// Not TOML, or TOML that is not a `.cowshed.toml`: a syntax error, a duplicated or unknown
+    /// section or key, a missing key, or a value of the wrong type. `message` is the TOML
+    /// reader's own, which names what it expected.
+    #[error(
+        "malformed configuration{}: {message}",
+        line.map_or_else(String::new, |line| format!(" at line {line}"))
+    )]
+    Malformed {
+        line: Option<usize>,
+        message: String,
     },
     #[error(
-        "[{section}] {key} entries must be non-empty {base}-relative paths without `.` or `..`: {path:?}"
+        "[{section}] {key} entry {path:?} at line {line} must be a non-empty {base}-relative path without `.` or `..`"
     )]
     InvalidRelativePath {
         section: &'static str,
         key: &'static str,
         base: &'static str,
+        line: usize,
         path: String,
     },
-    #[error("[{section}] value at line {line} must be true or false")]
-    ExpectedBoolean { section: &'static str, line: usize },
     #[error("[{section}] directory at line {line}: {reason}")]
     InvalidCapabilityDirectory {
         section: &'static str,
@@ -579,8 +431,6 @@ pub enum ConfigError {
         line: usize,
         reason: crate::metadata::ImageCapacityError,
     },
-    #[error("[build] state at line {line} must be an array of quoted checkout-relative paths")]
-    ExpectedBuildStateArray { line: usize },
     #[error("[build] state entry {path:?} at line {line} {reason}")]
     InvalidBuildState {
         line: usize,

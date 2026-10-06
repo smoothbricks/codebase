@@ -1602,13 +1602,14 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
 const DECLARED_STATE: &str = "upstream";
 
 /// Main's tree for the declared-build-state test: `.cowshed.toml` declares [`DECLARED_STATE`]
-/// as build state and `.gitignore` ignores it, committed; then, untracked, what an author's
-/// reconstruct script leaves there before cowshed ever saw it: a nested Git checkout of an
-/// upstream project and its build tree.
+/// as build state, in a multi-line array the way an author lays out a growing list, and
+/// `.gitignore` ignores it, committed; then, untracked, what an author's reconstruct script
+/// leaves there before cowshed ever saw it: a nested Git checkout of an upstream project and its
+/// build tree.
 fn write_declared_project(checkout: &Path) {
     fs::write(
         checkout.join(".cowshed.toml"),
-        format!("{FIXTURE_COWSHED_TOML}state = [\"{DECLARED_STATE}\"]\n"),
+        format!("{FIXTURE_COWSHED_TOML}state = [\n  # rebuilt by the reconstruct script\n  \"{DECLARED_STATE}\",\n]\n"),
     )
     .unwrap();
     fs::write(checkout.join(".gitignore"), format!("/{DECLARED_STATE}/\n")).unwrap();

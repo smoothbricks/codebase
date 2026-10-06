@@ -446,8 +446,8 @@ a workspace grant delta cannot remove a project deny.
   write allow as exact-name and descendant denies — `file-write*` for `denyWrite`, `file-read* file-write*` (with its
   `file-read-data` twin) for `deny`. Link creation remains denied; attempts to rename protected ancestors are denied by
   the parent's unlink operation. Existing workspaces use the same effective project policy as new ones.
-- **Repository-declared read+write denies.** Main's `.cowshed.toml` may declare `[sandbox] deny = ["<relative>", …]`
-  (one-line array of non-empty workspace-relative paths without `.`/`..`; comments allowed). The supervisor reads it
+- **Repository-declared read+write denies.** Main's `.cowshed.toml` may declare `[sandbox] deny = ["<relative>", …]` (a
+  TOML array, which may span lines, of non-empty workspace-relative paths without `.`/`..`). The supervisor reads it
   from main's checkout only — the operator's — never from a workspace's copy, which a job can edit; an unreadable or
   invalid file refuses the supervisor launch rather than run without the deny. Its paths join the effective `deny` set
   at the next supervisor launch.

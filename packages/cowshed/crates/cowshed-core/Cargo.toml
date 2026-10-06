@@ -44,6 +44,8 @@ serde_json.workspace = true
 sha2 = "0.10"
 thiserror = "2"
 tokio.workspace = true
+# `.cowshed.toml` is read by the real TOML grammar, typed through serde (storage/bootstrap.rs).
+toml.workspace = true
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"

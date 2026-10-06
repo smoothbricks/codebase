@@ -107,27 +107,24 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
     .unwrap();
     assert_eq!(config.substrate().unwrap().pool(), "tank");
 
-    assert_eq!(
-        parse_cowshed_config("[repository]\nname = \"widget\"\n").unwrap_err(),
-        ConfigError::UnknownSection("repository".to_owned())
-    );
-    // Cowshed has no devenv backend: a project activates devenv through its own `.envrc`.
-    assert_eq!(
-        parse_cowshed_config("[devenv]\ndir = \"tooling/devenv\"\n").unwrap_err(),
-        ConfigError::UnknownSection("devenv".to_owned())
-    );
+    for section in ["repository", "devenv"] {
+        // Cowshed has no devenv backend: a project activates devenv through its own `.envrc`.
+        let error = parse_cowshed_config(&format!("[{section}]\nname = \"widget\"\n")).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Malformed { line: Some(1), message }
+                    if message.contains(&format!("unknown field `{section}`"))
+            ),
+            "{error}"
+        );
+    }
     let invalid = [
-        (
-            "[substrate]\npool = \"tank\"\n",
-            "missing [substrate] key \"kind\"",
-        ),
-        (
-            "[substrate]\nkind = \"zfs\"\n",
-            "missing [substrate] key \"pool\"",
-        ),
+        ("[substrate]\npool = \"tank\"\n", "missing field `kind`"),
+        ("[substrate]\nkind = \"zfs\"\n", "missing field `pool`"),
         (
             "[substrate]\nkind = \"apfs\"\npool = \"tank\"\n",
-            "unsupported substrate kind",
+            "at line 2: unknown variant `apfs`, expected `zfs`",
         ),
         (
             "[substrate]\nkind = \"zfs\"\npool = \"tank/child\"\n",
@@ -135,56 +132,61 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
         ),
         (
             "[substrate]\nkind = \"zfs\"\npool = \"tank\"\nextra = \"x\"\n",
-            "unknown [substrate] key",
+            "at line 4: unknown field `extra`",
         ),
         (
             "[substrate]\nkind = \"zfs\"\nkind = \"zfs\"\npool = \"tank\"\n",
-            "duplicated",
+            "at line 3: duplicate key",
         ),
         (
             "[substrate]\nkind = \"zfs\"\npool = tank\n",
-            "quoted string",
+            "malformed configuration at line 3",
         ),
         (
             "[substrate]\nkind = \"zfs\"\npool = \"tank\"\n[substrate]\nkind = \"zfs\"\npool = \"tank\"\n",
-            "duplicated",
+            "at line 4: duplicate key",
         ),
+        ("top = \"level\"\n", "at line 1: unknown field `top`"),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
         assert!(error.to_string().contains(message), "{source:?}: {error}");
     }
-    assert_eq!(
-        parse_cowshed_config("[substrate]\nmalformed\n").unwrap_err(),
-        ConfigError::MalformedLine { line: 2 }
-    );
     for source in [
+        "[substrate]\nmalformed\n",
         "[substrate]\nkind = \"zfs\npool = \"tank\"\n",
         "[substrate]\nkind = zfs\"\npool = \"tank\"\n",
     ] {
-        assert!(matches!(
-            parse_cowshed_config(source),
-            Err(ConfigError::ExpectedQuotedString {
-                section: "substrate",
-                line: 2
-            })
-        ));
+        assert!(
+            matches!(
+                parse_cowshed_config(source),
+                Err(ConfigError::Malformed { line: Some(2), .. })
+            ),
+            "{source:?}"
+        );
     }
-    assert_eq!(
-        parse_cowshed_config("[substrate]\nkind = \"z#fs\" # outside comment\npool = \"tank\"\n")
-            .unwrap_err(),
-        ConfigError::UnsupportedKind("z#fs".to_owned())
-    );
-    assert_eq!(
-        parse_cowshed_config(
+    // A `#` inside a string is part of it, not a comment.
+    for (source, kind) in [
+        (
+            "[substrate]\nkind = \"z#fs\" # outside comment\npool = \"tank\"\n",
+            "z#fs",
+        ),
+        (
             r##"[substrate]
 kind = "z\"#fs" # outside comment
 pool = "tank"
 "##,
-        )
-        .unwrap_err(),
-        ConfigError::UnsupportedKind("z\"#fs".to_owned())
-    );
+            "z\"#fs",
+        ),
+    ] {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown variant `{kind}`")),
+            "{error}"
+        );
+    }
     for pool in ["1tank", "-tank"] {
         assert!(matches!(
             parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n")),
@@ -193,16 +195,102 @@ pool = "tank"
     }
 }
 
+/// `.cowshed.toml` is TOML: an array may span lines, end in a comma and carry comments between
+/// its entries, and a literal string is a string. Each entry error names its own line.
+#[test]
+fn cowshed_config_arrays_follow_the_toml_grammar() {
+    use cowshed_core::capabilities::{BuildStatePath, DeclaredState};
+    let config = parse_cowshed_config(
+        r#"[sandbox]
+deny = [
+  ".runtime", # runtime secrets
+  'a/./b',
+]
+
+[build]
+state = [
+  # an upstream checkout and its build tree
+  "vendor/upstream",
+  "tools/.pin",
+
+]
+
+[caches]
+home = [ ".cache/ttsc",
+         "Library/Caches/tool", ]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.sandbox_deny(),
+        [PathBuf::from(".runtime"), PathBuf::from("a/b")]
+    );
+    assert_eq!(
+        config.build_state(),
+        [
+            DeclaredState::Path(BuildStatePath::declared("tools/.pin").unwrap()),
+            DeclaredState::Path(BuildStatePath::declared("vendor/upstream").unwrap()),
+        ]
+    );
+    assert_eq!(
+        config.caches_home(),
+        [
+            PathBuf::from(".cache/ttsc"),
+            PathBuf::from("Library/Caches/tool")
+        ]
+    );
+
+    let invalid = [
+        (
+            "[build]\nstate = [\n  \"vendor\",\n  \"/abs\",\n]\n",
+            "[build] state entry \"/abs\" at line 4 must be a nonempty normalized checkout-relative path",
+        ),
+        (
+            "[build]\nstate = [\n  \"a\",\n  # nested\n  \"a/b\",\n]\n",
+            "[build] state at line 5 declares a/b inside a",
+        ),
+        (
+            "[caches]\nhome = [\n  \".cache/ok\",\n  \"../other-user\",\n]\n",
+            "[caches] home entry \"../other-user\" at line 4 must be a non-empty HOME-relative path",
+        ),
+        (
+            "[build]\nstate = [\n  \"a\",\n  7,\n]\n",
+            "malformed configuration at line 4: invalid type: integer `7`, expected a string",
+        ),
+        (
+            "[build]\nstate = [\n  \"a\"\n  \"b\"\n]\n",
+            "malformed configuration at line 4",
+        ),
+        ("[build]\nstate = [\n  \"a\",\n", "malformed configuration"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
 /// `land` runs nothing in its target, so `.cowshed.toml` has no `[land]` section: a file that
 /// still declares one is refused, never read as if its step ran.
 #[test]
 fn a_land_section_is_refused() {
     let error = parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\"]\n").unwrap_err();
-    assert_eq!(error, ConfigError::UnknownSection("land".to_owned()));
-    assert_eq!(error.to_string(), "unknown configuration section [land]");
+    assert!(
+        matches!(
+            &error,
+            ConfigError::Malformed { line: Some(1), message }
+                if message.contains("unknown field `land`")
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().starts_with(
+            "malformed configuration at line 1: unknown field `land`, expected one of"
+        ),
+        "{error}"
+    );
 }
 
-/// `[sandbox] deny` is a one-line array of workspace-relative paths, normalized, sorted and
+/// `[sandbox] deny` is an array of workspace-relative paths, normalized, sorted and
 /// deduplicated; anything that could name a path outside the workspace is refused.
 #[test]
 fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
@@ -228,15 +316,21 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
     );
 
     let invalid = [
-        ("[sandbox]\n", "missing [sandbox] key \"deny\""),
-        ("[sandbox]\ndeny = \".runtime\"\n", "array of quoted paths"),
-        ("[sandbox]\ndeny = [1]\n", "array of quoted paths"),
+        ("[sandbox]\n", "missing field `deny`"),
+        (
+            "[sandbox]\ndeny = \".runtime\"\n",
+            "at line 2: invalid type: string \".runtime\", expected a sequence",
+        ),
+        ("[sandbox]\ndeny = [1]\n", "expected a string"),
         ("[sandbox]\ndeny = [\"\"]\n", "workspace-relative"),
         ("[sandbox]\ndeny = [\"/etc\"]\n", "workspace-relative"),
         ("[sandbox]\ndeny = [\"../main\"]\n", "workspace-relative"),
         ("[sandbox]\ndeny = [\"a/../../b\"]\n", "workspace-relative"),
-        ("[sandbox]\ndeny = [\"a\"]\ndeny = [\"b\"]\n", "duplicated"),
-        ("[sandbox]\nread = [\"a\"]\n", "unknown [sandbox] key"),
+        (
+            "[sandbox]\ndeny = [\"a\"]\ndeny = [\"b\"]\n",
+            "at line 3: duplicate key",
+        ),
+        ("[sandbox]\nread = [\"a\"]\n", "unknown field `read`"),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
@@ -261,7 +355,7 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
     );
     let invalid = [
         ("[build]\n", "the [build] section sets nothing"),
-        ("[build]\ncapacity = 100\n", "must be a quoted string"),
+        ("[build]\ncapacity = 100\n", "expected a string"),
         (
             "[build]\ncapacity = \"lots\"\n",
             "[build] capacity at line 2",
@@ -269,10 +363,10 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
         ("[build]\ncapacity = \"1k\"\n", "[build] capacity at line 2"),
         (
             "[build]\ncapacity = \"1g\"\ncapacity = \"2g\"\n",
-            "duplicated",
+            "duplicate key",
         ),
-        ("[build]\ncapacity = \"1g\"\n[build]\n", "duplicated"),
-        ("[build]\nsize = \"1g\"\n", "unknown [build] key"),
+        ("[build]\ncapacity = \"1g\"\n[build]\n", "duplicate key"),
+        ("[build]\nsize = \"1g\"\n", "unknown field `size`"),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
@@ -280,7 +374,7 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
     }
 }
 
-/// `[caches] home` reuses `[sandbox] deny`'s parsing: a one-line array of HOME-relative paths of
+/// `[caches] home` reuses `[sandbox] deny`'s parsing: an array of HOME-relative paths of
 /// plain components, normalized, sorted and deduplicated; an empty, absolute or escaping entry is
 /// refused, and so is a section without its key.
 #[test]
@@ -311,12 +405,12 @@ fn caches_home_is_an_array_of_home_relative_paths() {
     );
 
     let invalid = [
-        ("[caches]\n", "missing [caches] key \"home\""),
+        ("[caches]\n", "missing field `home`"),
         (
             "[caches]\nhome = \".cache/ttsc\"\n",
-            "[caches] home at line 2 must be an array of quoted paths",
+            "malformed configuration at line 2: invalid type: string \".cache/ttsc\", expected a sequence",
         ),
-        ("[caches]\nhome = [7]\n", "array of quoted paths"),
+        ("[caches]\nhome = [7]\n", "expected a string"),
         ("[caches]\nhome = [\"\"]\n", "HOME-relative"),
         ("[caches]\nhome = [\"/etc\"]\n", "HOME-relative"),
         ("[caches]\nhome = [\"..\"]\n", "HOME-relative"),
@@ -325,9 +419,12 @@ fn caches_home_is_an_array_of_home_relative_paths() {
             "[caches]\nhome = [\".cache/../../escape\"]\n",
             "HOME-relative",
         ),
-        ("[caches]\nhome = [\"a\"]\nhome = [\"b\"]\n", "duplicated"),
-        ("[caches]\n[caches]\n", "duplicated"),
-        ("[caches]\nshared = [\"a\"]\n", "unknown [caches] key"),
+        (
+            "[caches]\nhome = [\"a\"]\nhome = [\"b\"]\n",
+            "duplicate key",
+        ),
+        ("[caches]\n[caches]\n", "duplicate key"),
+        ("[caches]\nshared = [\"a\"]\n", "unknown field `shared`"),
     ];
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
@@ -365,7 +462,7 @@ fn build_state_declares_disjoint_checkout_relative_paths() {
         Path::new("declared/tools/.pin")
     );
     let invalid = [
-        ("[build]\nstate = \"a\"\n", "must be an array of quoted"),
+        ("[build]\nstate = \"a\"\n", "expected a sequence"),
         (
             "[build]\nstate = [\"/abs\"]\n",
             "normalized checkout-relative",
@@ -386,7 +483,7 @@ fn build_state_declares_disjoint_checkout_relative_paths() {
             "[build]\nstate = [\"a\", \"a/b\"]\n",
             "declares a/b inside a; declare only the outer path",
         ),
-        ("[build]\nstate = []\nstate = []\n", "duplicated"),
+        ("[build]\nstate = []\nstate = []\n", "duplicate key"),
         (
             "[build]\nstate = [\"packages/*\"]\n",
             "must end in a literal name",

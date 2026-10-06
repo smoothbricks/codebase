@@ -36,7 +36,10 @@ pub mod sccache;
 pub mod uv;
 pub mod zig;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// A detector's identity. It deserializes from its [`Self::name`], the key of a `.cowshed.toml`
+/// `[capabilities.<name>]` section.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CapabilityId {
     Direnv,
     Nx,
@@ -87,10 +90,6 @@ impl CapabilityId {
             Self::Sccache => "capabilities.sccache",
             Self::Codegraph => "capabilities.codegraph",
         }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|id| id.name() == name)
     }
 
     pub const ALL: [Self; 13] = [

@@ -27,15 +27,9 @@ tokio.workspace = true
 # sccache's own config file is TOML, and `setup` has to read one it did not write without
 # reordering or dropping a key its author set. Parsing is what makes the never-clobber decision
 # honest; preservation is keys and byte-for-byte prefix — only a missing final newline is
-# inserted — and only cowshed's appended block is ever rewritten.
-#
-# `serde` is load-bearing and is NOT about (de)serializing our own types, so enumerating call
-# sites will mislead you: in toml 1.x the `toml::Table` and `toml::Value` types are themselves
-# behind `#[cfg(feature = "serde")]`, and capabilities/sccache/client_config.rs reads the config through
-# both. Dropping the feature does not trim a feature, it deletes the types —
-# `cargo check -p cowshed-cli` then fails with "cannot find type `Table` in crate `toml`".
-# Verify with a build, not by reading usage, before touching this line.
-toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# inserted — and only cowshed's appended block is ever rewritten. The workspace manifest says why
+# its `serde` feature is load-bearing.
+toml.workspace = true
 
 [dev-dependencies]
 # Paused time: a test lets a day pass while a foreground exec still waits for its job.
