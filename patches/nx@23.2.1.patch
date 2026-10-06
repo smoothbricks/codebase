@@ -441,6 +441,102 @@ index 4a34ba2..c08789f 100644
  }
  /**
   * Converts a string representation of a max cache size to a number.
+diff --git a/dist/src/tasks-runner/task-graph-utils.d.ts b/dist/src/tasks-runner/task-graph-utils.d.ts
+index 2ba00c254450c7d3b93e288b1f0bb28361ef8cf3..5f76eee85731e34fbf1edc4ebc0c7593dd2abdbd 100644
+--- a/dist/src/tasks-runner/task-graph-utils.d.ts
++++ b/dist/src/tasks-runner/task-graph-utils.d.ts
+@@ -10,7 +10,10 @@ export declare function findCycle(graph: {
+ }): string[] | null;
+ /**
+  * This function finds all cycles in the graph.
+- * @returns a list of unique task ids in all cycles found, or null if no cycle is found.
++ * @returns the unique task ids that lie on a cycle (every task of a strongly connected component of more than one
++ * task, and every task that depends on itself), or null if there is none. A task that merely leads to a cycle is not
++ * on it. The answer is a property of the graph, not of the order of its keys or of the tasks around it: this is what
++ * dummy-task flattening reads, and a different answer there gives a task different dependencies.
+  */
+ export declare function findCycles(graph: {
+     dependencies: Record<string, string[]>;
+diff --git a/dist/src/tasks-runner/task-graph-utils.js b/dist/src/tasks-runner/task-graph-utils.js
+index 42dc80a7a3551c9fe0737f39388670e9a7a475dd..99ac4a74f9cec802360f365d7ca8fc344412d53b 100644
+--- a/dist/src/tasks-runner/task-graph-utils.js
++++ b/dist/src/tasks-runner/task-graph-utils.js
+@@ -42,18 +42,66 @@ function findCycle(graph) {
+ }
+ /**
+  * This function finds all cycles in the graph.
+- * @returns a list of unique task ids in all cycles found, or null if no cycle is found.
++ * @returns the unique task ids that lie on a cycle (every task of a strongly connected component of more than one
++ * task, and every task that depends on itself), or null if there is none. A task that merely leads to a cycle is not
++ * on it. The answer is a property of the graph, not of the order of its keys or of the tasks around it: this is what
++ * dummy-task flattening reads, and a different answer there gives a task different dependencies.
+  */
+ function findCycles(graph) {
+-    const visited = {};
++    const edges = (id) => [
++        ...(graph.dependencies[id] ?? []),
++        ...(graph.continuousDependencies?.[id] ?? []),
++    ];
++    // Tarjan's algorithm, iterative so a deep dependency chain cannot overflow the stack.
++    const order = new Map();
++    const lowest = new Map();
++    const open = [];
++    const isOpen = new Set();
+     const cycles = new Set();
+-    for (const t of Object.keys(graph.dependencies)) {
+-        visited[t] = false;
+-    }
+-    for (const t of Object.keys(graph.dependencies)) {
+-        const cycle = _findCycle(graph, t, visited, [t]);
+-        if (cycle) {
+-            cycle.forEach((t) => cycles.add(t));
++    const enter = (id) => {
++        order.set(id, order.size);
++        lowest.set(id, order.get(id));
++        open.push(id);
++        isOpen.add(id);
++        return { id, edges: edges(id), next: 0 };
++    };
++    for (const start of Object.keys(graph.dependencies)) {
++        if (order.has(start)) {
++            continue;
++        }
++        const frames = [enter(start)];
++        while (frames.length > 0) {
++            const frame = frames[frames.length - 1];
++            if (frame.next < frame.edges.length) {
++                const d = frame.edges[frame.next++];
++                if (d === frame.id) {
++                    cycles.add(d);
++                }
++                if (!order.has(d)) {
++                    frames.push(enter(d));
++                }
++                else if (isOpen.has(d)) {
++                    lowest.set(frame.id, Math.min(lowest.get(frame.id), order.get(d)));
++                }
++                continue;
++            }
++            frames.pop();
++            const caller = frames[frames.length - 1];
++            if (caller) {
++                lowest.set(caller.id, Math.min(lowest.get(caller.id), lowest.get(frame.id)));
++            }
++            if (lowest.get(frame.id) === order.get(frame.id)) {
++                const component = [];
++                let member;
++                do {
++                    member = open.pop();
++                    isOpen.delete(member);
++                    component.push(member);
++                } while (member !== frame.id);
++                if (component.length > 1) {
++                    component.forEach((id) => cycles.add(id));
++                }
++            }
+         }
+     }
+     return cycles.size ? cycles : null;
 diff --git a/dist/src/utils/installation-directory.d.ts b/dist/src/utils/installation-directory.d.ts
 index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24adc4adf7a8 100644
 --- a/dist/src/utils/installation-directory.d.ts

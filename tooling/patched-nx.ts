@@ -35,12 +35,16 @@ const NX_REGISTRY_INTEGRITY =
 const NX_REGISTRY_TARBALL = `https://registry.npmjs.org/nx/-/nx-${NX_VERSION}.tgz`;
 const REPOSITORY = 'smoothbricks/codebase';
 const ASSET = `nx-${NX_VERSION}.tgz`;
-/** The upstream pull requests whose fixes the patch carries; the release is retired when Nx ships all of them. */
+/** The upstream pull requests whose fixes the patch carries. */
 const UPSTREAM = [
   ['nrwl/nx#37268', 'record task history on the client\u2019s own database connection'],
   ['nrwl/nx#37269', 'size the default cache bound from the cache\u2019s own filesystem'],
   ['nrwl/nx#37271', 'keep daemon plugin workers with graph hooks alive between graphs'],
   ['nrwl/nx#37272', 'resolve typescript and release version actions from the workspace root'],
+] as const;
+/** Repairs the patch carries that no upstream pull request proposes yet. */
+const NOT_YET_UPSTREAM = [
+  ['task graph', 'give a task the same dependencies whichever other tasks the run asks for (`findCycles`)'],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
@@ -185,12 +189,16 @@ function notes(built: Release): string {
     '',
     ...UPSTREAM.map(([pr, what]) => `- https://github.com/${pr.replace('#', '/pull/')} (${pr}): ${what}`),
     '',
+    'and these repairs, which no upstream pull request proposes yet:',
+    '',
+    ...NOT_YET_UPSTREAM.map(([area, what]) => `- ${area}: ${what}`),
+    '',
     'A consumer keeps `nx` at its registry version and sets `overrides.nx` to this asset\u2019s URL; bun.lock pins:',
     '',
     `- ${built.asset}: \`${built.integrity}\``,
     `- uncompressed tar sha256: \`${built.tarSha256}\``,
     '',
-    'Drop the override, and this release with it, once the installed Nx release contains all of these fixes.',
+    'Drop the override, and this release with it, once the installed Nx release contains all of these.',
     '',
   ].join('\n');
 }

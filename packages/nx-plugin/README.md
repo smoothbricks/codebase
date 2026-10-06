@@ -604,6 +604,16 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   and `release version` cannot resolve `@nx/js`'s version actions. The patch resolves both through `getNxRequirePaths`
   (the workspace first), falling back to Nx's own location. See
   [upstream Nx #37272](https://github.com/nrwl/nx/pull/37272).
+- **A task's dependencies do not depend on which other tasks the run asks for.** A target that depends on `^build`
+  through a project with no `build` target gets a dummy task for it, and Nx flattens each dummy into the real tasks
+  behind it except a dummy it believes sits in a cycle. `findCycles` reported every task on the depth-first path that
+  first reached a cycle, and only the cycles reached before another traversal marked their tasks visited, so the answer
+  followed the order of the graph's keys. In a workspace whose projects import each other, a shard requested alone
+  (`nx run app:test-4`) and the same shard requested through its aggregate (`nx run-many -t test`) got different
+  dependencies and, because `dependentTasksOutputFiles` keys on the dependency tasks' outputs, different hashes: a
+  pre-run of one never hit the cache of the other. The patch answers with the tasks that lie on a cycle (Tarjan's
+  strongly connected components), so a task's dependencies are a property of the graph behind it. Not yet proposed
+  upstream: Nx `master` carries the same `findCycles`.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -612,8 +622,8 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker and store-resolution regressions pass; preserve any repair not yet released. When every
-hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution and task-graph regressions pass; preserve any repair not yet released.
+When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 
