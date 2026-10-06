@@ -13,9 +13,11 @@
  *
  * Cargo's own `.rustc_info.json` (one per target directory) is the same trap.
  * It caches `rustc -vV` and `--print sysroot` under a key of the rustc path and
- * its mtime. Here that path is the devenv profile's `bin/rustc`, which a lock
- * bump never moves, and every Nix store file has mtime 1, so the key survives
- * a toolchain bump unchanged: after rust-overlay moved 1.100.0-nightly
+ * its mtime. The shell names rustc by the toolchain's store path
+ * (devenv.smoo.nix), which a bump moves, but a git hook reaches it through the
+ * devenv profile's `bin/rustc` (repo-path), which a lock bump never moves, and
+ * every Nix store file has mtime 1, so that key survives a toolchain bump
+ * unchanged: after rust-overlay moved 1.100.0-nightly
  * (2026-09-08) to 1.101.0-nightly (2026-10-03), `-Zbuild-std` compiled the OLD
  * nightly's rust-src with the NEW compiler (`unrecognized intrinsic function`
  * in core) because the cached sysroot still named the old store path.

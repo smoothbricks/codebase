@@ -36,6 +36,22 @@
   # devenv's own python tasks.
   python = config.languages.python;
   uvProject = python.enable && python.uv.enable;
+
+  # The Rust toolchain's own store bin, put ahead of this checkout's profile on
+  # PATH (enterShell item 2). `cargo clippy` runs `cargo-clippy`, which sets
+  # RUSTC_WORKSPACE_WRAPPER to the clippy-driver beside its own executable path
+  # (current_exe, which on Darwin is the path that was executed, symlinks
+  # unresolved), and cargo hashes that wrapper path into the identity of every
+  # workspace unit it checks. Reached through
+  # `<checkout>/tooling/direnv/.devenv/profile/bin`, the wrapper names the
+  # checkout, so a copy-on-write clone at another path re-checks every
+  # workspace crate under fresh unit directories although its target/ arrived
+  # warm, and the stale ones pile up per checkout. Resolved here, cargo,
+  # cargo-clippy and clippy-driver are one store path in every checkout.
+  # rustc resolves here too, but cargo keys units on its `-vV` output and not
+  # its path, so plain builds keep their units. The profile still carries the
+  # same files for anything that names it.
+  rustToolchainBin = "${config.languages.rust.toolchainPackage}/bin";
 in {
   env = lib.mkMerge [
     {
@@ -394,7 +410,10 @@ in {
     # 1. The devenv wrapper runs from tooling/direnv; every later step expects the
     #    workspace root.
     # 2. PATH order is most-specific → least-specific, the same list the git hooks
-    #    use, so a hook and a shell resolve one binary the same way.
+    #    use, so a hook and a shell resolve one binary the same way. The Rust
+    #    toolchain's store bin then goes ahead of all of it (rustToolchainBin
+    #    above): the same files the profile links, named by a path no checkout
+    #    owns.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
     # 4. ttsc caches in the checkout's .cache/ttsc (the path the CI ttsc-plugin
@@ -476,6 +495,7 @@ in {
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
+      export PATH="${rustToolchainBin}:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.
       # Tools then fall back to /tmp, which on Darwin is not the per-user
       # temporary directory the OS hands out, and a test that asserts the
