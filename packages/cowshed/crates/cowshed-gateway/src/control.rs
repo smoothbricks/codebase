@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,13 +19,15 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
-    DISK_LEASE_OP, DiskClass, EgressGrant, EgressMode, GatewayStatus, HostPattern, LeaseState,
-    MirrorRoute, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DiskClass, EgressGrant, EgressMode,
+    GatewayStatus, HostPattern, LeaseState, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
+    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
     actor::{GatewayError, GatewayHandle},
     config::{CONTROL_TCP_ADDR, StartupProbe},
+    cpu_budget::CpuBudget,
     disk_lease::{Claim, DiskLeases},
     interfaces::AuditEvent,
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
@@ -35,6 +38,8 @@ use crate::{
 };
 
 const MAX_CONTROL_MESSAGE: u64 = 1024 * 1024;
+/// The longest checkout path a `cpu-tokens` request may name; a longer one is refused.
+const MAX_CHECKOUT: usize = 4096;
 const MAX_AUDIT_TAIL_LIMIT: usize = 1024;
 const CONTROLLER_CREDENTIAL_BYTES: usize = 32;
 const CONTROLLER_CREDENTIAL_PREFIX: &str = "cctl1_";
@@ -328,13 +333,23 @@ enum ControlRequest {
         repo_id: String,
         device: String,
     },
+    /// The host CPU budget's ledger.
+    CpuBudget,
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
-/// or a disk lease, held for as long as its client keeps the connection open.
+/// or a disk lease or CPU tokens, held for as long as its client keeps the connection open.
 enum Incoming {
     Request(ControlRequest),
-    DiskLease { class: DiskClass, command: String },
+    DiskLease {
+        class: DiskClass,
+        command: String,
+    },
+    CpuTokens {
+        want: NonZeroUsize,
+        checkout: String,
+        command: String,
+    },
 }
 
 /// A `disk-lease` request's fields. Its keys are checked against the operation's allowed set
@@ -342,6 +357,14 @@ enum Incoming {
 #[derive(Deserialize)]
 struct DiskLeaseIn {
     class: DiskClass,
+    command: String,
+}
+
+/// A `cpu-tokens` request's fields, read the way [`DiskLeaseIn`] is.
+#[derive(Deserialize)]
+struct CpuTokensIn {
+    want: NonZeroUsize,
+    checkout: String,
     command: String,
 }
 
@@ -372,6 +395,11 @@ struct ControlResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lease: Option<LeaseState>,
+    /// How many CPU tokens a `cpu-tokens` grant holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_budget: Option<CpuBudgetStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -614,6 +642,7 @@ pub(crate) struct ControlServices {
     pub audit_tail: Option<AuditTailHandle>,
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
+    pub cpu_budget: CpuBudget,
 }
 
 impl ControlServices {
@@ -640,6 +669,7 @@ impl fmt::Debug for ControlServices {
             .field("audit_tail", &self.audit_tail)
             .field("startup", &self.startup)
             .field("disk_leases", &self.disk_leases)
+            .field("cpu_budget", &self.cpu_budget)
             .finish()
     }
 }
@@ -735,12 +765,36 @@ async fn serve<R, W>(
         .and_then(|line| parse(&line))
     {
         Ok(Incoming::DiskLease { class, command }) => {
-            serve_disk_lease(
+            let (tenure, granted) = services.disk_leases.ask(class, Claim::new(&command, pid));
+            hold(
                 reader,
                 writer,
-                class,
-                Claim::new(&command, pid),
-                &services.disk_leases,
+                tenure,
+                granted,
+                |()| lease(LeaseState::Granted),
+                "disk-lease scheduler",
+            )
+            .await;
+        }
+        Ok(Incoming::CpuTokens {
+            want,
+            checkout,
+            command,
+        }) => {
+            let (stake, granted) =
+                services
+                    .cpu_budget
+                    .ask(Arc::from(checkout), want, Claim::new(&command, pid));
+            hold(
+                reader,
+                writer,
+                stake,
+                granted,
+                |tokens| ControlResponse {
+                    tokens: Some(tokens),
+                    ..lease(LeaseState::Granted)
+                },
+                "CPU budget",
             )
             .await;
         }
@@ -752,20 +806,21 @@ async fn serve<R, W>(
     }
 }
 
-/// Hold one disk lease for this connection: answer `queued` at once, `granted` once the lease
-/// scheduler admits it, then hold until the client closes. A client that closes while queued
-/// leaves the queue.
-async fn serve_disk_lease<R, W>(
+/// Hold one lease for this connection — a disk lease or CPU tokens — whose stake is `stake`:
+/// answer `queued` at once, the `granted` answer once the scheduler admits it, then hold until the
+/// client closes. A client that closes while queued leaves the queue; either way, dropping the
+/// stake gives back whatever it held.
+async fn hold<R, W, S, G>(
     mut reader: R,
     mut writer: W,
-    class: DiskClass,
-    claim: Claim,
-    leases: &DiskLeases,
+    stake: S,
+    granted: tokio::sync::oneshot::Receiver<G>,
+    answer: impl FnOnce(G) -> ControlResponse,
+    scheduler: &str,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (tenure, granted) = leases.ask(class, claim);
     if write_response(&mut writer, &lease(LeaseState::Queued))
         .await
         .is_err()
@@ -773,32 +828,32 @@ async fn serve_disk_lease<R, W>(
         return;
     }
     let mut discard = [0_u8; 64];
-    tokio::select! {
-        answer = granted => if answer.is_err() {
-            let _ = write_response(
-                &mut writer,
-                &failure(
-                    ControlFailureCode::Rejected,
-                    "the gateway's disk-lease scheduler has stopped".to_owned(),
-                ),
-            )
-            .await;
-            return;
+    let grant = tokio::select! {
+        answer = granted => match answer {
+            Ok(grant) => grant,
+            Err(_) => {
+                let _ = write_response(
+                    &mut writer,
+                    &failure(
+                        ControlFailureCode::Rejected,
+                        format!("the gateway's {scheduler} has stopped"),
+                    ),
+                )
+                .await;
+                return;
+            }
         },
         // EOF, a broken socket, or bytes a lease client never sends: it is gone or confused, and
         // either way it leaves the queue.
         _ = reader.read(&mut discard) => return,
-    }
-    if write_response(&mut writer, &lease(LeaseState::Granted))
-        .await
-        .is_err()
-    {
+    };
+    if write_response(&mut writer, &answer(grant)).await.is_err() {
         return;
     }
     while let Ok(read) = reader.read(&mut discard).await
         && read > 0
     {}
-    drop(tenure);
+    drop(stake);
 }
 
 fn parse_control_request(bytes: &[u8]) -> Result<Incoming, ControlError> {
@@ -825,7 +880,9 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-approve" => &["op", "approval"],
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
+        "cpu-budget" => &["op"],
         DISK_LEASE_OP => &["op", "class", "command"],
+        CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -841,6 +898,23 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
     if op == DISK_LEASE_OP {
         let DiskLeaseIn { class, command } = serde_json::from_value(value).map_err(encoding)?;
         return Ok(Incoming::DiskLease { class, command });
+    }
+    if op == CPU_TOKENS_OP {
+        let CpuTokensIn {
+            want,
+            checkout,
+            command,
+        } = serde_json::from_value(value).map_err(encoding)?;
+        if checkout.is_empty() || checkout.len() > MAX_CHECKOUT {
+            return Err(ControlError::Encoding(format!(
+                "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
+            )));
+        }
+        return Ok(Incoming::CpuTokens {
+            want,
+            checkout,
+            command,
+        });
     }
     serde_json::from_value(value)
         .map(Incoming::Request)
@@ -1022,6 +1096,19 @@ async fn dispatch(
             },
             None,
         ),
+        ControlRequest::CpuBudget => (
+            match services.cpu_budget.status().await {
+                Some(budget) => ControlResponse {
+                    cpu_budget: Some(budget),
+                    ..success()
+                },
+                None => failure(
+                    ControlFailureCode::Rejected,
+                    "the gateway's CPU budget has stopped".to_owned(),
+                ),
+            },
+            None,
+        ),
     }
 }
 
@@ -1127,6 +1214,8 @@ fn success() -> ControlResponse {
         code: None,
         error: None,
         lease: None,
+        tokens: None,
+        cpu_budget: None,
     }
 }
 
@@ -1278,6 +1367,12 @@ mod tests {
             r#"{"op":"disk-lease","class":"storage","command":"diskutil","pid":1}"#,
             r#"{"op":"disk-lease","class":"compute","command":"diskutil"}"#,
             r#"{"op":"disk-lease","class":"storage"}"#,
+            r#"{"op":"cpu-tokens","want":0,"checkout":"/w","command":"nextest"}"#,
+            r#"{"op":"cpu-tokens","want":-1,"checkout":"/w","command":"nextest"}"#,
+            r#"{"op":"cpu-tokens","want":4,"checkout":"","command":"nextest"}"#,
+            r#"{"op":"cpu-tokens","want":4,"command":"nextest"}"#,
+            r#"{"op":"cpu-tokens","want":4,"checkout":"/w","command":"nextest","pid":1}"#,
+            r#"{"op":"cpu-budget","verbose":true}"#,
         ] {
             assert!(parse_control_request(request.as_bytes()).is_err());
         }
@@ -1290,6 +1385,27 @@ mod tests {
                 command,
             }) if command == "/sbin/umount /x"
         ));
+        assert!(matches!(
+            parse_control_request(
+                br#"{"op":"cpu-tokens","want":64,"checkout":"/w","command":"cargo nextest run"}"#
+            ),
+            Ok(Incoming::CpuTokens { want, checkout, command })
+                if want.get() == 64 && checkout == "/w" && command == "cargo nextest run"
+        ));
+        assert!(matches!(
+            parse_control_request(br#"{"op":"cpu-budget"}"#),
+            Ok(Incoming::Request(ControlRequest::CpuBudget))
+        ));
+        assert!(
+            parse_control_request(
+                format!(
+                    r#"{{"op":"cpu-tokens","want":1,"checkout":"{}","command":"x"}}"#,
+                    "c".repeat(MAX_CHECKOUT + 1)
+                )
+                .as_bytes()
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_str::<AuthenticatedControlRequestIn>(
                 r#"{"controllerCredential":"secret","request":{"op":"status"},"extra":true}"#,

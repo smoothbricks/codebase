@@ -299,6 +299,7 @@ impl Gateway {
                         audit_tail: audit_tail.clone(),
                         startup: config.startup.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
+                        cpu_budget: crate::cpu_budget::CpuBudget::start(config.cpu_budget),
                     },
                     config.control_tcp.as_ref(),
                 )

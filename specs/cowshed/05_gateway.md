@@ -231,9 +231,9 @@ coordinator-side; the data plane supplies neither git credentials nor a push pat
 ## Control plane (Unix socket + optional 7644)
 
 The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, and
-the host's disk-lifecycle lease to every process that runs a disk tool (below). Peer credentials on the Unix socket (and
-equivalent local authentication on TCP) must identify an authorized host process; the data-plane token is never accepted
-on the control plane.
+the host's disk-lifecycle lease and CPU budget to every process that runs a disk tool or a parallel runner (below). Peer
+credentials on the Unix socket (and equivalent local authentication on TCP) must identify an authorized host process;
+the data-plane token is never accepted on the control plane.
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
@@ -249,7 +249,7 @@ snapshot; that decision stands, and the write counts as superseded rather than f
 reconcile.
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a `disk-lease`
-request is held for as long as its client keeps the connection open.
+or `cpu-tokens` request is held for as long as its client keeps the connection open.
 
 ## Disk-lifecycle lease
 
@@ -292,6 +292,62 @@ The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_moun
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
 gateway's lease and then unleased. Measured at load 14–50: leased, 125 attaches at 1.24 s p50 and 1.93 s p95 (2.09 s and
 3.39 s with the lease wait); unleased, 8 attaches, each taking 53.5 s.
+
+## Host CPU budget
+
+Every gate on the host sizes its runners to the whole machine. Nx runs one task per core, and each nextest run under it
+runs one test thread per core again; five to ten concurrent gates on an 18-core host kept the load average at 80–170,
+and tests that do no disk work timed out waiting for a CPU (37 of 65 timeouts in one acceptance run). Running anything
+serially would trade those timeouts for idle cores. The gateway instead holds one budget of CPU tokens for the host: a
+runner takes tokens before it starts and sizes its own parallelism to its grant, every gate keeps running its tasks in
+parallel, and the total runnable work stays near the core count.
+
+- **The budget.** N tokens, one per core the host reports (`std::thread::available_parallelism`); one token is one
+  runnable thread or process. The ledger keeps `free + Σ held = N`; it never infers a holder from a process scan.
+- **Who asks.** The `@smoothbricks/nx-plugin` `bounded-exec` executor, before it starts any command — the inferred
+  nextest runners, `bun test` targets, cargo commands it runs. Its `want` is the command's runner's own parallelism: a
+  `nextest run` asks for its `--test-threads` or one per core; `bun test --parallel=N` for N workers, a bare
+  `--parallel` for one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`) for
+  one job per core; anything else, one `bun test` process included, for one. A target's `parallelism` option outranks
+  all of these. `test.concurrent` inside one process is not another CPU.
+- **Sized to the grant.** A grant is between 1 and `want` (a `want` above N asks for N). The executor sets
+  `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
+  outranks the environment), sets `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command
+  `BOUNDED_EXEC_CPU_TOKENS`, so a script that starts a runner itself can size it.
+- **Fair between checkouts.** The checkout is the Nx workspace root the request names. A checkout's share is N divided
+  among the checkouts holding or waiting (at least 1). The next grant goes to the waiting checkout that holds the fewest
+  tokens (the older head request on a tie), to its oldest request. While another checkout waits, that grant is
+  `min(want, max(1, share − held))`; with nobody else waiting it is `min(want, free)`. A head request whose least grant
+  is not free yet waits for it, and so does everyone behind it, so a large request is never starved by a stream of small
+  ones. A gate with sixty runners queued cannot crowd out one with three.
+- **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
+  requests can deadlock on each other's tokens.
+- **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
+  the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
+  restart forgets every grant, so runners started under the old one overshoot until they finish.
+- **The bounds start at the grant.** The executor's `timeoutMs` and `idleTimeoutMs` start when the command starts, after
+  the grant: a wait for the host is not the command's time.
+- **Wire.** The client writes `{"op":"cpu-tokens","want":<n>,"checkout":"<workspace root>","command":"<command>"}` and
+  does not half-close. The gateway answers `{"ok":true,"lease":"queued"}` at once and
+  `{"ok":true,"lease":"granted","tokens":<g>}` when the runner may start. `want` 0, a missing or empty checkout, or one
+  over 4096 bytes is refused as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as
+  `cpuBudget`: `total`, `held`, and per checkout `held`, `running` and `waiting`.
+- **The budget spaces runners out; it never decides whether one runs.** With no gateway listening (any host without
+  cowshed, CI included) the command runs exactly as configured and nothing is said. A gateway that predates the budget
+  refuses the unknown operation at once (an older one, silent until EOF, is half-closed after 2 s), and the command runs
+  unbudgeted with that reason on its stderr. A grant has no deadline: queued, the client knows the gateway is alive.
+- **Spans.** The executor prints
+  `cowshed: cpu-tokens wait done elapsed=<ms>ms status=ok tokens=<g>/<want> runner=<kind>` before the command's own
+  output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited
+  and how many threads it ran with. With `COWSHED_TIMING` set, the gateway prints each grant: tokens, want, the wait,
+  the checkout, and the client's pid and command.
+- **Not budgeted.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's `cargo` — run
+  as before; Cargo's make-protocol jobserver is the path for those builds and is not built.
+
+Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
+over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
+refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
+`executor.test.ts` (a granted run sized and released, a refused one run as asked).
 
 ## Credentials
 
