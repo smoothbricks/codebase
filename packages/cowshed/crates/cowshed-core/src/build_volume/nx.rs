@@ -59,6 +59,37 @@ pub fn discard_daemon_records(volume: &Path, state: &BuildVolumeState) -> io::Re
     Ok(())
 }
 
+/// Copy into the volume rooted at `into` the record of each live daemon the volume rooted at
+/// `from` names, when that daemon runs outside every sandbox, for a checkout whose build link
+/// moves from `from` to `into` with no task database of `from` open ([`held`], under
+/// [`hold_opens`]). Nx's daemon checks every 20 ms that the record names it and exits once it
+/// does not (pinned Nx 23.2.1, `daemon/server/server.js`), so a daemon the move left without
+/// its record dies under its clients, and a client that writes to it then fails
+/// (`write EPIPE`). A host daemon with no task database open resolves every other path of its
+/// state through the link when it opens it, as its clients do, so it serves the checkout on
+/// `into` as it did on `from`. A sandboxed daemon (a workspace keeper's) is left to exit: its
+/// grant names `from` alone, and its keeper starts the next one with a grant naming `into`.
+#[cfg(target_os = "macos")]
+pub fn hand_over_daemon_records(
+    from: &Path,
+    state: &BuildVolumeState,
+    into: &Path,
+) -> io::Result<()> {
+    for data in state.nx_workspace_data() {
+        let record = from.join(data).join(DAEMON_DIRECTORY).join(DAEMON_RECORD);
+        let Some(live) = crate::runtime::nx_daemon::live_record(&record) else {
+            continue;
+        };
+        if crate::process::sandboxed(live.pid)? {
+            continue;
+        }
+        let directory = into.join(data).join(DAEMON_DIRECTORY);
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join(DAEMON_RECORD), &live.bytes)?;
+    }
+    Ok(())
+}
+
 /// Why a volume's Nx state could not be closed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Busy {
@@ -162,6 +193,80 @@ pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Bu
         }
     }
     Ok(Ok(()))
+}
+
+/// Nx's open locks on a volume's task databases, held by this process until dropped. Stock Nx
+/// opens a task database only while it holds that database's open lock: the database's path
+/// with the `lock` extension, locked exclusively (`flock`) before the database is opened and let
+/// go once it is (pinned Nx 23.2.1, `native/db/mod.rs` `connect_to_nx_db`,
+/// `native/db/initialize.rs` `create_lock_file`). So while these are held no Nx process opens
+/// one of the databases: an opener waits on the lock, then opens the database by its path, so
+/// through whatever the checkout's build link names once they are let go.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub struct Opens {
+    _locks: Vec<fs::File>,
+}
+
+/// A task database an Nx process is opening: the processes that have its open lock open, the
+/// one holding it and any waiting on it.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Opening {
+    pub database: PathBuf,
+    pub holders: Vec<Holder>,
+}
+
+/// Take, without waiting, the open lock of each task database the volume rooted at `volume`
+/// holds and of each one `next` holds at the same place, which an Nx process opening through
+/// the checkout's link would create in `volume` while the link still names it. Answers the held
+/// locks, or the first database an Nx process is opening right now, after letting go of the
+/// rest. While the locks are held, [`held`] covers every Nx process: one that opened a database
+/// before holds it, and one that had not waits until the locks are let go.
+#[cfg(target_os = "macos")]
+pub fn hold_opens(
+    volume: &Path,
+    state: &BuildVolumeState,
+    next: &Path,
+) -> io::Result<Result<Opens, Opening>> {
+    let mut locks = Vec::new();
+    for data in state.nx_workspace_data() {
+        let mut names = std::collections::BTreeSet::new();
+        for root in [volume, next] {
+            names.extend(
+                task_databases_in(&root.join(data))?
+                    .into_iter()
+                    .filter_map(|database| database.file_name().map(ToOwned::to_owned)),
+            );
+        }
+        if names.is_empty() {
+            continue;
+        }
+        let directory = volume.join(data);
+        fs::create_dir_all(&directory)?;
+        for name in names {
+            let database = directory.join(name);
+            let lock = database.with_extension("lock");
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)?;
+            match file.try_lock() {
+                Ok(()) => locks.push(file),
+                Err(fs::TryLockError::WouldBlock) => {
+                    drop(file);
+                    drop(locks);
+                    return Ok(Err(Opening {
+                        database,
+                        holders: holders(&lock)?,
+                    }));
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+    Ok(Ok(Opens { _locks: locks }))
 }
 
 fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
@@ -1020,11 +1125,13 @@ mod tests {
         /// Run `nx daemon <verb>` in the checkout as a host shell does, without the caller's
         /// `NX_*` or `CI`; it must exit 0. Answers what it printed.
         fn daemon(&self, verb: &str) -> String {
+            self.run(&["daemon", verb])
+        }
+
+        /// Run `nx <args>` in the checkout as [`Self::daemon`] does.
+        fn run(&self, args: &[&str]) -> String {
             let mut command = std::process::Command::new("node");
-            command
-                .arg(&self.nx)
-                .args(["daemon", verb])
-                .current_dir(&self.checkout);
+            command.arg(&self.nx).args(args).current_dir(&self.checkout);
             for (key, _) in std::env::vars_os() {
                 if key.to_string_lossy().starts_with("NX_") || key == "CI" {
                     command.env_remove(key);
@@ -1041,7 +1148,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(output.status.success(), "nx daemon {verb}: {text}");
+            assert!(output.status.success(), "nx {args:?}: {text}");
             text
         }
 
@@ -1049,6 +1156,371 @@ mod tests {
             self.checkout
                 .join(".nx/workspace-data/d/server-process.json")
         }
+    }
+
+    /// The checkout's Nx state reached through a build link, as cowshed lays it out
+    /// (`.nx/workspace-data` -> `.cowshed/build/nx/workspace-data`), and two volumes the link
+    /// can name: `from`, which it names, and `into`.
+    #[cfg(target_os = "macos")]
+    struct Linked {
+        from: PathBuf,
+        into: PathBuf,
+        state: BuildVolumeState,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Linked {
+        fn new(root: &crate::scratch_apfs::ScratchRoot, stock: &StockNx) -> Self {
+            let [from, into] = ["from", "into"].map(|name| root.path().join("volumes").join(name));
+            for volume in [&from, &into] {
+                fs::create_dir_all(volume.join("nx/workspace-data")).unwrap();
+            }
+            // The volumes sit under the checkout only because the scratch root is the checkout.
+            fs::write(stock.checkout.join(".nxignore"), "volumes\n").unwrap();
+            fs::create_dir_all(stock.checkout.join(".cowshed")).unwrap();
+            fs::create_dir_all(stock.checkout.join(".nx")).unwrap();
+            std::os::unix::fs::symlink(
+                "../.cowshed/build/nx/workspace-data",
+                stock.checkout.join(".nx/workspace-data"),
+            )
+            .unwrap();
+            super::super::link::point(&stock.checkout, &from).unwrap();
+            Self {
+                from,
+                into,
+                state: BuildVolumeState {
+                    paths: vec![
+                        BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+                    ],
+                    fingerprint: None,
+                },
+            }
+        }
+    }
+
+    /// A process that opens the checkout's task database the way every Nx process does (the
+    /// native `connectToNxDb` Nx's own clients and daemon call) and keeps it open until its
+    /// stdin closes, after printing `open`. The connection stays referenced, as Nx keeps its
+    /// own: a collected one closes the database.
+    #[cfg(target_os = "macos")]
+    fn nx_opener(stock: &StockNx) -> std::process::Child {
+        let native = stock
+            .nx
+            .parent()
+            .and_then(Path::parent)
+            .expect("nx.js sits in dist/bin")
+            .join("src/native");
+        std::process::Command::new("node")
+            .arg("-e")
+            .arg(
+                "globalThis.db = require(process.argv[1]).connectToNxDb(process.argv[2]);\
+                 process.stdout.write('open\\n'); process.stdin.resume();",
+            )
+            .arg(native)
+            .arg(stock.checkout.join(".nx/workspace-data"))
+            .current_dir(&stock.checkout)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("node runs")
+    }
+
+    /// Read the opener's `open`: it opened the task database.
+    #[cfg(target_os = "macos")]
+    fn opened(opener: &mut std::process::Child) {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(opener.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "open\n", "the opener opened the task database");
+    }
+
+    /// One kernel event queue: a file's write, extend or attribute change, and processes' exits.
+    #[cfg(target_os = "macos")]
+    struct Events {
+        queue: std::os::fd::OwnedFd,
+        _watched: Vec<std::os::fd::OwnedFd>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Events {
+        fn new() -> Self {
+            use std::os::fd::FromRawFd as _;
+            // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
+            let queue = unsafe { libc::kqueue() };
+            assert!(queue >= 0, "kqueue: {}", io::Error::last_os_error());
+            Self {
+                // SAFETY: `queue` is a fresh descriptor only this value owns.
+                queue: unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) },
+                _watched: Vec::new(),
+            }
+        }
+
+        fn add(&self, ident: libc::uintptr_t, filter: i16, fflags: u32) {
+            use std::os::fd::AsRawFd as _;
+            let change = libc::kevent {
+                ident,
+                filter,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: one valid change, no events requested back.
+            let added = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    &change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(added == 0, "kevent: {}", io::Error::last_os_error());
+        }
+
+        /// Changes to `path`'s contents or attributes, watched without holding it open.
+        fn file(&mut self, path: &Path) {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            use std::os::unix::ffi::OsStrExt as _;
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `name` is NUL-terminated; a negative answer is an error.
+            let file = unsafe { libc::open(name.as_ptr(), libc::O_EVTONLY) };
+            assert!(
+                file >= 0,
+                "open {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            );
+            // SAFETY: `file` is a fresh descriptor only this value owns.
+            let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(file) };
+            self.add(
+                file.as_raw_fd() as libc::uintptr_t,
+                libc::EVFILT_VNODE,
+                libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB,
+            );
+            self._watched.push(file);
+        }
+
+        fn exit(&self, pid: u32) {
+            self.add(pid as libc::uintptr_t, libc::EVFILT_PROC, libc::NOTE_EXIT);
+        }
+
+        /// The filter of the next event, waiting for it.
+        fn next(&self) -> i16 {
+            use std::os::fd::AsRawFd as _;
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            loop {
+                // SAFETY: room for one event; no timeout.
+                let ready = unsafe {
+                    libc::kevent(
+                        self.queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if ready == 1 {
+                    // SAFETY: the kernel wrote one event.
+                    return unsafe { event.assume_init() }.filter;
+                }
+                let error = io::Error::last_os_error();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted, "kevent: {error}");
+            }
+        }
+    }
+
+    /// An Nx process that opens the task database while [`hold_opens`] holds its lock waits,
+    /// and once the lock is let go opens the database the checkout's link names then: never the
+    /// one the link named when it started opening. Without the lock it opened `from`'s and kept
+    /// it after the link moved, while every later process (its next daemon included) opened
+    /// `into`'s.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_nx_opener_waits_out_held_opens_and_opens_the_database_the_moved_link_names() {
+        let root = crate::scratch_apfs::ScratchRoot::new("nx-opens").expect("scratch root");
+        let stock = StockNx::new(&root);
+        let linked = Linked::new(&root, &stock);
+        // Each volume holds the task database a first Nx process made there.
+        for volume in [&linked.into, &linked.from] {
+            super::super::link::point(&stock.checkout, volume).unwrap();
+            let mut first = nx_opener(&stock);
+            opened(&mut first);
+            drop(first.stdin.take());
+            first.wait().unwrap();
+        }
+        let [database]: [PathBuf; 1] = task_databases_in(&linked.from.join("nx/workspace-data"))
+            .unwrap()
+            .try_into()
+            .expect("one task database");
+        let name = database.file_name().unwrap().to_owned();
+        let moved = linked.into.join("nx/workspace-data").join(&name);
+        let lock = database.with_extension("lock");
+        // Nx makes the lock with `File::create`, truncating it: a byte in it tells the opening.
+        fs::write(&lock, b"x").unwrap();
+
+        let mut events = Events::new();
+        events.file(&lock);
+        let opens = hold_opens(&linked.from, &linked.state, &linked.into)
+            .unwrap()
+            .expect("no Nx process is opening");
+        let mut opener = nx_opener(&stock);
+        events.exit(opener.id());
+        assert_eq!(
+            events.next(),
+            libc::EVFILT_VNODE,
+            "the opener reached `from`'s lock before it could exit"
+        );
+        super::super::link::point(&stock.checkout, &linked.into).unwrap();
+        drop(opens);
+        opened(&mut opener);
+
+        let pid = opener.id() as i32;
+        let on_moved = holders(&moved).unwrap();
+        let on_previous = holders(&database).unwrap();
+        assert!(
+            on_moved.iter().any(|holder| holder.pid == pid)
+                && !on_previous.iter().any(|holder| holder.pid == pid),
+            "opener {pid} holds the database the link names now ({}: {on_moved:?}), never the one \
+             it named when the opening began ({}: {on_previous:?})",
+            moved.display(),
+            database.display()
+        );
+        drop(opener.stdin.take());
+        opener.wait().unwrap();
+    }
+
+    /// A taken open lock is an Nx process opening its database: [`hold_opens`] answers that
+    /// database and the process, and holds nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hold_opens_names_an_nx_process_that_is_opening() {
+        let root = scratch("opening");
+        let data = root.join("nx/workspace-data");
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("T-v3.db");
+        fs::write(&database, b"").unwrap();
+        let lock = database.with_extension("lock");
+        fs::write(&lock, b"").unwrap();
+        let next = scratch("opening-next");
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        // `lockf` takes the lock as Nx does (`flock`), then runs its command.
+        let mut opening = std::process::Command::new("/usr/bin/lockf")
+            .args([
+                "-k",
+                lock.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "echo held; read _",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            std::io::BufReader::new(opening.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "held\n");
+        }
+        let pid = opening.id() as i32;
+        match hold_opens(&root, &state, &next).unwrap() {
+            Err(Opening {
+                database: named,
+                holders,
+            }) => {
+                assert_eq!(named, database);
+                assert!(
+                    holders
+                        .iter()
+                        .any(|holder| holder.pid == pid
+                            && holder.command.starts_with("/usr/bin/lockf")),
+                    "{holders:?}"
+                );
+            }
+            Ok(_) => panic!("a taken open lock is an opening"),
+        }
+        drop(opening.stdin.take());
+        opening.wait().unwrap();
+        drop(
+            hold_opens(&root, &state, &next)
+                .unwrap()
+                .expect("nothing is opening"),
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&next).unwrap();
+    }
+
+    /// A host daemon whose record is handed over keeps serving the checkout after its build
+    /// link moves, and a client finds it there. The same move without the record ends the
+    /// daemon by its own check that the record names it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move() {
+        let root = crate::scratch_apfs::ScratchRoot::new("nx-hand-over").expect("scratch root");
+        let stock = StockNx::new(&root);
+        let linked = Linked::new(&root, &stock);
+        stock.daemon("--start");
+        let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
+        assert!(!crate::process::sandboxed(daemon).unwrap());
+
+        hand_over_daemon_records(&linked.from, &linked.state, &linked.into).unwrap();
+        super::super::link::point(&stock.checkout, &linked.into).unwrap();
+        let status = stock.run(&["daemon"]);
+        assert!(status.contains("currently running"), "{status}");
+        assert_eq!(
+            crate::runtime::nx_daemon::live_pid(&stock.record()),
+            Some(daemon),
+            "the daemon serves on through the moved link: {status}"
+        );
+
+        // Back to `from`, its record gone as a land leaves the landing volume's: the daemon
+        // finds no record naming it and exits.
+        discard_daemon_records(&linked.from, &linked.state).unwrap();
+        let events = Events::new();
+        events.exit(daemon as u32);
+        super::super::link::point(&stock.checkout, &linked.from).unwrap();
+        assert_eq!(events.next(), libc::EVFILT_PROC);
+        assert!(!crate::process::running(daemon).unwrap());
+    }
+
+    /// A process `sandbox-exec` started is sandboxed. (The host daemon of the hand-over test is
+    /// the unsandboxed case.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_under_sandbox_exec_is_sandboxed() {
+        let mut sandboxed = std::process::Command::new(crate::exec::SANDBOX_EXEC)
+            .args([
+                "-p",
+                "(version 1)(allow default)",
+                "/bin/sh",
+                "-c",
+                "echo in; read _",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            std::io::BufReader::new(sandboxed.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "in\n");
+        }
+        assert!(crate::process::sandboxed(sandboxed.id() as i32).unwrap());
+        drop(sandboxed.stdin.take());
+        sandboxed.wait().unwrap();
     }
 
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the

@@ -84,13 +84,28 @@ pub(crate) fn probe(record: &Path) -> Probe {
 /// the signal at another process.
 #[cfg(target_os = "macos")]
 pub(crate) fn live_pid(record: &Path) -> Option<libc::pid_t> {
+    live_record(record).map(|live| live.pid)
+}
+
+/// A live daemon's record, as the one read that verified it holds it.
+#[cfg(target_os = "macos")]
+pub(crate) struct LiveRecord {
+    pub pid: libc::pid_t,
+    pub bytes: Vec<u8>,
+}
+
+/// The record `record` holds when the daemon it names is live: its bytes and pid, from the one
+/// read that verified the daemon, so a copy of it can only ever name that daemon.
+#[cfg(target_os = "macos")]
+pub(crate) fn live_record(record: &Path) -> Option<LiveRecord> {
     match read_and_probe(record) {
-        (Probe::Live, pid) => pid,
+        (Probe::Live, Some((pid, bytes))) => Some(LiveRecord { pid, bytes }),
         _ => None,
     }
 }
 
-fn read_and_probe(record: &Path) -> (Probe, Option<libc::pid_t>) {
+/// The probe of `record`, and for a live daemon the pid and bytes of the read that verified it.
+fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     let bytes = match std::fs::read(record) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return (Probe::Unrecorded, None),
@@ -111,7 +126,7 @@ fn read_and_probe(record: &Path) -> (Probe, Option<libc::pid_t>) {
         return (Probe::Dead, None);
     }
     match UnixStream::connect(&recorded.socket_path) {
-        Ok(_) => (Probe::Live, Some(pid)),
+        Ok(_) => (Probe::Live, Some((pid, bytes))),
         Err(_) => (Probe::Refused, None),
     }
 }

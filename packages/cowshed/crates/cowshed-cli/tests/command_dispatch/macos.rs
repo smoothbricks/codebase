@@ -2004,7 +2004,10 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
 
 /// A process other than main's daemon holding main's Nx task database open makes the land skip
 /// the swap and name that process (16_build_volumes.md, "The adoption needs the target's Nx
-/// database closed"). The seed is still frozen; main keeps its own volume.
+/// database closed"). So does an Nx process opening it as the swap begins, holding the lock
+/// stock Nx opens it under: let past the look, it would open the database the link names before
+/// the rename and keep it after, while the daemon it starts next opens the adopted one. The seed
+/// is still frozen; main keeps its own volume.
 #[tokio::test]
 async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
     let (nx, node) = repository_nx();
@@ -2031,6 +2034,59 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
         panic!("one task database in {}: {databases:?}", data.display());
     };
     let before = linked_volume(&layout, &fixture.checkout);
+
+    // An Nx process opening main's database: `lockf` takes the database's open lock as Nx does
+    // (`flock`), then runs its command.
+    let mut opening = Holder(
+        Command::new("/usr/bin/lockf")
+            .arg("-k")
+            .arg(database.with_extension("lock"))
+            .args(["/bin/sh", "-c", "echo held; read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn an Nx open-lock holder"),
+    );
+    {
+        use std::io::BufRead as _;
+        let mut held = String::new();
+        std::io::BufReader::new(opening.0.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut held)
+            .expect("read lockf's command");
+        assert_eq!(held, "held\n", "lockf holds the open lock");
+    }
+    let lockf = i32::try_from(opening.0.id()).expect("a pid fits i32");
+    let report = land(&mut service, "topic", false, &[&nx_check]).await;
+    match report.build_volume.adoption {
+        Adoption::Skipped {
+            reason:
+                AdoptionSkip::TargetOpening {
+                    database: opened,
+                    holders,
+                },
+        } => {
+            assert_eq!(
+                opened.canonicalize().expect("the opened database exists"),
+                database.canonicalize().expect("main's database exists")
+            );
+            assert!(
+                holders
+                    .iter()
+                    .any(|holder| holder.pid == lockf
+                        && holder.command.starts_with("/usr/bin/lockf")),
+                "lockf is named among {holders:?}"
+            );
+        }
+        adoption => {
+            panic!("an Nx process opening main's database skips the adoption: {adoption:?}")
+        }
+    }
+    assert_eq!(linked_volume(&layout, &fixture.checkout), before);
+    drop(opening.0.stdin.take());
+    opening.0.wait().expect("lockf exits with its command");
+    drop(opening);
+    fs::write(topic.join("a/src.txt"), b"src, changed again\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change a again"]);
 
     let holder = Holder(
         Command::new("/usr/bin/tail")

@@ -345,10 +345,17 @@ same for main and for an integration workspace; "the target" is whichever one it
    A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap.
 
 6. **Adopt the build volume.** Still under the lock:
-   1. query the target's task database once more: a holder that opened it since 5.4 means skip;
-   2. delete `nx/workspace-data/d` in the landing build volume;
-   3. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume;
-   4. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
+   1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
+      `lock` extension; every Nx process locks it exclusively before it opens the database and lets go once it has,
+      pinned Nx 23.2.1 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,
+      and name it. Held, the locks keep every Nx process from opening a database until the rename is done; one that
+      starts meanwhile waits, then opens the database by its path, so through the moved link;
+   2. query the target's task database once more: a holder that opened it since 5.4 means skip;
+   3. delete `nx/workspace-data/d` in the landing build volume, then copy into it the target's record of a live daemon
+      that runs outside every sandbox (the host daemon a client started since 5.3);
+   4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
+      go of the locks;
+   5. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
       below).
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
@@ -487,7 +494,10 @@ Cowshed never sets `NX_DAEMON=false` for any process, and never withholds the da
 - **Enforced by**: the same capability test; a lint over cowshed and managed shell files refuses the string.
 - The daemon's record lives in `.nx/workspace-data/d`, the directory that also holds the task database (pinned Nx
   23.2.1, `daemon/tmp-dir.js`), so the record would travel with a build volume. Fork and land delete it from the volume
-  (above); a daemon is per checkout.
+  (above); a daemon is per checkout. A land then gives the adopted volume the target's own record of a live host daemon
+  (Land 6.3), so the swap does not end it: the daemon exits within 20 ms of finding no record that names it, and a
+  client writing to it then fails with `write EPIPE` (measured). A sandboxed daemon's grant names the previous volume
+  alone, so its record is left behind; it exits and its keeper starts the next one on the adopted volume.
 - **Accepted property**: an Nx client sends its whole environment to the daemon in every message
   (`daemon/client/client.js` `getDaemonEnv`), and the daemon applies it to its own `process.env`
   (`daemon/server/handle-client-env.js`). In a workspace whose daemon runs inside the sandbox, a host client's
@@ -590,8 +600,21 @@ the same reason on its side.
 A run that started on the old tree and stays wholly on the old volume is correct even when it hits; the hazard is only
 the mix.
 
+The look is not enough by itself. It lists processes and then their open files, which on a loaded host takes from a
+quarter of a second to several seconds (measured: 0.25 s warm, 6.8 s cold). An Nx client that opens the database after
+the list was taken and before the rename keeps the old volume's database, while the daemon it restarts after the swap
+opens the adopted one. The client then records a task's details in one database, the daemon records the task's history
+in the other, and the daemon's write fails with `FOREIGN KEY constraint failed` (seen on main, 2026-10-06, and
+reproduced with stock Nx 23.2.1 against a scripted look and rename). So the look and the rename both happen under Nx's
+own open locks (Land 6.1): every Nx process opens the database only while it holds the database's lock, so one that
+began opening before the locks were taken holds the database at the look, and one that begins later waits and opens the
+adopted database.
+
 - **Enforced by**: a test that holds main's database open in a running Nx client, lands, and requires the swap to be
-  skipped and reported; and one with the database closed that requires the swap.
+  skipped and reported; one with the database closed that requires the swap; the same land test holding main's open
+  lock, which requires the skip to name the process opening; a test in which a stock Nx process starts opening while the
+  locks are held and the link then moves, and must open the database the moved link names; and one in which a stock Nx
+  daemon whose record was handed over still serves a client after the move, and exits without the record.
 
 ### Content-addressed tool caches are shared and writable
 
@@ -616,7 +639,8 @@ it belongs to. Each job's sandbox grants exactly the build volume the controller
 - A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the
-  daemon it watched is stopped at a swap (Nx reports `reconnecting`).
+  daemon it watched is stopped at a swap (Nx reports `reconnecting`); main's host daemon is not stopped by the swap
+  itself (rule "The Nx daemon stays on").
 - A coordinator that reads a workspace's files itself, outside any sandbox, follows the build link only into the volume
   the controller answers for it (`WorkspaceRef::build_volume`, `workspace.buildVolume`): the grant a job admitted now
   would get, fenced on the incarnation the coordinator holds. It compares what the link names against that answer, so a
@@ -662,6 +686,11 @@ The decisions this spec records, in the order they were taken. It is kept so the
   entries main's previous volume held, though they were content-addressed. A land now carries the target's Nx cache
   entries the landing volume lacks into it before the swap, copying while the target runs and indexing while its
   database is closed, so the swap's window stays as short as before.
+- 2026-10-06: an `nx build` started during a land in main failed with `FOREIGN KEY constraint failed` from its daemon:
+  it had opened main's previous task database after the swap's look and before its rename, and the daemon it restarted
+  opened the adopted one. The swap now holds stock Nx's own open locks from the look to the rename, and hands a live
+  host daemon's record to the adopted volume so the swap does not end that daemon under the client that waited. The
+  carry commits with foreign keys enforced, so an index Nx could not have written fails the carry instead.
 
 ## Open questions
 

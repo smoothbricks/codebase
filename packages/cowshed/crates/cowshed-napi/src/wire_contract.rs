@@ -542,6 +542,21 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
+    let land_opening = LandReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: true,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::TargetOpening {
+                    database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
+                    holders: vec![cowshed_core::api::dto::DatabaseHolder {
+                        pid: 4343,
+                        command: "node nx build widget".to_owned(),
+                    }],
+                },
+            },
+        },
+        ..land_first.clone()
+    };
 
     let push_new = PushReport {
         source_head: oid("3333333333333333333333333333333333333333"),
@@ -661,6 +676,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 ("firstLanding", document("land report", &land_first)),
                 ("retired", document("land report", &land_retired)),
                 ("adoptionSkipped", document("land report", &land_held)),
+                (
+                    "adoptionSkippedOpening",
+                    document("land report", &land_opening),
+                ),
             ]),
         ),
         (

@@ -948,6 +948,28 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "adoptionSkippedOpening": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
+            "holders": [
+              {
+                "command": "node nx build widget",
+                "pid": 4343
+              }
+            ],
+            "kind": "targetOpening"
+          }
+        },
+        "seeded": true
+      },
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "firstLanding": {
       "buildVolume": {
         "adoption": {

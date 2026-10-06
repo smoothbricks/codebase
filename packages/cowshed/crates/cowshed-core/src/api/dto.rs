@@ -2837,6 +2837,12 @@ pub enum AdoptionSkip {
         database: PathBuf,
         holders: Vec<DatabaseHolder>,
     },
+    /// An Nx process was opening the target's Nx task database as the adoption began (step 6):
+    /// it held, or waited on, the lock stock Nx opens the database under.
+    TargetOpening {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
     /// The target's Nx daemon outlived its stop.
     TargetDaemonStayed { daemon: DatabaseHolder },
     /// The landing volume had to grow to the target's capacity before the target adopts it,
@@ -2854,6 +2860,7 @@ impl AdoptionSkip {
             Self::LandingHeld { .. } => "landingHeld",
             Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
             Self::TargetHeld { .. } => "targetHeld",
+            Self::TargetOpening { .. } => "targetOpening",
             Self::TargetDaemonStayed { .. } => "targetDaemonStayed",
             Self::LandingVolumeBusy { .. } => "landingVolumeBusy",
         }
@@ -2894,6 +2901,17 @@ impl fmt::Display for AdoptionSkip {
                 holders: held,
             } => {
                 write!(formatter, "the target's {} is open in ", database.display())?;
+                holders(formatter, held)
+            }
+            Self::TargetOpening {
+                database,
+                holders: held,
+            } => {
+                write!(
+                    formatter,
+                    "an Nx process was opening the target's {}: ",
+                    database.display()
+                )?;
                 holders(formatter, held)
             }
             Self::LandingDaemonStayed { daemon } | Self::TargetDaemonStayed { daemon } => write!(

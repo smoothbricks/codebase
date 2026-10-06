@@ -414,11 +414,21 @@ fn place(staging: &Path, cache: &Path, hash: &str) -> io::Result<()> {
 
 /// Insert the rows of the `placed` entries, as the target's database holds them, in one
 /// transaction: an entry is a hit from the moment its row commits, and only whole entries
-/// have one.
+/// have one. Foreign keys are enforced, as stock Nx's own connection enforces them (its daemon
+/// answers `FOREIGN KEY constraint failed`): a `cache_outputs` row with no `task_details` row in
+/// the landing database stops the carry instead of committing an index Nx could not have written.
 fn index(connection: &Connection, placed: &BTreeSet<&str>) -> io::Result<()> {
     if placed.is_empty() {
         return Ok(());
     }
+    connection.execute("PRAGMA foreign_keys = ON", &[])?;
+    let mut enforced = connection.prepare("PRAGMA foreign_keys")?;
+    if !(enforced.step()? && enforced.integer(0) == 1) {
+        return Err(io::Error::other(
+            "SQLite did not turn foreign keys on for the carry",
+        ));
+    }
+    drop(enforced);
     connection.execute("BEGIN IMMEDIATE", &[])?;
     connection.execute("CREATE TEMP TABLE carried (hash TEXT PRIMARY KEY)", &[])?;
     {
@@ -565,5 +575,79 @@ fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) ->
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stock Nx 23.2.1's two tables the carry writes, as its own `CREATE` statements read.
+    const SCHEMA: &str = "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, \
+         project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); \
+         CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, \
+         size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+         accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+         FOREIGN KEY (hash) REFERENCES task_details (hash))";
+
+    fn database(path: &Path, sql: &str) {
+        fs::write(path, b"").unwrap();
+        let connection = Connection::open(path).unwrap();
+        for statement in sql.split(';') {
+            connection.execute(statement, &[]).unwrap();
+        }
+    }
+
+    fn indexed(path: &Path) -> i64 {
+        let connection = Connection::open(path).unwrap();
+        let mut count = connection
+            .prepare("SELECT count(*) FROM cache_outputs")
+            .unwrap();
+        assert!(count.step().unwrap());
+        count.integer(0)
+    }
+
+    /// A target row the carry would index without its task details stops the carry and
+    /// indexes nothing, where it used to commit an index stock Nx could not have written.
+    #[test]
+    fn a_cache_row_without_its_task_details_fails_the_carry_and_indexes_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-carry-keys-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("from.db");
+        let into = root.join("into.db");
+        // Foreign keys are off on this connection, as on any SQLite connection by default.
+        database(
+            &from,
+            &format!(
+                "{SCHEMA}; INSERT INTO task_details VALUES ('whole', 'a', 'build', NULL); \
+                 INSERT INTO cache_outputs (hash, code, size) VALUES ('whole', 0, 1); \
+                 INSERT INTO cache_outputs (hash, code, size) VALUES ('orphan', 0, 1)"
+            ),
+        );
+        database(&into, SCHEMA);
+
+        let connection = attached(&into, &from).unwrap();
+        let refused = index(&connection, &BTreeSet::from(["orphan", "whole"])).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("FOREIGN KEY constraint failed"),
+            "{refused}"
+        );
+        drop(connection);
+        assert_eq!(
+            indexed(&into),
+            0,
+            "the failed transaction committed nothing"
+        );
+
+        let connection = attached(&into, &from).unwrap();
+        index(&connection, &BTreeSet::from(["whole"])).unwrap();
+        drop(connection);
+        assert_eq!(indexed(&into), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 }

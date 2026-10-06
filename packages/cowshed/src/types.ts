@@ -319,6 +319,7 @@ export type AdoptionSkip =
   | { readonly kind: 'landingHeld'; readonly database: string; readonly holders: readonly DatabaseHolder[] }
   | { readonly kind: 'landingDaemonStayed'; readonly daemon: DatabaseHolder }
   | { readonly kind: 'targetHeld'; readonly database: string; readonly holders: readonly DatabaseHolder[] }
+  | { readonly kind: 'targetOpening'; readonly database: string; readonly holders: readonly DatabaseHolder[] }
   | { readonly kind: 'targetDaemonStayed'; readonly daemon: DatabaseHolder }
   | { readonly kind: 'landingVolumeBusy'; readonly reason: string };
 

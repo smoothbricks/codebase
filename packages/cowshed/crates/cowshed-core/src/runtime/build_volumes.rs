@@ -621,9 +621,18 @@ impl BuildVolumes {
     }
 
     /// Land step 6: when nothing opened the closed target's task database since
-    /// [`Self::close_target`], drop the landing volume's daemon record and rename the target's
-    /// build link onto the landing volume. The target's previous volume is unlinked and
-    /// released when idle. Answers how long the move took.
+    /// [`Self::close_target`], give the landing volume the target's daemon records in place of
+    /// its own and rename the target's build link onto it. The target's previous volume is
+    /// unlinked and released when idle. Answers how long the move took.
+    ///
+    /// The look and the rename happen under Nx's own open locks on the target's databases
+    /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:
+    /// an Nx client that opened the previous database after that, and before the rename, kept
+    /// it, while the daemon it restarts opens the adopted one, so the task history the daemon
+    /// records for the client's tasks names task details the adopted database lacks. Under the
+    /// locks such a client waits instead, and opens the adopted database. A host daemon a client
+    /// started since the close keeps its record across the move
+    /// ([`nx::hand_over_daemon_records`]), so the client that waited finds it still serving.
     pub async fn adopt(
         &self,
         quiet: &Quiet,
@@ -642,6 +651,12 @@ impl BuildVolumes {
                     previous.id
                 )));
             }
+            let opens = match nx::hold_opens(&previous.mount, &previous.state, &quiet.mount)
+                .map_err(|error| io("lock the target's Nx opens", &previous.mount, &error))?
+            {
+                Ok(opens) => opens,
+                Err(opening) => return Ok(Err(target_opening(opening))),
+            };
             if let Err(busy) = nx::held(&previous.mount, &previous.state)
                 .map_err(|error| io("look at the target's Nx state", &previous.mount, &error))?
             {
@@ -649,7 +664,12 @@ impl BuildVolumes {
             }
             nx::discard_daemon_records(&quiet.mount, &quiet.state)
                 .map_err(|error| io("discard the landing daemon record", &quiet.mount, &error))?;
+            nx::hand_over_daemon_records(&previous.mount, &previous.state, &quiet.mount)
+                .map_err(|error| io("hand over the target's daemon record", &quiet.mount, &error))?;
             link::point(&target_checkout, &quiet.mount)?;
+            // Every Nx process waiting to open now resolves the link to the adopted volume. The
+            // locks are files in the previous volume, so they go before it is released.
+            drop(opens);
             let elapsed = started.elapsed();
             layout.write_record(
                 &quiet.id,
@@ -1195,6 +1215,13 @@ fn skip(busy: nx::Busy, side: Side) -> AdoptionSkip {
         (nx::Busy::DaemonStayed { daemon }, Side::Target) => AdoptionSkip::TargetDaemonStayed {
             daemon: database_holder(daemon),
         },
+    }
+}
+
+fn target_opening(opening: nx::Opening) -> AdoptionSkip {
+    AdoptionSkip::TargetOpening {
+        database: opening.database,
+        holders: opening.holders.into_iter().map(database_holder).collect(),
     }
 }
 

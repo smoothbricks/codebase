@@ -42,6 +42,30 @@ pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
     }
 }
 
+/// Whether the process `pid` names may run under a sandbox profile: `sandbox_check` asked about
+/// no operation answers 0 only for a live process with no profile (libsystem_sandbox, the query
+/// `sandbox-exec`'s profiles are checked by), and 1 for a sandboxed process and for a pid that
+/// names none (measured), so `false` proves a live, unsandboxed process.
+#[cfg(target_os = "macos")]
+pub(crate) fn sandboxed(pid: libc::pid_t) -> io::Result<bool> {
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            filter: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    /// `SANDBOX_FILTER_NONE`: the operation takes no argument.
+    const NO_FILTER: libc::c_int = 0;
+    // SAFETY: a null operation with no filter reads no variadic argument.
+    match unsafe { sandbox_check(pid, std::ptr::null(), NO_FILTER) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 /// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
 /// (dead) has exited.
 #[cfg(target_os = "linux")]

@@ -770,7 +770,8 @@ probes the record: present, its process alive, its socket accepting. When the pr
 reports a start that failed on its own stderr; the next probe tries again. The daemon runs detached, in its own process
 group inside that job's sandbox, and a host client in the workspace finds it live through the shared record and connects
 to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout,
-and its daemon is the host's. A fork and a land delete the record from the build volume (16_build_volumes.md). A
+and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's
+and gives the adopted volume the target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A
 repository shell that exports either directory unconditionally replaces the checkout's, like any export, and splits the
 state again; a repository shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or
 leaves them unset.
