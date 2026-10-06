@@ -9685,10 +9685,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .map_err(native_integrity_error)?;
                     if replacement_block.is_some() {
                         crate::workspace_credentials::publish_workspace_environment(
-                            &config.workspace_mount,
+                            crate::workspace_environment::EnvironmentMount::Served {
+                                workspace_mount: &config.workspace_mount,
+                                temp_dir: &config.exec_temp_dir,
+                            },
                             current.metadata.platform,
                             published.port_block,
-                            Some(&config.exec_temp_dir),
                         )
                         .map_err(|error| {
                             CowshedError::internal(format!(

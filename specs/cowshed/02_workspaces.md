@@ -910,7 +910,9 @@ Every workspace image carries its environment in the in-image private namespace 
 and omits both lines. One function derives the file from the image's published token and the workspace's recorded
 platform and block, and it is the file's only writer: create, fork and restore publish it as they mint, and every
 supervisor start publishes it again, so values are always current — a workspace minted before a variable existed gains
-it on its next start. Nothing is derived from cwd, guessed from a slot, or trusted from a marker alone.
+it on its next start. The supervisor start alone also exports the sandbox's `TMPDIR` and `COWSHED_RUNTIME_LINK`, the
+workspace's short runtime link (04_sandbox.md): a mint may run at a staging mount, and the link is named after the mount
+the workspace is served at. Nothing is derived from cwd, guessed from a slot, or trusted from a marker alone.
 
 Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
 new, fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration

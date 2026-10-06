@@ -17,13 +17,14 @@ import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
 const script = join(managedAssetsRoot, 'raw/tooling/direnv/nx-socket-dir.sh');
-const PORT_BASE = '37376';
+/** A runtime link name of the shape cowshed derives from a checkout's mount. */
+const LINK_NAME = 'cs-0123456789ab';
 
 interface Scratch {
   readonly checkout: string;
-  /** Where cowshed keeps its short runtime links; `/tmp` on a real host. */
+  /** Stands in for `/tmp`, where cowshed keeps its short runtime links. */
   readonly links: string;
-  /** The link cowshed binds a job's runtime to: `<links>/cs-<port base>`. */
+  /** The link cowshed binds a job's runtime to, as its `.cowshed/env` names it. */
   readonly link: string;
   /** The real socket leaf every boundary of the checkout must reach. */
   readonly leaf: string;
@@ -41,7 +42,7 @@ function withScratch(run: (scratch: Scratch) => void): void {
     run({
       checkout,
       links,
-      link: join(links, `cs-${PORT_BASE}`),
+      link: join(links, LINK_NAME),
       leaf: join(checkout, '.cowshed', 'run', 'nx'),
       hostRuntime,
     });
@@ -50,12 +51,12 @@ function withScratch(run: (scratch: Scratch) => void): void {
   }
 }
 
-/** A cowshed checkout: its runtime tree and the `.cowshed/env` cowshed writes from the workspace's record. */
+/** A cowshed checkout: its runtime tree and the `.cowshed/env` cowshed writes when it serves the workspace. */
 function cowshedCheckout(scratch: Scratch): void {
   mkdirSync(join(scratch.checkout, '.cowshed', 'run'), { recursive: true });
   writeFileSync(
     join(scratch.checkout, '.cowshed', 'env'),
-    `export COWSHED_WORKSPACE_TOKEN=token\nexport COWSHED_PORT_BASE=${PORT_BASE}\nexport COWSHED_PORT_BLOCK_SIZE=64\n`,
+    `export COWSHED_WORKSPACE_TOKEN=token\nexport COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64\nexport TMPDIR='${scratch.hostRuntime}'\nexport COWSHED_RUNTIME_LINK=${scratch.link}\n`,
   );
 }
 
@@ -80,7 +81,7 @@ function setValue(line: string | undefined): string | undefined {
 
 /**
  * Source the script the way devenv.smoo.nix's prologue does — from the
- * workspace root, naming the links directory — and report what it exported.
+ * workspace root — and report what it exported.
  */
 function enterShell(scratch: Scratch, inherited: Record<string, string>): Entered {
   const result = spawnSync(
@@ -88,14 +89,13 @@ function enterShell(scratch: Scratch, inherited: Record<string, string>): Entere
     [
       '-c',
       [
-        '. "$1" "$2" && printf \'%s\\n\' "$NX_SOCKET_DIR" "$NX_WORKSPACE_ROOT_PATH"',
+        '. "$1" && printf \'%s\\n\' "$NX_SOCKET_DIR" "$NX_WORKSPACE_ROOT_PATH"',
         '"${NX_WORKSPACE_DATA_DIRECTORY+set:}${NX_WORKSPACE_DATA_DIRECTORY-}"',
         '"${NX_CACHE_DIRECTORY+set:}${NX_CACHE_DIRECTORY-}"',
         '"${NX_DAEMON_SOCKET_DIR+set:}${NX_DAEMON_SOCKET_DIR-}"',
       ].join(' '),
       'shell',
       script,
-      scratch.links,
     ],
     { cwd: scratch.checkout, encoding: 'utf8', env: { PATH: process.env.PATH ?? '', ...inherited } },
   );
@@ -126,7 +126,6 @@ function hostShell(scratch: Scratch, inherited: Record<string, string> = {}): En
  */
 function sandboxJob(scratch: Scratch): Entered {
   return enterShell(scratch, {
-    COWSHED_PORT_BASE: PORT_BASE,
     XDG_RUNTIME_DIR: scratch.link,
     DEVENV_RUNTIME: join(scratch.link, 'devenv-sandbox'),
     NX_SOCKET_DIR: join(scratch.link, 'nx'),
@@ -155,15 +154,16 @@ describe('nx-socket-dir.sh', () => {
     });
   });
 
-  it("ignores a host socket dir and port inherited from another workspace's shell", () => {
+  it("ignores a host socket dir and runtime link inherited from another workspace's shell", () => {
     withScratch((scratch) => {
       cowshedCheckout(scratch);
+      const another = join(scratch.links, 'cs-ba9876543210');
       const host = hostShell(scratch, {
-        COWSHED_PORT_BASE: '40960',
+        COWSHED_RUNTIME_LINK: another,
         NX_SOCKET_DIR: join(scratch.hostRuntime, 'nxrun-another', 'nx'),
       });
       expect(host.NX_SOCKET_DIR).toBe(join(scratch.link, 'nx'));
-      expect(existsSync(join(scratch.links, 'cs-40960'))).toBe(false);
+      expect(existsSync(another)).toBe(false);
     });
   });
 
@@ -190,7 +190,7 @@ describe('nx-socket-dir.sh', () => {
     });
   });
 
-  it("keeps a job's socket dir that resolves inside the checkout when cowshed names no port", () => {
+  it("keeps a job's socket dir that resolves inside the checkout when cowshed names no runtime link", () => {
     withScratch((scratch) => {
       mkdirSync(scratch.leaf, { recursive: true });
       const bound = join(scratch.hostRuntime, 'bound');

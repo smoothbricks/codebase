@@ -19,7 +19,9 @@ use crate::metadata::{
 };
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::storage::lifecycle::LifecycleWorkspace;
-use crate::workspace_environment::{WorkspaceEnvironmentError, write_workspace_environment};
+use crate::workspace_environment::{
+    EnvironmentMount, WorkspaceEnvironmentError, write_workspace_environment,
+};
 
 pub const CA_CERTIFICATE_PATH: &str = ".cowshed/ca.pem";
 pub const WORKSPACE_TOKEN_PATH: &str = ".cowshed/token";
@@ -126,9 +128,10 @@ pub fn mint_workspace_credentials(
     publish_asset(private_key_path, private_key.as_bytes())?;
     publish_asset(&certificate_path, certificate_pem.as_bytes())?;
     publish_asset(&token_path, token.as_bytes())?;
-    // A mint knows no store, so the sandbox's TMPDIR waits for the supervisor start that serves
-    // the minted workspace: it publishes the file again with it before any shell can use it.
-    publish_workspace_environment(mount_point, platform, port_block, None)?;
+    // A mint knows no store and may run at a staging mount, so the sandbox's TMPDIR and runtime
+    // link wait for the supervisor start that serves the minted workspace: it publishes the file
+    // again with them before any shell can use it.
+    publish_workspace_environment(EnvironmentMount::Minted(mount_point), platform, port_block)?;
     publish_minted_client_wiring(&credential_directory, certificate_pem.as_bytes())?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
@@ -143,17 +146,16 @@ pub fn mint_workspace_credentials(
 }
 
 /// Derives `.cowshed/env` from the image's published token, the workspace's recorded platform
-/// and port block, and, when the caller knows it, the sandbox's `TMPDIR`. This is the file's one
-/// writer: adopt, clone and restore publish it as they mint, and every supervisor start
-/// publishes it again with `temp_dir`, so a live workspace's file follows its metadata — a
+/// and port block, and, at a served mount, the sandbox's `TMPDIR` and runtime link. This is the
+/// file's one writer: adopt, clone and restore publish it as they mint, and every supervisor
+/// start publishes it again served, so a live workspace's file follows its metadata — a
 /// workspace minted before a variable existed gains it on its next start.
 pub fn publish_workspace_environment(
-    mount_point: &Path,
+    mount: EnvironmentMount<'_>,
     platform: Platform,
     port_block: Option<PortBlock>,
-    temp_dir: Option<&Path>,
 ) -> Result<(), WorkspaceCredentialError> {
-    let token_path = mount_point.join(WORKSPACE_TOKEN_PATH);
+    let token_path = mount.root().join(WORKSPACE_TOKEN_PATH);
     validate_token(&token_path)?;
     let token = read_bounded_utf8(
         &token_path,
@@ -161,7 +163,7 @@ pub fn publish_workspace_environment(
         TOKEN_ENCODED_BYTES as u64,
         "workspace token",
     )?;
-    write_workspace_environment(mount_point, &token, platform, port_block, temp_dir)?;
+    write_workspace_environment(mount, &token, platform, port_block)?;
     Ok(())
 }
 
@@ -535,7 +537,8 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use crate::workspace_environment::{
-        DEV_CI_POLICY, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, TEMP_DIR_ENV, WORKSPACE_TOKEN_ENV,
+        DEV_CI_POLICY, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
+        WORKSPACE_TOKEN_ENV,
     };
 
     use super::*;
@@ -661,17 +664,20 @@ mod tests {
 
         let temp_dir = root.join("tmp/workspace");
         publish_workspace_environment(
-            &image_mount,
+            EnvironmentMount::Served {
+                workspace_mount: &image_mount,
+                temp_dir: &temp_dir,
+            },
             crate::metadata::Platform::Macos,
             Some(port_block),
-            Some(&temp_dir),
         )
         .expect("republish");
         assert_eq!(
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
             format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\n",
-                temp_dir.display()
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\n",
+                temp_dir.display(),
+                crate::sandbox::workspace_runtime_link(&image_mount).display()
             )
         );
         assert_eq!(

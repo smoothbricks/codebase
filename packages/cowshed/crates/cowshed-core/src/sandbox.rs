@@ -398,11 +398,15 @@ pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
 
 /// Generic runtime aliases stay mode-private. Only a contributed daemon socket leaf is shared.
 pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
-    let suffix = match sandbox.mode {
-        RunSandboxMode::ReadOnly => "-ro",
-        RunSandboxMode::ReadWrite => "",
-    };
-    PathBuf::from(format!("/tmp/cs-{}{suffix}", sandbox.port_block.base()))
+    let link = workspace_runtime_link(&sandbox.workspace_mount);
+    match sandbox.mode {
+        RunSandboxMode::ReadOnly => {
+            let mut name = link.into_os_string();
+            name.push("-ro");
+            PathBuf::from(name)
+        }
+        RunSandboxMode::ReadWrite => link,
+    }
 }
 
 pub(crate) fn shared_daemon_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
@@ -410,7 +414,22 @@ pub(crate) fn shared_daemon_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
 }
 
 pub(crate) fn shared_daemon_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
-    PathBuf::from(format!("/tmp/cs-{}", sandbox.port_block.base()))
+    workspace_runtime_link(&sandbox.workspace_mount)
+}
+
+/// The short link a workspace's jobs and host shells reach its runtime dir through:
+/// `/tmp/cs-<12 hex of SHA-256(workspace mount)>`. It is named after its target's workspace,
+/// because only one live workspace is mounted at a path: no other workspace, in this store or
+/// another, can name the same link and retarget it. A port block is unique only within one
+/// store, so a name derived from it is not. The link stays in `/tmp`, under Darwin's 104-byte
+/// `sun_path`, for the sockets beneath it. This is the name's one owner.
+pub fn workspace_runtime_link(workspace_mount: &Path) -> PathBuf {
+    let digest =
+        crate::api::dto::Sha256Digest::compute(workspace_mount.as_os_str().as_encoded_bytes());
+    PathBuf::from(format!(
+        "/tmp/cs-{}",
+        crate::api::dto::hex_lower(&digest.as_bytes()[..6])
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2441,6 +2460,40 @@ mod tests {
                 usize::from(size)
             );
         }
+    }
+
+    /// Stores allocate port blocks independently, so two live workspaces can share a base; the
+    /// link each one's jobs reach their runtime through is named after its own mount, so it
+    /// differs between them and never moves for one of them.
+    #[test]
+    fn a_runtime_link_is_named_after_its_workspace_mount_not_its_port_block() {
+        let raven = config(RunSandboxMode::ReadWrite);
+        let mut crow = config(RunSandboxMode::ReadWrite);
+        crow.workspace_mount = PathBuf::from("/Users/other/.cowshed/mnt/acme/widget/crow");
+        assert_eq!(raven.port_block, crow.port_block);
+        assert_ne!(sandbox_runtime_link(&raven), sandbox_runtime_link(&crow));
+        assert_ne!(
+            shared_daemon_runtime_link(&raven),
+            shared_daemon_runtime_link(&crow)
+        );
+
+        let mut moved = config(RunSandboxMode::ReadWrite);
+        moved.port_block = PortBlock::new(49_152, 64).unwrap();
+        let link = sandbox_runtime_link(&raven);
+        assert_eq!(sandbox_runtime_link(&moved), link);
+        assert_eq!(shared_daemon_runtime_link(&raven), link);
+        assert_eq!(workspace_runtime_link(&raven.workspace_mount), link);
+        let name = link.to_str().unwrap().strip_prefix("/tmp/cs-").unwrap();
+        assert!(
+            name.len() == 12 && crate::api::dto::is_lowercase_hex(name),
+            "{name}"
+        );
+
+        let read_only = config(RunSandboxMode::ReadOnly);
+        assert_eq!(
+            sandbox_runtime_link(&read_only),
+            PathBuf::from(format!("{}-ro", link.display()))
+        );
     }
 
     /// Every role, Git's included, reads the entropy devices; none reaches the per-user directory

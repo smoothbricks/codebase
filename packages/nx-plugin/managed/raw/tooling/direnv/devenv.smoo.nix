@@ -535,7 +535,7 @@ in {
       # gives every workspace its own socket dir, and in a cowshed checkout the
       # one literal path its host shells and sandboxed jobs all share, and
       # states why.
-      . "$DEVENV_ROOT/nx-socket-dir.sh" /tmp
+      . "$DEVENV_ROOT/nx-socket-dir.sh"
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         . "$DEVENV_ROOT/apple-developer.sh" /nix/store
       ''}

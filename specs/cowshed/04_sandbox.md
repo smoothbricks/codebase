@@ -73,8 +73,13 @@ Shape:
 (allow network-bind network-inbound network-outbound
   (local unix-socket (path-prefix "<exec temp dir>/"))
   (remote unix-socket (path-prefix "<exec temp dir>/")))
-;; … and the same for both spellings of the short runtime link, /tmp/cs-<port>/
-;; and /private/tmp/cs-<port>/, through which the child reaches its runtime dir.
+;; … and the same for both spellings of the short runtime link, /tmp/cs-<digest>/
+;; and /private/tmp/cs-<digest>/, through which the child reaches its runtime dir.
+;; <digest> is the first 12 hex digits of SHA-256 of the workspace mount path, and a
+;; read-only job's link adds "-ro". The link is named after the workspace it leads to,
+;; never after its port block: blocks are unique only within one store, and two
+;; workspaces naming one link would retarget it under each other's jobs. Only one live
+;; workspace is mounted at a path, so no other workspace, in any store, names it.
 
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
 ;; (see 08_testing.md): port RANGES do not parse ("invalid port in network
@@ -753,14 +758,16 @@ running job: its compiled profile keeps its old physical authority.
 
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
 the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree, which jobs of every mode name as
-`/tmp/cs-<port base>/nx`. A host shell of a cowshed checkout names the same leaf by the same literal path: the managed
-devenv's `NX_SOCKET_DIR` reads the port base from the checkout's `.cowshed/env` and takes the workspace's own short
-link, creating it when no job has yet. Any other path fails, for three reasons. The checkout path is too long for Nx's
-plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting client's environment, so its
-plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets by literal path, so a
-sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and its plugin fails to
-load. Main's sandboxed jobs therefore connect to main's host daemon instead of starting their own and overwriting its
-record, and a host client in a workspace uses the workspace's sandboxed daemon without breaking its plugin workers.
+`/tmp/cs-<digest>/nx`, below the workspace's read-write runtime link. A host shell of a cowshed checkout names the same
+leaf by the same literal path: every supervisor start writes that link into the checkout's `.cowshed/env` as
+`COWSHED_RUNTIME_LINK`, and the managed devenv's `NX_SOCKET_DIR` reads it from there, never re-deriving it, and takes
+the workspace's own short link, creating it when no job has yet. Any other path fails, for three reasons. The checkout
+path is too long for Nx's plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting
+client's environment, so its plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets
+by literal path, so a sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and
+its plugin fails to load. Main's sandboxed jobs therefore connect to main's host daemon instead of starting their own
+and overwriting its record, and a host client in a workspace uses the workspace's sandboxed daemon without breaking its
+plugin workers.
 
 A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
 only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting

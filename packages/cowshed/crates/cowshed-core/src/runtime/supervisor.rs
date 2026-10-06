@@ -2229,16 +2229,18 @@ impl WorkspaceSupervisor {
         C: CommitmentSink + Send + 'static,
     {
         config.validate()?;
-        // A supervisor serves exactly the block and TMPDIR its sandbox records, so this is where
-        // the workspace's `.cowshed/env` is brought up to date with its metadata. The TMPDIR it
-        // names exists before any host shell can source it.
+        // A supervisor serves exactly the block, TMPDIR and runtime link its sandbox records, so
+        // this is where the workspace's `.cowshed/env` is brought up to date with its metadata.
+        // The TMPDIR it names exists before any host shell can source it.
         AnchoredDirectory::create(&config.sandbox.exec_temp_dir)
             .map_err(private_environment_error)?;
         crate::workspace_credentials::publish_workspace_environment(
-            &config.sandbox.workspace_mount,
+            crate::workspace_environment::EnvironmentMount::Served {
+                workspace_mount: &config.sandbox.workspace_mount,
+                temp_dir: &config.sandbox.exec_temp_dir,
+            },
             crate::metadata::Platform::Macos,
             Some(config.sandbox.port_block),
-            Some(&config.sandbox.exec_temp_dir),
         )
         .map_err(|error| {
             CowshedError::integrity(
@@ -4642,7 +4644,6 @@ mod workspace_toolchain_tests {
         .expect("workspace CA");
         std::fs::write(mount.join("README.md"), "plain\n").expect("plain file");
         let mut sandbox = sandbox_at(&mount);
-        sandbox.port_block = crate::metadata::PortBlock::new(49_120, 16).expect("port block");
         sandbox
             .configure_capabilities()
             .expect("detect capabilities");
@@ -4688,8 +4689,7 @@ mod workspace_toolchain_tests {
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
         std::fs::write(mount.join("Cargo.toml"), "").expect("cargo project");
-        let mut sandbox = sandbox_at(&mount);
-        sandbox.port_block = crate::metadata::PortBlock::new(49_072, 16).expect("port block");
+        let sandbox = sandbox_at(&mount);
         std::fs::create_dir_all(&sandbox.home).expect("home");
         let caller = BTreeMap::from([
             ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
@@ -4805,8 +4805,7 @@ mod workspace_toolchain_tests {
         let Some(mount) = std::env::var_os(ENVIRONMENT_PROBE) else {
             return;
         };
-        let mut sandbox = sandbox_at(Path::new(&mount));
-        sandbox.port_block = crate::metadata::PortBlock::new(49_040, 16).expect("port block");
+        let sandbox = sandbox_at(Path::new(&mount));
         let environment = sandbox_environment(&sandbox, &BTreeMap::new())
             .await
             .expect("environment");
@@ -4909,8 +4908,7 @@ mod workspace_toolchain_tests {
                 .any(|line| line.contains("foreign") || line.contains("Foreign")),
             "{foreign_shell:#?}"
         );
-        let mut sandbox = sandbox_at(&mount);
-        sandbox.port_block = crate::metadata::PortBlock::new(49_040, 16).expect("port block");
+        let sandbox = sandbox_at(&mount);
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4948,6 +4946,41 @@ mod workspace_toolchain_tests {
             dangling.symlink_metadata().is_err(),
             "taking a link sweeps the dangling one"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Stores hand out port blocks independently, so two live workspaces can hold one base.
+    /// Each still takes the link its own mount names, so neither retargets the other's: spawns
+    /// of both, interleaved, keep resolving to their own runtime dirs.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn workspaces_sharing_a_port_base_never_retarget_each_others_runtime_link() {
+        let root = scratch("runtime-link-owner");
+        let sandboxes =
+            ["first", "second"].map(|store| sandbox_at(&root.join(store).join("workspace")));
+        assert_eq!(sandboxes[0].port_block, sandboxes[1].port_block);
+        for sandbox in &sandboxes {
+            std::fs::create_dir_all(sandbox_runtime_dir(sandbox)).expect("runtime dir");
+        }
+        for _ in 0..2 {
+            for sandbox in &sandboxes {
+                link_runtime_dir(sandbox, &sandbox_runtime_dir(sandbox))
+                    .await
+                    .expect("runtime link");
+                assert_eq!(
+                    std::fs::read_link(sandbox_runtime_link(sandbox)).expect("runtime link"),
+                    sandbox_runtime_dir(sandbox)
+                );
+            }
+        }
+        for sandbox in &sandboxes {
+            assert_eq!(
+                std::fs::read_link(sandbox_runtime_link(sandbox)).expect("runtime link"),
+                sandbox_runtime_dir(sandbox),
+                "the other workspace's spawn left this one's link in place"
+            );
+            std::fs::remove_file(sandbox_runtime_link(sandbox)).ok();
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5565,7 +5598,8 @@ mod sandbox_environment_tests {
         let checkout_environment = root.join("checkout/.cowshed");
         let read_only_environment = root.join("exec-temp");
         let runtime = checkout_environment.join("run");
-        let alias = Path::new("/tmp/cs-49184");
+        let alias = crate::sandbox::workspace_runtime_link(&root.join("checkout"));
+        let alias = alias.as_path();
         let contribution = crate::capabilities::CapabilityContribution {
             daemon_isolation: crate::capabilities::DaemonIsolation {
                 directories: vec![alias.join("nx")],

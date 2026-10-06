@@ -1,8 +1,7 @@
 # Managed by `smoo monorepo`. Sourced by devenv.smoo.nix's enterShell prologue
-# from the workspace root, naming the directory that holds cowshed's short
-# runtime links:
+# from the workspace root:
 #
-#   . "$DEVENV_ROOT/nx-socket-dir.sh" /tmp
+#   . "$DEVENV_ROOT/nx-socket-dir.sh"
 #
 # Exports NX_WORKSPACE_ROOT_PATH and NX_SOCKET_DIR for this Nx workspace, and
 # drops the Nx state overrides another workspace's shell left behind.
@@ -34,21 +33,21 @@
 #   plugin workers bind their sockets under the client's NX_SOCKET_DIR.
 # - The sandbox admits Unix sockets by literal path. It grants the `nx` leaf of
 #   <checkout>/.cowshed/run under the name cowshed hands its jobs,
-#   <links>/cs-<port base>/nx, and refuses the same leaf reached through any
-#   other link: the worker's socket gets EPERM and its plugin fails to load.
+#   <runtime link>/nx, and refuses the same leaf reached through any other
+#   link: the worker's socket gets EPERM and its plugin fails to load.
 # So a host shell takes cowshed's own short link. A checkout path is too long
 # for the plugin workers' sockets ("exceeds the maximum socket length"), and
-# Nx refuses a symlinked leaf, so only the parent is a link. The port base
-# comes from the checkout's .cowshed/env, which cowshed rewrites from the
-# workspace's record at every supervisor start; a COWSHED_PORT_BASE in the
-# caller's environment may be another workspace's. A host shell creates the
-# link when cowshed has not yet, exactly as cowshed would. A link that leads
-# elsewhere is reported and left alone.
+# Nx refuses a symlinked leaf, so only the parent is a link. Cowshed names the
+# link after the checkout's mount and writes it as COWSHED_RUNTIME_LINK into
+# the checkout's .cowshed/env at every supervisor start; the shell reads it
+# from there, never re-deriving it, and never from the caller's environment,
+# whose COWSHED_RUNTIME_LINK may be another workspace's. A host shell creates
+# the link when cowshed has not yet, exactly as cowshed would. A link that
+# leads elsewhere is reported and left alone.
 #
 # Without that link, a socket dir that already resolves inside this checkout
 # is cowshed's binding for the job and stays. An inherited one that resolves
 # elsewhere belongs to another workspace, so the workspace takes its own.
-smoo_nx_links="$1"
 smoo_nx_checkout="$(pwd -P)"
 if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
   [ "$(cd "$NX_WORKSPACE_ROOT_PATH" >/dev/null 2>&1 && pwd -P)" != "$smoo_nx_checkout" ]; then
@@ -56,12 +55,11 @@ if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
 fi
 export NX_WORKSPACE_ROOT_PATH="$PWD"
 smoo_nx_socket=""
-smoo_nx_port=""
+smoo_nx_link=""
 if [ -d .cowshed/run ] && [ -f .cowshed/env ]; then
-  smoo_nx_port="$(sed -n 's/^export COWSHED_PORT_BASE=\([0-9][0-9]*\)$/\1/p' .cowshed/env)"
+  smoo_nx_link="$(sed -n 's/^export COWSHED_RUNTIME_LINK=\(\/[A-Za-z0-9._\/-]*\)$/\1/p' .cowshed/env)"
 fi
-if [ -n "$smoo_nx_port" ]; then
-  smoo_nx_link="$smoo_nx_links/cs-$smoo_nx_port"
+if [ -n "$smoo_nx_link" ]; then
   smoo_nx_run="$(cd "$smoo_nx_checkout/.cowshed/run" && pwd -P)"
   if [ ! -e "$smoo_nx_link" ] && [ ! -L "$smoo_nx_link" ]; then
     ln -s "$smoo_nx_run" "$smoo_nx_link"
@@ -71,7 +69,7 @@ if [ -n "$smoo_nx_port" ]; then
   else
     echo "devenv: $smoo_nx_link does not lead to this checkout's $smoo_nx_run; Nx here cannot reach the workspace's sandboxed daemon" >&2
   fi
-  unset smoo_nx_link smoo_nx_run
+  unset smoo_nx_run
 fi
 if [ -z "$smoo_nx_socket" ]; then
   case "$(cd "${NX_SOCKET_DIR:-/nonexistent}" >/dev/null 2>&1 && pwd -P)/" in
@@ -81,4 +79,4 @@ if [ -z "$smoo_nx_socket" ]; then
 fi
 export NX_SOCKET_DIR="$smoo_nx_socket"
 mkdir -p "$NX_SOCKET_DIR"
-unset smoo_nx_links smoo_nx_checkout smoo_nx_socket smoo_nx_port
+unset smoo_nx_checkout smoo_nx_socket smoo_nx_link

@@ -426,9 +426,9 @@ nothing when nothing changed:
   checkouts sets them itself; Go's own caches keep Go's defaults.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
-  `.cowshed/env` names a port base uses `/tmp/cs-<port base>/nx`, the literal path cowshed gives its sandboxed jobs, and
-  creates that link if no job has yet. Host shells and sandboxed jobs then share one Nx daemon, and a sandboxed daemon's
-  plugin workers can bind their sockets whichever side connected.
+  `.cowshed/env` names a `COWSHED_RUNTIME_LINK` uses `<that link>/nx`, the literal path cowshed gives its sandboxed
+  jobs, and creates that link if no job has yet. Host shells and sandboxed jobs then share one Nx daemon, and a
+  sandboxed daemon's plugin workers can bind their sockets whichever side connected.
 - On Darwin, `tooling/direnv/apple-developer.sh` hands the Apple toolchain to Xcode: it unsets `CC`/`CXX`, drops a
   `/nix/store` `SDKROOT` or `DEVELOPER_DIR`, and removes every `/nix/store` `PATH` entry that carries nixpkgs xcbuild's
   `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is then

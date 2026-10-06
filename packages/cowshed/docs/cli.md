@@ -595,6 +595,10 @@ Once a supervisor serves the workspace, `.cowshed/env` also exports `TMPDIR` as 
 the project store: the same one every sandboxed job receives. A host shell that sources it runs with the temp directory
 a land gate runs with, never the machine's shared one, whose size every concurrent gate grows.
 
+It also exports `COWSHED_RUNTIME_LINK`, the short `/tmp/cs-<digest>` link through which jobs reach the workspace's
+runtime directory, named after the workspace's mount. A host shell takes Nx's socket directory below it, by the same
+literal path as the workspace's jobs, so both reach one Nx daemon.
+
 ```
 $ cowshed exec raven -- sh -c 'echo $((COWSHED_PORT_BASE + 1))'
 40961

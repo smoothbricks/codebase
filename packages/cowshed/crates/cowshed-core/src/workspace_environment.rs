@@ -17,6 +17,10 @@ pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
 /// whole, and a user temp directory every concurrent gate fills holds each start for seconds.
 pub const TEMP_DIR_ENV: &str = "TMPDIR";
+/// The short link to the workspace's runtime dir, [`crate::sandbox::workspace_runtime_link`],
+/// exported so a host shell names the link its jobs use without re-deriving it: the Nx socket
+/// dir host shells and jobs share is `nx` below it, by that literal path.
+pub const RUNTIME_LINK_ENV: &str = "COWSHED_RUNTIME_LINK";
 
 /// Agent harnesses export `CI`; only a real runner may change local Cargo unit identities.
 pub(crate) const DEV_CI_POLICY: &str =
@@ -37,16 +41,41 @@ pub enum WorkspaceEnvironmentError {
     Publication(#[from] MetadataError),
 }
 
+/// Where `.cowshed/env` is published, and what is known about the workspace there.
+#[derive(Clone, Copy, Debug)]
+pub enum EnvironmentMount<'a> {
+    /// A mint's mount, possibly a staging path: no sandbox serves it yet, so the file names
+    /// neither a TMPDIR nor a runtime link. The supervisor start that serves it adds both.
+    Minted(&'a Path),
+    /// The workspace mount its supervisor serves, with that sandbox's `TMPDIR`. The runtime
+    /// link is named after this mount.
+    Served {
+        workspace_mount: &'a Path,
+        temp_dir: &'a Path,
+    },
+}
+
+impl<'a> EnvironmentMount<'a> {
+    pub fn root(self) -> &'a Path {
+        match self {
+            Self::Minted(root)
+            | Self::Served {
+                workspace_mount: root,
+                ..
+            } => root,
+        }
+    }
+}
+
 /// Atomically publish the source-able, workspace-local build environment inside an image. Its
 /// one caller is `workspace_credentials::publish_workspace_environment`, which reads the token
-/// the image publishes. `temp_dir` is the sandbox's `TMPDIR`, exported when the caller knows the
-/// store it lives in; the file names it single-quoted.
+/// the image publishes. A served mount also exports its `TMPDIR`, single-quoted, and its
+/// runtime link.
 pub(crate) fn write_workspace_environment(
-    image_root: &Path,
+    mount: EnvironmentMount<'_>,
     token: &Zeroizing<String>,
     platform: Platform,
     port_block: Option<PortBlock>,
-    temp_dir: Option<&Path>,
 ) -> Result<(), WorkspaceEnvironmentError> {
     match (platform, port_block) {
         (Platform::Macos, Some(block)) => {
@@ -65,19 +94,33 @@ pub(crate) fn write_workspace_environment(
             });
         }
     }
-    let temp_dir = temp_dir
-        .map(|path| {
-            path.to_str()
-                .filter(|text| path.is_absolute() && !text.contains(['\'', '\n']))
-                .ok_or_else(|| WorkspaceEnvironmentError::UnexportableTempDir(path.to_path_buf()))
-        })
-        .transpose()?;
+    let served = match mount {
+        EnvironmentMount::Minted(_) => None,
+        EnvironmentMount::Served {
+            workspace_mount,
+            temp_dir,
+        } => {
+            let temp_dir = temp_dir
+                .to_str()
+                .filter(|text| temp_dir.is_absolute() && !text.contains(['\'', '\n']))
+                .ok_or_else(|| {
+                    WorkspaceEnvironmentError::UnexportableTempDir(temp_dir.to_path_buf())
+                })?;
+            Some((
+                temp_dir,
+                crate::sandbox::workspace_runtime_link(workspace_mount),
+            ))
+        }
+    };
     // Token alphabet is unpadded base64url (`A-Za-z0-9_-`), already shell-safe; it is pushed
     // into a Zeroizing buffer and never through an intermediate String. Capacity is sized so the
     // buffer cannot reallocate: 32 fixed bytes around the token, at most 68 for the port lines,
-    // 18 around the temp directory, plus the fixed development CI policy.
+    // 18 around the temp directory, 49 for the runtime link line, plus the fixed development CI
+    // policy.
     let mut contents = Zeroizing::new(String::with_capacity(
-        128 + token.len() + DEV_CI_POLICY.len() + temp_dir.map_or(0, str::len),
+        192 + token.len()
+            + DEV_CI_POLICY.len()
+            + served.as_ref().map_or(0, |(temp_dir, _)| temp_dir.len()),
     ));
     contents.push_str(DEV_CI_POLICY);
     contents.push_str("export ");
@@ -94,13 +137,18 @@ pub(crate) fn write_workspace_environment(
         )
         .expect("writing to a String cannot fail");
     }
-    if let Some(temp_dir) = temp_dir {
-        writeln!(&mut *contents, "export {TEMP_DIR_ENV}='{temp_dir}'")
-            .expect("writing to a String cannot fail");
+    if let Some((temp_dir, runtime_link)) = served {
+        // The link is `/tmp/cs-` and hex digits: shell-safe, so it is written unquoted.
+        writeln!(
+            &mut *contents,
+            "export {TEMP_DIR_ENV}='{temp_dir}'\nexport {RUNTIME_LINK_ENV}={}",
+            runtime_link.display()
+        )
+        .expect("writing to a String cannot fail");
     }
 
     write_atomic_bytes(
-        &image_root.join(WORKSPACE_ENVIRONMENT_PATH),
+        &mount.root().join(WORKSPACE_ENVIRONMENT_PATH),
         contents.as_bytes(),
     )?;
     Ok(())
@@ -116,6 +164,7 @@ mod tests {
         assert_eq!(PORT_BASE_ENV, "COWSHED_PORT_BASE");
         assert_eq!(PORT_BLOCK_SIZE_ENV, "COWSHED_PORT_BLOCK_SIZE");
         assert_eq!(TEMP_DIR_ENV, "TMPDIR");
+        assert_eq!(RUNTIME_LINK_ENV, "COWSHED_RUNTIME_LINK");
     }
 
     #[test]
@@ -127,11 +176,13 @@ mod tests {
         ] {
             assert!(matches!(
                 write_workspace_environment(
-                    Path::new("/nonexistent-image"),
+                    EnvironmentMount::Served {
+                        workspace_mount: Path::new("/nonexistent-image"),
+                        temp_dir: Path::new(refused),
+                    },
                     &Zeroizing::new("token".to_owned()),
                     Platform::Linux,
                     None,
-                    Some(Path::new(refused)),
                 ),
                 Err(WorkspaceEnvironmentError::UnexportableTempDir(path)) if path == Path::new(refused)
             ));
@@ -156,11 +207,13 @@ mod tests {
         std::fs::create_dir_all(root.join(".cowshed")).unwrap();
         let temp_dir = root.join("exec temp");
         write_workspace_environment(
-            root,
+            EnvironmentMount::Served {
+                workspace_mount: root,
+                temp_dir: &temp_dir,
+            },
             &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
-            Some(&temp_dir),
         )
         .unwrap();
         for marker in [None, Some(""), Some("false"), Some("true")] {
@@ -168,7 +221,7 @@ mod tests {
             command
                 .args([
                     "-c",
-                    ". \"$1\"; printf '%s\\n' \"${CI-unset}\" \"$CC_aarch64_apple_darwin\" \"$CXX_aarch64_apple_darwin\" \"$AR_aarch64_apple_darwin\" \"$TMPDIR\"",
+                    ". \"$1\"; printf '%s\\n' \"${CI-unset}\" \"$CC_aarch64_apple_darwin\" \"$CXX_aarch64_apple_darwin\" \"$AR_aarch64_apple_darwin\" \"$TMPDIR\" \"$COWSHED_RUNTIME_LINK\"",
                     "cowshed-env",
                 ])
                 .arg(root.join(WORKSPACE_ENVIRONMENT_PATH))
@@ -191,8 +244,9 @@ mod tests {
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
                 format!(
-                    "{ci}\n/usr/bin/clang\n/usr/bin/clang++\n/usr/bin/ar\n{}\n",
-                    temp_dir.display()
+                    "{ci}\n/usr/bin/clang\n/usr/bin/clang++\n/usr/bin/ar\n{}\n{}\n",
+                    temp_dir.display(),
+                    crate::sandbox::workspace_runtime_link(root).display()
                 ),
                 "{marker:?}",
             );

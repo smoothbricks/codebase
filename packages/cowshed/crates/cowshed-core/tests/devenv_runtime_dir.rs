@@ -35,9 +35,6 @@ use cowshed_gateway_types::WorkspaceToken;
 
 use tokio::sync::mpsc;
 
-#[path = "support/runtime_link.rs"]
-mod runtime_link;
-
 /// `sun_path` on macOS is 104 bytes; devenv keeps its default runtime base short for exactly
 /// this reason (`resolve_runtime_dir`, devenv-core `paths.rs`). A base that leaves no room for
 /// the `devenv-<7 hex>` component plus a socket name is a base devenv cannot use.
@@ -172,8 +169,8 @@ async fn host_controller_shell_activation_owns_a_runtime_directory_the_profile_l
         printed["TMPDIR"]
     );
 
-    // The child sees the short `/tmp/cs-<port>` link - the `sun_path` budget - and it resolves
-    // onto the shed's own runtime directory, which is what the profile grants.
+    // The child sees the short `/tmp/cs-<mount digest>` link - the `sun_path` budget - and it
+    // resolves onto the shed's own runtime directory, which is what the profile grants.
     let runtime_link = PathBuf::from(printed["XDG_RUNTIME_DIR"]);
     assert_eq!(runtime_link, sandbox_runtime_link(&sandbox));
     let runtime_base =
@@ -1960,7 +1957,6 @@ async fn host_controller_a_bun_project_runs_bun_before_its_envrc_evaluates() {
 async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_caches() {
     let root = scratch("shared-tool-caches");
     let mut sandbox = workspace(&root, 42_592);
-    let _runtime_link = runtime_link::RuntimeLink::reserve(&mut sandbox);
     std::fs::create_dir_all(sandbox.home.join(".cargo")).unwrap();
     for name in cowshed_core::capabilities::cargo::STATE_FILES {
         std::fs::write(sandbox.home.join(".cargo").join(name), "").unwrap();
