@@ -284,6 +284,20 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `COWSHED_WORKSPACE_TOKEN`, and no file under the private `home`, `config` or `cache` carries it. The cargo `[env]`
     guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
 
+    **Limitation: per-workspace `CARGO_*` paths key nested-cwd cargo runs per workspace.** sccache hashes every
+    `CARGO_*` value into a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. Two of those
+    values are paths under the checkout: `CARGO_HTTP_CAINFO` (`<checkout>/.cowshed/ca-bundle.pem`) and the devenv's
+    `CARGO_INSTALL_ROOT` (`<checkout>/tooling/direnv/.devenv/state/cargo-install`, exported by devenv's own rust module
+    in `enterShell`, after every capability's env). A cargo run from the checkout root strips both. A run whose cwd is
+    below the root (a nested Cargo workspace such as a vendored upstream checkout) keys them verbatim, so its Rust
+    entries are per workspace: 0/192 cross-workspace hits measured. Neither path can take a stable spelling. The
+    bundle's content is per workspace, since it is the platform roots plus the workspace's own CA (04_sandbox.md), so a
+    content-addressed path still differs per workspace. A path spelled the same in every workspace but holding each
+    workspace's content would need a per-process filesystem namespace, which macOS does not have. Cargo still needs the
+    bundle: rustup's cargo verifies through SecureTransport, which ignores `SSL_CERT_FILE`. Fixing this at the key means
+    patching sccache, and cowshed does not grow its sccache patches. A nested build that should share entries across
+    workspaces therefore sets both variables itself to values that are identical in every workspace.
+
 ### The sccache daemon
 
 sccache is served by a **host-owned daemon**: the `dev.cowshed.sccache` LaunchAgent runs the sccache binary itself as a
