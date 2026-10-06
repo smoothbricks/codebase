@@ -4,6 +4,7 @@ import type { BigIntStats } from 'node:fs';
 import { closeSync, existsSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { inspect } from 'node:util';
 
 import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
@@ -169,6 +170,87 @@ export function describeMiss(reason: MissReason): string {
   }
 }
 
+/** A `smoo-nx-exec` command line: the target, the workspace root it names, and the binary to exec with its arguments. */
+export interface ExecInvocation {
+  readonly target: string;
+  /** As given; absent when the wrapper is to find the root at or above the caller's directory. */
+  readonly workspaceRoot: string | undefined;
+  /** Empty when there is nothing to exec, only the target to make current. */
+  readonly command: readonly string[];
+}
+
+/** A command line read as an invocation, or the usage mistake it makes. */
+export type ExecArguments =
+  | { readonly ok: true; readonly invocation: ExecInvocation }
+  | { readonly ok: false; readonly usage: string };
+
+/**
+ * Read `smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>]
+ * [-- <binary> [args...]]`. A flag may be spelled `--flag value` or
+ * `--flag=value`. Without `--` there is nothing to exec: the wrapper builds
+ * what is stale and exits, so a caller that only needs the target current pays
+ * the probe, not an Nx CLI start that replays every cached task's log.
+ */
+export function parseExecArguments(argv: readonly string[]): ExecArguments {
+  const separator = argv.indexOf('--');
+  const command = separator === -1 ? [] : argv.slice(separator + 1);
+  if (separator !== -1 && command.length === 0) {
+    return { ok: false, usage: 'no binary given after `--`' };
+  }
+  let target: string | undefined;
+  let workspaceRoot: string | undefined;
+  // Only leading `--` forms are split at `=`: a value may legitimately contain one.
+  const tokens = (separator === -1 ? argv : argv.slice(0, separator)).flatMap((arg) => {
+    const equals = arg.startsWith('--') ? arg.indexOf('=') : -1;
+    return equals === -1 ? [arg] : [arg.slice(0, equals), arg.slice(equals + 1)];
+  });
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === '--workspace-root') {
+      index += 1;
+      if (index === tokens.length) {
+        return { ok: false, usage: '--workspace-root needs a directory' };
+      }
+      workspaceRoot = tokens[index];
+    } else if (token.startsWith('-')) {
+      return { ok: false, usage: `unknown flag ${token}` };
+    } else if (target !== undefined) {
+      return { ok: false, usage: `more than one target given: ${target} and ${token}` };
+    } else {
+      target = token;
+    }
+  }
+  if (target === undefined) {
+    return { ok: false, usage: 'no project:target given' };
+  }
+  if (parseTargetSelector(target) === null) {
+    return { ok: false, usage: `'${target}' is not a project:target[:configuration] selector` };
+  }
+  // `execve` does no PATH lookup, so a bare name would fail as a missing file in
+  // the current directory. Say which mistake was made instead.
+  if (command.length > 0 && !command[0].includes('/')) {
+    return { ok: false, usage: `'${command[0]}' must be a path to the binary, not a name to look up on PATH` };
+  }
+  return { ok: true, invocation: { target, workspaceRoot, command } };
+}
+
+/**
+ * The message of whatever `ensureBuilt` rejected with. Nx rejects with plain
+ * objects as well as errors (its daemon client's `{ stack, message }`), and
+ * `String()` of one is `[object Object]`.
+ */
+export function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+  return typeof error === 'string'
+    ? error
+    : inspect(error, { breakLength: Number.POSITIVE_INFINITY, colors: false, depth: 5 });
+}
+
 /**
  * First reason the task set cannot be replayed, considering only recorded
  * results — no filesystem access. `null` means every task is a recorded
@@ -239,22 +321,16 @@ export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBu
   const workspaceRoot = resolve(options.cwd);
   const callerCwd = process.cwd();
   const callerEnv = { ...process.env };
-  // Whether the environment this process was launched with belongs to the
-  // workspace asked for, decided before the chdir and the rebinding below. The
-  // caller's workspace is the one its own Nx would bind: `NX_WORKSPACE_ROOT_PATH`
-  // when set, else the nearest `nx.json` above where it stands (none, when it
-  // stands in no workspace).
-  const callerRoot = callerEnv.NX_WORKSPACE_ROOT_PATH
-    ? resolve(callerCwd, callerEnv.NX_WORKSPACE_ROOT_PATH)
-    : findNxWorkspaceRoot(callerCwd);
-  const callerOwnsRoot = callerRoot !== null && isSameDirectory(callerRoot, workspaceRoot);
+  // Decided before the chdir and the rebinding below.
+  const callerOwnsRoot = callerOwnsWorkspace(callerEnv, callerCwd, workspaceRoot);
   try {
     // `cd <root> && nx run ...` is the invocation whose hashes are in the
     // cache. Everything below — plugin hooks, `runtime` inputs, and the hasher,
     // which keys against `process.cwd()` — has to see the same directory or the
     // probe keys differently from the CLI and never hits.
     process.chdir(workspaceRoot);
-    return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream', callerOwnsRoot);
+    assignEnvironment(process.env, workspaceEnvironment(callerEnv, workspaceRoot, callerOwnsRoot));
+    return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream');
   } finally {
     // Nx configures itself through the environment and this function runs
     // in-process, so without this the caller — and anything it goes on to exec
@@ -262,16 +338,7 @@ export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBu
     // whatever a plugin's preTasksExecution hook injected. The wrapper this
     // replaces got that isolation for free by running Nx in a child.
     process.chdir(callerCwd);
-    for (const key of Object.keys(process.env)) {
-      if (!(key in callerEnv)) {
-        delete process.env[key];
-      }
-    }
-    for (const [key, value] of Object.entries(callerEnv)) {
-      if (process.env[key] !== value) {
-        process.env[key] = value;
-      }
-    }
+    assignEnvironment(process.env, callerEnv);
   }
 }
 
@@ -322,37 +389,108 @@ function isSameDirectory(left: string, right: string): boolean {
 }
 
 /**
- * Point every Nx this call starts — the daemon client loaded below and the
- * `nx` CLI a miss spawns — at `workspaceRoot`, and give it that workspace's
- * state locations. A caller that was set up for this same root keeps its
- * overrides: they are the owner's cache and sandbox boundary. A caller set up
- * for another root, or for none, passes none of them on, so Nx falls back to
- * the per-root defaults. Nothing is reset or bypassed: the root's own daemon
- * and cache are used as they stand. `ensureBuilt` restores the caller's
- * environment when it returns.
+ * Whether the environment a caller was launched with belongs to
+ * `workspaceRoot`. The caller's workspace is the one its own Nx would bind:
+ * `NX_WORKSPACE_ROOT_PATH` when set (relative to where it stands), else the
+ * nearest `nx.json` at or above where it stands — none, when it stands in no
+ * workspace.
  */
-function isolateWorkspaceEnvironment(workspaceRoot: string, callerOwnsRoot: boolean): void {
-  process.env.NX_WORKSPACE_ROOT_PATH = workspaceRoot;
-  if (callerOwnsRoot) {
-    return;
+export function callerOwnsWorkspace(
+  callerEnv: Readonly<NodeJS.ProcessEnv>,
+  callerCwd: string,
+  workspaceRoot: string,
+): boolean {
+  const callerRoot = callerEnv.NX_WORKSPACE_ROOT_PATH
+    ? resolve(callerCwd, callerEnv.NX_WORKSPACE_ROOT_PATH)
+    : findNxWorkspaceRoot(callerCwd);
+  return callerRoot !== null && isSameDirectory(callerRoot, workspaceRoot);
+}
+
+/**
+ * The environment every Nx this call starts runs under — the daemon client
+ * loaded below and the `nx` CLI a miss spawns: the caller's, pointed at
+ * `workspaceRoot`, with that workspace's state locations. A caller that was set
+ * up for this same root keeps its overrides: they are the owner's cache and
+ * sandbox boundary. A caller set up for another root, or for none, passes none
+ * of them on, so Nx falls back to the per-root defaults. Nothing is reset or
+ * bypassed: the root's own daemon and cache are used as they stand.
+ */
+export function workspaceEnvironment(
+  callerEnv: Readonly<NodeJS.ProcessEnv>,
+  workspaceRoot: string,
+  callerOwnsRoot: boolean,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...callerEnv, NX_WORKSPACE_ROOT_PATH: workspaceRoot };
+  if (!callerOwnsRoot) {
+    for (const key of WORKSPACE_STATE_ENV_KEYS) {
+      delete env[key];
+    }
   }
-  for (const key of WORKSPACE_STATE_ENV_KEYS) {
-    delete process.env[key];
+  return env;
+}
+
+/**
+ * Make `target` hold exactly the variables of `env`: each one missing from
+ * `env` removed, each one different set. Nx reads its configuration from
+ * `process.env` in this process, so that is where an environment is put in
+ * place, and where the caller's is put back.
+ */
+export function assignEnvironment(target: NodeJS.ProcessEnv, env: Readonly<NodeJS.ProcessEnv>): void {
+  for (const key of Object.keys(target)) {
+    if (env[key] === undefined) {
+      delete target[key];
+    }
   }
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined && target[key] !== value) {
+      target[key] = value;
+    }
+  }
+}
+
+/**
+ * An outer Nx task exports its own cache-bypass setting to the process it
+ * launches. That setting describes the outer task, not the nested target:
+ * inheriting it makes the inner runner refuse cache writes forever. Outside an
+ * Nx task child, however, the same variables are the caller's explicit request
+ * to force this target to rebuild and remain authoritative.
+ */
+export function withoutOuterTaskCacheBypass(env: Readonly<NodeJS.ProcessEnv>): NodeJS.ProcessEnv {
+  const nested = { ...env };
+  if (nested.NX_TASK_TARGET_PROJECT !== undefined || nested.NX_TASK_TARGET_TARGET !== undefined) {
+    delete nested.NX_SKIP_NX_CACHE;
+    delete nested.NX_DISABLE_NX_CACHE;
+  }
+  return nested;
+}
+
+/**
+ * The miss known before anything is hashed: a cache bypass the environment
+ * asks for, then an input the daemon has not seen change yet (see
+ * `refreshWorkspaceContext`). `null` means only the probe can tell.
+ */
+export function missBeforeProbe(
+  env: Readonly<NodeJS.ProcessEnv>,
+  inputsChanged: boolean,
+  taskId: string,
+): MissReason | null {
+  if (env.NX_SKIP_NX_CACHE === 'true' || env.NX_DISABLE_NX_CACHE === 'true') {
+    return { kind: 'cache-disabled', taskId };
+  }
+  return inputsChanged ? { kind: 'stale-inputs', taskId } : null;
 }
 
 async function ensureBuiltInWorkspace(
   workspaceRoot: string,
   selector: TargetSelector,
   onMiss: 'stream',
-  callerOwnsRoot: boolean,
 ): Promise<EnsureBuiltResult> {
-  isolateWorkspaceEnvironment(workspaceRoot, callerOwnsRoot);
+  const taskId = selectorTaskId(selector);
   // The environment has precedence over nx.json. Avoid loading Nx at all on
   // this explicit fallback path, which also lets a deliberately minimal
   // checkout-local CLI stand in for Nx.
   if (process.env.NX_DAEMON === 'false') {
-    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId: selectorTaskId(selector) });
+    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId });
   }
   // Nx rejects daemon access when the client package's version differs from
   // the workspace's running daemon. Resolve every runtime module from the
@@ -362,18 +500,9 @@ async function ensureBuiltInWorkspace(
   bindWorkspaceRoot(workspaceRoot, requireNx);
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
-    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId: selectorTaskId(selector) });
+    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId });
   }
-
-  // An outer Nx task exports its own cache-bypass setting to the process it
-  // launches. That setting describes the outer task, not the nested target:
-  // inheriting it makes the inner runner refuse cache writes forever. Outside
-  // an Nx task child, however, the same variables are the caller's explicit
-  // request to force this target to rebuild and must remain authoritative.
-  if (process.env.NX_TASK_TARGET_PROJECT !== undefined || process.env.NX_TASK_TARGET_TARGET !== undefined) {
-    delete process.env.NX_SKIP_NX_CACHE;
-    delete process.env.NX_DISABLE_NX_CACHE;
-  }
+  assignEnvironment(process.env, withoutOuterTaskCacheBypass(process.env));
 
   const { readNxJson } = requireNx('nx/src/config/nx-json');
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
@@ -429,14 +558,9 @@ async function ensureBuiltInWorkspace(
   });
 
   performance.mark('ensureBuilt:probe:start');
-  let reason: MissReason | null;
-  if (process.env.NX_SKIP_NX_CACHE === 'true' || process.env.NX_DISABLE_NX_CACHE === 'true') {
-    reason = { kind: 'cache-disabled', taskId: selectorTaskId(selector) };
-  } else if (inputsChanged) {
-    reason = { kind: 'stale-inputs', taskId: selectorTaskId(selector) };
-  } else {
-    reason = await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx);
-  }
+  const reason =
+    missBeforeProbe(process.env, inputsChanged, taskId) ??
+    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx));
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   // The CLI runs the hooks around its own run, under its own id. This process
   // ran none of the tasks, so it reports none for the id it opened.
@@ -453,7 +577,8 @@ async function ensureBuiltInWorkspace(
   return result;
 }
 
-function selectorTaskId(selector: TargetSelector): string {
+/** The id Nx gives the task `selector` names, and the one a miss runs. */
+export function selectorTaskId(selector: TargetSelector): string {
   return selector.configuration === undefined
     ? `${selector.project}:${selector.target}`
     : `${selector.project}:${selector.target}:${selector.configuration}`;
@@ -465,8 +590,8 @@ function selectorTaskId(selector: TargetSelector): string {
  * a module-level singleton that reads `nx.json` from that root. So the root has
  * to be bound before the first Nx module loads, which is why this module
  * imports Nx dynamically throughout. A static import at the top of the file
- * would bind the caller's launch directory instead. `isolateWorkspaceEnvironment`
- * has already set `NX_WORKSPACE_ROOT_PATH`; this loads Nx and checks it took.
+ * would bind the caller's launch directory instead. `ensureBuilt` has already
+ * set `NX_WORKSPACE_ROOT_PATH`; this loads Nx and checks it took.
  */
 function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire): void {
   if (process.env.NX_PERF_LOGGING === 'true') {
@@ -511,37 +636,66 @@ async function refreshWorkspaceContext(
   const { WorkspaceContext, matchOutputPaths } = requireNx('nx/src/native');
   const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
   performance.mark('ensureBuilt:inputs:start');
-  const previousFiles = await daemonClient.getWorkspaceContextFileData();
-  const previousHashes = new Map<string, string>();
-  for (const { file, hash } of previousFiles) {
-    previousHashes.set(file, hash);
-  }
+  const daemonFiles = await daemonClient.getWorkspaceContextFileData();
   // A context is a snapshot, not a watcher. Do not reuse one across calls.
   const context = new WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot));
-  const createdFiles: string[] = [];
-  const updatedFiles: string[] = [];
-  for (const { file, hash } of context.allFileData()) {
-    const previousHash = previousHashes.get(file);
-    if (previousHash === undefined) {
-      createdFiles.push(file);
-    } else if (previousHash !== hash) {
-      updatedFiles.push(file);
-    }
-    previousHashes.delete(file);
-  }
-  const deletedFiles = [...previousHashes.keys()];
-  const changed = [...createdFiles, ...updatedFiles, ...deletedFiles];
+  const { created, updated, deleted } = workspaceFileChanges(daemonFiles, context.allFileData());
+  const changed = [...created, ...updated, ...deleted];
   let inputsChanged = false;
   if (changed.length > 0) {
-    await daemonClient.updateWorkspaceContext(createdFiles, updatedFiles, deletedFiles);
-    // The same matcher the task runner uses to collect outputs, over the union
-    // of every task's declared outputs. A negation declared by one task then
-    // also excludes another task's output, which errs toward a miss.
-    const outputs = tasks.flatMap((task) => task.outputs);
-    inputsChanged = matchOutputPaths(outputs, changed).includes(false);
+    await daemonClient.updateWorkspaceContext(created, updated, deleted);
+    inputsChanged = changesOutsideOutputs(tasks, changed, matchOutputPaths);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
   return inputsChanged;
+}
+
+/** How the files on disk differ from the daemon's file table, by workspace-relative path. */
+export interface WorkspaceFileChanges {
+  readonly created: string[];
+  readonly updated: string[];
+  readonly deleted: string[];
+}
+
+/** Compare the daemon's file table with a snapshot of the disk, both as Nx lists them: path and content hash. */
+export function workspaceFileChanges(
+  daemonFiles: readonly NxNative.FileData[],
+  diskFiles: readonly NxNative.FileData[],
+): WorkspaceFileChanges {
+  const daemonHashes = new Map<string, string>();
+  for (const { file, hash } of daemonFiles) {
+    daemonHashes.set(file, hash);
+  }
+  const created: string[] = [];
+  const updated: string[] = [];
+  for (const { file, hash } of diskFiles) {
+    const daemonHash = daemonHashes.get(file);
+    if (daemonHash === undefined) {
+      created.push(file);
+    } else if (daemonHash !== hash) {
+      updated.push(file);
+    }
+    daemonHashes.delete(file);
+  }
+  return { created, updated, deleted: [...daemonHashes.keys()] };
+}
+
+/**
+ * Whether any `changed` path is not a declared output of a task in the graph.
+ * `matchOutputPaths` is Nx's: the same matcher the task runner uses to collect
+ * outputs, here over the union of every task's declared outputs. A negation
+ * declared by one task then also excludes another task's output, which errs
+ * toward a miss.
+ */
+export function changesOutsideOutputs(
+  tasks: readonly Task[],
+  changed: string[],
+  matchOutputPaths: typeof NxNative.matchOutputPaths,
+): boolean {
+  return matchOutputPaths(
+    tasks.flatMap((task) => task.outputs),
+    changed,
+  ).includes(false);
 }
 
 /** `null` when the target is already built; otherwise the first reason it is not. */
@@ -561,6 +715,7 @@ async function probe(
   const { getCache } = requireNx('nx/src/tasks-runner/cache');
   const { getRunnerOptions } = requireNx('nx/src/tasks-runner/run-command');
   const { getExecutorNameForTask } = requireNx('nx/src/tasks-runner/utils');
+  const { expandOutputs } = requireNx('nx/src/native');
 
   // `isCloudDefault: false` because these options are only read here by the
   // hasher, which looks at `selectivelyHashTsConfig`; the cloud credentials the
@@ -588,14 +743,7 @@ async function probe(
   await hashTasks(hasher, projectGraph, taskGraph, perTaskEnvs, getTaskDetails(), tasks);
   performance.measure('ensureBuilt:hash', 'ensureBuilt:hash:start');
 
-  // An `nx:noop` task has no command: Nx completes it without spawning
-  // anything, and normalizes a command-less target that only names dependencies
-  // to one. A cache record would vouch for no work — the tasks it aggregates are
-  // in this graph and answer for themselves — so none is required. Demanding one
-  // made every call through an uncacheable aggregate hand the whole graph to Nx,
-  // which replays each dependency's cached log. Outputs a noop declares are
-  // still verified below, with every other task's.
-  const recordedTasks = tasks.filter((task) => getExecutorNameForTask(task, projectGraph) !== 'nx:noop');
+  const recorded = recordedTasks(tasks, (task) => getExecutorNameForTask(task, projectGraph));
 
   // Nx's own factory, but deliberately never `init()`ed: that is what makes
   // this a local-only, side-effect-free question. `init()` attaches the remote
@@ -605,12 +753,12 @@ async function probe(
   // outputs against, and an artifact missing from it is a miss.
   performance.mark('ensureBuilt:cache:start');
   const cache = getCache(runnerOptions);
-  const cachedResults = await cache.getBatch(recordedTasks.filter((task) => task.cache && task.hash));
+  const cachedResults = await cache.getBatch(recorded.filter((task) => task.cache && task.hash));
   const cachedCodeByHash = new Map<string, number>();
   for (const [hash, result] of cachedResults) {
     cachedCodeByHash.set(hash, result.code);
   }
-  const cacheMiss = firstCacheMiss(recordedTasks, cachedCodeByHash);
+  const cacheMiss = firstCacheMiss(recorded, cachedCodeByHash);
   performance.measure('ensureBuilt:cache', 'ensureBuilt:cache:start');
   if (cacheMiss) {
     return cacheMiss;
@@ -621,12 +769,7 @@ async function probe(
   // lives in the working tree, where anything may have deleted or rewritten it
   // since. The daemon answers that cheaply from the output hashes it recorded
   // when Nx last wrote them.
-  const claims: OutputClaim[] = [];
-  for (const task of tasks) {
-    if (task.outputs.length > 0 && task.hash !== undefined) {
-      claims.push({ taskId: task.id, outputs: task.outputs, hash: task.hash });
-    }
-  }
+  const claims = outputClaims(tasks);
   performance.mark('ensureBuilt:outputs:start');
   const verdicts = await daemonClient.outputsHashesMatchBatch(claims.map(({ outputs, hash }) => ({ outputs, hash })));
   performance.measure('ensureBuilt:outputs', 'ensureBuilt:outputs:start');
@@ -642,12 +785,63 @@ async function probe(
   // And a write the daemon processes more than 2 s after a record erases it,
   // which a daemon busy hashing does to a restore's own writes — so each
   // restore guarantees the next one. What settles the question is what a hit
-  // would restore: Nx's own local artifact for this exact hash. A working tree
-  // that already holds every entry of it is what the restore would leave.
-  // Anything else — no artifact, a difference, an error while reading — stays
-  // a miss.
+  // would restore: Nx's own local artifact for this exact hash.
   performance.mark('ensureBuilt:artifacts:start');
-  const { expandOutputs } = requireNx('nx/src/native');
+  // `recorded` excludes `nx:noop`, so a noop's declared outputs have no
+  // artifact here and stay a miss.
+  const verdict = compareWithArtifacts(workspaceRoot, doubted, cachedResults, expandOutputs);
+  if (verdict.kind === 'stale-outputs') {
+    return verdict;
+  }
+  // Re-arm the daemon the way Nx's runner does after restoring outputs, so the
+  // next call is back on the cheap path.
+  await daemonClient.recordOutputsHashBatch(doubted.map(({ outputs, hash }) => ({ outputs, hash })));
+  const movedDuringRecord = firstMovedClaim(verdict.observed);
+  performance.measure('ensureBuilt:artifacts', 'ensureBuilt:artifacts:start');
+  return movedDuringRecord === null ? null : { kind: 'stale-outputs', taskId: movedDuringRecord };
+}
+
+/**
+ * The tasks a cache record must answer for. An `nx:noop` task has no command:
+ * Nx completes it without spawning anything, and normalizes a command-less
+ * target that only names dependencies to one. A cache record would vouch for
+ * no work — the tasks it aggregates are in this graph and answer for
+ * themselves — so none is required. Demanding one made every call through an
+ * uncacheable aggregate hand the whole graph to Nx, which replays each
+ * dependency's cached log. Outputs a noop declares are still verified, with
+ * every other task's. `executorOf` is Nx's `getExecutorNameForTask` over the
+ * project graph.
+ */
+export function recordedTasks(tasks: readonly Task[], executorOf: (task: Task) => string): Task[] {
+  return tasks.filter((task) => executorOf(task) !== 'nx:noop');
+}
+
+/** What the working tree must hold: the declared outputs of every hashed task that declares any. */
+export function outputClaims(tasks: readonly Task[]): OutputClaim[] {
+  const claims: OutputClaim[] = [];
+  for (const task of tasks) {
+    if (task.outputs.length > 0 && task.hash !== undefined) {
+      claims.push({ taskId: task.id, outputs: task.outputs, hash: task.hash });
+    }
+  }
+  return claims;
+}
+
+/**
+ * Whether restoring every claim from its cache artifact would leave the
+ * working tree as it is. `artifacts` maps a hash to its artifact as Nx's local
+ * cache lists it (`getBatch`). A working tree that already holds every entry of
+ * each artifact is what the restore would leave: `restorable`, with each node
+ * compared, so a write after the comparison can still be caught. Anything else
+ * — no artifact, a difference, an error while reading, a write while comparing
+ * — is the first claim it happened to.
+ */
+export function compareWithArtifacts(
+  workspaceRoot: string,
+  claims: readonly OutputClaim[],
+  artifacts: ReadonlyMap<string, { readonly outputsPath: string }>,
+  expandOutputs: typeof NxNative.expandOutputs,
+): ArtifactVerdict {
   const comparison: ArtifactComparison = {
     expandOutputs,
     left: Buffer.allocUnsafe(COMPARE_CHUNK_BYTES),
@@ -655,37 +849,34 @@ async function probe(
     observed: [],
     realDirectories: new Set(),
   };
-  for (const claim of doubted) {
-    // `recordedTasks` excludes `nx:noop`, so a noop's declared outputs have no
-    // artifact here and stay a miss.
-    const artifact = cachedResults.get(claim.hash);
+  for (const claim of claims) {
+    const artifact = artifacts.get(claim.hash);
     if (artifact === undefined || !outputsMatchArtifact(comparison, workspaceRoot, artifact.outputsPath, claim)) {
       return { kind: 'stale-outputs', taskId: claim.taskId };
     }
   }
   // A write that landed while the bytes were being compared would otherwise be
   // recorded as current.
-  const movedBeforeRecord = firstMovedClaim(comparison.observed);
-  if (movedBeforeRecord !== null) {
-    return { kind: 'stale-outputs', taskId: movedBeforeRecord };
-  }
-  // Re-arm the daemon the way Nx's runner does after restoring outputs, so the
-  // next call is back on the cheap path.
-  await daemonClient.recordOutputsHashBatch(doubted.map(({ outputs, hash }) => ({ outputs, hash })));
-  const movedDuringRecord = firstMovedClaim(comparison.observed);
-  performance.measure('ensureBuilt:artifacts', 'ensureBuilt:artifacts:start');
-  return movedDuringRecord === null ? null : { kind: 'stale-outputs', taskId: movedDuringRecord };
+  const moved = firstMovedClaim(comparison.observed);
+  return moved === null
+    ? { kind: 'restorable', observed: comparison.observed }
+    : { kind: 'stale-outputs', taskId: moved };
 }
 
+/** What comparing the working tree with the cache artifacts found: the first stale claim, or every node compared. */
+export type ArtifactVerdict =
+  | { readonly kind: 'stale-outputs'; readonly taskId: string }
+  | { readonly kind: 'restorable'; readonly observed: readonly ObservedNode[] };
+
 /** A task's declared outputs, resolved to workspace-relative paths, and the hash they were cached under. */
-interface OutputClaim {
+export interface OutputClaim {
   readonly taskId: string;
   readonly outputs: string[];
   readonly hash: string;
 }
 
 /** A working-tree node as it was when compared, so a later write to it can be noticed. */
-interface ObservedNode {
+export interface ObservedNode {
   readonly taskId: string;
   readonly path: string;
   readonly stats: BigIntStats;
@@ -841,7 +1032,7 @@ function sameBytes(comparison: ArtifactComparison, actual: string, expected: str
  * compared as: replaced (device, inode), rewritten (size, mtime) or otherwise
  * touched (mode, ctime).
  */
-function firstMovedClaim(observed: readonly ObservedNode[]): string | null {
+export function firstMovedClaim(observed: readonly ObservedNode[]): string | null {
   for (const { taskId, path, stats } of observed) {
     let current: BigIntStats | undefined;
     try {

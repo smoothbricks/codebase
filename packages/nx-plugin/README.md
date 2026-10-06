@@ -655,8 +655,13 @@ Most tests never start Nx. Plugin behaviour is the value `createNodesV2` returns
 where it needs Nx's verdict on it, it calls the Nx function that gives the verdict, in process: `createTaskGraph` for
 the order a run-many runs tasks in, `getOutputsForTargetAndConfiguration` for what a cache hit restores,
 `globWithWorkspaceContextSync` for the files a fileset input hashes, and a `runtime` input's command under `sh -c` from
-the workspace root for the value Nx keys on. A test starts `nx` only when that process is the subject: the daemon client
-and its socket, daemon-hosted plugin workers, task history, a hunk of the repository's Nx patch, and fixture teardown.
+the workspace root for the value Nx keys on. `smoo-nx-exec`'s decisions are functions of Nx-shaped data — selector and
+arguments, the environment it hands Nx, the daemon's file table and output verdicts, the cache records, the artifact
+tree a restore would leave — and are called directly; its process handling (stdio, exit status, signals, cwd, `execve`)
+runs against a stand-in `nx` script with the daemon off, which loads no Nx at all. A test starts `nx` only when that
+process is the subject: a fresh daemon serving `smoo-nx-exec`'s probe (outputs it holds no record of, and the socket it
+binds for a root entered from another workspace's shell), daemon-hosted plugin workers, task history, a hunk of the
+repository's Nx patch, and fixture teardown.
 
 A test that runs real Nx in a temp workspace runs it daemonless unless the daemon is the behaviour under test: a
 daemonless Nx leaves nothing running once it exits. A daemon a fixture does start works in the fixture root, idling and

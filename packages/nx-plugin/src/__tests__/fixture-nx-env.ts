@@ -99,7 +99,7 @@ export async function withNxFixture<T>(
  * outlives its stop fails the retirement and keeps the root, so its working
  * directory still names a fixture the next run reclaims.
  */
-export async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
+async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
   await stopFixtureNxDaemon(workspace);
   await rm(root, { recursive: true, force: true });
 }

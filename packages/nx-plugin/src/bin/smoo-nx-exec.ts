@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { isAbsolute, resolve } from 'node:path';
-import { inspect } from 'node:util';
 
-import { describeMiss, ensureBuilt, findNxWorkspaceRoot, parseTargetSelector } from '../ensure-built.js';
+import { describeError, describeMiss, ensureBuilt, findNxWorkspaceRoot, parseExecArguments } from '../ensure-built.js';
 
 const USAGE = 'usage: smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>] [-- <binary> [args...]]';
 
@@ -12,80 +11,17 @@ function usageError(message: string): never {
   process.exit(2);
 }
 
-function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
-    return error.message;
-  }
-  return typeof error === 'string'
-    ? error
-    : inspect(error, { breakLength: Number.POSITIVE_INFINITY, colors: false, depth: 5 });
+const parsed = parseExecArguments(process.argv.slice(2));
+if (!parsed.ok) {
+  usageError(parsed.usage);
 }
-
-/**
- * Split `--flag=value` into two tokens so both spellings parse identically.
- * Only leading `--` forms are split: a value may legitimately contain `=`.
- */
-function tokenize(args: readonly string[]): string[] {
-  const tokens: string[] = [];
-  for (const arg of args) {
-    const equals = arg.startsWith('--') ? arg.indexOf('=') : -1;
-    if (equals === -1) {
-      tokens.push(arg);
-    } else {
-      tokens.push(arg.slice(0, equals), arg.slice(equals + 1));
-    }
-  }
-  return tokens;
-}
-
-function findWorkspaceRoot(from: string): string {
-  return findNxWorkspaceRoot(from) ?? usageError(`no nx.json at or above ${from}; pass --workspace-root`);
-}
-
-const argv = process.argv.slice(2);
-const separator = argv.indexOf('--');
-// Without `--` there is nothing to exec: build what is stale and exit, so a
-// caller that only needs the target current pays the probe, not an Nx CLI
-// start that replays every cached task's log.
-const command = separator === -1 ? [] : argv.slice(separator + 1);
-if (separator !== -1 && command.length === 0) {
-  usageError('no binary given after `--`');
-}
-
-let target: string | undefined;
-let workspaceRootArg: string | undefined;
-const tokens = tokenize(separator === -1 ? argv : argv.slice(0, separator));
-for (let index = 0; index < tokens.length; index += 1) {
-  const token = tokens[index];
-  if (token === '--workspace-root') {
-    index += 1;
-    workspaceRootArg = tokens[index] ?? usageError('--workspace-root needs a directory');
-  } else if (token.startsWith('-')) {
-    usageError(`unknown flag ${token}`);
-  } else if (target !== undefined) {
-    usageError(`more than one target given: ${target} and ${token}`);
-  } else {
-    target = token;
-  }
-}
-if (target === undefined) {
-  usageError('no project:target given');
-}
-if (parseTargetSelector(target) === null) {
-  usageError(`'${target}' is not a project:target[:configuration] selector`);
-}
-
-// `execve` does no PATH lookup, so a bare name would fail as a missing file in
-// the current directory. Say which mistake was made instead.
-if (command.length > 0 && !command[0].includes('/')) {
-  usageError(`'${command[0]}' must be a path to the binary, not a name to look up on PATH`);
-}
+const { target, command } = parsed.invocation;
 
 const workspaceRoot =
-  workspaceRootArg === undefined ? findWorkspaceRoot(process.cwd()) : resolve(process.cwd(), workspaceRootArg);
+  parsed.invocation.workspaceRoot === undefined
+    ? (findNxWorkspaceRoot(process.cwd()) ??
+      usageError(`no nx.json at or above ${process.cwd()}; pass --workspace-root`))
+    : resolve(process.cwd(), parsed.invocation.workspaceRoot);
 
 const result = await ensureBuilt({ target, cwd: workspaceRoot }).catch((error: unknown) => {
   process.stderr.write(`smoo-nx-exec: ${describeError(error)}\n`);
