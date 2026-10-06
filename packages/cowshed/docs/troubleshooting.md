@@ -214,6 +214,16 @@ time (cargo and nextest set it for every test).
 Xcode DerivedData does key on absolute paths: slot mounts (`new --slot`) recycle a stable path for it. `bun install`,
 `node_modules`, zig, and gradle caches are path-independent.
 
+## A workspace misses Nx entries main has, and `.nx/workspace-data` is a directory
+
+Every build-state path is a fixed link onto the checkout's build volume
+(`.nx/workspace-data -> ../.cowshed/build/nx/workspace-data`). A tool that removes the path itself — `nx reset`, an
+`rm -rf .nx/workspace-data` — leaves the next Nx run to make a real directory there: its task database and graph then
+live outside the volume, so no fork, land or seed sees them, and every `cowshed new` clones the directory from main.
+`cowshed doctor` reports each such path as `build-link`; `cowshed exec <ws> -- true` relinks it (the refresh before
+every exec discards what is there), and `cowshed setup` does the same for every workspace. A script that means to clear
+Nx's state should empty the directory, never remove the path.
+
 ## Parallel test fixture collisions
 
 Keep the normal Nx and nextest parallelism. Gateway fixtures reserve a block's next port in the kernel for the test

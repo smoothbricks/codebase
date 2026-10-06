@@ -116,27 +116,68 @@ pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> R
 }
 
 /// Whether every build-state path of `checkout` already is what a refresh at an unchanged
-/// fingerprint leaves it (`migrate::adopt_paths`): its fixed link, under real parent
-/// directories, reaching its directory in the volume mounted at `volume`; or, for a declared path
-/// nothing occupies, nothing at all. Reads only. Anything else — a link a tool displaced or
-/// removed, a missing volume directory, an entry that cannot be read — is the refresh's to repair
-/// or report.
+/// fingerprint leaves it: [`unsettled`] finds nothing. Reads only.
 pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool {
-    paths.iter().all(|state| {
-        let path = state.checkout.as_path();
-        let at = checkout.join(path);
-        match fs::symlink_metadata(&at) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => state.is_declared(),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                real_parents(checkout, path)
-                    && fs::read_link(&at)
-                        .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
-                    && fs::metadata(volume.join(state.volume.as_path()))
-                        .is_ok_and(|metadata| metadata.is_dir())
-            }
-            Ok(_) | Err(_) => false,
-        }
-    })
+    unsettled(checkout, volume, paths).is_empty()
+}
+
+/// How a build-state path differs from what a refresh leaves there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unsettled {
+    /// Nothing is there, where a link belongs: a tool removed it, and its next run makes a
+    /// directory in its place.
+    Missing,
+    /// A real directory displaced the link: a tool removed it and wrote there since, off the
+    /// volume.
+    Directory,
+    /// Something else: a file, a link aimed elsewhere or under a linked parent, a link whose
+    /// volume directory is gone, or an entry that cannot be read.
+    Foreign,
+}
+
+impl std::fmt::Display for Unsettled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "has no link onto the build volume",
+            Self::Directory => "is a real directory where its link onto the build volume belongs",
+            Self::Foreign => "is not the link onto the build volume a refresh leaves there",
+        })
+    }
+}
+
+/// Every build-state path of `checkout` that is not what a refresh at an unchanged fingerprint
+/// leaves it (`migrate::adopt_paths`): its fixed link, under real parent directories, reaching
+/// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies,
+/// nothing at all. Reads only; repairing or reporting each is the refresh's.
+pub fn unsettled(
+    checkout: &Path,
+    volume: &Path,
+    paths: &[BuildStatePath],
+) -> Vec<(PathBuf, Unsettled)> {
+    paths
+        .iter()
+        .filter_map(|state| {
+            let path = state.checkout.as_path();
+            let at = checkout.join(path);
+            let found = match fs::symlink_metadata(&at) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (!state.is_declared()).then_some(Unsettled::Missing)
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let linked = real_parents(checkout, path)
+                        && fs::read_link(&at).is_ok_and(|target| {
+                            target == relative_target(path, state.volume.as_path())
+                        })
+                        && fs::metadata(volume.join(state.volume.as_path()))
+                            .is_ok_and(|metadata| metadata.is_dir());
+                    (!linked).then_some(Unsettled::Foreign)
+                }
+                Ok(metadata) if metadata.is_dir() => Some(Unsettled::Directory),
+                Ok(_) | Err(_) => Some(Unsettled::Foreign),
+            };
+            found.map(|found| (path.to_path_buf(), found))
+        })
+        .collect()
 }
 
 /// Whether every directory between `checkout` and `relative`'s parent is a real directory, as
@@ -493,8 +534,16 @@ mod tests {
 
         fs::remove_file(checkout.join("target")).unwrap();
         assert!(!settled(&checkout, &volume, &paths), "a removed link");
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("target"), Unsettled::Missing)]
+        );
         fs::create_dir(checkout.join("target")).unwrap();
         assert!(!settled(&checkout, &volume, &paths), "a displaced link");
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("target"), Unsettled::Directory)]
+        );
         fs::remove_dir(checkout.join("target")).unwrap();
         std::os::unix::fs::symlink(volume.join("target"), checkout.join("target")).unwrap();
         assert!(

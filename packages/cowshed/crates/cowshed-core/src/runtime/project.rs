@@ -10526,6 +10526,34 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                     error,
                                 )),
                             }
+                            let checkout = expected_mount.clone();
+                            let links = crate::storage::lifecycle::dispatch_blocking(move || {
+                                unsettled_build_links(&checkout)
+                            })
+                            .await
+                            .map_err(|error| {
+                                CowshedError::internal(format!(
+                                    "build link inspection failed: {error}"
+                                ))
+                            })
+                            .and_then(|links| links);
+                            match links {
+                                Ok(links) => {
+                                    findings.extend(links.into_iter().map(|(path, unsettled)| {
+                                        build_link_finding(
+                                            &workspace_name,
+                                            &expected_mount,
+                                            path,
+                                            unsettled,
+                                        )
+                                    }))
+                                }
+                                Err(error) => findings.push(native_finding(
+                                    "build-link",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    error,
+                                )),
+                            }
                         }
                     }
                 }
@@ -15236,6 +15264,47 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+/// Every build-state path of the checkout at `checkout` that is not what a refresh leaves it,
+/// against the volume its build link names; none for a checkout that links no volume. Reads only.
+#[cfg(target_os = "macos")]
+fn unsettled_build_links(
+    checkout: &Path,
+) -> Result<Vec<(PathBuf, crate::build_volume::link::Unsettled)>> {
+    use crate::build_volume::{BuildVolumeState, link};
+    let Some(volume) = link::linked(checkout)? else {
+        return Ok(Vec::new());
+    };
+    let state = BuildVolumeState::read(&volume)?;
+    Ok(link::unsettled(checkout, &volume, &state.paths))
+}
+
+/// Doctor's report of a build-state path that is not its link onto the workspace's build volume
+/// (16_build_volumes.md, "One link per checkout"). A tool that removes the link -- `nx reset`, an
+/// `rm -rf` of the path -- leaves its next run to make a real directory there, off the volume:
+/// nothing it writes reaches a fork, a land or the volume's carry until a refresh relinks it.
+#[cfg(target_os = "macos")]
+fn build_link_finding(
+    workspace: &WorkspaceName,
+    checkout: &Path,
+    path: PathBuf,
+    unsettled: crate::build_volume::link::Unsettled,
+) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "build-link".into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message: format!(
+            "{workspace}'s {} {unsettled}: what its tools write there misses the build volume, so \
+             no fork, land or seed of {workspace} gets it",
+            path.display()
+        ),
+        hint: format!(
+            "cowshed exec {workspace} -- true relinks it (the refresh before every exec discards \
+             what is there; `cowshed setup` refreshes every workspace)"
+        ),
+        path: Some(checkout.join(path)),
     }
 }
 

@@ -1901,6 +1901,59 @@ async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run() {
     );
 }
 
+/// Doctor's `build-link` findings: one message each.
+async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
+    // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
+    let (_, stdout, _) = run(service, ["--json", "doctor"]).await;
+    let doctor: serde_json::Value = serde_json::from_slice(&stdout).expect("doctor --json");
+    doctor["result"]["findings"]
+        .as_array()
+        .expect("doctor findings")
+        .iter()
+        .filter(|finding| finding["code"] == "build-link")
+        .map(|finding| finding["message"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// A tool that removes main's `.nx/workspace-data` link -- the repository's own shell entry did,
+/// on every Nx plugin rebuild -- leaves its next Nx run to make a real directory there, off the
+/// build volume, and every new workspace clones that directory. Doctor names it, and the refresh
+/// before the next exec puts the link back.
+#[tokio::test]
+async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    assert_eq!(build_link_findings(&mut service).await, [""; 0]);
+
+    let data = fixture.checkout.join(".nx/workspace-data");
+    let link = fs::read_link(&data).expect("main's workspace-data link");
+    fs::remove_file(&data).unwrap();
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("project-graph.json"), b"{}").unwrap();
+    let displaced = build_link_findings(&mut service).await;
+
+    sh(&mut service, "main", "true").await;
+    let relinked = fs::read_link(&data);
+    let after = build_link_findings(&mut service).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert!(
+        matches!(
+            displaced.as_slice(),
+            [message] if message.starts_with(
+                "main's .nx/workspace-data is a real directory where its link onto the build volume belongs"
+            )
+        ),
+        "{displaced:?}"
+    );
+    assert_eq!(relinked.expect("the exec's refresh relinked it"), link);
+    assert_eq!(after, [""; 0]);
+}
+
 /// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
 /// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
 /// and changing nothing `a` hashes, lands next without running them. Main then adopts `b`'s

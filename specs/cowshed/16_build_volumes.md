@@ -135,6 +135,12 @@ state): new paths join the volume, held ones never move. A checkout with build s
 (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
 A build-state path that holds tracked source refuses before anything is deleted.
 
+A link displaced between refreshes detaches the checkout from its volume until the next one: what a tool writes there
+reaches no fork, land or seed. A tool that removes the path itself (`nx reset`, an `rm -rf` of the path) leaves its next
+run to make a real directory there, and a clone of main copies that directory. `cowshed doctor` reports each build-state
+path that is not what a refresh would leave (`build-link`: missing, a real directory, or something else) without
+changing it, and names `cowshed exec <ws> -- true`, whose refresh relinks it.
+
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
 excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
 without waiting for the delete, which runs in the background. A target directory can be tens of GiB, and no job waits on
