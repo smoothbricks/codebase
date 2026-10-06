@@ -139,6 +139,11 @@
       "development": "./src/bun/threadSpanBufferFfi.ts",
       "default": "./dist/ts/bun/threadSpanBufferFfi.js"
     },
+    "./bun/thread-ffi-path": {
+      "bun": "./src/bun/threadSpanBufferFfiPath.ts",
+      "development": "./src/bun/threadSpanBufferFfiPath.ts",
+      "default": "./dist/ts/bun/threadSpanBufferFfiPath.js"
+    },
     "./bun/preload": {
       "bun": "./src/bun/preload.ts",
       "development": "./src/bun/preload.ts",

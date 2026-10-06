@@ -12,8 +12,7 @@
  * TypedArray store here is a store into the row store itself.
  */
 
-import { dlopen, FFIType, type Pointer, ptr, suffix, toArrayBuffer } from 'bun:ffi';
-import { fileURLToPath } from 'node:url';
+import { dlopen, FFIType, type Pointer, ptr, toArrayBuffer } from 'bun:ffi';
 import type { LogSchema } from '../lib/schema/LogSchema.js';
 import { encodeSchemaBlob, schemaAttributeOrdinals } from '../lib/wasm/schemaBlob.js';
 import {
@@ -24,6 +23,7 @@ import {
   type ThreadSpanBufferBinding,
   type ThreadSpanBufferHandle,
 } from '../lib/wasm/threadSpanBuffer.js';
+import { threadSpanBufferFfiDylibPath } from './threadSpanBufferFfiPath.js';
 
 export type { ThreadAttributeKind, ThreadSpanBufferHandle };
 
@@ -37,12 +37,7 @@ export interface NativeThreadSpanBufferBinding extends ThreadSpanBufferBinding {
 
 const utf8 = new TextEncoder();
 
-const dylibName = suffix === 'dll' ? 'lmao_ffi_dylib.dll' : `liblmao_ffi_dylib.${suffix}`;
-const configuredPath = process.env.LMAO_THREAD_FFI_DYLIB;
-export const THREAD_SPAN_BUFFER_FFI_DYLIB_PATH =
-  configuredPath && configuredPath.length > 0
-    ? configuredPath
-    : fileURLToPath(new URL(`../../../../.cache/lmao-thread-ffi/${dylibName}`, import.meta.url));
+export const THREAD_SPAN_BUFFER_FFI_DYLIB_PATH = threadSpanBufferFfiDylibPath();
 
 const nativeSymbols = {
   thread_span_buffer_new: {
