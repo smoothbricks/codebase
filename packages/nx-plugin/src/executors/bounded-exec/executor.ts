@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
@@ -84,7 +85,7 @@ export default function boundedExecExecutor(
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
   const tempVolume =
     process.platform === 'darwin'
-      ? new RamTempVolume(ramTempPaths(process.getuid?.() ?? 0), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
+      ? new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
       : null;
   return runBoundedExec(options, recordContext(context), createProcessTreeKiller(), tempVolume);
 }

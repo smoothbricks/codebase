@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -9,10 +10,12 @@ import {
   imagesBackedUnder,
   mountsBelow,
   operationDisk,
+  type RamDisk,
+  type RamTempError,
   type RamTempPaths,
   RamTempVolume,
+  ramDisksIn,
   ramTempPaths,
-  volumeNameOf,
 } from './ram-temp.js';
 
 const MIB = 1024 * 1024;
@@ -26,11 +29,39 @@ describe('RAM temp volume output parsing', () => {
     expect(operationDisk('Error: -69808\n')).toBeNull();
   });
 
-  it('reads the volume name diskutil info prints', () => {
-    expect(volumeNameOf('   Device Identifier:         disk271s1\n   Volume Name:               smoo-ram-501\n')).toBe(
-      'smoo-ram-501',
-    );
-    expect(volumeNameOf('   Device Identifier:         disk270\n')).toBeNull();
+  it('lists the RAM disks hdiutil info reports, with their user, size and mountpoints', () => {
+    const info = [
+      'framework       : 683.160.3',
+      'driver          : 683.160.3',
+      'images          : 3',
+      '================================================',
+      'image-path      : /private/cowshed/store/x/main.asif',
+      'mounting user   : danny',
+      'framework name  : DiskImages2',
+      '/dev/disk10\t\t',
+      '/dev/disk11\tEF57347C-0000-11AA-AA11-00306543ECAC\t',
+      '/dev/disk11s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Users/danny/Dev/x',
+      '================================================',
+      'image-path      : ram://16777216',
+      'image-type      : read/write',
+      'blockcount      : 16777216',
+      'mounting user   : danny',
+      'mounting mode   : <unknown>',
+      'process ID      : 91006',
+      'framework name  : DiskImages',
+      '/dev/disk138\t\t',
+      '/dev/disk139\tEF57347C-0000-11AA-AA11-00306543ECAC\t',
+      '/dev/disk139s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Volumes/smoo-ram-502 1',
+      '================================================',
+      'image-path      : ram://16777216',
+      'mounting user   : root',
+      '/dev/disk159\t\t',
+      '',
+    ].join('\n');
+    expect(ramDisksIn(info)).toEqual([
+      { physical: '/dev/disk138', sectors: 16777216, user: 'danny', mountpoints: ['/Volumes/smoo-ram-502 1'] },
+      { physical: '/dev/disk159', sectors: 16777216, user: 'root', mountpoints: [] },
+    ]);
   });
 
   it('finds only the images whose backing file is on the volume', () => {
@@ -58,25 +89,19 @@ describe('RAM temp volume output parsing', () => {
 
   it('mounts where DiskArbitration puts it, short enough to hold sockets', () => {
     // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths.
-    expect(ramTempPaths(501)).toEqual({
+    expect(ramTempPaths({ uid: 501, username: 'ada' })).toEqual({
       mountpoint: '/Volumes/smoo-ram-501',
       lockFile: '/private/tmp/smoo-ram-501.lock',
-      stateFile: '/private/tmp/smoo-ram-501.device',
       volumeName: 'smoo-ram-501',
+      stagingName: 'smoo-ram-501-new',
+      user: 'ada',
     });
   });
 });
 
 describe('RAM temp volume on this host', () => {
   it('shares one volume between leases and detaches it when the last one ends', async () => {
-    const parent = mkdtempSync(join(process.env.TMPDIR ?? '/private/tmp', 'rt-'));
-    const name = `smoo-ram-test-${process.pid}`;
-    const paths: RamTempPaths = {
-      mountpoint: join('/Volumes', name),
-      lockFile: join(parent, 'v.lock'),
-      stateFile: join(parent, 'v.device'),
-      volumeName: name,
-    };
+    const { parent, paths, capacity } = scratchVolume(0);
     // The host's own commands, with one injectable image in the I/O Registry listing.
     const host = createHostCommands();
     const attachedBelow: { image: string | null } = { image: null };
@@ -92,13 +117,12 @@ describe('RAM temp volume on this host', () => {
       },
     };
     const alive = new Set([101, 202]);
-    const first = new RamTempVolume(paths, 256 * MIB, commands, 101, (pid) => alive.has(pid));
-    const second = new RamTempVolume(paths, 256 * MIB, commands, 202, (pid) => alive.has(pid));
+    const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+    const second = new RamTempVolume(paths, capacity, commands, 202, (pid) => alive.has(pid));
     try {
       const a = await first.acquire();
       if (!a.ok) {
-        // A cowshed sandbox cannot attach images: the creation step says so instead of leasing.
-        expect(a.error).toMatchObject({ kind: 'provision-failed', step: 'hdiutil attach' });
+        expectSandboxed(a.error);
         return;
       }
       expect(a.value.kind).toBe('leased');
@@ -124,7 +148,7 @@ describe('RAM temp volume on this host', () => {
       alive.delete(202);
       const image = join(leaseB.directory, 'store', 'main.asif');
       attachedBelow.image = image;
-      const third = new RamTempVolume(paths, 256 * MIB, commands, 101, (pid) => alive.has(pid));
+      const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
       const c = await third.acquire();
       if (!c.ok || c.value.kind !== 'leased') {
         throw new Error(`third lease failed: ${JSON.stringify(c)}`);
@@ -140,7 +164,7 @@ describe('RAM temp volume on this host', () => {
       // Once its owner has detached the image, the next task reclaims the lease, and its release,
       // the last, detaches the volume.
       attachedBelow.image = null;
-      const fourth = new RamTempVolume(paths, 256 * MIB, commands, 101, (pid) => alive.has(pid));
+      const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
       const d = await fourth.acquire();
       if (!d.ok || d.value.kind !== 'leased') {
         throw new Error(`fourth lease failed: ${JSON.stringify(d)}`);
@@ -149,19 +173,134 @@ describe('RAM temp volume on this host', () => {
       expect(existsSync(leaseB.directory)).toBe(false);
       expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
       expect(existsSync(paths.mountpoint)).toBe(false);
-      expect(existsSync(paths.stateFile)).toBe(false);
+      expect(attachedDisks(paths, capacity)).toEqual([]);
     } finally {
       // A failed assertion must not leave a RAM disk attached.
-      const state = existsSync(paths.stateFile) ? readFileSync(paths.stateFile, 'utf8') : '';
-      const physical = /"physical":"(\/dev\/disk\d+)"/.exec(state)?.[1];
-      if (physical) {
-        execFileSync('/usr/bin/hdiutil', ['detach', '-force', physical]);
-      }
+      detachAll(paths, capacity);
       rmSync(parent, { recursive: true, force: true });
     }
-    // A RAM volume's attach/format/mount and its detach: ~3 s of DiskArbitration.
+    // A RAM volume's attach/format/mount/rename and its detach: ~3 s of DiskArbitration.
   }, 30_000);
+
+  it('reclaims what a dead creator left, never mounting beside it as "<name> 1"', async () => {
+    const { parent, paths, capacity } = scratchVolume(1);
+    const host = createHostCommands();
+    const run = async (file: string, args: string[]): Promise<string> => {
+      const output = await host.run(file, args);
+      if (output.status !== 0) {
+        throw new Error(`${file} ${args.join(' ')}: exit ${output.status}: ${output.stderr}`);
+      }
+      return output.stdout;
+    };
+    const volume = new RamTempVolume(paths, capacity, host);
+    try {
+      // The debris: a volume mounted at the mountpoint by a creator that died before its marker
+      // (the order this module used to create in), and a RAM disk whose deadlined attach finished
+      // with nobody left to format it.
+      const sectors = `ram://${capacity / 512}`;
+      const orphan = await host.run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
+      if (orphan.status !== 0) {
+        const acquired = await volume.acquire();
+        expect(acquired.ok).toBe(false);
+        if (!acquired.ok) {
+          expectSandboxed(acquired.error);
+        }
+        return;
+      }
+      const physical = /^(\/dev\/disk\d+)\b/.exec(orphan.stdout)?.[1] ?? '';
+      const container = operationDisk(await run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical])) ?? '';
+      const orphanVolume =
+        operationDisk(
+          await run('/usr/sbin/diskutil', ['apfs', 'addVolume', container, 'APFS', paths.volumeName, '-nomount']),
+        ) ?? '';
+      await run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', orphanVolume]);
+      await run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
+      expect(attachedDisks(paths, capacity).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint], []]);
+
+      // An unmarked volume that carries a lease is someone's TMPDIR: it is named, not detached.
+      const lease = join(paths.mountpoint, `${process.pid}-abcdef`);
+      mkdirSync(lease);
+      const refused = await volume.acquire();
+      expect(refused).toEqual({
+        ok: false,
+        error: {
+          kind: 'provision-failed',
+          step: 'reclaim',
+          detail: `${physical} at ${paths.mountpoint} has no marker but carries leases ${process.pid}-abcdef; not detached`,
+        },
+      });
+      expect(existsSync(lease)).toBe(true);
+      rmdirSync(lease);
+
+      const acquired = await volume.acquire();
+      if (!acquired.ok || acquired.value.kind !== 'leased') {
+        throw new Error(`lease over the debris failed: ${JSON.stringify(acquired)}`);
+      }
+      expect(acquired.value.lease.mountpoint).toBe(paths.mountpoint);
+      expect(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
+      expect(existsSync(`${paths.mountpoint} 1`)).toBe(false);
+      expect(attachedDisks(paths, capacity).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
+
+      expect(await volume.release(acquired.value.lease)).toEqual({ ok: true, value: undefined });
+      expect(attachedDisks(paths, capacity)).toEqual([]);
+    } finally {
+      detachAll(paths, capacity);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('kills a deadlined command together with everything it spawned', async () => {
+    // `hdiutil attach` leaves the attach to a diskimages-helper it spawns; the deadline must take
+    // that child down too, or it finishes the attach after the task gave up on it.
+    const result = await createHostCommands(500).run('/bin/sh', ['-c', 'sleep 60 & echo $!; wait']);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/^no answer within 500 ms; killed process group \d+$/);
+    const spawned = result.stdout.trim();
+    expect(spawned).toMatch(/^\d+$/);
+    // Gone, or a zombie its new parent has yet to reap: either way no longer running.
+    const state = await createHostCommands().run('/bin/ps', ['-o', 'stat=', '-p', spawned]);
+    expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
+  });
 });
+
+/**
+ * A volume of its own for one test: a lock beside it, and a name and a size no other test
+ * process uses, since the size and the user are what identify a RAM disk as this volume's.
+ */
+function scratchVolume(index: number): { parent: string; paths: RamTempPaths; capacity: number } {
+  const parent = mkdtempSync(join(process.env.TMPDIR ?? '/private/tmp', 'rt-'));
+  const name = `smoo-ram-test-${process.pid}-${index}`;
+  return {
+    parent,
+    paths: {
+      mountpoint: join('/Volumes', name),
+      lockFile: join(parent, 'v.lock'),
+      volumeName: name,
+      stagingName: `${name}-new`,
+      user: userInfo().username,
+    },
+    capacity: 64 * MIB + (process.pid * 4 + index + 1) * 512,
+  };
+}
+
+function attachedDisks(paths: RamTempPaths, capacity: number): RamDisk[] {
+  const info = execFileSync('/usr/bin/hdiutil', ['info'], { encoding: 'utf8' });
+  return ramDisksIn(info).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
+}
+
+function detachAll(paths: RamTempPaths, capacity: number): void {
+  for (const disk of attachedDisks(paths, capacity)) {
+    execFileSync('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
+  }
+}
+
+/** A cowshed sandbox cannot attach images: creation fails at the host instead of leasing. */
+function expectSandboxed(error: RamTempError): void {
+  expect(error.kind).toBe('provision-failed');
+  if (error.kind === 'provision-failed') {
+    expect(['hdiutil info', 'hdiutil attach']).toContain(error.step);
+  }
+}
 
 /** One attached image as `ioreg -r -c AppleDiskImageDevice -l -w0` lists it. */
 function registryDevice(url: string, disk: string): string[] {

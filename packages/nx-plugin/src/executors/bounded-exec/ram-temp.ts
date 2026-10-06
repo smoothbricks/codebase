@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -37,13 +37,27 @@ import { join } from 'node:path';
  * process's pid; a lease whose pid is gone is reclaimed by the next task that
  * takes the lock, and the volume is detached when the last live lease ends.
  *
+ * The volume is formatted and mounted under a staging name, marked, and only
+ * then renamed to its own name: `diskutil rename` moves a mounted volume's
+ * /Volumes mountpoint with it (measured 2026-10-06). A creator that dies part
+ * way leaves debris at the staging name, never an unmarked volume at the
+ * mountpoint, which DiskArbitration would make every later volume dodge as
+ * "<name> 1". The host's own image list is the only record of what was
+ * attached: before creating, a task detaches every RAM disk of this user and
+ * this volume's exact size that is mounted nowhere but this volume's names,
+ * because a creator killed or deadlined mid-step leaves one behind — measured
+ * 2026-10-06: a deadlined `hdiutil attach` whose diskimages-helper finished the
+ * attach after `hdiutil` was killed, and a volume mounted with no marker. A
+ * disk with a lease directory on it is never detached; its error names it.
+ *
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
  * lease, from scratch roots outside TMPDIR (specs/cowshed/08_testing.md). This
  * module never detaches one, and never deletes through a mount below a lease.
  * A dead lease that still backs an image or holds a mount is kept, with the
  * volume under it, and every task that takes a lease names it. Every disk
- * child runs under a deadline, so a wedged DiskArbitration fails the task
+ * child runs under a deadline, in its own process group so the deadline also
+ * reaches the helper it spawned, so a wedged DiskArbitration fails the task
  * instead of every task queued on the lock.
  *
  * A cowshed sandbox denies writes to /private/tmp (EPERM on the lock), and
@@ -86,27 +100,34 @@ export interface RamTempPaths {
   /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */
   mountpoint: string;
   lockFile: string;
-  stateFile: string;
-  /** APFS volume name; names the mountpoint and identifies the volume when its mountpoint cannot. */
+  /** APFS volume name; names the mountpoint. */
   volumeName: string;
+  /** The volume's name while it is formatted and marked, before it is renamed to `volumeName`. */
+  stagingName: string;
+  /** Login name `hdiutil info` reports as the attaching user of this module's RAM disks. */
+  user: string;
 }
 
-export function ramTempPaths(uid: number): RamTempPaths {
-  const volumeName = `smoo-ram-${uid}`;
+export function ramTempPaths(user: { uid: number; username: string }): RamTempPaths {
+  const volumeName = `smoo-ram-${user.uid}`;
   return {
     mountpoint: join('/Volumes', volumeName),
     lockFile: `/private/tmp/${volumeName}.lock`,
-    stateFile: `/private/tmp/${volumeName}.device`,
     volumeName,
+    stagingName: `${volumeName}-new`,
+    user: user.username,
   };
 }
 
-/** The attached devices of a volume this module created, as recorded in its state file. */
-interface VolumeDevices {
-  /** The RAM disk itself (`/dev/diskN`): detaching it removes container and volume. */
+/** An attached RAM disk, as `hdiutil info` lists it. */
+export interface RamDisk {
+  /** The whole disk (`/dev/diskN`): detaching it removes its container and volumes. */
   physical: string;
-  /** The APFS volume (`diskMsK`) that mounts at the mountpoint. */
-  volume: string;
+  sectors: number;
+  /** Login name of the user that attached it. */
+  user: string;
+  /** Where its volumes are mounted, if anywhere. */
+  mountpoints: string[];
 }
 
 export interface RamTempLease {
@@ -132,9 +153,11 @@ interface Survivors {
   held: string[];
 }
 
+/** A host command or filesystem step failed while the volume was being created, mounted or detached. */
+type ProvisionFailed = { kind: 'provision-failed'; step: string; detail: string };
+
 export type RamTempError =
-  /** A host command or filesystem step failed while the volume was being created, mounted or detached. */
-  | { kind: 'provision-failed'; step: string; detail: string }
+  | ProvisionFailed
   /** A failed task left the volume (nearly) full: the likely cause of its failure. */
   | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number };
 
@@ -150,13 +173,18 @@ export function describeRamTempError(error: RamTempError): string {
 }
 
 export class RamTempVolume {
+  /** The RAM disk's size, which with the attaching user identifies this module's disks on the host. */
+  private readonly sectors: number;
+
   constructor(
     private readonly paths: RamTempPaths,
     private readonly capacityBytes: number,
     private readonly commands: HostCommands,
     private readonly pid: number = process.pid,
     private readonly isAlive: (pid: number) => boolean = processIsAlive,
-  ) {}
+  ) {
+    this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
+  }
 
   /** Take a lease: create the volume if no task holds one, and a private directory on it. */
   async acquire(): Promise<Result<RamTempAcquisition, RamTempError>> {
@@ -312,32 +340,39 @@ export class RamTempVolume {
   }
 
   private async create(): Promise<Result<void, RamTempError>> {
-    const stale = await this.detachRecorded();
-    if (!stale.ok) {
-      return stale;
+    const strays = await this.reclaimStrays();
+    if (!strays.ok) {
+      return strays;
     }
-    const sectors = Math.ceil(this.capacityBytes / SECTOR_BYTES);
-    const attached = await this.commands.run('/usr/bin/hdiutil', ['attach', '-nomount', `ram://${sectors}`]);
+    const attached = await this.commands.run('/usr/bin/hdiutil', ['attach', '-nomount', `ram://${this.sectors}`]);
     if (attached.status !== 0) {
+      // A deadlined attach took its helper's process group down with it; one that attached
+      // regardless is a stray the next creator detaches.
       return failed('hdiutil attach', commandText(attached));
     }
     const physical = /^(\/dev\/disk\d+)\b/.exec(attached.stdout)?.[1];
     if (!physical) {
       return failed('hdiutil attach', `no device in: ${attached.stdout.trim()}`);
     }
-    const devices: VolumeDevices = { physical, volume: '' };
-    const provisioned = await this.provision(devices);
-    if (!provisioned.ok) {
-      await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
-      await rm(this.paths.stateFile, { force: true });
+    const provisioned = await this.provision(physical);
+    if (provisioned.ok) {
+      return provisioned;
     }
-    return provisioned;
+    const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
+    return detached.status === 0
+      ? provisioned
+      : failed(
+          provisioned.error.step,
+          `${provisioned.error.detail}; hdiutil detach -force ${physical} then failed (${commandText(detached)}), so it stays attached until the next creator reclaims it`,
+        );
   }
 
-  private async provision(devices: VolumeDevices): Promise<Result<void, RamTempError>> {
-    // Recorded before anything can fail half-way, so a crash leaves the next creator a device to detach.
-    await writeFile(this.paths.stateFile, JSON.stringify(devices), { mode: 0o600 });
-    const container = await this.commands.run('/usr/sbin/diskutil', ['apfs', 'createContainer', devices.physical]);
+  /**
+   * Format, mount and mark the volume under its staging name, then rename it into place: the
+   * volume reaches the mountpoint already marked, so no crash leaves it there unmarked.
+   */
+  private async provision(physical: string): Promise<Result<void, ProvisionFailed>> {
+    const container = await this.commands.run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical]);
     const containerDisk = operationDisk(container.stdout);
     if (container.status !== 0 || !containerDisk) {
       return failed('diskutil apfs createContainer', commandText(container));
@@ -347,58 +382,108 @@ export class RamTempVolume {
       'addVolume',
       containerDisk,
       'APFS',
-      this.paths.volumeName,
+      this.paths.stagingName,
       '-nomount',
     ]);
     const volume = operationDisk(added.stdout);
     if (added.status !== 0 || !volume) {
       return failed('diskutil apfs addVolume', commandText(added));
     }
-    devices.volume = volume;
-    await writeFile(this.paths.stateFile, JSON.stringify(devices), { mode: 0o600 });
     // No -mountPoint: see the module comment. DiskArbitration names the mountpoint after the
-    // volume, and appends " 1" when a stale /Volumes entry already holds the name.
+    // volume, and appends " 1" when a /Volumes entry already holds the name.
     const mounted = await this.commands.run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', volume]);
     if (mounted.status !== 0) {
       return failed('diskutil mount', commandText(mounted));
     }
-    const table = await this.commands.run('/sbin/mount', []);
-    const point = new RegExp(`^/dev/${volume} on (.+) \\(`, 'm').exec(table.stdout)?.[1];
-    if (point !== this.paths.mountpoint) {
-      return failed('diskutil mount', `${volume} mounted at ${point ?? 'nowhere'}, expected ${this.paths.mountpoint}`);
+    const staging = join('/Volumes', this.paths.stagingName);
+    const staged = await this.expectMounted(volume, staging, 'diskutil mount');
+    if (!staged.ok) {
+      return staged;
     }
-    await writeFile(join(this.paths.mountpoint, MARKER_FILE), `${this.paths.volumeName}\n`);
-    return { ok: true, value: undefined };
+    try {
+      await writeFile(join(staging, MARKER_FILE), `${this.paths.volumeName}\n`);
+    } catch (error) {
+      return failed('marker', errorText(error));
+    }
+    const renamed = await this.commands.run('/usr/sbin/diskutil', ['rename', volume, this.paths.volumeName]);
+    if (renamed.status !== 0) {
+      return failed('diskutil rename', commandText(renamed));
+    }
+    return await this.expectMounted(volume, this.paths.mountpoint, 'diskutil rename');
   }
 
-  /** Detach what the state file records, if its volume is still the one this module named. */
-  private async detachRecorded(): Promise<Result<void, RamTempError>> {
-    const recorded = await readFile(this.paths.stateFile, 'utf8').catch(() => null);
-    if (recorded === null) {
-      return { ok: true, value: undefined };
+  private async expectMounted(volume: string, expected: string, step: string): Promise<Result<void, ProvisionFailed>> {
+    const table = await this.commands.run('/sbin/mount', []);
+    if (table.status !== 0) {
+      return failed('mount (mount table)', commandText(table));
     }
-    const devices = parseDevices(recorded);
-    if (devices && devices.volume !== '') {
-      const info = await this.commands.run('/usr/sbin/diskutil', ['info', devices.volume]);
-      // A device number is reused by the next image attached after ours went away: only a
-      // volume that still carries this module's name is ours to detach.
-      if (info.status === 0 && volumeNameOf(info.stdout) === this.paths.volumeName) {
-        const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', devices.physical]);
-        if (detached.status !== 0) {
-          return failed('hdiutil detach (stale volume)', commandText(detached));
+    const point = new RegExp(`^/dev/${volume} on (.+) \\(`, 'm').exec(table.stdout)?.[1];
+    return point === expected
+      ? { ok: true, value: undefined }
+      : failed(step, `${volume} mounted at ${point ?? 'nowhere'}, expected ${expected}`);
+  }
+
+  /** This module's RAM disks attached on the host: this user's, of this volume's exact size, mounted nowhere else. */
+  private async attached(): Promise<Result<RamDisk[], ProvisionFailed>> {
+    const info = await this.commands.run('/usr/bin/hdiutil', ['info']);
+    if (info.status !== 0) {
+      return failed('hdiutil info', commandText(info));
+    }
+    const ours = (point: string) => {
+      // DiskArbitration's " 1" suffix: a volume that found its name taken.
+      const name = point.replace(/ \d+$/, '');
+      return name === this.paths.mountpoint || name === join('/Volumes', this.paths.stagingName);
+    };
+    return {
+      ok: true,
+      value: ramDisksIn(info.stdout).filter(
+        (disk) => disk.user === this.paths.user && disk.sectors === this.sectors && disk.mountpoints.every(ours),
+      ),
+    };
+  }
+
+  /**
+   * Detach what earlier creators left attached: no marked volume is mounted, so every RAM disk of
+   * this volume is debris — unformatted, staged, or mounted without its marker. One carrying a
+   * lease, or with anything attached below it, is still in use and stops the creation instead.
+   */
+  private async reclaimStrays(): Promise<Result<void, RamTempError>> {
+    const strays = await this.attached();
+    if (!strays.ok) {
+      return strays;
+    }
+    for (const disk of strays.value) {
+      for (const point of disk.mountpoints) {
+        const leases = await readdir(point).then(
+          (names) => ({ ok: true as const, names: names.filter((name) => LEASE_NAME.test(name)) }),
+          (error: unknown) => ({ ok: false as const, detail: errorText(error) }),
+        );
+        if (!leases.ok) {
+          return failed('reclaim', `${disk.physical} at ${point}: ${leases.detail}`);
+        }
+        if (leases.names.length > 0) {
+          return failed(
+            'reclaim',
+            `${disk.physical} at ${point} has no marker but carries leases ${leases.names.join(', ')}; not detached`,
+          );
+        }
+        const holders = await this.holders(`${point}/`);
+        if (!holders.ok) {
+          return holders;
+        }
+        if (holders.value.length > 0) {
+          return failed('reclaim', holdingText(point, holders.value));
         }
       }
+      const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
+      if (detached.status !== 0) {
+        return failed(`hdiutil detach (stray ${disk.physical})`, commandText(detached));
+      }
     }
-    await rm(this.paths.stateFile, { force: true });
     return { ok: true, value: undefined };
   }
 
   private async detach(): Promise<Result<void, RamTempError>> {
-    const recorded = await readFile(this.paths.stateFile, 'utf8').catch(() => null);
-    const devices = recorded === null ? null : parseDevices(recorded);
-    if (!devices) {
-      return failed('detach', `${this.paths.stateFile} does not record the mounted volume's device`);
-    }
     // Every lease is gone, so nothing below the volume should be attached; whatever is would lose
     // its backing file to the detach.
     const holders = await this.holders(`${this.paths.mountpoint}/`);
@@ -408,14 +493,24 @@ export class RamTempVolume {
     if (holders.value.length > 0) {
       return failed('detach', holdingText(this.paths.mountpoint, holders.value));
     }
-    let detached = await this.commands.run('/usr/bin/hdiutil', ['detach', devices.physical]);
+    const disks = await this.attached();
+    if (!disks.ok) {
+      return disks;
+    }
+    const disk = disks.value.find((candidate) => candidate.mountpoints.includes(this.paths.mountpoint));
+    if (!disk) {
+      return failed(
+        'detach',
+        `hdiutil info lists no RAM disk of ${this.paths.user} with ${this.sectors} sectors mounted at ${this.paths.mountpoint}`,
+      );
+    }
+    let detached = await this.commands.run('/usr/bin/hdiutil', ['detach', disk.physical]);
     if (detached.status !== 0) {
-      detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', devices.physical]);
+      detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
     }
     if (detached.status !== 0) {
       return failed('hdiutil detach', commandText(detached));
     }
-    await rm(this.paths.stateFile, { force: true });
     // DiskArbitration removes the /Volumes directory it created when the volume goes.
     return { ok: true, value: undefined };
   }
@@ -484,27 +579,28 @@ export function operationDisk(stdout: string): string | null {
   return /^Disk from APFS operation: (disk\d+(?:s\d+)?)$/m.exec(stdout)?.[1] ?? null;
 }
 
-export function volumeNameOf(diskutilInfo: string): string | null {
-  return /^\s*Volume Name:\s*(.+)$/m.exec(diskutilInfo)?.[1]?.trim() ?? null;
-}
-
-function parseDevices(text: string): VolumeDevices | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    if (
-      typeof value === 'object' &&
-      value !== null &&
-      'physical' in value &&
-      'volume' in value &&
-      typeof value.physical === 'string' &&
-      typeof value.volume === 'string'
-    ) {
-      return { physical: value.physical, volume: value.volume };
+/**
+ * The RAM disks in `hdiutil info` output. Images are separated by a row of `=`; a RAM disk's
+ * `image-path` is `ram://<sectors>`, and its entity rows are `<dev>\t<content hint>\t<mountpoint>`,
+ * the whole disk first.
+ */
+export function ramDisksIn(info: string): RamDisk[] {
+  const disks: RamDisk[] = [];
+  for (const block of info.split(/^=+$/m)) {
+    const sectors = /^image-path\s*:\s*ram:\/\/(\d+)\s*$/m.exec(block)?.[1];
+    const user = /^mounting user\s*:\s*(\S+)\s*$/m.exec(block)?.[1];
+    const entities = [...block.matchAll(/^(\/dev\/disk\d+(?:s\d+)*)\t[^\t\n]*(?:\t([^\n]*))?$/gm)];
+    const physical = entities[0]?.[1];
+    if (sectors === undefined || user === undefined || physical === undefined) {
+      continue;
     }
-  } catch {
-    // An unparsable record names nothing to detach.
+    const mountpoints = entities.flatMap((entity) => {
+      const point = entity[2]?.trimEnd();
+      return point ? [point] : [];
+    });
+    disks.push({ physical, sectors: Number(sectors), user, mountpoints });
   }
-  return null;
+  return disks;
 }
 
 /**
@@ -514,29 +610,56 @@ function parseDevices(text: string): VolumeDevices | null {
  */
 const HOST_COMMAND_DEADLINE_MS = 120_000;
 
-export function createHostCommands(): HostCommands {
+export function createHostCommands(deadlineMs: number = HOST_COMMAND_DEADLINE_MS): HostCommands {
   return {
     run(file, args) {
       return new Promise((resolve) => {
-        // The registry listing of every attached image runs to megabytes on a busy host
-        // (2 MB measured with 136 images); execFile's 1 MB default truncates it into a failure.
-        execFile(
-          file,
-          [...args],
-          { encoding: 'utf8', maxBuffer: 64 * MIB, timeout: HOST_COMMAND_DEADLINE_MS, killSignal: 'SIGKILL' },
-          (error, stdout, stderr) => {
-            if (error === null) {
-              resolve({ status: 0, stdout, stderr });
-              return;
-            }
-            const status = typeof error.code === 'number' ? error.code : 1;
-            const detail = error.killed ? `no answer within ${HOST_COMMAND_DEADLINE_MS} ms; killed` : error.message;
-            resolve({ status, stdout, stderr: stderr === '' || error.killed ? detail : stderr });
-          },
-        );
+        // `detached` leads a process group, so the deadline kills what the child spawned too:
+        // `hdiutil attach` hands the attach to a diskimages-helper, and one that outlived its
+        // killed `hdiutil` finished the attach later, an image nobody detached (2026-10-06).
+        const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        const stdout: Buffer[] = [];
+        const stderr: Buffer[] = [];
+        child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+        child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+        const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
+        // Answered without waiting for the pipes: a helper that escaped the group may hold them.
+        const timer = setTimeout(() => {
+          resolve({
+            status: 1,
+            stdout: text(stdout),
+            stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
+          });
+        }, deadlineMs);
+        child.on('error', (error) => {
+          clearTimeout(timer);
+          resolve({ status: 1, stdout: text(stdout), stderr: error.message });
+        });
+        child.on('close', (code, signal) => {
+          clearTimeout(timer);
+          const error = text(stderr);
+          resolve({
+            status: code ?? 1,
+            stdout: text(stdout),
+            stderr: error === '' && signal !== null ? `killed by ${signal}` : error,
+          });
+        });
       });
     },
   };
+}
+
+/** SIGKILL the child's whole process group; what happened, for the error. */
+function killGroup(child: ChildProcess): string {
+  if (child.pid === undefined) {
+    return 'never started';
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+    return `killed process group ${child.pid}`;
+  } catch (error) {
+    return `killing process group ${child.pid} failed: ${errorText(error)}`;
+  }
 }
 
 function processIsAlive(pid: number): boolean {
@@ -549,7 +672,7 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function failed<T>(step: string, detail: string): Result<T, RamTempError> {
+function failed<T>(step: string, detail: string): Result<T, ProvisionFailed> {
   return { ok: false, error: { kind: 'provision-failed', step, detail } };
 }
 

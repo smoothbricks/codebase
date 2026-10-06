@@ -653,6 +653,13 @@ The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: a
 to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
 plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
 
+The volume is formatted, mounted and marked as `smoo-ram-<uid>-new`, then renamed into place, so a creator that dies
+part way never leaves an unmarked volume at `/Volumes/smoo-ram-<uid>` for the next one to dodge as `smoo-ram-<uid> 1`.
+Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but those two names:
+the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
+something attached below it, is named in the task's error instead. A disk command that runs past its deadline is killed
+with its whole process group, so `hdiutil attach` cannot leave a helper behind that finishes the attach later.
+
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
 
