@@ -2,6 +2,7 @@ import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -66,6 +67,53 @@ it('a stale plugin build clears the workspace data through its link and keeps th
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(readlinkSync(link)).toBe('../volume/nx/workspace-data');
     expect(readdirSync(volume)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * devenv captures the shell's environment, with DEVENV_SKIP_TASKS set, before it runs the tasks that install
+ * node_modules. A checkout with none (or with another lockfile's) has no working `ttsc` then, and a hook that fails
+ * aborts the capture before the install could run: the hosted-runner jobs died there. The capture pass does nothing;
+ * the entry proper, without the variable, still stops on a plugin it cannot rebuild.
+ */
+it('the environment capture pass rebuilds nothing, the entry proper still does', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
+  try {
+    const plugin = join(root, 'packages/nx-plugin');
+    mkdirSync(join(plugin, 'src'), { recursive: true });
+    writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
+    writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
+    mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
+
+    // No build marker: the plugin is stale. This `ttsc` is the one a checkout without node_modules has.
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const attempts = join(root, 'ttsc-attempts');
+    writeFileSync(join(bin, 'ttsc'), `#!/bin/sh\necho attempt >> '${attempts}'\nexit 2\n`);
+    chmodSync(join(bin, 'ttsc'), 0o755);
+
+    const enter = (extra: Record<string, string>) =>
+      spawnSync('bun', [enterShell], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          DEVENV_ROOT: join(root, 'tooling/direnv'),
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_ACTIONS: 'true',
+          ...extra,
+        },
+      });
+
+    const capture = enter({ DEVENV_SKIP_TASKS: '1' });
+    expect(capture.status, `${capture.stdout}${capture.stderr}`).toBe(0);
+    expect(existsSync(attempts)).toBe(false);
+
+    const entry = enter({ DEVENV_SKIP_TASKS: '' });
+    expect(entry.status, `${entry.stdout}${entry.stderr}`).not.toBe(0);
+    expect(existsSync(attempts)).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

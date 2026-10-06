@@ -418,8 +418,13 @@ nothing when nothing changed:
   lockfile, `bunfig.toml`, patch or the install scripts changed, or `node_modules` was deleted (devenv's
   `execIfModified`), and `smoo:cargo-fetch` runs `cargo fetch --locked` only when CARGO_HOME lacks a workspace's locked
   packages (its `status`), which the Nx plugin's offline `cargo metadata` needs. A failed task loads the shell anyway;
-  CI runs both with `devenv tasks run`, which fails. The managed `.envrc` watches `package.json`, the lockfiles and the
-  scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull or a script change.
+  CI runs both with `devenv tasks run`, which fails. devenv also evaluates the `enterShell` script once BEFORE it runs
+  any task, only to capture the environment (it sets `DEVENV_SKIP_TASKS` for that pass), so a repository's own
+  `enterShell` hook that needs what the tasks install, such as the `ttsc` in `node_modules`, must skip the pass: on a
+  fresh checkout or a runner that restored another lockfile's `node_modules` the hook would abort the capture before the
+  install could run. This repository's `tooling/direnv/enter-shell.ts` does. The managed `.envrc` watches
+  `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
+  or a script change.
 - Shell secrets resolve only for an entry that installs; see below.
 - ttsc caches in the checkout's `.cache/ttsc`, its Go build cache in `.cache/ttsc/go-build`, and `GOFLAGS` carries
   `-trimpath`. A value the caller already exported wins, so a host or a sandbox that shares these caches across
@@ -584,10 +589,11 @@ must stay synchronized with those comments. Composite action internals do not ch
 Managed CI setup is split across local composite actions:
 
 - `setup-devenv` detects the runner kind first. An ephemeral runner installs a single-user [Nix], restores `/nix` itself
-  from the Actions cache — store paths and the Nix database, as files, so nothing is imported — enables [Cachix],
-  installs [devenv] at `devenv.lock`'s rev, restores `node_modules` and the ttsc plugins, and builds the shell. A
-  host-nix runner (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install and every store cache: it already has the
-  store and keeps its caches on the shared bind.
+  from the Actions cache — store paths and the Nix database, as files, so nothing is imported — hands `~/.cache` back to
+  the runner (the cache action unpacks through sudo and leaves that directory root's, where the first `~/.cache/smoo`
+  stamp would die with EACCES), enables [Cachix], installs [devenv] at `devenv.lock`'s rev, restores `node_modules` and
+  the ttsc plugins, and builds the shell. A host-nix runner (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install
+  and every store cache: it already has the store and keeps its caches on the shared bind.
 - `save-nix-devenv` runs under `always()` and saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
   the shell produced `nix-eval-cache.db`. The store cache saves itself in `setup-devenv`'s post phase, which collects
   garbage down to the live closure before uploading.

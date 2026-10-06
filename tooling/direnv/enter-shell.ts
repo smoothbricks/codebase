@@ -11,9 +11,18 @@ if (!devenvRoot) {
 const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
 
-await rebuildNxPluginIfStale();
+// devenv runs this hook twice per shell entry. First it captures the shell's environment: a pass that runs the shell
+// hook to read what the prologue exports, marked DEVENV_SKIP_TASKS (`capture_shell_environment` in cachix/devenv sets
+// it on that subprocess alone), and that runs BEFORE the tasks ordered ahead of devenv:enterShell (smoo:install,
+// smoo:cargo-fetch). Then it runs those tasks and starts the shell, whose hook runs again with everything installed. A
+// fresh checkout, or a runner that restored node_modules cached for another lockfile, has no working `ttsc` in the
+// first pass, and a failing hook aborts that capture ("Shell environment capture failed") before smoo:install could
+// make one. So only the entry proper rebuilds the plugin and syncs the runtime pins.
+if ((process.env.DEVENV_SKIP_TASKS ?? '') === '') {
+  await rebuildNxPluginIfStale();
 
-await syncRuntimePinsIfDrifted();
+  await syncRuntimePinsIfDrifted();
+}
 
 /** Shell entry tracks runtime pins: cheap local `--version` probes, sync on drift, best-effort (offline failure warns, validate is the gate, a CI runner never rewrites). */
 async function syncRuntimePinsIfDrifted(): Promise<void> {

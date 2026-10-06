@@ -220,6 +220,24 @@ runs:
         restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v6-
         gc-max-store-size: 1G
 
+    # cache-nix-action unpacks through sudo, so the directory it creates on the
+    # way to ~/.cache/nix, ~/.cache itself, belongs to root. Every later step runs
+    # as the runner, and the first one that makes something there (smoo's
+    # cargo-fetch stamp under ~/.cache/smoo) fails with EACCES. ~/.cache/nix inside
+    # it stays the runner's.
+    - name: 🏠 Give ~/.cache back to the runner
+      if: steps.runner-kind.outputs.host != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.cache"
+        if [ -O "$HOME/.cache" ]; then
+          echo "~/.cache is already the runner's"
+        else
+          ls -ld "$HOME/.cache"
+          sudo chown "$(id -u):$(id -g)" "$HOME/.cache"
+          echo "gave ~/.cache to $(id -un)"
+        fi
+
     - name: ⚡ Enable Cachix
       if: steps.runner-kind.outputs.host != 'true'
       uses: cachix/cachix-action@v17
