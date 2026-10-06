@@ -152,7 +152,7 @@ describe('Arrow Table Conversion', () => {
       }
       buffer.message(0, 'test-span');
       buffer.requiredField(0, 42);
-      // optionalField not set - should be null
+      // optionalField never written: its column is null, not key 0 of an empty dictionary
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -160,7 +160,8 @@ describe('Arrow Table Conversion', () => {
       expect(table.numRows).toBe(1);
 
       expect(getColumnValue(table, 'requiredField', 0)).toBe(42);
-      expect(getColumnValue(table, 'optionalField', 0)).toBeUndefined();
+      expect(getColumnValue(table, 'optionalField', 0)).toBeNull();
+      expect(table.getChild('optionalField').nullCount).toBe(1);
     });
   });
 

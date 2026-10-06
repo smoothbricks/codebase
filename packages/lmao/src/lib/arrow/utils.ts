@@ -71,10 +71,17 @@ export function concatenateFloat64Arrays(arrays: Float64Array[]): Float64Array {
 }
 
 /**
- * Concatenate null bitmaps from multiple buffers
+ * Concatenate the validity of `columnName` across a buffer chain. A buffer with a validity
+ * bitmap contributes it. One whose column holds values but no bitmap is an eager column,
+ * written on every row, so its rows are valid. One with neither never wrote the column — a
+ * lazy column allocates both on its first write — so every row of it is null; reading its
+ * zeroed index or value lanes as valid would state a value nobody wrote, and a dictionary
+ * column's index 0 would point past its empty dictionary.
  */
 export function concatenateNullBitmaps(buffers: AnySpanBuffer[], columnName: string): ConcatenatedNullBitmaps {
-  const hasAnyNulls = buffers.some((buf) => buf.getNullsIfAllocated(columnName) !== undefined);
+  const hasAnyNulls = buffers.some(
+    (buf) => buf.getNullsIfAllocated(columnName) !== undefined || buf.getColumnIfAllocated(columnName) === undefined,
+  );
 
   if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };
 
@@ -83,8 +90,6 @@ export function concatenateNullBitmaps(buffers: AnySpanBuffer[], columnName: str
   const nullBitmap = new Uint8Array(bitmapBytes);
   nullBitmap.fill(0xff); // Default all valid
 
-  // Buffer chains: all buffers except the last are full (writeIndex == capacity).
-  // If capacity is a multiple of 8, each buffer starts at a byte boundary.
   let rowOffset = 0;
   let nullCount = 0;
 
@@ -94,10 +99,13 @@ export function concatenateNullBitmaps(buffers: AnySpanBuffer[], columnName: str
 
     if (sourceBitmap) {
       copyBits(nullBitmap, rowOffset, sourceBitmap, 0, rowCount);
-      // Count nulls using countNulls from arrow-builder
       nullCount += countNulls(sourceBitmap, rowCount);
+    } else if (buf.getColumnIfAllocated(columnName) === undefined) {
+      for (let row = rowOffset; row < rowOffset + rowCount; row++) {
+        nullBitmap[row >>> 3] &= ~(1 << (row & 7));
+      }
+      nullCount += rowCount;
     }
-    // If no sourceBitmap, leave as 0xff (all valid)
 
     rowOffset += rowCount;
   }

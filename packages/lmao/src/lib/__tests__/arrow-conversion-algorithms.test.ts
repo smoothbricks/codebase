@@ -39,6 +39,20 @@ describe('arrow conversion algorithms', () => {
     expect(nullCount).toBe(3);
   });
 
+  it('concatenateNullBitmaps marks the rows of a buffer that never allocated the column null', () => {
+    const buffers: AnySpanBuffer[] = [
+      mockBuffer(3, ['a', 'b', 'c'], undefined),
+      mockBuffer(2, undefined, undefined),
+      mockBuffer(3, ['d', undefined, 'e'], new Uint8Array([0b00000101])),
+    ];
+
+    const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, 'field');
+
+    // Rows 0-2 eager and valid, rows 3-4 never written, rows 5 and 7 valid, row 6 null.
+    expect(nullBitmap?.[0]).toBe(0b10100111);
+    expect(nullCount).toBe(3);
+  });
+
   it('buildTextDictionary marks all rows null when text column is never allocated', () => {
     const buffers: AnySpanBuffer[] = [mockBuffer(2, undefined, undefined), mockBuffer(1, undefined, undefined)];
 

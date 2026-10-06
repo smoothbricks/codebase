@@ -83,8 +83,9 @@ describe('convertSpanStartToArrowTable', () => {
       parent_span_id: opened.buffer.span_id,
       timestamp: openedChild.buffer.timestamp[0],
     });
-    // The row as it read when the span opened: the child tags its user only afterwards.
-    expect(childStart?.user).not.toBe('ada');
+    // The row as it read when the span opened: the child tags its user only afterwards, so
+    // the attributes nobody had written yet are null, not a zeroed lane read as a value.
+    expect(childStart).toMatchObject({ user: null, attempt: null });
   });
 
   it('converts an ended span to the start row its whole conversion leads with, and leaves the buffer whole', async () => {
@@ -102,6 +103,26 @@ describe('convertSpanStartToArrowTable', () => {
     expect(rowsOf(convertSpanStartToArrowTable(childBuffer))).toMatchObject([
       { entry_type: 'span-start', message: 'child-call', user: 'ada' },
     ]);
+  });
+
+  it('reads an attribute a buffer never wrote as null, in its own rows and in its overflow', async () => {
+    const tracer = new OpeningTracer(opContext, createTestTracerOptions());
+    await tracer.trace('root', root);
+
+    const [opened, openedChild] = tracer.opened;
+    if (opened === undefined || openedChild === undefined) throw new Error('both spans open through the hooks');
+    // The root writes neither attribute: its category column has an empty dictionary, so a
+    // row read as valid would name index 0 of nothing, which an Arrow reader refuses.
+    for (const table of [convertSpanStartToArrowTable(opened.buffer), convertToArrowTable(opened.buffer)]) {
+      expect(table.getChild('user').nullCount).toBe(table.numRows);
+      expect(table.getChild('attempt').nullCount).toBe(table.numRows);
+    }
+    // The child tags its user on its start row alone; its overflow buffer never allocates the
+    // column, and its rows are null like every other row the tag did not write.
+    expect(openedChild.buffer._overflow).toBeDefined();
+    const users = rowsOf(convertToArrowTable(openedChild.buffer)).map((row) => row.user);
+    expect(users[0]).toBe('ada');
+    expect(users.slice(1).every((user) => user === null)).toBe(true);
   });
 
   it('refuses a thread-lane view, whose rows only its row store can read', async () => {
