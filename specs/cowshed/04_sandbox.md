@@ -46,6 +46,12 @@ Shape:
 ;; OS library identity lookup and filesystem notification, not directory-record authority.
 (allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
 (allow mach-lookup (global-name "com.apple.FSEvents"))
+;; com.apple.bsd.dirhelper stays denied, so confstr(3)'s DARWIN_USER_TEMP_DIR answers EIO:
+;; answered, it names the host user's /var/folders, which macOS mktemp prefers over TMPDIR
+;; and no job may write.
+;; Runtime seeding (Python dies in _Py_HashRandomization_Init without it). Every role,
+;; the controller's Git profile included: it runs merge drivers and hooks.
+(allow file-read* (literal "/dev/random") (literal "/dev/urandom"))
 
 ;; Local IPC: scoped, never blanket — a blanket unix-connect allow would let a
 ;; workspace reach a sibling's supervisor socket (same uid; file permissions are

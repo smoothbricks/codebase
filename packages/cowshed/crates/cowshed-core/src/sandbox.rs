@@ -657,6 +657,12 @@ pub fn seatbelt_profile(
         // Git's isolated global configuration is the empty device, not user HOME.
         push_literal_rule(&mut profile, "allow file-read*", Path::new("/dev/null"))?;
     }
+    // Every runtime seeds itself from the kernel's entropy before it runs a line; Python reads
+    // `/dev/urandom` for it, and without it dies in `_Py_HashRandomization_Init`. Git's own
+    // profile runs merge drivers and hooks too, so every role reads both devices.
+    for device in ["/dev/random", "/dev/urandom"] {
+        push_literal_rule(&mut profile, "allow file-read*", Path::new(device))?;
+    }
     // Directory metadata is distinct from file-read-data in Seatbelt. Toolchain
     // launchers (notably /usr/bin/git -> xcrun) must traverse their immutable
     // system roots without gaining metadata access to the user's home.
@@ -699,6 +705,11 @@ pub fn seatbelt_profile(
         &mut profile,
         "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
     );
+    // The per-user directory helper (`com.apple.bsd.dirhelper`) stays denied, so `confstr(3)`'s
+    // `DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR` answer EIO and tools fall back to
+    // `TMPDIR` or `/tmp`. Answered, they name the host user's own `/var/folders` directories,
+    // which no job may write (every host process's temp files live there): `mktemp` under a
+    // devenv shell then picked one and failed with EPERM instead of using the job's temp dir.
 
     for socket in &sockets {
         push_line(
@@ -2432,6 +2443,28 @@ mod tests {
         }
     }
 
+    /// Every role, Git's included, reads the entropy devices; none reaches the per-user directory
+    /// helper, whose answers name host directories no job may write
+    /// (`host_controller_seatbelt_gives_every_role_entropy` runs both).
+    #[test]
+    fn every_role_has_entropy_and_no_user_directory_helper() {
+        let config = config(RunSandboxMode::ReadWrite);
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap();
+            for rule in [
+                "(allow file-read* (literal \"/dev/random\"))",
+                "(allow file-read* (literal \"/dev/urandom\"))",
+            ] {
+                assert!(profile.contains(rule), "{role:?} lacks {rule}");
+            }
+            assert!(!profile.contains("com.apple.bsd.dirhelper"), "{role:?}");
+        }
+    }
+
     /// An admitted socket reaches the profile as an outbound rule with its directory traversable,
     /// or connecting fails on path resolution before the outbound rule is consulted.
     #[test]
@@ -2530,6 +2563,83 @@ mod tests {
             assert!(
                 !denied_record.status.success(),
                 "{role:?} must not acquire directory-record authority: {denied_record:?}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every runtime seeds itself from the kernel's entropy before it runs a line. Git runs
+    /// merge drivers under the controller's Git profile during `cowshed rebase`, and a Python
+    /// driver there died in `_Py_HashRandomization_Init` ("failed to get random numbers"). Every
+    /// role reads the entropy devices. The per-user directory helper stays denied: answered, it
+    /// names `/var/folders` directories no job may write, and `mktemp` picked them over the
+    /// job's own `TMPDIR`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_gives_every_role_entropy() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-entropy-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.mount_root = root.join("mounts");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        for path in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
+            fs::create_dir_all(path).unwrap();
+        }
+        // The interpreter itself, not the `/usr/bin/python3` shim: the shim's own lookups are
+        // not what this proves.
+        let found = std::process::Command::new("/usr/bin/xcrun")
+            .args(["--find", "python3"])
+            .output_locked()
+            .unwrap();
+        assert!(found.status.success(), "{found:?}");
+        let python = String::from_utf8(found.stdout).unwrap().trim().to_owned();
+        let run = |profile: &str, argv: &[&str]| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--"])
+                .args(argv)
+                .current_dir(&config.workspace_mount)
+                .output_locked()
+                .unwrap()
+        };
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap();
+            let seeded = run(
+                &profile,
+                &[&python, "-c", "import os; print(len(os.urandom(8)))"],
+            );
+            assert!(
+                seeded.status.success() && seeded.stdout == b"8\n",
+                "{role:?} entropy: {}",
+                String::from_utf8_lossy(&seeded.stderr)
+            );
+            // The user directories stay unnamed, so a temp file lands where `TMPDIR` says: the
+            // job's own temp dir, never the host user's `/var/folders`.
+            let named = run(&profile, &["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]);
+            assert!(!named.status.success(), "{role:?}: {named:?}");
+            let made = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/mktemp"])
+                .env("TMPDIR", &config.exec_temp_dir)
+                .current_dir(&config.workspace_mount)
+                .output_locked()
+                .unwrap();
+            assert!(
+                made.status.success()
+                    && Path::new(String::from_utf8_lossy(&made.stdout).trim())
+                        .starts_with(&config.exec_temp_dir),
+                "{role:?} mktemp: {made:?}"
             );
         }
         fs::remove_dir_all(&root).unwrap();
