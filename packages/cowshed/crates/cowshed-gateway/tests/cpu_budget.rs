@@ -159,6 +159,9 @@ async fn ledger(socket: &Path) -> CpuBudgetStatus {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     let (gateway, root, socket) = gateway(4).await;
+    // One grant holds at most half the host, so another checkout holds the other half.
+    let mut other = Asker::ask(&socket, 4, "/w/other").await;
+    assert_eq!(other.granted(Duration::from_secs(10)).await, Some(2));
 
     // The holder is another process, so SIGKILL is a real death: the kernel closes its socket.
     let mut holder = Command::new("/usr/bin/nc")
@@ -181,9 +184,9 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     .await
     .expect("read answers");
     assert!(answers.0.contains("\"queued\""), "{}", answers.0);
-    assert!(answers.1.contains("\"tokens\":4"), "{}", answers.1);
+    assert!(answers.1.contains("\"tokens\":2"), "{}", answers.1);
 
-    let mut waiter = Asker::ask(&socket, 4, "/w/waiting").await;
+    let mut waiter = Asker::ask(&socket, 2, "/w/waiting").await;
     assert_eq!(waiter.granted(Duration::from_millis(300)).await, None);
     let held = ledger(&socket).await;
     assert_eq!((held.total, held.held), (4, 4));
@@ -192,33 +195,38 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     holder.wait().expect("reap");
     assert_eq!(
         waiter.granted(Duration::from_secs(10)).await,
-        Some(4),
+        Some(2),
         "the killed holder's tokens go to the waiter"
     );
     let held = ledger(&socket).await;
     assert_eq!(held.held, 4);
-    assert_eq!(held.checkouts.len(), 1);
-    assert_eq!(held.checkouts[0].checkout, "/w/waiting");
-    drop(input);
+    assert_eq!(
+        held.checkouts
+            .iter()
+            .map(|checkout| (checkout.checkout.as_str(), checkout.held))
+            .collect::<Vec<_>>(),
+        [("/w/other", 2), ("/w/waiting", 2)]
+    );
+    drop((input, other));
 
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkouts_share_the_host_and_a_want_past_it_gets_the_host() {
+async fn checkouts_share_the_host_and_one_grant_holds_at_most_half() {
     let (gateway, root, socket) = gateway(8).await;
 
+    // Alone, a checkout fills the host with two runners, each capped at half of it.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
-    assert_eq!(whole.granted(Duration::from_secs(10)).await, Some(8));
+    assert_eq!(whole.granted(Duration::from_secs(10)).await, Some(4));
     let mut a_next = Asker::ask(&socket, 8, "/w/a").await;
+    assert_eq!(a_next.granted(Duration::from_secs(10)).await, Some(4));
     let mut b = Asker::ask(&socket, 8, "/w/b").await;
     assert_eq!(b.granted(Duration::from_millis(300)).await, None);
 
-    // The host frees all 8. Both checkouts wait, so each gets its share of 4: a's waiter asked
-    // first, and b holds no more than a.
+    // a's first runner returns 4: b holds least, and its share of 4 is what came free.
     drop(whole);
-    assert_eq!(a_next.granted(Duration::from_secs(10)).await, Some(4));
     assert_eq!(b.granted(Duration::from_secs(10)).await, Some(4));
     let held = ledger(&socket).await;
     assert_eq!(held.held, 8);

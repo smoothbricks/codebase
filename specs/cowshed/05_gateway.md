@@ -310,8 +310,8 @@ parallel, and the total runnable work stays near the core count.
   `--parallel` for one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`) for
   one job per core; anything else, one `bun test` process included, for one. A target's `parallelism` option outranks
   all of these. `test.concurrent` inside one process is not another CPU.
-- **Sized to the grant.** A grant is between 1 and `want` (a `want` above N asks for N). The executor sets
-  `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
+- **Sized to the grant.** A grant is between 1 and `want`, and `want` is capped at half the host (below). The executor
+  sets `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
   outranks the environment), sets `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command
   `BOUNDED_EXEC_CPU_TOKENS`, so a script that starts a runner itself can size it.
 - **Fair between checkouts.** The checkout is the Nx workspace root the request names. A checkout's share is N divided
@@ -322,6 +322,15 @@ parallel, and the total runnable work stays near the core count.
   ones. A gate with sixty runners queued cannot crowd out one with three.
 - **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
   requests can deadlock on each other's tokens.
+- **No grant exceeds half the host**, `ceil(N/2)`. Fairness acts only when a grant is made, and a running nextest or
+  cargo cannot hand tokens back. Uncapped, one checkout's single runner once held 17 of 18 tokens for its whole run, and
+  a second checkout's gate held 1 and waited it out. With the cap, a checkout arriving beside one runner finds the other
+  half, or the next runner's tokens. A checkout alone still fills the host, because each gate runs several runners.
+  - The cost: one runner alone on the host runs at most N/2 threads. Measured on 18 cores at host load 83–99 from other
+    work, with `cowshed-core`'s 903 non-APFS unit tests: 26 s at 18 threads (warm) against 31 s and 44 s at 9. A
+    newcomer behind an uncapped runner instead waits out that runner's whole run.
+  - Rejected alternative: reserving slots for a newcomer. It idles cores whenever no newcomer comes, and it still lets
+    two runners of one checkout hold everything else.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
   restart forgets every grant, so runners started under the old one overshoot until they finish.

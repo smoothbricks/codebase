@@ -13,6 +13,11 @@
 //! is all at once and between one and the request's `want`; a request never holds part of a grant
 //! while waiting for the rest, so no two requests can deadlock on each other's tokens.
 //!
+//! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back.
+//! So no single grant exceeds half the host ([`Ledger::max_grant`]). A checkout alone still fills
+//! the host with two runners, but a checkout that arrives while one runner holds its grant finds
+//! the other half, or the next runner's tokens, instead of waiting out the whole run.
+//!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
 
@@ -61,7 +66,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Waiter {
     ticket: Ticket,
-    /// Capped at the host total when asked.
+    /// Capped at [`Ledger::max_grant`] when asked.
     want: usize,
     asked: Instant,
     claim: Claim,
@@ -88,6 +93,8 @@ struct Checkout {
 #[derive(Debug)]
 pub(crate) struct Ledger {
     total: usize,
+    /// The most one grant holds: half the host, rounded up.
+    max_grant: usize,
     free: usize,
     checkouts: HashMap<Arc<str>, Checkout>,
     tickets: HashMap<Ticket, Arc<str>>,
@@ -97,14 +104,15 @@ impl Ledger {
     pub(crate) fn new(limits: CpuBudgetLimits) -> Self {
         Self {
             total: limits.tokens.get(),
+            max_grant: limits.tokens.get().div_ceil(2),
             free: limits.tokens.get(),
             checkouts: HashMap::new(),
             tickets: HashMap::new(),
         }
     }
 
-    /// `ticket` of `checkout` asks for up to `want` tokens. A `want` above the host total asks for
-    /// the host total.
+    /// `ticket` of `checkout` asks for up to `want` tokens. A `want` above [`Self::max_grant`]
+    /// asks for that.
     pub(crate) fn ask(
         &mut self,
         now: Instant,
@@ -120,7 +128,7 @@ impl Ledger {
             .waiting
             .push_back(Waiter {
                 ticket,
-                want: want.get().min(self.total),
+                want: want.get().min(self.max_grant),
                 asked: now,
                 claim,
             });
@@ -455,12 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_request_takes_what_it_wants_and_a_want_past_the_host_takes_the_host() {
+    fn a_lone_request_takes_what_it_wants_and_a_want_past_half_the_host_takes_half() {
         let mut clock = Clock::new(18);
         assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
         assert_eq!(clock.leave(1, 1), []);
-        assert_eq!(clock.ask(2, 2, "a", 64), [(2, 18)]);
-        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.ask(2, 2, "a", 64), [(2, 9)]);
+        assert_eq!(clock.ledger.status().held, 9);
         assert_eq!(clock.leave(3, 2), []);
         assert_eq!(clock.ledger.status().held, 0);
         assert!(clock.ledger.status().checkouts.is_empty());
@@ -468,27 +476,38 @@ mod tests {
     }
 
     #[test]
-    fn with_nobody_else_waiting_a_checkout_takes_every_free_token_up_to_its_want() {
+    fn a_newcomer_starts_beside_a_checkout_whose_runner_asked_for_the_whole_host() {
+        // A running nextest cannot give tokens back, so fairness at grant time alone let one
+        // runner of one checkout hold 17 of 18 while another checkout's gate waited it out.
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask(0, 1, "carry", 18), [(1, 9)]);
+        assert_eq!(clock.ask(1, 2, "train", 18), [(2, 9)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn with_nobody_else_waiting_a_checkout_takes_free_tokens_up_to_its_want_and_the_cap() {
         let mut clock = Clock::new(18);
         assert_eq!(clock.ask(0, 1, "a", 5), [(1, 5)]);
-        // Checkout b holds nothing, so its share of 9 is its claim; nobody else waits, so it
-        // takes all 13 free tokens rather than stopping at its share.
-        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 13)]);
+        // Nobody else waits, so b is not held to its share of 9 by fairness, only by the cap.
+        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 9)]);
+        // a's second runner takes the rest: alone, a checkout still fills the host.
+        assert_eq!(clock.ask(2, 3, "a", 18), [(3, 4)]);
         assert!(clock.balanced());
     }
 
     #[test]
     fn a_full_host_hands_freed_tokens_to_the_checkout_holding_least() {
         let mut clock = Clock::new(18);
-        assert_eq!(clock.ask(0, 1, "a", 18), [(1, 18)]);
-        // a's next runners queue first; b arrives later and wants the whole host.
-        assert_eq!(clock.ask(1, 2, "a", 1), []);
-        assert_eq!(clock.ask(2, 3, "a", 1), []);
-        assert_eq!(clock.ask(3, 4, "b", 18), []);
-        // Two checkouts: a share of 9 each. Both hold nothing once a's runner returns, so a's
-        // older waiter goes first; then b holds least, and while a still waits it gets its share,
-        // not all 18; a's last waiter takes one token of what is left.
-        assert_eq!(clock.leave(4, 1), [(2, 1), (4, 9), (3, 1)]);
+        assert_eq!(clock.ask(0, 1, "a", 18), [(1, 9)]);
+        assert_eq!(clock.ask(0, 2, "a", 18), [(2, 9)]);
+        // a's next runner queues first; b arrives later and wants the whole host.
+        assert_eq!(clock.ask(1, 3, "a", 1), []);
+        assert_eq!(clock.ask(2, 4, "b", 18), []);
+        // Two checkouts, a share of 9 each. b holds least, so the 9 a's runner returns are b's,
+        // and a's waiter waits for a's next return.
+        assert_eq!(clock.leave(3, 1), [(4, 9)]);
+        assert_eq!(clock.leave(4, 2), [(3, 1)]);
         assert!(clock.balanced());
     }
 
@@ -515,27 +534,29 @@ mod tests {
     #[test]
     fn a_large_request_waits_for_its_share_and_is_not_starved_by_small_ones() {
         let mut clock = Clock::new(8);
-        assert_eq!(clock.ask(0, 1, "a", 7), [(1, 7)]);
-        assert_eq!(clock.ask(1, 2, "b", 1), [(2, 1)]);
-        assert_eq!(clock.ask(2, 3, "c", 4), []);
-        assert_eq!(clock.ask(3, 4, "b", 1), []);
+        assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
+        assert_eq!(clock.ask(0, 2, "a", 3), [(2, 3)]);
+        assert_eq!(clock.ask(1, 3, "b", 1), [(3, 1)]);
+        assert_eq!(clock.ask(2, 4, "c", 4), []);
+        assert_eq!(clock.ask(3, 5, "b", 1), []);
         // One token frees. Three checkouts share 8 as 2 each; c holds least and asked first, so
         // it waits for both tokens of its share, and b's single-token request waits behind it.
-        assert_eq!(clock.leave(4, 2), []);
-        // a's runner returns its 7: c, now one of two checkouts, takes its share of 4, and b the
-        // token it asked for.
-        assert_eq!(clock.leave(5, 1), [(3, 4), (4, 1)]);
+        assert_eq!(clock.leave(4, 3), []);
+        // a's runner returns its 4: c takes its share of 2 while b waits, then b its token.
+        assert_eq!(clock.leave(5, 1), [(4, 2), (5, 1)]);
         assert!(clock.balanced());
     }
 
     #[test]
     fn a_waiter_that_leaves_is_never_granted_and_a_holder_that_leaves_returns_its_tokens() {
         let mut clock = Clock::new(4);
-        assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
-        assert_eq!(clock.ask(1, 2, "b", 4), []);
-        assert_eq!(clock.leave(2, 2), []);
+        assert_eq!(clock.ask(0, 1, "a", 2), [(1, 2)]);
+        assert_eq!(clock.ask(0, 2, "a", 2), [(2, 2)]);
+        assert_eq!(clock.ask(1, 3, "b", 2), []);
+        assert_eq!(clock.leave(2, 3), []);
         assert_eq!(clock.ledger.status().checkouts.len(), 1);
         assert_eq!(clock.leave(3, 1), []);
+        assert_eq!(clock.leave(3, 2), []);
         assert_eq!(clock.ledger.status().held, 0);
         // An unknown ticket — a stake dropped twice, or a grant already returned — is ignored.
         assert_eq!(clock.leave(4, 1), []);
