@@ -2,7 +2,18 @@
   "name": "@smoothbricks/tooling",
   "private": true,
   "nx": {
-    "name": "tooling"
+    "name": "tooling",
+    "targets": {
+      "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 direnv",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      }
+    }
   },
   "dependencies": {
     "@smoothbricks/cli": "workspace:*"

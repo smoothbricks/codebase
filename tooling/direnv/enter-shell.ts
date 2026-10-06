@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readdir, stat, utimes } from 'node:fs/promises';
+import { readdir, rm, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
@@ -101,7 +101,17 @@ async function clearNxDaemonState(): Promise<void> {
   // job: following the variable would delete that DB every time and the shared
   // cache could never be warm. Nx's own graph cache accounts for changed plugin
   // files, so the redirected case needs no help from here.
-  await runQuietly('rm', ['-rf', path.join(projectRoot, '.nx/workspace-data')], projectRoot);
+  //
+  // What is inside it, never the path itself: in a cowshed checkout the path is a
+  // link onto the checkout's build volume, and removing it (as `rm -rf` of the
+  // path did) left the next Nx run to make a real directory in its place, off the
+  // volume, until cowshed's next refresh discarded it.
+  const data = path.join(projectRoot, '.nx/workspace-data');
+  const entries = await readdir(data).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  await Promise.all(entries.map((entry) => rm(path.join(data, entry), { recursive: true, force: true })));
 }
 
 async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
