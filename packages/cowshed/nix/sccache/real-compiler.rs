@@ -488,6 +488,18 @@ impl Daemon {
         name: &str,
         extra: &[&OsStr],
     ) -> PathBuf {
+        self.cargo_compile_env(rustc, checkout, name, extra, &[])
+    }
+
+    /// `cargo_compile` with more client environment.
+    fn cargo_compile_env(
+        &self,
+        rustc: &Path,
+        checkout: &Path,
+        name: &str,
+        extra: &[&OsStr],
+        env: &[(&str, &OsStr)],
+    ) -> PathBuf {
         let out = checkout.join("target");
         fs::create_dir_all(&out).unwrap();
         run(self
@@ -495,6 +507,7 @@ impl Daemon {
             .current_dir(checkout)
             .env("SCCACHE_BASEDIR_CWD", "1")
             .env("CARGO_MANIFEST_DIR", checkout.join(name))
+            .envs(env.iter().copied())
             .arg(rustc)
             .args([
                 "--crate-name",
@@ -616,6 +629,279 @@ fn path_reading_proc_macro_output_stays_with_its_checkout() {
     fs::remove_file(&a).unwrap();
     daemon.cargo_compile(&rustc, &checkouts.a, "baked", &externs);
     assert!(names(&a, &checkouts.a));
+    let stats = daemon.stats().stats;
+    assert_eq!((stats.cache_misses.all(), stats.cache_hits.all()), (2, 1));
+}
+
+/// A request that names its checkout root in SCCACHE_BASEDIR while its cwd is the checkout
+/// root, as cargo's is, keys exactly as SCCACHE_BASEDIR_CWD=1 alone: setting it for a whole
+/// build reuses every Rust entry that build already stored.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn request_basedir_at_the_cwd_keys_as_the_cwd_alone() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(
+        daemon.root.path(),
+        &[("plain/src/lib.rs", "pub fn value() -> u32 { 17 }\n")],
+    );
+    daemon.cargo_compile(&rustc, &checkouts.a, "plain", &[]);
+    daemon.wait_for_writes(1);
+    daemon.cargo_compile_env(
+        &rustc,
+        &checkouts.b,
+        "plain",
+        &[],
+        &[("SCCACHE_BASEDIR", checkouts.b.as_os_str())],
+    );
+    let stats = daemon.stats().stats;
+    assert_eq!((stats.cache_misses.all(), stats.cache_hits.all()), (1, 1));
+}
+
+/// The dep-info of crate `name` in `out`, as rustc wrote it or a hit restored it.
+fn dep_info_of(out: &Path, name: &str) -> String {
+    fs::read_to_string(out.join(format!("{name}.d"))).unwrap()
+}
+
+/// A crate that includes a file generated below its checkout through an env-dep, as Bun's
+/// crates include `${BUN_CODEGEN_DIR}/*.rs`: the env-dep value and the dep-info name the
+/// checkout, the output does not. Every checkout shares the entry, and each is handed a
+/// dep-info that names its own files, as cargo reads it.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn generated_include_shares_and_restores_its_dep_info() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(
+        daemon.root.path(),
+        &[
+            (
+                "gen/src/lib.rs",
+                "include!(concat!(env!(\"GEN_DIR\"), \"/gen.rs\"));\n",
+            ),
+            ("build/codegen/gen.rs", "pub fn value() -> u32 { 41 }\n"),
+        ],
+    );
+    let compile = |checkout: &Path| {
+        let gen_dir = checkout.join("build/codegen");
+        daemon.cargo_compile_env(
+            &rustc,
+            checkout,
+            "gen",
+            &[],
+            &[("GEN_DIR", gen_dir.as_os_str())],
+        )
+    };
+    compile(&checkouts.a);
+    daemon.wait_for_writes(1);
+    let out = compile(&checkouts.b);
+    let stats = daemon.stats().stats;
+    assert_eq!(
+        (stats.cache_misses.all(), stats.cache_hits.all()),
+        (1, 1),
+        "checkout B must reuse checkout A's entry"
+    );
+    let dep_info = dep_info_of(&out, "gen");
+    let b_gen = checkouts.b.join("build/codegen");
+    assert!(
+        !dep_info.contains(checkouts.a.to_str().unwrap()),
+        "{dep_info}"
+    );
+    assert!(
+        dep_info.contains(&format!("{}/gen.rs", b_gen.display())),
+        "{dep_info}"
+    );
+    assert!(
+        dep_info.contains(&format!("# env-dep:GEN_DIR={}\n", b_gen.display())),
+        "{dep_info}"
+    );
+    assert!(!dep_info.contains('\0'), "{dep_info:?}");
+    for artifact in ["libgen.rlib", "libgen.rmeta"] {
+        assert!(
+            !names(&out.join(artifact), &checkouts.a),
+            "checkout B's {artifact} names checkout A"
+        );
+    }
+}
+
+/// cargo compiles a registry crate from its package directory, which every checkout shares,
+/// with an absolute source path; its build script's OUT_DIR, and the linker cargo is handed,
+/// lie below the checkout, which the build names in SCCACHE_BASEDIR. The dep-info names both
+/// bases, and each checkout is handed its own.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn registry_crate_shares_across_checkouts() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let root = fs::canonicalize(daemon.root.path()).unwrap();
+    let package = root.join("registry/dep-1.0.0");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(
+        package.join("src/lib.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\"));\n",
+    )
+    .unwrap();
+    let checkouts = Checkouts::new(
+        &root,
+        &[(
+            "target/build/dep/out/out.rs",
+            "pub fn value() -> u32 { 43 }\n",
+        )],
+    );
+    let compile = |checkout: &Path| {
+        let out = checkout.join("target/deps");
+        fs::create_dir_all(&out).unwrap();
+        run(daemon
+            .command()
+            .current_dir(&package)
+            .env("SCCACHE_BASEDIR_CWD", "1")
+            .env("SCCACHE_BASEDIR", checkout)
+            .env("CARGO_MANIFEST_DIR", &package)
+            .env("CARGO_TARGET_TEST_LINKER", checkout.join("wrap/cc"))
+            .env("OUT_DIR", checkout.join("target/build/dep/out"))
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                "dep",
+                "--edition=2021",
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata,link",
+            ])
+            .arg(package.join("src/lib.rs"))
+            .arg("--out-dir")
+            .arg(&out));
+        out
+    };
+    compile(&checkouts.a);
+    daemon.wait_for_writes(1);
+    let out = compile(&checkouts.b);
+    let stats = daemon.stats().stats;
+    assert_eq!(
+        (stats.cache_misses.all(), stats.cache_hits.all()),
+        (1, 1),
+        "checkout B must reuse checkout A's entry"
+    );
+    let dep_info = dep_info_of(&out, "dep");
+    assert!(
+        !dep_info.contains(checkouts.a.to_str().unwrap()),
+        "{dep_info}"
+    );
+    for named in [
+        package.join("src/lib.rs"),
+        checkouts.b.join("target/build/dep/out/out.rs"),
+    ] {
+        assert!(dep_info.contains(named.to_str().unwrap()), "{dep_info}");
+    }
+    for artifact in ["libdep.rlib", "libdep.rmeta"] {
+        assert!(
+            !names(&out.join(artifact), &checkouts.a),
+            "checkout B's {artifact} names checkout A"
+        );
+    }
+}
+
+fn real_clang() -> PathBuf {
+    fs::canonicalize(
+        std::env::var_os("SCCACHE_TEST_CLANG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| which::which("clang").unwrap()),
+    )
+    .unwrap()
+}
+
+/// A source whose header bakes its own path into the object through `__FILE__`.
+const C_CHECKOUT: &[(&str, &str)] = &[
+    (
+        "include/value.h",
+        "static inline const char *value_file(void) { return __FILE__; }\n",
+    ),
+    (
+        "src/value.c",
+        "#include \"value.h\"\nconst char *value(void) { return value_file(); }\n",
+    ),
+];
+
+impl Daemon {
+    /// Compile `src/value.c` the way ninja compiles a cmake or Bun target: from a build
+    /// directory below the checkout root, which the client names in SCCACHE_BASEDIR, with the
+    /// include directory absolute and a make depfile. Returns the build directory.
+    fn c_compile(&self, clang: &Path, checkout: &Path, extra: &[OsString]) -> PathBuf {
+        let build = checkout.join("build/release");
+        fs::create_dir_all(&build).unwrap();
+        let mut include = OsString::from("-I");
+        include.push(checkout.join("include"));
+        run(self
+            .command()
+            .current_dir(&build)
+            .env("SCCACHE_BASEDIR", checkout)
+            .arg(clang)
+            .args(["-g", "-MMD", "-MF", "value.o.d", "-c", "../../src/value.c"])
+            .args(["-o", "value.o"])
+            .arg(include)
+            .args(extra));
+        build
+    }
+}
+
+/// With the checkout mapped out of debug info and `__FILE__`, a compile from another
+/// checkout's build directory hits, and neither its object nor its depfile names a checkout.
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn c_request_basedir_shares_objects_across_checkouts() {
+    let clang = real_clang();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(daemon.root.path(), C_CHECKOUT);
+    let prefix_map = |checkout: &Path| {
+        let mut map = OsString::from("-ffile-prefix-map=");
+        map.push(checkout);
+        map.push("=.");
+        vec![map]
+    };
+    let a = daemon.c_compile(&clang, &checkouts.a, &prefix_map(&checkouts.a));
+    daemon.wait_for_writes(1);
+    let b = daemon.c_compile(&clang, &checkouts.b, &prefix_map(&checkouts.b));
+    let stats = daemon.stats().stats;
+    assert_eq!(
+        (stats.cache_misses.all(), stats.cache_hits.all()),
+        (1, 1),
+        "checkout B must reuse checkout A's entry"
+    );
+    for build in [&a, &b] {
+        for checkout in [&checkouts.a, &checkouts.b] {
+            assert!(
+                !names(&build.join("value.o"), checkout),
+                "{} names {}",
+                build.join("value.o").display(),
+                checkout.display()
+            );
+        }
+    }
+    // The depfile is the one this checkout's preprocessing wrote, never the entry's.
+    assert!(names(&b.join("value.o.d"), &checkouts.b));
+    assert!(!names(&b.join("value.o.d"), &checkouts.a));
+}
+
+/// Without a prefix map the object names its checkout, so only that checkout reuses it.
+#[test]
+#[ignore = "requires real clang and launches a private daemon"]
+fn c_object_naming_its_checkout_stays_with_it() {
+    let clang = real_clang();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(daemon.root.path(), C_CHECKOUT);
+    let a = daemon.c_compile(&clang, &checkouts.a, &[]);
+    assert!(names(&a.join("value.o"), &checkouts.a));
+    daemon.wait_for_writes(1);
+    let b = daemon.c_compile(&clang, &checkouts.b, &[]);
+    assert!(
+        !names(&b.join("value.o"), &checkouts.a),
+        "checkout B was served checkout A's object"
+    );
+    assert!(names(&b.join("value.o"), &checkouts.b));
+    daemon.wait_for_writes(2);
+    fs::remove_file(a.join("value.o")).unwrap();
+    daemon.c_compile(&clang, &checkouts.a, &[]);
+    assert!(names(&a.join("value.o"), &checkouts.a));
     let stats = daemon.stats().stats;
     assert_eq!((stats.cache_misses.all(), stats.cache_hits.all()), (2, 1));
 }

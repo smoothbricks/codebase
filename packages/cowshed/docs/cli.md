@@ -433,12 +433,12 @@ does any more:
   records in rmeta and debuginfo is workspace-relative.
 
 So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach. A unit whose
-output still names its checkout — an `env-dep:` value (`env!("CARGO_MANIFEST_DIR")`, never normalized), a proc macro
-that reads the manifest directory, an include recorded by absolute path — is found by reading the outputs before they
-are stored, and is stored for that path alone: it hits again at the same path and fails closed at every other. Tooling
-that persists absolute paths across tenant generations keeps working, and an unpatched sccache or a cargo older than
-1.97 still needs the path to be identical. The table below is that older world, measured on this hardware with sccache
-0.16 over a ten-crate workspace, second checkout of identical sources:
+output still names its checkout — an `env!("CARGO_MANIFEST_DIR")` value compiled into it, a proc macro that reads the
+manifest directory — is found by reading the outputs before they are stored, and is stored for that path alone: it hits
+again at the same path and fails closed at every other. Tooling that persists absolute paths across tenant generations
+keeps working, and an unpatched sccache or a cargo older than 1.97 still needs the path to be identical. The table below
+is that older world, measured on this hardware with sccache 0.16 over a ten-crate workspace, second checkout of
+identical sources:
 
 | build path                         | Rust units hit |
 | ---------------------------------- | -------------- |
@@ -1076,22 +1076,39 @@ agent and removes the plist; both operations are idempotent. The copy is what ke
 update or nix garbage collection: an sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies
 on byte drift and rewrites the plist only on drift.
 
-Cross-path Rust reuse — every workspace hitting one cache regardless of its mount path — requires an sccache that
-carries `nix/sccache/sccache-rust-basedir-cwd.patch`. It extends `SCCACHE_BASEDIRS` normalization to the Rust hasher and
-honors the per-request `SCCACHE_BASEDIR_CWD=1` client variable cowshed exports in every workspace, keying the cwd, the
-blanket `CARGO_*` environment values, and the argument bytes relative to the request cwd. Values rustc records as
-`# env-dep:` are never normalized. A normalized key is only as good as the claim that the output does not depend on the
-path it omits, so the patch makes that claim true and then checks it:
+Cross-path reuse — every workspace hitting one cache regardless of its mount path — requires an sccache that carries
+`nix/sccache/sccache-basedir.patch`. It extends `SCCACHE_BASEDIRS` normalization to the Rust hasher and lets a client
+name base directories of its own, per request:
 
-- such a compile runs under `--remap-path-prefix=<cwd>=`, so the working directory rustc writes into rmeta and debuginfo
-  is workspace-relative and identical at every mount;
-- before the entry is stored, its outputs (and the dependency list of its dep-info) are searched for every normalized
-  path. An output that names one — a proc macro that read `CARGO_MANIFEST_DIR` through `std::env`, which dep-info cannot
-  see, or an `env!` value — is stored under the verbatim per-path key, with a marker under the normalized key that sends
-  later lookups to their own per-path key. That checkout keeps reusing it; no other checkout is ever served it.
+- `SCCACHE_BASEDIR_CWD=1`, which cowshed exports in every workspace, names the request cwd. Cargo runs rustc from the
+  workspace root, so the Rust hasher keys the cwd, the blanket `CARGO_*` environment values and the argument bytes
+  relative to it. The C/C++ hasher ignores it.
+- `SCCACHE_BASEDIR=<absolute dir>` names a checkout root that is not the cwd, and both hashers honor it. A C/C++ build
+  sets it for cmake and ninja, which compile from a build directory below the root: the preprocessed text (whose line
+  markers name every source and header) and the arguments are keyed without it, and direct mode is off for such a
+  request. A nested cargo run sets it to strip workspace paths such as `CARGO_HTTP_CAINFO` that sit above its cwd. Named
+  at the cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone.
+
+The Rust hasher strips the same directories from the values rustc records as `# env-dep:`. A normalized key is only as
+good as the claim that the output does not depend on the path it omits, so the patch makes that claim true where it can
+and then checks it:
+
+- a Rust compile runs under `--remap-path-prefix=<dir>=` for each of the request's own base directories, so the working
+  directory rustc writes into rmeta and debuginfo is relative and identical at every mount. A C/C++ compile is not
+  rewritten; the build passes `-ffile-prefix-map=<root>=.` itself, which the key strips like any argument path;
+- a Rust dep-info names the sources and env-dep values at the checkout that compiled it, and cargo reads it as such. A
+  shared entry holds it with each of the request's own base directories, where one starts a path, replaced by a
+  placeholder for its role (`SCCACHE_BASEDIR`, or the cwd), and a hit writes the requesting checkout's directories back;
+- before the entry is stored, its outputs (the dep-info in its placeholder form, rule targets aside) are searched for
+  every normalized path. An output that names one — a proc macro that read `CARGO_MANIFEST_DIR` through `std::env`,
+  which dep-info cannot see, an `env!` value compiled into a string, a C object compiled without a prefix map — is
+  stored under the verbatim per-path key, with a marker under the normalized key that sends later lookups to their own
+  per-path key. That checkout keeps reusing it; no other checkout is ever served it. A C depfile is not searched: a hit
+  keeps the one the request's own preprocessing wrote and never restores the entry's.
 
 Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache still serves
-same-path (slot-tenant) reuse, nothing more. Prove the build with `strings sccache | grep cowshed-path-v2`.
+same-path (slot-tenant) reuse, nothing more. Prove the build with `strings sccache | grep cowshed-path-v3`; the C/C++
+half is `cowshed-path-v2:c-request-basedir`.
 
 Concurrent misses of one cache key wait for the first compile (`patches/sccache-singleflight.patch`; prove with
 `nm sccache | grep inflight_join`). Without it, parallel `cargo` processes compile the same crate N times.

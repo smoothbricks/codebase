@@ -1,0 +1,1131 @@
+diff --git a/src/compiler/c.rs b/src/compiler/c.rs
+index 7cf84b5..5c6dd77 100644
+--- a/src/compiler/c.rs
++++ b/src/compiler/c.rs
+@@ -16,7 +16,7 @@ use crate::cache::{FileObjectSource, Storage};
+ use crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key;
+ use crate::compiler::{
+     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
+-    CompilerKind, HashResult, Language,
++    CompilerKind, DepInfo, HashResult, Language, PathPin, request_basedir,
+ };
+ #[cfg(feature = "dist-client")]
+ use crate::compiler::{DistPackagers, NoopOutputsRewriter};
+@@ -29,6 +29,8 @@ use crate::util::{
+     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
+     hash_all, strip_basedirs,
+ };
++#[cfg(unix)]
++use crate::util::strip_argument_basedirs;
+ use async_trait::async_trait;
+ use fs_err as fs;
+ use std::borrow::Cow;
+@@ -407,11 +409,19 @@ where
+         }
+ 
+         let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
++        let request_basedir = request_basedir(&env_vars)?;
+ 
+         let use_preprocessor_cache_mode = if needs_preprocessing {
++            // A direct-mode hit returns a stored result key without the output check that
++            // keeps a key normalized by the request honest (see `PathPin`).
++            if request_basedir.is_some() && preprocessor_cache_mode_config.use_preprocessor_cache_mode
++            {
++                debug!("generate_hash_key: Disabling preprocessor cache because of SCCACHE_BASEDIR");
++            }
+             let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
+                 .use_preprocessor_cache_mode
+-                && !too_hard_for_preprocessor_cache_mode;
++                && !too_hard_for_preprocessor_cache_mode
++                && request_basedir.is_none();
+ 
+             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
+ 
+@@ -520,6 +530,7 @@ where
+                                         env_vars: env_vars.clone(),
+                                     }),
+                                     weak_toolchain_key,
++                                    path_pin: None,
+                                 });
+                             } else {
+                                 debug!("Preprocessor cache miss: {preprocessor_key}");
+@@ -625,7 +636,7 @@ where
+         let mut common_and_arch_args = self.parsed_args.common_args.clone();
+         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+ 
+-        let key = HashKeyParams::new(
++        let params = HashKeyParams::new(
+             &self.executable_digest,
+             self.parsed_args.language,
+             &common_and_arch_args,
+@@ -633,9 +644,59 @@ where
+         )
+         .with_extra_hashes(&extra_hashes)
+         .with_env_vars(&env_vars)
+-        .with_plusplus(self.compiler.plusplus())
+-        .with_basedirs(storage.basedirs())
+-        .compute();
++        .with_plusplus(self.compiler.plusplus());
++        // A request base directory (SCCACHE_BASEDIR, the checkout root above the build
++        // directory cmake and ninja compile from) is omitted from the key alongside the
++        // server's SCCACHE_BASEDIRS: from the preprocessed text, whose line markers name every
++        // source and header, and from the arguments, where `-ffile-prefix-map=<dir>=.` names
++        // it. The key is then shared by every checkout, so it carries the output check the
++        // Rust hasher's normalized keys carry (`PathPin`): an object that names its checkout,
++        // through debug info or a `__FILE__` without a prefix map, is stored for that checkout
++        // alone. The make depfile is exempt: preprocessing wrote this checkout's own, and a hit
++        // keeps it.
++        let (key, path_pin) = match request_basedir {
++            None => (params.with_basedirs(storage.basedirs()).compute(), None),
++            Some(basedir) => {
++                let basedir = basedir.into_os_string().into_encoded_bytes();
++                let paths: Vec<Vec<u8>> = storage
++                    .basedirs()
++                    .iter()
++                    .cloned()
++                    .chain([basedir.clone()])
++                    .collect();
++                // `strip_basedirs` ends a match at a component boundary only through the
++                // trailing separator the server's basedirs carry.
++                let preprocessed: Vec<Vec<u8>> = storage
++                    .basedirs()
++                    .iter()
++                    .cloned()
++                    .chain([[&basedir[..], b"/"].concat()])
++                    .collect();
++                let normalized = params
++                    .clone()
++                    .with_basedirs(&preprocessed)
++                    .with_argument_basedirs(&paths)
++                    .with_scheme(b"cowshed-path-v2:c-request-basedir")
++                    .compute();
++                let bound = params
++                    .with_scheme(b"cowshed-path-v2:c-request-basedir:bound")
++                    .compute();
++                let dep_info = self
++                    .parsed_args
++                    .outputs
++                    .get("d")
++                    .map(|depfile| DepInfo::Preprocessed(cwd.join(&depfile.path)));
++                PathPin::key(
++                    &*storage,
++                    normalized,
++                    bound,
++                    paths,
++                    dep_info,
++                    &self.parsed_args.output_pretty(),
++                )
++                .await
++            }
++        };
+ 
+         // Cache the preprocessing step
+         if let Some(preprocessor_key) = preprocessor_key {
+@@ -678,6 +739,7 @@ where
+                 env_vars,
+             }),
+             weak_toolchain_key,
++            path_pin,
+         })
+     }
+ 
+@@ -1498,6 +1560,8 @@ pub struct HashKeyParams<'a> {
+     preprocessor_output: &'a [u8],
+     plusplus: bool,
+     basedirs: &'a [Vec<u8>],
++    argument_basedirs: &'a [Vec<u8>],
++    scheme: &'a [u8],
+ }
+ 
+ impl<'a> HashKeyParams<'a> {
+@@ -1525,6 +1589,8 @@ impl<'a> HashKeyParams<'a> {
+             env_vars: &[],
+             plusplus: false,
+             basedirs: &[],
++            argument_basedirs: &[],
++            scheme: &[],
+         }
+     }
+ 
+@@ -1552,6 +1618,19 @@ impl<'a> HashKeyParams<'a> {
+         self
+     }
+ 
++    /// Sets the base directories stripped from the arguments: where an argument starts or
++    /// follows `=` (`-ffile-prefix-map=<dir>=.`), and only at a component boundary.
++    pub fn with_argument_basedirs(mut self, argument_basedirs: &'a [Vec<u8>]) -> Self {
++        self.argument_basedirs = argument_basedirs;
++        self
++    }
++
++    /// Names the key space, so a key normalized some other way never equals an upstream one.
++    pub fn with_scheme(mut self, scheme: &'a [u8]) -> Self {
++        self.scheme = scheme;
++        self
++    }
++
+     /// Computes the hash key based on the configured parameters.
+     ///
+     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
+@@ -1567,8 +1646,21 @@ impl<'a> HashKeyParams<'a> {
+         // we have to incorporate that into the hash as well.
+         m.update(&[self.plusplus as u8]);
+         m.update(CACHE_VERSION);
++        if !self.scheme.is_empty() {
++            m.update(self.scheme);
++        }
+         m.update(self.language.as_str().as_bytes());
+         for arg in self.arguments {
++            #[cfg(unix)]
++            if !self.argument_basedirs.is_empty() {
++                use std::os::unix::ffi::OsStrExt as _;
++                OsStr::from_bytes(&strip_argument_basedirs(
++                    arg.as_bytes(),
++                    self.argument_basedirs,
++                ))
++                .hash(&mut HashToDigest { digest: &mut m });
++                continue;
++            }
+             arg.hash(&mut HashToDigest { digest: &mut m });
+         }
+         for hash in self.extra_hashes {
+@@ -1764,6 +1856,32 @@ mod test {
+         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
+     }
+ 
++    #[test]
++    #[cfg(unix)]
++    fn test_hash_key_argument_basedirs_and_scheme() {
++        let args1 = ovec!["-O2", "-ffile-prefix-map=/home/user1/project=."];
++        let args2 = ovec!["-O2", "-ffile-prefix-map=/home/user2/project=."];
++        let dirs = [
++            b"/home/user1/project".to_vec(),
++            b"/home/user2/project".to_vec(),
++        ];
++        let hash = |args: &[OsString], dirs: &[Vec<u8>], scheme: &[u8]| {
++            HashKeyParams::new("abcd", Language::C, args, b"int x;")
++                .with_argument_basedirs(dirs)
++                .with_scheme(scheme)
++                .compute()
++        };
++        // A prefix map naming each checkout keys alike once the checkout is stripped.
++        assert_eq!(hash(&args1, &dirs, b""), hash(&args2, &dirs, b""));
++        assert_neq!(hash(&args1, &[], b""), hash(&args2, &[], b""));
++        // Nothing to strip keys as upstream does, and a scheme never does.
++        assert_eq!(
++            hash(&args1, &dirs[1..], b""),
++            HashKeyParams::new("abcd", Language::C, &args1, b"int x;").compute()
++        );
++        assert_neq!(hash(&args1, &dirs, b""), hash(&args1, &dirs, b"scheme"));
++    }
++
+     #[cfg(target_os = "windows")]
+     #[test]
+     fn test_hash_key_basedirs_windows_escaped_backslashes() {
+diff --git a/src/compiler/compiler.rs b/src/compiler/compiler.rs
+index 78bb5a4..cb3c508 100644
+--- a/src/compiler/compiler.rs
++++ b/src/compiler/compiler.rs
+@@ -556,7 +556,7 @@ where
+             out_pretty,
+             fmt_duration_as_secs(&start.elapsed())
+         );
+-        let (key, compilation, weak_toolchain_key) = match result {
++        let (key, compilation, weak_toolchain_key, path_pin) = match result {
+             Err(e) => {
+                 return match e.downcast::<ProcessError>() {
+                     Ok(ProcessError(output)) => {
+@@ -570,7 +570,8 @@ where
+                 key,
+                 compilation,
+                 weak_toolchain_key,
+-            }) => (key, compilation, weak_toolchain_key),
++                path_pin,
++            }) => (key, compilation, weak_toolchain_key, path_pin),
+         };
+         debug!("[{}]: Hash key: {}", out_pretty, key);
+         // If `ForceRecache` is enabled, we won't check the cache.
+@@ -639,7 +640,20 @@ where
+ 
+                 let hit = CompileResult::CacheHit(duration);
+                 match entry.extract_objects(filtered_outputs, &pool).await {
+-                    Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
++                    Ok(()) => {
++                        let restored = match path_pin.clone() {
++                            None => Ok(()),
++                            Some(pin) => pool.spawn_blocking(move || pin.restore()).await?,
++                        };
++                        match restored {
++                            Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
++                            // Compiling overwrites the outputs the entry restored.
++                            Err(e) => {
++                                debug!("[{}]: {:#}; compiling", out_pretty, e);
++                                Ok(CacheLookupResult::Miss(MissType::CacheReadError))
++                            }
++                        }
++                    }
+                     Err(e) => {
+                         if e.downcast_ref::<DecompressionFailure>().is_some() {
+                             debug!("[{}]: Failed to decompress object", out_pretty);
+@@ -775,10 +789,52 @@ where
+                     out_pretty,
+                     fmt_duration_as_secs(&duration_compilation)
+                 );
++                // An entry under a normalized key is served at every checkout path, so it
++                // holds only outputs that do not name the path they were compiled at.
++                let (key, marker_key, portable) = match path_pin {
++                    None => (key, None, None),
++                    Some(pin) => {
++                        let scanned = outputs.clone();
++                        let (pin, checked) = pool
++                            .spawn_blocking(move || {
++                                let checked = pin.check(&scanned);
++                                (pin, checked)
++                            })
++                            .await?;
++                        match checked.context("failed to read compiler outputs")? {
++                            Checked::Bound(path) => {
++                                debug!(
++                                    "[{}]: {} names the checkout path; storing under the path-bound key",
++                                    out_pretty,
++                                    path.display()
++                                );
++                                (pin.bound_key, Some(pin.marker_key), None)
++                            }
++                            Checked::Shared(portable) => (key, None, portable),
++                        }
++                    }
++                };
+                 let start_create_artifact = Instant::now();
+-                let mut entry = CacheWrite::from_objects(outputs, &pool)
+-                    .await
+-                    .context("failed to zip up compiler outputs")?;
++                let mut entry = match portable {
++                    None => CacheWrite::from_objects(outputs, &pool).await,
++                    Some(PortableDepInfo { path, bytes, mode }) => {
++                        let (dep_info, rest): (Vec<_>, Vec<_>) =
++                            outputs.into_iter().partition(|output| output.path == path);
++                        CacheWrite::from_objects(rest, &pool)
++                            .await
++                            .and_then(|mut entry| {
++                                for output in dep_info {
++                                    entry.put_object(
++                                        &output.key,
++                                        &mut std::io::Cursor::new(&bytes),
++                                        mode,
++                                    )?;
++                                }
++                                Ok(entry)
++                            })
++                    }
++                }
++                .context("failed to zip up compiler outputs")?;
+ 
+                 entry.put_stdout(&compiler_result.stdout)?;
+                 entry.put_stderr(&compiler_result.stderr)?;
+@@ -793,7 +849,14 @@ where
+                 // entry. We'll get the result back elsewhere.
+                 let future = async move {
+                     let start = Instant::now();
+-                    match storage.put(&key, entry).await {
++                    let put = match (storage.put(&key, entry).await, marker_key) {
++                        (Ok(duration), Some(marker_key)) => storage
++                            .put(&marker_key, CacheWrite::new())
++                            .await
++                            .map(|_| duration),
++                        (put, _) => put,
++                    };
++                    match put {
+                         Ok(_) => {
+                             debug!("[{}]: Stored in cache successfully!", out_pretty2);
+                             Ok(CacheWriteInfo {
+@@ -1155,6 +1218,301 @@ where
+     pub compilation: Box<dyn Compilation<T> + 'static>,
+     /// A weak key that may be used to identify the toolchain
+     pub weak_toolchain_key: String,
++    /// Present when `key` omits checkout paths: where the entry belongs instead if the
++    /// outputs name one of them.
++    pub path_pin: Option<PathPin>,
++}
++
++/// A key normalized across checkout paths, and the evidence needed to keep it honest.
++///
++/// The normalized key is shared by every checkout of the same sources, so its entry may only
++/// hold outputs that do not name the path they were compiled at. Whether they do is decided
++/// by reading them, after the compile: no key input reveals what a proc macro read from its
++/// environment, or which string a C header baked into an object.
++#[derive(Clone, Debug)]
++pub struct PathPin {
++    /// The paths the normalized key omitted.
++    pub paths: Vec<Vec<u8>>,
++    /// The dependency list among the outputs, if the check reads it specially.
++    pub dep_info: Option<DepInfo>,
++    /// The key over every input verbatim, paths included.
++    pub bound_key: String,
++    /// Stored when the outputs name a path: a later lookup that finds it uses its own
++    /// `bound_key` instead of the normalized key.
++    pub marker_key: String,
++}
++
++/// A dependency list among a compile's outputs, and how the path check reads it.
++#[derive(Clone, Debug)]
++pub enum DepInfo {
++    /// cargo's dep-info. It names the sources and env-dep values at the checkout that
++    /// compiled it, and cargo reads it as such, so a normalized entry holds it portable: each
++    /// of `bases` that starts a path becomes its placeholder, and a hit puts the requesting
++    /// checkout's directory back. Its rule targets are this compile's output paths, which
++    /// every cargo reader ignores, so the check skips them.
++    Cargo { path: PathBuf, bases: Vec<RequestBase> },
++    /// A C compiler's make depfile. Every lookup writes its own, naming its own checkout, from
++    /// the preprocessing that computes the key, and a hit keeps that one rather than restore
++    /// the entry's (the `is_locally_preprocessed` filter above), so the entry's copy is never
++    /// served and the check skips it.
++    Preprocessed(PathBuf),
++}
++
++/// One of a request's own base directories, and the placeholder that stands for it in a
++/// normalized entry's cargo dep-info. A placeholder names the role, not the directory: the
++/// same role is a different directory at every checkout.
++#[derive(Clone, Debug)]
++pub struct RequestBase {
++    pub placeholder: &'static [u8],
++    pub dir: Vec<u8>,
++}
++
++impl RequestBase {
++    /// The directory `SCCACHE_BASEDIR` names.
++    pub const BASEDIR: &'static [u8] = b"\0SCCACHE_BASEDIR\0";
++    /// The cwd of a `SCCACHE_BASEDIR_CWD=1` request.
++    pub const CWD: &'static [u8] = b"\0SCCACHE_BASEDIR_CWD\0";
++}
++
++/// `dep_info` with every base that starts a path (at a line start, after a space, or after
++/// the `=` of an env-dep) replaced by its placeholder; the longest base wins, and among equal
++/// ones the last. A base holding a byte that make(1) or rustc escapes stays as it is, and so
++/// does every base in a dep-info that already holds a NUL: the check then finds it and binds
++/// the entry to its checkout.
++fn portable_dep_info(dep_info: &[u8], bases: &[RequestBase]) -> Vec<u8> {
++    let bases: Vec<&RequestBase> = bases
++        .iter()
++        .filter(|base| {
++            !base.dir.is_empty()
++                && !base.dir.iter().any(|byte| {
++                    matches!(
++                        byte,
++                        b'\0' | b' ' | b'\t' | b'\n' | b'\r' | b'\\' | b'#' | b'$' | b':' | b'='
++                    )
++                })
++        })
++        .collect();
++    if bases.is_empty() || dep_info.contains(&b'\0') {
++        return dep_info.to_vec();
++    }
++    let mut portable = Vec::with_capacity(dep_info.len());
++    let mut at = 0;
++    while at < dep_info.len() {
++        if at == 0 || matches!(dep_info[at - 1], b'\n' | b' ' | b'\t' | b'=') {
++            let base = bases
++                .iter()
++                .filter(|base| {
++                    dep_info[at..].starts_with(&base.dir)
++                        && matches!(
++                            dep_info.get(at + base.dir.len()),
++                            None | Some(b'/' | b' ' | b'\t' | b'\n' | b'\r' | b':')
++                        )
++                })
++                .max_by_key(|base| base.dir.len());
++            if let Some(base) = base {
++                portable.extend_from_slice(base.placeholder);
++                at += base.dir.len();
++                continue;
++            }
++        }
++        portable.push(dep_info[at]);
++        at += 1;
++    }
++    portable
++}
++
++/// `dep_info` with every placeholder replaced by this request's directory for it.
++fn restore_dep_info(dep_info: &[u8], bases: &[RequestBase]) -> Result<Vec<u8>> {
++    let mut restored = Vec::with_capacity(dep_info.len());
++    let mut rest = dep_info;
++    while let Some(nul) = memchr::memchr(b'\0', rest) {
++        restored.extend_from_slice(&rest[..nul]);
++        rest = &rest[nul..];
++        let Some(base) = bases
++            .iter()
++            .find(|base| rest.starts_with(base.placeholder))
++        else {
++            bail!("the cached dep-info names a base directory this request does not set");
++        };
++        restored.extend_from_slice(&base.dir);
++        rest = &rest[base.placeholder.len()..];
++    }
++    restored.extend_from_slice(rest);
++    Ok(restored)
++}
++
++/// The check's verdict on a normalized entry's outputs.
++enum Checked {
++    /// This output names the checkout path: the entry is stored as compiled, under the bound
++    /// key.
++    Bound(PathBuf),
++    /// No output names it: the entry is stored under the normalized key, its cargo dep-info,
++    /// if any, portable.
++    Shared(Option<PortableDepInfo>),
++}
++
++struct PortableDepInfo {
++    path: PathBuf,
++    bytes: Vec<u8>,
++    mode: Option<u32>,
++}
++
++impl PathPin {
++    fn marker_key(normalized_key: &str) -> String {
++        let mut m = crate::util::Digest::new();
++        m.update(b"cowshed-path-bound-marker:");
++        m.update(normalized_key.as_bytes());
++        m.finish()
++    }
++
++    /// The key a normalizing request looks up and stores under: the normalized key with the
++    /// pin that keeps it honest, unless a marker says this sources' outputs name their
++    /// checkout, in which case the bound key alone. A failed marker read is no reason to stop
++    /// sharing: every normalized entry was checked before it was stored.
++    pub async fn key(
++        storage: &dyn Storage,
++        normalized_key: String,
++        bound_key: String,
++        paths: Vec<Vec<u8>>,
++        dep_info: Option<DepInfo>,
++        out_pretty: &str,
++    ) -> (String, Option<PathPin>) {
++        let marker_key = Self::marker_key(&normalized_key);
++        match storage.get(&marker_key).await {
++            Ok(Cache::Hit(_)) => {
++                debug!("[{out_pretty}]: outputs name the checkout path; using the path-bound key");
++                (bound_key, None)
++            }
++            _ => (
++                normalized_key,
++                Some(PathPin {
++                    paths,
++                    dep_info,
++                    bound_key,
++                    marker_key,
++                }),
++            ),
++        }
++    }
++
++    /// Puts this checkout's directories back into the cargo dep-info a normalized hit
++    /// restored.
++    fn restore(&self) -> Result<()> {
++        let Some(DepInfo::Cargo { path, bases }) = &self.dep_info else {
++            return Ok(());
++        };
++        let bytes = match fs::read(path) {
++            Ok(bytes) => bytes,
++            // An entry without dep-info: the compile did not ask for it.
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++            Err(e) => return Err(e).context("failed to read the restored dep-info"),
++        };
++        if bytes.contains(&b'\0') {
++            fs::write(path, restore_dep_info(&bytes, bases)?)
++                .context("failed to write the restored dep-info")?;
++        }
++        Ok(())
++    }
++
++    /// Whether any output names one of `paths`, reading the cargo dep-info in its portable
++    /// form.
++    fn check(&self, outputs: &[FileObjectSource]) -> std::io::Result<Checked> {
++        // make(1) syntax escapes a space in a dependency path.
++        let escaped: Vec<Vec<u8>> = self
++            .paths
++            .iter()
++            .filter(|path| path.contains(&b' '))
++            .map(|path| {
++                path.iter().fold(Vec::new(), |mut escaped, &byte| {
++                    if byte == b' ' {
++                        escaped.push(b'\\');
++                    }
++                    escaped.push(byte);
++                    escaped
++                })
++            })
++            .collect();
++        let names = |bytes: &[u8]| {
++            self.paths
++                .iter()
++                .chain(&escaped)
++                .any(|path| memchr::memmem::find(bytes, path).is_some())
++        };
++        let mut portable = None;
++        for output in outputs {
++            if matches!(&self.dep_info, Some(DepInfo::Preprocessed(depfile)) if *depfile == output.path)
++            {
++                continue;
++            }
++            let file = match fs::File::open(&output.path) {
++                Ok(file) => file,
++                Err(e) if output.optional && e.kind() == std::io::ErrorKind::NotFound => continue,
++                Err(e) => return Err(e),
++            };
++            #[cfg(unix)]
++            let mode = {
++                use std::os::unix::fs::MetadataExt;
++                Some(file.metadata()?.mode())
++            };
++            #[cfg(not(unix))]
++            let mode = None;
++            let mut bytes = Vec::new();
++            { file }.read_to_end(&mut bytes)?;
++            let named = match &self.dep_info {
++                Some(DepInfo::Cargo { path, bases }) if *path == output.path => {
++                    let bytes = portable_dep_info(&bytes, bases);
++                    let named = bytes.split(|&byte| byte == b'\n').any(|line| {
++                        names(match memchr::memmem::find(line, b": ") {
++                            Some(colon) if !line.starts_with(b"#") => &line[colon + 2..],
++                            _ => line,
++                        })
++                    });
++                    portable = Some(PortableDepInfo {
++                        path: path.clone(),
++                        bytes,
++                        mode,
++                    });
++                    named
++                }
++                _ => names(&bytes),
++            };
++            if named {
++                return Ok(Checked::Bound(output.path.clone()));
++            }
++        }
++        Ok(Checked::Shared(portable))
++    }
++}
++
++/// The client's per-request base directory, `SCCACHE_BASEDIR`: a path prefix this request's
++/// key omits, as every request's key omits the server's `SCCACHE_BASEDIRS`. A build names it
++/// where its checkout root is not the compiler's working directory (cmake and ninja compile
++/// from a build directory below it). Unset or empty means none. Returned absolute, without a
++/// trailing separator, `.` components or doubled separators.
++pub fn request_basedir(env_vars: &[(OsString, OsString)]) -> Result<Option<PathBuf>> {
++    let Some((_, value)) = env_vars
++        .iter()
++        .find(|(k, v)| k == "SCCACHE_BASEDIR" && !v.is_empty())
++    else {
++        return Ok(None);
++    };
++    let path = Path::new(value);
++    let mut normalized = PathBuf::new();
++    for component in path.components() {
++        match component {
++            std::path::Component::RootDir | std::path::Component::Normal(_) => {
++                normalized.push(component)
++            }
++            std::path::Component::CurDir => {}
++            std::path::Component::Prefix(_) | std::path::Component::ParentDir => {
++                bail!("SCCACHE_BASEDIR must not contain `..` or a drive prefix: {value:?}")
++            }
++        }
++    }
++    if !path.is_absolute() || normalized.parent().is_none() {
++        bail!("SCCACHE_BASEDIR must be an absolute directory below the root: {value:?}");
++    }
++    Ok(Some(normalized))
+ }
+ 
+ /// Possible results of parsing compiler arguments.
+@@ -1910,6 +2268,99 @@ mod test {
+     use test_case::test_case;
+     use tokio::runtime::Runtime;
+ 
++    #[test]
++    fn test_portable_dep_info_round_trip() {
++        let bases = |pin: &str| {
++            vec![
++                RequestBase {
++                    placeholder: RequestBase::BASEDIR,
++                    dir: pin.as_bytes().to_vec(),
++                },
++                RequestBase {
++                    placeholder: RequestBase::CWD,
++                    dir: b"/reg/dep".to_vec(),
++                },
++            ]
++        };
++        // `{P}` is the checkout; `/a/pinx` and `lib/a/pin` only look like checkout A.
++        let at = |pin: &str| {
++            "{P}/t/libdep.rmeta: /reg/dep/src/lib.rs {P}/out/x.rs /a/pinx/y.rs\n\
++            \n/reg/dep/src/lib.rs:\n{P}/out/x.rs:\nlib/a/pin/z.rs:\n\
++            \n# env-dep:OUT_DIR={P}/out\n# env-dep:ROOT={P}\n"
++                .replace("{P}", pin)
++                .into_bytes()
++        };
++        let portable = portable_dep_info(&at("/a/pin"), &bases("/a/pin"));
++        assert_eq!(
++            portable,
++            b"\0SCCACHE_BASEDIR\0/t/libdep.rmeta: \0SCCACHE_BASEDIR_CWD\0/src/lib.rs \
++            \0SCCACHE_BASEDIR\0/out/x.rs /a/pinx/y.rs\n\
++            \n\0SCCACHE_BASEDIR_CWD\0/src/lib.rs:\n\0SCCACHE_BASEDIR\0/out/x.rs:\nlib/a/pin/z.rs:\n\
++            \n# env-dep:OUT_DIR=\0SCCACHE_BASEDIR\0/out\n# env-dep:ROOT=\0SCCACHE_BASEDIR\0\n"
++                .to_vec()
++        );
++        assert_eq!(
++            restore_dep_info(&portable, &bases("/a/pin")).unwrap(),
++            at("/a/pin")
++        );
++        assert_eq!(
++            restore_dep_info(&portable, &bases("/b/pin")).unwrap(),
++            at("/b/pin")
++        );
++        // Without the role, the entry cannot be restored here.
++        assert!(restore_dep_info(&portable, &bases("/b/pin")[1..]).is_err());
++    }
++
++    #[test]
++    fn test_portable_dep_info_prefers_the_cwd_and_skips_unsafe_bases() {
++        let both = [
++            RequestBase {
++                placeholder: RequestBase::BASEDIR,
++                dir: b"/ws".to_vec(),
++            },
++            RequestBase {
++                placeholder: RequestBase::CWD,
++                dir: b"/ws".to_vec(),
++            },
++        ];
++        assert_eq!(
++            portable_dep_info(b"/ws/src/lib.rs:\n", &both),
++            b"\0SCCACHE_BASEDIR_CWD\0/src/lib.rs:\n".to_vec()
++        );
++        let spaced = [RequestBase {
++            placeholder: RequestBase::CWD,
++            dir: b"/my ws".to_vec(),
++        }];
++        assert_eq!(
++            portable_dep_info(b"/my\\ ws/src/lib.rs:\n", &spaced),
++            b"/my\\ ws/src/lib.rs:\n".to_vec()
++        );
++        // A NUL already present would be read back as a placeholder.
++        assert_eq!(
++            portable_dep_info(b"/ws/a\0:\n", &both),
++            b"/ws/a\0:\n".to_vec()
++        );
++    }
++
++    #[test]
++    fn test_request_basedir() {
++        let parse = |value: &str| {
++            request_basedir(&[(
++                OsString::from("SCCACHE_BASEDIR"),
++                OsString::from(value),
++            )])
++        };
++        assert_eq!(request_basedir(&[]).unwrap(), None);
++        assert_eq!(parse("").unwrap(), None);
++        assert_eq!(
++            parse("/ws//pin/./").unwrap(),
++            Some(PathBuf::from("/ws/pin"))
++        );
++        for invalid in ["ws/pin", "/", "/ws/../pin"] {
++            assert!(parse(invalid).is_err(), "{invalid}");
++        }
++    }
++
+     #[test]
+     fn test_c_preprocessing_consistent() {
+         // Must contain all possible values from `Language`.
+diff --git a/src/compiler/rust.rs b/src/compiler/rust.rs
+index 975f434..39f4b33 100644
+--- a/src/compiler/rust.rs
++++ b/src/compiler/rust.rs
+@@ -16,8 +16,8 @@ use crate::cache::{FileObjectSource, Storage};
+ use crate::compiler::args::*;
+ use crate::compiler::{
+     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
+-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
+-    SingleCompileCommand, c::ArtifactDescriptor,
++    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, DepInfo, HashResult, Language,
++    PathPin, RequestBase, SingleCompileCommand, c::ArtifactDescriptor, request_basedir,
+ };
+ #[cfg(feature = "dist-client")]
+ use crate::compiler::{DistPackagers, OutputsRewriter};
+@@ -26,7 +26,11 @@ use crate::dist::pkg;
+ #[cfg(feature = "dist-client")]
+ use crate::lru_disk_cache::{LruCache, Meter};
+ use crate::mock_command::{CommandCreatorSync, RunCommand};
+-use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
++use crate::util::{
++    Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output, strip_basedirs,
++};
++#[cfg(unix)]
++use crate::util::strip_argument_basedirs;
+ use crate::util::{HashToDigest, OsStrExt};
+ use crate::{counted_array, dist};
+ use async_trait::async_trait;
+@@ -1392,7 +1396,7 @@ where
+         _may_dist: bool,
+         pool: &tokio::runtime::Handle,
+         _rewrite_includes_only: bool,
+-        _storage: Arc<dyn Storage>,
++        storage: Arc<dyn Storage>,
+         _cache_control: CacheControl,
+     ) -> Result<HashResult<T>> {
+         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
+@@ -1494,8 +1498,138 @@ where
+             target_json_hash
+         )?;
+ 
++        // Cross-path keys. The normalized key strips the server-configured SCCACHE_BASEDIRS
++        // and this request's own base directories from the argument list, the blanket CARGO_*
++        // environment values, the env-dep values and the cwd. A request's own base directories
++        // are its cwd when the client sets SCCACHE_BASEDIR_CWD=1 (cargo invokes rustc from the
++        // workspace root, so cwd is the checkout base) and the directory it names in
++        // SCCACHE_BASEDIR (a checkout root that is not the cwd; the C hasher honors it too).
++        //
++        // Stripping a path from the key is sound only while the output cannot observe it:
++        //
++        // - rustc itself records the working directory in rmeta and in debuginfo
++        //   (DW_AT_comp_dir). A request-normalized compile therefore runs under
++        //   `--remap-path-prefix=<dir>=` for each of the request's own base directories, so
++        //   those records are relative, exactly like the source paths cargo already passes,
++        //   and identical at every checkout.
++        // - The dep-info names the sources and env-dep values at this checkout, and cargo
++        //   reads it as such. A normalized entry holds it with each of the request's own base
++        //   directories replaced by a placeholder, and a hit puts the requesting checkout's
++        //   directory back (`DepInfo::Cargo`).
++        // - Anything else that reads a stripped path, such as env!("CARGO_MANIFEST_DIR")
++        //   compiled into a string, or a proc macro calling std::env::var (invisible to
++        //   dep-info), leaves the path in the outputs. Before a normalized entry is stored,
++        //   its outputs are searched for every stripped path; if one appears, the entry is
++        //   stored under `bound_key`, which hashes every input verbatim, and a marker under
++        //   the normalized key sends every later lookup to its own bound key. A normalized
++        //   entry is therefore one whose outputs were seen not to name the path they were
++        //   compiled at.
++        let request_base = request_basedir(&env_vars)?;
++        let cwd_base = (cfg!(unix)
++            && env_vars
++                .iter()
++                .any(|(k, v)| k == "SCCACHE_BASEDIR_CWD" && v == "1"))
++        .then(|| cwd.clone());
++        // The cwd role last: where both name one directory, the dep-info placeholder is the
++        // cwd's, which every SCCACHE_BASEDIR_CWD=1 request can restore.
++        let dep_info_bases: Vec<RequestBase> = request_base
++            .iter()
++            .map(|dir| (RequestBase::BASEDIR, dir))
++            .chain(cwd_base.iter().map(|dir| (RequestBase::CWD, dir)))
++            .map(|(placeholder, dir)| RequestBase {
++                placeholder,
++                dir: dir.as_os_str().as_encoded_bytes().to_vec(),
++            })
++            .collect();
++        let remapped: Vec<PathBuf> = {
++            let mut dirs: Vec<PathBuf> = request_base.into_iter().chain(cwd_base).collect();
++            // rustc applies the last matching mapping, so the longest goes last: the most
++            // specific base wins, as it does when the key is stripped. A base named both ways
++            // is one base, keyed exactly as either way alone.
++            dirs.sort_by(|a, b| {
++                let (a, b) = (a.as_os_str().as_encoded_bytes(), b.as_os_str().as_encoded_bytes());
++                a.len().cmp(&b.len()).then(a.cmp(b))
++            });
++            dirs.dedup();
++            dirs
++        };
++        let hash_basedirs: Vec<Vec<u8>> = storage
++            .basedirs()
++            .iter()
++            .cloned()
++            .chain(
++                remapped
++                    .iter()
++                    .map(|dir| dir.as_os_str().as_encoded_bytes().to_vec()),
++            )
++            .collect();
++        // Every input goes into both digests; a path input goes into `bound` verbatim and
++        // into `normalized` with `basedirs` stripped.
++        struct KeyDigest<'a> {
++            normalized: Digest,
++            bound: Digest,
++            basedirs: &'a [Vec<u8>],
++        }
++        impl KeyDigest<'_> {
++            fn update(&mut self, bytes: &[u8]) {
++                self.normalized.update(bytes);
++                self.bound.update(bytes);
++            }
++            fn hash<H: Hash + ?Sized>(&mut self, value: &H) {
++                value.hash(&mut HashToDigest {
++                    digest: &mut self.normalized,
++                });
++                value.hash(&mut HashToDigest {
++                    digest: &mut self.bound,
++                });
++            }
++            // Verbatim with the value's own Hash (a Path hashes by component), so a request
++            // that normalizes nothing keys exactly as upstream does.
++            fn path<P: Hash + AsRef<std::ffi::OsStr> + ?Sized>(&mut self, value: &P) {
++                value.hash(&mut HashToDigest {
++                    digest: &mut self.bound,
++                });
++                #[cfg(unix)]
++                if !self.basedirs.is_empty() {
++                    use std::os::unix::ffi::OsStrExt as _;
++                    self.normalized
++                        .update(&strip_basedirs(value.as_ref().as_bytes(), self.basedirs));
++                    return;
++                }
++                value.hash(&mut HashToDigest {
++                    digest: &mut self.normalized,
++                });
++            }
++            // The argument list hashes as upstream concatenates it. It normalizes per argument,
++            // because a path in an argument starts it or follows `=` (`-C linker=<path>`),
++            // never the whitespace or quote `strip_basedirs` looks for.
++            fn arguments(&mut self, args: &[&OsString]) {
++                let joined = args.iter().fold(OsString::new(), |mut joined, arg| {
++                    joined.push(arg);
++                    joined
++                });
++                #[cfg(unix)]
++                if !self.basedirs.is_empty() {
++                    use std::os::unix::ffi::OsStrExt as _;
++                    joined.hash(&mut HashToDigest {
++                        digest: &mut self.bound,
++                    });
++                    for arg in args {
++                        self.normalized
++                            .update(&strip_argument_basedirs(arg.as_bytes(), self.basedirs));
++                    }
++                    return;
++                }
++                self.path(&joined);
++            }
++        }
++
+         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
+-        let mut m = Digest::new();
++        let mut m = KeyDigest {
++            normalized: Digest::new(),
++            bound: Digest::new(),
++            basedirs: &hash_basedirs,
++        };
+         // Hash inputs:
+         // 1. A version
+         m.update(CACHE_VERSION);
+@@ -1503,14 +1637,29 @@ where
+         for d in &self.compiler_shlibs_digests {
+             m.update(d.as_bytes());
+         }
+-        let weak_toolchain_key = m.clone().finish();
++        let weak_toolchain_key = m.normalized.clone().finish();
++        // A normalizing request's keys name the scheme, so they share nothing with
++        // upstream's key space or with entries stored under an earlier scheme, and the bound
++        // key never equals the normalized one. v3 strips env-dep values and holds the dep-info
++        // with placeholders. `remap-cwd` predates SCCACHE_BASEDIR and names every
++        // request-remapped compile: the stripped key already says which bases were remapped,
++        // and a cwd base keys as it always has.
++        if !hash_basedirs.is_empty() {
++            let scheme: &[u8] = if remapped.is_empty() {
++                b"cowshed-path-v3:server-basedirs"
++            } else {
++                b"cowshed-path-v3:remap-cwd"
++            };
++            m.update(scheme);
++            m.bound.update(b":bound");
++        }
+         // 3. The full commandline (self.arguments)
+         // TODO: there will be full paths here, it would be nice to
+         // normalize them so we can get cross-machine cache hits.
+         // A few argument types are not passed in a deterministic order
+         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
+         // and append them to the rest of the arguments.
+-        let args = {
++        let args: Vec<&OsString> = {
+             let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
+                 .iter()
+                 // We exclude a few arguments from the hash:
+@@ -1537,12 +1686,9 @@ where
+             rest.into_iter()
+                 .chain(sortables)
+                 .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+-                .fold(OsString::new(), |mut a, b| {
+-                    a.push(b);
+-                    a
+-                })
++                .collect()
+         };
+-        args.hash(&mut HashToDigest { digest: &mut m });
++        m.arguments(&args);
+         // 4. The digest of all source files (this includes src file from cmdline).
+         // 5. The digest of all files listed on the commandline (self.externs).
+         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
+@@ -1557,12 +1703,13 @@ where
+         }
+         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
+         //    output. Additionally also has all environment variables starting with `CARGO_`,
+-        //    since those are not listed in dep-info but affect cacheability.
++        //    since those are not listed in dep-info but affect cacheability. An env-dep value
++        //    compiled into the output still names its path there, which the check reads.
+         env_deps.sort();
+         for (var, val) in env_deps.iter() {
+-            var.hash(&mut HashToDigest { digest: &mut m });
++            m.hash(var);
+             m.update(b"=");
+-            val.hash(&mut HashToDigest { digest: &mut m });
++            m.path(val);
+         }
+         let mut env_vars: Vec<_> = env_vars
+             .iter()
+@@ -1591,14 +1738,15 @@ where
+                 continue;
+             }
+ 
+-            var.hash(&mut HashToDigest { digest: &mut m });
++            m.hash(var);
+             m.update(b"=");
+-            val.hash(&mut HashToDigest { digest: &mut m });
++            m.path(val);
+         }
+-        // 9. The cwd of the compile. This will wind up in the rlib.
+-        cwd.hash(&mut HashToDigest { digest: &mut m });
++        // 9. The cwd of the compile. rustc records it in rmeta and debuginfo, so a
++        //    cwd-normalized compile is remapped below.
++        m.path(cwd.as_path());
+         // 10. The version of the compiler.
+-        self.version.hash(&mut HashToDigest { digest: &mut m });
++        m.hash(&self.version);
+ 
+         // Turn arguments into a simple Vec<OsString> to calculate outputs.
+         let flat_os_string_arguments: Vec<OsString> = os_string_arguments
+@@ -1717,6 +1865,20 @@ where
+                 ArgDisposition::Separated,
+             ));
+         }
++        // First, because rustc applies the last matching mapping: a caller's own
++        // --remap-path-prefix for a path inside the checkout still wins.
++        arguments.splice(
++            0..0,
++            remapped.into_iter().map(|dir| {
++                let mut mapping = dir.into_os_string();
++                mapping.push("=");
++                Argument::WithValue(
++                    "--remap-path-prefix",
++                    ArgData::PassThrough(mapping),
++                    ArgDisposition::Concatenated(Some(b'=')),
++                )
++            }),
++        );
+ 
+         let inputs = source_files
+             .into_iter()
+@@ -1724,8 +1886,29 @@ where
+             .chain(abs_staticlibs)
+             .collect();
+ 
++        let KeyDigest {
++            normalized, bound, ..
++        } = m;
++        let bound_key = bound.finish();
++        let (key, path_pin) = if hash_basedirs.is_empty() {
++            (bound_key, None)
++        } else {
++            PathPin::key(
++                &*storage,
++                normalized.finish(),
++                bound_key,
++                hash_basedirs,
++                dep_info.as_ref().map(|p| DepInfo::Cargo {
++                    path: cwd.join(p),
++                    bases: dep_info_bases,
++                }),
++                &self.parsed_args.crate_name,
++            )
++            .await
++        };
++
+         Ok(HashResult {
+-            key: m.finish(),
++            key,
+             compilation: Box::new(RustCompilation {
+                 executable: self.executable.clone(),
+                 host: self.host.clone(),
+@@ -1743,6 +1926,7 @@ where
+                 rlib_dep_reader: self.rlib_dep_reader.clone(),
+             }),
+             weak_toolchain_key,
++            path_pin,
+         })
+     }
+ 
+diff --git a/src/util.rs b/src/util.rs
+index 3a0e847..7753324 100644
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -1202,6 +1202,36 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
+     Cow::Owned(result)
+ }
+ 
++/// `arg` with every `basedirs` entry removed where it starts the argument or follows `=`, the two
++/// places a path sits in a compiler argument (`src/lib.rs`, `-C linker=<path>`). The longest
++/// matching entry wins.
++#[cfg(unix)]
++pub fn strip_argument_basedirs(arg: &[u8], basedirs: &[Vec<u8>]) -> Vec<u8> {
++    let mut stripped = Vec::with_capacity(arg.len());
++    let mut at = 0;
++    while at < arg.len() {
++        if at == 0 || arg[at - 1] == b'=' {
++            // A whole path component: `/ws` is not a prefix of `/wsx`.
++            if let Some(dir) = basedirs
++                .iter()
++                .filter(|dir| {
++                    !dir.is_empty()
++                        && arg[at..].starts_with(dir)
++                        && (dir.ends_with(b"/")
++                            || matches!(arg.get(at + dir.len()), None | Some(b'/' | b'=')))
++                })
++                .max_by_key(|dir| dir.len())
++            {
++                at += dir.len();
++                continue;
++            }
++        }
++        stripped.push(arg[at]);
++        at += 1;
++    }
++    stripped
++}
++
+ /// Double every `/` in a normalized path.
+ ///
+ /// Paths inside preprocessor output are C string literals, so on Windows
+@@ -1645,6 +1675,24 @@ mod tests {
+         assert!(empty_result.is_empty(), "{:?}", empty_result);
+     }
+ 
++    #[test]
++    #[cfg(unix)]
++    fn test_strip_argument_basedirs() {
++        let dirs = [b"/ws".to_vec(), b"/ws/sub".to_vec()];
++        let strip =
++            |arg: &str| String::from_utf8(super::strip_argument_basedirs(arg.as_bytes(), &dirs));
++        assert_eq!(strip("/ws/src/lib.rs").unwrap(), "/src/lib.rs");
++        assert_eq!(strip("linker=/ws/sub/ld.sh").unwrap(), "linker=/ld.sh");
++        assert_eq!(
++            strip("--remap-path-prefix=/ws=/x").unwrap(),
++            "--remap-path-prefix==/x"
++        );
++        assert_eq!(strip("lib/ws/x").unwrap(), "lib/ws/x");
++        assert_eq!(strip("/wsx/ld.sh").unwrap(), "/wsx/ld.sh");
++        assert_eq!(strip("/ws").unwrap(), "");
++        assert_eq!(strip("-C").unwrap(), "-C");
++    }
++
+     #[test]
+     fn test_strip_basedir_simple() {
+         // Simple cases

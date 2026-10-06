@@ -73,15 +73,22 @@
         # for clients to find, not by a name.
         suffix = "cowshed";
 
-        # 1. rust-basedir-cwd: SCCACHE_BASEDIRS normalization extended to Rust cache keys, plus
-        #    SCCACHE_BASEDIR_CWD=1 so cwd, blanket CARGO_* env, and argument bytes key relative to
-        #    the request cwd. cargo >= 1.97 path-independent -C metadata plus this is what lets
-        #    every cowshed workspace share one cache at any mount path. env-dep values are never
-        #    normalized. A cwd-normalized compile runs under `--remap-path-prefix=<cwd>=`, so the
-        #    working directory rustc records in rmeta and debuginfo is workspace-relative, and an
-        #    entry is stored under the normalized key only if no output names a normalized path;
-        #    otherwise it goes under the verbatim key and a marker sends that checkout's later
-        #    lookups there. Present in the build iff `strings` finds `cowshed-path-v2`.
+        # 1. basedir: cross-path cache keys for both hashers. SCCACHE_BASEDIRS normalization is
+        #    extended to Rust keys, and a client adds its own base directories per request:
+        #    SCCACHE_BASEDIR_CWD=1 names the request cwd (Rust only; cargo runs rustc from the
+        #    workspace root), and SCCACHE_BASEDIR=<abs dir> names a checkout root above the cwd,
+        #    which both hashers honor (cmake and ninja compile from a build directory below it).
+        #    Rust keys cwd, blanket CARGO_* env, env-dep values and argument bytes without them,
+        #    and compiles under `--remap-path-prefix=<dir>=` for each, so rmeta and debuginfo name
+        #    no checkout; a shared entry holds the dep-info with a placeholder for each base, and
+        #    a hit writes the requesting checkout's directories back. C/C++ keys the preprocessed
+        #    text and the arguments (`-ffile-prefix-map=<dir>=.`) without them, with direct mode
+        #    off; the caller's prefix map keeps the objects path-free. Either way an entry is
+        #    stored under the normalized key only if no output names a normalized path (a C
+        #    depfile is exempt: a hit keeps the one local preprocessing wrote); otherwise it goes
+        #    under the verbatim key and a marker sends that checkout's later lookups there.
+        #    Present in the build iff `strings` finds `cowshed-path-v3:remap-cwd` and
+        #    `cowshed-path-v2:c-request-basedir`.
         # 2. singleflight: concurrent misses of one cache key wait for the first compile to publish
         #    instead of running N rustcs. Present in the build iff `nm` finds `inflight_join`.
         # 3. compiler-executable: bind concrete compilers to the same stable,
@@ -95,7 +102,7 @@
         # appear in this list and every entry must exist: nix ignores an unreferenced patch in
         # silence, so an orphaned file would read as applied while the built binary lacks it.
         patches = [
-          ./sccache-rust-basedir-cwd.patch
+          ./sccache-basedir.patch
           ./sccache-singleflight.patch
           ./sccache-compiler-executable.patch
         ];
