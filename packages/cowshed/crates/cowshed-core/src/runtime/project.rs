@@ -2047,8 +2047,8 @@ enum SupervisorHome {
 #[cfg(target_os = "macos")]
 const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a served supervisor stays with no named session and no running job before it
-/// retires; the next command starts another.
+/// How long a served supervisor stays idle (no named session, no running job, and its keeper
+/// holds no Nx daemon) before it retires; the next command starts another.
 #[cfg(target_os = "macos")]
 const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -6373,8 +6373,10 @@ impl NativeProjectRuntimeHost {
 
     /// Serve `name`'s supervisor from this process until it retires: the
     /// `cowshed __workspace-supervisor` verb. It retires when a client retires it, or once it
-    /// has held no named session and no running job for [`SUPERVISOR_IDLE`]; meanwhile it
-    /// answers `advance` requests by re-reading the workspace's grants.
+    /// has held no named session, no running job and no Nx daemon for [`SUPERVISOR_IDLE`]; a
+    /// shed's idle Nx daemon is stopped by its keeper first, so none outlives the supervisor
+    /// that watched it. Meanwhile it answers `advance` requests by re-reading the workspace's
+    /// grants.
     async fn serve_supervisor_until_retired(&mut self, name: WorkspaceName) -> Result<()> {
         self.supervisors_run_in = SupervisorHome::ThisProcess;
         self.validate_binding().await?;

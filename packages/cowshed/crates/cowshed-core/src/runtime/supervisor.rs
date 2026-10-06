@@ -38,7 +38,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe};
+use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
     SealedCheckpointManifest, StreamKind,
@@ -2186,10 +2186,12 @@ impl WorkspaceSupervisorHandle {
     }
 
     /// Whether the supervisor holds nothing a client could come back for: no named session is
-    /// open and no job is running. Only the process serving a supervisor asks, to retire it; that
-    /// serving host is the macOS native project host.
+    /// open, no job is running, and a shed's keeper has stopped its Nx daemon and finds none
+    /// ([`NxDaemonKeeper`]), so no daemon outlives the supervisor that watched it. Only the
+    /// process serving a supervisor asks, to retire it; that serving host is the macOS native
+    /// project host.
     #[cfg(target_os = "macos")]
-    pub(super) async fn idle(&self) -> Result<bool> {
+    pub async fn idle(&self) -> Result<bool> {
         self.call(|reply| Command::Idle { reply }).await
     }
 
@@ -2824,7 +2826,8 @@ impl SupervisorActor {
             #[cfg(target_os = "macos")]
             Command::Idle { reply } => {
                 let idle = self.named_sessions.is_empty()
-                    && self.jobs.values().all(JobStateRecord::terminal);
+                    && self.jobs.values().all(JobStateRecord::terminal)
+                    && self.nx_daemon.as_ref().is_none_or(|keeper| keeper.settled);
                 let _ = reply.send(Ok(idle));
             }
         }
@@ -3285,9 +3288,11 @@ impl SupervisorActor {
     }
 
     /// One probe of a shed's Nx daemon: nothing while the keeper's start job runs; once it has
-    /// ended, say how it went unless it left the daemon live; start the daemon, inside the
-    /// sandbox, when the probe finds none live. Nobody waits for the start, so a start that is
-    /// refused is said where the supervisor's own failures go, and the next probe tries again.
+    /// ended, say how it went unless it left the daemon live; then judge whether the shed still
+    /// wants a daemon ([`NxDaemonKeeper::judge`]), stopping one it no longer wants; start the
+    /// daemon, inside the sandbox, when the shed wants one and the probe finds none live. Nobody
+    /// waits for the start, so a start that is refused is said where the supervisor's own
+    /// failures go, and the next probe tries again.
     async fn keep_nx_daemon(&mut self) {
         let Some(keeper) = &mut self.nx_daemon else {
             return;
@@ -3303,6 +3308,8 @@ impl SupervisorActor {
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
         let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
         else {
+            // No Nx to keep: nothing for the supervisor to wait for.
+            keeper.settled = true;
             return;
         };
         let record = crate::capabilities::nx::daemon_record(&project_root);
@@ -3310,6 +3317,11 @@ impl SupervisorActor {
         if let Some(job_id) = ended {
             let job = self.jobs.get(&job_id).map(|job| &job.info);
             super::nx_daemon::report_start(job_id, job, &project_root, daemon);
+        }
+        let working =
+            !self.named_sessions.is_empty() || self.jobs.values().any(|job| !job.terminal());
+        if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
+            return;
         }
         if daemon == Probe::Live {
             return;

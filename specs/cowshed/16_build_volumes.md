@@ -525,6 +525,10 @@ Cowshed never sets `NX_DAEMON=false` for any process, and never withholds the da
   (Land 6.3), so the swap does not end it: the daemon exits within 20 ms of finding no record that names it, and a
   client writing to it then fails with `write EPIPE` (measured). A sandboxed daemon's grant names the previous volume
   alone, so its record is left behind; it exits and its keeper starts the next one on the adopted volume.
+- An idle shed's daemon is stopped, never disabled. Five minutes after a shed was last in use, its keeper stops its
+  daemon and starts none until the shed is in use again (04_sandbox.md), and the next Nx command starts one. What the
+  rule protects is the warm state of a shed in use; a daemon nothing uses is a resident process, its plugin workers and
+  a file watcher recomputing the project graph for every change in a tree nobody builds.
 - **Accepted property**: an Nx client sends its whole environment to the daemon in every message
   (`daemon/client/client.js` `getDaemonEnv`), and the daemon applies it to its own `process.env`
   (`daemon/server/handle-client-env.js`). In a workspace whose daemon runs inside the sandbox, a host client's

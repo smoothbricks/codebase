@@ -172,7 +172,9 @@ values. Validation precedes RPC, job/artifact effects, process allocation, and s
 into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
 - It retires itself after 30 minutes with no named session open and no job running, freeing its warm hosts; the next
-  command starts another. `cowshed detach`/`cowshed rm` retire it before the substrate changes (teardown below).
+  command starts another. A shed's supervisor also waits for its Nx daemon to be gone, which its keeper stops five
+  minutes after the shed was last in use (04_sandbox.md). `cowshed detach`/`cowshed rm` retire it before the substrate
+  changes (teardown below).
 
 ## Protocol
 

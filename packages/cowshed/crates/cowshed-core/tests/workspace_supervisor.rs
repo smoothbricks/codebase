@@ -3119,6 +3119,207 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     std::fs::remove_dir_all(sockets).unwrap();
 }
 
+/// How long a shed must go unused before its keeper stops the daemon it keeps.
+const NX_IDLE: Duration = Duration::from_secs(5 * 60);
+
+/// The daemon a start job leaves, as Nx leaves one: a running process its record names, whose
+/// socket accepts. The process stands in for the daemon and is `sleep`, which a `SIGTERM` ends.
+/// The socket is served, as Nx's daemon serves its own: a listener nobody accepts from refuses
+/// a connection once its backlog holds the keeper's probes, and the keeper would find the daemon
+/// gone.
+struct LiveDaemon {
+    process: std::process::Child,
+    sockets: PathBuf,
+    socket: PathBuf,
+    serving: Option<std::thread::JoinHandle<()>>,
+    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LiveDaemon {
+    fn start(project: &Path) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets = PathBuf::from("/tmp").join(format!(
+            "cs-nxi-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&sockets).unwrap();
+        let socket = sockets.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let closing = std::sync::Arc::new(AtomicBool::new(false));
+        let serving = {
+            let closing = closing.clone();
+            std::thread::spawn(move || {
+                for connection in listener.incoming() {
+                    if closing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    drop(connection);
+                }
+            })
+        };
+        let process = std::process::Command::new("sleep")
+            .arg("3600")
+            .spawn_locked()
+            .unwrap();
+        let record = project.join(".nx/workspace-data/d/server-process.json");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(
+            &record,
+            serde_json::json!({
+                "processId": process.id(),
+                "socketPath": socket,
+                "nxVersion": "23.2.1",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Self {
+            process,
+            sockets,
+            socket,
+            serving: Some(serving),
+            closing,
+        }
+    }
+
+    /// Whether the stand-in still runs: stopping it is what the keeper does to an idle daemon.
+    fn running(&mut self) -> bool {
+        self.process.try_wait().unwrap().is_none()
+    }
+}
+
+impl Drop for LiveDaemon {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        // The serving thread is blocked in `accept`: one connection wakes it to see the flag.
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        if let Some(serving) = self.serving.take() {
+            let _ = serving.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.sockets);
+    }
+}
+
+/// A shed with a live daemon its start job left, and the harness over it.
+async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
+    let (supervisor_config, root) = nx_project(name);
+    let project = supervisor_config.workspace_root.clone();
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let start = h.spawned.recv().await.unwrap();
+    let daemon = LiveDaemon::start(&project);
+    complete(&start, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(start.request.job_id).await.unwrap();
+    (h, daemon, project, root)
+}
+
+/// A daemon costs its host a Node process, its plugin workers and a file watcher that recomputes
+/// the project graph on every change, and Nx's own three-hour idle stop never comes in a tree
+/// that keeps changing. So a shed's keeper stops the daemon it keeps once the shed has gone
+/// unused, starts none while the shed stays unused, and starts one again for the next job.
+#[tokio::test(start_paused = true)]
+async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
+    let (mut h, mut daemon, project, _root) = shed_with_live_nx_daemon("wren").await;
+
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(30)).await;
+    assert!(daemon.running(), "a daemon is kept for the whole interval");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!daemon.running(), "the idle daemon is stopped");
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "an idle shed starts no daemon"
+    );
+
+    let job = h
+        .handle
+        .exec_background(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let ran = h.spawned.recv().await.unwrap();
+    assert_eq!(ran.request.job_id, job);
+    let restart = tokio::time::timeout(NX_PROBES, h.spawned.recv())
+        .await
+        .expect("a shed at work wants its daemon again")
+        .unwrap();
+    let SpawnCommand::Argv(argv) = &restart.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(argv, &nx_daemon_start(&project));
+    assert_eq!(restart.request.mode, RunSandboxMode::ReadWrite);
+
+    complete(&ran, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    complete(&restart, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(restart.request.job_id).await.unwrap();
+}
+
+/// A job in the shed is use for as long as it runs: its own Nx talks to the daemon, which stays
+/// until the shed has been unused for the interval after the job's end.
+#[tokio::test(start_paused = true)]
+async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
+    let (mut h, mut daemon, _project, _root) = shed_with_live_nx_daemon("lark").await;
+
+    let job = h
+        .handle
+        .exec_background(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let ran = h.spawned.recv().await.unwrap();
+    tokio::time::sleep(NX_IDLE * 2).await;
+    assert!(daemon.running(), "a running job keeps the daemon");
+
+    complete(&ran, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(30)).await;
+    assert!(daemon.running(), "the interval starts when the job ends");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+}
+
+/// A host shell's Nx run is no job of the supervisor's, but it holds a task database open while
+/// its tasks run, so a shed whose gate runs from a host shell is not idle.
+#[tokio::test(start_paused = true)]
+async fn a_shed_keeps_its_nx_daemon_while_a_client_holds_a_task_database() {
+    let (_h, mut daemon, project, _root) = shed_with_live_nx_daemon("pika").await;
+
+    let database = project.join(".nx/workspace-data/task-v3.db");
+    std::fs::write(&database, b"").unwrap();
+    let client = std::fs::File::open(&database).unwrap();
+    tokio::time::sleep(NX_IDLE * 2).await;
+    assert!(daemon.running(), "a client at work keeps the daemon");
+
+    // The last look that found the client was up to a look interval before it ended.
+    drop(client);
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(60)).await;
+    assert!(daemon.running(), "the interval starts when the client ends");
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+}
+
+/// A supervisor whose keeper still holds a daemon is not idle, however little else it holds, so
+/// the supervisor never retires over a daemon nobody then watches.
+#[cfg(target_os = "macos")]
+#[tokio::test(start_paused = true)]
+async fn a_shed_supervisor_is_idle_only_once_its_nx_daemon_is_gone() {
+    let (h, mut daemon, _project, _root) = shed_with_live_nx_daemon("tern").await;
+
+    assert!(
+        !h.handle.idle().await.unwrap(),
+        "a live daemon is something to come back for"
+    );
+    tokio::time::sleep(NX_IDLE + Duration::from_secs(60)).await;
+    assert!(!daemon.running());
+    assert!(
+        h.handle.idle().await.unwrap(),
+        "no job, no session and no daemon: nothing is left"
+    );
+}
+
 /// A keeper resolves the checkout's current pointer even when no user job has been
 /// admitted since a land. Restarting the daemon must not reuse the previous job's grant.
 #[tokio::test(start_paused = true)]

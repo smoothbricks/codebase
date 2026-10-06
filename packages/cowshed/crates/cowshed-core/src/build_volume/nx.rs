@@ -141,21 +141,11 @@ pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), B
 
 /// [`close`] for one `workspace-data` directory, wherever it lives: in a build volume, or in a
 /// checkout that links none. A directory that does not exist holds nothing.
-#[cfg(target_os = "macos")]
 pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
     let daemon = live_daemon(data);
     let databases = task_databases_in(data)?;
-    for database in &databases {
-        let holders: Vec<Holder> = holders(database)?
-            .into_iter()
-            .filter(|holder| Some(holder.pid) != daemon)
-            .collect();
-        if !holders.is_empty() {
-            return Ok(Err(Busy::Held {
-                database: database.clone(),
-                holders,
-            }));
-        }
+    if let Some(busy) = first_held(&databases, daemon)? {
+        return Ok(Err(busy));
     }
     if let Some(pid) = daemon
         && !stop_daemon(pid)?
@@ -167,16 +157,32 @@ pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
             },
         }));
     }
-    for database in &databases {
-        let holders = holders(database)?;
+    Ok(first_held(&databases, None)?.map_or(Ok(()), Err))
+}
+
+/// Whether a process other than the live daemon of the `workspace-data` directory `data` holds
+/// one of its task databases open, as [`close_workspace_data`] first asks: an Nx client at work,
+/// which a host shell is as much as a job. Nothing is stopped. Nx's graph and hash passes open
+/// no database, so this is the signal of a run's tasks, not of every client.
+pub fn in_use(data: &Path) -> io::Result<Option<Busy>> {
+    first_held(&task_databases_in(data)?, live_daemon(data))
+}
+
+/// The first of `databases` that a process other than `daemon` holds open, with its holders.
+fn first_held(databases: &[PathBuf], daemon: Option<i32>) -> io::Result<Option<Busy>> {
+    for database in databases {
+        let holders: Vec<Holder> = holders(database)?
+            .into_iter()
+            .filter(|holder| Some(holder.pid) != daemon)
+            .collect();
         if !holders.is_empty() {
-            return Ok(Err(Busy::Held {
+            return Ok(Some(Busy::Held {
                 database: database.clone(),
                 holders,
             }));
         }
     }
-    Ok(Ok(()))
+    Ok(None)
 }
 
 /// Whether any process holds one of the volume's task databases open, without stopping
@@ -288,7 +294,6 @@ fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// The pid of the daemon `workspace-data`'s record names, when that daemon is live, from the one
 /// read of the record that verified it: its process runs and its socket accepts a connection.
-#[cfg(target_os = "macos")]
 fn live_daemon(data: &Path) -> Option<i32> {
     crate::runtime::nx_daemon::live_pid(&data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD))
 }
@@ -370,6 +375,118 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
             }
         }
     }
+}
+
+/// [`stop_daemon`] through a pidfd: opened before the signal, so an exit between the two is never
+/// missed, and the signal goes through the descriptor, so it can only ever reach the process the
+/// descriptor was opened on, never another that reuses the pid.
+#[cfg(target_os = "linux")]
+fn stop_daemon(pid: i32) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if opened < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            _ => Err(error),
+        };
+    }
+    let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
+    // SAFETY: `descriptor` is a fresh descriptor this function alone owns.
+    let process = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    // SAFETY: a pidfd, SIGTERM, no siginfo and no flags: the call reads nothing else.
+    let signalled = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if signalled != 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            _ => Err(error),
+        };
+    }
+    let mut poll = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::c_int::try_from(DAEMON_EXIT_GRACE.as_millis()).map_err(io::Error::other)?;
+    loop {
+        // SAFETY: `poll` describes one live descriptor this function owns.
+        match unsafe { libc::poll(&mut poll, 1, timeout) } {
+            1 => return Ok(true),
+            0 => return Ok(false),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Every process that has `path` open, from procfs: each `/proc/<pid>/fd` link that names the
+/// file. A process of another user, or one that exited since the listing, shows none.
+#[cfg(target_os = "linux")]
+pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
+    let file = match fs::canonicalize(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut holders = Vec::new();
+    for process in fs::read_dir("/proc")? {
+        let process = process?;
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        if descriptors
+            .flatten()
+            .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(|link| link == file))
+        {
+            holders.push(Holder {
+                pid,
+                command: command_line(pid),
+            });
+        }
+    }
+    Ok(holders)
+}
+
+/// `pid`'s argument vector joined by spaces, or its executable path, or a placeholder naming that
+/// neither could be read.
+#[cfg(target_os = "linux")]
+fn command_line(pid: libc::pid_t) -> String {
+    if let Ok(arguments) = fs::read(format!("/proc/{pid}/cmdline")) {
+        let command = arguments
+            .split(|&byte| byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !command.is_empty() {
+            return command;
+        }
+    }
+    fs::read_link(format!("/proc/{pid}/exe")).map_or_else(
+        |_| "command unreadable".to_owned(),
+        |executable| executable.display().to_string(),
+    )
 }
 
 /// Every process that has `path` open: one open-file query (`proc_listpidspath`), the kernel's

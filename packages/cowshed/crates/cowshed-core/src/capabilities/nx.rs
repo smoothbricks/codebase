@@ -133,6 +133,13 @@ pub(crate) fn daemon_record(project_root: &Path) -> PathBuf {
         .join(DAEMON_RECORD_FILE)
 }
 
+/// The `workspace-data` directory of the Nx project at `project_root`, which holds its task
+/// databases and its daemon's rendezvous directory: the checkout's own, which every boundary of
+/// the checkout shares.
+pub(crate) fn workspace_data(project_root: &Path) -> PathBuf {
+    project_root.join(STATE).join("workspace-data")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

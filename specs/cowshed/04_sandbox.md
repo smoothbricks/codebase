@@ -815,6 +815,22 @@ repository shell that exports either directory unconditionally replaces the chec
 state again; a repository shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or
 leaves them unset.
 
+A kept daemon costs its host a resident Node process, about six plugin workers and a file watcher that recomputes the
+project graph on every change in the tree, per shed. Nx stops a daemon after three hours without a request or a file
+event (pinned Nx 23.2.1, `daemon/server/shutdown-utils.js`), a constant no setting changes, and every file event of the
+tree restarts it, so a tree that keeps changing never reaches it. The keeper therefore also ends the daemon. A shed is
+in use while its supervisor runs a job or holds a named session, while a process other than the daemon holds one of the
+checkout's Nx task databases open (a host shell's run: Nx's client opens the database for the tasks of a run, and its
+graph and hash passes open none, so a probe sees a run's tasks, not every client), and for five minutes after a daemon
+comes up. Once a shed has been out of use for five minutes the keeper stops the daemon as `nx daemon --stop` does (a
+SIGTERM to the pid its record names, taken from the read that verified it live; its plugin workers go with it), says so
+on its stderr, and starts none until the shed is in use again: a job, a session, a task database held, or a daemon
+someone else started, which the keeper then stops after five more minutes of disuse. A supervisor retires only once its
+keeper holds no daemon (11_shell.md), so no daemon outlives the supervisor that watched it. The price is one Nx's own
+idle stop has: the first host client after a shed went idle finds no daemon and starts one of its own, outside the
+sandbox, until the keeper stops that one too. A daemon is stopped, never disabled: the next Nx command starts one
+(16_build_volumes.md, "The Nx daemon stays on").
+
 A known, accepted property: a host client that connects to a workspace's daemon sends it the client's environment, as
 every Nx client does with its first message (`getDaemonEnv`, pinned Nx 23.2.1 `daemon/client/daemon-environment.js`).
 The daemon applies that environment to its own process environment, which the workspace's project-graph plugins run
