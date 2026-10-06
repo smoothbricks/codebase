@@ -438,7 +438,7 @@ pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
 /// Add `u+rwx` to each directory beneath (and including) `root` that this user owns, top-down so
 /// each one is searchable before its children are visited. A directory another user owns is not
 /// descended into. An entry gone mid-walk was removed by someone else and is skipped.
-fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
+pub(crate) fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     // SAFETY: geteuid has no preconditions and reads no caller-owned memory.

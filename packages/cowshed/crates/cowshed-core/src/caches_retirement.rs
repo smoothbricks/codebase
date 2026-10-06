@@ -827,6 +827,9 @@ struct Totals {
 /// Move every entry the host lacks into it and drop every entry it already holds, recursing
 /// where both hold a directory.
 fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
+    // WHY: tools seal their caches (Go's module cache extracts every directory 0555), so the
+    // volume-side tree must be writable by its owner before entries can leave it.
+    crate::fsio::grant_owner_directory_access(from)?;
     let mut names = Vec::new();
     for entry in fs::read_dir(from)? {
         names.push(entry?.file_name());
@@ -842,8 +845,17 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
         match fs::symlink_metadata(&destination) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let bytes = tree_bytes(&source)?;
-                move_directory(&source, &destination, false)?;
-                totals.moved += bytes;
+                match move_directory(&source, &destination, false) {
+                    Ok(()) => totals.moved += bytes,
+                    // A sealed host directory refuses new entries. Every cache that moves here
+                    // is content its tool fetches or rebuilds on a miss, so the volume copy is
+                    // dropped rather than unsealing the host tool's own cache.
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                        totals.dropped += bytes;
+                        remove_tree(&source)?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) => return Err(error),
             Ok(destination_metadata)
@@ -889,7 +901,7 @@ fn move_directory(from: &Path, to: &Path, replace_link: bool) -> io::Result<()> 
 
 fn remove_tree(path: &Path) -> io::Result<()> {
     let result = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(metadata) if metadata.is_dir() => crate::fsio::remove_owned_tree(path),
         Ok(_) => fs::remove_file(path),
         Err(error) => Err(error),
     };
