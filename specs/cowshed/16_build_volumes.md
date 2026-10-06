@@ -303,6 +303,11 @@ lane base, a stack base).
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
    (rule "One Nx state per checkout").
 
+Steps 2 and 3 up to the attach run beside step 1's attach of the cloned image, under the same lock: every attach waits
+in the host's one `storagekitd` queue (01_storage.md "How the APFS host degrades"), and the two in flight together wait
+in it once. The new workspace's own seed is cloned, and its link written, only once its checkout is staged; a clone that
+never stages releases the volume made for it.
+
 The fork is warm for everything the target's volume held when the seed was last frozen: at the latest land, or at the
 latest reseed, which is this fork's own step 2 unless the target's volume had a writer. If the target's tree has moved
 past its seed's (a land skipped its swap, below), the fork builds the difference incrementally, as an edit would.
