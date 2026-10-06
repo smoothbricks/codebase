@@ -49,6 +49,11 @@ export interface MonorepoContext {
    * everything is validated and everything is built.
    */
   projects?: readonly string[];
+  /**
+   * Reads the resolved Nx project graph the post-build packs check. Absent,
+   * Nx resolves it (`readProjectTargets`).
+   */
+  readProjectTargets?: (root: string) => Promise<ProjectTargets[]>;
 }
 
 export interface ValidatePackOptions {
@@ -148,7 +153,7 @@ const packs: MonorepoPack[] = [
     // Post-build: the toolchain identity is read off the RESOLVED graph, which
     // means running the inference plugin, which means its dist has to exist.
     async validatePostBuild(ctx) {
-      return validateCargoToolchainInputs(ctx.root, await readProjectTargets(ctx.root));
+      return validateCargoToolchainInputs(ctx.root, await (ctx.readProjectTargets ?? readProjectTargets)(ctx.root));
     },
   },
   {
@@ -483,7 +488,7 @@ export function resolvedTargetsByProject(projects: ProjectTargets[]): Map<string
 }
 
 async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ResolvedProjectTargets>> {
-  return resolvedTargetsByProject(await readProjectTargets(ctx.root));
+  return resolvedTargetsByProject(await (ctx.readProjectTargets ?? readProjectTargets)(ctx.root));
 }
 
 function ensureLocalSmooShim(root: string): void {

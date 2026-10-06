@@ -237,15 +237,19 @@ describe('monorepo validation pack phases', () => {
         throw new Error('cargo validation pack not found');
       }
       const runBuild = () => 0;
+      // The fixture declares no Nx project, so the graph the post-build packs read is empty.
+      const ctx = { root, syncRuntime: false, readProjectTargets: async () => [] };
 
       // A policy nothing calls is not a policy: validate must reach it.
-      expect(
-        await runValidatePacks({ root, syncRuntime: false }, { failFast: true }, { packs: [cargoPack], runBuild }),
-      ).toEqual({ failures: 1, failedChecks: 1 });
+      expect(await runValidatePacks(ctx, { failFast: true }, { packs: [cargoPack], runBuild })).toEqual({
+        failures: 1,
+        failedChecks: 1,
+      });
 
-      expect(
-        await runValidatePacks({ root, syncRuntime: false }, { fix: true }, { packs: [cargoPack], runBuild }),
-      ).toEqual({ failures: 0, failedChecks: 0 });
+      expect(await runValidatePacks(ctx, { fix: true }, { packs: [cargoPack], runBuild })).toEqual({
+        failures: 0,
+        failedChecks: 0,
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
