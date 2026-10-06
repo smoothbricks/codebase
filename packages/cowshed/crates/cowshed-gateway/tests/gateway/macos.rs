@@ -1379,6 +1379,121 @@ async fn native_registry_requests_use_one_admitted_proxy_path_and_cache() {
     assert_eq!(hit, 2);
 }
 
+/// A client holding the registry's manifest revalidates it with the ETag it stored, weak when the
+/// registry compressed it for that client. The gateway answers `304` itself, from the fill it just
+/// published and then from its cache, and never forwards the validator: the registry would answer
+/// the validator with a `304` the gateway has no body for. Hyper never polls a `304`'s empty body,
+/// so each answer must still be audited as completed, not as a dropped response.
+#[tokio::test]
+async fn a_conditional_registry_request_is_answered_304_by_the_gateway_and_audited_completed() {
+    let registry = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind registry fixture");
+    let upstream_port = registry.local_addr().expect("registry address").port();
+    // One connection: everything after the fill is served from the cache.
+    let registry = tokio::spawn(async move {
+        let (mut stream, _) = registry.accept().await.expect("accept registry request");
+        let request = read_headers(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nETag: \"v1\"\r\nCache-Control: public, max-age=300\r\nConnection: close\r\n\r\nok",
+            )
+            .await
+            .expect("write registry response");
+        request
+    });
+    let (audit_tx, mut audit_rx) = mpsc::channel(32);
+    let endpoint = free_endpoint();
+    let (config, _cache) = test_config();
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: vec![grant("mirror.test", upstream_port)],
+        mirrors: vec![
+            MirrorRoute::new(
+                &format!("https://mirror.test:{upstream_port}"),
+                vec!["/allowed".to_owned()],
+                false,
+            )
+            .expect("registry route"),
+        ],
+    };
+    let (installed, token, _) = session(
+        "conditional",
+        "owner/repo-conditional",
+        block_endpoint(endpoint),
+        9,
+        1,
+        policy,
+    );
+    let endpoint = install_in_free_block(&gateway.handle(), installed).await;
+    let conditional = |validator: &str| {
+        format!(
+            "GET https://mirror.test:{upstream_port}/allowed HTTP/1.1\r\nHost: mirror.test:{upstream_port}\r\nAccept: application/vnd.npm.install-v1+json\r\nIf-None-Match: {validator}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    for validator in ["W/\"v1\"", "\"v1\""] {
+        let response = proxy_request(endpoint, conditional(validator)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 304"),
+            "{validator}: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("etag: \"v1\""),
+            "{validator}: {response}"
+        );
+        assert!(response.ends_with("\r\n\r\n"), "{validator}: {response}");
+    }
+    let changed = proxy_request(endpoint, conditional("W/\"v0\"")).await;
+    assert!(changed.starts_with("HTTP/1.1 200"), "{changed}");
+    assert!(changed.ends_with("\r\n\r\nok"), "{changed}");
+
+    let forwarded = registry
+        .await
+        .expect("registry fixture")
+        .to_ascii_lowercase();
+    assert!(
+        !forwarded.contains("if-none-match"),
+        "the client's validator reached the registry: {forwarded}"
+    );
+    gateway.drain().await.expect("drain gateway");
+    let mut answers = Vec::new();
+    while let Ok(event) = audit_rx.try_recv() {
+        if event.kind == AuditKind::Npm {
+            answers.push((event.status, event.http_status, event.mirror_cache_status));
+        }
+    }
+    assert_eq!(
+        answers,
+        [
+            (
+                AuditStatus::Completed,
+                Some(304),
+                Some(MirrorCacheStatus::Filled)
+            ),
+            (
+                AuditStatus::Completed,
+                Some(304),
+                Some(MirrorCacheStatus::Hit)
+            ),
+            (
+                AuditStatus::Completed,
+                Some(200),
+                Some(MirrorCacheStatus::Hit)
+            ),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_mismatch() {
     use sha2::{Digest as _, Sha512};

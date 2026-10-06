@@ -2821,7 +2821,7 @@ impl ProxyBody {
         idle: Duration,
         total_deadline: Instant,
     ) -> Self {
-        Self {
+        let mut body = Self {
             inner,
             completion: Some(completion),
             request_timeout,
@@ -2829,7 +2829,15 @@ impl ProxyBody {
             idle: tokio::time::sleep(idle),
             idle_duration: idle,
             total: tokio::time::sleep_until(total_deadline),
+        };
+        // A body already at its end (a 304, a HEAD answer, an empty object) is never polled: hyper
+        // writes the head and stops, so the request completes here, not on a poll that never comes.
+        if body.inner.is_end_stream()
+            && let Some(mut completion) = body.completion.take()
+        {
+            completion.send(AuditStatus::Completed, None, 0);
         }
+        body
     }
 
     fn boxed(inner: BoxBody<Bytes, BoxError>) -> Self {
