@@ -1,10 +1,10 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
@@ -344,98 +344,32 @@ it('hashes a Cargo workspace that lives inside a directory its enclosing reposit
 });
 
 it.each(['helper', 'cli'])(
-  'include-workspace keeps a custom Nx cached Cargo consumer fresh via %s',
+  'include-workspace gives a custom Nx cached Cargo consumer a runtime input that follows transitive edits via %s',
   async (mode) => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-nx-')));
-    const repositoryRoot = join(import.meta.dir, '../../..');
+    const root = await mkdtemp(join(tmpdir(), 'cargo-hash-consumer-'));
     const dist = join(import.meta.dir, '../dist');
     try {
-      const { workspace, leafSource } = await workspaceCargoFixture(root);
-      execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-      await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-      await writeFile(join(workspace, '.gitignore'), 'node_modules/\ntarget/\ndist/\n.nx/\n');
-      await writeFile(join(workspace, 'package.json'), '{"name":"cargo-consumer-fixture","private":true}\n');
+      const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
       const hashProgram =
         `import { hashCargoPathInputs } from ${JSON.stringify(join(dist, 'cargo-source-hash.js'))}; ` +
         'console.log(await hashCargoPathInputs("Cargo.toml", process.cwd(), { includeWorkspace: true }));';
-      await writeFile(
-        join(workspace, 'nx.json'),
-        JSON.stringify({
-          namedInputs: {
-            cargoSources: [
-              '{workspaceRoot}/Cargo.lock',
-              {
-                runtime:
-                  mode === 'helper'
-                    ? `bun -e '${hashProgram}'`
-                    : `bun ${JSON.stringify(join(dist, 'bin/smoo-nx-cargo-hash.js'))} --include-workspace`,
-              },
-            ],
-          },
-        }),
-      );
-      await writeFile(
-        join(workspace, 'packages/app/project.json'),
-        JSON.stringify({
-          name: 'app',
-          targets: {
-            build: {
-              executor: 'nx:run-commands',
-              cache: true,
-              inputs: ['{projectRoot}/**/*', '!{projectRoot}/dist/**/*', 'cargoSources'],
-              outputs: ['{projectRoot}/dist'],
-              options: { command: 'bun packages/app/build.ts' },
-            },
-          },
-        }),
-      );
-      const executions = join(root, 'executions.log');
-      const outputDirectory = join(workspace, 'packages/app/dist');
-      const output = join(outputDirectory, 'result.txt');
-      await writeFile(
-        join(workspace, 'packages/app/build.ts'),
-        `import { execFileSync } from 'node:child_process';
-import { appendFile, mkdir, writeFile } from 'node:fs/promises';
-const result = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '--manifest-path', 'packages/app/Cargo.toml'], { encoding: 'utf8' });
-await mkdir(${JSON.stringify(outputDirectory)}, { recursive: true });
-await writeFile(${JSON.stringify(output)}, result);
-await appendFile(${JSON.stringify(executions)}, result);
-`,
-      );
-      const run = async () => {
-        const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:build'], {
-          cwd: workspace,
-          env: fixtureNxEnv(workspace),
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const [exitCode, stdout, stderr] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ]);
-        expect(exitCode, stdout + stderr).toBe(0);
-      };
+      // What a consumer's nx.json names as a `runtime` input; Nx keys the task on its stdout.
+      const runtime =
+        mode === 'helper'
+          ? `bun -e '${hashProgram}'`
+          : `bun ${JSON.stringify(join(dist, 'bin/smoo-nx-cargo-hash.js'))} --include-workspace`;
 
-      await run();
-      expect(await readFile(output, 'utf8')).toBe('11\n');
-      expect(await readFile(executions, 'utf8')).toBe('11\n');
-      await rm(outputDirectory, { recursive: true });
-      await run();
-      expect(await readFile(output, 'utf8')).toBe('11\n');
-      expect(await readFile(executions, 'utf8')).toBe('11\n');
+      const initial = await runtimeInputValue(runtime, workspace);
+      expect(initial).toBe(`${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`);
+      expect(await runtimeInputValue(runtime, workspace)).toBe(initial);
 
+      // Reached from the consumer only through bridge.
       await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
-      await run();
-      expect(await readFile(output, 'utf8')).toBe('12\n');
-      expect(await readFile(executions, 'utf8')).toBe('11\n12\n');
-      await rm(outputDirectory, { recursive: true });
-      await run();
-      expect(await readFile(output, 'utf8')).toBe('12\n');
-      expect(await readFile(executions, 'utf8')).toBe('11\n12\n');
+      const edited = await runtimeInputValue(runtime, workspace);
+      expect(edited).not.toBe(initial);
+      expect(edited).toBe(`${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   },
-  120_000,
 );

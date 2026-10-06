@@ -651,6 +651,13 @@ lives in another project) may use any `cwd`.
 
 ## Test Fixtures That Run Nx
 
+Most tests never start Nx. Plugin behaviour is the value `createNodesV2` returns, so a test asserts on that value, and
+where it needs Nx's verdict on it, it calls the Nx function that gives the verdict, in process: `createTaskGraph` for
+the order a run-many runs tasks in, `getOutputsForTargetAndConfiguration` for what a cache hit restores,
+`globWithWorkspaceContextSync` for the files a fileset input hashes, and a `runtime` input's command under `sh -c` from
+the workspace root for the value Nx keys on. A test starts `nx` only when that process is the subject: the daemon client
+and its socket, daemon-hosted plugin workers, task history, a hunk of the repository's Nx patch, and fixture teardown.
+
 A test that runs real Nx in a temp workspace runs it daemonless unless the daemon is the behaviour under test: a
 daemonless Nx leaves nothing running once it exits. A daemon a fixture does start works in the fixture root, idling and
 watching files until something stops it, so `@smoothbricks/nx-plugin/testing` (used by this package's and the CLI's

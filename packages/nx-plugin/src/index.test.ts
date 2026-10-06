@@ -4,12 +4,20 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import type {
+  CreateNodesContextV2,
+  CreateNodesV2,
+  ProjectGraph,
+  ProjectGraphProjectNode,
+  TargetConfiguration,
+} from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
+import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
+import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -26,157 +34,46 @@ const inferTargets: typeof rawInferTargets = async (files, options, context) => 
 };
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
-  it('runs Rust-only lint without ESLint and checks JavaScript when sources appear', async () => {
-    const workspace = await createNxWorkspace();
-    const root = workspace.context.workspaceRoot;
-    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+  it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
+    const workspace = await createWorkspace();
+    // The emitter keys on one input outside its project, as a transform or toolchain does. The
+    // aggregate hashes only the project, so a toolchain change moves the emitter's key and not the
+    // aggregate's: the aggregate replays from cache right after the emitter reran.
+    const emit: TargetConfiguration = {
+      executor: 'nx:run-commands',
+      cache: true,
+      inputs: ['{projectRoot}/source.txt', '{workspaceRoot}/toolchain.txt'],
+      outputs: ['{projectRoot}/dist'],
+      options: { command: 'mkdir -p dist && cat source.txt ../../toolchain.txt > dist/app.js', cwd: '{projectRoot}' },
+    };
+    const declared = { 'emit-js': emit };
     try {
-      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
-      await workspace.write('package.json', '{"name":"lint-workspace","private":true,"workspaces":["packages/*"]}\n');
-      await workspace.write(
-        'nx.json',
-        JSON.stringify({
-          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
-          namedInputs: { default: ['{projectRoot}/**/*'] },
-          targetDefaults: { lint: { cache: true } },
-        }),
-      );
-      await workspace.write(
-        'biome.json',
-        '{"formatter":{"enabled":false},"linter":{"rules":{"suspicious":{"noDebugger":"off"}}}}\n',
-      );
-      await workspace.write(
-        'eslint.config.mjs',
-        'export default [{ files: ["**/*.{js,ts}"], rules: { "no-debugger": "error" } }];\n',
-      );
-      await workspace.write('Cargo.toml', '[workspace]\nmembers = ["packages/rust"]\nresolver = "2"\n');
-      await workspace.write('Cargo.lock', 'version = 4\n\n[[package]]\nname = "lint-crate"\nversion = "0.1.0"\n');
-      await workspace.write('packages/rust/package.json', '{"name":"rust-fixture"}\n');
-      await workspace.write(
-        'packages/rust/Cargo.toml',
-        '[package]\nname = "lint-crate"\nversion = "0.1.0"\nedition = "2021"\n',
-      );
-      await workspace.write('packages/rust/src/lib.rs', 'pub fn answer() -> u32 {\n    42\n}\n');
-      const runLint = async () => {
-        const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'rust-fixture:lint'], {
-          cwd: root,
-          env: {
-            ...fixtureNxEnv(root),
-            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-            RUSTC_WRAPPER: '',
-            RUSTC_WORKSPACE_WRAPPER: '',
-          },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const [exitCode, stdout, stderr] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ]);
-        return { exitCode, output: stdout + stderr };
-      };
-      const rustOnly = await runLint();
-      expect(rustOnly).toMatchObject({ exitCode: 0 });
-      expect(rustOnly.output).toContain('cargo-lint');
-      await workspace.write('packages/rust/src/check.js', 'debugger;\n');
-      const withJavaScript = await runLint();
-      expect(withJavaScript.exitCode).not.toBe(0);
-      expect(withJavaScript.output).toContain('no-debugger');
-      await workspace.write(
-        'packages/rust/package.json',
-        JSON.stringify({
-          name: 'rust-fixture',
-          nx: { targets: { lint: { executor: 'nx:run-commands', options: { command: 'printf explicit-lint' } } } },
-        }),
-      );
-      const overridden = await runLint();
-      expect(overridden).toMatchObject({ exitCode: 0 });
-      expect(overridden.output).toContain('explicit-lint');
-    } finally {
-      await workspace.cleanup();
-    }
-  }, 120_000);
-
-  it('never restores a stale child artifact from the cached build aggregate', async () => {
-    const workspace = await createNxWorkspace();
-    const root = workspace.context.workspaceRoot;
-    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
-    try {
-      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
-      await workspace.write(
-        'package.json',
-        '{"name":"aggregate-workspace","private":true,"workspaces":["packages/*"]}\n',
-      );
-      await workspace.write(
-        'nx.json',
-        JSON.stringify({
-          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
-          namedInputs: { default: ['{projectRoot}/**/*'] },
-        }),
-      );
-      // Emitted artifacts are not sources, so the aggregate's own inputs never see them.
-      await workspace.write('.gitignore', 'dist\n.nx\nnode_modules\n');
-      await workspace.write('toolchain.txt', 'toolchain-1\n');
-      await workspace.write('packages/app/source.txt', 'source\n');
-      // The emitter keys on one input outside its project, as a transform or
-      // toolchain does. The inferred `build` aggregate hashes only the project,
-      // so a toolchain change moves the emitter's key and not the aggregate's.
       await workspace.write(
         'packages/app/package.json',
-        JSON.stringify({
-          name: 'app',
-          private: true,
-          nx: {
-            targets: {
-              'emit-js': {
-                executor: 'nx:run-commands',
-                cache: true,
-                inputs: ['{projectRoot}/source.txt', '{workspaceRoot}/toolchain.txt'],
-                outputs: ['{projectRoot}/dist'],
-                options: {
-                  command: 'mkdir -p dist && cat source.txt ../../toolchain.txt > dist/app.js',
-                  cwd: '{projectRoot}',
-                },
-              },
-            },
-          },
-        }),
+        JSON.stringify({ name: 'app', private: true, nx: { targets: declared } }),
       );
-      const build = async () => {
-        const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:build'], {
-          cwd: root,
-          env: {
-            ...fixtureNxEnv(root),
-            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-          },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const [exitCode, stdout, stderr] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ]);
-        return { exitCode, output: stdout + stderr };
+      const targets = await inferProjectTargets(workspace, 'packages/app/package.json');
+      const build = resolveDeclaredOverInferred(targets, declared, 'build');
+      expect(build?.dependsOn).toContain('emit-js');
+      expect(build?.cache).toBe(true);
+      if (build === undefined) throw new Error('app infers no build aggregate over emit-js');
+
+      // A replay restores exactly what Nx resolves as the task's outputs. Left without `outputs`, a
+      // `build` target gets Nx's legacy defaults, `{projectRoot}/dist` among them, and the replay
+      // puts back the dist the emitter wrote on the run that last produced the aggregate's key.
+      const app: ProjectGraphProjectNode = {
+        name: 'app',
+        type: 'lib',
+        data: { root: 'packages/app', targets: { build, 'emit-js': emit } },
       };
-      const artifact = () => readFile(join(root, 'packages/app/dist/app.js'), 'utf8');
-
-      const first = await build();
-      expect(first.exitCode, first.output).toBe(0);
-      expect(await artifact()).toBe('source\ntoolchain-1\n');
-
-      await workspace.write('toolchain.txt', 'toolchain-2\n');
-      const second = await build();
-      expect(second.exitCode, second.output).toBe(0);
-      // The emitter reran on its new key. The aggregate's key did not move, so
-      // it replays from cache — and a replay must not put back the dist it
-      // would have claimed on the first run.
-      expect(await artifact(), second.output).toBe('source\ntoolchain-2\n');
+      expect(getOutputsForTargetAndConfiguration({ project: 'app', target: 'build' }, {}, app)).toEqual([]);
+      expect(getOutputsForTargetAndConfiguration({ project: 'app', target: 'emit-js' }, {}, app)).toEqual([
+        'packages/app/dist',
+      ]);
     } finally {
       await workspace.cleanup();
     }
-  }, 120_000);
+  });
 
   it('names standalone package projects from package metadata', async () => {
     const workspace = await createWorkspace();
@@ -1021,11 +918,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write(`${root}/package.json`, '{"name":"ferris"}\n');
       await workspace.write(`${root}/Cargo.toml`, '[workspace]\nmembers = ["crates/core"]\n');
       await workspace.write(`${root}/crates/core/Cargo.toml`, '[package]\nname = "ferris-core"\n');
+      const biome = `biome check --files-ignore-unknown=true '${root}'`;
       const rust = await inferProjectTargets(workspace, `${root}/package.json`);
       const rustLint = resolveLint(rust);
       expect(rustLint.executor).toBe('nx:run-commands');
       expect(rustLint.dependsOn).toEqual(['cargo-lint']);
-      expect(rustLint.options?.commands).toEqual([`biome check --files-ignore-unknown=true '${root}'`]);
+      expect(rustLint.options?.commands).toEqual([biome]);
+
+      // A JavaScript source joins ESLint's file list the moment it appears, with no tsconfig to announce it.
+      await workspace.write(`${root}/src/check.js`, 'debugger;\n');
+      const withJavaScript = resolveLint(await inferProjectTargets(workspace, `${root}/package.json`));
+      expect(withJavaScript.dependsOn).toEqual(['cargo-lint']);
+      expect(withJavaScript.options?.commands).toEqual([biome, `eslint '${root}/src/check.js'`]);
 
       const custom = { executor: 'nx:run-commands', options: { command: 'custom-linter package.json' } };
       await workspace.write(
@@ -1040,8 +944,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write(`${root}/src/index.ts`, 'export const value = 1;\n');
       const mixed = await inferProjectTargets(workspace, `${root}/package.json`);
       expect(resolveLint(mixed).options?.commands).toEqual([
-        `biome check --files-ignore-unknown=true '${root}'`,
-        `eslint '${root}/src/index.ts'`,
+        biome,
+        `eslint '${root}/src/check.js' '${root}/src/index.ts'`,
       ]);
       expectNoSchedulerThrottle(mixed);
     } finally {
@@ -2390,80 +2294,40 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   });
 
   it('orders a three-project chain of INFERRED deploys through one run-many', async () => {
-    const workspace = await createNxWorkspace();
-    const root = workspace.context.workspaceRoot;
-    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+    const workspace = await createWorkspace();
+    // c is deepest: a's deploy calls into b's, b's calls into c's. No project declares a deploy
+    // target — each only has a wrangler manifest and, where it needs ordering, the edge. Nothing
+    // here says "round one" or "round two", and no project knows the depth.
+    const chain: Record<string, string[]> = { a: ['b:deploy'], b: ['c:deploy'], c: [] };
     try {
-      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
-      await workspace.write('package.json', '{"name":"chain-workspace","private":true,"workspaces":["packages/*"]}\n');
-      await workspace.write(
-        'nx.json',
-        JSON.stringify({
-          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
-          namedInputs: { default: ['{projectRoot}/**/*'] },
-        }),
-      );
-      // c is deepest: a's deploy calls into b's, b's calls into c's. No project declares a
-      // deploy target — each only has a wrangler manifest and, where it needs ordering, the
-      // edge. Nothing here says "round one" or "round two", and no project knows the depth.
-      const chain: Record<string, string[]> = { a: ['b:deploy'], b: ['c:deploy'], c: [] };
-      for (const [name, dependsOn] of Object.entries(chain)) {
+      const nodes: Record<string, ProjectGraphProjectNode> = {};
+      for (const [name, edges] of Object.entries(chain)) {
+        const declared: Record<string, TargetConfiguration> =
+          edges.length > 0 ? { deploy: { dependsOn: ['...', ...edges] } } : {};
         await workspace.write(`packages/${name}/wrangler.toml`, `name = "${name}"\n`);
         await workspace.write(
           `packages/${name}/package.json`,
-          JSON.stringify({
-            name,
-            private: true,
-            nx: {
-              targets: {
-                deploy: {
-                  ...(dependsOn.length > 0 ? { dependsOn: ['...', ...dependsOn] } : {}),
-                  // The real inferred command deploys to Cloudflare. Only `command` is
-                  // overridden, so this still proves the rest of the inferred target — the
-                  // executor that runs it, and the edges — is what carries the run.
-                  options: {
-                    command: `printf '%s\\n' ${name} >> ${join(root, 'deploy-order.txt')}`,
-                    forwardAllArgs: false,
-                  },
-                },
-              },
-            },
-          }),
+          JSON.stringify({ name, private: true, nx: { targets: declared } }),
         );
+        const targets = await inferProjectTargets(workspace, `packages/${name}/package.json`);
+        const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
+        // The edge rides on the inferred target: its executor and command still carry the run.
+        expect(deploy?.executor).toBe('nx:run-commands');
+        expect(deploy?.options?.command).toBe('smoo wrangler deploy-stage --stage {args.stage}');
+        if (deploy === undefined) throw new Error(`${name} infers no deploy`);
+        nodes[name] = { name, type: 'app', data: { root: `packages/${name}`, targets: { ...targets, deploy } } };
       }
-      const child = Bun.spawn(
-        [
-          'bun',
-          join(repositoryRoot, 'node_modules/.bin/nx'),
-          'run-many',
-          '-t',
-          'deploy',
-          '--projects=a,b,c',
-          '--parallel=3',
-          '--stage=staging',
-        ],
-        {
-          cwd: root,
-          env: {
-            ...fixtureNxEnv(root),
-            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-          },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        },
-      );
-      const [exitCode, stdout, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-      ]);
-      expect({ exitCode, output: stdout + stderr }).toMatchObject({ exitCode: 0 });
-      const order = (await readFile(join(root, 'deploy-order.txt'), 'utf8')).trim().split('\n');
-      expect(order).toEqual(['c', 'b', 'a']);
+      const graph: ProjectGraph = { nodes, dependencies: { a: [], b: [], c: [] } };
+
+      // The task graph `nx run-many -t deploy --projects=a,b,c` runs: Nx starts a task only once
+      // every task it depends on has finished, so this is the order.
+      const tasks = createTaskGraph(graph, {}, ['a', 'b', 'c'], ['deploy'], undefined, { stage: 'staging' });
+      expect(tasks.dependencies).toEqual({ 'a:deploy': ['b:deploy'], 'b:deploy': ['c:deploy'], 'c:deploy': [] });
+      expect(tasks.roots).toEqual(['c:deploy']);
     } finally {
       await workspace.cleanup();
     }
-  }, 120_000);
+  });
 
   it('archives a declared foreign triple beside the host archive, and runs it without building', async () => {
     const workspace = await createWorkspace();
@@ -2613,19 +2477,6 @@ async function createWorkspace(parent = tmpdir()): Promise<WorkspaceFixture> {
   };
 }
 
-/**
- * A workspace that runs real Nx, daemonless (`fixtureNxEnv`), so nothing runs
- * in it once that Nx exits. It gets its own Git boundary, as every other
- * fixture here that runs Nx does, so no enclosing checkout's ignore rules
- * decide which of its files Nx sees.
- */
-async function createNxWorkspace(): Promise<WorkspaceFixture> {
-  const workspace = await createWorkspace();
-  const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace.context.workspaceRoot]);
-  expect(initialized.exitCode).toBe(0);
-  return workspace;
-}
-
 interface WorkspaceFixture {
   context: CreateNodesContextV2;
   write(filePath: string, contents: string): Promise<void>;
@@ -2693,18 +2544,6 @@ function cachedCargoTargets(targets: Record<string, TargetConfiguration>): [stri
     ].join('\n');
     return target.cache === true && /\bcargo/.test(text);
   });
-}
-
-/** What Nx actually hashes for a `runtime` input: the command's stdout. */
-async function runtimeInputValue(command: string, cwd: string): Promise<string> {
-  const child = Bun.spawn(['sh', '-c', command], { cwd, stdout: 'pipe', stderr: 'pipe' });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  expect({ command, exitCode, stderr }).toMatchObject({ command, exitCode: 0 });
-  return stdout;
 }
 
 async function inferProject(

@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { Watcher } from 'nx/src/native/index.js';
-import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import {
   aggregateOf,
   type CountedCargo,
@@ -18,7 +18,7 @@ import {
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
 import { createNodesV2 } from './index.js';
 
@@ -29,8 +29,8 @@ useFixtureCargoHome();
 /**
  * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf`
  * through `bridge`, and `external` — outside the Nx workspace — through
- * `bridge` too. `unrelated` is a member nothing depends on. `app` records
- * every real compile in `executions.log`, so a cache hit is an unchanged log.
+ * `bridge` too. `unrelated` is a member nothing depends on. `app` declares a
+ * custom cached target keyed on its closure.
  * `extraFiles` (paths relative to `root`) are written with the rest, last.
  */
 async function closureFixture(
@@ -39,8 +39,6 @@ async function closureFixture(
   extraFiles: Record<string, string> = {},
 ) {
   const workspace = join(root, 'workspace');
-  const executions = join(root, 'executions.log');
-  const output = join(workspace, 'packages/app/dist/result.txt');
   const files: Record<string, string> = {
     'workspace/.gitignore': gitignore,
     'workspace/package.json':
@@ -49,9 +47,6 @@ async function closureFixture(
       plugins: ['@smoothbricks/nx-plugin'],
       namedInputs: { externalRustCrates: [] },
     }),
-    // Exercise the real linked-source path: Node's strip-only loader must
-    // import the plugin when the workspace selects development exports.
-    'workspace/tsconfig.base.json': JSON.stringify({ compilerOptions: { customConditions: ['development'] } }),
     'workspace/Cargo.toml':
       '[workspace]\nmembers=["packages/app","crates/bridge","crates/leaf","crates/unrelated"]\nresolver="2"\n',
     'workspace/packages/app/package.json': JSON.stringify({
@@ -62,20 +57,12 @@ async function closureFixture(
           compile: {
             executor: 'nx:run-commands',
             cache: true,
-            inputs: ['{projectRoot}/compile.ts', CARGO_CLOSURE_INPUT],
-            outputs: ['{projectRoot}/dist'],
-            options: { command: 'bun packages/app/compile.ts' },
+            inputs: [CARGO_CLOSURE_INPUT],
+            options: { command: 'cargo build --quiet --locked --offline --manifest-path packages/app/Cargo.toml' },
           },
         },
       },
     }),
-    'workspace/packages/app/compile.ts': `import { execFileSync } from 'node:child_process';
-import { appendFile, mkdir, writeFile } from 'node:fs/promises';
-const result = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '--manifest-path', 'packages/app/Cargo.toml'], { encoding: 'utf8' });
-await mkdir(${JSON.stringify(dirname(output))}, { recursive: true });
-await writeFile(${JSON.stringify(output)}, result);
-await appendFile(${JSON.stringify(executions)}, result);
-`,
     'workspace/packages/app/Cargo.toml':
       '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nbridge={path="../../crates/bridge"}\n',
     'workspace/packages/app/src/main.rs': 'fn main() { println!("{}", bridge::answer()); }\n',
@@ -101,21 +88,6 @@ await appendFile(${JSON.stringify(executions)}, result);
     stdio: 'pipe',
   });
 
-  /** A fresh, daemonless Node CLI, loading the linked plugin through development exports. */
-  async function compile(): Promise<void> {
-    const child = Bun.spawn(['node', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:compile'], {
-      cwd: workspace,
-      env: fixtureNxEnv(workspace),
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    expect(exitCode, stdout + stderr).toBe(0);
-  }
   /**
    * Rewrite a fixture file as an edit Nx can see. Nx keeps each file's hash
    * beside its mtime in whole seconds and reuses the hash until that second
@@ -130,33 +102,49 @@ await appendFile(${JSON.stringify(executions)}, result);
     const edited = new Date(Math.max(Date.now(), mtimeMs + 1000));
     await utimes(file, edited, edited);
   }
-  const log = () => readFile(executions, 'utf8');
-  return { workspace, compile, edit, log };
+  return { workspace, edit };
 }
 
 it('keys a custom target on exactly its Cargo closure, inside the workspace and out', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-')));
   try {
-    const { compile, edit, log } = await closureFixture(root);
-    await compile();
-    expect(await log()).toBe('11\n');
-    await compile();
-    expect(await log()).toBe('11\n');
+    const { workspace, edit } = await closureFixture(root);
+    resetWorkspaceContext();
+    const closure = closureOf(byFile(await graphComputation(workspace)()), 'packages/app');
+    const filesets = closure.flatMap((input) => (typeof input === 'string' ? [input] : []));
+    const runtime = closure.flatMap((input) =>
+      typeof input === 'object' && 'runtime' in input ? [input.runtime] : [],
+    );
+    // What the closure's filesets reach, as Nx's own file index matches them: `!` entries exclude. In
+    // process, as the plugin reads a root no daemon serves (`indexedCargoManifests`).
+    const anchored = (inputs: string[]) =>
+      inputs.map((input) => {
+        expect(input).toStartWith('{workspaceRoot}/');
+        return input.slice('{workspaceRoot}/'.length);
+      });
+    const keyed = globWithWorkspaceContextSync(
+      workspace,
+      anchored(filesets.filter((input) => !input.startsWith('!'))),
+      anchored(filesets.flatMap((input) => (input.startsWith('!') ? [input.slice(1)] : []))),
+    );
+    // The one runtime entry, which Nx keys on by its stdout.
+    expect(runtime).toHaveLength(1);
+    const outside = () => runtimeInputValue(runtime.join(), workspace);
+    const before = await outside();
 
-    // Reached only through bridge: no path of app's own names it.
-    await edit('workspace/crates/leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n');
-    await compile();
-    expect(await log()).toBe('11\n12\n');
-
-    // A workspace member outside the closure is not an input.
+    // Reached only through bridge: no path of app's own names it. A workspace member outside the
+    // closure is not an input.
+    expect(keyed.filter((path) => path.endsWith('.rs')).sort()).toEqual([
+      'crates/bridge/src/lib.rs',
+      'crates/leaf/src/lib.rs',
+      'packages/app/src/main.rs',
+    ]);
     await edit('workspace/crates/unrelated/src/lib.rs', 'pub fn unrelated() -> u8 { 4 }\n');
-    await compile();
-    expect(await log()).toBe('11\n12\n');
+    expect(await outside()).toBe(before);
 
-    // Outside the Nx workspace, where no fileset reaches.
+    // Outside the Nx workspace, where no fileset reaches: the runtime entry does.
     await edit('external/src/lib.rs', 'pub fn answer() -> u8 { 20 }\n');
-    await compile();
-    expect(await log()).toBe('11\n12\n22\n');
+    expect(await outside()).not.toBe(before);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
