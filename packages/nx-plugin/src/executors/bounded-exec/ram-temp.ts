@@ -2,7 +2,8 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { diskClassOf, GATEWAY_SOCKET, takeDiskLease } from './disk-lease.js';
+import { diskClassOf, takeDiskLease } from './disk-lease.js';
+import { GATEWAY_SOCKET } from './gateway-lease.js';
 
 /**
  * One RAM-backed APFS volume per host user, shared by every test task that runs

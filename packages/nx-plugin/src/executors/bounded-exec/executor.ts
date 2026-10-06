@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
-import { userInfo } from 'node:os';
+import { availableParallelism, userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
+import { type CpuBudget, gatewayCpuBudget, runnerDemand, sizeRunner, type TokenGrant } from './cpu-tokens.js';
 import {
   createHostCommands,
   describeRamTempError,
@@ -13,6 +14,7 @@ import {
 } from './ram-temp.js';
 import type { BoundedExecOptions } from './schema.js';
 import {
+  type BoundedExecRecord,
   type BoundedExecTask,
   clearTaskDirectory,
   JUNIT_FILE,
@@ -87,7 +89,7 @@ export default function boundedExecExecutor(
     process.platform === 'darwin'
       ? new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
       : null;
-  return runBoundedExec(options, recordContext(context), createProcessTreeKiller(), tempVolume);
+  return runBoundedExec(options, recordContext(context), createProcessTreeKiller(), tempVolume, gatewayCpuBudget());
 }
 
 /**
@@ -113,11 +115,17 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
   };
 }
 
+/**
+ * Run the command once its runner holds CPU tokens from `budget` (`cpu-tokens.ts`), sized to the
+ * grant; `null`, or a budget nobody serves, runs it as asked. Both bounds start once it is
+ * granted: a wait for the host is not the command's time.
+ */
 export async function runBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
   killer: ProcessTreeKiller,
   tempVolume: TempVolume | null,
+  budget: CpuBudget | null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -125,15 +133,22 @@ export async function runBoundedExec(
   if (directory !== null) {
     await clearTaskDirectory(directory);
   }
-  const command = directory === null ? buildCommand(options) : await withJunitReport(buildCommand(options), directory);
+  const requested = buildCommand(options);
   const timeoutMs = options.timeoutMs;
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
   const outputChunks: string[] = [];
   const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
-  // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes
-  // its JUnit report to this path when it is set.
-  const env = directory === null ? options.env : { [JUNIT_REPORT_ENV]: join(directory, JUNIT_FILE), ...options.env };
+  const appendStdout = (chunk: Buffer | string): void => {
+    const text = chunk.toString();
+    outputChunks.push(text);
+    process.stdout.write(text);
+  };
+  const appendStderr = (chunk: Buffer | string): void => {
+    const text = chunk.toString();
+    outputChunks.push(text);
+    process.stderr.write(text);
+  };
 
   let lease: RamTempLease | null = null;
   if (tempVolume !== null) {
@@ -146,14 +161,12 @@ export async function runBoundedExec(
     if (acquired.value.kind === 'leased') {
       lease = acquired.value.lease;
       for (const held of acquired.value.held) {
-        const message = `RAM temp volume: dead lease ${held}\n`;
-        outputChunks.push(message);
-        process.stderr.write(message);
+        appendStderr(`RAM temp volume: dead lease ${held}\n`);
       }
     } else {
-      const message = `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`;
-      outputChunks.push(message);
-      process.stderr.write(message);
+      appendStderr(
+        `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
+      );
     }
   }
   const releaseLease = async (): Promise<void> => {
@@ -168,6 +181,37 @@ export async function runBoundedExec(
     }
   };
 
+  // The wait is one span line, as cowshed's own spans read. With no gateway listening, as on any
+  // host without cowshed, the command runs exactly as asked and nothing is said.
+  let tokens: TokenGrant | null = null;
+  let cpu: BoundedExecRecord['cpu'];
+  let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
+  if (budget !== null) {
+    const demand = runnerDemand(requested, options.parallelism, availableParallelism());
+    const asked = Date.now();
+    tokens = await budget.take(demand.want, context.root, requested);
+    const waitedMs = Date.now() - asked;
+    if (tokens.granted) {
+      sized = sizeRunner(demand.kind, requested, tokens.tokens);
+      cpu = { tokens: tokens.tokens, want: demand.want, waitedMs };
+      appendStderr(
+        `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=ok tokens=${tokens.tokens}/${demand.want} runner=${demand.kind}\n`,
+      );
+    } else if (tokens.cause !== 'absent') {
+      appendStderr(
+        `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=err runner=${demand.kind} runs unbudgeted: ${tokens.reason}\n`,
+      );
+    }
+  }
+  const command = directory === null ? sized.command : await withJunitReport(sized.command, directory);
+  // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes
+  // its JUnit report to this path when it is set. The grant's sizing outranks the target's own
+  // environment: the runner may use what it was granted, not what it was configured with.
+  const env = {
+    ...(directory === null ? {} : { [JUNIT_REPORT_ENV]: join(directory, JUNIT_FILE) }),
+    ...options.env,
+    ...sized.env,
+  };
   const startedAt = Date.now();
   const child = spawn(command, [], {
     cwd,
@@ -176,17 +220,6 @@ export async function runBoundedExec(
     detached: process.platform !== 'win32',
     windowsHide: true,
   });
-
-  const appendStdout = (chunk: Buffer | string): void => {
-    const text = chunk.toString();
-    outputChunks.push(text);
-    process.stdout.write(text);
-  };
-  const appendStderr = (chunk: Buffer | string): void => {
-    const text = chunk.toString();
-    outputChunks.push(text);
-    process.stderr.write(text);
-  };
 
   let idleTimer: NodeJS.Timeout | undefined;
   const armIdleTimer = (): void => {
@@ -298,6 +331,11 @@ export async function runBoundedExec(
   clearTimeout(totalTimer);
   clearTimeout(idleTimer);
   removeSignalHandlers();
+  // The runner is gone; its tokens are the next one's. Killed instead, this process's socket
+  // closes with it and the gateway takes them back the same way.
+  if (tokens?.granted) {
+    tokens.release();
+  }
 
   const code = exitCode ?? signalToExitCode(exitSignal);
   if (code !== 0 && state.expiry === null) {
@@ -326,7 +364,7 @@ export async function runBoundedExec(
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
-    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict });
+    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict, ...(cpu ? { cpu } : {}) });
   }
 
   return {

@@ -48,7 +48,7 @@ async function verdictOf(
   }
   process.stdout.write = () => true;
   process.stderr.write = () => true;
-  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, createProcessTreeKiller(), null);
+  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, createProcessTreeKiller(), null, null);
   const record = await readRecord(context.record?.directory ?? '');
   expect(record?.task).toBe('app:test');
   expect(record?.hash).toBe('42');

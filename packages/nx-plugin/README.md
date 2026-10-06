@@ -667,6 +667,18 @@ before the command's deadline. Without a grant the command runs unleased and std
 running is said once per process. A gateway from before disk leases answers only after 2 s of silence, so once one is
 found the process stops asking it for a minute, as cowshed's own commands do.
 
+Every `bounded-exec` command takes CPU tokens from cowshed's host CPU budget before it starts, when the gateway answers
+on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on one host keep their
+runnable work near the core count instead of each sizing its runners to the whole machine. It asks for as many tokens as
+the command's runner runs at once — a `nextest run` its `--test-threads` or one per core, `bun test --parallel=N` N, a
+cargo build one per core, anything else one, or the target's `parallelism` option — and sizes the runner to the grant:
+`NEXTEST_TEST_THREADS`, a rewritten `--test-threads=`/`--parallel=` count, `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`,
+and `BOUNDED_EXEC_CPU_TOKENS` for every command. The gateway shares tokens fairly between checkouts (Nx workspace
+roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with the
+executor's socket when it is killed. The wait prints one
+`cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway listening, the command runs
+exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted and stderr says so.
+
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
 

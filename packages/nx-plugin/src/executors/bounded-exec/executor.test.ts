@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-
+import type { CpuBudget } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
   createProcessTreeKiller,
@@ -40,6 +40,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -54,6 +55,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "process.exit(7)"', timeoutMs: 5_000 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
       null,
     );
 
@@ -73,6 +75,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -90,6 +93,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -105,6 +109,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 30_000, idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
       null,
     );
 
@@ -138,6 +143,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -166,6 +172,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -180,6 +187,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: 30_000, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
       null,
     );
 
@@ -196,6 +204,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: 30_000 },
       workspace.context,
       createProcessTreeKiller(),
+      null,
       null,
     );
 
@@ -225,6 +234,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       killer,
+      null,
       null,
     );
 
@@ -264,6 +274,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       killer,
       null,
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -288,6 +299,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 50, killAfterMs: 10 },
       workspace.context,
       killer,
+      null,
       null,
     );
     expect(Date.now() - started).toBeLessThan(5_000);
@@ -320,6 +332,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
     const suppressed = await runBoundedExec(
       {
@@ -331,6 +344,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       createProcessTreeKiller(),
+      null,
       null,
     );
 
@@ -363,6 +377,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
+      null,
     );
 
     await sleep(1_000);
@@ -383,6 +398,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       volume,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -400,6 +416,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       volume,
+      null,
     );
 
     expect(result.success).toBe(true);
@@ -421,6 +438,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       volume,
+      null,
     );
 
     expect(result.success).toBe(false);
@@ -442,11 +460,91 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       volume,
+      null,
     );
 
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain(`RAM temp volume ${workspace.root} is full: 1 MiB free of 1024 MiB`);
     expect(volume.released).toEqual([directory]);
+  });
+
+  it('starts the runner once granted, sized to its grant, and returns the tokens when it exits', async () => {
+    const workspace = await createWorkspace();
+    const asked: { want: number; checkout: string; command: string }[] = [];
+    const released: number[] = [];
+    const budget: CpuBudget = {
+      async take(want, checkout, command) {
+        asked.push({ want, checkout, command });
+        return { granted: true, tokens: 3, release: () => released.push(3) };
+      },
+    };
+    // `nextest run` in a trailing comment makes the shell command a nextest runner by invocation.
+    const command =
+      "node -e \"console.log('threads=' + process.env.NEXTEST_TEST_THREADS + ' tokens=' + process.env.BOUNDED_EXEC_CPU_TOKENS)\" # nextest run";
+
+    const result = await runBoundedExec(
+      { command, timeoutMs: 5_000, parallelism: 8, env: { NEXTEST_TEST_THREADS: '64' } },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      budget,
+    );
+
+    expect(result.success).toBe(true);
+    expect(asked).toEqual([{ want: 8, checkout: workspace.root, command }]);
+    expect(result.terminalOutput).toContain('threads=3 tokens=3');
+    expect(result.terminalOutput).toMatch(
+      /^cowshed: cpu-tokens wait done elapsed=\d+ms status=ok tokens=3\/8 runner=nextest$/m,
+    );
+    expect(released).toEqual([3]);
+  });
+
+  it('runs the command as asked, saying why, when the budget refuses', async () => {
+    const workspace = await createWorkspace();
+    const budget: CpuBudget = {
+      async take() {
+        return { granted: false, cause: 'predates', reason: 'the gateway predates the CPU budget' };
+      },
+    };
+
+    // A nextest runner configured for 64 threads keeps them: nothing sizes it without a grant.
+    const result = await runBoundedExec(
+      {
+        command: 'node -e "console.log(\'threads=\' + process.env.NEXTEST_TEST_THREADS)" # nextest run',
+        timeoutMs: 5_000,
+        env: { NEXTEST_TEST_THREADS: '64' },
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      budget,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('threads=64');
+    expect(result.terminalOutput).toContain(
+      'status=err runner=nextest runs unbudgeted: the gateway predates the CPU budget',
+    );
+  });
+
+  it('says nothing and runs as asked where no gateway listens', async () => {
+    const workspace = await createWorkspace();
+    const budget: CpuBudget = {
+      async take() {
+        return { granted: false, cause: 'absent', reason: 'no socket' };
+      },
+    };
+
+    const result = await runBoundedExec(
+      { command: 'node -e "console.log(\'ran\')"', timeoutMs: 5_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      budget,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toBe('ran\n');
   });
 });
 

@@ -39,6 +39,11 @@
       "default": 10000,
       "description": "Milliseconds to wait after graceful termination before force-killing the process tree."
     },
+    "parallelism": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Most threads or processes the command runs at once: the CPU tokens it asks the cowshed host budget for before it starts. Omit to let the runner in the command decide (nextest and cargo one per core, `bun test --parallel=N` N, anything else one). The grant reaches the command as BOUNDED_EXEC_CPU_TOKENS."
+    },
     "forwardAllArgs": {
       "type": "boolean",
       "default": true,

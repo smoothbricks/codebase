@@ -25,6 +25,12 @@ export interface BoundedExecRecord {
   readonly task: string;
   readonly hash: string | null;
   readonly verdict: BoundedExecVerdict;
+  /**
+   * The host CPU budget's grant the run started under: tokens granted of those asked for, and
+   * how long it waited. Absent when it ran unbudgeted; written for the reader of a slow run,
+   * never read back.
+   */
+  readonly cpu?: { readonly tokens: number; readonly want: number; readonly waitedMs: number };
 }
 
 /** The Nx task a run executes as. Nx gives an executor no task id, only its parts. */
@@ -165,9 +171,12 @@ export const VERDICT_FILE = 'verdict.json';
 export const JUNIT_FILE = 'report.xml';
 const NEXTEST_REPORT_CONFIG_FILE = 'nextest-report.toml';
 
-/** `bun test`, or nextest's `nextest run` under any cargo spelling, as one shell word sequence. */
-const BUN_TEST = /(?<=^|[\s;&|()])bun\s+test(?=\s|$)/g;
-const NEXTEST_RUN = /(?<=^|[\s;&|()-])nextest\s+run(?=\s|$)/g;
+/**
+ * `bun test`, or nextest's `nextest run` under any cargo spelling, as one shell word sequence.
+ * Global, for `match` and `replace`; `search` ignores the flag where only presence matters.
+ */
+export const BUN_TEST = /(?<=^|[\s;&|()])bun\s+test(?=\s|$)/g;
+export const NEXTEST_RUN = /(?<=^|[\s;&|()-])nextest\s+run(?=\s|$)/g;
 
 /**
  * `command` with its test runner asked to write a JUnit report into `directory`, the report
