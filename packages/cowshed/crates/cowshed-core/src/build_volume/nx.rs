@@ -15,7 +15,6 @@ use crate::api::dto::UnattributedRun;
 /// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 23.2.1,
 /// `daemon/tmp-dir.js`). It names one checkout's process and socket, so it never travels.
 pub const DAEMON_DIRECTORY: &str = "d";
-#[cfg(target_os = "macos")]
 const DAEMON_RECORD: &str = "server-process.json";
 /// The run summary Nx's `StoreRunInformationLifeCycle` writes into its cache directory after
 /// every `run`/`run-many` (pinned Nx 23.2.1, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
