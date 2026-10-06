@@ -59,10 +59,23 @@ function cowshedCheckout(scratch: Scratch): void {
   );
 }
 
+/** The Nx state overrides the script keeps or drops: `undefined` when unset. */
+interface NxState {
+  readonly NX_WORKSPACE_DATA_DIRECTORY: string | undefined;
+  readonly NX_CACHE_DIRECTORY: string | undefined;
+  readonly NX_DAEMON_SOCKET_DIR: string | undefined;
+}
+
 interface Entered {
   readonly NX_SOCKET_DIR: string;
   readonly NX_WORKSPACE_ROOT_PATH: string;
+  readonly state: NxState;
   readonly stderr: string;
+}
+
+/** One printed line: `set:<value>` when the variable is set, empty when it is not. */
+function setValue(line: string | undefined): string | undefined {
+  return line?.startsWith('set:') ? line.slice('set:'.length) : undefined;
 }
 
 /**
@@ -74,7 +87,12 @@ function enterShell(scratch: Scratch, inherited: Record<string, string>): Entere
     'bash',
     [
       '-c',
-      `. "$1" "$2" && printf '%s\\n%s\\n' "$NX_SOCKET_DIR" "$NX_WORKSPACE_ROOT_PATH"`,
+      [
+        '. "$1" "$2" && printf \'%s\\n\' "$NX_SOCKET_DIR" "$NX_WORKSPACE_ROOT_PATH"',
+        '"${NX_WORKSPACE_DATA_DIRECTORY+set:}${NX_WORKSPACE_DATA_DIRECTORY-}"',
+        '"${NX_CACHE_DIRECTORY+set:}${NX_CACHE_DIRECTORY-}"',
+        '"${NX_DAEMON_SOCKET_DIR+set:}${NX_DAEMON_SOCKET_DIR-}"',
+      ].join(' '),
       'shell',
       script,
       scratch.links,
@@ -83,8 +101,17 @@ function enterShell(scratch: Scratch, inherited: Record<string, string>): Entere
   );
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
   expect(result.status).toBe(0);
-  const [socket = '', root = ''] = result.stdout.split('\n');
-  return { NX_SOCKET_DIR: socket, NX_WORKSPACE_ROOT_PATH: root, stderr: result.stderr };
+  const [socket = '', root = '', data, cache, daemon] = result.stdout.split('\n');
+  return {
+    NX_SOCKET_DIR: socket,
+    NX_WORKSPACE_ROOT_PATH: root,
+    state: {
+      NX_WORKSPACE_DATA_DIRECTORY: setValue(data),
+      NX_CACHE_DIRECTORY: setValue(cache),
+      NX_DAEMON_SOCKET_DIR: setValue(daemon),
+    },
+    stderr: result.stderr,
+  };
 }
 
 /** A host shell: devenv's own runtime, no cowshed variables. */
@@ -170,6 +197,52 @@ describe('nx-socket-dir.sh', () => {
       symlinkSync(join(scratch.checkout, '.cowshed', 'run'), bound);
       const job = hostShell(scratch, { NX_SOCKET_DIR: join(bound, 'nx') });
       expect(job.NX_SOCKET_DIR).toBe(join(bound, 'nx'));
+    });
+  });
+
+  it('drops the Nx state overrides a shell bound for another workspace left behind', () => {
+    withScratch((scratch) => {
+      cowshedCheckout(scratch);
+      // A shell that was in main's checkout, entering a fork of it: main's devenv
+      // made every override absolute, and the fork's own shell keeps an absolute
+      // inherited value, so without the drop Nx here opens main's database.
+      const main = join(scratch.hostRuntime, 'main');
+      mkdirSync(main);
+      const host = hostShell(scratch, {
+        NX_WORKSPACE_ROOT_PATH: main,
+        NX_WORKSPACE_DATA_DIRECTORY: join(main, '.nx/workspace-data'),
+        NX_CACHE_DIRECTORY: join(main, '.nx/cache'),
+        NX_DAEMON_SOCKET_DIR: join(main, '.nx/daemon'),
+      });
+      expect(host.state).toEqual({
+        NX_WORKSPACE_DATA_DIRECTORY: undefined,
+        NX_CACHE_DIRECTORY: undefined,
+        NX_DAEMON_SOCKET_DIR: undefined,
+      });
+      expect(host.NX_WORKSPACE_ROOT_PATH).toBe(scratch.checkout);
+      // A root that no longer exists names no workspace this shell owns either.
+      const gone = hostShell(scratch, {
+        NX_WORKSPACE_ROOT_PATH: join(scratch.hostRuntime, 'retired'),
+        NX_WORKSPACE_DATA_DIRECTORY: '/elsewhere/.nx/workspace-data',
+      });
+      expect(gone.state.NX_WORKSPACE_DATA_DIRECTORY).toBeUndefined();
+    });
+  });
+
+  it('keeps the Nx state overrides bound for this workspace or for no root at all', () => {
+    withScratch((scratch) => {
+      const overrides = {
+        NX_WORKSPACE_DATA_DIRECTORY: '/shared/lane/workspace-data',
+        NX_CACHE_DIRECTORY: '/shared/lane/cache',
+        NX_DAEMON_SOCKET_DIR: '/shared/lane/daemon',
+      };
+      // CI binds a shared tree before entering the shell and names no root.
+      expect(hostShell(scratch, overrides).state).toEqual(overrides);
+      // A cowshed job: the supervisor binds the root to the checkout, by any spelling.
+      const alias = join(scratch.hostRuntime, 'alias');
+      symlinkSync(scratch.checkout, alias);
+      expect(hostShell(scratch, { ...overrides, NX_WORKSPACE_ROOT_PATH: alias }).state).toEqual(overrides);
+      expect(hostShell(scratch, { ...overrides, NX_WORKSPACE_ROOT_PATH: '.' }).state).toEqual(overrides);
     });
   });
 });

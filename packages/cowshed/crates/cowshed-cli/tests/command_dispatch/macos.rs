@@ -1302,6 +1302,29 @@ fn assert_target_on_build_volume(checkout: &Path) {
     );
 }
 
+/// The moment `cowshed new` returns, `fork`'s build state resolves into a volume of its own and
+/// never into the one `target` links: a process the fork starts at once must not open the
+/// target's task database, or the target's next land cannot adopt.
+fn assert_on_own_build_volume(fork: &Path, target: &Path) {
+    let resolve = |path: PathBuf| {
+        path.canonicalize()
+            .unwrap_or_else(|error| panic!("{} resolves: {error}", path.display()))
+    };
+    let own = resolve(fork.join(".cowshed/build"));
+    assert_ne!(
+        own,
+        resolve(target.join(".cowshed/build")),
+        "{}",
+        fork.display()
+    );
+    assert!(
+        resolve(fork.join("target")).starts_with(&own),
+        "{}/target resolves outside its own volume {}",
+        fork.display(),
+        own.display()
+    );
+}
+
 fn nx_run_many(node: &Path) -> String {
     format!(
         "{} node_modules/nx/dist/bin/nx.js run-many -t build test",
@@ -1519,6 +1542,7 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
         "the warm build volume is cloned to another checkout path"
     );
     assert_target_on_build_volume(&w2);
+    assert_on_own_build_volume(&w2, &fixture.checkout);
     let host = Command::new("/bin/sh")
         .args(["-ec", &format!(". .cowshed/env; exec {CARGO_BUILD}")])
         .current_dir(&w2)

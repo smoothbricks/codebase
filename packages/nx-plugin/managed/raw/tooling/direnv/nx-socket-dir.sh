@@ -4,7 +4,20 @@
 #
 #   . "$DEVENV_ROOT/nx-socket-dir.sh" /tmp
 #
-# Exports NX_WORKSPACE_ROOT_PATH and NX_SOCKET_DIR for this Nx workspace.
+# Exports NX_WORKSPACE_ROOT_PATH and NX_SOCKET_DIR for this Nx workspace, and
+# drops the Nx state overrides another workspace's shell left behind.
+#
+# An inherited NX_WORKSPACE_ROOT_PATH that names another directory says the
+# environment was bound for that workspace, and so were its Nx state
+# overrides: NX_WORKSPACE_DATA_DIRECTORY, NX_CACHE_DIRECTORY and
+# NX_DAEMON_SOCKET_DIR. They are absolute, so a repository shell that keeps
+# an inherited absolute value (CI binds a shared tree that way) kept that
+# workspace's, and every Nx here opened its task database and cache. A
+# cowshed fork entered from a shell that had been in main's checkout did
+# exactly that: its Nx held main's database on main's build volume, and the
+# next land into main could not adopt. The smoo Nx wrappers drop the same
+# keys on the same evidence (WORKSPACE_STATE_ENV_KEYS). An override
+# inherited without a root, or with this root, is the caller's own and stays.
 #
 # One socket dir per Nx workspace. DEVENV_RUNTIME is keyed to the devenv ROOT,
 # so every workspace sharing one devenv - a sibling repository, a
@@ -36,8 +49,12 @@
 # is cowshed's binding for the job and stays. An inherited one that resolves
 # elsewhere belongs to another workspace, so the workspace takes its own.
 smoo_nx_links="$1"
-export NX_WORKSPACE_ROOT_PATH="$PWD"
 smoo_nx_checkout="$(pwd -P)"
+if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
+  [ "$(cd "$NX_WORKSPACE_ROOT_PATH" >/dev/null 2>&1 && pwd -P)" != "$smoo_nx_checkout" ]; then
+  unset NX_WORKSPACE_DATA_DIRECTORY NX_CACHE_DIRECTORY NX_DAEMON_SOCKET_DIR
+fi
+export NX_WORKSPACE_ROOT_PATH="$PWD"
 smoo_nx_socket=""
 smoo_nx_port=""
 if [ -d .cowshed/run ] && [ -f .cowshed/env ]; then
