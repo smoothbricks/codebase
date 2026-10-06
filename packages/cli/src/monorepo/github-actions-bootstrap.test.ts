@@ -14,6 +14,8 @@ const script = join(managedAssetsRoot, 'raw/tooling/direnv/github-actions-bootst
 // so build-shell exercises the real capture/filter/persist path.
 const DEVENV_STUB = `#!/usr/bin/env bash
 set -euo pipefail
+# build-shell runs the install tasks first; they are not what this measures.
+[ "\${1:-}" = tasks ] && exit 0
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
 # Real enterShell hooks print progress to stdout; the capture must survive it.

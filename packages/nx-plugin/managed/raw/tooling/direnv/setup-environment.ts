@@ -125,11 +125,20 @@ const POST_COMMIT_BLOCK = [
 // The managed devenv module passes `--python <interpreter>` for a uv project:
 // the interpreter devenv's languages.python would use, as a store path, so the
 // environment uv builds does not name this checkout's profile as its home.
+// `--cargo` runs the Cargo fetches instead of the installs: they are devenv's
+// smoo:cargo-fetch task, whose `status` is `--cargo --check` (exit 0 when
+// CARGO_HOME already holds every workspace's locked packages). Their stamps
+// (cargoFetcher) live in smoo's user cache and count only while CARGO_HOME
+// names the directory they were fetched into, which no checkout-relative
+// change detection can see.
 // Declared above the bootstrap block for the same hoisting reason as above.
-const { values: flags } = parseArgs({ options: { python: { type: 'string' } } });
+const { values: flags } = parseArgs({
+  options: { python: { type: 'string' }, cargo: { type: 'boolean' }, check: { type: 'boolean' } },
+});
+const cargoMode = flags.cargo === true;
 
 // The Nx plugin's test for a Cargo workspace root manifest (CARGO_WORKSPACE_PATTERN), which
-// cargoFetchInputs applies during the bootstrap block; declared above it for the same reason.
+// cargoWorkspaces applies during the bootstrap block; declared above it for the same reason.
 const CARGO_WORKSPACE = /^\s*\[workspace\]/m;
 
 // Go to project root
@@ -140,14 +149,21 @@ try {
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.
   const bunInputs = bunInstallInputs();
-  const uvInputs = uvSyncInputs();
-  const cargo = cargoFetchInputs(bunInputs);
-  recordInstallInputs([...bunInputs, ...uvInputs, ...cargo.inputs]);
-  const cargoFetches = cargo.workspaces.map(cargoFetcher);
+  const cargoFetches = cargoMode ? cargoWorkspaces(bunInputs).map(cargoFetcher) : [];
+  if (flags.check === true) {
+    process.exit(cargoFetches.every((fetch) => fetch.isCurrent()) ? 0 : 1);
+  }
+  const uvInputs = cargoMode ? [] : uvSyncInputs();
   // A CI runner is GitHub Actions or Forgejo Actions, which mirrors every FORGEJO_*
   // variable as GITHUB_*. Not `CI`: agent harnesses set CI=true on every command
   // they run, and this branch installs unconditionally.
-  if (process.env.GITHUB_ACTIONS === 'true') {
+  if (process.env.GITHUB_ACTIONS === 'true' && cargoMode) {
+    await withInstallLock(async () => {
+      for (const fetch of cargoFetches) {
+        await fetch.install({ quiet: false });
+      }
+    });
+  } else if (process.env.GITHUB_ACTIONS === 'true') {
     const uv = uvInstaller(uvInputs, { locked: true });
     await resolveSecrets();
     // Failures are captured and reported below. Exiting in the catch would
@@ -191,10 +207,15 @@ try {
       if (uv !== null) {
         await uv.install({ quiet: false });
       }
-      for (const fetch of cargoFetches) {
-        await fetch.install({ quiet: false });
-      }
     });
+  } else if (cargoMode) {
+    // A failed fetch loads the shell like a failed install; the graph then names Cargo's refusal.
+    const fetchError = await withInstallLock(() =>
+      installLocalDependencies(cargoFetches.filter((fetch) => !fetch.isCurrent())),
+    );
+    if (fetchError !== undefined) {
+      reportDegradedSetup(fetchError);
+    }
   } else {
     // A local secret-resolution or install failure (a provider that is not
     // signed in, an unpublished private package, a missing registry
@@ -206,9 +227,7 @@ try {
     const uv = uvInstaller(uvInputs, { locked: false });
     const bun = bunInstaller(bunInputs);
     const installError = await withInstallLock(async () => {
-      const pending = [bun, ...(uv === null ? [] : [uv]), ...cargoFetches].filter(
-        (installer) => !installer.isCurrent(),
-      );
+      const pending = [bun, ...(uv === null ? [] : [uv])].filter((installer) => !installer.isCurrent());
       const error = await installLocalDependencies(pending);
       if (!pending.includes(bun)) {
         reportDeveloperLinks(projectRoot);
@@ -575,26 +594,20 @@ function uvSyncInputs(): string[] {
 }
 
 /**
- * The Cargo workspaces the Nx plugin resolves — a project directory (the root
+ * The Cargo workspaces the Nx plugin resolves: a project directory (the root
  * or a workspace member, found by its package.json) whose Cargo.toml declares
- * `[workspace]` — and what their fetch reads. Every project directory's
- * Cargo.toml is an input whether or not it exists, so adding a Cargo
- * workspace is itself a change.
+ * `[workspace]`.
  */
-function cargoFetchInputs(bunInputs: readonly string[]): { workspaces: string[]; inputs: string[] } {
+function cargoWorkspaces(bunInputs: readonly string[]): string[] {
   const workspaces: string[] = [];
-  const inputs: string[] = [];
   for (const projectManifest of bunInputs.filter((input) => path.posix.basename(input) === 'package.json')) {
     const directory = path.posix.dirname(projectManifest);
-    const manifest = path.posix.join(directory, 'Cargo.toml');
-    inputs.push(manifest);
-    const content = readFileIfPresent(path.join(projectRoot, manifest));
+    const content = readFileIfPresent(path.join(projectRoot, path.posix.join(directory, 'Cargo.toml')));
     if (content !== null && CARGO_WORKSPACE.test(content.toString('utf8'))) {
       workspaces.push(directory);
-      inputs.push(...cargoWorkspaceInputs(directory));
     }
   }
-  return { workspaces: workspaces.sort(), inputs: [...new Set(inputs)].sort() };
+  return workspaces.sort();
 }
 
 /** What `cargo fetch --locked` reads for the workspace at `directory`, relative to the project root. */
@@ -692,29 +705,6 @@ function readFileIfPresent(file: string): Buffer | null {
       return null;
     }
     throw error;
-  }
-}
-
-/**
- * The files whose change must re-run shell entry's installs, one absolute
- * path per line in $DEVENV_STATE/install-inputs. The managed .envrc watches
- * each of them, so a shell direnv keeps loaded re-enters exactly when an
- * installer would do something. The uv half is recorded whether or not this
- * shell syncs one, so that adding a pyproject.toml is itself a change.
- */
-function recordInstallInputs(inputs: readonly string[]): void {
-  const state = process.env.DEVENV_STATE;
-  if (state === undefined) {
-    return;
-  }
-  const file = path.join(state, 'install-inputs');
-  const content = `${[...new Set(inputs)]
-    .sort()
-    .map((input) => path.join(projectRoot, input))
-    .join('\n')}\n`;
-  if (readFileIfPresent(file)?.toString('utf8') !== content) {
-    mkdirSync(state, { recursive: true });
-    writeFileSync(file, content);
   }
 }
 

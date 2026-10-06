@@ -232,15 +232,15 @@ missing from Nx's file index, or another closure Nx cannot express precisely, fa
 Neither condition falls back to a whole-workspace runtime hash or silently reuses an older closure.
 
 Resolution therefore needs the packages `Cargo.lock` pins already in `CARGO_HOME`, before any task can run: the graph's
-own `cargo-fetch` target cannot supply them. The managed shell entry (`tooling/direnv/setup-environment.ts`) runs
-`cargo fetch --locked` for every project whose `Cargo.toml` declares `[workspace]`, once per change to that workspace's
-`Cargo.toml`, `Cargo.lock` or `.cargo/config[.toml]`. Its stamp lives in `$XDG_CACHE_HOME/smoo/cargo-fetched`
-(`~/.cache/smoo` when that is unset), never in `CARGO_HOME`: a sandboxed shell may write only Cargo's own paths there. A
-stamp outside `CARGO_HOME` outlives it, so the stamp also names the directory `CARGO_HOME` was when the fetch finished
-(device, inode and creation time): a deleted and recreated `CARGO_HOME`, or another one, fetches again, while a copied
-checkout sharing the `CARGO_HOME` does not. A failed fetch writes no stamp. In CI a failed fetch fails the shell;
-locally it prints Cargo's cause, loads the shell, and retries on the next entry, while graph inference keeps refusing
-with that same cause.
+own `cargo-fetch` target cannot supply them. The managed shell's devenv task `smoo:cargo-fetch`
+(`tooling/direnv/setup-environment.ts --cargo`, gated by its `--cargo --check` status) runs `cargo fetch --locked` for
+every project whose `Cargo.toml` declares `[workspace]`, once per change to that workspace's `Cargo.toml`, `Cargo.lock`
+or `.cargo/config[.toml]`. Its stamp lives in `$XDG_CACHE_HOME/smoo/cargo-fetched` (`~/.cache/smoo` when that is unset),
+never in `CARGO_HOME`: a sandboxed shell may write only Cargo's own paths there. A stamp outside `CARGO_HOME` outlives
+it, so the stamp also names the directory `CARGO_HOME` was when the fetch finished (device, inode and creation time): a
+deleted and recreated `CARGO_HOME`, or another one, fetches again, while a copied checkout sharing the `CARGO_HOME` does
+not. A failed fetch writes no stamp. In CI (`devenv tasks run`) a failed fetch fails; locally the task prints Cargo's
+cause, the shell loads, and the next entry retries, while graph inference keeps refusing with that same cause.
 
 In-workspace members follow Nx's file semantics, which differ from the command's own walk in two places: a symlinked
 directory inside a package is not followed, and manifests and Cargo configuration above the Nx root (a

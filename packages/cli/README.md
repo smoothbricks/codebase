@@ -413,8 +413,12 @@ nothing when nothing changed:
 - The managed `.envrc` loads no parent directory's `.envrc`: the shell is built from the checkout's own inputs, so the
   same commit enters the same shell wherever it is checked out. An environment wanted from outside the checkout belongs
   in the gitignored `.envrc-local`.
-- The managed `.envrc` watches every one of those inputs (listed in `$DEVENV_STATE/install-inputs`) and the scripts
-  shell entry runs, so a shell direnv keeps loaded re-enters exactly when an install has something to do.
+- The installs are devenv tasks ordered before `devenv:enterShell`: `smoo:install` (bun, uv) runs only when a manifest,
+  lockfile, `bunfig.toml`, patch or the install scripts changed, or `node_modules` was deleted (devenv's
+  `execIfModified`), and `smoo:cargo-fetch` runs `cargo fetch --locked` only when CARGO_HOME lacks a workspace's locked
+  packages (its `status`), which the Nx plugin's offline `cargo metadata` needs. A failed task loads the shell anyway;
+  CI runs both with `devenv tasks run`, which fails. The managed `.envrc` watches `package.json`, the lockfiles and the
+  scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull or a script change.
 - Shell secrets resolve only for an entry that installs; see below.
 - `tooling/direnv/shared-caches.sh` points `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE` at
   `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,

@@ -16,27 +16,19 @@ eval "$(devenv direnvrc)"
 use devenv
 popd >/dev/null
 
-# Re-enter exactly when shell entry has something to do. The scripts it runs
-# decide what that is, and setup-environment.ts records the files its install
-# stamps cover — lockfiles, every workspace manifest, bunfig.toml, patches,
-# every pyproject.toml — one per line in $DEVENV_STATE/install-inputs. A shell
-# direnv keeps loaded, or a pool of them gated on direnv's watches, then
-# reinstalls after a pull or a manifest edit and stays put otherwise.
-install_inputs=()
-if [ -f "${DEVENV_STATE:-}/install-inputs" ]; then
-  while IFS= read -r install_input; do
-    install_inputs+=("$install_input")
-  done <"$DEVENV_STATE/install-inputs"
-fi
+# Re-enter after a pull or a dependency edit; devenv's smoo:install and
+# smoo:cargo-fetch tasks then decide whether anything installs. The scripts
+# shell entry runs are not inputs devenv evaluates, so a change to one
+# re-enters through this watch too.
 watch_file \
+  package.json bun.lock uv.lock Cargo.lock \
   tooling/direnv/repo-path \
   tooling/direnv/shared-caches.sh \
   tooling/direnv/nx-socket-dir.sh \
   tooling/direnv/apple-developer.sh \
   tooling/direnv/setup-environment.ts \
   tooling/direnv/secret-references.ts \
-  tooling/direnv/toolchain-stamp.ts \
-  ${install_inputs[@]+"${install_inputs[@]}"}
+  tooling/direnv/toolchain-stamp.ts
 
 # A cowshed workspace's environment, for interactive shells inside one; an
 # absent file is skipped.

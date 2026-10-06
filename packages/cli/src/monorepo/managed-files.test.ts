@@ -237,6 +237,8 @@ describe('managed raw files', () => {
       [
         '#!/usr/bin/env bash',
         'set -euo pipefail',
+        // build-shell runs the install tasks first; they are not what this measures.
+        '[ "${1:-}" = tasks ] && exit 0',
         'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
         'shift',
         'cd ../..',

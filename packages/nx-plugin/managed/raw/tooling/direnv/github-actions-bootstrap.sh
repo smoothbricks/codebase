@@ -142,8 +142,11 @@ devenv_path_and_caches() {
 build_devenv_shell() {
   local since
   since="$(date +%s)"
-  # One evaluation: the shell that captures the environment is the shell
-  # build. A separate `devenv shell -- date` evaluated everything twice.
+  # The installs are devenv tasks, and a failed task does not fail
+  # `devenv shell`; `devenv tasks run` does, so CI runs them first and the
+  # shell capture below then finds them current. Its evaluation is the one
+  # the capture reuses from devenv's eval cache.
+  devenv tasks run smoo:install smoo:cargo-fetch
   persist_devenv_environment
   # Only the ephemeral-runner path of setup-devenv opts in: the scan walks the
   # whole store, which on a developer host or a host runner is large and not

@@ -40,6 +40,9 @@ type EntryOptions = {
    * install, which runs no provider command and so needs every declared secret supplied.
    */
   readonly ciSecrets?: Readonly<Record<string, string>>;
+  /** devenv's smoo:cargo-fetch task: `--cargo`, and its `status`, `--cargo --check`. */
+  readonly cargo?: boolean;
+  readonly check?: boolean;
 } & (
   | {
       /** The CARGO_HOME this entry runs with, instead of the repository's own. */
@@ -297,6 +300,8 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
       'bun',
       join(root, 'tooling', 'direnv', 'setup-environment.ts'),
       ...(options.python === undefined ? [] : ['--python', options.python]),
+      ...(options.cargo === true ? ['--cargo'] : []),
+      ...(options.check === true ? ['--check'] : []),
     ],
     cwd: root,
     env: {
@@ -458,36 +463,6 @@ describe('what shell entry installs', () => {
         expect(await enter()).toEqual(HEALTHY);
         expect(performance.now() - started).toBeLessThan(10_000);
         expect(readFileSync(join(root, 'installed'), 'utf8')).toBe('x\n');
-      },
-    );
-  });
-
-  it('records every install input where the managed envrc watches them', async () => {
-    await withManagedRepository(
-      {
-        workspaces: ['packages/*'],
-        files: {
-          [MEMBER]: JSON.stringify({ name: 'member', version: '0.0.0' }),
-          'pyproject.toml': '[tool.uv.workspace]\nmembers = ["python/*"]\n',
-          'python/tool/pyproject.toml': '[project]\nname = "tool"\n',
-        },
-      },
-      async ({ root, state, enterShell: enter }) => {
-        expect(await enter()).toEqual(HEALTHY);
-        const recorded = readFileSync(join(state, 'install-inputs'), 'utf8').trimEnd().split('\n');
-        expect(recorded).toEqual(
-          expect.arrayContaining(
-            [
-              'package.json',
-              'bun.lock',
-              'bunfig.toml',
-              MEMBER,
-              'pyproject.toml',
-              'uv.lock',
-              'python/tool/pyproject.toml',
-            ].map((file) => join(root, file)),
-          ),
-        );
       },
     );
   });
@@ -937,62 +912,69 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     return existsSync(directory) ? readdirSync(directory) : [];
   };
 
-  it("fetches each workspace's locked packages once per change to what the fetch reads", async () => {
+  // Shell entry's installs never fetch: devenv's smoo:cargo-fetch task runs `--cargo`, gated by `--cargo --check`.
+  const CARGO = { cargo: true } as const;
+
+  it('installs without fetching; the cargo task fetches each workspace once per change to what the fetch reads', async () => {
     await withManagedRepository(
       { workspaces: ['packages/*'], files: CARGO_PROJECT },
       async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
         expect(await enter()).toEqual(HEALTHY);
-        expect(await enter()).toEqual(HEALTHY);
+        expect(cargoRuns()).toEqual([]);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
         expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
         expect(stamps(xdgCache)).toHaveLength(2);
 
         await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
-        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
         // Adding Cargo configuration changes what the fetch reads as much as editing it does.
         await mkdir(join(root, 'packages/native/.cargo'));
         await edit(join(root, 'packages/native/.cargo/config.toml'), '[net]\noffline = false\n');
-        expect(await enter()).toEqual(HEALTHY);
-        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
         expect(cargoRuns().slice(2)).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
       },
     );
   });
 
-  it('fetches again into a CARGO_HOME that does not hold them, and not for a copied checkout sharing one', async () => {
+  it('reports through --check whether CARGO_HOME holds every workspace, so a fresh one fetches', async () => {
     await withManagedRepository({ files: CARGO_PROJECT }, async (original) => {
-      expect(await original.enterShell()).toEqual(HEALTHY);
-      expect(original.cargoRuns()).toEqual([fetch('Cargo.toml')]);
+      expect((await original.enterShell({ cargo: true, check: true })).exitCode).toBe(1);
+      expect(await original.enterShell(CARGO)).toEqual(HEALTHY);
+      expect(await original.enterShell({ cargo: true, check: true })).toEqual(HEALTHY);
 
+      // A copy of the checkout sharing CARGO_HOME is fetched already.
       const clone = join(dirname(original.root), 'clone');
       await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
       const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
-      expect(await copied.enterShell()).toEqual(HEALTHY);
-      expect(copied.cargoRuns()).toEqual([fetch('Cargo.toml')]);
+      expect(await copied.enterShell({ cargo: true, check: true })).toEqual(HEALTHY);
 
       await rm(original.cargoHome, { recursive: true, force: true });
-      expect(await original.enterShell()).toEqual(HEALTHY);
+      expect((await original.enterShell({ cargo: true, check: true })).exitCode).toBe(1);
+      expect(await original.enterShell(CARGO)).toEqual(HEALTHY);
       expect(original.cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
     });
   });
 
   it('fetches again into a recreated CARGO_HOME and into another one, each keeping its own stamp', async () => {
     await withManagedRepository({ files: CARGO_PROJECT }, async ({ cargoHome, enterShell: enter, cargoRuns }) => {
-      expect(await enter()).toEqual(HEALTHY);
+      expect(await enter(CARGO)).toEqual(HEALTHY);
       // Another CARGO_HOME holds none of what the first one fetched.
-      expect(await enter({ cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
+      expect(await enter({ ...CARGO, cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
       expect(cargoRuns()).toHaveLength(2);
       // Neither fetch spoiled the other's stamp.
-      expect(await enter()).toEqual(HEALTHY);
-      expect(await enter({ cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
+      expect(await enter(CARGO)).toEqual(HEALTHY);
+      expect(await enter({ ...CARGO, cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
       expect(cargoRuns()).toHaveLength(2);
 
       // The same path, deleted and created again: a stamp outside CARGO_HOME survives it, so what
       // it promises must not.
       await rm(cargoHome, { recursive: true });
       await mkdir(cargoHome);
-      expect(await enter()).toEqual(HEALTHY);
+      expect(await enter(CARGO)).toEqual(HEALTHY);
       expect(cargoRuns()).toHaveLength(3);
-      expect(await enter()).toEqual(HEALTHY);
+      expect(await enter(CARGO)).toEqual(HEALTHY);
       expect(cargoRuns()).toHaveLength(3);
     });
   });
@@ -1013,8 +995,8 @@ describe('what shell entry fetches for a Cargo workspace', () => {
           // The fixture is only a model of the grant when the root really refuses a new entry.
           await expect(writeFile(join(cargoHome, 'smoo-fetched'), '')).rejects.toThrow('EACCES');
 
-          expect(await enter()).toEqual(HEALTHY);
-          expect(await enter()).toEqual(HEALTHY);
+          expect(await enter(CARGO)).toEqual(HEALTHY);
+          expect(await enter(CARGO)).toEqual(HEALTHY);
           expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
           expect(readdirSync(cargoHome).sort()).toEqual([...CARGO_STATE_FILES, 'git', 'registry'].sort());
           expect(stamps(xdgCache)).toHaveLength(1);
@@ -1029,8 +1011,8 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     await withManagedRepository({ files: CARGO_PROJECT }, async ({ root, enterShell: enter, cargoRuns }) => {
       const home = join(dirname(root), 'home');
       await mkdir(home);
-      expect(await enter({ home })).toEqual(HEALTHY);
-      expect(await enter({ home })).toEqual(HEALTHY);
+      expect(await enter({ ...CARGO, home })).toEqual(HEALTHY);
+      expect(await enter({ ...CARGO, home })).toEqual(HEALTHY);
       expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
       expect(readdirSync(join(home, '.cargo')).sort()).toEqual(['.package-cache', 'registry']);
       expect(readdirSync(join(home, '.cache', 'smoo'))).toEqual(['cargo-fetched']);
@@ -1042,61 +1024,36 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     await withManagedRepository(
       { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
       async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
-        const failed = await enter();
+        const failed = await enter(CARGO);
         expect(failed.exitCode).toBe(0);
         expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
         expect(failed.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
-        expect((await enter()).exitCode).toBe(0);
+        expect((await enter(CARGO)).exitCode).toBe(0);
         expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
         // A fetch that failed promised nothing: no stamp, not even the directory for one.
         expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
 
         await rm(join(root, 'cargo-fails'));
-        expect(await enter()).toEqual(HEALTHY);
-        expect(await enter()).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
+        expect(await enter(CARGO)).toEqual(HEALTHY);
         expect(cargoRuns()).toHaveLength(3);
         expect(stamps(xdgCache)).toHaveLength(1);
       },
     );
   });
 
-  it('fails a CI entry whose fetch fails', async () => {
+  it('fails a CI fetch that fails', async () => {
     await withManagedRepository(
-      { files: { ...CARGO_PROJECT, 'cargo-fails': '', '.gitignore': 'node_modules\ntooling/direnv/.devenv\n' } },
-      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
-        // The frozen install needs a lockfile; `bun install` writes it as a commit would carry it.
-        const install = Bun.spawn({ cmd: ['bun', 'install'], cwd: root, stdout: 'ignore', stderr: 'pipe' });
-        const [stderr, exitCode] = await Promise.all([new Response(install.stderr).text(), install.exited]);
-        if (exitCode !== 0) throw new Error(`bun install failed: ${stderr}`);
-
-        const entry = await enter({ ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } });
+      { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
+      async ({ xdgCache, enterShell: enter, cargoRuns }) => {
+        const entry = await enter({
+          cargo: true,
+          ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' },
+        });
         expect(entry.exitCode).toBe(1);
         expect(entry.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
         expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
         expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
-      },
-    );
-  });
-
-  it('records what each fetch reads where the managed envrc watches it, a Cargo.toml it may add included', async () => {
-    await withManagedRepository(
-      { workspaces: ['packages/*'], files: CARGO_PROJECT },
-      async ({ root, state, enterShell: enter }) => {
-        expect(await enter()).toEqual(HEALTHY);
-        const recorded = readFileSync(join(state, 'install-inputs'), 'utf8').trimEnd().split('\n');
-        expect(recorded).toEqual(
-          expect.arrayContaining(
-            [
-              'Cargo.toml',
-              'Cargo.lock',
-              '.cargo/config.toml',
-              'packages/native/Cargo.lock',
-              'packages/native/.cargo/config.toml',
-              'packages/plain/Cargo.toml',
-            ].map((file) => join(root, file)),
-          ),
-        );
-        expect(recorded).not.toContain(join(root, 'packages/plain/Cargo.lock'));
       },
     );
   });
@@ -1235,7 +1192,7 @@ describe('a shell direnv keeps loaded', () => {
     return { base, direnv };
   }
 
-  it('re-enters exactly when an install input changes', async () => {
+  it('re-enters when a lockfile changes, and not for any other edit', async () => {
     await withManagedRepository(
       {
         workspaces: ['packages/*'],
@@ -1256,8 +1213,9 @@ describe('a shell direnv keeps loaded', () => {
 
         expect(await direnv(['export', 'json'], loaded)).toBe('');
         await edit(join(root, 'README.md'), 'edited\n');
-        expect(await direnv(['export', 'json'], loaded)).toBe('');
         await edit(join(root, MEMBER), JSON.stringify({ name: 'member', version: '0.0.1' }));
+        expect(await direnv(['export', 'json'], loaded)).toBe('');
+        await edit(join(root, 'Cargo.lock'), 'version = 4\n');
         expect(await direnv(['export', 'json'], loaded)).not.toBe('');
       },
     );

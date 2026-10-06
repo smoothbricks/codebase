@@ -328,6 +328,64 @@ in {
     "system"
   ];
 
+  # Shell entry's installs are devenv tasks ordered before devenv:enterShell, so
+  # devenv decides when they run and an unchanged checkout starts no installer.
+  #
+  # smoo:install runs `bun install` (and `uv sync` for a uv project) through
+  # setup-environment.ts when anything they read changed: execIfModified keys
+  # each file by content hash, by its path relative to tooling/direnv (so a
+  # copy-on-write clone at another path is unchanged), honouring .gitignore.
+  # The globs over-match (a fixture's package.json), which costs a no-op
+  # install. node_modules/.smoo-install is the stamp a successful install
+  # writes; named literally it is checked although node_modules is ignored, so
+  # deleting node_modules reinstalls. The script keeps its own per-installer
+  # digest under the install lock, so two shells entering at once install once.
+  # The scripts themselves are inputs: a new setup-environment.ts reruns.
+  #
+  # smoo:cargo-fetch establishes what the Nx plugin's offline `cargo metadata
+  # --locked` needs: every Cargo workspace's locked packages in CARGO_HOME. Its
+  # stamps live in smoo's user cache and count only while CARGO_HOME names the
+  # directory they were fetched into, which differs per host and per sandbox
+  # and no checkout path can name, so it is gated by `status` (exit 0 when
+  # CARGO_HOME holds them) rather than execIfModified.
+  #
+  # A failed task does not fail shell entry (devenv reports it and the shell
+  # still loads, so the tools to repair it stay available). CI runs both with
+  # `devenv tasks run`, which does fail; setup-environment.ts is strict there.
+  tasks = let
+    setup = ''bun "$DEVENV_ROOT/setup-environment.ts"'';
+  in {
+    "smoo:install" = {
+      description = "bun install / uv sync when what they read changed";
+      exec = setup + lib.optionalString uvProject " --python ${python.package.interpreter}";
+      execIfModified = [
+        "../../package.json"
+        "../../bun.lock"
+        "../../bun.lockb"
+        "../../bunfig.toml"
+        "../../**/package.json"
+        "../../**/*.patch"
+        "../../pyproject.toml"
+        "../../uv.lock"
+        "../../**/pyproject.toml"
+        "../../tooling/workspace.gitconfig"
+        "setup-environment.ts"
+        "developer-links.ts"
+        "secret-references.ts"
+        "../../node_modules/.smoo-install"
+      ];
+      before = ["devenv:enterShell"];
+      showOutput = true;
+    };
+    "smoo:cargo-fetch" = {
+      description = "cargo fetch --locked into CARGO_HOME for each Cargo workspace";
+      exec = "${setup} --cargo";
+      status = "${setup} --cargo --check";
+      before = ["devenv:enterShell"];
+      showOutput = true;
+    };
+  };
+
   enterShell = lib.mkMerge [
     # Prologue, in order:
     #
@@ -339,12 +397,9 @@ in {
     #    6 API, so the two must be named separately.
     # 4. Go and ttsc caches: tooling/direnv/shared-caches.sh places them under
     #    the machine's shared caches root when it exists and states why.
-    # 5. The shared setup-environment.ts bootstraps repository dependencies. It
-    #    runs `bun install` — and, for a uv project, `uv sync` — only when that
-    #    installer's inputs changed since its last successful run, so an
-    #    unchanged checkout enters in the time it takes to hash a lockfile. It
-    #    records those inputs, and the managed .envrc watches them, so a shell
-    #    that direnv keeps loaded re-enters exactly when one of them changes.
+    # 5. Dependencies are installed by the smoo:install and smoo:cargo-fetch
+    #    tasks above, which devenv runs before this prologue; the prologue only
+    #    activates what they installed.
     #
     #    The uv project environment is devenv's UV_PROJECT_ENVIRONMENT, synced
     #    with the interpreter devenv would use and activated here after the
@@ -427,7 +482,6 @@ in {
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
       . "$DEVENV_ROOT/shared-caches.sh" /private/cowshed/caches
       unset GOROOT
-      bun "$DEVENV_ROOT/setup-environment.ts"${lib.optionalString uvProject " --python ${python.package.interpreter}"} || exit $?
       ${lib.optionalString uvProject ''
         if [ -f pyproject.toml ]; then
           export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
