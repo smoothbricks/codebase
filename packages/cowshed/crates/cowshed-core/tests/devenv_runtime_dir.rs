@@ -592,6 +592,7 @@ async fn host_controller_proxy_bypass_does_not_admit_unallocated_loopback_ports(
 
 /// Turns this test binary into a TCP probe inside a workspace sandbox: `listen <port>,…` holds
 /// the block's listener pairs and the named retained-block ports until stdin ends;
+/// `serve` holds one listener on a block port and one on port 0 until stdin ends;
 /// `connect <port>,…` reports what each connect met.
 const TCP_PROBE: &str = "COWSHED_TCP_PROBE";
 const TCP_PROBE_TEST: &str = "host_controller_tcp_probe_runs_as_a_sandboxed_child";
@@ -632,6 +633,8 @@ fn host_controller_tcp_probe_runs_as_a_sandboxed_child() {
     let base = port(PORT_BASE_ENV);
     if let Some(retained) = probe.strip_prefix("listen ") {
         hold_listener_pairs(base, port(PORT_BLOCK_SIZE_ENV), parse_ports(retained));
+    } else if probe == "serve" {
+        serve_on_the_block_and_on_port_zero(base, port(PORT_BLOCK_SIZE_ENV));
     } else if let Some(targets) = probe.strip_prefix("connect ") {
         connect_beyond_the_block(base, parse_ports(targets));
     } else {
@@ -714,6 +717,45 @@ fn connect_beyond_the_block(base: u16, targets: Vec<u16>) {
                 println!("{TCP_PROBE_LINE}{port} denied");
             }
             Err(error) => println!("{TCP_PROBE_LINE}{port} {error}"),
+        }
+    }
+}
+
+/// Binds one listener by the block allocation rule (04_sandbox.md), highest port first and on to
+/// the next one down only past `EADDRINUSE`, and one on port 0. Reports both, holds them until the
+/// controller closes stdin, then reports which of them a connection reached.
+fn serve_on_the_block_and_on_port_zero(base: u16, size: u16) {
+    use std::io::Read;
+
+    let block = (base + 1..base + size)
+        .rev()
+        .find_map(
+            |port| match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => Some(listener),
+                Err(error) if error.kind() == ErrorKind::AddrInUse => None,
+                Err(error) => panic!("bind 127.0.0.1:{port} inside the sandbox: {error}"),
+            },
+        )
+        .expect("a free service port in the block");
+    let ephemeral = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap_or_else(|error| panic!("bind 127.0.0.1:0 inside the sandbox: {error}"));
+    let listeners = [("block", block), ("ephemeral", ephemeral)].map(|(kind, listener)| {
+        let port = listener.local_addr().expect("listener address").port();
+        println!("{TCP_PROBE_LINE}{kind} {port}");
+        (port, listener)
+    });
+    println!("{TCP_PROBE_LINE}ready");
+    std::io::stdin()
+        .read_to_end(&mut Vec::new())
+        .expect("hold until the controller closes stdin");
+    for (port, listener) in &listeners {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        match listener.accept() {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Ok(_) => println!("{TCP_PROBE_LINE}{port} reached"),
+            Err(error) => panic!("accept on {port}: {error}"),
         }
     }
 }
@@ -975,6 +1017,90 @@ async fn host_controller_a_grown_port_block_holds_listener_pairs_no_sibling_reac
     }
     std::fs::remove_dir_all(own_root).expect("remove grown workspace");
     std::fs::remove_dir_all(sibling_root).expect("remove sibling workspace");
+}
+
+/// A job binds the listeners its own processes connect to in its block. A second process of the
+/// same workspace reaches a listener that took a block port by the allocation rule, and is denied
+/// a listener the same server bound on port 0: the kernel picked that port from the host's
+/// ephemeral range, and the connect allowlist holds only the block's literal ports.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_same_workspace_process_reaches_block_listeners_and_not_port_zero_ones() {
+    let blocks = free_probe_blocks();
+    let own = blocks.own;
+    let probe = std::fs::canonicalize(std::env::current_exe().expect("test binary"))
+        .expect("canonical test binary");
+    let root = scratch("own-listeners");
+    let workspace = probe_workspace(&root, own, Vec::new(), &probe);
+
+    let mut server =
+        SandboxedChild::spawn(tcp_probe_request(&workspace, &probe, "serve".to_owned())).await;
+    server
+        .until_probe_line(&format!("{TCP_PROBE_LINE}ready"))
+        .await;
+    let reported = |kind: &str| -> u16 {
+        let prefix = format!("{TCP_PROBE_LINE}{kind} ");
+        let lines = probe_lines(&server.stdout);
+        let line = lines
+            .iter()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("the server reports its {kind} listener: {lines:?}"));
+        line.parse()
+            .unwrap_or_else(|error| panic!("{kind} port `{line}`: {error}"))
+    };
+    let block = reported("block");
+    let ephemeral = reported("ephemeral");
+    assert_eq!(
+        block,
+        *own.ports().expect("own block").end(),
+        "the rule's first candidate, the block's highest port, was free"
+    );
+    assert!(
+        !own.ports().expect("own block").contains(&ephemeral),
+        "port 0 took {ephemeral}, inside the block {own}"
+    );
+
+    let (exit, stdout, stderr) = SandboxedChild::run(tcp_probe_request(
+        &workspace,
+        &probe,
+        format!("connect {block},{ephemeral}"),
+    ))
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "connecting probe: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        probe_lines(&stdout),
+        [
+            format!("{TCP_PROBE_LINE}{} roundtrip", own.base() + 1),
+            format!("{TCP_PROBE_LINE}{block} connected"),
+            format!("{TCP_PROBE_LINE}{ephemeral} denied"),
+        ],
+        "a process of the same workspace reaches the block listener and is denied the port-0 one"
+    );
+
+    server.close_stdin();
+    let (exit, stdout, stderr) = server.wait().await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "serving probe: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        probe_lines(&stdout),
+        [
+            format!("{TCP_PROBE_LINE}block {block}"),
+            format!("{TCP_PROBE_LINE}ephemeral {ephemeral}"),
+            format!("{TCP_PROBE_LINE}ready"),
+            format!("{TCP_PROBE_LINE}{block} reached"),
+        ],
+        "only the block listener saw a connection"
+    );
+    std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
 fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> ProcessSpawnRequest {

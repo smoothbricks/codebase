@@ -293,6 +293,36 @@ Notes:
   sizes are live at once, and `cowshed grant <ws> --ports <N>` can grow a workspace's block (below). Tools that ignore
   the convention bind outside their block and are denied. Linux exports neither value: its services use private loopback
   directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
+- **A sandboxed job binds its listeners in its block (macOS).** Any loopback listener that another process in the same
+  workspace connects to (a test's fake server, a runner's inspector or sync socket, a parent's log sink a worker reports
+  to, the process itself calling back) binds a port of the workspace's block, never port 0, or uses a Unix socket under
+  the workspace tree or the exec temp dir. A port-0 listener still binds, and the host browser still reaches it, but no
+  process in the workspace can connect to it: the kernel picks from the shared ephemeral range (49152–65535), and the
+  Seatbelt connect allowlist holds only the block's literal ports. The allocation rule, for any consumer that reads
+  `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`:
+  - Candidates are `base+1 … base+size-1`. `base` is the gateway's own listener and is never a candidate.
+  - Bind the real listener on a candidate. On `EADDRINUSE`, advance to the next candidate. Any other error is that
+    bind's own failure and surfaces as is. A bind that fails on the last candidate reports its native error, so an
+    exhausted block surfaces as `EADDRINUSE` rather than a silent fall back to port 0.
+  - Keep what you bind. A helper that binds, closes and hands out the number (probe-then-reuse) also advances its own
+    cursor past every port it has handed out, because the port is free again the moment the probe closes.
+  - Allocators that share a block scan from opposite ends to cut down on retries: long-lived test listeners go
+    lowest-first, tool-internal helpers (runner inspector and sync ports, trace sinks) highest-first. Concurrent
+    allocators stay correct anyway, because only the real bind claims a port.
+  - With no `COWSHED_PORT_BASE` (outside cowshed, or on Linux) the consumer binds port 0 as usual. A
+    `COWSHED_PORT_BLOCK_SIZE` without a base, or a base that is unaligned or not a power-of-two size, is a broken
+    environment and is refused, never guessed around. Cowshed itself supplies only the environment and this rule. It
+    does not rewrite a job's listeners, because nothing else is sound on macOS (measured):
+  - SBPL network filters match only static `localhost`/`*` host:port literals. No filter names "a port a same-sandbox
+    process bound", and no sandbox-extension class covers network.
+  - A restricted `network-bind` fails `bind(0)` with EPERM instead of steering it.
+  - The ephemeral range (`net.inet.ip.portrange.*`) is host-global.
+  - `DYLD_INSERT_LIBRARIES` interposition is stripped from the children of every SIP launcher (`/bin/sh`,
+    `/usr/bin/env`) and ignored by hardened-runtime binaries, so it would silently cover some processes and not others.
+    A third-party tool with no port knob is patched at the consumer to follow the rule. A connect it then still makes to
+    a port-0 listener fails in-band with EPERM (`connect`; Bun reports `FailedToOpenSocket` for `127.0.0.1` and
+    `ConnectionRefused` for `localhost`). Cowshed adds no message of its own. The unified-log correlation that could
+    name the denied port (denial evidence, below) is unavailable to a non-admin controller.
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.
 - **Read grants have one narrow meaning.** Built-in system/toolchain roots remain readable so processes can start. A
@@ -633,12 +663,14 @@ evidence — never inferred from output text:
    cleanly distinguishable from an allowed-but-unserved connection (**ECONNREFUSED, errno 61**). This in-band signal is
    authoritative enough for exit 6 to stand on its own when the failing syscall and target are known (e.g. via the
    gateway or pre-flight probes cowshed itself performs).
-5. **Unified-log correlation (macOS) — enhancement, unverified.** Seatbelt violations are believed to reach the unified
-   log with pid, operation, and target, which would let cowshed-shell match a job's pid tree + time window (11_shell.md)
-   to produce `denial.kind` and `suggested_grant` for arbitrary child syscalls. This could not be verified from a
-   sandboxed session (the log store itself is permission-gated) and remains an open item — verify from an unsandboxed
-   controller context (kickoff experiments). The design does not depend on it: sources 1–4 stand alone. The Linux
-   analogue is Landlock audit/LSM notifications where the kernel provides them.
+5. **Unified-log correlation (macOS): not available to the controller.** Seatbelt violations are believed to reach the
+   unified log with pid, operation and target. If they did, cowshed-shell could match a job's pid tree and time window
+   (11_shell.md) to produce `denial.kind` and `suggested_grant` for arbitrary child syscalls. An unsandboxed controller
+   running as a non-admin user cannot read that log. Measured on macOS 26 as that user, outside every sandbox:
+   `log show` fails with `Could not open local log store: Operation not permitted`, `log stream` with
+   `Must be admin to run 'stream' command`. Cowshed does not require an admin user, so it reads no log and builds no
+   denial message from it. Sources 1–4 stand alone. The Linux analogue is Landlock audit/LSM notifications where the
+   kernel provides them.
 
 The SBPL mechanics this profile depends on are measured, not assumed (08_testing.md): port ranges do not parse;
 operation specificity and ordered carve-backs both govern filesystem rules; implicit bind-on-connect is exempt from
