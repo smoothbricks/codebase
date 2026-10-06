@@ -1306,6 +1306,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     try {
       await writeCargoIdentityFixture(workspace);
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      // Installed the way a consumer links it, so the inputs find the wrapper they name. After
+      // inference, whose fixture walk would follow the link.
+      await mkdir(join(workspace.context.workspaceRoot, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(
+        fileURLToPath(new URL('..', import.meta.url)),
+        join(workspace.context.workspaceRoot, 'node_modules/@smoothbricks/nx-plugin'),
+      );
       const offenders: string[] = [];
       for (const [name, target] of cachedCargoTargets(targets)) {
         for (const input of target.inputs ?? []) {

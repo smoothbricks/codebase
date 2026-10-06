@@ -483,6 +483,13 @@ Cowshed never sets `NX_DAEMON=false` for any process, and never withholds the da
   environment therefore reaches code the workspace controls. This is accepted: no checkout holds real secrets in its
   environment, the ones present are temporary, and host-side Nx in an agent's workspace runs with a pure environment.
   Revisit when real secrets exist.
+- **Runtime inputs read only the checkout.** The same adoption runs a host client's runtime hash inputs inside the
+  sandbox with the host's `HOME` and without the job's git isolation. An input that reads the operator's home (git's
+  global configuration, for one) then fails there, and Nx 23.2.1 would hash the failure's text as the key. 04_sandbox.md
+  states the contract that keeps one tree's key identical from every client: inputs are hermetic, and every input runs
+  through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which makes a failed input an Nx error.
+  - **Enforced by**: `packages/nx-plugin/src/runtime-input.test.ts`, which plants a failing input through real Nx, with
+    and without the daemon, and refuses a runtime input in this repository that bypasses the wrapper.
 
 ### One Cargo environment on every path
 

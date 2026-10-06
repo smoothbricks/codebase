@@ -12,6 +12,7 @@ import {
   HASH_SKIPPED_DIRECTORIES,
   readCargoResolve,
 } from './cargo-source-hash.js';
+import { runtimeInput, shellWord } from './runtime-input.js';
 
 /**
  * The named input the plugin infers for every project with crates of a Cargo
@@ -206,7 +207,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     ...packageGlobs.map((glob) => `!${anchored(glob, SKIPPED_TREES)}`),
     ...[...ancestors].sort().map((ancestor) => anchored(ancestor, ANCESTOR_FILES)),
     ...[...loose].sort().map((file) => anchored(file)),
-    ...(external ? [{ runtime: `${CARGO_HASH_COMMAND} ${closureArguments}` }] : []),
+    ...(external ? [runtimeInput(`${CARGO_HASH_COMMAND} ${closureArguments}`)] : []),
   ];
 }
 
@@ -231,9 +232,4 @@ function parent(path: string): string | null {
 
 function contains(directory: string, path: string): boolean {
   return directory === '' || path === directory || path.startsWith(`${directory}/`);
-}
-
-/** One shell word: bare when nothing in it is special to `sh`, single-quoted otherwise. */
-function shellWord(word: string): string {
-  return /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'"'"'`)}'`;
 }

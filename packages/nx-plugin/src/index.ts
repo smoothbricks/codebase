@@ -61,6 +61,7 @@ import {
   EXTRACTED_TARGET_DIR,
   NEXTEST_EXTRACT_BIN,
 } from './nextest-extraction.js';
+import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import {
   isBuildOutputTargetName,
@@ -428,9 +429,9 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
 // declaration that drops it. See cargo-toolchain-policy.ts for why it is the
 // declared pin and not the ambient environment.
 
+/** The toolchain versions `command` prints, from the directory whose `rust-toolchain` selects them. */
 function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
-  const quotedRoot = `'${projectRoot.replaceAll("'", "'\"'\"'")}'`;
-  return { runtime: `cd ${quotedRoot} && ${command}` };
+  return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${command}`)} ${shellWord(projectRoot)}`);
 }
 
 /**
@@ -480,7 +481,7 @@ function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfigurati
   return [
     ...(repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS),
     ...CARGO_TOOLCHAIN_PIN_INPUTS,
-    { runtime: `bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'` },
+    runtimeInput(`bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'`),
     { externalDependencies: ['@napi-rs/cli'] },
   ];
 }
@@ -2509,9 +2510,9 @@ async function addCargoTestTargets(
         ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
         posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
       ]),
-      {
-        runtime: `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' '${PLUGIN_NEXTEST_CONFIG.replaceAll("'", "'\"'\"'")}'`,
-      },
+      runtimeInput(
+        `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' ${shellWord(PLUGIN_NEXTEST_CONFIG)}`,
+      ),
     ];
     const archive = cargoTargetDependency(currentProjectName, {
       projectName: workspace.rootProjectName,

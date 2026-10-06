@@ -783,6 +783,30 @@ reasons. A workspace is a clone of main for changing main in parallel. Main's en
 and the credentials it carries today are temporary. Host-side Nx in coder workspaces runs from the pure environment, not
 a login shell's. Revisit this property once real secrets can reach a host shell that runs Nx in a workspace.
 
+The same adoption decides what a runtime hash input sees. Nx runs a task's `runtime` inputs in the process that hashes
+the task, which for a workspace's clients is the daemon inside the sandbox, and lays the requesting client's environment
+over each command (pinned Nx 23.2.1, `native/tasks/hashers/hash_runtime.rs`; the client sends its whole environment as
+the task's). An input a host client asks for therefore runs under the sandbox's filesystem authority with the host's
+`HOME` and without this job contract: no private `XDG_*` directories and no git isolation (`GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_NOSYSTEM`, the fetch-route include). Applying the client's environment also deletes those variables from the
+daemon's own process environment, and Nx 23.2.1 has no setting that keeps a daemon variable against a client. `git` with
+the host's `HOME` reads the host user's global configuration, the sandbox denies it (`EPERM`), and git dies on any error
+but a missing file. Cowshed does not widen the profile to the host's git configuration, which holds credential helpers
+and is exactly what the captured identity keeps out of every workspace (02_workspaces.md), and does not withhold the
+daemon (16_build_volumes.md).
+
+So the contract sits on the input: **a runtime input reads only its checkout and its declared environment, never the
+operator's home.** A `git` command in one runs with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`, which also
+keeps the operator's `log` and `diff` settings out of the key. Such an input computes the same value through the
+sandboxed daemon, in a sandboxed client and in a daemonless host client. One that breaks the contract fails when a host
+client uses it, and Nx must report that failure as an error. Nx 23.2.1 ignores a runtime input's exit status and hashes
+its stdout and stderr, so a failed input would otherwise become a valid key: its error text, constant across every tree.
+Every runtime input therefore runs through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which keys on stdout alone
+and turns a nonzero exit into an Nx error. Measured on one consumer test target before the contract: a sandboxed client
+(through the sandboxed daemon) and a daemonless host client both hashed it `6594635368833226346`. A host client through
+the sandboxed daemon hashed it `10802304702072678079`, because its git-history input hashed git's
+`unable to access '/Users/<user>/.config/git/config': Operation not permitted` in place of the history.
+
 Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
 dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write
 grant is not a socket grant, and a read-only job cannot reach the sockets read-write jobs' daemons keep under the mount.

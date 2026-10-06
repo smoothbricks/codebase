@@ -192,7 +192,7 @@ it('leaves a closure inside the workspace to Nx: no process runs when its tasks 
     // app reaches `external`, the one member only a process can hash, and
     // only it: the in-workspace members stay filesets.
     expect(runtimeCommands('packages/app')).toEqual([
-      'node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-hash.js --closure packages/app Cargo.toml',
+      'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-hash.js --closure packages/app Cargo.toml',
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });

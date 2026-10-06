@@ -251,6 +251,7 @@
     "dist",
     "src",
     "nextest.toml",
+    "runtime-input.sh",
     "test-timings.json",
     "README.md",
     "loader.js",

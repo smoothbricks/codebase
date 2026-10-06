@@ -163,6 +163,29 @@ Keep workspace-owned runtime state outside Nx's source index. In a cowshed works
 `.cowshed/`: Nx's watcher reads the root ignore files, not Git's `.git/info/exclude`. Watching the daemon's own log,
 plugin sockets or job records turns each graph computation into another file event and another graph computation.
 
+### Runtime inputs
+
+Every runtime input, inferred or declared, runs through `runtime-input.sh`:
+
+```json
+{ "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --version" }
+```
+
+Nx 23.2.1 hashes a runtime input's stdout and stderr and ignores its exit status, so a failed input becomes a valid key:
+its error text, one string for every history, toolchain or file it could not read, and a result cached under it is
+replayed for all of them. The script keys on the command's stdout alone and turns a nonzero exit into an Nx error: it
+ends stdout with the byte 0xFF, and Nx refuses output that is not UTF-8
+(`invalid utf-8 sequence of 1 bytes from index N`, exit 1). That message names neither the input nor its cause; run the
+target's runtime inputs (`nx show target <project>:<target> --inputs`) by hand to read the cause.
+`runtime-input.test.ts` plants a failure through real Nx and fails if Nx ever hashes those bytes instead of refusing
+them.
+
+An input that runs inside a cowshed workspace's sandboxed daemon gets the client's environment, a host shell's `HOME`
+included, but not the client's filesystem view (cowshed `04_sandbox.md`). An input that reads the operator's home fails
+there, so a runtime input reads only the checkout and its declared environment. A `git` command in one sets
+`GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`: the key is a function of the repository, not of the operator's git
+configuration.
+
 ### Cargo source runtime inputs
 
 For inferred Cargo targets in a repository-root Cargo workspace, declare the external-source input once:
@@ -170,7 +193,7 @@ For inferred Cargo targets in a repository-root Cargo workspace, declare the ext
 ```json
 {
   "namedInputs": {
-    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }]
+    "externalRustCrates": [{ "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash" }]
   }
 }
 ```
@@ -220,11 +243,10 @@ resolution checks external manifests too, so a dependency introduced by an exter
 
 A runtime input that cannot be computed, whether from a manifest or locked dependency it cannot resolve or from
 arguments it refuses, prints one fixed line (`cargo-input-unavailable`, `cargo-input-invalid-arguments`) and exits
-nonzero. Nx hashes a runtime input's stderr even when it exits nonzero, so stderr carries the same bytes in every
-checkout: an unresolvable input writes its cause there, Cargo's own message included, with the checkout's absolute path
-written as a relative one and Cargo's timing-dependent lock-wait lines dropped; refused arguments write nothing. The
-cause reaches whoever reads the failed input, and the Cargo target that runs next still refuses the missing dependency
-or manifest with Cargo's own cause.
+nonzero, and `runtime-input.sh` turns that into an Nx error. Its stderr names the cause, Cargo's own message included,
+with the checkout's absolute path written as a relative one and Cargo's timing-dependent lock-wait lines dropped;
+refused arguments write nothing. The Cargo target, run by hand, still refuses the missing dependency or manifest with
+Cargo's own cause.
 
 Cargo resolution failures (no `cargo` on PATH, a stale `Cargo.lock`, or an unavailable locked dependency) fail graph
 inference with `CargoMetadataError`, including the manifest path and Cargo's cause. A member inside the workspace
@@ -255,7 +277,9 @@ project declares its own named input and names its directory:
 {
   "namedInputs": {
     "cargoSources": [
-      { "runtime": "smoo-nx-cargo-hash --include-workspace --closure packages/example" },
+      {
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash --include-workspace --closure packages/example"
+      },
       "{workspaceRoot}/Cargo.lock",
       "{workspaceRoot}/devenv.lock",
       "{workspaceRoot}/tooling/direnv/devenv.lock"

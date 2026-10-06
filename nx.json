@@ -17,7 +17,9 @@
       "!{projectRoot}/**/*.spec.*"
     ],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
-    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }],
+    "externalRustCrates": [
+      { "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash" }
+    ],
     "rustWorkspace": [
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",
@@ -36,7 +38,7 @@
     ],
     "lmaoGitRevision": [
       {
-        "runtime": "sh -c 'if [ -n \"${LMAO_GIT_REVISION:-}\" ]; then printf \"%s\\n\" \"$LMAO_GIT_REVISION\"; elif revision=$(git rev-parse HEAD 2>/dev/null); then printf \"%s\\n\" \"$revision\"; else printf \"unknown\\n\"; fi'"
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'if [ -n \"${LMAO_GIT_REVISION:-}\" ]; then printf \"%s\\n\" \"$LMAO_GIT_REVISION\"; else GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD; fi'"
       }
     ]
   },
