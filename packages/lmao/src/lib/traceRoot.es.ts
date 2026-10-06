@@ -30,6 +30,7 @@ import {
 } from './traceRoot.js';
 import { TraceTopology } from './traceTopology.js';
 import type { AnySpanBuffer } from './types.js';
+import { millisToNanos, performanceWallNanos, WallClock } from './wallClock.js';
 
 /** Shared TextEncoder for trace_id encoding (stateless, reusable) */
 const textEncoder = new TextEncoder();
@@ -223,6 +224,9 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   }
 }
 
+/** Where the wall clock stands against `performance.now()`, learned across this realm's trace roots. */
+const performanceWallClock = new WallClock();
+
 /**
  * Factory function for creating browser TraceRoot instances.
  * Pass this to Tracer constructor for browser/ES environments.
@@ -232,8 +236,15 @@ export function createTraceRoot<T extends LogSchema>(
   tracer: TracerLifecycleHooks<T>,
   parent?: RemoteParent,
 ): TraceRoot<T> {
-  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  const before = Date.now();
   const anchorPerfNow = performance.now();
+  // The wall clock at that read, to sub-millisecond precision (`WallClock`).
+  const anchorEpochNanos = performanceWallClock.anchor(
+    millisToNanos(anchorPerfNow),
+    before,
+    Date.now(),
+    performanceWallNanos(anchorPerfNow),
+  );
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, tracer, parent);
 }
 //#endregion smoo/lmao!n/es-trace-root

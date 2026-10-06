@@ -29,6 +29,7 @@ import {
 } from './traceRoot.js';
 import { TraceTopology } from './traceTopology.js';
 import type { AnySpanBuffer } from './types.js';
+import { performanceWallNanos, WallClock } from './wallClock.js';
 
 /** Shared TextEncoder for trace_id encoding (stateless, reusable) */
 const textEncoder = new TextEncoder();
@@ -221,6 +222,9 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   }
 }
 
+/** Where the wall clock stands against `process.hrtime`, learned across this process's trace roots. */
+const hrtimeWallClock = new WallClock();
+
 /**
  * Factory function for creating Node.js TraceRoot instances.
  * Pass this to Tracer constructor for Node.js environments.
@@ -230,8 +234,11 @@ export function createTraceRoot<T extends LogSchema>(
   tracer: TracerLifecycleHooks<T>,
   parent?: RemoteParent,
 ): TraceRoot<T> {
-  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  const before = Date.now();
   const anchorHrtimeBigInt = process.hrtime.bigint();
+  const guess = performanceWallNanos(performance.now());
+  // The wall clock at the hrtime read, to sub-millisecond precision (`WallClock`).
+  const anchorEpochNanos = hrtimeWallClock.anchor(anchorHrtimeBigInt, before, Date.now(), guess);
   // Also store as f64 in the shared _system layout (WASM reads it without BigInt extraction)
   const anchorPerfNow = Number(anchorHrtimeBigInt);
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer, parent);

@@ -11,6 +11,7 @@ import { createTraceRoot as createEsTraceRoot, TraceRoot as EsTraceRoot } from '
 import type { TracerLifecycleHooks } from '../traceRoot.js';
 import { createTraceRoot as createNodeTraceRoot, TraceRoot as NodeTraceRoot } from '../traceRoot.node.js';
 import type { SpanBuffer } from '../types.js';
+import { WallClock } from '../wallClock.js';
 import { createTestSpanBuffer } from './test-helpers.js';
 
 const mockBuffer = createTestSpanBuffer({}).spanBuffer;
@@ -39,6 +40,21 @@ function withPerformanceNow<T>(now: () => number, run: () => T): T {
     return run();
   } finally {
     Object.defineProperty(performance, 'now', { configurable: true, value: original });
+  }
+}
+
+/** Run `run` with `performance.timeOrigin`, `performance.now()` and `Date.now()` answering as given. */
+function withWallClock<T>(clock: { origin: number; now: number; date: () => number }, run: () => T): T {
+  const originalDateNow = Date.now;
+  const ownOrigin = Object.getOwnPropertyDescriptor(performance, 'timeOrigin');
+  Object.defineProperty(performance, 'timeOrigin', { configurable: true, get: () => clock.origin });
+  Date.now = clock.date;
+  try {
+    return withPerformanceNow(() => clock.now, run);
+  } finally {
+    Date.now = originalDateNow;
+    if (ownOrigin === undefined) Reflect.deleteProperty(performance, 'timeOrigin');
+    else Object.defineProperty(performance, 'timeOrigin', ownOrigin);
   }
 }
 
@@ -272,29 +288,37 @@ describe('Platform timestamp append contract', () => {
   });
 
   it('re-anchors each new trace while an existing trace ignores wall-clock rollback', () => {
-    const originalDateNow = Date.now;
     const originalHrtime = process.hrtime.bigint;
-    const wallTimes = [1_700_000_000_000, 1_699_999_000_000];
+    // Each root reads the wall clock before and after its monotonic read.
+    const wallTimes = [1_700_000_000_000, 1_700_000_000_000, 1_699_999_000_000, 1_699_999_000_000];
     const ticks = [100n, 110n, 200n, 220n, 120n];
     const firstStart = createMockSpanBuffer();
     const secondStart = createMockSpanBuffer();
     let wallIndex = 0;
     let tickIndex = 0;
-    Date.now = () => wallTimes[wallIndex++] ?? wallTimes[wallTimes.length - 1];
     process.hrtime.bigint = () => ticks[tickIndex++] ?? ticks[ticks.length - 1];
 
     try {
-      const first = createNodeTraceRoot('first-anchor', createMockTracer());
-      first._writeSpanStart(first, firstStart, 'first');
-      const second = createNodeTraceRoot('second-anchor', createMockTracer());
-      second._writeSpanStart(second, secondStart, 'second');
+      // The platform's sub-millisecond estimate stays where the first wall clock was: 0.25 ms into its millisecond.
+      const [first, second] = withWallClock(
+        { origin: wallTimes[0], now: 0.25, date: () => wallTimes[wallIndex++] ?? wallTimes[wallTimes.length - 1] },
+        () => {
+          const first = createNodeTraceRoot('first-anchor', createMockTracer());
+          first._writeSpanStart(first, firstStart, 'first');
+          const second = createNodeTraceRoot('second-anchor', createMockTracer());
+          second._writeSpanStart(second, secondStart, 'second');
+          return [first, second];
+        },
+      );
       const firstLater = first._timestampNow(first);
 
-      expect(firstStart.timestamp[0]).toBe(BigInt(wallTimes[0]) * 1_000_000n + 10n);
-      expect(secondStart.timestamp[0]).toBe(BigInt(wallTimes[1]) * 1_000_000n + 20n);
+      expect(firstStart.timestamp[0]).toBe(BigInt(wallTimes[0]) * 1_000_000n + 250_000n + 10n);
+      // The wall clock stepped back 1000 s: the second trace anchors on it, and the estimate it disproves is held
+      // inside the millisecond the wall clock names.
+      expect(secondStart.timestamp[0]).toBe(BigInt(wallTimes[2]) * 1_000_000n + 999_999n + 20n);
       expect(firstLater).toBeGreaterThan(firstStart.timestamp[0]);
+      expect(second.anchorEpochNanos).toBe(BigInt(wallTimes[2]) * 1_000_000n + 999_999n);
     } finally {
-      Date.now = originalDateNow;
       process.hrtime.bigint = originalHrtime;
     }
   });
@@ -426,5 +450,74 @@ describe('Platform entry points export createTraceRoot', () => {
     const esModule = await import('../../es.js');
     expect(esModule.createTraceRoot).toBeDefined();
     expect(typeof esModule.createTraceRoot).toBe('function');
+  });
+});
+
+describe('Trace root wall-clock anchor', () => {
+  const millisecond = 1_700_000_000_000;
+  const millisecondNanos = BigInt(millisecond) * 1_000_000n;
+
+  it('anchors at the platform sub-millisecond estimate, not the truncated Date.now() millisecond', () => {
+    const anchored = new WallClock().anchor(5_000n, millisecond, millisecond, millisecondNanos + 437_500n);
+    expect(anchored).toBe(millisecondNanos + 437_500n);
+  });
+
+  it('anchors Node and ES roots on the sub-millisecond wall clock', () => {
+    const [node, es] = withWallClock({ origin: millisecond - 1_000, now: 1_000.4375, date: () => millisecond }, () => [
+      createNodeTraceRoot('node-sub-ms', createMockTracer()),
+      createEsTraceRoot('es-sub-ms', createMockTracer()),
+    ]);
+    expect(node.anchorEpochNanos).toBe(millisecondNanos + 437_500n);
+    expect(es.anchorEpochNanos).toBe(millisecondNanos + 437_500n);
+  });
+
+  it('holds an estimate the Date.now() reads disprove inside the millisecond they name', () => {
+    // `performance.timeOrigin` measured 200–320 µs early under bun test.
+    const early = new WallClock().anchor(0n, millisecond, millisecond, millisecondNanos - 300_000n);
+    expect(early).toBe(millisecondNanos);
+    const late = new WallClock().anchor(0n, millisecond, millisecond, millisecondNanos + 1_300_000n);
+    expect(late).toBe(millisecondNanos + 999_999n);
+  });
+
+  it('learns the offset from anchors that fall at different points of a millisecond', () => {
+    // The true wall clock is the monotonic clock plus `offset`; there is no platform estimate.
+    const offset = millisecondNanos + 400_000n;
+    const clock = new WallClock();
+    const read = (monotonic: bigint) => {
+      const wallMs = Number((monotonic + offset) / 1_000_000n);
+      return clock.anchor(monotonic, wallMs, wallMs, undefined) - monotonic;
+    };
+    // One read leaves the whole millisecond open.
+    expect(read(0n)).toBe(millisecondNanos + 499_999n);
+    // Reads just past and just before a millisecond boundary close it on the offset, less what the host could have
+    // slewed the wall clock in the 1.6 ms between them (500 ppm).
+    read(600_000n);
+    const learned = read(1_599_999n);
+    expect(learned).toBeGreaterThanOrEqual(offset - 800n);
+    expect(learned).toBeLessThanOrEqual(offset);
+  });
+
+  it('starts over when the wall clock is stepped', () => {
+    const clock = new WallClock();
+    clock.anchor(0n, millisecond, millisecond, millisecondNanos + 100_000n);
+    const stepped = millisecond - 10_000;
+    const anchored = clock.anchor(1_000n, stepped, stepped, undefined);
+    expect(anchored).toBeGreaterThanOrEqual(BigInt(stepped) * 1_000_000n);
+    expect(anchored).toBeLessThan(BigInt(stepped + 1) * 1_000_000n);
+  });
+
+  it('anchors real roots inside the wall-clock millisecond with sub-millisecond digits', () => {
+    const anchors: bigint[] = [];
+    for (let i = 0; i < 64; i++) {
+      for (const create of [createNodeTraceRoot, createEsTraceRoot]) {
+        const before = BigInt(Date.now()) * 1_000_000n;
+        const root = create('real-anchor', createMockTracer());
+        const after = BigInt(Date.now() + 1) * 1_000_000n;
+        expect(root.anchorEpochNanos).toBeGreaterThanOrEqual(before);
+        expect(root.anchorEpochNanos).toBeLessThan(after);
+        anchors.push(root.anchorEpochNanos);
+      }
+    }
+    expect(anchors.some((anchor) => anchor % 1_000_000n !== 0n)).toBe(true);
   });
 });

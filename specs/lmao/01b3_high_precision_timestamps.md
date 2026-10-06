@@ -95,8 +95,8 @@ const filename = `traces-${Date.now()}.parquet`;
 ### Browser Implementation
 
 ```typescript
-// ONE Date.now() captured at trace root (when Tracer.trace() creates TraceRoot)
-// ONE performance.now() captured at trace root
+// ONE performance.now() and ONE Date.now() captured at trace root (when Tracer.trace() creates TraceRoot):
+// together they are the sub-millisecond wall-clock anchor (wallClockNanos, "Implementation" below)
 // All subsequent timestamps use delta calculation
 
 // TraceRoot - stored on root SpanBuffer, shared by all spans via reference
@@ -104,7 +104,7 @@ interface TraceRoot {
   readonly trace_id: TraceId;
 
   // Time anchor - flat primitives, not nested object
-  readonly anchorEpochNanos: bigint; // BigInt(Date.now()) * 1_000_000n at trace root
+  readonly anchorEpochNanos: bigint; // wallClockNanos(anchorPerfNow, Date.now()) at trace root
   readonly anchorPerfNow: number; // performance.now() at trace root
 
   // Reference to tracer for lifecycle hooks
@@ -113,10 +113,11 @@ interface TraceRoot {
 
 // Created by Tracer.trace() before root span execution
 function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
+  const anchorPerfNow = performance.now();
   return {
     trace_id: traceId ?? generateTraceId(),
-    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
-    anchorPerfNow: performance.now(),
+    anchorEpochNanos: wallClockNanos(anchorPerfNow, Date.now()),
+    anchorPerfNow,
     tracer,
   };
 }
@@ -141,8 +142,8 @@ function getTimestamp(buffer: SpanBuffer): bigint {
 ### Node.js Implementation
 
 ```typescript
-// ONE Date.now() captured at trace root (when Tracer.trace() creates TraceRoot)
-// ONE process.hrtime.bigint() captured at trace root
+// ONE process.hrtime.bigint() captured at trace root (when Tracer.trace() creates TraceRoot), and right after it
+// ONE performance.now() and ONE Date.now(): the sub-millisecond wall-clock anchor (wallClockNanos)
 // All subsequent timestamps use hrtime delta
 
 // TraceRoot - stored on root SpanBuffer, shared by all spans via reference
@@ -151,7 +152,7 @@ interface TraceRoot {
   readonly trace_id: TraceId;
 
   // Time anchor - flat primitives
-  readonly anchorEpochNanos: bigint; // BigInt(Date.now()) * 1_000_000n at trace root
+  readonly anchorEpochNanos: bigint; // wallClockNanos(performance.now(), Date.now()) at trace root
   readonly anchorPerfNow: number; // Number(process.hrtime.bigint()) at trace root
 
   // Reference to tracer for lifecycle hooks
@@ -160,10 +161,11 @@ interface TraceRoot {
 
 // Created by Tracer.trace() before root span execution
 function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
+  const anchorPerfNow = Number(process.hrtime.bigint());
   return {
     trace_id: traceId ?? generateTraceId(),
-    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
-    anchorPerfNow: Number(process.hrtime.bigint()),
+    anchorEpochNanos: wallClockNanos(performance.now(), Date.now()),
+    anchorPerfNow,
     tracer,
   };
 }
@@ -297,8 +299,8 @@ class TraceRoot implements ITraceRoot {
   }
 }
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
-  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
   const anchorHrtimeBigInt = process.hrtime.bigint();
+  const anchorEpochNanos = wallClockNanos(performance.now(), Date.now()); // sub-ms wall clock, see below
   return new TraceRoot(
     createTraceId(trace_id),
     anchorEpochNanos,
@@ -317,8 +319,9 @@ class TraceRoot implements ITraceRoot {
   }
 }
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
-  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
-  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, performance.now(), tracer);
+  const anchorPerfNow = performance.now();
+  const anchorEpochNanos = wallClockNanos(anchorPerfNow, Date.now()); // sub-ms wall clock, see below
+  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, tracer);
 }
 ```
 
@@ -332,3 +335,15 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
   test pins this. This supersedes a `BigInt(Math.round(anchorPerfNow))` approach, which would drift.
 - Entry points (`node.ts`, `es.ts`) re-export the matching `createTraceRoot` factory; `Tracer` calls it
 - No runtime platform detection — the platform is chosen at import time (which factory) for zero overhead
+
+**The anchor is the wall clock to sub-millisecond precision** (`wallClockNanos`, `packages/lmao/src/lib/wallClock.ts`).
+`BigInt(Date.now()) * 1_000_000n` is the wall clock truncated to the millisecond, so a trace anchored on it is stamped
+up to 1 ms early throughout. A span's parent may be another process's span stamped with an exact wall-clock read (a Rust
+writer reads `CLOCK_REALTIME` at every boundary), and the early anchor made a child that started microseconds after its
+cross-process parent read as starting before it. `performance.timeOrigin + performance.now()` carries the
+sub-millisecond digits but is the process-start wall clock advanced by the monotonic clock, so it drifts by whatever the
+host slewed or stepped since the process started. The anchor is that estimate held inside the millisecond `Date.now()`
+names, read after it: exact to the performance clock (measured within ~2 µs of `CLOCK_REALTIME` under Bun) while the
+drift stays under a millisecond, never more than that millisecond wrong when it does not, and a wall-clock step
+re-anchors the next trace as before. A runtime without `performance.timeOrigin` anchors on the millisecond. Within a
+trace nothing changes: every stamp is the anchor plus the monotonic delta.

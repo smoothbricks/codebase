@@ -698,8 +698,8 @@ interface TraceRoot {
   readonly trace_id: TraceId;
 
   /**
-   * Epoch time in nanoseconds when trace was created.
-   * Captured via Date.now() * 1_000_000n at trace root.
+   * Wall-clock epoch time in nanoseconds when trace was created, to sub-millisecond precision:
+   * `wallClockNanos(performance.now(), Date.now())` at trace root (01b3).
    */
   readonly anchorEpochNanos: bigint;
 
