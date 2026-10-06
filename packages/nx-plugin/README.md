@@ -626,6 +626,27 @@ The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: a
 to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
 plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
 
+Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
+task id and the hash it ran at:
+
+- `bound`: nothing failed but a wall-clock bound. Either the command outlived `timeoutMs`, or every failing test in the
+  runner's JUnit report failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"`,
+  `bun test` writes `type="TimeoutError"`). A loaded host produces exactly these.
+- `wedged`: `idleTimeoutMs` fired. Silence means a hang, never load.
+- `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
+- `passed`.
+
+The report needs no target configuration. When the command runs exactly one `bun test` or `nextest run`, the executor
+asks that runner for a JUnit report in the task's directory: `bun test` through `--reporter=junit --reporter-outfile`,
+nextest through a one-key tool config (nextest takes the report path only from configuration). A script that spawns the
+runner itself passes `--reporter=junit --reporter-outfile="$BOUNDED_EXEC_JUNIT"` on; the variable is set for every task.
+A command with no runner, or with two (they would write one report), is judged by its exit alone.
+
+`smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in the Nx cache directory) against those records
+and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for that task's
+hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a loaded host failed,
+and to stop on anything else.
+
 The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
 tools that need to normalize package JSON consistently.
 

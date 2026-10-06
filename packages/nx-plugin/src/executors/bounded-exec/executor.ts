@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
+import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
 import {
   createHostCommands,
@@ -10,6 +11,17 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import type { BoundedExecOptions } from './schema.js';
+import {
+  type BoundedExecTask,
+  clearTaskDirectory,
+  JUNIT_FILE,
+  JUNIT_REPORT_ENV,
+  judgeRun,
+  readJunitReport,
+  taskDirectory,
+  withJunitReport,
+  writeRecord,
+} from './verdict.js';
 
 const DEFAULT_KILL_AFTER_MS = 10_000;
 const REAP_AFTER_FORCE_KILL_MS = 2_000;
@@ -21,6 +33,17 @@ const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
 
 export interface BoundedExecContext {
   root: string;
+  /** The Nx task this run executes as, and the directory its verdict and report go to. */
+  record?: { task: BoundedExecTask; directory: string };
+}
+
+/** The part of Nx's executor context that names the running task. */
+export interface NxTaskContext {
+  root: string;
+  projectName?: string;
+  targetName?: string;
+  configurationName?: string;
+  taskGraph?: { tasks: Record<string, { hash?: string }> };
 }
 
 export interface BoundedExecResult {
@@ -56,14 +79,37 @@ export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness'>
 
 export default function boundedExecExecutor(
   options: BoundedExecOptions,
-  context: BoundedExecContext,
+  context: NxTaskContext,
 ): Promise<BoundedExecResult> {
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
   const tempVolume =
     process.platform === 'darwin'
       ? new RamTempVolume(ramTempPaths(process.getuid?.() ?? 0), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
       : null;
-  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume);
+  return runBoundedExec(options, recordContext(context), createProcessTreeKiller(), tempVolume);
+}
+
+/**
+ * Nx gives an executor the task's project, target and configuration, not its id; the id is the
+ * key of the task graph entry they name. Outside a task graph the run records nothing.
+ */
+export function recordContext(context: NxTaskContext): BoundedExecContext {
+  const { root, projectName, targetName, configurationName, taskGraph } = context;
+  if (!projectName || !targetName) {
+    return { root };
+  }
+  const id = `${projectName}:${targetName}${configurationName ? `:${configurationName}` : ''}`;
+  const task = taskGraph?.tasks[id];
+  if (task === undefined) {
+    return { root };
+  }
+  return {
+    root,
+    record: {
+      task: { id, hash: task.hash ?? null },
+      directory: taskDirectory(workspaceDataDirectoryForWorkspace(root), id),
+    },
+  };
 }
 
 export async function runBoundedExec(
@@ -73,12 +119,20 @@ export async function runBoundedExec(
   tempVolume: TempVolume | null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
-  const command = buildCommand(options);
+  const directory = context.record?.directory ?? null;
+  // A previous run's verdict and report go first, so neither can be read as this run's.
+  if (directory !== null) {
+    await clearTaskDirectory(directory);
+  }
+  const command = directory === null ? buildCommand(options) : await withJunitReport(buildCommand(options), directory);
   const timeoutMs = options.timeoutMs;
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
   const outputChunks: string[] = [];
   const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
+  // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes
+  // its JUnit report to this path when it is set.
+  const env = directory === null ? options.env : { [JUNIT_REPORT_ENV]: join(directory, JUNIT_FILE), ...options.env };
 
   let lease: RamTempLease | null = null;
   if (tempVolume !== null) {
@@ -116,7 +170,7 @@ export async function runBoundedExec(
   const startedAt = Date.now();
   const child = spawn(command, [], {
     cwd,
-    env: mergeEnv(lease, options.env),
+    env: mergeEnv(lease, env),
     shell: true,
     detached: process.platform !== 'win32',
     windowsHide: true,
@@ -259,6 +313,20 @@ export async function runBoundedExec(
     appendStderr(`${describeRamTempError(full)}\n`);
   }
   await releaseLease();
+
+  if (context.record !== undefined) {
+    const { task, directory: recordDirectory } = context.record;
+    const verdict = judgeRun({
+      exitCode: code,
+      elapsedMs: Date.now() - startedAt,
+      expiry: state.expiry,
+      report: await readJunitReport(recordDirectory),
+    });
+    if (verdict.outcome === 'bound' && verdict.bound === 'test') {
+      appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
+    }
+    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict });
+  }
 
   return {
     success: state.expiry === null && code === 0,
