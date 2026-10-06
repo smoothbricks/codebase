@@ -50,13 +50,14 @@ pub struct MirrorRequest {
     pub target: CanonicalTarget,
     pub method: Method,
     pub upstream_path: String,
+    /// The client's request headers less secrets. `to_fetch` derives what goes upstream from them.
     pub headers: HeaderMap,
     pub metadata: MirrorProtocolMetadata,
     pub cache_scope: MirrorCacheScope,
     pub credentialed: bool,
     pub redirects_remaining: u8,
     /// The packument representation this request names: `Some` exactly for an npm packument.
-    /// `headers` only carry what is sent upstream; the cache identity comes from here.
+    /// The cache identity comes from here, not from `headers`.
     representation: Option<PackumentRepresentation>,
 }
 
@@ -119,13 +120,19 @@ impl MirrorRequest {
         })
     }
 
+    /// The upstream request. The client's validators stay behind: the mirror evaluates them
+    /// against the representation it serves (`answer_validators`), and the only validators it
+    /// sends upstream are its cached entry's own.
     pub fn to_fetch(&self) -> MirrorFetchRequest {
+        let mut headers = self.headers.clone();
+        headers.remove(header::IF_NONE_MATCH);
+        headers.remove(header::IF_MODIFIED_SINCE);
         MirrorFetchRequest {
             protocol: self.protocol,
             target: self.target.clone(),
             method: self.method.clone(),
             path: self.upstream_path.clone(),
-            headers: self.headers.clone(),
+            headers,
             redirects_remaining: self.redirects_remaining,
         }
     }
@@ -301,7 +308,10 @@ impl MirrorService {
                     .await?,
             );
         }
-        self.execute_expected(request, health, upstream).await
+        let outcome = self
+            .execute_expected(&mut request, health, upstream)
+            .await?;
+        answer_validators(&request.headers, outcome).await
     }
 
     /// Published integrity is indexed once, as the unchanged packument fills the cache. The index
@@ -335,7 +345,7 @@ impl MirrorService {
                     header::ACCEPT,
                     HeaderValue::from_static(PackumentRepresentation::InstallV1.upstream_accept()),
                 );
-                let packument = MirrorRequest::new(
+                let mut packument = MirrorRequest::new(
                     MirrorProtocol::Npm,
                     tarball.target.clone(),
                     Method::GET,
@@ -345,8 +355,9 @@ impl MirrorService {
                     tarball.credentialed,
                     None,
                 )?;
-                let MirrorOutcome::Response(response) =
-                    self.execute_expected(packument, health, upstream).await?
+                let MirrorOutcome::Response(response) = self
+                    .execute_expected(&mut packument, health, upstream)
+                    .await?
                 else {
                     return Err(MirrorError::MissingIntegrity);
                 };
@@ -417,7 +428,7 @@ impl MirrorService {
 
     async fn execute_expected<U>(
         &self,
-        mut request: MirrorRequest,
+        request: &mut MirrorRequest,
         health: UpstreamHealth,
         upstream: &U,
     ) -> Result<MirrorOutcome, MirrorError>
@@ -461,7 +472,7 @@ impl MirrorService {
                     }
                     if request.method == Method::HEAD {
                         permit.bypass().await?;
-                        return self.fetch_bypassed(&request, upstream).await;
+                        return self.fetch_bypassed(request, upstream).await;
                     }
                     let previous = match self.cache.validate_previous(&permit).await {
                         Ok(previous) => previous,
@@ -489,10 +500,10 @@ impl MirrorService {
                     }
                     if response.status().is_redirection() {
                         permit.bypass().await?;
-                        return redirect_outcome(&request, &response);
+                        return redirect_outcome(request, &response);
                     }
                     validate_representation(&response)?;
-                    if response.status() != StatusCode::OK || !cacheable(&request, &response) {
+                    if response.status() != StatusCode::OK || !cacheable(request, &response) {
                         permit.bypass().await?;
                         return Ok(MirrorOutcome::Response(MirrorResponse {
                             response: sanitize_response(response),
@@ -510,7 +521,7 @@ impl MirrorService {
                     {
                         expected.length = response_content_length(&response)?;
                     }
-                    let max_bytes = response_limit(&request, &response)?;
+                    let max_bytes = response_limit(request, &response)?;
                     let (mut parts, body) = response.into_parts();
                     strip_response_secrets(&mut parts.headers);
                     let cached = CachedResponse {
@@ -839,14 +850,149 @@ fn empty_body() -> MirrorBody {
         .boxed()
 }
 
+/// The mirror's own upstream validators: the cached entry's, never the client's.
 fn add_conditionals(headers: &mut HeaderMap, response: &CachedResponse) {
-    headers.remove(header::IF_NONE_MATCH);
-    headers.remove(header::IF_MODIFIED_SINCE);
     if let Some(etag) = response.etag() {
         headers.insert(header::IF_NONE_MATCH, etag.clone());
     } else if let Some(last_modified) = response.last_modified() {
         headers.insert(header::IF_MODIFIED_SINCE, last_modified.clone());
     }
+}
+
+/// Answers the client's validators (RFC 9110 §13.1) against the representation the mirror
+/// resolved, whichever way it was produced: cache hit, revalidation, fill or bypass. A registry's
+/// 304 answers the validator it was sent and leaves the mirror no body to serve or cache, so
+/// client validators never travel upstream.
+///
+/// A representation the client already holds is a `304` carrying the headers that identify it.
+/// A fill still publishes before the answer: the client's validator does not make the object
+/// less worth caching for the next request.
+async fn answer_validators(
+    request: &HeaderMap,
+    outcome: MirrorOutcome,
+) -> Result<MirrorOutcome, MirrorError> {
+    let MirrorOutcome::Response(MirrorResponse {
+        response,
+        cache_status,
+    }) = outcome
+    else {
+        return Ok(outcome);
+    };
+    if !response.status().is_success() || !client_holds(request, response.headers()) {
+        return Ok(MirrorOutcome::Response(MirrorResponse {
+            response,
+            cache_status,
+        }));
+    }
+    let (parts, mut body) = response.into_parts();
+    if cache_status == MirrorCacheStatus::Filled {
+        while let Some(frame) = body.frame().await {
+            frame.map_err(MirrorError::Upstream)?;
+        }
+    }
+    Ok(MirrorOutcome::Response(MirrorResponse {
+        response: not_modified(&parts.headers),
+        cache_status,
+    }))
+}
+
+/// RFC 9110 §13.2.2 steps 3 and 4 for a GET or HEAD answered 2xx: whether the client's
+/// validators say it already holds `response`. `If-None-Match` compares weakly and rules out
+/// `If-Modified-Since`, which counts only as one valid HTTP-date against `Last-Modified`. A
+/// validator the mirror cannot read never matches: serving the representation is always safe.
+fn client_holds(request: &HeaderMap, response: &HeaderMap) -> bool {
+    if request.contains_key(header::IF_NONE_MATCH) {
+        let etag = response
+            .get(header::ETAG)
+            .and_then(|value| entity_tag(value.as_bytes()));
+        return request
+            .get_all(header::IF_NONE_MATCH)
+            .iter()
+            .flat_map(|value| list_members(value.as_bytes()))
+            .any(|member| match member {
+                Member::Any => true,
+                Member::Tag(tag) => etag == Some(tag),
+            });
+    }
+    let mut dates = request.get_all(header::IF_MODIFIED_SINCE).iter();
+    let (Some(since), None) = (dates.next().and_then(http_date), dates.next()) else {
+        return false;
+    };
+    response
+        .get(header::LAST_MODIFIED)
+        .and_then(http_date)
+        .is_some_and(|modified| modified <= since)
+}
+
+fn http_date(value: &HeaderValue) -> Option<SystemTime> {
+    httpdate::parse_http_date(value.to_str().ok()?).ok()
+}
+
+/// One member of an `If-None-Match` list: `*`, or an entity-tag's opaque-tag (the quoted string;
+/// weak comparison, RFC 9110 §8.8.3.2, drops the `W/` flag).
+#[derive(Clone, Copy)]
+enum Member<'a> {
+    Any,
+    Tag(&'a [u8]),
+}
+
+/// The members of one `If-None-Match` field line. A tag may hold commas, so the list is walked
+/// tag by tag; the first malformed member ends it.
+fn list_members(mut rest: &[u8]) -> impl Iterator<Item = Member<'_>> {
+    std::iter::from_fn(move || {
+        let start = rest
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t' | b','))?;
+        rest = &rest[start..];
+        if let Some(tail) = rest.strip_prefix(b"*") {
+            rest = tail;
+            return Some(Member::Any);
+        }
+        let (tag, tail) = split_entity_tag(rest)?;
+        rest = tail;
+        Some(Member::Tag(tag))
+    })
+}
+
+/// The opaque-tag of the entity-tag opening `bytes` (`"x"` and `W/"x"` both give `"x"`), and the
+/// bytes after it.
+fn split_entity_tag(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let quoted = bytes.strip_prefix(b"W/").unwrap_or(bytes);
+    let end = quoted
+        .strip_prefix(b"\"")?
+        .iter()
+        .position(|&byte| byte == b'"')?;
+    Some(quoted.split_at(end + 2))
+}
+
+/// The opaque-tag of a field value that is exactly one entity-tag, as an `ETag` is.
+fn entity_tag(value: &[u8]) -> Option<&[u8]> {
+    split_entity_tag(value)
+        .filter(|(_, rest)| rest.is_empty())
+        .map(|(tag, _)| tag)
+}
+
+/// The headers a 304 repeats from the 200 it stands for (RFC 9110 §15.4.5): what identifies and
+/// caches the representation, and nothing that describes the body that is not sent.
+const NOT_MODIFIED_HEADERS: [header::HeaderName; 7] = [
+    header::CACHE_CONTROL,
+    header::CONTENT_LOCATION,
+    header::DATE,
+    header::ETAG,
+    header::EXPIRES,
+    header::LAST_MODIFIED,
+    header::VARY,
+];
+
+fn not_modified(representation: &HeaderMap) -> Response<MirrorBody> {
+    let mut response = Response::new(empty_body());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    for name in NOT_MODIFIED_HEADERS {
+        for value in representation.get_all(&name) {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    response
 }
 
 fn response_limit(
@@ -960,8 +1106,6 @@ fn redirect_outcome(
     }
     let mut headers = request.headers.clone();
     strip_request_secrets(&mut headers);
-    headers.remove(header::IF_NONE_MATCH);
-    headers.remove(header::IF_MODIFIED_SINCE);
     Ok(MirrorOutcome::Redirect(MirrorRedirect {
         request: MirrorFetchRequest {
             protocol: request.protocol,
@@ -1265,5 +1409,135 @@ mod tests {
             PackumentRepresentation::InstallV1.cache_protocol(),
             PackumentRepresentation::Full.cache_protocol()
         );
+    }
+
+    fn validators(fields: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(name.clone(), HeaderValue::from_str(value).expect("fixture"));
+        }
+        headers
+    }
+
+    fn holds(
+        request: &[(header::HeaderName, &str)],
+        response: &[(header::HeaderName, &str)],
+    ) -> bool {
+        client_holds(&validators(request), &validators(response))
+    }
+
+    #[test]
+    fn if_none_match_compares_weakly_and_reads_each_tag_whole() {
+        let served = |etag| [(header::ETAG, etag)];
+        for (etag, sent, expected) in [
+            ("\"a\"", "\"a\"", true),
+            ("\"a\"", "W/\"a\"", true),
+            ("W/\"a\"", "\"a\"", true),
+            ("W/\"a\"", "W/\"a\"", true),
+            ("\"a\"", "\"b\", \"a\"", true),
+            ("\"a\"", "\"b\" , , \tW/\"a\"", true),
+            ("\"a,b\"", "\"a,b\"", true),
+            ("\"a\"", "*", true),
+            ("\"a\"", "\"b\"", false),
+            ("\"a\"", "\"A\"", false),
+            ("\"a\"", "\"ab\"", false),
+            ("\"a,b\"", "\"a\", \"b\"", false),
+            ("\"a\"", "", false),
+            ("\"a\"", ",", false),
+            ("\"a\"", "a", false),
+            ("\"a\"", "w/\"a\"", false),
+            ("\"a\"", "W/a", false),
+            ("\"a\"", "\"a", false),
+            // A malformed member ends the list: what follows it is never read.
+            ("\"a\"", "a, \"a\"", false),
+            // The registry's own ETag must be one entity-tag for anything but `*` to match it.
+            ("a", "\"a\"", false),
+            ("\"a\" \"b\"", "\"a\"", false),
+            ("\"a\"x", "\"a\"", false),
+        ] {
+            assert_eq!(
+                holds(&[(header::IF_NONE_MATCH, sent)], &served(etag)),
+                expected,
+                "{etag} against {sent:?}"
+            );
+        }
+        assert!(
+            holds(&[(header::IF_NONE_MATCH, "*")], &[]),
+            "`*` matches any current representation, tagged or not"
+        );
+        assert!(!holds(&[(header::IF_NONE_MATCH, "\"a\"")], &[]));
+        assert!(
+            holds(
+                &[
+                    (header::IF_NONE_MATCH, "\"b\""),
+                    (header::IF_NONE_MATCH, "W/\"a\""),
+                ],
+                &served("\"a\"")
+            ),
+            "field lines are one list"
+        );
+    }
+
+    #[test]
+    fn if_modified_since_counts_only_without_if_none_match_and_as_one_valid_date() {
+        let modified = [(header::LAST_MODIFIED, "Fri, 26 Dec 2025 06:55:24 GMT")];
+        for (since, expected) in [
+            ("Fri, 26 Dec 2025 06:55:24 GMT", true),
+            ("Fri, 26 Dec 2025 06:55:25 GMT", true),
+            ("Friday, 26-Dec-25 06:55:24 GMT", true),
+            ("Fri Dec 26 06:55:24 2025", true),
+            ("Fri, 26 Dec 2025 06:55:23 GMT", false),
+            ("Fri, 26 Dec 2025", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                holds(&[(header::IF_MODIFIED_SINCE, since)], &modified),
+                expected,
+                "{since:?}"
+            );
+        }
+        let since = || (header::IF_MODIFIED_SINCE, "Sat, 27 Dec 2025 00:00:00 GMT");
+        assert!(!holds(&[since(), since()], &modified));
+        assert!(
+            !holds(&[since()], &[]),
+            "no Last-Modified, nothing to compare"
+        );
+        assert!(
+            !holds(&[since()], &[(header::LAST_MODIFIED, "sometime last week")]),
+            "an unreadable Last-Modified is not a date"
+        );
+        assert!(
+            !holds(&[(header::IF_NONE_MATCH, "\"b\""), since()], &modified),
+            "If-None-Match rules out If-Modified-Since"
+        );
+    }
+
+    #[test]
+    fn a_304_repeats_what_identifies_the_representation_and_nothing_of_its_body() {
+        let representation = validators(&[
+            (header::ETAG, "\"a\""),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+            (header::DATE, "Fri, 26 Dec 2025 06:55:24 GMT"),
+            (header::LAST_MODIFIED, "Fri, 26 Dec 2025 06:55:24 GMT"),
+            (header::VARY, "accept-encoding"),
+            (header::VARY, "accept"),
+            (header::CONTENT_LENGTH, "5606"),
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CONTENT_ENCODING, "identity"),
+            (header::ACCEPT_RANGES, "bytes"),
+        ]);
+        let response = not_modified(&representation);
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        let mut names = response
+            .headers()
+            .keys()
+            .map(header::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["cache-control", "date", "etag", "last-modified", "vary"]
+        );
+        assert_eq!(response.headers().get_all(header::VARY).iter().count(), 2);
     }
 }

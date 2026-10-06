@@ -84,6 +84,14 @@ Full `application/json` packuments (including npm installs and `npm view`) and c
 identities. Either representation's published index can verify a tarball; the gateway does not fetch a second packument
 just because the install client requested full metadata.
 
+A client's `If-None-Match` or `If-Modified-Since` is answered by the gateway and never forwarded: the registry's `304`
+answers the validator it was sent, which would leave the gateway nothing to serve or cache. `If-None-Match` is compared
+weakly (`W/"x"` matches `"x"`) and rules out `If-Modified-Since`, which is compared with `Last-Modified`. Whether the
+representation comes from a cache hit, a revalidation, or a fill, a client that already holds it gets a `304` repeating
+its `ETag`, `Last-Modified`, `Cache-Control`, `Expires`, `Vary`, `Date`, and `Content-Location`; any other client gets
+the `200`. A fill still publishes before the `304`, so a client with a warm manifest cache (Bun, npm) fills the gateway
+cache instead of failing against it. Only the gateway's own cached entry validates upstream.
+
 The index is persisted as a checksummed appendix to the cache entry, after the unchanged metadata bytes. Cache format
 version 3 discards version 2 entries once on upgrade, so the first install after upgrading is cold. Malformed JSON or
 unsafe, ambiguous integrity metadata aborts the stream and publishes neither cache entry nor index. Unsupported

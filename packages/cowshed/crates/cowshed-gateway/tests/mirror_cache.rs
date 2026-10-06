@@ -2401,3 +2401,633 @@ async fn a_redirect_hop_keeps_the_full_representation_and_its_cache_identity() {
     assert_eq!(bytes.as_ref(), full);
     assert_eq!(upstream.call_count(), 1);
 }
+
+const LAST_MODIFIED: &str = "Fri, 26 Dec 2025 06:55:24 GMT";
+
+/// A registry that answers `If-None-Match` as registry.npmjs.org does: `304` when the validator
+/// names its current representation under weak comparison, the document otherwise. A mirror
+/// that forwards its client's validator is answered with a `304` it has no body to serve.
+struct ValidatingRegistry {
+    etag: String,
+    document: Vec<u8>,
+    requests: Mutex<Vec<MirrorFetchRequest>>,
+}
+
+impl ValidatingRegistry {
+    fn new(etag: &str, document: &[u8]) -> Self {
+        Self {
+            etag: etag.to_owned(),
+            document: document.to_vec(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<MirrorFetchRequest> {
+        self.requests.lock().expect("request lock").clone()
+    }
+
+    /// Whether `validator` names the current representation. The registry's tag is one quoted
+    /// string, so a validator naming it contains it, under either weakness.
+    fn names_current(&self, validator: &str) -> bool {
+        validator.trim() == "*" || validator.contains(self.etag.trim_start_matches("W/"))
+    }
+}
+
+#[async_trait]
+impl MirrorUpstream for ValidatingRegistry {
+    async fn fetch(
+        &self,
+        request: MirrorFetchRequest,
+    ) -> Result<Response<MirrorBody>, CacheBodyError> {
+        let named = request
+            .headers
+            .get_all(header::IF_NONE_MATCH)
+            .iter()
+            .any(|value| value.to_str().is_ok_and(|value| self.names_current(value)));
+        let head = request.method == Method::HEAD;
+        self.requests.lock().expect("request lock").push(request);
+        let builder = Response::builder()
+            .header(header::ETAG, &self.etag)
+            .header(header::CACHE_CONTROL, "public, max-age=300")
+            .header(header::LAST_MODIFIED, LAST_MODIFIED)
+            .header(header::VARY, "accept-encoding, accept");
+        Ok(if named {
+            builder
+                .status(StatusCode::NOT_MODIFIED)
+                .body(body(Bytes::new()))
+        } else {
+            builder
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.npm.install-v1+json")
+                .header(header::CONTENT_LENGTH, self.document.len())
+                .body(if head {
+                    body(Bytes::new())
+                } else {
+                    body(self.document.clone())
+                })
+        }
+        .expect("registry response"))
+    }
+}
+
+/// What the mirror hands its client.
+struct Answer {
+    status: StatusCode,
+    cache_status: MirrorCacheStatus,
+    headers: HeaderMap,
+    bytes: Bytes,
+}
+
+async fn answer(outcome: MirrorOutcome) -> Answer {
+    let MirrorOutcome::Response(response) = outcome else {
+        panic!("expected mirror response");
+    };
+    let cache_status = response.cache_status;
+    let (parts, body) = response.response.into_parts();
+    Answer {
+        status: parts.status,
+        cache_status,
+        headers: parts.headers,
+        bytes: body
+            .collect()
+            .await
+            .expect("collect mirror response")
+            .to_bytes(),
+    }
+}
+
+/// Bun's manifest request for `@msgpack/msgpack`: its abbreviated `Accept` plus the validators of
+/// the manifest it cached.
+fn bun_manifest_at(
+    path: &str,
+    method: Method,
+    validators: &[(header::HeaderName, &str)],
+) -> MirrorRequest {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ACCEPT,
+        INSTALL_V1_ACCEPT.parse().expect("accept header"),
+    );
+    for (name, value) in validators {
+        headers.append(name.clone(), value.parse().expect("validator header"));
+    }
+    MirrorRequest::new(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        method,
+        path.to_owned(),
+        headers,
+        MirrorCacheScope::Anonymous,
+        false,
+        None,
+    )
+    .expect("valid fixture mirror request")
+}
+
+fn bun_manifest(method: Method, validators: &[(header::HeaderName, &str)]) -> MirrorRequest {
+    bun_manifest_at("/@msgpack%2fmsgpack", method, validators)
+}
+
+/// The state of the mirror's cache when the conditional request arrives.
+#[derive(Clone, Copy, Debug)]
+enum Warmth {
+    /// Nothing cached: the request fills.
+    Cold,
+    /// Cached and inside the metadata TTL: the request hits.
+    Fresh,
+    /// Cached and past the TTL: the request revalidates with the cached entry's own validator.
+    Stale,
+}
+
+impl Warmth {
+    fn cache_status(self) -> MirrorCacheStatus {
+        match self {
+            Self::Cold => MirrorCacheStatus::Filled,
+            Self::Fresh => MirrorCacheStatus::Hit,
+            Self::Stale => MirrorCacheStatus::Revalidated,
+        }
+    }
+}
+
+struct Conditional {
+    _root: TestRoot,
+    service: MirrorService,
+    answer: Answer,
+    /// The registry requests this one request caused; priming is excluded.
+    sent: Vec<MirrorFetchRequest>,
+}
+
+/// One conditional manifest request against `registry`, with the cache in `warmth`. Priming is a
+/// plain `GET` of the same manifest.
+async fn conditional_manifest(
+    warmth: Warmth,
+    registry: &ValidatingRegistry,
+    method: Method,
+    validators: &[(header::HeaderName, &str)],
+) -> Conditional {
+    let root = TestRoot::new();
+    let mut config = root.cache_config();
+    config.metadata_ttl = match warmth {
+        Warmth::Stale => Duration::from_millis(15),
+        Warmth::Cold | Warmth::Fresh => Duration::from_secs(300),
+    };
+    let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
+    if !matches!(warmth, Warmth::Cold) {
+        let primed = answer(
+            service
+                .execute(
+                    bun_manifest(Method::GET, &[]),
+                    UpstreamHealth::Healthy,
+                    registry,
+                )
+                .await
+                .expect("prime the manifest"),
+        )
+        .await;
+        assert_eq!(primed.cache_status, MirrorCacheStatus::Filled);
+    }
+    if matches!(warmth, Warmth::Stale) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let primed = registry.requests().len();
+    let answered = answer(
+        service
+            .execute(
+                bun_manifest(method, validators),
+                UpstreamHealth::Healthy,
+                registry,
+            )
+            .await
+            .expect("a conditional GET is answered, never failed"),
+    )
+    .await;
+    Conditional {
+        _root: root,
+        service,
+        answer: answered,
+        sent: registry.requests().split_off(primed),
+    }
+}
+
+/// The cached manifest as an offline client reads it: whatever the conditional request did, the
+/// entry must be published whole.
+async fn cached_manifest(service: &MirrorService, context: &str) -> Answer {
+    let offline = QueueUpstream::new([]);
+    let cached = answer(
+        service
+            .execute(
+                bun_manifest(Method::GET, &[]),
+                UpstreamHealth::Offline,
+                &offline,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{context}: the manifest is not cached: {error:?}")),
+    )
+    .await;
+    assert_eq!(offline.call_count(), 0);
+    cached
+}
+
+fn assert_no_client_validator(request: &MirrorFetchRequest, context: &str) {
+    for name in [header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE] {
+        assert!(
+            !request.headers.contains_key(&name),
+            "{context}: the client's {name} reached the registry"
+        );
+    }
+}
+
+/// The 304 repeats the ETag that identifies the representation and nothing that describes its
+/// body.
+fn assert_not_modified(answer: &Answer, etag: &str, context: &str) {
+    assert_eq!(answer.status, StatusCode::NOT_MODIFIED, "{context}");
+    assert!(answer.bytes.is_empty(), "{context}");
+    assert_eq!(header_str(&answer.headers, header::ETAG), etag, "{context}");
+    for name in [header::CONTENT_LENGTH, header::CONTENT_TYPE] {
+        assert!(!answer.headers.contains_key(&name), "{context}: {name}");
+    }
+}
+
+/// A registry manifest's 304 also repeats the headers that cache and vary it.
+fn assert_manifest_not_modified(answer: &Answer, etag: &str, context: &str) {
+    assert_not_modified(answer, etag, context);
+    assert_eq!(
+        header_str(&answer.headers, header::CACHE_CONTROL),
+        "public, max-age=300",
+        "{context}"
+    );
+    assert_eq!(
+        header_str(&answer.headers, header::LAST_MODIFIED),
+        LAST_MODIFIED,
+        "{context}"
+    );
+    assert_eq!(
+        header_str(&answer.headers, header::VARY),
+        "accept-encoding, accept",
+        "{context}"
+    );
+}
+
+#[tokio::test]
+async fn a_clients_etag_is_compared_weakly_by_the_mirror_and_never_reaches_the_registry() {
+    let document = published(b"manifest tarball", false);
+    // (ETag the registry serves, If-None-Match the client sends, whether the client holds it)
+    for (served, sent, holds) in [
+        ("\"v1\"", "\"v1\"", true),
+        ("\"v1\"", "W/\"v1\"", true),
+        ("W/\"v1\"", "W/\"v1\"", true),
+        ("W/\"v1\"", "\"v1\"", true),
+        ("\"v1\"", "\"v0\", W/\"v1\"", true),
+        ("\"v1\"", "\"v0\",W/\"v1\" ,\"v2\"", true),
+        ("\"v1\"", "*", true),
+        ("\"a,b\"", "W/\"a,b\"", true),
+        ("\"v1\"", "W/\"v2\"", false),
+        ("W/\"v1\"", "\"v2\"", false),
+        ("\"v1\"", "\"v10\"", false),
+        ("\"a,b\"", "\"a\", \"b\"", false),
+        ("\"v1\"", "v1", false),
+        ("\"v1\"", "w/\"v1\"", false),
+        ("\"v1\"", "\"v1", false),
+    ] {
+        for warmth in [Warmth::Cold, Warmth::Fresh, Warmth::Stale] {
+            let context = format!("{served} against If-None-Match {sent} on a {warmth:?} cache");
+            let registry = ValidatingRegistry::new(served, &document);
+            // Bound whole: the cache root lives as long as this iteration.
+            let conditional = conditional_manifest(
+                warmth,
+                &registry,
+                Method::GET,
+                &[(header::IF_NONE_MATCH, sent)],
+            )
+            .await;
+            let (answer, upstream) = (&conditional.answer, &conditional.sent);
+            let service = &conditional.service;
+
+            assert_eq!(answer.cache_status, warmth.cache_status(), "{context}");
+            if holds {
+                assert_manifest_not_modified(answer, served, &context);
+            } else {
+                assert_eq!(answer.status, StatusCode::OK, "{context}");
+                assert_eq!(answer.bytes.as_ref(), document, "{context}");
+                assert_eq!(
+                    header_str(&answer.headers, header::ETAG),
+                    served,
+                    "{context}"
+                );
+            }
+
+            // The registry hears only the mirror's own validator, never the client's.
+            match warmth {
+                Warmth::Cold => {
+                    assert_eq!(upstream.len(), 1, "{context}");
+                    assert_no_client_validator(&upstream[0], &context);
+                }
+                Warmth::Fresh => assert!(upstream.is_empty(), "{context}"),
+                Warmth::Stale => {
+                    assert_eq!(upstream.len(), 1, "{context}");
+                    assert_eq!(
+                        header_str(&upstream[0].headers, header::IF_NONE_MATCH),
+                        served,
+                        "{context}"
+                    );
+                    assert!(
+                        !upstream[0].headers.contains_key(header::IF_MODIFIED_SINCE),
+                        "{context}"
+                    );
+                }
+            }
+
+            // Answering 304 never costs the next client its cache entry.
+            let cached = cached_manifest(service, &context).await;
+            assert_eq!(cached.status, StatusCode::OK, "{context}");
+            assert_eq!(cached.bytes.as_ref(), document, "{context}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_registry_change_is_answered_from_the_fill_that_publishes_it() {
+    let v1 = published(b"manifest tarball v1", false);
+    let v2 = published(b"manifest tarball v2, a different size", false);
+    assert_ne!(v1, v2);
+    for (sent, holds) in [("W/\"v1\"", false), ("W/\"v2\"", true)] {
+        let root = TestRoot::new();
+        let mut config = root.cache_config();
+        config.metadata_ttl = Duration::from_millis(15);
+        let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
+        let before = ValidatingRegistry::new("\"v1\"", &v1);
+        let primed = answer(
+            service
+                .execute(
+                    bun_manifest(Method::GET, &[]),
+                    UpstreamHealth::Healthy,
+                    &before,
+                )
+                .await
+                .expect("prime the first version"),
+        )
+        .await;
+        assert_eq!(primed.cache_status, MirrorCacheStatus::Filled);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let after = ValidatingRegistry::new("\"v2\"", &v2);
+        let answered = answer(
+            service
+                .execute(
+                    bun_manifest(Method::GET, &[(header::IF_NONE_MATCH, sent)]),
+                    UpstreamHealth::Healthy,
+                    &after,
+                )
+                .await
+                .expect("a conditional GET across a registry change"),
+        )
+        .await;
+        assert_eq!(answered.cache_status, MirrorCacheStatus::Filled, "{sent}");
+        assert_eq!(
+            header_str(&after.requests()[0].headers, header::IF_NONE_MATCH),
+            "\"v1\"",
+            "the mirror validates its cached v1, whatever the client holds"
+        );
+        if holds {
+            assert_manifest_not_modified(&answered, "\"v2\"", sent);
+        } else {
+            assert_eq!(answered.status, StatusCode::OK, "{sent}");
+            assert_eq!(answered.bytes.as_ref(), v2, "{sent}");
+        }
+        let cached = cached_manifest(&service, sent).await;
+        assert_eq!(cached.bytes.as_ref(), v2, "{sent}");
+        assert_eq!(header_str(&cached.headers, header::ETAG), "\"v2\"");
+    }
+}
+
+#[tokio::test]
+async fn head_is_answered_with_the_same_conditional_semantics() {
+    let document = published(b"manifest tarball", false);
+    for warmth in [Warmth::Cold, Warmth::Fresh] {
+        for (sent, holds) in [("W/\"v1\"", true), ("\"v2\"", false)] {
+            let context = format!("HEAD against If-None-Match {sent} on a {warmth:?} cache");
+            let registry = ValidatingRegistry::new("\"v1\"", &document);
+            let conditional = conditional_manifest(
+                warmth,
+                &registry,
+                Method::HEAD,
+                &[(header::IF_NONE_MATCH, sent)],
+            )
+            .await;
+            let (answer, upstream) = (&conditional.answer, &conditional.sent);
+            if holds {
+                assert_manifest_not_modified(answer, "\"v1\"", &context);
+            } else {
+                assert_eq!(answer.status, StatusCode::OK, "{context}");
+                assert!(answer.bytes.is_empty(), "{context}");
+                assert_eq!(
+                    header_str(&answer.headers, header::CONTENT_LENGTH),
+                    document.len().to_string(),
+                    "{context}"
+                );
+            }
+            if matches!(warmth, Warmth::Cold) {
+                assert_eq!(
+                    answer.cache_status,
+                    MirrorCacheStatus::Bypassed,
+                    "{context}"
+                );
+                assert_eq!(upstream.len(), 1, "{context}");
+                assert_eq!(upstream[0].method, Method::HEAD, "{context}");
+                assert_no_client_validator(&upstream[0], &context);
+            } else {
+                assert_eq!(answer.cache_status, MirrorCacheStatus::Hit, "{context}");
+                assert!(upstream.is_empty(), "{context}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn if_modified_since_is_answered_by_the_mirror_unless_if_none_match_is_present() {
+    let document = published(b"manifest tarball", false);
+    let etag = "\"v1\"";
+    // Last-Modified is Fri, 26 Dec 2025 06:55:24 GMT.
+    for (validators, holds) in [
+        (vec![(header::IF_MODIFIED_SINCE, LAST_MODIFIED)], true),
+        (
+            vec![(header::IF_MODIFIED_SINCE, "Sat, 27 Dec 2025 00:00:00 GMT")],
+            true,
+        ),
+        (
+            vec![(header::IF_MODIFIED_SINCE, "Friday, 26-Dec-25 06:55:24 GMT")],
+            true,
+        ),
+        (
+            vec![(header::IF_MODIFIED_SINCE, "Fri Dec 26 06:55:24 2025")],
+            true,
+        ),
+        (
+            vec![(header::IF_MODIFIED_SINCE, "Thu, 25 Dec 2025 00:00:00 GMT")],
+            false,
+        ),
+        (
+            vec![(header::IF_MODIFIED_SINCE, "Fri, 26 Dec 2025 06:55:23 GMT")],
+            false,
+        ),
+        (vec![(header::IF_MODIFIED_SINCE, "yesterday")], false),
+        (
+            vec![
+                (header::IF_MODIFIED_SINCE, LAST_MODIFIED),
+                (header::IF_MODIFIED_SINCE, LAST_MODIFIED),
+            ],
+            false,
+        ),
+        (
+            vec![
+                (header::IF_NONE_MATCH, "\"v2\""),
+                (header::IF_MODIFIED_SINCE, "Sat, 27 Dec 2025 00:00:00 GMT"),
+            ],
+            false,
+        ),
+        (
+            vec![
+                (header::IF_NONE_MATCH, "W/\"v1\""),
+                (header::IF_MODIFIED_SINCE, "Thu, 25 Dec 2025 00:00:00 GMT"),
+            ],
+            true,
+        ),
+    ] {
+        for warmth in [Warmth::Cold, Warmth::Fresh, Warmth::Stale] {
+            let context = format!("{validators:?} on a {warmth:?} cache");
+            let registry = ValidatingRegistry::new(etag, &document);
+            let conditional =
+                conditional_manifest(warmth, &registry, Method::GET, &validators).await;
+            let (answer, upstream) = (&conditional.answer, &conditional.sent);
+            assert_eq!(answer.cache_status, warmth.cache_status(), "{context}");
+            if holds {
+                assert_manifest_not_modified(answer, etag, &context);
+            } else {
+                assert_eq!(answer.status, StatusCode::OK, "{context}");
+                assert_eq!(answer.bytes.as_ref(), document, "{context}");
+            }
+            for request in upstream {
+                assert!(
+                    !request.headers.contains_key(header::IF_MODIFIED_SINCE),
+                    "{context}: the client's validator reached the registry"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_hop_still_answers_the_clients_validator() {
+    let document = published(b"manifest tarball", false);
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let redirected = Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, "/@msgpack%2fmsgpack")
+        .body(body(Bytes::new()))
+        .expect("redirect response");
+    let first = QueueUpstream::new([redirected]);
+    let MirrorOutcome::Redirect(redirect) = service
+        .execute(
+            bun_manifest_at(
+                "/@msgpack/msgpack",
+                Method::GET,
+                &[(header::IF_NONE_MATCH, "W/\"v1\"")],
+            ),
+            UpstreamHealth::Healthy,
+            &first,
+        )
+        .await
+        .expect("typed redirect")
+    else {
+        panic!("expected redirect outcome");
+    };
+    assert_no_client_validator(&first.requests()[0], "the redirected request");
+    assert_eq!(
+        header_str(&redirect.request.headers, header::IF_NONE_MATCH),
+        "W/\"v1\"",
+        "the hop carries the client's validator to its own answer"
+    );
+    let hop = MirrorRequest::from_redirect(redirect.request, MirrorCacheScope::Anonymous, false)
+        .expect("re-admitted redirect request");
+    let registry = ValidatingRegistry::new("\"v1\"", &document);
+    let answered = answer(
+        service
+            .execute(hop, UpstreamHealth::Healthy, &registry)
+            .await
+            .expect("the hop is answered"),
+    )
+    .await;
+    assert_manifest_not_modified(&answered, "\"v1\"", "after the redirect hop");
+    assert_no_client_validator(&registry.requests()[0], "the redirect hop");
+}
+
+#[tokio::test]
+async fn a_tarballs_client_validator_reaches_neither_its_packument_nor_its_own_fetch() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"conditional tarball bytes";
+    let packument = json_response(&published(tarball, false));
+    let object = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, tarball.len())
+        .header(header::ETAG, "\"t1\"")
+        .body(body(Bytes::copy_from_slice(tarball)))
+        .expect("tarball response");
+    let upstream = QueueUpstream::new([packument, object]);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_NONE_MATCH,
+        "W/\"t1\"".parse().expect("validator header"),
+    );
+    let answered = answer(
+        service
+            .execute(
+                MirrorRequest::new(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    Method::GET,
+                    "/@scope/pkg/-/pkg-1.0.0.tgz".to_owned(),
+                    headers,
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                )
+                .expect("valid fixture mirror request"),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("a conditional tarball GET is answered"),
+    )
+    .await;
+    assert_not_modified(&answered, "\"t1\"", "tarball");
+    assert_eq!(answered.cache_status, MirrorCacheStatus::Filled);
+    let sent = upstream.requests();
+    assert_eq!(sent.len(), 2, "the packument, then the tarball");
+    for request in &sent {
+        assert_no_client_validator(request, &request.path);
+    }
+
+    // The 304 was answered after the verified tarball was published.
+    let (status, bytes) = collect(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-1.0.0.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Offline,
+                &QueueUpstream::new([]),
+            )
+            .await
+            .expect("the tarball is cached"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::OfflineHit);
+    assert_eq!(bytes.as_ref(), tarball);
+}
