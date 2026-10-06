@@ -864,8 +864,16 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
                     && !source_metadata.file_type().is_symlink()
                     && !destination_metadata.file_type().is_symlink() =>
             {
-                merge_tree(&source, &destination, totals)?;
-                fs::remove_dir(&source)?;
+                // WHY loop: a tool still writing the old location (a cache daemon that has not
+                // yet restarted onto the host path) can add an entry between the merge and the
+                // removal. Merging again moves it too; the tree only shrinks, so this ends.
+                loop {
+                    merge_tree(&source, &destination, totals)?;
+                    match fs::remove_dir(&source) {
+                        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
+                        removed => break removed?,
+                    }
+                }
             }
             Ok(_) => {
                 totals.dropped += tree_bytes(&source)?;
