@@ -1860,6 +1860,47 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     fixture.stop_gateway().await;
 }
 
+/// `cowshed fork` reseeds its source as `new` does (16_build_volumes.md, "Fork"): `w1` runs on
+/// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
+/// instead of cloning the older seed and running everything again.
+#[tokio::test]
+async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let nx_check = nx_run_many(&node);
+
+    let w1 = new_workspace(&mut service, "w1").await;
+    fs::write(w1.join("a/src.txt"), b"src, changed in w1\n").unwrap();
+    git(&w1, &["commit", "-q", "-am", "change a in w1"]);
+    let ran = nx_statuses(&mut service, "w1", &w1, &nx_check).await;
+    assert!(
+        ran.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::Miss),
+        "w1 runs a:build and a:test itself: {ran:?}"
+    );
+
+    let (_, stderr) = succeed(&mut service, ["fork", "w1", "w2"]).await;
+    assert!(!stderr.contains("seed stays"), "{stderr}");
+    let w2 = service
+        .path("w2", false)
+        .await
+        .expect("w2 is mounted")
+        .mount;
+    let hits = nx_statuses(&mut service, "w2", &w2, &nx_check).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "a fork reseeds w1 first and hits w1's run: {hits:?}"
+    );
+}
+
 /// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
 /// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
 /// and changing nothing `a` hashes, lands next without running them. Main then adopts `b`'s

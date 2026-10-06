@@ -8216,27 +8216,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     )
                     .await?;
                     // Under the source's image lock, which every fork of the source holds here:
-                    // the seed the next step clones is the source's own work up to now, unless
+                    // the seed the fork clones is first the source's own work up to now, unless
                     // something still writes the source's volume.
-                    let reseed = timed_async(
-                        "new",
-                        "reseed",
-                        build_volumes.reseed(seed_source.clone(), source_mount.clone()),
-                    )
-                    .await?;
-                    if let crate::api::dto::Reseed::Skipped { behind_ms, reason } = &reseed {
-                        eprintln!(
-                            "cowshed: {}'s seed stays{} behind its build volume, so {destination} misses what {} built since: {reason}; the next fork retries",
-                            seed_source.name,
-                            behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
-                            seed_source.name,
-                        );
-                    }
                     timed_async(
                         "new",
                         "build-volume",
                         build_volumes.fork(
                             seed_source,
+                            source_mount.clone(),
                             super::build_volumes::Owner {
                                 name: destination.clone(),
                                 incarnation: stage.workspace.incarnation().clone(),
@@ -8455,9 +8442,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
                     )
                     .await?;
+                    // Under the source's image lock, as for `create`: the source's seed first
+                    // catches up with its live volume.
                     build_volumes
                         .fork(
                             seed_source,
+                            source_mount.clone(),
                             super::build_volumes::Owner {
                                 name: forked.clone(),
                                 incarnation: stage.workspace.incarnation().clone(),

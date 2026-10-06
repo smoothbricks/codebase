@@ -283,17 +283,32 @@ impl BuildVolumes {
         .await
     }
 
-    /// Fork (16_build_volumes.md, "Fork"): the checkout staged at `checkout`, which `destination`
-    /// is about to become, gets its own clone of `source`'s latest seed, mounted, with no daemon
-    /// record, and linked; and `destination` gets its own seed, a second clone of the same seed,
-    /// so it is a target others can fork from. A source with no seed gives none: its checkout
-    /// links nothing either, unless something is wrong, which refuses.
+    /// Fork (16_build_volumes.md, "Fork"): `source`'s seed first catches up with the live volume
+    /// `source_checkout` links ([`Self::reseed`]; a skip is said on stderr, and the older seed is
+    /// forked). Then the checkout staged at `checkout`, which `destination` is about to become,
+    /// gets its own clone of `source`'s latest seed, mounted, with no daemon record, and linked;
+    /// and `destination` gets its own seed, a second clone of the same seed, so it is a target
+    /// others can fork from. A source with no seed gives none: its checkout links nothing either,
+    /// unless something is wrong, which refuses. The caller holds `source`'s image lock, which
+    /// every fork of `source` and its reseed hold.
     pub async fn fork(
         &self,
         source: Owner,
+        source_checkout: PathBuf,
         destination: Owner,
         checkout: PathBuf,
     ) -> Result<Option<BuildVolumeId>> {
+        if let Reseed::Skipped { behind_ms, reason } =
+            self.reseed(source.clone(), source_checkout).await?
+        {
+            eprintln!(
+                "cowshed: {}'s seed stays{} behind its build volume, so {} misses what {} built since: {reason}; the next fork retries",
+                source.name,
+                behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
+                destination.name,
+                source.name,
+            );
+        }
         self.blocking(move |host, layout| {
             let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)? else {
                 if link::linked(&checkout)?.is_some() {
@@ -1380,7 +1395,7 @@ mod tests {
     async fn real_apfs_collection_keeps_a_forming_forks_volume_and_seed() {
         let scratch = Scratch::new("build-forming-fork");
         let main = owner("main", '0');
-        let (_, main_live, _) = scratch.linked_checkout("main", 1);
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
         scratch
             .host
             .clone_build_volume(
@@ -1401,7 +1416,7 @@ mod tests {
         fs::create_dir_all(staged.join(".cowshed")).unwrap();
         let forked = scratch
             .volumes
-            .fork(main.clone(), lane.clone(), staged.clone())
+            .fork(main.clone(), main_checkout, lane.clone(), staged.clone())
             .await
             .expect("fork from main's seed")
             .expect("main has a seed");
@@ -1629,7 +1644,12 @@ mod tests {
         };
         let topic_checkout = checkout("topic");
         let forked = volumes
-            .fork(main.clone(), topic, topic_checkout.clone())
+            .fork(
+                main.clone(),
+                main_checkout.clone(),
+                topic,
+                topic_checkout.clone(),
+            )
             .await
             .expect("fork from main's seed")
             .expect("main has a seed");
