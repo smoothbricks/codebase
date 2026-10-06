@@ -263,12 +263,8 @@ export interface FixtureNxOptions {
 }
 
 /**
- * `nx` against a fixture root, owning its own workspace root, graph, cache and
- * daemon. The daemon runs only when `options` asks for it, whatever the
- * inherited `NX_DAEMON` or CI flag says, and the socket directory of whichever
- * workspace launched this process never reaches the fixture. Inheriting the
- * outer task's locations could select or overwrite another workspace. The root
- * must lie in a live fixture, which then stops whatever this client starts.
+ * `nx` against a fixture root, with {@link fixtureNxEnv}. The root must lie in
+ * a live fixture, which then stops whatever this client starts.
  */
 export async function runFixtureNx(
   root: string,
@@ -289,24 +285,38 @@ export async function runFixtureNx(
   }
 }
 
+/**
+ * The environment of a fixture `nx`: it owns its own workspace root, graph,
+ * cache and daemon. The daemon runs only when `options` asks for it, whatever
+ * the inherited `NX_DAEMON` or CI flag says, and the socket directory of
+ * whichever workspace launched this process never reaches the fixture. Host CI
+ * runners export the state locations to a per-lane tree shared by every task in
+ * the run; a fixture inheriting them overwrote the real workspace's project
+ * graph with its own one-project graph, and the concurrent `nx run-many -t test`
+ * died with "Could not find project lmao-ttsc".
+ */
+export function fixtureNxEnv(root: string, options: FixtureNxOptions): Record<string, string> {
+  const env = definedProcessEnv();
+  delete env.NX_SOCKET_DIR;
+  delete env.NX_DAEMON_SOCKET_DIR;
+  return {
+    ...env,
+    NX_DAEMON: options.daemon ? 'true' : 'false',
+    NX_WORKSPACE_ROOT_PATH: root,
+    NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
+    NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
+    ...FIXTURE_NX_DIAGNOSTICS,
+  };
+}
+
 function spawnFixtureNx(
   root: string,
   args: string[],
   options: FixtureNxOptions,
 ): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
-  const env = definedProcessEnv();
-  delete env.NX_SOCKET_DIR;
-  delete env.NX_DAEMON_SOCKET_DIR;
   return Bun.spawn(['nx', ...args], {
     cwd: root,
-    env: {
-      ...env,
-      NX_DAEMON: options.daemon ? 'true' : 'false',
-      NX_WORKSPACE_ROOT_PATH: root,
-      NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
-      NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
-      ...FIXTURE_NX_DIAGNOSTICS,
-    },
+    env: fixtureNxEnv(root, options),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',

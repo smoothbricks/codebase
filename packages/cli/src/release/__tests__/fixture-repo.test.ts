@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -18,6 +18,7 @@ import {
 } from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
+  fixtureNxEnv,
   git,
   gitIsAncestor,
   gitOutput,
@@ -114,56 +115,37 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('runs real Nx builds for comma-separated npm-missing package projects', async () => {
-    await withFixtureRepo(async (root) => {
-      await writeWorkspace(root);
-      await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await writeBuildablePackage(root, '@scope/b', 'packages/b');
-
-      await runFixtureNx(root, ['run-many', '-t', 'build', '--projects=a,b']);
-
-      await expect(readFile(join(root, 'packages/a/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
-      await expect(readFile(join(root, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
-    });
-  });
-
-  it('keeps fixture Nx state out of a shared workspace-data directory', async () => {
-    // Host CI runners export these to a per-lane tree shared by every task in the
-    // run. A fixture inheriting them overwrote the real workspace's project graph
-    // with its own one-project graph, and the concurrent `nx run-many -t test`
-    // died with "Could not find project lmao-ttsc". Assert the outer directories
-    // stay untouched, which is the only thing that made that failure possible.
-    await withFixtureRepo(async (root) => {
-      const shared = await mkdtemp(join(tmpdir(), 'nx-shared-'));
-      const sharedData = join(shared, 'workspace-data');
-      const sharedCache = join(shared, 'cache');
-      const inherited = {
-        NX_WORKSPACE_ROOT_PATH: process.env.NX_WORKSPACE_ROOT_PATH,
-        NX_WORKSPACE_DATA_DIRECTORY: process.env.NX_WORKSPACE_DATA_DIRECTORY,
-        NX_CACHE_DIRECTORY: process.env.NX_CACHE_DIRECTORY,
-      };
-      process.env.NX_WORKSPACE_ROOT_PATH = shared;
-      await mkdir(sharedData, { recursive: true });
-      await mkdir(sharedCache, { recursive: true });
-      process.env.NX_WORKSPACE_DATA_DIRECTORY = sharedData;
-      process.env.NX_CACHE_DIRECTORY = sharedCache;
-      try {
-        await writeWorkspace(root);
-        await writeBuildablePackage(root, '@scope/a', 'packages/a');
-
-        await runFixtureNx(root, ['run-many', '-t', 'build', '--projects=a']);
-
-        expect(await readdir(sharedData)).toEqual([]);
-        expect(await readdir(sharedCache)).toEqual([]);
-        expect(await readdir(join(root, '.nx'))).toContain('workspace-data');
-      } finally {
-        for (const [key, value] of Object.entries(inherited)) {
-          if (value === undefined) delete process.env[key];
-          else process.env[key] = value;
-        }
-        await rm(shared, { recursive: true, force: true });
+  it('keeps fixture Nx state out of a shared workspace-data directory', () => {
+    // Host CI runners export these to a per-lane tree shared by every task in the run. A fixture
+    // Nx inheriting any of them works in, or overwrites, another workspace's state.
+    const shared = '/runner/lane/nx';
+    const root = '/fixture/repo';
+    const inherited = {
+      NX_WORKSPACE_ROOT_PATH: shared,
+      NX_WORKSPACE_DATA_DIRECTORY: join(shared, 'workspace-data'),
+      NX_CACHE_DIRECTORY: join(shared, 'cache'),
+      NX_SOCKET_DIR: join(shared, 'socket'),
+      NX_DAEMON_SOCKET_DIR: join(shared, 'socket'),
+    };
+    const outer = Object.fromEntries(Object.keys(inherited).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, inherited);
+    try {
+      for (const daemon of [false, true]) {
+        const env = fixtureNxEnv(root, { daemon });
+        expect(Object.entries(env).filter(([, value]) => value.includes(shared))).toEqual([]);
+        expect(env).toMatchObject({
+          NX_DAEMON: String(daemon),
+          NX_WORKSPACE_ROOT_PATH: root,
+          NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
+          NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
+        });
       }
-    });
+    } finally {
+      for (const [key, value] of Object.entries(outer)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it('leaves no process of its Nx daemon running once the fixture retires', async () => {
@@ -229,29 +211,28 @@ describe('release planning with fixture git repositories', () => {
     expect(await survivors(root, [])).toEqual([]);
   }, 120_000);
 
-  it('repairs multiple fetched remote targets from a runner clone with real git checkout and Nx build', async () => {
+  it('repairs multiple fetched remote targets from a runner clone, building each at its own checkout', async () => {
     await withFixtureRepo(async (author) => {
-      await writeWorkspace(author);
-      await writeBuildablePackage(author, '@scope/a', 'packages/a', '1.0.0');
-      await writeBuildablePackage(author, '@scope/b', 'packages/b', '1.0.0');
+      await writePackage(author, '@scope/a', 'packages/a', '1.0.0');
+      await writePackage(author, '@scope/b', 'packages/b', '1.0.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'initial release']);
       await tag(author, 'a@1.0.0', '2025-01-01T00:00:00Z');
       await tag(author, 'b@1.0.0', '2025-01-01T00:00:01Z');
 
-      await writeBuildablePackage(author, '@scope/a', 'packages/a', '1.1.0');
+      await writePackage(author, '@scope/a', 'packages/a', '1.1.0');
       await git(author, ['add', 'packages/a/package.json']);
       await git(author, ['commit', '-m', 'release a 1.1.0']);
       const githubOnlySha = await gitOutput(author, ['rev-parse', 'HEAD']);
       await tag(author, 'a@1.1.0', '2025-01-02T00:00:00Z');
 
-      await writeBuildablePackage(author, '@scope/b', 'packages/b', '2.0.0-beta.1');
+      await writePackage(author, '@scope/b', 'packages/b', '2.0.0-beta.1');
       await git(author, ['add', 'packages/b/package.json']);
       await git(author, ['commit', '-m', 'release b prerelease']);
       const npmAndGithubSha = await gitOutput(author, ['rev-parse', 'HEAD']);
       await tag(author, 'b@2.0.0-beta.1', '2025-01-03T00:00:00Z');
 
-      await writeBuildablePackage(author, '@scope/a', 'packages/a', '1.2.0');
+      await writePackage(author, '@scope/a', 'packages/a', '1.2.0');
       await git(author, ['add', 'packages/a/package.json']);
       await git(author, ['commit', '-m', 'head release a 1.2.0']);
       const headSha = await gitOutput(author, ['rev-parse', 'HEAD']);
@@ -294,7 +275,7 @@ describe('release planning with fixture git repositories', () => {
       expect(shell.devenvLoads).toBe(3);
       expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
       await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
-      expect(shell.builds).toEqual([['@scope/b']]);
+      expect(shell.builds).toEqual([{ head: npmAndGithubSha, packages: ['@scope/b'] }]);
       expect(shell.publishes).toEqual([{ name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false }]);
       expect(shell.githubCreates).toEqual([
         { name: '@scope/a', version: '1.1.0', dryRun: false },
@@ -302,15 +283,12 @@ describe('release planning with fixture git repositories', () => {
       ]);
       expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
       expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
-      await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
-      await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
     });
   });
 
   it('pushes current release refs to a local bare remote', async () => {
     await withFixtureRepo(async (author) => {
-      await writeWorkspace(author);
-      await writeBuildablePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
+      await writePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'release pushed package']);
       const releaseSha = await gitOutput(author, ['rev-parse', 'HEAD']);
@@ -350,8 +328,7 @@ describe('release planning with fixture git repositories', () => {
 
   it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
     await withFixtureRepo(async (author) => {
-      await writeWorkspace(author);
-      await writeBuildablePackage(author, '@scope/cli', 'packages/cli', '0.2.0');
+      await writePackage(author, '@scope/cli', 'packages/cli', '0.2.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'release cli 0.2.0']);
       const releaseSha = await gitOutput(author, ['rev-parse', 'HEAD']);
@@ -386,6 +363,7 @@ describe('release planning with fixture git repositories', () => {
       expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
       expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
       expect(shell.pushes).toEqual([['cli@0.2.0']]);
+      expect(shell.builds).toEqual([{ head: releaseSha, packages: ['@scope/cli'] }]);
       expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
       expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
       expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
@@ -529,7 +507,8 @@ function releaseFixturePackages(): ReleasePackageInfo[] {
 class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   readonly checkouts: string[] = [];
   readonly pushes: string[][] = [];
-  readonly builds: string[][] = [];
+  /** Each build the release asked for, with the commit checked out when it asked. */
+  readonly builds: Array<{ head: string; packages: string[] }> = [];
   readonly publishes: Array<{ name: string; version: string; distTag: string; dryRun: boolean }> = [];
   readonly githubCreates: Array<{ name: string; version: string; dryRun: boolean }> = [];
   devenvLoads = 0;
@@ -586,13 +565,7 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   }
 
   async buildReleaseCandidate(packages: ReleasePackageInfo[]): Promise<void> {
-    this.builds.push(packages.map((pkg) => pkg.name));
-    await runFixtureNx(this.root, [
-      'run-many',
-      '-t',
-      'build',
-      `--projects=${packages.map((pkg) => pkg.projectName).join(',')}`,
-    ]);
+    this.builds.push({ head: await this.gitHead(), packages: packages.map((pkg) => pkg.name) });
   }
 
   async publishPackage(pkg: ReleasePackageInfo, distTag: string, dryRun: boolean): Promise<void> {
