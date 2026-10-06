@@ -660,6 +660,12 @@ the debris of a creator that was killed or ran into its deadline. One that still
 something attached below it, is named in the task's error instead. A disk command that runs past its deadline is killed
 with its whole process group, so `hdiutil attach` cannot leave a helper behind that finishes the attach later.
 
+Every `hdiutil` and `diskutil` the volume runs takes cowshed's host disk-lifecycle lease first, when the cowshed gateway
+answers at `/private/cowshed/store/gateway.sock` (`specs/cowshed/05_gateway.md`): storage calls and mount-table changes
+never overlap on the host, because an attach does not finish while the mount table keeps changing. The lease wait comes
+before the command's deadline. Without a grant the command runs unleased and stderr says why; a gateway that is not
+running is said once per process.
+
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
 

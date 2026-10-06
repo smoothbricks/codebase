@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { diskClassOf, GATEWAY_SOCKET, takeDiskLease } from './disk-lease.js';
 
 /**
  * One RAM-backed APFS volume per host user, shared by every test task that runs
@@ -610,43 +611,84 @@ export function ramDisksIn(info: string): RamDisk[] {
  */
 const HOST_COMMAND_DEADLINE_MS = 120_000;
 
-export function createHostCommands(deadlineMs: number = HOST_COMMAND_DEADLINE_MS): HostCommands {
+/** Whether this process already said the cowshed gateway is not there to lease disk commands. */
+let gatewayAbsenceSaid = false;
+
+/**
+ * Every disk tool runs under cowshed's host disk-lifecycle lease when the gateway answers
+ * (`disk-lease.ts`): its attaches and mounts then never starve cowshed's, nor cowshed's them. The
+ * lease wait comes before the deadline starts, and the lease is released once the command is
+ * answered. Without a grant the command runs unleased and stderr says why; an absent gateway is
+ * said once per process.
+ */
+export function createHostCommands(
+  deadlineMs: number = HOST_COMMAND_DEADLINE_MS,
+  gatewaySocket: string = GATEWAY_SOCKET,
+): HostCommands {
   return {
-    run(file, args) {
-      return new Promise((resolve) => {
-        // `detached` leads a process group, so the deadline kills what the child spawned too:
-        // `hdiutil attach` hands the attach to a diskimages-helper, and one that outlived its
-        // killed `hdiutil` finished the attach later, an image nobody detached (2026-10-06).
-        const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
-        child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
-        const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
-        // Answered without waiting for the pipes: a helper that escaped the group may hold them.
-        const timer = setTimeout(() => {
-          resolve({
-            status: 1,
-            stdout: text(stdout),
-            stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
-          });
-        }, deadlineMs);
-        child.on('error', (error) => {
-          clearTimeout(timer);
-          resolve({ status: 1, stdout: text(stdout), stderr: error.message });
-        });
-        child.on('close', (code, signal) => {
-          clearTimeout(timer);
-          const error = text(stderr);
-          resolve({
-            status: code ?? 1,
-            stdout: text(stdout),
-            stderr: error === '' && signal !== null ? `killed by ${signal}` : error,
-          });
-        });
+    async run(file, args) {
+      const diskClass = diskClassOf(file);
+      if (diskClass === null) {
+        return runBounded(file, args, deadlineMs);
+      }
+      const lease = await takeDiskLease(gatewaySocket, diskClass, [file, ...args].join(' '), {
+        ackMs: 2_000,
+        afterCloseMs: 5_000,
+        grantMs: deadlineMs,
       });
+      if (!lease.granted && !(lease.absent && gatewayAbsenceSaid)) {
+        gatewayAbsenceSaid ||= lease.absent;
+        process.stderr.write(`RAM temp volume: ${file} runs without cowshed's disk lease: ${lease.reason}\n`);
+      }
+      try {
+        return await runBounded(file, args, deadlineMs);
+      } finally {
+        if (lease.granted) {
+          lease.release();
+        }
+      }
     },
   };
+}
+
+function runBounded(file: string, args: readonly string[], deadlineMs: number): Promise<CommandOutput> {
+  // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
+  // es2022 from tsconfig.base.json.
+  let resolve!: (output: CommandOutput) => void;
+  const promise = new Promise<CommandOutput>((settled) => {
+    resolve = settled;
+  });
+  // `detached` leads a process group, so the deadline kills what the child spawned too:
+  // `hdiutil attach` hands the attach to a diskimages-helper, and one that outlived its
+  // killed `hdiutil` finished the attach later, an image nobody detached (2026-10-06).
+  const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+  child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
+  // Answered without waiting for the pipes: a helper that escaped the group may hold them.
+  const timer = setTimeout(() => {
+    resolve({
+      status: 1,
+      stdout: text(stdout),
+      stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
+    });
+  }, deadlineMs);
+  child.on('error', (error) => {
+    clearTimeout(timer);
+    resolve({ status: 1, stdout: text(stdout), stderr: error.message });
+  });
+  child.on('close', (code, signal) => {
+    clearTimeout(timer);
+    const error = text(stderr);
+    resolve({
+      status: code ?? 1,
+      stdout: text(stdout),
+      stderr: error === '' && signal !== null ? `killed by ${signal}` : error,
+    });
+  });
+  return promise;
 }
 
 /** SIGKILL the child's whole process group; what happened, for the error. */
