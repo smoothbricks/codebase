@@ -7,11 +7,14 @@
  * someone stops it. A test that throws stops it in its `finally`; a test
  * process that is killed runs no `finally`. So every fixture root lives in a
  * run directory named for the test process that owns it,
- * `<tmpdir>/smoothbricks-fixtures/<suite>/run-<pid>`, and the first fixture a
+ * `<tmpdir>/smoothbricks-fixtures/<suite>/run-<pid>`. A process that gets
+ * SIGTERM, SIGINT or SIGHUP (a bounded test leg's timeout sends SIGTERM, and
+ * SIGKILL 10 s later) first stops whatever still works in its own run, then
+ * dies of that signal. One killed outright cannot, so the first fixture a
  * process creates for a suite reclaims every run of that suite whose owner is
  * gone: each process working in it is stopped, then the run is deleted. A run
- * whose owner still exists is never touched, so nothing outside a dead run of
- * the same suite is ever signalled.
+ * whose owner still exists is never touched by another process, so nothing
+ * outside a dead or dying run of the same suite is ever signalled.
  *
  * Node APIs only: the module is built with the library and imported by Bun
  * tests in other packages.
@@ -25,6 +28,8 @@ import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const EXIT_TIMEOUT_MS = 10_000;
+/** Under half of the SIGTERM-to-SIGKILL grace a bounded test leg gives, per round of signals. */
+const SIGNALLED_GRACE_MS = 3_000;
 const FIXTURE_HOME = 'smoothbricks-fixtures';
 const RUN_NAME = /^run-(\d+)$/;
 const SWEEP_LOCK = 'sweep.lock';
@@ -102,10 +107,14 @@ export function terminate(pid: number, signal: NodeJS.Signals = 'SIGTERM'): void
 
 /**
  * Wait until every one of `processes` has exited. One still running
- * {@link EXIT_TIMEOUT_MS} later is an error naming it and `owner`.
+ * `timeoutMs` later is an error naming it and `owner`.
  */
-export async function awaitExit(processes: readonly ProcessEntry[], owner: string): Promise<void> {
-  const deadline = Date.now() + EXIT_TIMEOUT_MS;
+export async function awaitExit(
+  processes: readonly ProcessEntry[],
+  owner: string,
+  timeoutMs = EXIT_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   for (let waiting = processes.filter((entry) => isRunning(entry.pid)); waiting.length > 0; ) {
     if (Date.now() > deadline) {
       // A signal probe also answers for a zombie, which has already exited.
@@ -117,7 +126,7 @@ export async function awaitExit(processes: readonly ProcessEntry[], owner: strin
         return;
       }
       throw new Error(
-        `${owner}: ${survivors.map((entry) => `${entry.pid} (${entry.command})`).join(', ')} still running ${EXIT_TIMEOUT_MS}ms after it was stopped`,
+        `${owner}: ${survivors.map((entry) => `${entry.pid} (${entry.command})`).join(', ')} still running ${timeoutMs}ms after it was stopped`,
       );
     }
     await sleep(50);
@@ -254,6 +263,16 @@ async function openRun(suite: string): Promise<string> {
   const suiteDirectory = await reclaimDeadFixtureRuns(suite);
   const directory = join(suiteDirectory, `run-${process.pid}`);
   await mkdir(directory, { recursive: true });
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+    process.once(signal, () => {
+      // Inside the 10 s a bounded leg grants between SIGTERM and SIGKILL.
+      reclaimRun(directory, 'signalled fixture run', SIGNALLED_GRACE_MS)
+        .catch((error: unknown) => {
+          process.stderr.write(`could not reclaim ${directory}: ${error instanceof Error ? error.message : error}\n`);
+        })
+        .finally(() => process.kill(process.pid, signal));
+    });
+  }
   return directory;
 }
 
@@ -290,14 +309,14 @@ async function reclaimDeadRuns(suiteDirectory: string): Promise<void> {
   }
   try {
     for (const directory of dead) {
-      await reclaimRun(directory);
+      await reclaimRun(directory, 'dead fixture run');
     }
   } finally {
     await rm(lock, { force: true });
   }
 }
 
-async function reclaimRun(directory: string): Promise<void> {
+async function reclaimRun(directory: string, owner: string, graceMs = EXIT_TIMEOUT_MS): Promise<void> {
   const roots = await readdir(directory).catch((error: unknown) => {
     if (errorCode(error) === 'ENOENT') {
       return null;
@@ -314,19 +333,19 @@ async function reclaimRun(directory: string): Promise<void> {
     const processes = (await processTable()).filter((entry) => working.includes(entry.pid));
     if (processes.length > 0) {
       process.stderr.write(
-        `reclaiming dead fixture run ${directory}: ${processes.map((entry) => `${entry.pid} (${entry.command})`).join(', ')}\n`,
+        `reclaiming ${owner} ${directory}: ${processes.map((entry) => `${entry.pid} (${entry.command})`).join(', ')}\n`,
       );
       for (const entry of processes) {
         terminate(entry.pid);
       }
       try {
-        await awaitExit(processes, `processes of dead fixture run ${directory}`);
+        await awaitExit(processes, `processes of ${owner} ${directory}`, graceMs);
       } catch (error) {
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}; sending SIGKILL\n`);
         for (const entry of processes) {
           terminate(entry.pid, 'SIGKILL');
         }
-        await awaitExit(processes, `processes of dead fixture run ${directory} after SIGKILL`);
+        await awaitExit(processes, `processes of ${owner} ${directory} after SIGKILL`, graceMs);
       }
     }
   }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
+  isRunning,
   nxDaemonProcesses,
   ownedFixtureRoot,
   type ProcessEntry,
@@ -102,6 +103,53 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
       terminate(entry.pid);
     }
     await Promise.all([helper.exited, bystander.exited]);
+    await rm(suiteDirectory, { recursive: true, force: true });
+  }
+}, 120_000);
+
+it('stops what works in its own run when the owning process is signalled, then dies of the signal', async () => {
+  const suite = `signal-regression-${process.pid}`;
+  const suiteDirectory = join(await realpath(tmpdir()), 'smoothbricks-fixtures', suite);
+  const script = join(suiteDirectory, 'owner.ts');
+  await mkdir(suiteDirectory, { recursive: true });
+  // A detached stand-in for a fixture daemon: its own session, so only the
+  // owner's handler, not a process-group signal, can stop it. The interval
+  // keeps the owner alive until it is signalled.
+  await writeFile(
+    script,
+    `import { spawn } from 'node:child_process';
+import { ownedFixtureRoot } from ${JSON.stringify(join(import.meta.dir, 'testing.ts'))};
+const root = await ownedFixtureRoot(${JSON.stringify(suite)}, 'signalled-');
+const helper = spawn('sleep', ['600'], { cwd: root, detached: true, stdio: 'ignore' });
+helper.unref();
+console.log('READY ' + helper.pid);
+setInterval(() => {}, 1 << 30);
+`,
+  );
+  const owner = Bun.spawn([process.execPath, script], { stdout: 'pipe', stderr: 'pipe' });
+  let helper = 0;
+  try {
+    const reader = owner.stdout.getReader();
+    const decoder = new TextDecoder();
+    let printed = '';
+    while (helper === 0) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error(`the owner exited before it was ready: ${printed}`);
+      printed += decoder.decode(chunk.value, { stream: true });
+      helper = Number(/^READY (\d+)$/m.exec(printed)?.[1] ?? 0);
+    }
+    expect(isRunning(helper)).toBe(true);
+
+    owner.kill('SIGTERM');
+    await owner.exited;
+
+    expect(owner.signalCode, await new Response(owner.stderr).text()).toBe('SIGTERM');
+    expect(await stillRunning([{ pid: helper, ppid: 0, stat: '', command: 'sleep 600' }])).toEqual([]);
+    expect(existsSync(join(suiteDirectory, `run-${owner.pid}`))).toBe(false);
+  } finally {
+    if (helper !== 0) terminate(helper);
+    owner.kill('SIGKILL');
+    await owner.exited;
     await rm(suiteDirectory, { recursive: true, force: true });
   }
 }, 120_000);
