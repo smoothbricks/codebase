@@ -13,7 +13,7 @@ no longer exist. Use this instead, per workspace, with a CLEAN tree:
 # in the workspace
 git fetch main
 git rebase --onto main/main <fork-base> cowshed/<name>
-cargo test -p <crate> && cargo clippy -p <crate> --all-targets -- -D warnings
+cargo test -p <crate> && cargo clippy -p <crate> --all-targets --config 'build.warnings="deny"'
 # in the host checkout
 git fetch /Users/danny/Dev/.cowshed/smoothbricks/codebase/<name> cowshed/<name>
 git merge --ff-only FETCH_HEAD

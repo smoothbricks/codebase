@@ -15,7 +15,7 @@ mutants:
 
 check:
     cargo check -p 'columine-*' --all-targets
-    cargo clippy -p 'columine-*' --all-targets -- -D warnings
+    cargo clippy -p 'columine-*' --all-targets --config 'build.warnings="deny"'
 
 # `profile` is a cargo profile: `dev` for every local build and test,
 # `wasm-release` for the artifact that ships (the nx `cargo-wasm` production

@@ -480,7 +480,7 @@ describe('cargo toolchain identity policy', () => {
     targets: ['cargo-lint'],
     targetCache: new Map([['cargo-lint', true]]),
     targetInputs: new Map([['cargo-lint', inputs]]),
-    targetOptions: new Map([['cargo-lint', { command: 'cargo --frozen clippy --workspace -- -D warnings' }]]),
+    targetOptions: new Map([['cargo-lint', { command: 'cargo --frozen clippy --workspace' }]]),
   });
 
   // The failure this policy exists for: a hand-written input list replaces the

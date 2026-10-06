@@ -35,5 +35,5 @@ bench:
 
 check:
     cargo check -p 'lmao-*' --all-targets
-    cargo clippy -p 'lmao-*' --all-targets -- -D warnings
+    cargo clippy -p 'lmao-*' --all-targets --config 'build.warnings="deny"'
 

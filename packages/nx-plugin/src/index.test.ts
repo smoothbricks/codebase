@@ -830,7 +830,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // test compile: a directory of its own compiled every host unit twice.
       const [fmt, clippy] = targets['cargo-lint']?.options?.commands ?? [];
       expect(fmt).toBe('cargo fmt --all --check');
-      expect(clippy).toMatch(/^cargo --frozen clippy --workspace --all-targets .*-- -D warnings$/);
+      expect(clippy).toBe(CARGO_LINT_CLIPPY_COMMAND);
+      expect(clippy).toMatch(/^cargo --frozen clippy --workspace --all-targets /);
       for (const command of [clippy, targets['cargo-test-compile']?.options?.command]) {
         expect(command).not.toContain('--target-dir');
       }
@@ -1281,7 +1282,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const plugin = 'node_modules/.bun/@smoothbricks+nx-plugin@0.4.26/node_modules/@smoothbricks/nx-plugin';
     const runner = { executor: '@smoothbricks/nx-plugin:bounded-exec' };
     const archive = `cargo --frozen nextest archive --workspace --tool-config-file "smoo:$PWD/${plugin}/nextest.toml"`;
-    const clippy = 'cargo --frozen clippy --workspace --all-targets -- -D warnings';
+    const clippy = CARGO_LINT_CLIPPY_COMMAND;
     expect(cargoCommandNpmPackages(runner, 'cargo --frozen nextest run', true)).toEqual(['@smoothbricks/nx-plugin']);
     expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, archive, true)).toEqual([
       '@smoothbricks/nx-plugin',

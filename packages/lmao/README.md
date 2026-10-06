@@ -340,7 +340,7 @@ just proptest-heavy  # heavy tier: 10k proptest cases, includes TDD-red ignored 
 just mutants         # mutation tier (cargo install cargo-mutants)
 just wasm            # wasm32 ABI build (rustup target add wasm32-unknown-unknown)
 just bench           # criterion harness for the overhead gates
-just check           # cargo check + clippy -D warnings
+just check           # cargo check + clippy, warnings denied
 ```
 
 Without `just`: the same commands are spelled out in `justfile`, and `.cargo/config.toml` provides `cargo t`,

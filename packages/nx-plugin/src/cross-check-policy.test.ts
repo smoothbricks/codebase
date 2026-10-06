@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_TARGET,
+  CARGO_DENY_WARNINGS,
   CARGO_LINT_CLIPPY_COMMAND,
   CARGO_LINUX_TRIPLE,
   CROSS_CHECK_SCRIPT_COMMAND,
@@ -57,9 +58,66 @@ describe('Linux cross-check policy', () => {
   it('matches the severity and triple CI lints with', () => {
     // A weaker local command passes where CI fails, which is the failure this
     // gate exists to prevent rather than reproduce.
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('-D warnings');
+    expect(CARGO_CROSS_LINT_COMMAND).toContain(CARGO_DENY_WARNINGS);
     expect(CARGO_CROSS_LINT_COMMAND).toContain(`--target ${CARGO_LINUX_TRIPLE}`);
   });
+
+  it('passes clippy-driver no arguments, so the gate and a plain clippy share one unit set', () => {
+    // Anything after `--` becomes CLIPPY_ARGS, part of every member's fingerprint.
+    for (const command of [CARGO_LINT_CLIPPY_COMMAND, CARGO_CROSS_LINT_COMMAND]) {
+      expect(command).not.toContain(' -- ');
+    }
+  });
+
+  it('fails on warnings it replays from units a plain clippy already checked', async () => {
+    const project = await mkdtemp(join(tmpdir(), 'cargo-lint-warnings-'));
+    const clippy = async (command: string): Promise<{ exitCode: number; output: string }> => {
+      const child = Bun.spawn(['sh', '-c', command], {
+        cwd: project,
+        env: { ...process.env, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { exitCode, output: stdout + stderr };
+    };
+    try {
+      await mkdir(join(project, 'src'));
+      await writeFile(
+        join(project, 'Cargo.toml'),
+        '[package]\nname = "warning-fixture"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n',
+      );
+      await writeFile(
+        join(project, 'Cargo.lock'),
+        'version = 4\n\n[[package]]\nname = "warning-fixture"\nversion = "0.1.0"\n',
+      );
+      await writeFile(join(project, 'src/lib.rs'), 'pub fn planted() {\n    let unused = 1;\n}\n');
+      const plain = cargoFrozen('clippy --workspace --all-targets');
+
+      const first = await clippy(plain);
+      expect(first).toMatchObject({ exitCode: 0 });
+      expect(first.output).toContain('Checking warning-fixture');
+      expect(first.output).toContain('unused variable');
+
+      // Fresh: the gate replays the plain run's units and their warning, and fails on it.
+      const gate = await clippy(CARGO_LINT_CLIPPY_COMMAND);
+      expect(gate.exitCode).not.toBe(0);
+      expect(gate.output).not.toContain('Checking warning-fixture');
+      expect(gate.output).toContain('unused variable');
+      expect(gate.output).toContain('warnings are denied by `build.warnings` configuration');
+
+      // And the gate left the plain run's units Fresh in turn.
+      const again = await clippy(plain);
+      expect(again).toMatchObject({ exitCode: 0 });
+      expect(again.output).not.toContain('Checking warning-fixture');
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it('fails closed on Darwin without the linux-cross compiler instead of compiling', () => {
     // Without this guard a Darwin cache miss sits in ring's cc-rs looking for

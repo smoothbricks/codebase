@@ -476,5 +476,5 @@ baseline is an explicit deliverable, not an inherited APFS number.
   Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests) runs only
   where a developer runs the gate: `bun nx run-many -t lint test build -p cowshed` on a Mac, with `bun run check:linux`
   cross-linting the Linux target.
-- Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (repo rule: fix
-  everything you see — no pre-existing-failure waivers).
+- Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --config 'build.warnings="deny"'` (repo
+  rule: fix everything you see — no pre-existing-failure waivers).

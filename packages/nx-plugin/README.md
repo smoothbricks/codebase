@@ -62,14 +62,17 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
   of an outer workspace.
 - **Commands:** validation runs from the governing Cargo workspace directory. One `cargo fmt --all --check` and one
-  `cargo --frozen clippy --workspace --all-targets -- -D warnings` cover every member. Clippy of a crate is a check
-  build of its whole closure, so a target directory per crate rebuilt every shared dependency once per crate — 49
-  closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Clippy writes the workspace's own
-  `target/`, like every dev build: its check units carry their mode in the unit hash and never collide with build units,
-  and the host units a dev build compiled (build scripts and their host-only dependencies) are reused instead of
-  compiled a second time. Cargo's own lock serializes the invocations that share the directory. `cargo-lint-cross` keeps
-  `target/cargo-lint-cross`: a foreign triple's units are distinct anyway, and its own lock keeps the cross check from
-  queueing behind host builds.
+  `cargo --frozen clippy --workspace --all-targets --config 'build.warnings="deny"'` cover every member. Clippy of a
+  crate is a check build of its whole closure, so a target directory per crate rebuilt every shared dependency once per
+  crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Clippy writes the workspace's
+  own `target/`, like every dev build: its check units carry their mode in the unit hash and never collide with build
+  units, and the host units a dev build compiled (build scripts and their host-only dependencies) are reused instead of
+  compiled a second time. Warnings are denied by Cargo's `build.warnings`, not `-- -D warnings`: arguments after `--`
+  are clippy-driver's `CLIPPY_ARGS`, which enter every member's fingerprint, so the gate and a plain
+  `cargo clippy --workspace --all-targets` would re-check each other's units. `build.warnings` also fails on warnings
+  replayed from Fresh units, so the two share one unit set and the gate still fails. Cargo's own lock serializes the
+  invocations that share the directory. `cargo-lint-cross` keeps `target/cargo-lint-cross`: a foreign triple's units are
+  distinct anyway, and its own lock keeps the cross check from queueing behind host builds.
 - **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
   edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
   waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,

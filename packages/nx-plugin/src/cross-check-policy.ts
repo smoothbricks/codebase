@@ -94,8 +94,25 @@ export const CARGO_FETCH_TARGET = 'cargo-fetch';
 export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
 
 /**
- * Clippy rather than `cargo check`, and `-D warnings`, because that is exactly
- * what CI's `lint` runs; a weaker local command would pass where CI fails.
+ * Deny warnings through Cargo's `build.warnings`, never `-- -D warnings`.
+ *
+ * Arguments after `--` reach clippy-driver through `CLIPPY_ARGS`, which Cargo
+ * hashes into every member unit's fingerprint. A gate that passes
+ * `-D warnings` therefore owns a unit set of its own: it and a plain
+ * `cargo clippy` invalidate each other, re-checking every member each time.
+ * `build.warnings` is Cargo's own verdict over the diagnostics it collected,
+ * including those it replays from Fresh units, and it reaches no compiler
+ * invocation, so every caller shares one unit set while the gate still fails.
+ *
+ * On the command line rather than in a config file: the gate's verdict is not
+ * a repository's local choice, and `--config` outranks every config file.
+ */
+export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
+
+/**
+ * Clippy rather than `cargo check`, and warnings denied, because that is
+ * exactly what CI's `lint` runs; a weaker local command would pass where CI
+ * fails.
  *
  * `--all-targets` is what answers "what does test mean when cross-compiling": it
  * type-checks bins, tests, benches and examples for the target, so test CODE is
@@ -113,7 +130,8 @@ export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
  *
  * Keep the caller's CARGO_HOME: it owns registry sources, credentials and global
  * Cargo configuration, including paths relative to that configuration. Relocating
- * or replaying it through --config changes path resolution or precedence.
+ * or replaying it through --config changes path resolution or precedence; the
+ * one `--config` here sets `build.warnings` alone.
  * Cargo may serialize registry access on its package-cache lock; these checks
  * are unbounded, and correctness takes priority over overlapping that access.
  *
@@ -122,7 +140,7 @@ export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
  * behind host builds.
  */
 export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${cargoFrozen(
-  `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
+  `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross ${CARGO_DENY_WARNINGS}`,
 )}`;
 
 /**
@@ -134,8 +152,9 @@ export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${cargoFroze
  * a proc-macro and ordinary code use stays a distinct unit: a dev build
  * compiles it once at the target profile, while a check build needs a separate
  * host copy. Distinct hashes coexist, so neither command dirties the other.
+ * A plain `cargo clippy --workspace --all-targets` checks exactly these units.
  */
-export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen('clippy --workspace --all-targets -- -D warnings');
+export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(`clippy --workspace --all-targets ${CARGO_DENY_WARNINGS}`);
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
