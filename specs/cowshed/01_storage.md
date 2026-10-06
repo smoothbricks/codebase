@@ -458,9 +458,11 @@ What the substrate does about each:
   106 attaches in 43 s with the phases kept apart, at 0.94 s p50 and 1.78 s p95 under load 167–212.
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
-  attach budget for as long as it stays attached. A test run mints one blank template with the production minter and
-  clones every test image from it; a test store that mints is seeded with a clone of it, so the suite pays one template
-  mint per test process tree rather than one per store.
+  attach budget for as long as it stays attached. Tests mint one blank template per host user with the production
+  minter, at `/private/tmp/cowshed-itest-templates-uid<uid>`, and clone every test image from it; a test store that
+  mints is seeded with a clone of it. Like a store's template it outlives its minter and its name spells everything its
+  bytes depend on, so concurrent lanes and later runs clone the same one instead of each test process tree paying a
+  create, a formatting attach, a format and a detach before its first test.
 - **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
   contention instead of reducing it; the fix is fewer calls, and calls that do not starve each other.
 - **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.

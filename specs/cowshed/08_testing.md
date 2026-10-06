@@ -178,7 +178,7 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
-one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the run's template stay under `/private/tmp`
+one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the user's template stay under `/private/tmp`
 whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease; a clone
 reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
 runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
