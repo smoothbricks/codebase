@@ -192,10 +192,10 @@ fn nix_state_keeps_the_host_copy() {
     assert!(holds_only_marker(&fixture.volume).unwrap());
 }
 
-/// A cargo process holding cargo's package-cache lock refuses the whole run before anything
-/// moves.
+/// A cargo process holding cargo's package-cache lock delays the run until it lets go; nothing
+/// moves while the lock is held, and the run completes once it is released.
 #[test]
-fn a_held_cargo_lock_refuses_the_run() {
+fn a_held_cargo_lock_is_waited_out_before_anything_moves() {
     let fixture = Fixture::new();
     let layout = fixture.layout(&[]);
     fixture.file(&fixture.volume.join("cargo/registry/index/x"), 4);
@@ -207,17 +207,23 @@ fn a_held_cargo_lock_refuses_the_run() {
         .expect("unlocked");
 
     let planned = plan(&layout, &observe(&layout).unwrap());
-    let error = execute(&layout, &planned).unwrap_err();
-    assert!(
-        matches!(&error, RetirementError::CargoLockHeld { cargo_home: named } if named == &cargo_home),
-        "{error}"
-    );
-    assert!(error.to_string().contains("package-cache lock"));
-    assert!(fixture.volume.join("cargo/registry/index/x").is_file());
-    assert!(fixture.volume.join("zig/o/h").is_file());
-    assert!(!fixture.home.join(".cache/zig").exists());
-    drop(held);
-    assert!(fixture.run(&layout).leftovers.is_empty());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            done_tx.send(execute(&layout, &planned)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        // The run cannot finish while the lock is held: its result is not ready, and nothing
+        // has moved yet.
+        assert!(done_rx.try_recv().is_err());
+        assert!(fixture.volume.join("cargo/registry/index/x").is_file());
+        drop(held);
+        let report = done_rx.recv().unwrap().unwrap();
+        assert!(report.leftovers.is_empty());
+    });
+    assert!(fixture.home.join(".cargo/registry/index/x").is_file());
 }
 
 /// A directory no detector names and no main declares stays, named with its size; an empty one

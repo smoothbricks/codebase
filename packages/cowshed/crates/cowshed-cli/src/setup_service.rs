@@ -690,15 +690,7 @@ async fn declared_repository_caches(home: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn retirement_error(error: RetirementError) -> CowshedError {
-    match error {
-        RetirementError::CargoLockHeld { .. } => CowshedError::conflict(
-            error.to_string(),
-            "let running cargo builds finish, then cowshed setup",
-        ),
-        RetirementError::Step { .. } | RetirementError::Observe(_) => {
-            CowshedError::environment_missing(error.to_string(), "cowshed setup")
-        }
-    }
+    CowshedError::environment_missing(error.to_string(), "cowshed setup")
 }
 
 /// Release the indirect nix GC root cowshed registered for sccache.

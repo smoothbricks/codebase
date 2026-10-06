@@ -650,10 +650,6 @@ pub struct RetirementReport {
 
 #[derive(Debug)]
 pub enum RetirementError {
-    /// A cargo process holds cargo's package-cache lock, so cargo's caches cannot move now.
-    CargoLockHeld {
-        cargo_home: PathBuf,
-    },
     /// A step failed; everything before it is in `report`.
     Step {
         step: String,
@@ -666,11 +662,6 @@ pub enum RetirementError {
 impl std::fmt::Display for RetirementError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CargoLockHeld { cargo_home } => write!(
-                formatter,
-                "a cargo process holds {}'s package-cache lock, so cargo's caches cannot move now",
-                cargo_home.display()
-            ),
             Self::Step { step, error, .. } => write!(formatter, "{step} failed: {error}"),
             Self::Observe(error) => write!(formatter, "cannot inspect the caches volume: {error}"),
         }
@@ -682,7 +673,7 @@ impl std::error::Error for RetirementError {}
 /// Perform `plan`, then observe the volume again for what it still holds.
 ///
 /// Cargo's caches move under cargo's own package-cache locks; a lock a cargo process holds right
-/// now refuses the whole run before anything moves.
+/// now is waited out (with progress on stderr) before anything moves.
 pub fn execute(
     layout: &RetirementLayout,
     plan: &Plan,
@@ -800,12 +791,30 @@ fn lock_cargo(cargo_home: &Path) -> Result<cargo::CacheLock, RetirementError> {
         report: RetirementReport::default(),
     };
     fs::create_dir_all(cargo_home).map_err(failed)?;
-    match cargo::try_lock_caches(cargo_home) {
-        Ok(Some(lock)) => Ok(lock),
-        Ok(None) => Err(RetirementError::CargoLockHeld {
-            cargo_home: cargo_home.to_path_buf(),
-        }),
-        Err(error) => Err(failed(error)),
+    // WHY wait, not refuse: on a host where agents build continuously some cargo holds the
+    // package-cache lock most of the time, but each holds it only while it resolves or fetches.
+    // Refusing made the move impossible on a busy host while every job already depended on it.
+    // Both locks are tried together and released together, so this never holds one while
+    // waiting for the other and cannot deadlock against cargo's own acquisition order.
+    let started = std::time::Instant::now();
+    let mut reported = std::time::Duration::ZERO;
+    loop {
+        match cargo::try_lock_caches(cargo_home) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {
+                let waited = started.elapsed();
+                if waited >= reported + std::time::Duration::from_secs(10) {
+                    reported = waited;
+                    eprintln!(
+                        "cowshed: waiting {}s for cargo's package-cache lock in {} so its caches can move",
+                        waited.as_secs(),
+                        cargo_home.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(failed(error)),
+        }
     }
 }
 
