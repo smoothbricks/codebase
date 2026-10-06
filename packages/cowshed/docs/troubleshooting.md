@@ -405,6 +405,21 @@ recycle, and a mount that takes a second can outlast the deadline. When that is 
 it (`… vnodes in use of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor` reports it as
 `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl kern.maxvnodes=<n>`.
 
+## An attach is slow, or stderr says `disk-lease … unleased=`
+
+Every disk tool cowshed runs takes the gateway's host disk-lifecycle lease first: `diskutil`, `hdiutil` and `newfs_apfs`
+share one phase, `mount_apfs` and `umount` the other, and the two never overlap, because an attach does not finish while
+the mount table keeps changing. Each command prints `cowshed: disk-lease <class> wait` with the time it queued and
+`cowshed: disk-lease <class> phase` around the command itself. A long wait is time spent behind the other class's phase;
+a long phase is the command.
+
+`status=err` on the wait, with an `unleased=<reason>` line, means the command ran without a lease. "predates disk
+leases" means the running gateway is from an older build: `cowshed setup` from this build restarts it. A gateway that is
+not running is said once per process and every disk command runs unleased until it is back. The gateway's own stderr
+names a holder it evicted, `disk-lease evicted a <class> holder after <held> while <class> waited`, with the pid and
+command line: a command that kept its phase ten seconds while the other class waited is the stuck one, and
+`ps -o pid,etime,args -p <pid>` shows whether it still runs.
+
 ## Every attach fails with `error code 150`
 
 `Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from every image attach,
