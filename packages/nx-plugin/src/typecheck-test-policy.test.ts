@@ -203,6 +203,7 @@ describe('applyTypecheckTestDefaults', () => {
     const tsconfigTest: Record<string, unknown> = {};
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       referencePaths: ['./tsconfig.lib.json'],
       isNew: true,
     });
@@ -231,13 +232,22 @@ describe('applyTypecheckTestDefaults', () => {
     // that with a program of zero files, which passed the gate by compiling
     // nothing (the false green the policy exists to prevent).
     const declared: Record<string, unknown> = { extends: './tsconfig.json', compilerOptions: { noEmit: true } };
-    applyTypecheckTestDefaults(declared, { testRunners: new Set(['bun'] as const), referencePaths: [] });
+    applyTypecheckTestDefaults(declared, {
+      testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
+      referencePaths: [],
+    });
+    expect(declared.extends).toBe('./tsconfig.json');
     expect(Object.hasOwn(declared, 'include')).toBe(false);
     // Same for `types`: declaring it would drop the workers types the program inherits.
     expect(Object.hasOwn(expectRecord(declared.compilerOptions), 'types')).toBe(false);
 
     const explicit: Record<string, unknown> = { extends: './tsconfig.json', include: ['test/**/*.ts'] };
-    applyTypecheckTestDefaults(explicit, { testRunners: new Set(['bun'] as const), referencePaths: [] });
+    applyTypecheckTestDefaults(explicit, {
+      testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
+      referencePaths: [],
+    });
     expect(expectStringArray(explicit.include)).toEqual(expect.arrayContaining(['test/**/*.ts', 'src/**/*.test.ts']));
   });
 
@@ -251,6 +261,7 @@ describe('applyTypecheckTestDefaults', () => {
     };
     applyTypecheckTestDefaults(declared, {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       referencePaths: [],
       libCompilerOptions: { lib: ['es2022'], module: 'preserve' },
     });
@@ -262,17 +273,18 @@ describe('applyTypecheckTestDefaults', () => {
     const silent: Record<string, unknown> = { compilerOptions: {} };
     applyTypecheckTestDefaults(silent, {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       referencePaths: [],
       libCompilerOptions: { lib: ['es2022'] },
     });
     expect(expectRecord(silent.compilerOptions).lib).toEqual(['es2022']);
   });
 
-  it('uses custom extends from lib tsconfig', () => {
+  it('extends what it is given when the file names nothing', () => {
     const tsconfigTest: Record<string, unknown> = {};
     applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
-      tsconfigLibExtends: '../tsconfig.custom.json',
+      testExtends: '../tsconfig.custom.json',
       referencePaths: [],
     });
     expect(tsconfigTest.extends).toBe('../tsconfig.custom.json');
@@ -282,6 +294,7 @@ describe('applyTypecheckTestDefaults', () => {
     const tsconfigTest: Record<string, unknown> = {};
     applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       libCompilerOptions: { baseUrl: '.', module: 'esnext', jsx: 'react-jsx' },
       referencePaths: [],
     });
@@ -295,6 +308,7 @@ describe('applyTypecheckTestDefaults', () => {
     const tsconfigTest: Record<string, unknown> = {};
     applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['vitest'] as const),
+      testExtends: '../../tsconfig.base.json',
       referencePaths: [],
     });
     const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
@@ -307,6 +321,7 @@ describe('applyTypecheckTestDefaults', () => {
     };
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       referencePaths: [],
     });
     expect(changed).toBe(true);
@@ -319,6 +334,7 @@ describe('applyTypecheckTestDefaults', () => {
     const tsconfigTest: Record<string, unknown> = {};
     const opts = {
       testRunners: new Set(['bun'] as const),
+      testExtends: '../../tsconfig.base.json',
       libCompilerOptions: { lib: ['es2024', 'webworker'] },
       referencePaths: ['./tsconfig.lib.json'],
     };
@@ -387,6 +403,26 @@ describe('typecheck test policy (Tree)', () => {
 
     const references = expectReferences(tsconfig.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
+  });
+
+  it('extends the workspace base from the project root when there is no lib program', () => {
+    // `tooling` sits one level below the workspace root. A fixed
+    // '../../tsconfig.base.json' named a file above the repository.
+    const tree = createTreeWithEmptyWorkspace();
+    for (const [name, root] of [
+      ['tooling', 'tooling'],
+      ['app', 'packages/app'],
+    ] as const) {
+      addProjectConfiguration(tree, name, { root, targets: {} });
+      if (tree.exists(`${root}/project.json`)) tree.delete(`${root}/project.json`);
+      writeJson(tree, `${root}/package.json`, { name: `@scope/${name}`, scripts: { test: 'bun test' }, nx: { name } });
+    }
+
+    applyTypecheckTestPolicyTree(tree);
+    expect(readJson<Record<string, unknown>>(tree, 'tooling/tsconfig.test.json').extends).toBe('../tsconfig.base.json');
+    expect(readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json').extends).toBe(
+      '../../tsconfig.base.json',
+    );
   });
 
   it('references only composite lib programs (TS6306 otherwise), resolving composite through extends', () => {

@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, posix, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
 import typia from 'typia';
@@ -159,7 +159,8 @@ export function applyTypecheckTestDefaults(
   tsconfigTest: Record<string, unknown>,
   options: {
     testRunners: ReadonlySet<TestRunner>;
-    tsconfigLibExtends?: string | string[];
+    /** What the file extends when it names nothing. */
+    testExtends: string | string[];
     libCompilerOptions?: Record<string, unknown>;
     referencePaths: string[];
     /** The file did not exist: a fresh program gets the src-test globs. */
@@ -167,7 +168,7 @@ export function applyTypecheckTestDefaults(
   },
 ): boolean {
   let changed = !Object.hasOwn(tsconfigTest, 'extends');
-  if (changed) tsconfigTest.extends = options.tsconfigLibExtends ?? '../../tsconfig.base.json';
+  if (changed) tsconfigTest.extends = options.testExtends;
 
   const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
 
@@ -319,7 +320,9 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     // Read lib tsconfig for extends and compiler options
     const libTsconfigPath = `${config.root}/tsconfig.lib.json`;
     const libTsconfig = tree.exists(libTsconfigPath) ? readJson<Record<string, unknown>>(tree, libTsconfigPath) : null;
-    const tsconfigLibExtends = tsconfigExtends(libTsconfig) ?? '../../tsconfig.base.json';
+    // The lib program's base, else the workspace tsconfig.base.json as reached
+    // from this project's root: one level up from `tooling`, two from `packages/app`.
+    const testExtends = tsconfigExtends(libTsconfig) ?? posix.relative(config.root, 'tsconfig.base.json');
     const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
 
     // Collect reference paths
@@ -327,7 +330,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
 
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners,
-      tsconfigLibExtends,
+      testExtends,
       libCompilerOptions: libCompilerOptions ?? undefined,
       referencePaths,
       isNew,
@@ -404,14 +407,14 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
       issues.push(...absoluteIssues);
       if (absoluteIssues.length === 0) {
         const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
-        const tsconfigLibExtends = tsconfigExtends(libTsconfig) ?? '../../tsconfig.base.json';
+        const testExtends = tsconfigExtends(libTsconfig) ?? posix.relative(packagePath, 'tsconfig.base.json');
         const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
         const referencePaths = collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames);
         const normalized = structuredClone(tsconfig);
         if (
           applyTypecheckTestDefaults(normalized, {
             testRunners,
-            tsconfigLibExtends,
+            testExtends,
             libCompilerOptions: libCompilerOptions ?? undefined,
             referencePaths,
           })
