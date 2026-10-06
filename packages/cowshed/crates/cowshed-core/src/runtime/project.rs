@@ -21,9 +21,9 @@ use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, RemovedWorkspace, RevisionResult, RunSandboxMode, SealedJob,
-    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, RunSandboxMode,
+    SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -207,7 +207,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         into: Option<WorkspaceTarget>,
         options: RebaseOptions,
-    ) -> Result<GitOid>;
+    ) -> Result<RebaseReport>;
     /// Land `workspace` into `into`, or into main when `into` is `None`.
     async fn land(
         &mut self,
@@ -1138,11 +1138,11 @@ impl ProjectActor {
         require_coordinator(request.authority())?;
         let params: IntoParams<RebaseOptions> = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
-        let oid = self
+        let report = self
             .host
             .rebase(params.workspace, params.into, params.options)
             .await?;
-        json_response(RevisionResult { oid })
+        json_response(report)
     }
 
     async fn coordinator_land(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -9922,7 +9922,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         into: Option<WorkspaceTarget>,
         options: RebaseOptions,
-    ) -> Result<GitOid> {
+    ) -> Result<RebaseReport> {
         require_single_destination(options.onto.as_ref(), into.as_ref())?;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
@@ -9969,7 +9969,26 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let onto_head = git_revision_oid(&root, &onto).await?;
         require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
         run_git_rebase_atomically(&root, &onto, &source_head).await?;
-        git_oid(&root).await
+        let oid = git_oid(&root).await?;
+        // The rebase has happened: a failed carry reads as such, never as a refused rebase.
+        let build_volume = timed_async(
+            "rebase",
+            "carry",
+            self.build_volumes()?
+                .rebase_carry(root.clone(), into.mount.clone()),
+        )
+        .await
+        .map_err(|failed| {
+            CowshedError::new(
+                failed.code,
+                format!(
+                    "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {}",
+                    into.name, failed.message
+                ),
+                failed.hint,
+            )
+        })?;
+        Ok(RebaseReport { oid, build_volume })
     }
 
     async fn land(

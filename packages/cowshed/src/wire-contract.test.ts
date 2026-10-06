@@ -12,6 +12,7 @@ import type {
   JobInfo,
   LandReport,
   PushReport,
+  RebaseReport,
   RemoveReport,
   ResizeResult,
   WorkspaceInfo,
@@ -69,6 +70,10 @@ const seamTypes = {
   LandReport: {
     assertOne: typia.createAssertEquals<LandReport>(),
     parseOne: typia.json.createAssertParse<LandReport>(),
+  },
+  RebaseReport: {
+    assertOne: typia.createAssertEquals<RebaseReport>(),
+    parseOne: typia.json.createAssertParse<RebaseReport>(),
   },
   PushReport: {
     assertOne: typia.createAssertEquals<PushReport>(),

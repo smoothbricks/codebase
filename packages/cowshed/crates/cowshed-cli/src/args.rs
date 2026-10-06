@@ -2670,6 +2670,7 @@ const REBASE: CommandSpec = CommandSpec {
     about: &[
         "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
         "With `--into <lane>`, the destination is what the unit lands into instead: the branch the lane base <lane> has checked out, fetched from its mount, so a unit forked from a lane base catches up with what its lane-mates have landed there.",
+        "Then the workspace's build volume takes every Nx cache entry its target's volume indexes and it lacks, so tasks the target already ran at the rebased tree hit instead of re-running. The new head prints on stdout and what was carried on stderr. The carry stops each side's idle Nx daemon, which restarts on its next client; a side whose task database another process holds carries nothing, says which process, and the rebase still stands.",
     ],
     options: &[
         Opt {

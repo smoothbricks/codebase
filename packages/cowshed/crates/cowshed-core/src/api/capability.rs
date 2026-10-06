@@ -1,11 +1,11 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
-    GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
-    ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RevisionResult, RunSandboxMode, SealedJob, StdinSource, StepReport,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    ResizeVolume, RunSandboxMode, SealedJob, StdinSource, StepReport, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1648,20 +1648,20 @@ impl Coordinator {
     }
 
     /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's `main`
-    /// when `into` is `None`. `into` and `options.onto` are exclusive.
+    /// when `into` is `None`. `into` and `options.onto` are exclusive. The report carries the new
+    /// head and what the workspace's build volume took of its target's Nx cache.
     pub async fn rebase(
         &self,
         workspace: &str,
         into: Option<&WorkspaceRef>,
         options: RebaseOptions,
-    ) -> Result<GitOid> {
-        let result: RevisionResult = call_typed(
+    ) -> Result<RebaseReport> {
+        call_typed(
             &self.runtime,
             "coordinator.rebase",
             self.landing_params(workspace, into, json!(options)),
         )
-        .await?;
-        Ok(result.oid)
+        .await
     }
 
     /// Land `workspace` into `into` — fast-forward the branch `into` has checked out and retire

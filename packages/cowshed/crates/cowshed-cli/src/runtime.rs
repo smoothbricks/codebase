@@ -18,11 +18,11 @@ use cowshed_core::api::{
     ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions,
     GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
-    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, Reseed, ReseedResult, ResizeResult, ResizeVolume,
-    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, Reseed, ReseedResult,
+    ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -152,7 +152,7 @@ pub trait CliService: Send {
         workspace: &str,
         into: Option<&str>,
         options: RebaseOptions,
-    ) -> Result<GitOid>;
+    ) -> Result<RebaseReport>;
     async fn land(
         &mut self,
         workspace: &str,
@@ -736,7 +736,7 @@ impl CliService for ActorBridge {
         workspace: &str,
         into: Option<&str>,
         options: RebaseOptions,
-    ) -> Result<GitOid> {
+    ) -> Result<RebaseReport> {
         let coordinator = self.coordinator()?;
         let into = match into {
             Some(name) => Some(coordinator.project().workspace(name).await?),
@@ -1617,16 +1617,15 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
             };
-            let oid = service
+            let report = service
                 .rebase(&workspace, args.into.as_deref(), options)
                 .await?;
             if json {
-                output
-                    .success(RevisionResult { oid: oid.clone() })
-                    .map_err(output_error)?;
+                output.success(report).map_err(output_error)?;
             } else {
                 output
-                    .bare_line(oid.as_str().as_bytes())
+                    .bare_line(report.oid.as_str().as_bytes())
+                    .and_then(|()| output.guidance(&rebase_build_volume_line(&report.build_volume)))
                     .map_err(output_error)?;
             }
             Ok(success())
@@ -2893,6 +2892,28 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
             Ok(())
         })
         .map_err(output_error)
+}
+
+/// What the rebase carried into the workspace's build volume, as one stderr line
+/// (16_build_volumes.md, "Rebase carry"); the same value the JSON report carries.
+fn rebase_build_volume_line(build: &RebaseBuildVolume) -> String {
+    match build {
+        RebaseBuildVolume::Skipped { reason } => {
+            format!("build volume: carried nothing of the target's Nx cache: {reason}")
+        }
+        RebaseBuildVolume::Carried { carried } => format!(
+            "build volume: carried {} Nx cache entr{} ({} bytes) the target held into the rebased workspace in {} ms{}",
+            carried.entries,
+            if carried.entries == 1 { "y" } else { "ies" },
+            carried.bytes,
+            carried.elapsed_ms,
+            carried
+                .stopped
+                .as_ref()
+                .map(|stopped| format!("; the carry stopped short: {stopped}"))
+                .unwrap_or_default()
+        ),
+    }
 }
 
 /// What the land did with build volumes, one stderr line each (16_build_volumes.md, Land steps

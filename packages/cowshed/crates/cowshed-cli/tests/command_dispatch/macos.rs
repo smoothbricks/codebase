@@ -7,7 +7,8 @@ use cowshed_core::apfs::{
 };
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, DatabaseHolder, LandReport, Reseed, ReseedResult,
+    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, LandReport, RebaseBuildVolume,
+    RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
@@ -1954,8 +1955,9 @@ async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() 
 
 /// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
 /// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
-/// and changing nothing `a` hashes, lands next without running them. Main then adopts `b`'s
-/// volume, which never held `a`'s entries, and a fork of main still hits both.
+/// and changing nothing `a` hashes, lands next without running them. `b` catches up with plain
+/// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
+/// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
 #[tokio::test]
 async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts() {
     let (nx, node) = repository_nx();
@@ -1977,7 +1979,11 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
     let report = land(&mut service, "a", true, &[&nx_check]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
-    succeed(&mut service, ["rebase", "b"]).await;
+    git(
+        &b,
+        &["fetch", "-q", &fixture.checkout.to_string_lossy(), "HEAD"],
+    );
+    git(&b, &["rebase", "-q", "FETCH_HEAD"]);
     let report = land(&mut service, "b", true, &[]).await;
     match &report.build_volume.adoption {
         Adoption::Adopted { carried, .. } => {
@@ -2000,6 +2006,120 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
             .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
         "a fork of main hits what a's land ran, though b's land adopted a volume without it: {hits:?}"
     );
+}
+
+/// A rebase carries main's Nx cache entries into the rebased workspace's volume
+/// (16_build_volumes.md, "Rebase carry"): `b`, forked before `a` lands and warms `a:build` and
+/// `a:test` in main, rebases after that land, and its run of the landed check hits both without
+/// re-running either. A rebase while a process holds `b`'s task database carries nothing and
+/// names that process.
+#[tokio::test]
+async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let nx_check = nx_run_many(&node);
+
+    let b = new_workspace(&mut service, "b").await;
+    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
+    git(&b, &["add", "unrelated.txt"]);
+    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
+
+    let a = new_workspace(&mut service, "a").await;
+    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
+    git(&a, &["commit", "-q", "-am", "change a"]);
+    let report = land(&mut service, "a", true, &[&nx_check]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+
+    let rebased = rebase(&mut service, "b").await;
+    assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
+    match &rebased.build_volume {
+        RebaseBuildVolume::Carried { carried } => {
+            assert_eq!(carried.stopped, None, "{rebased:?}");
+            assert!(
+                carried.entries >= 2,
+                "a:build and a:test, which main held and b's volume did not: {rebased:?}"
+            );
+        }
+        RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
+    }
+    let hits = nx_statuses(&mut service, "b", &b, &nx_check).await;
+
+    let data = b.join(".nx/workspace-data");
+    let databases: Vec<PathBuf> = fs::read_dir(&data)
+        .expect("b's Nx workspace data")
+        .map(|entry| entry.expect("workspace data entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
+        .collect();
+    let [database] = databases.as_slice() else {
+        panic!("one task database in {}: {databases:?}", data.display());
+    };
+    let holder = Holder(
+        Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(database)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn a database holder"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    eventually("tail holds the task database open", || {
+        nx::holders(database)
+            .expect("query the database's holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    })
+    .await;
+    let held = rebase(&mut service, "b").await;
+    drop(holder);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "b runs the landed check without re-running what a's land ran: {hits:?}"
+    );
+    match held.build_volume {
+        RebaseBuildVolume::Skipped {
+            reason:
+                RebaseCarrySkip::Held {
+                    side: CarrySide::Workspace,
+                    database: named,
+                    holders,
+                },
+        } => {
+            assert_eq!(
+                named.canonicalize().expect("the held database exists"),
+                database.canonicalize().expect("b's database exists")
+            );
+            assert!(
+                holders.iter().any(|holder| holder.pid == pid),
+                "tail is named among {holders:?}"
+            );
+        }
+        build_volume => panic!("a held database skips the carry: {build_volume:?}"),
+    }
+}
+
+/// `cowshed rebase --json <workspace>`; answers the report the CLI printed.
+async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
+    let (stdout, stderr) = succeed(service, ["--json", "rebase", workspace]).await;
+    let envelope: JsonEnvelope<RebaseReport> =
+        serde_json::from_slice(&stdout).unwrap_or_else(|error| {
+            panic!(
+                "rebase --json printed no report ({error}): {}\n{stderr}",
+                String::from_utf8_lossy(&stdout)
+            )
+        });
+    envelope
+        .result()
+        .cloned()
+        .expect("a successful rebase report")
 }
 
 /// A process other than main's daemon holding main's Nx task database open makes the land skip

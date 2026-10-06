@@ -1,7 +1,8 @@
 //! The project side of build volumes (16_build_volumes.md): a fork clones its target's seed, a
 //! land quiesces the landing workspace, freezes the target's seed, and moves the target's one
-//! link, a reseed refreezes a target's seed from its own quiet volume, and collection deletes
-//! what nothing links.
+//! link, a rebase carries its target's Nx cache entries into the rebased workspace's volume, a
+//! reseed refreezes a target's seed from its own quiet volume, and collection deletes what
+//! nothing links.
 //!
 //! Every step here runs inside one process's project actor, so no two of that process's steps
 //! interleave; another cowshed process's can, which is why collection defers what a workspace
@@ -16,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::apfs::SystemCommandRunner;
 use crate::api::dto::{
-    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry, Reseed,
-    ReseedSkip, Sha256Digest,
+    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry,
+    RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
 };
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
@@ -481,6 +482,58 @@ impl BuildVolumes {
         .await
     }
 
+    /// Rebase carry (16_build_volumes.md, "Rebase carry"): index in the volume `checkout` links
+    /// every Nx cache entry the target's volume indexes and it lacks, with the land's carry. The
+    /// copies are staged while both sides run. Then each side's Nx state is closed as a land
+    /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
+    /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
+    /// the carry writes either while it indexes. A skip deletes what was staged.
+    pub async fn rebase_carry(
+        &self,
+        checkout: PathBuf,
+        target_checkout: PathBuf,
+    ) -> Result<RebaseBuildVolume> {
+        let workspace = self.layout.linked(&checkout)?;
+        let target = self.layout.linked(&target_checkout)?;
+        self.blocking(move |host, layout| {
+            let skipped = |reason| Ok(RebaseBuildVolume::Skipped { reason });
+            let Some(workspace) = workspace else {
+                return skipped(RebaseCarrySkip::NoWorkspaceVolume);
+            };
+            let Some(target) = target else {
+                return skipped(RebaseCarrySkip::NoTargetVolume);
+            };
+            let started = Instant::now();
+            let into = host
+                .mount_build_volume(layout, &workspace)
+                .map_err(storage)?;
+            let into_state = BuildVolumeState::read(&into)?;
+            let from = host.mount_build_volume(layout, &target).map_err(storage)?;
+            let from_state = BuildVolumeState::read(&from)?;
+            let staged = carry::stage(&from, &from_state, &into, &into_state);
+            let staged_in = started.elapsed();
+            let sides = [
+                (CarrySide::Workspace, into.as_path(), &into_state),
+                (CarrySide::Target, from.as_path(), &from_state),
+            ];
+            let opens = match settle(&sides)? {
+                Ok(opens) => opens,
+                Err(reason) => {
+                    carry::unstage(&into)
+                        .map_err(|error| io("unstage the carry", &into, &error))?;
+                    return skipped(reason);
+                }
+            };
+            let committing = Instant::now();
+            let carried = carry::commit(staged, &into);
+            drop(opens);
+            Ok(RebaseBuildVolume::Carried {
+                carried: nx_carry(carried, staged_in + committing.elapsed(), &workspace),
+            })
+        })
+        .await
+    }
+
     /// Land step 5: `target`'s new seed is a clone of the quiet landing volume, and every older
     /// seed of `target` is deleted.
     pub async fn freeze_seed(&self, quiet: &Quiet, target: Owner, tree: GitOid) -> Result<()> {
@@ -593,19 +646,11 @@ impl BuildVolumes {
         self.blocking(move |_, _| {
             let started = Instant::now();
             let carried = carry::commit(staging.staged, &quiet.mount);
-            let carry = NxCarry {
-                entries: carried.entries,
-                bytes: carried.bytes,
-                elapsed_ms: millis(staging.elapsed + started.elapsed()),
-                stopped: carried.stopped,
-            };
-            crate::timing::event("build-volume", || {
-                format!(
-                    "carried {} Nx entries ({} bytes) into {} in {} ms",
-                    carry.entries, carry.bytes, quiet.id, carry.elapsed_ms
-                )
-            });
-            Ok(carry)
+            Ok(nx_carry(
+                carried,
+                staging.elapsed + started.elapsed(),
+                &quiet.id,
+            ))
         })
         .await
     }
@@ -1222,6 +1267,78 @@ fn target_opening(opening: nx::Opening) -> AdoptionSkip {
     AdoptionSkip::TargetOpening {
         database: opening.database,
         holders: opening.holders.into_iter().map(database_holder).collect(),
+    }
+}
+
+/// What a carry into the volume `into` reports, taking `elapsed` in all; also said as a timing
+/// event.
+fn nx_carry(carried: carry::Carried, elapsed: Duration, into: &BuildVolumeId) -> NxCarry {
+    let carry = NxCarry {
+        entries: carried.entries,
+        bytes: carried.bytes,
+        elapsed_ms: millis(elapsed),
+        stopped: carried.stopped,
+    };
+    crate::timing::event("build-volume", || {
+        format!(
+            "carried {} Nx entries ({} bytes) into {into} in {} ms",
+            carry.entries, carry.bytes, carry.elapsed_ms
+        )
+    });
+    carry
+}
+
+/// The rebase carry's commit precondition on each of `sides`, the volume mounted at its path
+/// with its state: its Nx state closed ([`nx::close`] stops only an idle daemon), then its open
+/// locks held and its task databases held by nothing. Answers the held locks, which keep every
+/// Nx process from opening either database until they are dropped, or the first side that
+/// failed it, with every lock taken until then let go.
+fn settle(
+    sides: &[(CarrySide, &Path, &BuildVolumeState)],
+) -> Result<std::result::Result<Vec<nx::Opens>, RebaseCarrySkip>> {
+    for &(side, mount, state) in sides {
+        if let Err(busy) =
+            nx::close(mount, state).map_err(|error| io("close the Nx state", mount, &error))?
+        {
+            return Ok(Err(rebase_skip(busy, side)));
+        }
+    }
+    let mut opens = Vec::with_capacity(sides.len());
+    for &(side, mount, state) in sides {
+        match nx::hold_opens(mount, state, mount)
+            .map_err(|error| io("lock the Nx opens", mount, &error))?
+        {
+            Ok(held) => opens.push(held),
+            Err(opening) => {
+                return Ok(Err(RebaseCarrySkip::Opening {
+                    side,
+                    database: opening.database,
+                    holders: opening.holders.into_iter().map(database_holder).collect(),
+                }));
+            }
+        }
+    }
+    for &(side, mount, state) in sides {
+        if let Err(busy) =
+            nx::held(mount, state).map_err(|error| io("look at the Nx state", mount, &error))?
+        {
+            return Ok(Err(rebase_skip(busy, side)));
+        }
+    }
+    Ok(Ok(opens))
+}
+
+fn rebase_skip(busy: nx::Busy, side: CarrySide) -> RebaseCarrySkip {
+    match busy {
+        nx::Busy::Held { database, holders } => RebaseCarrySkip::Held {
+            side,
+            database,
+            holders: holders.into_iter().map(database_holder).collect(),
+        },
+        nx::Busy::DaemonStayed { daemon } => RebaseCarrySkip::DaemonStayed {
+            side,
+            daemon: database_holder(daemon),
+        },
     }
 }
 

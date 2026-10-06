@@ -723,7 +723,8 @@ and are refused together (exit 2).
   before the rebase starts (exit 4, commit or discard first): the rebase runs with `--no-autostash` whatever the
   repository's config says, because an autostash re-apply that conflicts leaves unmerged paths and a parked stash yet
   exits 0. Conflicts abort the rebase (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with
-  `next:` hints naming the conflicted paths and the by-hand replay.
+  `next:` hints naming the conflicted paths and the by-hand replay. A rebase that did not conflict then carries its
+  target's Nx cache entries into the workspace's build volume (16_build_volumes.md, "Rebase carry").
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md

@@ -440,12 +440,11 @@ impl Coordinator {
         let into = into.map(|reference| reference.inner.clone());
         spawn_promise(env, async move {
             let options = parse_json::<RebaseOptions>("rebase options", &options_json)?;
-            Ok(coordinator
+            let report = coordinator
                 .rebase(&workspace, into.as_ref(), options)
                 .await
-                .map_err(AddonFailure::from)?
-                .as_str()
-                .to_owned())
+                .map_err(AddonFailure::from)?;
+            canonical_json("rebase report", &report)
         })
     }
 

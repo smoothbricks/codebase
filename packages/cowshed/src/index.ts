@@ -35,6 +35,7 @@ import {
   type PushOptions,
   type PushReport,
   type RebaseOptions,
+  type RebaseReport,
   type RemoveOptions,
   type RemoveReport,
   type ResizeResult,
@@ -87,6 +88,7 @@ export {
   type PushOptions,
   type PushReport,
   type RebaseOptions,
+  type RebaseReport,
   type RemoveOptions,
   type RemoveReport,
   type ResizeResult,
@@ -122,6 +124,7 @@ const parseWorkspaceInfo = typia.json.createAssertParse<WorkspaceInfo>();
 const parseWorkspaceInfos = typia.json.createAssertParse<WorkspaceInfo[]>();
 const parseGrantSet = typia.json.createAssertParse<GrantSet>();
 const parseLandReport = typia.json.createAssertParse<LandReport>();
+const parseRebaseReport = typia.json.createAssertParse<RebaseReport>();
 const parseGcReport = typia.json.createAssertParse<GcReport>();
 const parsePushReport = typia.json.createAssertParse<PushReport>();
 const parseJobInfo = typia.json.createAssertParse<JobInfo>();
@@ -334,11 +337,13 @@ class CoordinatorImpl implements Coordinator {
     return parseGrantSet(await callNativeAsync(() => this.#native.revoke(workspace, encodeGrantDelta(delta))));
   }
 
-  async rebase(workspace: string, options?: RebaseOptions): Promise<string> {
+  async rebase(workspace: string, options?: RebaseOptions): Promise<RebaseReport> {
     // `into` with `onto` is refused by the controller, the one place that decides a destination.
     const { into, ...rest } = options ?? {};
     const handle = into === undefined ? undefined : WorkspaceRefImpl.handleOf(into);
-    return callNativeAsync(() => this.#native.rebase(workspace, encodeRebaseOptions(rest), handle));
+    return parseRebaseReport(
+      await callNativeAsync(() => this.#native.rebase(workspace, encodeRebaseOptions(rest), handle)),
+    );
   }
 
   async land(workspace: string, options?: LandOptions): Promise<LandReport> {

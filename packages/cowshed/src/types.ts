@@ -323,6 +323,34 @@ export type AdoptionSkip =
   | { readonly kind: 'targetDaemonStayed'; readonly daemon: DatabaseHolder }
   | { readonly kind: 'landingVolumeBusy'; readonly reason: string };
 
+/** What `rebase` did: the new head, and what the workspace's build volume took of its target's Nx cache (16_build_volumes.md, "Rebase carry"). */
+export interface RebaseReport {
+  readonly oid: string;
+  readonly buildVolume:
+    | { readonly kind: 'carried'; readonly carried: NxCarry }
+    | { readonly kind: 'skipped'; readonly reason: RebaseCarrySkip };
+}
+
+/** The rebased workspace's volume, or the volume of what it rebased onto. */
+export type CarrySide = 'workspace' | 'target';
+
+export type RebaseCarrySkip =
+  | { readonly kind: 'noWorkspaceVolume' }
+  | { readonly kind: 'noTargetVolume' }
+  | {
+      readonly kind: 'held';
+      readonly side: CarrySide;
+      readonly database: string;
+      readonly holders: readonly DatabaseHolder[];
+    }
+  | {
+      readonly kind: 'opening';
+      readonly side: CarrySide;
+      readonly database: string;
+      readonly holders: readonly DatabaseHolder[];
+    }
+  | { readonly kind: 'daemonStayed'; readonly side: CarrySide; readonly daemon: DatabaseHolder };
+
 export interface AdoptionCheck {
   readonly hits: number;
   readonly misses: readonly CacheMiss[];
@@ -534,7 +562,7 @@ export interface Coordinator {
   moveCheckout(destination: string): Promise<WorkspaceRef>;
   grant(workspace: string, delta: GrantDelta): Promise<GrantSet>;
   revoke(workspace: string, delta: GrantDelta): Promise<GrantSet>;
-  rebase(workspace: string, options?: RebaseOptions): Promise<string>;
+  rebase(workspace: string, options?: RebaseOptions): Promise<RebaseReport>;
   land(workspace: string, options?: LandOptions): Promise<LandReport>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;

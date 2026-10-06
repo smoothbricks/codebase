@@ -1046,6 +1046,85 @@
       "sourceHead": "3333333333333333333333333333333333333333"
     }
   },
+  "RebaseReport": {
+    "carried": {
+      "buildVolume": {
+        "carried": {
+          "bytes": 8192,
+          "elapsedMs": 40,
+          "entries": 12
+        },
+        "kind": "carried"
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "daemonStayed": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "daemon": {
+            "command": "node nx daemon",
+            "pid": 4646
+          },
+          "kind": "daemonStayed",
+          "side": "target"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "noTargetVolume": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "kind": "noTargetVolume"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "noWorkspaceVolume": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "kind": "noWorkspaceVolume"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "targetOpening": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
+          "holders": [
+            {
+              "command": "node nx build widget",
+              "pid": 4545
+            }
+          ],
+          "kind": "opening",
+          "side": "target"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "workspaceHeld": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
+          "holders": [
+            {
+              "command": "node nx run-many -t test",
+              "pid": 4444
+            }
+          ],
+          "kind": "held",
+          "side": "workspace"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    }
+  },
   "RemoveReport": {
     "abandoned": {
       "abandoned": {

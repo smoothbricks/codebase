@@ -1118,7 +1118,7 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         _into: Option<WorkspaceTarget>,
         options: RebaseOptions,
-    ) -> Result<GitOid> {
+    ) -> Result<cowshed_core::api::dto::RebaseReport> {
         let current = self.workspace(&workspace)?;
         if options
             .expected_workspace_incarnation
@@ -1130,8 +1130,13 @@ impl ProjectRuntimeHost for FakeHost {
                 "refresh and retry",
             ));
         }
-        GitOid::new("1111111111111111111111111111111111111111")
-            .map_err(|error| CowshedError::internal(error.to_string()))
+        Ok(cowshed_core::api::dto::RebaseReport {
+            oid: GitOid::new("1111111111111111111111111111111111111111")
+                .map_err(|error| CowshedError::internal(error.to_string()))?,
+            build_volume: cowshed_core::api::dto::RebaseBuildVolume::Skipped {
+                reason: cowshed_core::api::dto::RebaseCarrySkip::NoWorkspaceVolume,
+            },
+        })
     }
 
     async fn land(

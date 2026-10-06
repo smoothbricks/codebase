@@ -21,14 +21,14 @@ use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path
 
 use cowshed_core::{
     api::{
-        AbandonedWork, BinaryData, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
+        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
         EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
         GcReport, GitOid, GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits,
         OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
-        RemoveReport, RepoRule, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId,
-        StdinInfo, StdinKind, StreamInfo, TraceContext, TraceId, UtcTimestamp,
-        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
-        WorkspaceRole, WorkspaceState,
+        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResizeResult,
+        ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamInfo,
+        TraceContext, TraceId, UtcTimestamp, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding,
+        WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -557,6 +557,28 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
+    // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
+    // TypeScript union is not checked against.
+    let rebase_carried = RebaseReport {
+        oid: oid("7777777777777777777777777777777777777777"),
+        build_volume: RebaseBuildVolume::Carried {
+            carried: cowshed_core::api::dto::NxCarry {
+                entries: 12,
+                bytes: 8192,
+                elapsed_ms: 40,
+                stopped: None,
+            },
+        },
+    };
+    let rebase_skipped = |reason| RebaseReport {
+        build_volume: RebaseBuildVolume::Skipped { reason },
+        ..rebase_carried.clone()
+    };
+    let holder = |pid, command: &str| cowshed_core::api::dto::DatabaseHolder {
+        pid,
+        command: command.to_owned(),
+    };
+    let database = || PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db");
 
     let push_new = PushReport {
         source_head: oid("3333333333333333333333333333333333333333"),
@@ -679,6 +701,58 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 (
                     "adoptionSkippedOpening",
                     document("land report", &land_opening),
+                ),
+            ]),
+        ),
+        (
+            "RebaseReport",
+            BTreeMap::from([
+                ("carried", document("rebase report", &rebase_carried)),
+                (
+                    "noWorkspaceVolume",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::NoWorkspaceVolume),
+                    ),
+                ),
+                (
+                    "noTargetVolume",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::NoTargetVolume),
+                    ),
+                ),
+                (
+                    "workspaceHeld",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::Held {
+                            side: CarrySide::Workspace,
+                            database: database(),
+                            holders: vec![holder(4444, "node nx run-many -t test")],
+                        }),
+                    ),
+                ),
+                (
+                    "targetOpening",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::Opening {
+                            side: CarrySide::Target,
+                            database: database(),
+                            holders: vec![holder(4545, "node nx build widget")],
+                        }),
+                    ),
+                ),
+                (
+                    "daemonStayed",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::DaemonStayed {
+                            side: CarrySide::Target,
+                            daemon: holder(4646, "node nx daemon"),
+                        }),
+                    ),
                 ),
             ]),
         ),

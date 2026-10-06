@@ -661,12 +661,6 @@ pub struct RekeyResult {
     pub tombstone_removed: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RevisionResult {
-    pub oid: GitOid,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SlotResult {
@@ -2818,6 +2812,121 @@ pub struct NxCarry {
     pub stopped: Option<String>,
 }
 
+/// What `cowshed rebase` did: the workspace's new head, and the Nx cache entries its target's
+/// volume held that the workspace's volume took (16_build_volumes.md, "Rebase carry").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RebaseReport {
+    pub oid: GitOid,
+    pub build_volume: RebaseBuildVolume,
+}
+
+/// The rebase carry's outcome. The rebase itself has succeeded either way; a skip only leaves
+/// the workspace to rebuild what its target already ran at the rebased tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum RebaseBuildVolume {
+    /// The workspace's volume indexes every entry the target's held and it lacked, up to
+    /// `carried.stopped`.
+    Carried { carried: NxCarry },
+    /// Nothing was carried, and nothing was left staged.
+    Skipped { reason: RebaseCarrySkip },
+}
+
+/// One of the two volumes a rebase carry reads or writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CarrySide {
+    /// The rebased workspace's volume, which takes the entries.
+    Workspace,
+    /// The volume of what the workspace rebased onto, which holds them.
+    Target,
+}
+
+impl fmt::Display for CarrySide {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Workspace => "rebased workspace's",
+            Self::Target => "target's",
+        })
+    }
+}
+
+/// Why a rebase carried nothing (16_build_volumes.md, "Rebase carry"): a side's Nx task
+/// database had a writer other than the carry, or a side has no volume.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum RebaseCarrySkip {
+    /// The rebased workspace links no build volume.
+    NoWorkspaceVolume,
+    /// The target links no build volume.
+    NoTargetVolume,
+    /// A process other than the side's stopped daemon holds its Nx task database.
+    Held {
+        side: CarrySide,
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// An Nx process held, or waited on, the lock stock Nx opens the side's database under.
+    Opening {
+        side: CarrySide,
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The side's Nx daemon outlived its stop.
+    DaemonStayed {
+        side: CarrySide,
+        daemon: DatabaseHolder,
+    },
+}
+
+impl fmt::Display for RebaseCarrySkip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let holders = |formatter: &mut fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
+            for (index, holder) in holders.iter().enumerate() {
+                let separator = if index == 0 { "" } else { ", " };
+                write!(
+                    formatter,
+                    "{separator}pid {} ({})",
+                    holder.pid, holder.command
+                )?;
+            }
+            Ok(())
+        };
+        match self {
+            Self::NoWorkspaceVolume => {
+                formatter.write_str("the rebased workspace has no build volume")
+            }
+            Self::NoTargetVolume => formatter.write_str("the target has no build volume"),
+            Self::Held {
+                side,
+                database,
+                holders: held,
+            } => {
+                write!(formatter, "the {side} {} is open in ", database.display())?;
+                holders(formatter, held)
+            }
+            Self::Opening {
+                side,
+                database,
+                holders: held,
+            } => {
+                write!(
+                    formatter,
+                    "an Nx process was opening the {side} {}: ",
+                    database.display()
+                )?;
+                holders(formatter, held)
+            }
+            Self::DaemonStayed { side, daemon } => write!(
+                formatter,
+                "the {side} Nx daemon pid {} ({}) did not exit after SIGTERM",
+                daemon.pid, daemon.command
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AdoptionSkip {
@@ -3299,7 +3408,7 @@ result_bodies!(
     GcReport,
     CheckpointResult,
     RekeyResult,
-    RevisionResult,
+    RebaseReport,
     ResizeResult,
     DefragmentResult,
     ReseedResult,

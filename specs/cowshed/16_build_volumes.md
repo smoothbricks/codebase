@@ -424,6 +424,33 @@ deletes before it starts.
 - **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
   that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
 
+### Rebase carry
+
+A workspace forked before other lands holds none of what they ran. `cowshed rebase` moves its tree onto the target's,
+where the target's volume already holds those tasks' entries, so the workspace's next gate would re-run every task the
+target ran at that tree. So once a rebase has not conflicted, the workspace's build volume takes every Nx cache entry
+the target's task database indexes and its own lacks, with the land's carry (above), in the other direction: the
+target's volume is the source and the workspace's is the destination.
+
+1. **Stage** while both sides run: the target's missing rows are read and their files copied into the workspace volume's
+   `.carry/`, as at Land 5.1.
+2. **Close each side**, the workspace first, as Land 5.2–5.4 close the target: when nothing but the side's daemon holds
+   its task database, stop that daemon (it restarts on its next client); any other holder skips.
+3. **Take both sides' open locks and look again**, as Land 6.1–6.2 do for the target: a lock some process holds, or a
+   database some process opened since the close, skips. The workspace's jobs keep running through a rebase, unlike a
+   landing workspace's, so this look is what proves nothing in the workspace writes its database during the commit; an
+   Nx process that starts meanwhile waits on the lock.
+4. **Commit**, as Land 5.5, then let go of the locks.
+
+A skip deletes what was staged and names the side, the database and each process with its pid and command; the rebase
+itself has happened and stands. A copy that fails stops the carry and keeps what was carried until then, as at a land.
+The report is `RebaseReport { oid, buildVolume }`, where `buildVolume` is `carried` with the `NxCarry` counts or
+`skipped` with the reason. A rebase moves no seed: the workspace's seed catches up with its volume at its next fork
+(Targets and seeds).
+
+- **Enforced by**: a real-APFS test in which a workspace forked before a land rebases after it, its report counts the
+  land's entries carried, and its run of the landed check then hits every task.
+
 ### Stacks and merge queues
 
 A stack of changes on top of main (a PR stack, a merge queue, a lane) is a chain of targets, and the same three moves
