@@ -115,6 +115,43 @@ pub fn link_paths(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> R
     Ok(())
 }
 
+/// Whether every build-state path of `checkout` already is what a refresh at an unchanged
+/// fingerprint leaves it (`migrate::adopt_paths`): its fixed link, under real parent
+/// directories, reaching its directory in the volume mounted at `volume`; or, for a declared path
+/// nothing occupies, nothing at all. Reads only. Anything else — a link a tool displaced or
+/// removed, a missing volume directory, an entry that cannot be read — is the refresh's to repair
+/// or report.
+pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool {
+    paths.iter().all(|state| {
+        let path = state.checkout.as_path();
+        let at = checkout.join(path);
+        match fs::symlink_metadata(&at) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => state.is_declared(),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                real_parents(checkout, path)
+                    && fs::read_link(&at)
+                        .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
+                    && fs::metadata(volume.join(state.volume.as_path()))
+                        .is_ok_and(|metadata| metadata.is_dir())
+            }
+            Ok(_) | Err(_) => false,
+        }
+    })
+}
+
+/// Whether every directory between `checkout` and `relative`'s parent is a real directory, as
+/// [`contained_parent`] requires before it links there.
+fn real_parents(checkout: &Path, relative: &Path) -> bool {
+    let mut parent = checkout.to_path_buf();
+    let Some(parents) = relative.parent() else {
+        return true;
+    };
+    parents.components().all(|component| {
+        parent.push(component);
+        fs::symlink_metadata(&parent).is_ok_and(|metadata| metadata.is_dir())
+    })
+}
+
 /// Opens the block of `info/exclude` lines cowshed owns. Every entry in it is one of cowshed's
 /// own links, anchored at the checkout root.
 const EXCLUDE_BEGIN: &str =
@@ -429,6 +466,50 @@ mod tests {
         assert_eq!(fs::read(volume.join("target/unit")).unwrap(), b"a");
         fs::write(checkout.join(".nx/cache/run.json"), b"{}").unwrap();
         assert!(volume.join("nx/cache/run.json").is_file());
+    }
+
+    /// A resident `exec` admits a job without the controller's refresh only while every link is
+    /// what that refresh would leave; each way a tool can disturb one sends the job through it.
+    #[test]
+    fn only_the_links_a_refresh_leaves_are_settled() {
+        let scratch = Scratch::new("settled");
+        let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        point(&checkout, &volume).unwrap();
+        let mut paths = paths();
+        link_paths(&checkout, &volume, &paths).unwrap();
+        paths.push(BuildStatePath::declared("upstream/build").unwrap());
+        assert!(
+            settled(&checkout, &volume, &paths),
+            "a declared path nothing occupies needs no link"
+        );
+
+        fs::create_dir_all(checkout.join("upstream/build")).unwrap();
+        assert!(
+            !settled(&checkout, &volume, &paths),
+            "a declared path that appeared is linked by the refresh"
+        );
+        fs::remove_dir_all(checkout.join("upstream")).unwrap();
+
+        fs::remove_file(checkout.join("target")).unwrap();
+        assert!(!settled(&checkout, &volume, &paths), "a removed link");
+        fs::create_dir(checkout.join("target")).unwrap();
+        assert!(!settled(&checkout, &volume, &paths), "a displaced link");
+        fs::remove_dir(checkout.join("target")).unwrap();
+        std::os::unix::fs::symlink(volume.join("target"), checkout.join("target")).unwrap();
+        assert!(
+            !settled(&checkout, &volume, &paths),
+            "a link aimed elsewhere"
+        );
+        fs::remove_file(checkout.join("target")).unwrap();
+        link_paths(&checkout, &volume, &paths[..paths.len() - 1]).unwrap();
+        assert!(settled(&checkout, &volume, &paths));
+
+        fs::remove_dir_all(volume.join("nx/cache")).unwrap();
+        assert!(
+            !settled(&checkout, &volume, &paths),
+            "a link whose volume directory is gone dangles"
+        );
     }
 
     /// A repository ignores its build directories with directory patterns (`target/`), which

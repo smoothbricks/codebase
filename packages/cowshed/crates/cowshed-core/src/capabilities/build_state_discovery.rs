@@ -71,27 +71,32 @@ const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 3";
 const PACKAGE_MANIFEST: &str = "package.json";
 
 /// Track the files Cargo reads, including unstaged edits, but not caller or untracked inputs.
-/// One index query supplies the path set; BLAKE3 hashes their working-tree bytes. A tracked
-/// `package.json` contributes whether its package is installed, not its bytes: only that decides
-/// its build state, and a dependency edit must not rediscover Cargo. Source-image clones inherit
-/// the matching fingerprint and links; capability config/markers, the expansion of the declared
-/// build state (a newly tracked package joins a pattern) and a new
-/// [`DISCOVERY_REVISION`] invalidate it.
-pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<String> {
+/// One index query supplies the path set, shared with the detectors' tracked-manifest
+/// conventions; BLAKE3 hashes their working-tree bytes. A tracked `package.json` contributes
+/// whether its package is installed, not its bytes: only that decides its build state, and a
+/// dependency edit must not rediscover Cargo. Source-image clones inherit the matching
+/// fingerprint and links; capability config/markers, the expansion of the declared build state
+/// (a newly tracked package joins a pattern) and a new [`DISCOVERY_REVISION`] invalidate it.
+///
+/// A function of the checkout at `workspace` alone: the controller's refresh and a resident
+/// `exec` (06_cli.md, "Resident workspaces") compute the same value for the same checkout.
+pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
     let mut digest = blake3::Hasher::new();
     digest.update(DISCOVERY_REVISION);
     digest.update(&[0]);
-    for name in tracked_build_inputs(context.workspace_root)?
+    let mut tracked = TrackedManifests::default();
+    for name in tracked
+        .inputs(workspace)?
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
         let relative = Path::new(std::ffi::OsStr::from_bytes(name));
-        let path = context.workspace_root.join(relative);
+        let path = workspace.join(relative);
         digest.update(name);
         digest.update(&[0]);
         if relative.file_name() == Some(std::ffi::OsStr::new(PACKAGE_MANIFEST)) {
-            digest.update(&[u8::from(installed_package(context.workspace_root, &path)?)]);
-        } else if super::convention_file(context.workspace_root, &path)? {
+            digest.update(&[u8::from(installed_package(workspace, &path)?)]);
+        } else if super::convention_file(workspace, &path)? {
             let bytes = fs::read(&path).map_err(|error| super::detection_error(&path, error))?;
             digest.update(&[1]);
             digest.update(blake3::hash(&bytes).as_bytes());
@@ -99,7 +104,7 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
             digest.update(&[0]);
         }
     }
-    let config = context.workspace_root.join(".cowshed.toml");
+    let config = workspace.join(".cowshed.toml");
     match fs::read(&config) {
         Ok(bytes) => {
             digest.update(&bytes);
@@ -107,8 +112,8 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(super::detection_error(&config, error)),
     }
-    let settings = super::workspace_config(context)?;
-    for state in expand_declared(context.workspace_root, settings.build_state())? {
+    let settings = super::workspace_config(workspace)?;
+    for state in expand_declared(workspace, settings.build_state())? {
         digest.update(state.checkout.as_path().as_os_str().as_bytes());
         digest.update(&[0]);
     }
@@ -126,13 +131,13 @@ pub fn tracked_manifest_fingerprint(context: &DetectionContext<'_>) -> Result<St
         }
         let project = setting
             .and_then(|setting| setting.directory.as_ref())
-            .map(|directory| context.workspace_root.join(directory))
-            .unwrap_or_else(|| context.workspace_root.to_owned());
-        super::validate_project_directory(context.workspace_root, &project)?;
+            .map(|directory| workspace.join(directory))
+            .unwrap_or_else(|| workspace.to_owned());
+        super::validate_project_directory(workspace, &project)?;
         digest.update(&[u8::from(detector.matches(
-            context.workspace_root,
+            workspace,
             &project,
-            &mut TrackedManifests::default(),
+            &mut tracked,
         )?)]);
     }
     Ok(digest.finalize().to_hex().to_string())
@@ -392,7 +397,7 @@ pub fn discover_build_state(
     context: &DetectionContext<'_>,
     cargo: &mut dyn CargoRunner,
 ) -> Result<BuildStateDiscovery> {
-    let config = super::workspace_config(context)?;
+    let config = super::workspace_config(context.workspace_root)?;
     let mut tracked = TrackedManifests::default();
     let detected = super::detect_with(context, config.capabilities(), &mut tracked)?;
     let mut result = BuildStateDiscovery {
@@ -1164,13 +1169,13 @@ mod tests {
                 "packages/go/go.mod",
             ],
         );
-        let mut fingerprint = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let mut fingerprint = tracked_manifest_fingerprint(&fixture.root).unwrap();
         write(&fixture, "untracked/Cargo.toml", "not a manifest");
         write(&fixture, "untracked/.cargo/config.toml", "not a config");
         write(&fixture, "untracked/go.mod", "not a module");
         assert_eq!(
             fingerprint,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap()
+            tracked_manifest_fingerprint(&fixture.root).unwrap()
         );
         for path in [
             "rust/Cargo.toml",
@@ -1181,7 +1186,7 @@ mod tests {
             let at = fixture.root.join(path);
             let previous = fs::read_to_string(&at).unwrap();
             fs::write(&at, format!("{previous}\n# new tracked content\n")).unwrap();
-            let next = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+            let next = tracked_manifest_fingerprint(&fixture.root).unwrap();
             assert_ne!(
                 fingerprint, next,
                 "{path} worktree bytes must invalidate discovery"
@@ -1189,7 +1194,7 @@ mod tests {
             git(&fixture, &["add", path]);
             assert_eq!(
                 next,
-                tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+                tracked_manifest_fingerprint(&fixture.root).unwrap(),
                 "staging unchanged worktree content does not change the fingerprint"
             );
             fingerprint = next;
@@ -1197,7 +1202,7 @@ mod tests {
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
         assert_ne!(
             fingerprint,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "an indexer marker adds its build state"
         );
     }
@@ -1216,7 +1221,7 @@ mod tests {
             &fixture,
             &["add", "rust/Cargo.toml", "rust/.cargo/config.toml"],
         );
-        let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let before = tracked_manifest_fingerprint(&fixture.root).unwrap();
         assert_eq!(
             cargo_paths(&fixture).paths,
             [BuildStatePath::new("rust/first-target", "rust/first-target").unwrap()]
@@ -1226,10 +1231,7 @@ mod tests {
             "rust/.cargo/config.toml",
             "[build]\ntarget-dir = \"second-target\"\n",
         );
-        assert_ne!(
-            before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap()
-        );
+        assert_ne!(before, tracked_manifest_fingerprint(&fixture.root).unwrap());
         assert_eq!(
             cargo_paths(&fixture).paths,
             [BuildStatePath::new("rust/second-target", "rust/second-target").unwrap()]
@@ -1307,7 +1309,7 @@ mod tests {
     fn installing_a_package_refreshes_discovery_but_editing_its_manifest_does_not() {
         let fixture = Fixture::new();
         javascript_workspace(&fixture);
-        let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let before = tracked_manifest_fingerprint(&fixture.root).unwrap();
         write(
             &fixture,
             "packages/app/package.json",
@@ -1315,24 +1317,21 @@ mod tests {
         );
         assert_eq!(
             before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "a dependency edit leaves where tools write unchanged"
         );
         fs::create_dir(fixture.root.join("packages/fixture/node_modules")).unwrap();
         assert_ne!(
             before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "a newly installed package adds its tool cache"
         );
         fs::remove_dir(fixture.root.join("packages/fixture/node_modules")).unwrap();
-        assert_eq!(
-            before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap()
-        );
+        assert_eq!(before, tracked_manifest_fingerprint(&fixture.root).unwrap());
         fs::remove_file(fixture.root.join("bun.lock")).unwrap();
         assert_ne!(
             before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "the package manager's convention decides whether any cache is build state"
         );
     }
@@ -1356,7 +1355,7 @@ mod tests {
         git(&fixture, &["init", "--quiet"]);
         upstream_checkout(&fixture);
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
-        let undeclared = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let undeclared = tracked_manifest_fingerprint(&fixture.root).unwrap();
         assert_eq!(
             cargo_paths(&fixture).paths,
             [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
@@ -1366,7 +1365,7 @@ mod tests {
             ".cowshed.toml",
             "[build]\nstate = [\"vendor/upstream\"]\n",
         );
-        let declared = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let declared = tracked_manifest_fingerprint(&fixture.root).unwrap();
         assert_ne!(undeclared, declared, "a new declaration is rediscovered");
         let state = cargo_paths(&fixture);
         assert!(state.findings.is_empty(), "{:?}", state.findings);
@@ -1384,7 +1383,7 @@ mod tests {
         );
         assert_ne!(
             declared,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "a changed declaration is rediscovered"
         );
         assert_eq!(
@@ -1496,11 +1495,11 @@ mod tests {
             !fixture.root.join("packages/a/.cache").exists(),
             "discovery makes nothing"
         );
-        let before = tracked_manifest_fingerprint(&fixture.context()).unwrap();
+        let before = tracked_manifest_fingerprint(&fixture.root).unwrap();
         git(&fixture, &["add", "packages/untracked/package.json"]);
         assert_ne!(
             before,
-            tracked_manifest_fingerprint(&fixture.context()).unwrap(),
+            tracked_manifest_fingerprint(&fixture.root).unwrap(),
             "a newly tracked package moves the fingerprint"
         );
         assert_eq!(

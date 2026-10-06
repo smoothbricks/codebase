@@ -4007,26 +4007,11 @@ impl NativeProjectRuntimeHost {
     ) -> Result<crate::build_volume::BuildStateRefresh> {
         use super::build_volumes::Discovered;
         let name = current.derived.workspace.name().clone();
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
         let volumes = self.build_volumes()?;
-        let sandbox = supervisor_sandbox(
-            &self.home,
-            &self.layout,
-            &self.telemetry_root,
-            current,
-            &grants,
-            mount.to_owned(),
-            main_mount.clone(),
-            volumes.layout.grant(&name, mount)?,
-        )?;
         let (fingerprint, recorded) = {
-            let (sandbox, volumes, mount) = (sandbox.clone(), volumes.clone(), mount.to_owned());
+            let (volumes, mount) = (volumes.clone(), mount.to_owned());
             crate::storage::lifecycle::dispatch_blocking(move || {
-                let fingerprint = sandbox.with_detection_context(
-                    &mount,
-                    crate::capabilities::tracked_manifest_fingerprint,
-                )?;
+                let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&mount)?;
                 Ok::<_, CowshedError>((fingerprint, volumes.state_of(&mount)?))
             })
             .await
@@ -4040,6 +4025,18 @@ impl NativeProjectRuntimeHost {
         let (discovered, findings) = if unchanged {
             (Discovered::Unchanged, Vec::new())
         } else {
+            let main_mount = self.workspace_mount_path(&main_name())?;
+            let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
+            let sandbox = supervisor_sandbox(
+                &self.home,
+                &self.layout,
+                &self.telemetry_root,
+                current,
+                &grants,
+                mount.to_owned(),
+                main_mount.clone(),
+                volumes.layout.grant(&name, mount)?,
+            )?;
             let discovery = {
                 let mount = mount.to_owned();
                 let runtime = tokio::runtime::Handle::current();

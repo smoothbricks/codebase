@@ -1,11 +1,12 @@
 //! `path` and `exec` answered by a resident workspace (06_cli.md "Resident workspaces").
 //!
 //! A named workspace that is mounted, whose daemon-owned supervisor serves its current authority,
-//! and whose gateway session is current (for `exec`) is answered here without opening the
-//! project controller: [`cowshed_core::resident::resolve`] reads its records and asks the live
-//! state, and the job runs through the supervisor's socket. Everything else — and every
-//! workspace the resolution declines — falls through to the controller untouched, so this path
-//! never answers what the controller would answer differently.
+//! and — for `exec` — whose gateway session is current and whose build state the controller's
+//! refresh would leave as it is, is answered here without opening the project controller:
+//! [`cowshed_core::resident::resolve`] reads its records and asks the live state, and the job
+//! runs through the supervisor's socket. Everything else — and every workspace the resolution
+//! declines — falls through to the controller untouched, so this path never answers what the
+//! controller would answer differently.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,6 +70,14 @@ where
                 return Ok(Answer::Declined(stdin));
             };
             if !gateway_current(&resident).await {
+                return Ok(Answer::Declined(stdin));
+            }
+            let build_state = {
+                let _span = span("resident", "build-state");
+                resident.build_state_current()
+            };
+            if let Err(decline) = build_state {
+                declined(decline);
                 return Ok(Answer::Declined(stdin));
             }
             let command = exec_command(args.clone(), stdin)?;

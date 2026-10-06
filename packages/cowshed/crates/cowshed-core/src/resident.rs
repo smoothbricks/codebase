@@ -18,11 +18,14 @@
 //! What a resident answer does not re-check is what the serving supervisor already proved when
 //! it started: the project binding it opened under. A binding changes only through a cowshed
 //! verb, which changes the records read here; a Git remote edited by hand is reconciled by the
-//! next verb that opens the controller. Nor does it refresh the checkout's build state (the
-//! controller's `refresh_build_state`): it grants the volume the build link names when that
-//! volume's record says it is this workspace's and it is mounted, and declines otherwise. A
-//! build-state path discovered or displaced since the last controller verb is linked by the next
-//! one.
+//! next verb that opens the controller.
+//!
+//! A job is admitted only onto build state the controller's refresh would leave as it is
+//! (16_build_volumes.md, "Refresh"; [`Resident::build_state_current`]): the tracked build inputs
+//! still have the fingerprint the checkout's build volume records, and every fixed link that
+//! volume's state names is in place. Anything else — inputs that moved, a volume that records
+//! none or no volume at all, a link a tool displaced — declines, and the controller's refresh
+//! rediscovers or relinks before it admits the job. `path` admits no job and checks none of it.
 
 use std::path::{Path, PathBuf};
 
@@ -73,6 +76,15 @@ pub enum Decline {
     /// The build link names a volume that is not this workspace's, or is not mounted: mounting
     /// through the controller resolves it.
     BuildVolume,
+    /// The checkout links no build volume, or its volume records no fingerprint of the build
+    /// inputs: only discovery, which the controller runs, says what build state it has.
+    BuildStateUnrecorded,
+    /// The tracked build inputs no longer have the fingerprint the build volume records.
+    BuildInputsMoved,
+    /// The tracked build inputs cannot be fingerprinted; the controller's refresh reports why.
+    BuildInputsUnreadable,
+    /// A build-state link is missing, displaced, or reaches no directory in the volume.
+    BuildLinkDisplaced,
 }
 
 impl Decline {
@@ -89,6 +101,10 @@ impl Decline {
             Self::Unserved => "no supervisor serves the workspace",
             Self::ServesOtherAuthority => "the supervisor serves another authority",
             Self::BuildVolume => "the build link needs the controller to resolve it",
+            Self::BuildStateUnrecorded => "no build volume records the checkout's build inputs",
+            Self::BuildInputsMoved => "the build inputs moved off the recorded fingerprint",
+            Self::BuildInputsUnreadable => "the build inputs cannot be fingerprinted",
+            Self::BuildLinkDisplaced => "a build-state link is displaced or missing",
         }
     }
 }
@@ -160,6 +176,34 @@ impl Resident {
     /// The socket the supervisor serves.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Whether a job may be admitted onto the checkout's build state as it is, which is exactly
+    /// when the controller's refresh (16_build_volumes.md, "Refresh") would change nothing: every
+    /// link the volume's state names is in place, and the tracked build inputs still have the
+    /// fingerprint it records. Reads only; the fingerprint costs one `git ls-files` (and one per
+    /// declared pattern) plus a hash of the tracked manifests. A pending discard is left to the
+    /// next controller refresh and `cowshed gc`.
+    pub fn build_state_current(&self) -> Result<(), Decline> {
+        use crate::build_volume::{BuildVolumeState, link};
+        let volume = self
+            .build_volume
+            .as_deref()
+            .ok_or(Decline::BuildStateUnrecorded)?;
+        let state = BuildVolumeState::read(volume).map_err(|_| Decline::Records)?;
+        let recorded = state
+            .fingerprint
+            .as_deref()
+            .ok_or(Decline::BuildStateUnrecorded)?;
+        if !link::settled(&self.mount, volume, &state.paths) {
+            return Err(Decline::BuildLinkDisplaced);
+        }
+        let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&self.mount)
+            .map_err(|_| Decline::BuildInputsUnreadable)?;
+        if fingerprint != recorded {
+            return Err(Decline::BuildInputsMoved);
+        }
+        Ok(())
     }
 }
 
@@ -716,5 +760,89 @@ mod tests {
         .await
         .err();
         assert_eq!(declined, Some(Decline::StaleMount));
+    }
+
+    /// Raven's checkout made a Git repository with its own build volume holding `paths`, linked
+    /// and recorded at the fingerprint its tracked build inputs have now, as a refresh leaves
+    /// it. Answers the volume's mountpoint.
+    fn linked_volume(store: &Store, paths: &[crate::capabilities::BuildStatePath]) -> PathBuf {
+        use crate::build_volume::{
+            BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
+            link,
+        };
+        use crate::fork_lock::Run as _;
+        let checkout = &store.raven_mount;
+        let init = crate::git::git_command_at(checkout)
+            .args(["init", "--quiet"])
+            .output_locked()
+            .expect("git init");
+        assert!(init.status.success(), "git init: {init:?}");
+        let layout = BuildVolumeLayout::new(store.layout.project()).expect("build layout");
+        let id = BuildVolumeId::mint();
+        let volume = layout.mount(&id);
+        std::fs::create_dir_all(&volume).expect("volume");
+        std::fs::create_dir_all(layout.images()).expect("images");
+        layout
+            .write_record(
+                &id,
+                &BuildVolumeRecord::new(None, BuildVolumeRole::Linked { checkout: raven() }),
+            )
+            .expect("record");
+        link::point(checkout, &volume).expect("build link");
+        link::link_paths(checkout, &volume, paths).expect("links");
+        BuildVolumeState {
+            paths: paths.to_vec(),
+            fingerprint: Some(
+                crate::capabilities::tracked_manifest_fingerprint(checkout).expect("fingerprint"),
+            ),
+        }
+        .write(&volume)
+        .expect("state");
+        volume
+    }
+
+    async fn admission(store: &Store, volume: Option<&Path>) -> Result<(), Decline> {
+        let mut probe = probe(store, store.current());
+        probe.mounted.extend(volume.map(Path::to_path_buf));
+        resolve(&store.store, &store.checkout, &raven(), &probe)
+            .await
+            .expect("resident")
+            .build_state_current()
+    }
+
+    /// A resident `exec` admits a job only onto build state the controller's refresh would
+    /// leave as it is (16_build_volumes.md, "Refresh"); `path`, which admits none, still
+    /// resolves. A declared path that appeared moves the fingerprint, and a tool that replaced
+    /// a link with a directory displaced it: both send the job through the controller, whose
+    /// refresh links them. A checkout that links no volume has no recorded fingerprint, so
+    /// only discovery says whether it has build state.
+    #[tokio::test]
+    async fn a_resident_exec_is_admitted_only_onto_build_state_a_refresh_would_leave() {
+        let store = Store::new();
+        assert_eq!(
+            admission(&store, None).await,
+            Err(Decline::BuildStateUnrecorded)
+        );
+        let target = crate::capabilities::BuildStatePath::new("target", "target").expect("path");
+        let volume = linked_volume(&store, &[target]);
+        assert_eq!(admission(&store, Some(&volume)).await, Ok(()));
+
+        let config = store.raven_mount.join(".cowshed.toml");
+        std::fs::write(&config, "[build]\nstate = [\"upstream\"]\n").expect("config");
+        std::fs::create_dir(store.raven_mount.join("upstream")).expect("declared path");
+        assert_eq!(
+            admission(&store, Some(&volume)).await,
+            Err(Decline::BuildInputsMoved)
+        );
+        std::fs::remove_file(&config).expect("config");
+        assert_eq!(admission(&store, Some(&volume)).await, Ok(()));
+
+        let link = store.raven_mount.join("target");
+        std::fs::remove_file(&link).expect("link");
+        std::fs::create_dir(&link).expect("rebuilt directory");
+        assert_eq!(
+            admission(&store, Some(&volume)).await,
+            Err(Decline::BuildLinkDisplaced)
+        );
     }
 }

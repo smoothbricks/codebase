@@ -359,15 +359,23 @@ policy (whose revision is part of the effective grant revision), slot records (w
 lifecycle-intent journal. It asks the host two things: whether a filesystem is mounted exactly at the mount path, and
 which authority the supervisor's socket reports. `exec` also asks the gateway whether the workspace's session is
 installed at that revision — exactly the case in which the controller's pre-exec reconcile would install nothing for it.
-The job then runs through the supervisor's socket, relayed as the controller path relays it.
+And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "Refresh") would leave as
+it is: every fixed link the checkout's build volume records is in place and reaches its volume directory (a declared
+path nothing occupies needs none), and the tracked build inputs still have the fingerprint that volume records, computed
+as the refresh computes it (one `git ls-files`, one more per declared pattern, and a hash of the tracked manifests). The
+job then runs through the supervisor's socket, relayed as the controller path relays it.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached,
-unserved, served under an older grant or another incarnation, a gateway session not yet at the served revision, a linked
-worktree, or unfinished lifecycle work on the workspace, on `main`, or on the project identity. Git discovery steered by
-`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted
-`<ws>`, `path --slot`, and `exec --session` always go through the controller. No directory is listed: a project with a
-thousand retired sessions answers as fast as one with a single workspace. Once the supervisor admits the job, every
-later failure is that job's and is reported, never retried through the controller.
+unserved, served under an older grant or another incarnation, a gateway session not yet at the served revision, build
+inputs whose fingerprint moved (a `.cowshed.toml` `[build] state` edit, a new manifest), a checkout that links no build
+volume or whose volume records no fingerprint (only discovery says what build state it has), a build-state link a tool
+displaced or removed, a linked worktree, or unfinished lifecycle work on the workspace, on `main`, or on the project
+identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or
+`GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and `exec --session` always go through the
+controller. No directory is listed: a project with a thousand retired sessions answers as fast as one with a single
+workspace. Once the supervisor admits the job, every later failure is that job's and is reported, never retried through
+the controller. A discard an earlier refresh left pending is resumed by the next refresh that opens the controller, or
+by `cowshed gc`.
 
 What a resident answer does not re-check is what the serving supervisor proved when it opened: the project binding
 against Git's remotes. The recorded binding changes only through cowshed verbs, which change the records read above; a
