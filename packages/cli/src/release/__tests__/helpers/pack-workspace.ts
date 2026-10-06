@@ -1,6 +1,6 @@
-import { mkdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { FIXTURE_NX_DIAGNOSTICS, git, withFixtureRepo } from './fixture-repo.js';
+import { git, withFixtureRepo } from './fixture-repo.js';
 import { bunBinary } from './private-registry.js';
 
 /** Every fixture package claims this repository, so root ownership checks pass. */
@@ -39,18 +39,9 @@ export async function withPackWorkspace(
   options: PackWorkspaceOptions = {},
 ): Promise<void> {
   await withFixtureRepo(async (root) => {
-    // Build output stays out of the index so a command's Nx build does not
-    // register as a working-tree mutation.
-    await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\nartifacts\nbun-home\nbun-cache\ndist\n*.tgz\n.env\n');
-    // `release pack` spawns Nx itself, from this process's environment. Nx
-    // loads the workspace root's `.env` before anything else, so its child
-    // and daemon get the fixture diagnostics without a global env change.
-    await writeFile(
-      join(root, '.env'),
-      Object.entries(FIXTURE_NX_DIAGNOSTICS)
-        .map(([name, value]) => `${name}=${value}\n`)
-        .join(''),
-    );
+    // Pack and install output stays out of the index so neither registers as
+    // a working-tree mutation.
+    await writeFile(join(root, '.gitignore'), 'node_modules\nartifacts\nbun-home\nbun-cache\ndist\n*.tgz\n');
     await writeFile(
       join(root, 'package.json'),
       manifestText({
@@ -61,13 +52,6 @@ export async function withPackWorkspace(
         repository: { type: 'git', url: PACK_FIXTURE_REPOSITORY },
       }),
     );
-    await writeFile(
-      join(root, 'nx.json'),
-      manifestText({
-        cacheDirectory: '.nx/cache',
-        targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
-      }),
-    );
     await writePackWorkspacePackage(root, {
       name: '@priv.test/alpha',
       projectName: 'alpha',
@@ -76,7 +60,6 @@ export async function withPackWorkspace(
       dependencies: { '@priv.test/beta': 'workspace:*', ...(options.alphaDependencies ?? {}) },
       tags: ['npm:private'],
       ...(options.alphaScripts ? { scripts: options.alphaScripts } : {}),
-      ...(options.alphaFiles ? { buildFiles: options.alphaFiles } : {}),
       ...(options.alphaTypes ? { types: options.alphaTypes } : {}),
       ...(options.alphaExports ? { exports: options.alphaExports } : {}),
     });
@@ -137,13 +120,11 @@ export async function withPackWorkspace(
         private: true,
       });
     }
+    // `bun pm pack` resolves `workspace:*` from bun.lock and refuses to pack
     // without one ("Failed to resolve workspace version"), so the fixture needs
     // a real lockfile. `--lockfile-only` writes it from the local workspace
-    // alone: no network, no node_modules. It runs before the node_modules
-    // symlink exists so nothing can reach the real workspace tree.
+    // alone: no network, no node_modules.
     await writeLockfile(root);
-    // Nx needs a resolvable node_modules; the workspace's own is reused.
-    await symlink(join(import.meta.dir, '../../../../../../node_modules'), join(root, 'node_modules'), 'dir');
     await git(root, ['add', '-A']);
     await git(root, ['commit', '-m', 'fixture closure']);
     for (const tag of options.stableTags ?? []) {
@@ -167,23 +148,15 @@ export interface PackWorkspacePackage {
   /** Written verbatim into the package manifest. */
   types?: string;
   exports?: Record<string, unknown>;
-  buildFiles?: Record<string, string>;
 }
 
+/**
+ * A package as a release finds it after its build: `dist/index.js` is already
+ * there. The tests pack; they never build.
+ */
 export async function writePackWorkspacePackage(root: string, pkg: PackWorkspacePackage): Promise<void> {
   await mkdir(join(root, pkg.path, 'dist'), { recursive: true });
   await writeFile(join(root, pkg.path, 'dist', 'index.js'), `export const name = ${JSON.stringify(pkg.name)};\n`);
-  await writeFile(
-    join(root, pkg.path, 'build-fixture.mjs'),
-    `import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
-const files = ${JSON.stringify({ 'dist/index.js': 'export const built = true;\n', ...pkg.buildFiles })};
-for (const [path, content] of Object.entries(files)) {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, content);
-}
-`,
-  );
   await writeFile(
     join(root, pkg.path, 'package.json'),
     manifestText({
@@ -198,16 +171,7 @@ for (const [path, content] of Object.entries(files)) {
       ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
       ...(pkg.types ? { types: pkg.types } : {}),
       ...(pkg.exports ? { exports: pkg.exports } : {}),
-      nx: {
-        name: pkg.projectName,
-        tags: pkg.tags,
-        targets: {
-          build: {
-            executor: 'nx:run-commands',
-            options: { command: 'node build-fixture.mjs', cwd: pkg.path },
-          },
-        },
-      },
+      nx: { name: pkg.projectName, tags: pkg.tags },
     }),
   );
 }

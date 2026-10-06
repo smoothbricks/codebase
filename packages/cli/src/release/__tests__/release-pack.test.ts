@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
+import { RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import {
   listPublicPackages,
   listPublishablePackages,
@@ -12,6 +13,7 @@ import {
   assertPackedArtifact,
   packReleaseTarball,
   type ReleasePackManifest,
+  type ReleasePackNx,
   releasePack,
   verifyReleasePackManifest,
 } from '../pack.js';
@@ -93,17 +95,19 @@ describe('publishable closure classification', () => {
  */
 describe('release pack artifacts', () => {
   it('packs the runtime closure into a verifiable manifest without contacting a registry or moving a ref', async () => {
-    let fixtureCacheRun = '';
     await withPrivateNpmFixture(async (fixture) => {
       await withPackWorkspace(async (root) => {
         const output = join(root, 'artifacts');
         const headBefore = await gitOutput(root, ['rev-parse', 'HEAD']);
         const tagsBefore = await gitOutput(root, ['tag', '--list']);
         const statusBefore = await gitOutput(root, ['status', '--porcelain', '--untracked-files=no']);
+        const runs: string[][] = [];
 
-        await releasePack(root, { projects: 'alpha', output });
-        fixtureCacheRun = join(root, '.nx/cache/run.json');
-        expect(await Bun.file(fixtureCacheRun).exists()).toBe(true);
+        await releasePack(root, { projects: 'alpha', output }, fixtureNx(runs));
+        // One build of the whole closure, in the configuration that ships.
+        expect(runs).toEqual([
+          ['run-many', '-t', 'build', '--projects=alpha,beta', `--configuration=${RELEASE_CONFIGURATION}`],
+        ]);
 
         const manifest = await readManifest(output);
         expect(manifest.schemaVersion).toBe(1);
@@ -135,7 +139,6 @@ describe('release pack artifacts', () => {
         expect(await gitOutput(root, ['status', '--porcelain', '--untracked-files=no'])).toBe(statusBefore);
       });
     });
-    expect(await Bun.file(fixtureCacheRun).exists()).toBe(false);
   });
 
   it('refuses a nonempty output directory instead of mixing releases', async () => {
@@ -144,7 +147,7 @@ describe('release pack artifacts', () => {
       await mkdir(output, { recursive: true });
       await writeFile(join(output, 'stale.tgz'), 'previous release');
 
-      await expect(releasePack(root, { projects: 'alpha', output })).rejects.toThrow();
+      await expect(releasePack(root, { projects: 'alpha', output }, fixtureNx())).rejects.toThrow();
 
       expect(await readdir(output)).toEqual(['stale.tgz']);
     });
@@ -153,9 +156,9 @@ describe('release pack artifacts', () => {
   it('refuses a runtime edge on a package that can never be published', async () => {
     await withPackWorkspace(
       async (root) => {
-        await expect(releasePack(root, { projects: 'alpha', output: join(root, 'artifacts') })).rejects.toThrow(
-          /@priv\.test\/internal/,
-        );
+        await expect(
+          releasePack(root, { projects: 'alpha', output: join(root, 'artifacts') }, fixtureNx()),
+        ).rejects.toThrow(/@priv\.test\/internal/);
       },
       { alphaDependencies: { '@priv.test/internal': 'workspace:*' } },
     );
@@ -164,9 +167,9 @@ describe('release pack artifacts', () => {
   it('refuses a public package depending on a private one', async () => {
     await withPackWorkspace(
       async (root) => {
-        await expect(releasePack(root, { projects: 'public-face', output: join(root, 'artifacts') })).rejects.toThrow(
-          /@priv\.test\/alpha/,
-        );
+        await expect(
+          releasePack(root, { projects: 'public-face', output: join(root, 'artifacts') }, fixtureNx()),
+        ).rejects.toThrow(/@priv\.test\/alpha/);
       },
       { publicFace: true },
     );
@@ -175,9 +178,9 @@ describe('release pack artifacts', () => {
   it('refuses to pack a foreign-owned package even when named directly', async () => {
     await withPackWorkspace(
       async (root) => {
-        await expect(releasePack(root, { projects: 'vendored', output: join(root, 'artifacts') })).rejects.toThrow(
-          /vendored/,
-        );
+        await expect(
+          releasePack(root, { projects: 'vendored', output: join(root, 'artifacts') }, fixtureNx()),
+        ).rejects.toThrow(/vendored/);
       },
       { foreignPackage: true },
     );
@@ -187,7 +190,7 @@ describe('release pack artifacts', () => {
     await withPackWorkspace(
       async (root) => {
         const output = join(root, 'artifacts');
-        await expect(releasePack(root, { projects: 'alpha', output })).rejects.toThrow(/reducer\.wasm/);
+        await expect(releasePack(root, { projects: 'alpha', output }, fixtureNx())).rejects.toThrow(/reducer\.wasm/);
         expect(await readdir(output)).toEqual([]);
       },
       {
@@ -199,7 +202,7 @@ describe('release pack artifacts', () => {
   it('ships a declared Wasm export that is present in the files allowlist', async () => {
     await withPackWorkspace(
       async (root) => {
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
         try {
           const extraction = await Bun.$`tar -xzOf ${packed.tarball} package/dist/reducer.wasm`.quiet();
           expect(extraction.stdout.toString()).toBe('wasm-bytes');
@@ -218,7 +221,7 @@ describe('release pack artifacts', () => {
     await withPackWorkspace(
       async (root) => {
         const pkg = packagedProject(root, 'alpha');
-        const packed = await packReleaseTarball(root, pkg);
+        const packed = await packReleaseTarball(root, pkg, {}, fixtureNx());
         try {
           await expect(assertPackedArtifact(root, packed.tarball, pkg)).rejects.toThrow(/index\.d\.ts/);
         } finally {
@@ -232,7 +235,7 @@ describe('release pack artifacts', () => {
   it('rejects a tampered artifact when the manifest is verified', async () => {
     await withPackWorkspace(async (root) => {
       const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output });
+      await releasePack(root, { projects: 'beta', output }, fixtureNx());
 
       const manifest = await verifyReleasePackManifest(output);
       expect(manifest.packages.map((entry) => entry.name)).toEqual(['@priv.test/beta']);
@@ -251,7 +254,7 @@ describe('release pack artifacts', () => {
   it('refuses an artifact directory holding a tarball the manifest does not bind', async () => {
     await withPackWorkspace(async (root) => {
       const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output });
+      await releasePack(root, { projects: 'beta', output }, fixtureNx());
 
       // `release pack` writes into an empty directory, so an extra tarball is a
       // mixed or tampered release, not an artifact this manifest describes.
@@ -264,7 +267,7 @@ describe('release pack artifacts', () => {
   it('refuses a manifest that binds one package name twice or escapes the directory', async () => {
     await withPackWorkspace(async (root) => {
       const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output });
+      await releasePack(root, { projects: 'beta', output }, fixtureNx());
       const manifest = await readManifest(output);
       const entry = manifest.packages[0];
       if (!entry) {
@@ -305,9 +308,12 @@ describe('private publish manifest transform', () => {
       const manifestPath = join(root, 'packages/beta/package.json');
       const before = await readFile(manifestPath, 'utf8');
 
-      const packed = await packReleaseTarball(root, packagedProject(root, 'beta'), {
-        publishConfigRegistry: registry,
-      });
+      const packed = await packReleaseTarball(
+        root,
+        packagedProject(root, 'beta'),
+        { publishConfigRegistry: registry },
+        fixtureNx(),
+      );
       try {
         const manifest = await packedManifestJson(packed.tarball);
         expect(manifest).toContain(`"registry": "${registry}"`);
@@ -323,7 +329,12 @@ describe('private publish manifest transform', () => {
   it('refuses a packed artifact whose registry is still an environment placeholder', async () => {
     await withPackWorkspace(async (root) => {
       const pkg = packagedProject(root, 'beta');
-      const packed = await packReleaseTarball(root, pkg, { publishConfigRegistry: '${PRIV_NPM_REGISTRY}' });
+      const packed = await packReleaseTarball(
+        root,
+        pkg,
+        { publishConfigRegistry: '${PRIV_NPM_REGISTRY}' },
+        fixtureNx(),
+      );
       try {
         await expect(assertPackedArtifact(root, packed.tarball, pkg)).rejects.toThrow(/environment placeholder/);
       } finally {
@@ -336,7 +347,7 @@ describe('private publish manifest transform', () => {
 describe('release pack tarball production', () => {
   it('normalizes workspace protocol dependencies to exact versions', async () => {
     await withPackWorkspace(async (root) => {
-      const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+      const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
       try {
         const manifest = await packedManifestJson(packed.tarball);
         expect(manifest).toContain('"@priv.test/beta": "0.2.0"');
@@ -350,7 +361,7 @@ describe('release pack tarball production', () => {
   it('does not run package lifecycle scripts while packing', async () => {
     await withPackWorkspace(
       async (root) => {
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
         try {
           // The script would create this file; packing must not execute it.
           await expect(readFile(join(root, 'packages/alpha/prepack-ran'), 'utf8')).rejects.toThrow();
@@ -370,7 +381,7 @@ describe('release pack tarball production', () => {
         const manifestPath = join(root, 'packages/alpha/package.json');
         const manifestBefore = await readFile(manifestPath);
 
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
         try {
           // publish-mode sync rewrote the -next lock entry to the stable tag
           // mid-flight; the packed dependency must embed the stable version...
@@ -391,6 +402,20 @@ describe('release pack tarball production', () => {
     );
   });
 });
+
+/**
+ * The Nx a pack sees here: a graph in which no fixture project declares a
+ * release-check gate, and a run-many that `runs` records instead of running.
+ * The fixture writes every package's built files itself.
+ */
+function fixtureNx(runs: string[][] = []): ReleasePackNx {
+  return {
+    loadProjects: async () => ({}),
+    runNx: async (args) => {
+      runs.push(args);
+    },
+  };
+}
 
 /** The package as classification produces it — the same value the commands pack. */
 function packagedProject(root: string, projectName: string): PackageInfo {

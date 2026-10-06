@@ -22,7 +22,7 @@ import {
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import { withPublishManifest } from '../monorepo/publish-manifest.js';
-import { loadNxProjects } from '../nx/index.js';
+import { loadNxProjects, type NxProjects, projectTargetsFromNxProjects } from '../nx/index.js';
 
 const parseReleasePackManifestText = typia.json.createIsParse<ReleasePackManifest>();
 /** Runtime dependency fields expanded when computing the artifact closure. */
@@ -32,6 +32,20 @@ export interface ReleasePackOptions {
   projects: string;
   output: string;
 }
+
+/**
+ * The Nx boundary of packing: the resolved project graph the release-check
+ * gate reads, and what runs `nx`.
+ */
+export interface ReleasePackNx {
+  readonly loadProjects: (root: string) => Promise<NxProjects>;
+  readonly runNx: (args: string[], root: string) => Promise<void>;
+}
+
+const WORKSPACE_NX: ReleasePackNx = {
+  loadProjects: loadNxProjects,
+  runNx: (args, root) => run('nx', args, root),
+};
 
 export interface ReleasePackPackageEntry {
   projectName: string;
@@ -73,6 +87,7 @@ export async function packReleaseTarball(
   root: string,
   pkg: PackageInfo,
   options: { publishConfigRegistry?: string } = {},
+  nx: ReleasePackNx = WORKSPACE_NX,
 ): Promise<{ tarball: string; cleanup: () => Promise<void> }> {
   const lockSnapshot = await snapshotBunLockfile(root);
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-pack-'));
@@ -85,7 +100,7 @@ export async function packReleaseTarball(
   // installable versions, then restore the exact original bytes.
   try {
     syncBunLockfileVersions(root, { mode: 'publish', log: true });
-    await runReleaseCheckGate(root, pkg);
+    await runReleaseCheckGate(root, pkg, nx);
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await withPublishManifest(
       join(root, pkg.path),
@@ -127,8 +142,9 @@ export async function packReleaseTarball(
  *
  * Undeclared packages pack exactly as before.
  */
-async function runReleaseCheckGate(root: string, pkg: PackageInfo): Promise<void> {
-  const gate = (await loadNxProjects(root))[pkg.projectName]?.targets?.['release-check'];
+async function runReleaseCheckGate(root: string, pkg: PackageInfo, nx: ReleasePackNx): Promise<void> {
+  const projects = await nx.loadProjects(root);
+  const gate = projects[pkg.projectName]?.targets?.['release-check'];
   if (!gate) {
     return;
   }
@@ -145,7 +161,12 @@ async function runReleaseCheckGate(root: string, pkg: PackageInfo): Promise<void
   }
   console.log(`${pkg.name}@${pkg.version}: running Nx release-check gate`);
   try {
-    await githubCiNxRunMany(root, { targets: 'release-check', projects: pkg.projectName });
+    // The graph the gate was just checked against selects its run.
+    await githubCiNxRunMany(
+      root,
+      { targets: 'release-check', projects: pkg.projectName },
+      { readProjectTargets: async () => projectTargetsFromNxProjects(projects), runNx: nx.runNx },
+    );
   } catch (error) {
     throw new Error(`${pkg.name}@${pkg.version}: release-check gate refused the release`, { cause: error });
   }
@@ -342,7 +363,11 @@ async function listTarballFiles(root: string, tarball: string): Promise<Set<stri
  * dependency names. Never calls registry status, changes Git refs/versions,
  * publishes, or pushes. Requires no registry credentials.
  */
-export async function releasePack(root: string, options: ReleasePackOptions): Promise<void> {
+export async function releasePack(
+  root: string,
+  options: ReleasePackOptions,
+  nx: ReleasePackNx = WORKSPACE_NX,
+): Promise<void> {
   const closure = resolvePackClosure(root, options.projects);
   const outputDir = isAbsolute(options.output) ? options.output : resolve(root, options.output);
   await mkdir(outputDir, { recursive: true });
@@ -350,8 +375,7 @@ export async function releasePack(root: string, options: ReleasePackOptions): Pr
   if (existing.length > 0) {
     throw new Error(`Refusing to pack into nonempty output directory ${outputDir}; use an empty directory.`);
   }
-  await run(
-    'nx',
+  await nx.runNx(
     [
       'run-many',
       '-t',
@@ -363,7 +387,7 @@ export async function releasePack(root: string, options: ReleasePackOptions): Pr
   );
   const entries: ReleasePackPackageEntry[] = [];
   for (const pkg of closure) {
-    const { tarball, cleanup } = await packReleaseTarball(root, pkg);
+    const { tarball, cleanup } = await packReleaseTarball(root, pkg, {}, nx);
     try {
       await assertPackedArtifact(root, tarball, pkg);
       const fileName = tarballFileName(pkg);
