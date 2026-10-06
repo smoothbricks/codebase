@@ -16,10 +16,12 @@ use url::Url;
 #[cfg(target_os = "macos")]
 use crate::api::dto::AbandonedWork;
 #[cfg(target_os = "macos")]
+use crate::api::dto::GitOid;
+#[cfg(target_os = "macos")]
 use crate::api::dto::LandingCommits;
 use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
-    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
+    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, RunSandboxMode,
