@@ -10,6 +10,7 @@ mod actor;
 mod cache;
 mod config;
 mod control;
+mod disk_lease;
 mod interfaces;
 mod mirror;
 mod npm_index;
@@ -39,6 +40,7 @@ pub use cowshed_gateway_types::{
     SupervisorRecovery, TOKEN_BYTES, TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
     WorkspaceSession, WorkspaceToken, is_macos_port_block, normalize_path, validate_repo_id,
 };
+pub use disk_lease::DiskLeaseLimits;
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,
     ConnectError, CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery,

@@ -2433,13 +2433,15 @@ fn run_command_with(
             command.program()
         )));
     }
-    let output = spawn(program, command.args()).map_err(|source| {
-        HostError::new(format!(
-            "cannot execute {:?} with argv {:?}: {source}",
-            command.program(),
-            command.args()
-        ))
-    })?;
+    let output =
+        crate::disk_lease::leased(program, command.args(), || spawn(program, command.args()))
+            .map_err(|source| {
+                HostError::new(format!(
+                    "cannot execute {:?} with argv {:?}: {source}",
+                    command.program(),
+                    command.args()
+                ))
+            })?;
     Ok(output.into())
 }
 
@@ -2973,6 +2975,8 @@ impl MacAuthorizationSession {
         authorization_status("preauthorize privileged execution", status)?;
         Ok(session)
     }
+    /// Run `command` as root, under the disk-lifecycle lease when it is a disk tool
+    /// ([`crate::disk_lease`]).
     fn execute_authorized(
         &mut self,
         command: &HostCommand,
@@ -2984,6 +2988,16 @@ impl MacAuthorizationSession {
                 command.program()
             )));
         }
+        crate::disk_lease::leased(Path::new(command.program()), command.args(), || {
+            self.execute_authorized_unleased(command, input)
+        })
+    }
+
+    fn execute_authorized_unleased(
+        &mut self,
+        command: &HostCommand,
+        input: Option<&[u8]>,
+    ) -> Result<HostCommandOutput, HostError> {
         // AEWP's OSStatus is "tool launched", not the child wait status. Run a
         // fixed /bin/sh wrapper so the pipe carries `{stdout, wait_status}` and
         // a failed security/install/launchctl cannot surface as Exit(0).
@@ -7227,7 +7241,19 @@ mod unix {
 
     const MARKER_MODE: libc::mode_t = 0o600;
 
+    /// Run `program args` to completion or `deadline`, under the disk-lifecycle lease when it is
+    /// a disk tool ([`crate::disk_lease`]); the deadline starts once the lease is granted.
     pub(super) fn spawn_with_deadline(
+        program: &Path,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<Output, HostError> {
+        crate::disk_lease::leased(program, args, || {
+            spawn_unleased_with_deadline(program, args, deadline)
+        })
+    }
+
+    fn spawn_unleased_with_deadline(
         program: &Path,
         args: &[String],
         deadline: Duration,

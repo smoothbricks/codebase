@@ -9,6 +9,7 @@ pub mod checkout;
 pub mod copy;
 mod device;
 pub mod disk_image_helpers;
+pub mod disk_lease;
 pub mod error;
 pub mod exec;
 pub mod fork_lock;

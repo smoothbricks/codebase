@@ -15,11 +15,13 @@
 //! listener, limit and cache-root variants: one enum, so a value the controller can construct is
 //! exactly a value the daemon accepts, and `cowshed-gateway`'s own validators report through it.
 
+pub mod disk_lease;
 pub mod policy;
 pub mod repo_id;
 pub mod session;
 pub mod status;
 
+pub use disk_lease::{DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyDenial, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy,

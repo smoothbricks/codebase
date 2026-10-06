@@ -16,6 +16,7 @@ use crate::cache::{
     CacheConfig, DEFAULT_FILL_WAIT_TIMEOUT, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES,
     DEFAULT_METADATA_TTL,
 };
+use crate::disk_lease::DiskLeaseLimits;
 
 pub const CONTROL_TCP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644);
 
@@ -257,6 +258,8 @@ pub struct GatewayConfig {
     pub timeouts: GatewayTimeouts,
     pub command_capacity: NonZeroUsize,
     pub mirror_cache: MirrorCacheConfig,
+    /// The host disk-lifecycle lease served on the control socket (05_gateway.md).
+    pub disk_lease: DiskLeaseLimits,
     /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
     /// whether the daemon is running the same build it is.
     pub executable_sha256: Option<String>,
@@ -278,6 +281,7 @@ impl Default for GatewayConfig {
             timeouts: GatewayTimeouts::default(),
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             mirror_cache: MirrorCacheConfig::default(),
+            disk_lease: DiskLeaseLimits::default(),
             executable_sha256: None,
             startup: None,
         }
@@ -289,6 +293,7 @@ impl GatewayConfig {
         self.limits.validate()?;
         self.timeouts.validate()?;
         self.mirror_cache.validate()?;
+        self.disk_lease.validate()?;
         if let Some(path) = &self.control_socket
             && !path.is_absolute()
         {

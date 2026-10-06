@@ -187,12 +187,14 @@ The `real_apfs_*` tests are scheduled like every other test: nextest runs them i
 partitions place them in whichever Nx shard falls out. No nextest test group, `parallelism` flag, process cap or other
 throttle orders them, and the cowshed CLI lane is unrestricted the same way. What keeps concurrent fixtures from
 interfering is the production backend's per-image lease (01_storage.md), not scheduling: independent images overlap and
-one image is driven by one holder at a time. The earlier scheduling serialized these tests and was measured on a hosted
-arm64 macOS runner: the CLI lane overlapped other cargo lanes, checked land timed out at 30s while still inside adopt,
-and its two production `hdiutil detach` calls took 6.4s and 9.1s; the core exceptions lane, which ran with no other task
-running, completed whole create/attach/format/detach tests in 3.3–5.4s, but its 23 serialized tests did not fit one 120s
-window (17 took 117.5s, six were still waiting). Test selection, per-test deadlines and the 120s target bound are
-unchanged: `nextest.toml` singles out only tests carrying a raised `slow-timeout` (compile-fail tests and the real-APFS
+one image is driven by one holder at a time. Across images, every test's disk tools run under the host's disk-lifecycle
+lease (05_gateway.md) through the same `SystemCommandRunner` production uses, so a test's attaches never queue behind
+another lane's mount churn. The earlier scheduling serialized these tests and was measured on a hosted arm64 macOS
+runner: the CLI lane overlapped other cargo lanes, checked land timed out at 30s while still inside adopt, and its two
+production `hdiutil detach` calls took 6.4s and 9.1s; the core exceptions lane, which ran with no other task running,
+completed whole create/attach/format/detach tests in 3.3–5.4s, but its 23 serialized tests did not fit one 120s window
+(17 took 117.5s, six were still waiting). Test selection, per-test deadlines and the 120s target bound are unchanged:
+`nextest.toml` singles out only tests carrying a raised `slow-timeout` (compile-fail tests and the real-APFS
 full-lifecycle tests), and those are hash-partitioned into `cargo-test-<crate>-exceptions-shard1..N` by the crate's
 declared shard count.
 

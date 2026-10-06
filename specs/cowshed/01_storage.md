@@ -409,7 +409,11 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    0.22 s alone, 1.2 s with 16 concurrent, and 2.5 s with 32. A parallel real-image test suite peaked at 37 concurrent
    disk-tool processes and measured 2.5–8 s for single calls that take 0.2 s idle. CPU load changes none of this; the
    number of concurrent disk-tool calls on the host does. `hdiutil detach`, `newfs_apfs`, `fsck_apfs`, `mount_apfs` and
-   IORegistry reads do not go through `storagekitd`.
+   IORegistry reads do not go through `storagekitd`. Mount-table churn starves it all the same: an attach spends most of
+   its time in `syncAllDisks` after its device already exists (76% of a sampled stuck attach), and that sync does not
+   finish while mounts and unmounts keep changing the table. With no attach running, one `mount_apfs`/`umount` loop at
+   6.3 cycles/s moved a probe attach's median from 1.15 s to 12.2 s, and four loops starved every probe past 60 s; eight
+   attach loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s.
 2. **AppleDiskImages2 runs out of kernel mappings, held by orphaned `diskimagesiod` helpers.** Every attached image has
    its own `diskimagesiod` (launchd job `system/com.apple.diskimagesiod.<UUID>`), which maps its IO request pool into
    the kernel: 36 shared buffers of 2 MiB each (queue depth 36, 2 MiB max IO), 72 MiB per helper, so 100 attached images
@@ -448,13 +452,17 @@ What the substrate does about each:
   an ASIF image's capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses
   any layout other than the measured one), and a mounted volume's from IORegistry.
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
+- **Storage calls and mount-table changes never overlap.** Every disk tool on the host runs under the gateway's
+  disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"): `diskutil`, `hdiutil` and `newfs_apfs` share one phase,
+  `mount_apfs` and `umount` the other, and the two alternate. The same eight attach loops beside two mount loops made
+  106 attaches in 43 s with the phases kept apart, at 0.94 s p50 and 1.78 s p95 under load 167–212.
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached. A test run mints one blank template with the production minter and
   clones every test image from it; a test store that mints is seeded with a clone of it, so the suite pays one template
   mint per test process tree rather than one per store.
 - **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
-  contention instead of reducing it; the fix is fewer calls.
+  contention instead of reducing it; the fix is fewer calls, and calls that do not starve each other.
 - **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.
 
 ## Ownership, identity, and the volume label

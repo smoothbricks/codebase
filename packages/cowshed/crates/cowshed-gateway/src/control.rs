@@ -18,13 +18,14 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
-    EgressGrant, EgressMode, GatewayStatus, HostPattern, MirrorRoute, WorkspaceCa,
-    WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    DISK_LEASE_OP, DiskClass, EgressGrant, EgressMode, GatewayStatus, HostPattern, LeaseState,
+    MirrorRoute, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
     actor::{GatewayError, GatewayHandle},
     config::{CONTROL_TCP_ADDR, StartupProbe},
+    disk_lease::{Claim, DiskLeases},
     interfaces::AuditEvent,
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
     sim_broker::{
@@ -329,6 +330,21 @@ enum ControlRequest {
     },
 }
 
+/// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
+/// or a disk lease, held for as long as its client keeps the connection open.
+enum Incoming {
+    Request(ControlRequest),
+    DiskLease { class: DiskClass, command: String },
+}
+
+/// A `disk-lease` request's fields. Its keys are checked against the operation's allowed set
+/// before this is read, so the `op` tag is the one key it ignores.
+#[derive(Deserialize)]
+struct DiskLeaseIn {
+    class: DiskClass,
+    command: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthenticatedControlRequestIn {
@@ -354,6 +370,8 @@ struct ControlResponse {
     code: Option<ControlFailureCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<LeaseState>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -595,6 +613,7 @@ pub(crate) struct ControlServices {
     pub sim_broker: SimBrokerHandle,
     pub audit_tail: Option<AuditTailHandle>,
     pub startup: Option<Arc<dyn StartupProbe>>,
+    pub disk_leases: DiskLeases,
 }
 
 impl ControlServices {
@@ -620,6 +639,7 @@ impl fmt::Debug for ControlServices {
             .field("sim_broker", &self.sim_broker)
             .field("audit_tail", &self.audit_tail)
             .field("startup", &self.startup)
+            .field("disk_leases", &self.disk_leases)
             .finish()
     }
 }
@@ -671,11 +691,13 @@ impl fmt::Debug for ControllerCredential {
 }
 
 pub(crate) async fn serve_control_unix(stream: UnixStream, services: ControlServices) {
+    // The pid names a disk-lease holder the gateway has to report; nothing is decided by it.
+    let pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|credentials| credentials.pid());
     let (reader, writer) = stream.into_split();
-    let request = read_frame(reader)
-        .await
-        .and_then(|bytes| parse_control_request(&bytes));
-    serve_request(writer, request, services).await;
+    serve(reader, writer, pid, parse_control_request, services).await;
 }
 
 pub(crate) async fn serve_control_tcp(
@@ -684,25 +706,108 @@ pub(crate) async fn serve_control_tcp(
     services: ControlServices,
 ) {
     let (reader, writer) = stream.into_split();
-    let request = read_frame(reader).await.and_then(|bytes| {
-        let mut envelope: AuthenticatedControlRequestIn = serde_json::from_slice(&bytes)
+    let parse = |bytes: &[u8]| {
+        let mut envelope: AuthenticatedControlRequestIn = serde_json::from_slice(bytes)
             .map_err(|error| ControlError::Encoding(error.to_string()))?;
         if !credential.matches(&envelope.controller_credential) {
             return Err(ControlError::Unauthorized);
         }
         envelope.controller_credential.zeroize();
         parse_control_request_value(envelope.request)
-    });
-    serve_request(writer, request, services).await;
+    };
+    serve(reader, writer, None, parse, services).await;
 }
 
-fn parse_control_request(bytes: &[u8]) -> Result<ControlRequest, ControlError> {
+/// Read the connection's one request line and answer it. A one-shot request must be followed by
+/// the client's EOF, as it always was; a disk lease is held until that EOF comes.
+async fn serve<R, W>(
+    mut reader: R,
+    writer: W,
+    pid: Option<i32>,
+    parse: impl FnOnce(&[u8]) -> Result<Incoming, ControlError>,
+    services: ControlServices,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match read_request_line(&mut reader)
+        .await
+        .and_then(|line| parse(&line))
+    {
+        Ok(Incoming::DiskLease { class, command }) => {
+            serve_disk_lease(
+                reader,
+                writer,
+                class,
+                Claim::new(&command, pid),
+                &services.disk_leases,
+            )
+            .await;
+        }
+        Ok(Incoming::Request(request)) => {
+            let request = expect_eof(&mut reader).await.map(|()| request);
+            serve_request(writer, request, services).await;
+        }
+        Err(error) => serve_request(writer, Err(error), services).await,
+    }
+}
+
+/// Hold one disk lease for this connection: answer `queued` at once, `granted` once the lease
+/// scheduler admits it, then hold until the client closes. A client that closes while queued
+/// leaves the queue.
+async fn serve_disk_lease<R, W>(
+    mut reader: R,
+    mut writer: W,
+    class: DiskClass,
+    claim: Claim,
+    leases: &DiskLeases,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (tenure, granted) = leases.ask(class, claim);
+    if write_response(&mut writer, &lease(LeaseState::Queued))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut discard = [0_u8; 64];
+    tokio::select! {
+        answer = granted => if answer.is_err() {
+            let _ = write_response(
+                &mut writer,
+                &failure(
+                    ControlFailureCode::Rejected,
+                    "the gateway's disk-lease scheduler has stopped".to_owned(),
+                ),
+            )
+            .await;
+            return;
+        },
+        // EOF, a broken socket, or bytes a lease client never sends: it is gone or confused, and
+        // either way it leaves the queue.
+        _ = reader.read(&mut discard) => return,
+    }
+    if write_response(&mut writer, &lease(LeaseState::Granted))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(read) = reader.read(&mut discard).await
+        && read > 0
+    {}
+    drop(tenure);
+}
+
+fn parse_control_request(bytes: &[u8]) -> Result<Incoming, ControlError> {
     let value =
         serde_json::from_slice(bytes).map_err(|error| ControlError::Encoding(error.to_string()))?;
     parse_control_request_value(value)
 }
 
-fn parse_control_request_value(value: serde_json::Value) -> Result<ControlRequest, ControlError> {
+fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, ControlError> {
     let object = value
         .as_object()
         .ok_or_else(|| ControlError::Encoding("control request must be an object".to_owned()))?;
@@ -720,6 +825,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<ControlReques
         "sim-approve" => &["op", "approval"],
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
+        DISK_LEASE_OP => &["op", "class", "command"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -731,7 +837,14 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<ControlReques
             "gateway control request contains an unknown field".to_owned(),
         ));
     }
-    serde_json::from_value(value).map_err(|error| ControlError::Encoding(error.to_string()))
+    let encoding = |error: serde_json::Error| ControlError::Encoding(error.to_string());
+    if op == DISK_LEASE_OP {
+        let DiskLeaseIn { class, command } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::DiskLease { class, command });
+    }
+    serde_json::from_value(value)
+        .map(Incoming::Request)
+        .map_err(encoding)
 }
 
 async fn serve_request<W>(
@@ -758,14 +871,8 @@ async fn serve_request<W>(
     if let Some(receiver) = subscription.as_mut() {
         while let Some(event) = receiver.recv().await {
             let response = ControlResponse {
-                ok: true,
-                status: None,
-                audit_events: None,
                 audit_event: Some(event),
-                mirror_info: None,
-                sim_devices: None,
-                code: None,
-                error: None,
+                ..success()
             };
             if write_response(&mut writer, &response).await.is_err() {
                 break;
@@ -918,25 +1025,49 @@ async fn dispatch(
     }
 }
 
-async fn read_frame<R>(reader: R) -> Result<Zeroizing<Vec<u8>>, ControlError>
+/// The connection's one request line, newline included. Nothing may follow it in what has
+/// arrived so far: a one-shot client half-closes after its line, and a lease client sends nothing
+/// more. Bytes are read in chunks rather than through a buffered reader, so every byte of a
+/// controller credential stays in zeroized memory.
+async fn read_request_line<R>(reader: &mut R) -> Result<Zeroizing<Vec<u8>>, ControlError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut bytes = Zeroizing::new(Vec::new());
-    reader
-        .take(MAX_CONTROL_MESSAGE + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.is_empty()
-        || bytes.len() > MAX_CONTROL_MESSAGE as usize
-        || !bytes.ends_with(b"\n")
-        || bytes[..bytes.len() - 1]
-            .iter()
-            .any(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        return Err(ControlError::MessageTooLarge);
+    let mut line = Zeroizing::new(Vec::new());
+    let mut chunk = Zeroizing::new([0_u8; 4096]);
+    loop {
+        let read = reader.read(&mut chunk[..]).await?;
+        if read == 0 {
+            return Err(ControlError::MessageTooLarge);
+        }
+        let start = line.len();
+        line.extend_from_slice(&chunk[..read]);
+        if let Some(offset) = line[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + offset + 1;
+            if end != line.len()
+                || end > MAX_CONTROL_MESSAGE as usize
+                || line[..end - 1].contains(&b'\r')
+            {
+                return Err(ControlError::MessageTooLarge);
+            }
+            return Ok(line);
+        }
+        if line.len() > MAX_CONTROL_MESSAGE as usize {
+            return Err(ControlError::MessageTooLarge);
+        }
     }
-    Ok(bytes)
+}
+
+/// The client's EOF after a one-shot request: anything else is a second message.
+async fn expect_eof<R>(reader: &mut R) -> Result<(), ControlError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut extra = [0_u8; 1];
+    match reader.read(&mut extra).await? {
+        0 => Ok(()),
+        _ => Err(ControlError::MessageTooLarge),
+    }
 }
 
 async fn read_response_line<R>(reader: &mut BufReader<R>) -> Result<ControlResponse, ControlError>
@@ -995,6 +1126,14 @@ fn success() -> ControlResponse {
         sim_devices: None,
         code: None,
         error: None,
+        lease: None,
+    }
+}
+
+fn lease(state: LeaseState) -> ControlResponse {
+    ControlResponse {
+        lease: Some(state),
+        ..success()
     }
 }
 
@@ -1136,9 +1275,21 @@ mod tests {
             r#"{"op":"repo-mirror","request":{"workspaceId":"ws","repoId":"repo","remote":"https://example.test/repo"},"push":true}"#,
             r#"{"op":"sim-openurl","url":"demo://value"}"#,
             r#"{"op":"unknown"}"#,
+            r#"{"op":"disk-lease","class":"storage","command":"diskutil","pid":1}"#,
+            r#"{"op":"disk-lease","class":"compute","command":"diskutil"}"#,
+            r#"{"op":"disk-lease","class":"storage"}"#,
         ] {
             assert!(parse_control_request(request.as_bytes()).is_err());
         }
+        assert!(matches!(
+            parse_control_request(
+                br#"{"op":"disk-lease","class":"namespace","command":"/sbin/umount /x"}"#
+            ),
+            Ok(Incoming::DiskLease {
+                class: DiskClass::Namespace,
+                command,
+            }) if command == "/sbin/umount /x"
+        ));
         assert!(
             serde_json::from_str::<AuthenticatedControlRequestIn>(
                 r#"{"controllerCredential":"secret","request":{"op":"status"},"extra":true}"#,
@@ -1169,14 +1320,29 @@ mod tests {
 
     #[tokio::test]
     async fn request_frame_is_bounded_and_requires_exactly_one_message() {
-        let (mut writer, reader) = tokio::io::duplex(128);
+        let (mut writer, mut reader) = tokio::io::duplex(128);
         writer
             .write_all(b"{\"op\":\"status\"}\n{\"op\":\"status\"}\n")
             .await
             .expect("write");
         writer.shutdown().await.expect("shutdown");
         assert!(matches!(
-            read_frame(reader).await,
+            read_request_line(&mut reader).await,
+            Err(ControlError::MessageTooLarge)
+        ));
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(b"{\"op\":\"status\"}\n")
+            .await
+            .expect("write");
+        assert!(read_request_line(&mut reader).await.is_ok());
+        writer
+            .write_all(b"{\"op\":\"status\"}\n")
+            .await
+            .expect("write");
+        assert!(matches!(
+            expect_eof(&mut reader).await,
             Err(ControlError::MessageTooLarge)
         ));
     }

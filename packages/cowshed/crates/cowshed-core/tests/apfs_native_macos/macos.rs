@@ -13,7 +13,7 @@ use cowshed_core::apfs::{
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, MountAccess,
     SystemCommandRunner,
 };
-use cowshed_core::fork_lock::{Fenced, Run as _, Spawn as _};
+use cowshed_core::fork_lock::{Fenced, Spawn as _};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
     Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
@@ -355,14 +355,19 @@ impl RealFixture {
     /// Mount `attachment`'s volume at `mount_point` with exactly `options`.
     fn remount(&self, attachment: &AttachedImage, mount_point: &Path, options: &str) {
         std::fs::create_dir_all(mount_point).expect("mount point");
-        let mounted = Command::new("/sbin/mount_apfs")
-            .args(["-o", options])
-            .arg(attachment.volume_device())
-            .arg(mount_point)
-            .output_locked()
+        let mounted = SystemCommandRunner
+            .run(&CommandRequest::new(
+                "/sbin/mount_apfs",
+                [
+                    "-o".as_ref(),
+                    options.as_ref(),
+                    attachment.volume_device().as_ref(),
+                    mount_point.as_os_str(),
+                ],
+            ))
             .expect("run mount_apfs");
         assert!(
-            mounted.status.success(),
+            mounted.succeeded(),
             "mount_apfs -o {options} {} {}: {}",
             attachment.volume_device(),
             mount_point.display(),
@@ -2557,28 +2562,37 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
     fixture.blank_image(&foreign);
     let backend = cowshed_core::apfs::MacOsApfsBackend::new(SystemCommandRunner);
     let attachment = backend.attach_verified(&owned).expect("verified owner");
-    let ejected = Command::new("/usr/sbin/diskutil")
-        .args(["eject", "force"])
-        .arg(attachment.whole_device())
-        .output_locked()
+    let ejected = SystemCommandRunner
+        .run(&CommandRequest::new(
+            "/usr/sbin/diskutil",
+            ["eject", "force", attachment.whole_device()],
+        ))
         .expect("external forced eject");
-    let image_driver_ejected = Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-force"])
-        .arg(attachment.whole_device())
-        .output_locked()
+    let image_driver_ejected = SystemCommandRunner
+        .run(&CommandRequest::new(
+            "/usr/bin/hdiutil",
+            ["detach", "-force", attachment.whole_device()],
+        ))
         .expect("external image-driver forced detach");
     assert!(
-        !image_driver_ejected.status.success(),
+        !image_driver_ejected.succeeded(),
         "image driver released a pinned owner: {image_driver_ejected:?}"
     );
-    if ejected.status.success() {
-        let attached_foreign = Command::new("/usr/sbin/diskutil")
-            .args(["image", "attach", "--nobrowse", "--plist"])
-            .arg(&foreign)
-            .output_locked()
+    if ejected.succeeded() {
+        let attached_foreign = SystemCommandRunner
+            .run(&CommandRequest::new(
+                "/usr/sbin/diskutil",
+                [
+                    "image".as_ref(),
+                    "attach".as_ref(),
+                    "--nobrowse".as_ref(),
+                    "--plist".as_ref(),
+                    foreign.as_os_str(),
+                ],
+            ))
             .expect("external foreign attachment");
         assert!(
-            attached_foreign.status.success(),
+            attached_foreign.succeeded(),
             "foreign ASIF mount: {attached_foreign:?}"
         );
         let volume = attachment.volume_device().trim_start_matches("/dev/");
@@ -2589,7 +2603,7 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
         );
     }
     assert!(
-        !ejected.status.success(),
+        !ejected.succeeded(),
         "verified image was ejected before mount: {}",
         String::from_utf8_lossy(&ejected.stdout)
     );
@@ -2604,15 +2618,23 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
     assert!(!attached(&foreign));
 }
 
-/// Attach `image` the way another process does, outside every cowshed lease and check.
+/// Attach `image` the way another process does, outside every cowshed image lease and check.
 fn attach_behind_cowshed(image: &Path) {
-    let attached = Command::new("/usr/sbin/diskutil")
-        .args(["image", "attach", "--nobrowse", "--noMount", "--plist"])
-        .arg(image)
-        .output_locked()
+    let attached = SystemCommandRunner
+        .run(&CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [
+                "image".as_ref(),
+                "attach".as_ref(),
+                "--nobrowse".as_ref(),
+                "--noMount".as_ref(),
+                "--plist".as_ref(),
+                image.as_os_str(),
+            ],
+        ))
         .expect("diskutil image attach");
     assert!(
-        attached.status.success(),
+        attached.succeeded(),
         "attach {}: {}",
         image.display(),
         String::from_utf8_lossy(&attached.stderr)
@@ -4499,12 +4521,11 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         }
         let result = host.mounts(&repo());
         assert_eq!(result.is_ok(), expected_valid, "{options}: {result:?}");
-        let unmounted = Command::new("/sbin/umount")
-            .arg(&mount)
-            .output_locked()
+        let unmounted = SystemCommandRunner
+            .run(&CommandRequest::new("/sbin/umount", [&mount]))
             .expect("umount");
         assert!(
-            unmounted.status.success(),
+            unmounted.succeeded(),
             "umount {}: {}",
             mount.display(),
             String::from_utf8_lossy(&unmounted.stderr)

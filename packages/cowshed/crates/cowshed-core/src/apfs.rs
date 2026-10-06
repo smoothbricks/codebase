@@ -24,16 +24,17 @@ use crate::device::{DISKUTIL, container_of, identifier_depth};
 /// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
 /// images are attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never
 /// from `hdiutil info`.
-const HDIUTIL: &str = "/usr/bin/hdiutil";
+pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
 /// because `diskutil` routes the mount through Disk Arbitration, which serialises every client
 /// on the host: under a loaded fleet a mount that `mount_apfs` completes in about a second was
 /// measured queueing for 68 s at the median and past the 120 s child deadline at the tail.
 /// Disk Arbitration still observes the mounted volume, so eject and inventory keep working.
-const MOUNT_APFS: &str = "/sbin/mount_apfs";
-const UMOUNT: &str = "/sbin/umount";
-const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
+pub(crate) const MOUNT_APFS: &str = "/sbin/mount_apfs";
+pub(crate) const UMOUNT: &str = "/sbin/umount";
+pub(crate) const NEWFS_APFS: &str =
+    "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 
 /// Unix `st_blocks` units: 512 bytes on Darwin. GC allocated-byte accounting reads them.
 pub(crate) const SECTOR_BYTES: u64 = 512;
@@ -196,8 +197,21 @@ impl SystemCommandRunner {
     /// Spawn `request` and collect its output, killing the child when `deadline` passes
     /// first. [`CommandRunner::run`] is this with [`DISK_CHILD_DEADLINE`]; tests pass a
     /// short deadline to prove a hung child is reaped promptly.
+    ///
+    /// A disk tool runs under the host disk-lifecycle lease of its class ([`crate::disk_lease`]):
+    /// the deadline starts once the lease is granted, and the lease is released when the child
+    /// has been reaped.
     pub fn run_with_deadline(
         &self,
+        request: &CommandRequest,
+        deadline: Duration,
+    ) -> Result<CommandOutput, CommandRunError> {
+        crate::disk_lease::leased(&request.program, &request.args, || {
+            Self::run_unleased(request, deadline)
+        })
+    }
+
+    fn run_unleased(
         request: &CommandRequest,
         deadline: Duration,
     ) -> Result<CommandOutput, CommandRunError> {

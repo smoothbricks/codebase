@@ -298,6 +298,7 @@ impl Gateway {
                         sim_broker: sim_broker.clone(),
                         audit_tail: audit_tail.clone(),
                         startup: config.startup.clone(),
+                        disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
                     },
                     config.control_tcp.as_ref(),
                 )

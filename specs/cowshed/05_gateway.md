@@ -230,9 +230,10 @@ coordinator-side; the data plane supplies neither git credentials nor a push pat
 
 ## Control plane (Unix socket + optional 7644)
 
-The control plane provides status and audit to host tools and a project-bound repo-mirror operation to coordinators.
-Peer credentials on the Unix socket (and equivalent local authentication on TCP) must identify an authorized host
-process; the data-plane token is never accepted on the control plane.
+The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, and
+the host's disk-lifecycle lease to every process that runs a disk tool (below). Peer credentials on the Unix socket (and
+equivalent local authentication on TCP) must identify an authorized host process; the data-plane token is never accepted
+on the control plane.
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
@@ -246,6 +247,51 @@ removal never revokes a newer decision, which would leave a tombstone refusing t
 next attach. A write refused with `revision-fence` or `not-installed` lost a race to a reconcile that read a newer
 snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran the
 reconcile.
+
+Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a `disk-lease`
+request is held for as long as its client keeps the connection open.
+
+## Disk-lifecycle lease
+
+Every disk tool cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every test's —
+runs under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the command's
+class off its program and holds a lease of that class around the child, and the setup host's commands go through the
+same client. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that
+sync does not finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"): eight attach
+loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s, while keeping the two apart made 106 attaches
+at 0.94 s p50 and 1.78 s p95 under load 167–212. Attaches among themselves only queue on `storagekitd`; so the lease is
+two classes that exclude each other rather than N interchangeable tokens.
+
+- **Storage**: every `diskutil` verb, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`. Other
+  programs (`fsck_apfs`, IORegistry reads) take no lease.
+- Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
+  and nobody waiting enters at once; an idle gateway starts a phase for it.
+- Once a member of the other class waits, the running phase admits nobody new, so a steady stream of one class cannot
+  starve the other. When the phase drains, the next goes to the other class, whose oldest waiters enter it in arrival
+  order up to the cap; with both classes waiting, phases alternate.
+- **A stuck holder is bounded.** A holder that keeps its phase 10 s after its grant while the other class waits is
+  evicted from the phase: it no longer counts, the phase hands over once its other holders leave, and the gateway's
+  stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
+  command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
+  overlap, not every attach on the host. A client's own deadline still kills its child at 120 s.
+- **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}` and does not
+  half-close. The gateway answers `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the
+  command may run; the lease lasts until the client closes the connection, so a client that dies holding one releases it
+  with its socket, and one that closes while queued leaves the queue.
+- **The lease spaces commands out; it never decides whether one runs.** The command runs unleased when the control
+  socket does not answer (said once per process: the gateway is down or being set up), when the gateway refuses, when no
+  grant comes within 120 s, and when the gateway predates leases. An older gateway says nothing until it reads EOF, so a
+  client that hears no `queued` within 2 s half-closes, reads that gateway's `invalid-request` refusal, and stops asking
+  it for a minute.
+- **Spans.** The client's lifecycle spans are `disk-lease <class> wait`, from the request to the grant (`status=err`,
+  with an `unleased=<reason>` line, when the command runs unleased), and `disk-lease <class> phase`, around the command
+  the grant admitted. With `COWSHED_TIMING` set, the gateway prints each phase as it drains: its class, how long it ran,
+  its members, and how many it evicted.
+
+The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
+name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
+gateway's lease and then unleased. Measured at load 14–50: leased, 125 attaches at 1.24 s p50 and 1.93 s p95 (2.09 s and
+3.39 s with the lease wait); unleased, 8 attaches, each taking 53.5 s.
 
 ## Credentials
 
