@@ -460,11 +460,11 @@ into one) is a different compilation.
 
 Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `RUSTC_WRAPPER`
 naming the sccache that `cowshed setup --sccache` pinned (the program the host daemon runs, by its store path, so a
-repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1` and the cache endpoints
-(`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a pinned sccache gets no wrapper. Name mounts are not excluded:
-the bundled sccache normalizes the residual path-bearing key inputs against the request cwd, so sibling paths share
-entries with each other. A slot buys the one input normalization cannot reach — cargo's `-C metadata`, a hash sccache
-never sees — and same-path reuse of the units whose output names their checkout.
+repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>` and
+the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a pinned sccache gets no wrapper. Name mounts
+are not excluded: the bundled sccache normalizes the residual path-bearing key inputs against the request cwd and the
+workspace root, so sibling paths share entries with each other. A slot buys the one input normalization cannot reach —
+cargo's `-C metadata`, a hash sccache never sees — and same-path reuse of the units whose output names their checkout.
 
 `CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
 profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a
@@ -1083,11 +1083,12 @@ name base directories of its own, per request:
 - `SCCACHE_BASEDIR_CWD=1`, which cowshed exports in every workspace, names the request cwd. Cargo runs rustc from the
   workspace root, so the Rust hasher keys the cwd, the blanket `CARGO_*` environment values and the argument bytes
   relative to it. The C/C++ hasher ignores it.
-- `SCCACHE_BASEDIR=<absolute dir>` names a checkout root that is not the cwd, and both hashers honor it. A C/C++ build
-  sets it for cmake and ninja, which compile from a build directory below the root: the preprocessed text (whose line
-  markers name every source and header) and the arguments are keyed without it, and direct mode is off for such a
-  request. A nested cargo run sets it to strip workspace paths such as `CARGO_HTTP_CAINFO` that sit above its cwd. Named
-  at the cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone.
+- `SCCACHE_BASEDIR=<absolute dir>` names a checkout root that is not the cwd, and both hashers honor it. Cowshed exports
+  the workspace root: cargo compiles a registry crate from its package directory, and the OUT_DIR its build script fills
+  (which serde includes from), `CARGO_HTTP_CAINFO` and a nested cargo run's other workspace paths sit outside that cwd.
+  A C/C++ build sets its own for cmake and ninja, which compile from a build directory below the root: the preprocessed
+  text (whose line markers name every source and header) and the arguments are keyed without it, and direct mode is off
+  for such a request. Named at the cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone.
 
 The Rust hasher strips the same directories from the values rustc records as `# env-dep:`. A normalized key is only as
 good as the claim that the output does not depend on the path it omits, so the patch makes that claim true where it can
@@ -1096,6 +1097,10 @@ and then checks it:
 - a Rust compile runs under `--remap-path-prefix=<dir>=` for each of the request's own base directories, so the working
   directory rustc writes into rmeta and debuginfo is relative and identical at every mount. A C/C++ compile is not
   rewritten; the build passes `-ffile-prefix-map=<root>=.` itself, which the key strips like any argument path;
+- a proc-macro crate is never cached, but every crate the macro expands into hashes its dylib, so the client links it
+  under the same mappings and, on macOS, with an `@rpath/<file>` install name and no debug map (`-Wl,-S`): the linker
+  would otherwise record the output path and the object paths below the target directory. The dylib is then the same
+  bytes at every mount, and so is every key it feeds;
 - a Rust dep-info names the sources and env-dep values at the checkout that compiled it, and cargo reads it as such. A
   shared entry holds it with each of the request's own base directories, where one starts a path, replaced by a
   placeholder for its role (`SCCACHE_BASEDIR`, or the cwd), and a hit writes the requesting checkout's directories back;

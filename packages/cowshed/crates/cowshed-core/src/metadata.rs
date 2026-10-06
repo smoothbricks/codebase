@@ -463,9 +463,10 @@ impl<'de> Deserialize<'de> for CheckoutRootRecord {
 /// Cargo computes `-C metadata` / `-C extra-filename` path-independently for workspace members
 /// (measured on cargo 1.97: identical hashes for one workspace checked out at two paths), and
 /// the bundled sccache keys its residual path-bearing inputs — cwd, blanket `CARGO_*`
-/// environment values, argument bytes — relative to the request cwd when the client sets
-/// `SCCACHE_BASEDIR_CWD=1`, which every workspace now does, and compiles such a request with the
-/// cwd remapped out of rmeta and debuginfo. Cross-path sharing is therefore the default, with one
+/// environment values, env-dep values, argument bytes — relative to the request cwd and the
+/// workspace root (`SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR`, which every workspace now sets),
+/// and compiles such a request, proc macros included, with both remapped out of rmeta and
+/// debuginfo. Cross-path sharing is therefore the default, with one
 /// deliberate exception: a unit whose output still names its checkout (an `env!` value, a proc
 /// macro that read the manifest directory) is stored for that path alone, so it fails closed
 /// across paths. A slot's remaining value is the stable absolute path itself: same-path reuse of

@@ -4694,6 +4694,7 @@ mod workspace_toolchain_tests {
         let caller = BTreeMap::from([
             ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
             ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
+            ("SCCACHE_BASEDIR".to_owned(), "/elsewhere".to_owned()),
         ]);
         // Detection reads the host's pinned client, so each case configures a fresh snapshot,
         // as a supervisor start does.
@@ -4712,12 +4713,17 @@ mod workspace_toolchain_tests {
                 pooled, child,
                 "pooled and one-shot children see one environment"
             );
-            ["RUSTC_WRAPPER", "SCCACHE_BASEDIR_CWD", "CARGO_INCREMENTAL"]
-                .map(|name| child.get(OsStr::new(name)).cloned())
+            [
+                "RUSTC_WRAPPER",
+                "SCCACHE_BASEDIR_CWD",
+                "SCCACHE_BASEDIR",
+                "CARGO_INCREMENTAL",
+            ]
+            .map(|name| child.get(OsStr::new(name)).cloned())
         };
         // A cargo project on a host with no pinned client builds without a wrapper, and the
-        // caller's wrapper and cwd normalization never reach the child either.
-        let unwrapped = [None, None, None];
+        // caller's wrapper and request bases never reach the child either.
+        let unwrapped = [None, None, None, None];
         assert_eq!(wiring().await, unwrapped, "no sccache pinned");
 
         let store_path = root.join("store/0000-sccache-cowshed");
@@ -4731,6 +4737,7 @@ mod workspace_toolchain_tests {
             [
                 Some(store_path.join("bin/sccache").into_os_string()),
                 Some(OsString::from("1")),
+                Some(mount.clone().into_os_string()),
                 None,
             ],
             "the pinned program"

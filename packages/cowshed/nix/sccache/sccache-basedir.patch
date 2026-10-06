@@ -1,5 +1,55 @@
+diff --git a/src/commands.rs b/src/commands.rs
+index 4b05b00..bb15ea2 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -15,7 +15,7 @@
+ use crate::cache::{IpcStorage, storage_from_config};
+ use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
+ use crate::cmdline::{Command, StatsFormat};
+-use crate::compiler::ColorMode;
++use crate::compiler::{ColorMode, local_compile_arguments};
+ use crate::config::{Config, default_disk_cache_dir};
+ use crate::jobserver::Client;
+ use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
+@@ -643,9 +643,18 @@ where
+ {
+     trace!("do_compile");
+     let exe_path = which_in(exe, path, cwd)?;
++    let local = local_compile_arguments(&cmdline, cwd, &env_vars)?;
+     let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars)?;
+     handle_compile_response(
+-        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
++        creator,
++        runtime,
++        &mut conn,
++        res,
++        &exe_path,
++        local.unwrap_or(cmdline),
++        cwd,
++        stdout,
++        stderr,
+     )
+ }
+ 
+@@ -672,6 +681,7 @@ where
+ {
+     trace!("do_compile_client_side");
+     let exe_path = which_in(exe, path, cwd)?;
++    let local = local_compile_arguments(&cmdline, cwd, &env_vars)?;
+     let storage = IpcStorage::connect(conn)?;
+     let conn_arc = storage.conn();
+     let (tx, _rx) = futures::channel::mpsc::channel(1);
+@@ -698,7 +708,7 @@ where
+         compile_resp,
+         finished,
+         &exe_path,
+-        cmdline,
++        local.unwrap_or(cmdline),
+         cwd,
+         stdout,
+         stderr,
 diff --git a/src/compiler/c.rs b/src/compiler/c.rs
-index 7cf84b5..5c6dd77 100644
+index 7cf84b5..6109f53 100644
 --- a/src/compiler/c.rs
 +++ b/src/compiler/c.rs
 @@ -16,7 +16,7 @@ use crate::cache::{FileObjectSource, Storage};
@@ -11,16 +61,16 @@ index 7cf84b5..5c6dd77 100644
  };
  #[cfg(feature = "dist-client")]
  use crate::compiler::{DistPackagers, NoopOutputsRewriter};
-@@ -29,6 +29,8 @@ use crate::util::{
-     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-     hash_all, strip_basedirs,
- };
+@@ -25,6 +25,8 @@ use crate::dist;
+ #[cfg(feature = "dist-client")]
+ use crate::dist::pkg;
+ use crate::mock_command::CommandCreatorSync;
 +#[cfg(unix)]
 +use crate::util::strip_argument_basedirs;
- use async_trait::async_trait;
- use fs_err as fs;
- use std::borrow::Cow;
-@@ -407,11 +409,19 @@ where
+ use crate::util::{
+     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
+     hash_all, strip_basedirs,
+@@ -407,11 +409,22 @@ where
          }
  
          let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
@@ -29,9 +79,12 @@ index 7cf84b5..5c6dd77 100644
          let use_preprocessor_cache_mode = if needs_preprocessing {
 +            // A direct-mode hit returns a stored result key without the output check that
 +            // keeps a key normalized by the request honest (see `PathPin`).
-+            if request_basedir.is_some() && preprocessor_cache_mode_config.use_preprocessor_cache_mode
++            if request_basedir.is_some()
++                && preprocessor_cache_mode_config.use_preprocessor_cache_mode
 +            {
-+                debug!("generate_hash_key: Disabling preprocessor cache because of SCCACHE_BASEDIR");
++                debug!(
++                    "generate_hash_key: Disabling preprocessor cache because of SCCACHE_BASEDIR"
++                );
 +            }
              let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
                  .use_preprocessor_cache_mode
@@ -41,7 +94,7 @@ index 7cf84b5..5c6dd77 100644
  
              let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
  
-@@ -520,6 +530,7 @@ where
+@@ -520,6 +533,7 @@ where
                                          env_vars: env_vars.clone(),
                                      }),
                                      weak_toolchain_key,
@@ -49,7 +102,7 @@ index 7cf84b5..5c6dd77 100644
                                  });
                              } else {
                                  debug!("Preprocessor cache miss: {preprocessor_key}");
-@@ -625,7 +636,7 @@ where
+@@ -625,7 +639,7 @@ where
          let mut common_and_arch_args = self.parsed_args.common_args.clone();
          common_and_arch_args.extend(self.parsed_args.arch_args.clone());
  
@@ -58,7 +111,7 @@ index 7cf84b5..5c6dd77 100644
              &self.executable_digest,
              self.parsed_args.language,
              &common_and_arch_args,
-@@ -633,9 +644,59 @@ where
+@@ -633,9 +647,59 @@ where
          )
          .with_extra_hashes(&extra_hashes)
          .with_env_vars(&env_vars)
@@ -121,7 +174,7 @@ index 7cf84b5..5c6dd77 100644
  
          // Cache the preprocessing step
          if let Some(preprocessor_key) = preprocessor_key {
-@@ -678,6 +739,7 @@ where
+@@ -678,6 +742,7 @@ where
                  env_vars,
              }),
              weak_toolchain_key,
@@ -129,7 +182,7 @@ index 7cf84b5..5c6dd77 100644
          })
      }
  
-@@ -1498,6 +1560,8 @@ pub struct HashKeyParams<'a> {
+@@ -1498,6 +1563,8 @@ pub struct HashKeyParams<'a> {
      preprocessor_output: &'a [u8],
      plusplus: bool,
      basedirs: &'a [Vec<u8>],
@@ -138,7 +191,7 @@ index 7cf84b5..5c6dd77 100644
  }
  
  impl<'a> HashKeyParams<'a> {
-@@ -1525,6 +1589,8 @@ impl<'a> HashKeyParams<'a> {
+@@ -1525,6 +1592,8 @@ impl<'a> HashKeyParams<'a> {
              env_vars: &[],
              plusplus: false,
              basedirs: &[],
@@ -147,7 +200,7 @@ index 7cf84b5..5c6dd77 100644
          }
      }
  
-@@ -1552,6 +1618,19 @@ impl<'a> HashKeyParams<'a> {
+@@ -1552,6 +1621,19 @@ impl<'a> HashKeyParams<'a> {
          self
      }
  
@@ -167,7 +220,7 @@ index 7cf84b5..5c6dd77 100644
      /// Computes the hash key based on the configured parameters.
      ///
      /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
-@@ -1567,8 +1646,21 @@ impl<'a> HashKeyParams<'a> {
+@@ -1567,8 +1649,21 @@ impl<'a> HashKeyParams<'a> {
          // we have to incorporate that into the hash as well.
          m.update(&[self.plusplus as u8]);
          m.update(CACHE_VERSION);
@@ -189,7 +242,7 @@ index 7cf84b5..5c6dd77 100644
              arg.hash(&mut HashToDigest { digest: &mut m });
          }
          for hash in self.extra_hashes {
-@@ -1764,6 +1856,32 @@ mod test {
+@@ -1764,6 +1859,32 @@ mod test {
          assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
      }
  
@@ -223,7 +276,7 @@ index 7cf84b5..5c6dd77 100644
      #[test]
      fn test_hash_key_basedirs_windows_escaped_backslashes() {
 diff --git a/src/compiler/compiler.rs b/src/compiler/compiler.rs
-index 78bb5a4..cb3c508 100644
+index 78bb5a4..f07caf9 100644
 --- a/src/compiler/compiler.rs
 +++ b/src/compiler/compiler.rs
 @@ -556,7 +556,7 @@ where
@@ -375,7 +428,10 @@ index 78bb5a4..cb3c508 100644
 +    /// of `bases` that starts a path becomes its placeholder, and a hit puts the requesting
 +    /// checkout's directory back. Its rule targets are this compile's output paths, which
 +    /// every cargo reader ignores, so the check skips them.
-+    Cargo { path: PathBuf, bases: Vec<RequestBase> },
++    Cargo {
++        path: PathBuf,
++        bases: Vec<RequestBase>,
++    },
 +    /// A C compiler's make depfile. Every lookup writes its own, naming its own checkout, from
 +    /// the preprocessing that computes the key, and a hit keeps that one rather than restore
 +    /// the entry's (the `is_locally_preprocessed` filter above), so the entry's copy is never
@@ -453,10 +509,7 @@ index 78bb5a4..cb3c508 100644
 +    while let Some(nul) = memchr::memchr(b'\0', rest) {
 +        restored.extend_from_slice(&rest[..nul]);
 +        rest = &rest[nul..];
-+        let Some(base) = bases
-+            .iter()
-+            .find(|base| rest.starts_with(base.placeholder))
-+        else {
++        let Some(base) = bases.iter().find(|base| rest.starts_with(base.placeholder)) else {
 +            bail!("the cached dep-info names a base directory this request does not set");
 +        };
 +        restored.extend_from_slice(&base.dir);
@@ -641,7 +694,7 @@ index 78bb5a4..cb3c508 100644
  }
  
  /// Possible results of parsing compiler arguments.
-@@ -1910,6 +2268,99 @@ mod test {
+@@ -1910,6 +2268,96 @@ mod test {
      use test_case::test_case;
      use tokio::runtime::Runtime;
  
@@ -722,10 +775,7 @@ index 78bb5a4..cb3c508 100644
 +    #[test]
 +    fn test_request_basedir() {
 +        let parse = |value: &str| {
-+            request_basedir(&[(
-+                OsString::from("SCCACHE_BASEDIR"),
-+                OsString::from(value),
-+            )])
++            request_basedir(&[(OsString::from("SCCACHE_BASEDIR"), OsString::from(value))])
 +        };
 +        assert_eq!(request_basedir(&[]).unwrap(), None);
 +        assert_eq!(parse("").unwrap(), None);
@@ -741,8 +791,17 @@ index 78bb5a4..cb3c508 100644
      #[test]
      fn test_c_preprocessing_consistent() {
          // Must contain all possible values from `Language`.
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 46a16a4..d633a8c 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -36,3 +36,4 @@ mod counted_array;
+ pub use crate::compiler::c::CCompilerKind;
+ pub use crate::compiler::compiler::*;
+ pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
++pub use crate::compiler::rust::local_compile_arguments;
 diff --git a/src/compiler/rust.rs b/src/compiler/rust.rs
-index 975f434..39f4b33 100644
+index 975f434..459d627 100644
 --- a/src/compiler/rust.rs
 +++ b/src/compiler/rust.rs
 @@ -16,8 +16,8 @@ use crate::cache::{FileObjectSource, Storage};
@@ -761,14 +820,23 @@ index 975f434..39f4b33 100644
  use crate::lru_disk_cache::{LruCache, Meter};
  use crate::mock_command::{CommandCreatorSync, RunCommand};
 -use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
++#[cfg(unix)]
++use crate::util::strip_argument_basedirs;
 +use crate::util::{
 +    Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output, strip_basedirs,
 +};
-+#[cfg(unix)]
-+use crate::util::strip_argument_basedirs;
  use crate::util::{HashToDigest, OsStrExt};
  use crate::{counted_array, dist};
  use async_trait::async_trait;
+@@ -44,7 +48,7 @@ use std::collections::{HashMap, HashSet};
+ use std::env::consts::DLL_EXTENSION;
+ #[cfg(feature = "dist-client")]
+ use std::env::consts::{DLL_PREFIX, EXE_EXTENSION};
+-use std::ffi::OsString;
++use std::ffi::{OsStr, OsString};
+ use std::fmt;
+ use std::future::Future;
+ use std::hash::Hash;
 @@ -1392,7 +1396,7 @@ where
          _may_dist: bool,
          pool: &tokio::runtime::Handle,
@@ -778,7 +846,7 @@ index 975f434..39f4b33 100644
          _cache_control: CacheControl,
      ) -> Result<HashResult<T>> {
          trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
-@@ -1494,8 +1498,138 @@ where
+@@ -1494,8 +1498,123 @@ where
              target_json_hash
          )?;
  
@@ -809,11 +877,7 @@ index 975f434..39f4b33 100644
 +        //   entry is therefore one whose outputs were seen not to name the path they were
 +        //   compiled at.
 +        let request_base = request_basedir(&env_vars)?;
-+        let cwd_base = (cfg!(unix)
-+            && env_vars
-+                .iter()
-+                .any(|(k, v)| k == "SCCACHE_BASEDIR_CWD" && v == "1"))
-+        .then(|| cwd.clone());
++        let cwd_base = request_cwd_base(&env_vars, &cwd);
 +        // The cwd role last: where both name one directory, the dep-info placeholder is the
 +        // cwd's, which every SCCACHE_BASEDIR_CWD=1 request can restore.
 +        let dep_info_bases: Vec<RequestBase> = request_base
@@ -825,18 +889,7 @@ index 975f434..39f4b33 100644
 +                dir: dir.as_os_str().as_encoded_bytes().to_vec(),
 +            })
 +            .collect();
-+        let remapped: Vec<PathBuf> = {
-+            let mut dirs: Vec<PathBuf> = request_base.into_iter().chain(cwd_base).collect();
-+            // rustc applies the last matching mapping, so the longest goes last: the most
-+            // specific base wins, as it does when the key is stripped. A base named both ways
-+            // is one base, keyed exactly as either way alone.
-+            dirs.sort_by(|a, b| {
-+                let (a, b) = (a.as_os_str().as_encoded_bytes(), b.as_os_str().as_encoded_bytes());
-+                a.len().cmp(&b.len()).then(a.cmp(b))
-+            });
-+            dirs.dedup();
-+            dirs
-+        };
++        let remapped = remapped_bases(request_base, cwd_base);
 +        let hash_basedirs: Vec<Vec<u8>> = storage
 +            .basedirs()
 +            .iter()
@@ -918,7 +971,7 @@ index 975f434..39f4b33 100644
          // Hash inputs:
          // 1. A version
          m.update(CACHE_VERSION);
-@@ -1503,14 +1637,29 @@ where
+@@ -1503,14 +1622,29 @@ where
          for d in &self.compiler_shlibs_digests {
              m.update(d.as_bytes());
          }
@@ -950,7 +1003,7 @@ index 975f434..39f4b33 100644
              let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
                  .iter()
                  // We exclude a few arguments from the hash:
-@@ -1537,12 +1686,9 @@ where
+@@ -1537,12 +1671,9 @@ where
              rest.into_iter()
                  .chain(sortables)
                  .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
@@ -965,7 +1018,7 @@ index 975f434..39f4b33 100644
          // 4. The digest of all source files (this includes src file from cmdline).
          // 5. The digest of all files listed on the commandline (self.externs).
          // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
-@@ -1557,12 +1703,13 @@ where
+@@ -1557,12 +1688,13 @@ where
          }
          // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
          //    output. Additionally also has all environment variables starting with `CARGO_`,
@@ -982,7 +1035,7 @@ index 975f434..39f4b33 100644
          }
          let mut env_vars: Vec<_> = env_vars
              .iter()
-@@ -1591,14 +1738,15 @@ where
+@@ -1591,14 +1723,15 @@ where
                  continue;
              }
  
@@ -1003,7 +1056,7 @@ index 975f434..39f4b33 100644
  
          // Turn arguments into a simple Vec<OsString> to calculate outputs.
          let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-@@ -1717,6 +1865,20 @@ where
+@@ -1717,6 +1850,20 @@ where
                  ArgDisposition::Separated,
              ));
          }
@@ -1024,7 +1077,7 @@ index 975f434..39f4b33 100644
  
          let inputs = source_files
              .into_iter()
-@@ -1724,8 +1886,29 @@ where
+@@ -1724,8 +1871,29 @@ where
              .chain(abs_staticlibs)
              .collect();
  
@@ -1055,7 +1108,7 @@ index 975f434..39f4b33 100644
              compilation: Box::new(RustCompilation {
                  executable: self.executable.clone(),
                  host: self.host.clone(),
-@@ -1743,6 +1926,7 @@ where
+@@ -1743,6 +1911,7 @@ where
                  rlib_dep_reader: self.rlib_dep_reader.clone(),
              }),
              weak_toolchain_key,
@@ -1063,6 +1116,313 @@ index 975f434..39f4b33 100644
          })
      }
  
+@@ -2716,6 +2885,193 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
+     Ok(dep_names)
+ }
+ 
++/// The cwd as a request base: present when the client opts in with `SCCACHE_BASEDIR_CWD=1`
++/// (cargo invokes rustc from the workspace root, so the cwd is the checkout base).
++fn request_cwd_base(env_vars: &[(OsString, OsString)], cwd: &Path) -> Option<PathBuf> {
++    (cfg!(unix)
++        && env_vars
++            .iter()
++            .any(|(k, v)| k == "SCCACHE_BASEDIR_CWD" && v == "1"))
++    .then(|| cwd.to_owned())
++}
++
++/// The directories a compile under these request bases runs remapped away from, as
++/// `--remap-path-prefix=<dir>=`. rustc applies the last matching mapping, so the longest goes
++/// last: the most specific base wins, as it does when the key is stripped. A base named both
++/// ways is one base, keyed exactly as either way alone.
++fn remapped_bases(request_base: Option<PathBuf>, cwd_base: Option<PathBuf>) -> Vec<PathBuf> {
++    let mut dirs: Vec<PathBuf> = request_base.into_iter().chain(cwd_base).collect();
++    dirs.sort_by(|a, b| {
++        let (a, b) = (
++            a.as_os_str().as_encoded_bytes(),
++            b.as_os_str().as_encoded_bytes(),
++        );
++        a.len().cmp(&b.len()).then(a.cmp(b))
++    });
++    dirs.dedup();
++    dirs
++}
++
++/// The command line the client runs itself for a compile the server leaves to it.
++///
++/// The server caches no proc-macro crate, so every checkout links its own macro dylib, and
++/// that dylib is an input of every crate the macro expands into: the key hashes each
++/// `--extern`. Unless the dylib is the same bytes at every checkout, all of those crates miss
++/// across checkouts for want of the one compile sccache never runs. Under request base
++/// directories a proc-macro compile therefore runs as a cached compile does, remapped away
++/// from each base, so rustc's metadata and debuginfo name none. On macOS the linker records
++/// two more paths: the install name, which defaults to the absolute output path, becomes
++/// `@rpath/<file>` (rustc loads a macro by path, and nothing links against it); and the debug
++/// map, whose object paths lie below the target directory wherever that is, is left out
++/// (`-S`). `None` for every other command line, which runs verbatim.
++pub fn local_compile_arguments(
++    arguments: &[OsString],
++    cwd: &Path,
++    env_vars: &[(OsString, OsString)],
++) -> Result<Option<Vec<OsString>>> {
++    let Some(compile) = ProcMacroCompile::scan(arguments) else {
++        return Ok(None);
++    };
++    let remapped = remapped_bases(request_basedir(env_vars)?, request_cwd_base(env_vars, cwd));
++    if remapped.is_empty() {
++        return Ok(None);
++    }
++    let mut added: Vec<OsString> = remapped
++        .into_iter()
++        .map(|dir| {
++            let mut mapping = OsString::from("--remap-path-prefix=");
++            mapping.push(dir);
++            mapping.push("=");
++            mapping
++        })
++        .collect();
++    if cfg!(target_os = "macos") {
++        if let Some(file_name) = compile.output_file_name() {
++            let mut install_name = OsString::from("link-arg=-Wl,-install_name,@rpath/");
++            install_name.push(file_name);
++            added.extend([OsString::from("-C"), install_name]);
++        }
++        added.extend([OsString::from("-C"), OsString::from("link-arg=-Wl,-S")]);
++    }
++    // Before the caller's own mappings, as on the cached path: a caller's
++    // --remap-path-prefix for a path inside the checkout still wins.
++    let (before, after) = arguments.split_at(compile.first_remap.unwrap_or(arguments.len()));
++    Ok(Some(
++        before
++            .iter()
++            .cloned()
++            .chain(added)
++            .chain(after.iter().cloned())
++            .collect(),
++    ))
++}
++
++/// The rustc flags `ProcMacroCompile::scan` reads, each of which takes a value.
++#[derive(Clone, Copy)]
++enum ScannedFlag {
++    CrateType,
++    CrateName,
++    Codegen,
++    Output,
++    Remap,
++}
++
++const SCANNED_FLAGS: [(&str, ScannedFlag); 6] = [
++    ("--crate-type", ScannedFlag::CrateType),
++    ("--crate-name", ScannedFlag::CrateName),
++    ("-C", ScannedFlag::Codegen),
++    ("--codegen", ScannedFlag::Codegen),
++    ("-o", ScannedFlag::Output),
++    ("--remap-path-prefix", ScannedFlag::Remap),
++];
++
++/// What `local_compile_arguments` reads from a proc-macro command line.
++struct ProcMacroCompile<'a> {
++    crate_name: Option<&'a str>,
++    extra_filename: &'a str,
++    output: Option<&'a Path>,
++    /// The index of the caller's first `--remap-path-prefix`.
++    first_remap: Option<usize>,
++}
++
++impl<'a> ProcMacroCompile<'a> {
++    /// `Some` iff `arguments` compile a proc-macro crate. A flag's value is the next argument,
++    /// or joined to it (`--flag=value`, `-Cvalue`, `-ovalue`).
++    fn scan(arguments: &'a [OsString]) -> Option<Self> {
++        let mut proc_macro = false;
++        let mut compile = Self {
++            crate_name: None,
++            extra_filename: "",
++            output: None,
++            first_remap: None,
++        };
++        let named = |text: &str| {
++            SCANNED_FLAGS
++                .iter()
++                .find(|(name, _)| *name == text)
++                .map(|&(_, flag)| flag)
++        };
++        let mut i = 0;
++        while i < arguments.len() {
++            let index = i;
++            i += 1;
++            let Some(text) = arguments[index].to_str() else {
++                continue;
++            };
++            let (flag, value): (ScannedFlag, &OsStr) = if let Some(flag) = named(text) {
++                let Some(value) = arguments.get(i) else {
++                    break;
++                };
++                i += 1;
++                (flag, value)
++            } else if let Some((flag, value)) = text
++                .split_once('=')
++                .filter(|(name, _)| name.starts_with("--"))
++                .and_then(|(name, value)| Some((named(name)?, value)))
++            {
++                (flag, OsStr::new(value))
++            } else if let Some(value) = text.strip_prefix("-C").filter(|v| !v.is_empty()) {
++                (ScannedFlag::Codegen, OsStr::new(value))
++            } else if let Some(value) = text.strip_prefix("-o").filter(|v| !v.is_empty()) {
++                (ScannedFlag::Output, OsStr::new(value))
++            } else {
++                continue;
++            };
++            match flag {
++                ScannedFlag::CrateType => {
++                    proc_macro |= value
++                        .to_str()
++                        .is_some_and(|types| types.split(',').any(|t| t == "proc-macro"))
++                }
++                ScannedFlag::CrateName => compile.crate_name = value.to_str(),
++                ScannedFlag::Codegen => {
++                    if let Some(extra) = value
++                        .to_str()
++                        .and_then(|option| option.strip_prefix("extra-filename="))
++                    {
++                        compile.extra_filename = extra;
++                    }
++                }
++                ScannedFlag::Output => compile.output = Some(Path::new(value)),
++                ScannedFlag::Remap => {
++                    compile.first_remap.get_or_insert(index);
++                }
++            }
++        }
++        proc_macro.then_some(compile)
++    }
++
++    /// The file name rustc links the macro to: `-o`'s, else cargo's `lib<name><extra>.dylib`.
++    fn output_file_name(&self) -> Option<OsString> {
++        match self.output {
++            Some(output) => output.file_name().map(OsStr::to_owned),
++            None => self
++                .crate_name
++                .map(|name| format!("lib{name}{}.dylib", self.extra_filename).into()),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;
+@@ -4103,4 +4459,112 @@ proc_macro false
+         let result = parse_arguments(&args, cwd);
+         assert!(matches!(result, CompilerArguments::CannotCache(..)));
+     }
++
++    fn os_strings(arguments: &[&str]) -> Vec<OsString> {
++        arguments.iter().map(OsString::from).collect()
++    }
++
++    const CWD_BASE: [(&str, &str); 1] = [("SCCACHE_BASEDIR_CWD", "1")];
++
++    fn local(arguments: &[&str], env: &[(&str, &str)]) -> Option<Vec<OsString>> {
++        let env: Vec<(OsString, OsString)> = env
++            .iter()
++            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
++            .collect();
++        local_compile_arguments(&os_strings(arguments), Path::new("/w/a"), &env).unwrap()
++    }
++
++    /// What a proc-macro compile adds after the remaps: on macOS an @rpath install name for
++    /// `file` and no debug map; elsewhere nothing.
++    fn link_flags(file: &str) -> Vec<String> {
++        if cfg!(target_os = "macos") {
++            vec![
++                "-C".into(),
++                format!("link-arg=-Wl,-install_name,@rpath/{file}"),
++                "-C".into(),
++                "link-arg=-Wl,-S".into(),
++            ]
++        } else {
++            vec![]
++        }
++    }
++
++    #[test]
++    fn local_arguments_leave_cached_crate_types_verbatim() {
++        let rlib = ["--crate-name", "dep", "--crate-type", "lib", "src/lib.rs"];
++        assert_eq!(local(&rlib, &CWD_BASE), None);
++        let bin = ["--crate-name", "tool", "--crate-type", "bin", "src/main.rs"];
++        assert_eq!(local(&bin, &CWD_BASE), None);
++    }
++
++    #[test]
++    fn local_arguments_leave_a_proc_macro_without_request_base_verbatim() {
++        let pm = [
++            "--crate-name",
++            "pm",
++            "--crate-type",
++            "proc-macro",
++            "src/lib.rs",
++        ];
++        assert_eq!(local(&pm, &[]), None);
++        assert_eq!(local(&pm, &[("SCCACHE_BASEDIR_CWD", "0")]), None);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn local_arguments_compile_a_cargo_proc_macro_path_free() {
++        let pm = [
++            "--crate-name",
++            "serde_derive",
++            "--edition=2021",
++            "/reg/serde_derive-1.0.228/src/lib.rs",
++            "--crate-type",
++            "proc-macro",
++            "-C",
++            "prefer-dynamic",
++            "-C",
++            "extra-filename=-0b529c50d02d547e",
++            "--remap-path-prefix",
++            "/w/a/vendor=v",
++            "--extern",
++            "proc_macro",
++        ];
++        let mut expected: Vec<String> = pm[..10].iter().map(|s| s.to_string()).collect();
++        // Before the caller's own mapping, which stays the last match for its path.
++        expected.push("--remap-path-prefix=/w/a=".into());
++        expected.extend(link_flags("libserde_derive-0b529c50d02d547e.dylib"));
++        expected.extend(pm[10..].iter().map(|s| s.to_string()));
++        assert_eq!(
++            local(&pm, &CWD_BASE),
++            Some(expected.iter().map(OsString::from).collect())
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn local_arguments_read_joined_flags_and_both_bases() {
++        let pm = [
++            "--crate-type=proc-macro",
++            "--crate-name=pm",
++            "-Cextra-filename=-x",
++            "pm.rs",
++            "-o",
++            "/w/a/out/libpm-named.dylib",
++        ];
++        let mut expected: Vec<String> = pm.iter().map(|s| s.to_string()).collect();
++        // Shortest first: rustc applies the last matching mapping.
++        expected.push("--remap-path-prefix=/w/a=".into());
++        expected.push("--remap-path-prefix=/w/a/sub=".into());
++        expected.extend(link_flags("libpm-named.dylib"));
++        assert_eq!(
++            local(
++                &pm,
++                &[
++                    ("SCCACHE_BASEDIR_CWD", "1"),
++                    ("SCCACHE_BASEDIR", "/w/a/sub")
++                ]
++            ),
++            Some(expected.iter().map(OsString::from).collect())
++        );
++    }
+ }
 diff --git a/src/util.rs b/src/util.rs
 index 3a0e847..7753324 100644
 --- a/src/util.rs

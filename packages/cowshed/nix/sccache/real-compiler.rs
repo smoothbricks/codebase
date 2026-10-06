@@ -801,6 +801,86 @@ fn registry_crate_shares_across_checkouts() {
     }
 }
 
+/// sccache caches no proc-macro crate, so each checkout links its own macro dylib, and every
+/// crate the macro expands into hashes that dylib as an `--extern`. The client links it
+/// remapped from the request bases (on macOS also with an @rpath install name and no debug
+/// map), so both checkouts link the same bytes and the macro's dependent hits across them.
+#[test]
+#[ignore = "requires a real rustc and launches a private daemon"]
+fn proc_macro_dependent_shares_across_checkouts() {
+    let rustc = real_rustc();
+    let daemon = Daemon::start();
+    let checkouts = Checkouts::new(
+        daemon.root.path(),
+        &[
+            (
+                "pm/src/lib.rs",
+                "extern crate proc_macro;\n\
+                 #[proc_macro_derive(Answer)]\n\
+                 pub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream {\n\
+                 \x20   \"impl Point { pub fn answer() -> u32 { 42 } }\".parse().unwrap()\n\
+                 }\n",
+            ),
+            (
+                "user/src/lib.rs",
+                "#[derive(pm::Answer)]\npub struct Point;\n",
+            ),
+        ],
+    );
+    // As cargo compiles a proc macro, with debuginfo on so the objects feed a debug map.
+    let compile = |checkout: &Path| {
+        let out = checkout.join("target");
+        fs::create_dir_all(&out).unwrap();
+        run(daemon
+            .command()
+            .current_dir(checkout)
+            .env("SCCACHE_BASEDIR_CWD", "1")
+            .env("CARGO_MANIFEST_DIR", checkout.join("pm"))
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                "pm",
+                "--edition=2021",
+                "--crate-type",
+                "proc-macro",
+                "--emit=dep-info,link",
+                "-C",
+                "prefer-dynamic",
+                "-C",
+                "debuginfo=2",
+                "-C",
+                "extra-filename=-h",
+                "pm/src/lib.rs",
+                "--extern",
+                "proc_macro",
+                "--out-dir",
+            ])
+            .arg(&out));
+        let dylib = out.join(format!("{DLL_PREFIX}pm-h.{DLL_EXTENSION}"));
+        let mut pm = OsString::from("pm=");
+        pm.push(&dylib);
+        daemon.cargo_compile(&rustc, checkout, "user", &[OsStr::new("--extern"), &pm]);
+        dylib
+    };
+    let a = compile(&checkouts.a);
+    daemon.wait_for_writes(1);
+    let b = compile(&checkouts.b);
+    assert!(
+        !names(&b, &checkouts.b),
+        "checkout B's macro names checkout B"
+    );
+    assert!(
+        fs::read(&a).unwrap() == fs::read(&b).unwrap(),
+        "the macro dylib differs between checkouts"
+    );
+    let stats = daemon.stats().stats;
+    assert_eq!(
+        (stats.cache_misses.all(), stats.cache_hits.all()),
+        (1, 1),
+        "checkout B's macro dependent must reuse checkout A's entry"
+    );
+}
+
 fn real_clang() -> PathBuf {
     fs::canonicalize(
         std::env::var_os("SCCACHE_TEST_CLANG")

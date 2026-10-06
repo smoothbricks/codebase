@@ -87,8 +87,11 @@
         #    stored under the normalized key only if no output names a normalized path (a C
         #    depfile is exempt: a hit keeps the one local preprocessing wrote); otherwise it goes
         #    under the verbatim key and a marker sends that checkout's later lookups there.
-        #    Present in the build iff `strings` finds `cowshed-path-v3:remap-cwd` and
-        #    `cowshed-path-v2:c-request-basedir`.
+        #    sccache caches no proc macro, yet every crate a macro expands into hashes its dylib, so
+        #    the client links one under the same remaps and, on macOS, with an `@rpath/<file>`
+        #    install name and no debug map (`-Wl,-S`): the dylib is the same bytes at every mount.
+        #    Present in the build iff `strings` finds `cowshed-path-v3:remap-cwd`,
+        #    `cowshed-path-v2:c-request-basedir` and `-install_name,@rpath/`.
         # 2. singleflight: concurrent misses of one cache key wait for the first compile to publish
         #    instead of running N rustcs. Present in the build iff `nm` finds `inflight_join`.
         # 3. compiler-executable: bind concrete compilers to the same stable,

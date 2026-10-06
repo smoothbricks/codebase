@@ -264,12 +264,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       distributions, native libraries and JDKs stay private and no other part of the host `~/.gradle` is granted;
     - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
       daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
-    - the build wiring: `SCCACHE_BASEDIR_CWD=1`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the
-      host's sccache GC root pins, the program the daemon itself runs (below). It is read through the root before every
-      spawn and names the program rather than a `PATH` entry: shell activation owns `PATH`, and a repository shell that
-      ships no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned
-      none — sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; neither value is the
-      caller's;
+    - the build wiring: `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming
+      `bin/sccache` inside the store path the host's sccache GC root pins, the program the daemon itself runs (below).
+      It is read through the root before every spawn and names the program rather than a `PATH` entry: shell activation
+      owns `PATH`, and a repository shell that ships no sccache left a bare `sccache` unresolvable, failing every cargo
+      at its version probe. A host that pinned none — sccache is opt-in — or whose pinned store path was collected gets
+      no wrapper at all; no value is the caller's;
     - trust anchors as defaults a caller may override: the core's `GIT_SSL_CAINFO` and `SSL_CERT_FILE`, and each
       detected capability's own — `CARGO_HTTP_CAINFO`, `NODE_EXTRA_CA_CERTS`, `NIX_SSL_CERT_FILE` with an
       `ssl-cert-file` line appended to `NIX_CONFIG`, `UV_SYSTEM_CERTS=true` (04_sandbox.md);
@@ -284,21 +284,20 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `COWSHED_WORKSPACE_TOKEN`, and no file under the private `home`, `config` or `cache` carries it. The cargo `[env]`
     guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
 
-    **Limitation: per-workspace `CARGO_*` paths key nested-cwd cargo runs per workspace.** sccache hashes every
-    `CARGO_*` value into a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. Two of those
-    values are paths under the checkout: `CARGO_HTTP_CAINFO` (`<checkout>/.cowshed/ca-bundle.pem`) and the devenv's
-    `CARGO_INSTALL_ROOT` (`<checkout>/tooling/direnv/.devenv/state/cargo-install`, exported by devenv's own rust module
-    in `enterShell`, after every capability's env). A cargo run from the checkout root strips both. A run whose cwd is
-    below the root (a nested Cargo workspace such as a vendored upstream checkout) keys them verbatim, so its Rust
-    entries are per workspace: 0/192 cross-workspace hits measured. Neither path can take a stable spelling. The
-    bundle's content is per workspace, since it is the platform roots plus the workspace's own CA (04_sandbox.md), so a
-    content-addressed path still differs per workspace. A path spelled the same in every workspace but holding each
-    workspace's content would need a per-process filesystem namespace, which macOS does not have. Cargo still needs the
-    bundle: rustup's cargo verifies through SecureTransport, which ignores `SSL_CERT_FILE`. The bundled sccache instead
-    takes a per-request `SCCACHE_BASEDIR=<absolute dir>` (both hashers; the C/C++ one for cmake and ninja builds below a
-    checkout root). A nested build that should share entries across workspaces names the checkout root there, which
-    strips both paths; cowshed does not export it, because only the build knows which root its outputs may be relative
-    to.
+    **Paths under the checkout but outside the cwd.** sccache hashes every `CARGO_*` value and every env-dep value into
+    a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. cargo runs a registry crate's
+    rustc from its package directory, so the OUT_DIR its build script fills (`<checkout>/target/.../out`) is outside
+    that cwd, and a crate that includes from it — serde and serde_core do — keyed and recorded the checkout, as did
+    every crate built on it. A nested Cargo workspace (a vendored upstream checkout) has the same problem with
+    `CARGO_HTTP_CAINFO` (`<checkout>/.cowshed/ca-bundle.pem`) and the devenv's `CARGO_INSTALL_ROOT`
+    (`<checkout>/tooling/direnv/.devenv/state/cargo-install`): 0/192 cross-workspace hits measured. Neither path can
+    take a stable spelling: the bundle's content is per workspace (the platform roots plus the workspace's own CA,
+    04_sandbox.md), and a path spelled the same in every workspace but holding each workspace's content would need a
+    per-process filesystem namespace, which macOS does not have. So every job also gets
+    `SCCACHE_BASEDIR=<workspace root>`, the bundled sccache's per-request base (both hashers): it strips and remaps the
+    workspace root as the cwd is, and at a workspace member's cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone. A
+    C/C++ request under it runs with direct mode off. A build whose outputs are relative to a deeper root (cmake and
+    ninja below a checkout) sets its own.
 
 ### The sccache daemon
 

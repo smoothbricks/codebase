@@ -88,6 +88,15 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         contribution
             .env
             .insert("SCCACHE_BASEDIR_CWD", EnvAction::Own("1".into()));
+        // cargo runs a registry crate's rustc from its package directory, so the cwd base does
+        // not cover the workspace: the OUT_DIR a build script fills sits below it, and a crate
+        // that includes from OUT_DIR (serde does) would key, and record, this workspace's path,
+        // as would every crate built on it. The workspace root as the request base strips and
+        // remaps it as the cwd is; at a workspace member's cwd it keys as the cwd alone.
+        contribution.env.insert(
+            "SCCACHE_BASEDIR",
+            EnvAction::Own(context.workspace_root.as_os_str().to_owned()),
+        );
         contribution.env.insert(
             "SCCACHE_SERVER_UDS",
             EnvAction::Own(server_socket().into_os_string()),
@@ -107,6 +116,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         contribution
             .env
             .insert("SCCACHE_BASEDIR_CWD", EnvAction::Unset);
+        contribution.env.insert("SCCACHE_BASEDIR", EnvAction::Unset);
     }
     Ok(contribution)
 }
@@ -126,13 +136,11 @@ mod tests {
         std::os::unix::fs::symlink(store, root).unwrap();
         assert!(DETECTOR.detect(&fixture.context()).unwrap().is_none());
         fixture.files(&["Cargo.toml"]);
-        assert!(
-            DETECTOR
-                .detect(&fixture.context())
-                .unwrap()
-                .unwrap()
-                .env
-                .contains_key("RUSTC_WRAPPER")
+        let contribution = DETECTOR.detect(&fixture.context()).unwrap().unwrap();
+        assert!(contribution.env.contains_key("RUSTC_WRAPPER"));
+        assert_eq!(
+            contribution.env.get("SCCACHE_BASEDIR"),
+            Some(&EnvAction::Own(fixture.root.clone().into_os_string()))
         );
         std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
         assert!(DETECTOR.detect(&fixture.context()).unwrap().is_none());
@@ -147,9 +155,8 @@ mod tests {
             contribution.env.get("RUSTC_WRAPPER"),
             Some(&EnvAction::Unset)
         );
-        assert_eq!(
-            contribution.env.get("SCCACHE_BASEDIR_CWD"),
-            Some(&EnvAction::Unset)
-        );
+        for name in ["SCCACHE_BASEDIR_CWD", "SCCACHE_BASEDIR"] {
+            assert_eq!(contribution.env.get(name), Some(&EnvAction::Unset));
+        }
     }
 }

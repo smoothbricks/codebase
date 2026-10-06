@@ -215,9 +215,10 @@ workspace sits at a different path.
 | `-C target-cpu=native` ties the cache to one CPU class                      | Fine for a single host; it means the store cannot be shared with a different machine generation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 Two things you do not need to set: `trim-paths` and `--remap-path-prefix`. The bundled sccache already compiles every
-unit it shares across checkouts with the checkout root remapped away, and stores a unit whose output still names its
-checkout (a proc macro that reads `CARGO_MANIFEST_DIR`, say) for that checkout alone. Setting either yourself puts the
-checkout path into the key, so the reuse disappears.
+unit it shares across checkouts with the checkout root remapped away, links every proc macro the same way (it caches
+none, but the crates a macro expands into hash its dylib), and stores a unit whose output still names its checkout (a
+proc macro that reads `CARGO_MANIFEST_DIR`, say) for that checkout alone. Setting either yourself puts the checkout path
+into the key, so the reuse disappears.
 
 ### The same rules for other toolchains
 
