@@ -710,8 +710,7 @@ pub fn execute(
                 let mut totals = Totals::default();
                 let merged = match placement.merge {
                     Merge::ContentAddressed => {
-                        merge_tree(&placement.volume, &placement.host, &mut totals)
-                            .and_then(|()| fs::remove_dir(&placement.volume))
+                        merge_then_remove(&placement.volume, &placement.host, &mut totals)
                     }
                     Merge::HostWins => {
                         totals.dropped = *bytes;
@@ -864,16 +863,7 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
                     && !source_metadata.file_type().is_symlink()
                     && !destination_metadata.file_type().is_symlink() =>
             {
-                // WHY loop: a tool still writing the old location (a cache daemon that has not
-                // yet restarted onto the host path) can add an entry between the merge and the
-                // removal. Merging again moves it too; the tree only shrinks, so this ends.
-                loop {
-                    merge_tree(&source, &destination, totals)?;
-                    match fs::remove_dir(&source) {
-                        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
-                        removed => break removed?,
-                    }
-                }
+                merge_then_remove(&source, &destination, totals)?;
             }
             Ok(_) => {
                 totals.dropped += tree_bytes(&source)?;
@@ -882,6 +872,22 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Merge `from` into `to`, then remove `from`.
+///
+/// WHY loop: a tool still writing the old location (a job whose environment predates the move,
+/// or a cache daemon that has not restarted onto the host path) can add an entry between the
+/// merge and the removal. Merging again moves it too; every pass moves what it finds, so this
+/// ends once no writer adds anything between the two steps.
+fn merge_then_remove(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
+    loop {
+        merge_tree(from, to, totals)?;
+        match fs::remove_dir(from) {
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
+            removed => return removed,
+        }
+    }
 }
 
 /// Copy `from` to `to` through its staging name and publish it with one rename, replacing the
