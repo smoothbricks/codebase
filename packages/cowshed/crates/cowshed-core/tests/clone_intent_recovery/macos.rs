@@ -303,10 +303,15 @@ impl Fixture {
     }
 
     /// Stands at `workspace`'s supervisor socket until a lifecycle verb asks who serves it, which
-    /// the verb does only once the workspace's image is published. At that moment it does what a
-    /// gateway reconcile in another process does to install the workspace's session: bind the
-    /// base port of the published block. Then it lets go of the socket, so the verb serves its
-    /// own supervisor there.
+    /// the verb does only once the workspace's image is published. At that moment a gateway
+    /// reconcile in another process may install the workspace's session on the published block,
+    /// so the block must hold no kernel claim of the verb's: it answers the block's ports any
+    /// socket of this process -- the runtime's -- is still bound to. Then it lets go of the
+    /// socket, so the verb serves its own supervisor there.
+    ///
+    /// It never binds the block to find out: the host's port space is shared with every other
+    /// store (each concurrent test has its own) and program, whose allocator takes the lowest
+    /// free block the moment this one is released, so a refused bind says nothing of the verb.
     fn gateway_at_hello(&self, workspace: &str) -> GatewayAtHello {
         let workspace = name(workspace);
         let socket = supervisor_socket::socket_path(self.storage.store(), &self.repo, &workspace);
@@ -323,15 +328,59 @@ impl Fixture {
             let published = DetachedWorkspaceMetadata::read_for_image(&image).expect("sidecar");
             assert_eq!(published.publication_state, PublicationState::Active);
             let block = published.grants.port_block.expect("a port block");
-            let installed =
-                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, block.base()))
-                    .map(drop)
-                    .map_err(|error| error.kind());
+            let held = own_tcp_ports()
+                .into_iter()
+                .filter(|port| block.ports().expect("block ports").contains(port))
+                .collect();
             drop(listener);
             drop(hello);
-            installed
+            held
         }))
     }
+}
+
+/// Every local TCP port a socket of this process is bound to, from the descriptors it has open.
+fn own_tcp_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    for entry in fs::read_dir("/dev/fd").expect("list this process's descriptors") {
+        let entry = entry.expect("descriptor entry");
+        let fd: libc::c_int = entry
+            .file_name()
+            .to_str()
+            .and_then(|fd| fd.parse().ok())
+            .expect("a descriptor number");
+        // SAFETY: an all-zero `sockaddr_storage` is a valid value of the plain C struct.
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+        let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("sockaddr_storage size");
+        // SAFETY: `address` is writable storage of `length` bytes.
+        let named = unsafe {
+            libc::getsockname(fd, (&raw mut address).cast::<libc::sockaddr>(), &mut length)
+        };
+        if named != 0 {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                // Not a socket; or the listing's own descriptor, closed since it was listed.
+                Some(libc::ENOTSOCK | libc::EBADF) => continue,
+                _ => panic!("getsockname({fd}): {error}"),
+            }
+        }
+        let port = match libc::c_int::from(address.ss_family) {
+            libc::AF_INET => {
+                // SAFETY: the kernel wrote a `sockaddr_in` for an AF_INET socket.
+                let address = unsafe { *(&raw const address).cast::<libc::sockaddr_in>() };
+                address.sin_port
+            }
+            libc::AF_INET6 => {
+                // SAFETY: the kernel wrote a `sockaddr_in6` for an AF_INET6 socket.
+                let address = unsafe { *(&raw const address).cast::<libc::sockaddr_in6>() };
+                address.sin6_port
+            }
+            _ => continue,
+        };
+        ports.push(u16::from_be(port));
+    }
+    ports
 }
 
 /// Reservation markers this test holds on behalf of an imaginary concurrent creator.
@@ -345,11 +394,11 @@ impl PortClaims {
     }
 }
 
-/// What binding the published block's gateway port answered, at the verb's hello.
-struct GatewayAtHello(tokio::task::JoinHandle<std::result::Result<(), std::io::ErrorKind>>);
+/// The ports of the published block this process still held at the verb's hello.
+struct GatewayAtHello(tokio::task::JoinHandle<Vec<u16>>);
 
 impl GatewayAtHello {
-    async fn installed(self) -> std::result::Result<(), std::io::ErrorKind> {
+    async fn claimed(self) -> Vec<u16> {
         self.0.await.expect("the gateway stand-in")
     }
 }
@@ -694,8 +743,8 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
 
 /// The kernel claim on a new workspace's port block lasts until its image publication is
 /// complete and no longer (05_gateway.md): from then on the image owns the block, and another
-/// process's gateway reconcile installing the workspace's session must find its base port
-/// free, not move the workspace to another block at a new grant revision.
+/// process's gateway reconcile installing the workspace's session must find no claim of the
+/// verb's on it, or it moves the workspace to another block at a new grant revision.
 #[tokio::test]
 async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
     let fixture = Fixture::new("published-create");
@@ -706,7 +755,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
         .create(&runtime, "published", CreateOptions::default())
         .await
         .expect("create");
-    assert_eq!(gateway.installed().await, Ok(()));
+    assert_eq!(gateway.claimed().await, [0_u16; 0]);
     runtime.shutdown().await.expect("stop the runtime");
 }
 
@@ -720,7 +769,7 @@ async fn a_forked_workspaces_port_block_is_free_for_its_gateway_session_once_pub
         .fork(&runtime, "main", "published")
         .await
         .expect("fork");
-    assert_eq!(gateway.installed().await, Ok(()));
+    assert_eq!(gateway.claimed().await, [0_u16; 0]);
     runtime.shutdown().await.expect("stop the runtime");
 }
 
@@ -730,6 +779,6 @@ async fn an_adopted_mains_port_block_is_free_for_its_gateway_session_once_publis
     let gateway = fixture.gateway_at_hello("main");
 
     let runtime = fixture.adopt().await;
-    assert_eq!(gateway.installed().await, Ok(()));
+    assert_eq!(gateway.claimed().await, [0_u16; 0]);
     runtime.shutdown().await.expect("stop the runtime");
 }
