@@ -28,10 +28,14 @@ pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
 /// process, so a run opens dozens of sweeps at once. Unserialized, each of them raced the others
 /// for the same abandoned images: every sweeper waited on the image lease another held for its
 /// detach (11.5 s measured), then found the volume already unmounted under it and failed. One
-/// sweep at a time does the work once. The file records when the last finished sweep started,
-/// and a sweep that started after a process asked to sweep has already seen every run that was
-/// dead when it asked, so the queue behind a sweep returns without sweeping again. Its name
-/// spells no pid, so no sweep ever reclaims it.
+/// sweep at a time does the work once. A process that finds a sweep under way leaves the work to
+/// it rather than queueing behind it: nothing a test does waits on another run's leftovers, and
+/// a queue made every test of a run start only after the first sweep detached them all (6 s,
+/// measured behind nine images a killed run left). That sweep reclaims every run that was dead
+/// when it started; a run that died since is reclaimed by the next process to find the lock
+/// free. The file records when the last finished sweep started, and a sweep that started after
+/// a process asked to sweep has already seen every run that was dead when it asked, so that
+/// process returns without sweeping again. Its name spells no pid, so no sweep ever reclaims it.
 const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
 
 /// How long the processes left working under a scratch root get to exit on `SIGTERM` before
@@ -107,8 +111,9 @@ impl Drop for ScratchRoot {
 /// Processes go first: one working in a dead run's volume would hold that volume attached.
 fn sweep_dead_runs() {
     let asked = since_epoch();
-    let sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
-        Ok(lock) => lock,
+    let sweeping = match try_lock_exclusive(Path::new(SWEEP_LOCK)) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
         Err(error) => {
             eprintln!("abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}");
             return;
@@ -172,6 +177,30 @@ pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error);
+        }
+    }
+}
+
+/// `path` opened (created if absent) and `flock`ed exclusively, or `None` when another process
+/// holds it: the lock lives as long as the returned file, and dies with its process however that
+/// process ends.
+fn try_lock_exclusive(path: &Path) -> std::io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    loop {
+        // SAFETY: `flock` takes a descriptor `file` keeps open for the call and touches no memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            _ => return Err(error),
         }
     }
 }

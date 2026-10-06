@@ -23,8 +23,8 @@ use cowshed_core::storage::apfs::native::{
     blank_template, blank_template_path, blank_template_staged_stem,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource,
-    MetadataPolicy, TokioApfsBlockingLane,
+    Alongside, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+    IncarnationSource, MetadataPolicy, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
@@ -247,7 +247,9 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         )?;
         let fork_started = Instant::now();
         let fork = substrate
-            .execute_create_staged(fork_plan, |_| async { Ok::<(), &'static str>(()) })
+            .execute_create_staged(fork_plan, Alongside::none(), |_, ()| async {
+                Ok::<(), &'static str>(())
+            })
             .await
             .map_err(|error| std::io::Error::other(format!("live clone: {error}")))?
             .workspace;

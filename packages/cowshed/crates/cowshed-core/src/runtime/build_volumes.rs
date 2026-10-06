@@ -59,6 +59,19 @@ pub(crate) struct Quiet {
     state: BuildVolumeState,
 }
 
+/// A fork's live volume, cloned from its source's latest seed and mounted while the source's
+/// image is cloned and attached beside it (Fork steps 2 and 3): the staged checkout it is for
+/// does not exist yet. [`BuildVolumes::finish_fork`] gives the destination its own seed and
+/// links the checkout to it; [`BuildVolumes::abandon_fork`] releases it when no checkout staged.
+#[derive(Debug)]
+pub(crate) struct PreparedFork {
+    seed: BuildVolumeId,
+    tree: Option<GitOid>,
+    live: BuildVolumeId,
+    mount: PathBuf,
+    started: Instant,
+}
+
 /// The target's volume once its Nx state is closed (Land step 5): its daemon stopped and its
 /// task database held by nothing.
 #[derive(Clone, Debug)]
@@ -283,55 +296,97 @@ impl BuildVolumes {
         .await
     }
 
-    /// Fork (16_build_volumes.md, "Fork"): `source`'s seed first catches up with the live volume
-    /// `source_checkout` links ([`Self::reseed`]; a skip is said on stderr, and the older seed is
-    /// forked). Then the checkout staged at `checkout`, which `destination` is about to become,
-    /// gets its own clone of `source`'s latest seed, mounted, with no daemon record, and linked;
-    /// and `destination` gets its own seed, a second clone of the same seed, so it is a target
-    /// others can fork from. A source with no seed gives none: its checkout links nothing either,
-    /// unless something is wrong, which refuses. The caller holds `source`'s image lock, which
-    /// every fork of `source` and its reseed hold.
-    pub async fn fork(
+    /// Fork steps 2 and 3 (16_build_volumes.md, "Fork"), up to the checkout: `source`'s seed
+    /// first catches up with the live volume `source_checkout` links ([`Self::reseed`]; a skip
+    /// is said on stderr, and the older seed is forked), then `destination` gets its live volume,
+    /// a clone of `source`'s latest seed, mounted, with no daemon record. A source with no seed
+    /// gives none. The caller holds `source`'s image lock, which every fork of `source` and its
+    /// reseed hold, and runs this beside the clone of `source`'s image, whose stage
+    /// [`Self::finish_fork`] then links.
+    pub async fn prepare_fork(
         &self,
         source: Owner,
         source_checkout: PathBuf,
-        destination: Owner,
-        checkout: PathBuf,
-    ) -> Result<Option<BuildVolumeId>> {
+        destination: WorkspaceName,
+    ) -> Result<Option<PreparedFork>> {
         if let Reseed::Skipped { behind_ms, reason } =
             self.reseed(source.clone(), source_checkout).await?
         {
             eprintln!(
-                "cowshed: {}'s seed stays{} behind its build volume, so {} misses what {} built since: {reason}; the next fork retries",
+                "cowshed: {}'s seed stays{} behind its build volume, so {destination} misses what {} built since: {reason}; the next fork retries",
                 source.name,
                 behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
-                destination.name,
                 source.name,
             );
         }
         self.blocking(move |host, layout| {
             let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)? else {
+                return Ok(None);
+            };
+            let started = Instant::now();
+            let (live, mount) = host
+                .fork_build_volume(
+                    layout,
+                    &seed,
+                    &BuildVolumeRecord::new(
+                        record.tree.clone(),
+                        BuildVolumeRole::Linked {
+                            checkout: destination,
+                        },
+                    ),
+                )
+                .map_err(storage)?;
+            Ok(Some(PreparedFork {
+                seed,
+                tree: record.tree,
+                live,
+                mount,
+                started,
+            }))
+        })
+        .await
+    }
+
+    /// The rest of the fork, once the checkout `destination` is about to become is staged at
+    /// `checkout`: `destination` gets its own seed, a second clone of the seed its live volume
+    /// came from, so it is a target others can fork from, and then the checkout links the live
+    /// volume. Without a prepared volume the checkout must link nothing, or something is wrong,
+    /// which refuses.
+    pub async fn finish_fork(
+        &self,
+        prepared: Option<PreparedFork>,
+        destination: Owner,
+        checkout: PathBuf,
+    ) -> Result<Option<BuildVolumeId>> {
+        self.blocking(move |host, layout| {
+            let Some(PreparedFork {
+                seed,
+                tree,
+                live,
+                mount,
+                started,
+            }) = prepared
+            else {
                 if link::linked(&checkout)?.is_some() {
                     return Err(CowshedError::integrity(
                         format!(
-                            "workspace {} links a build volume but has no seed to fork from",
-                            source.name
+                            "{}'s staged checkout links a build volume, but its source has no seed to fork from",
+                            destination.name
                         ),
                         "cowshed doctor --json",
                     ));
                 }
                 return Ok(None);
             };
-            let started = Instant::now();
-            // The seed first: a crash after it leaves an unlinked volume, never a target
-            // without a seed.
+            // The seed before the link: a crash between them leaves an unlinked volume, never a
+            // target without a seed.
             let own_seed = BuildVolumeId::mint();
             host.clone_build_volume(
                 layout,
                 &seed,
                 &own_seed,
                 &BuildVolumeRecord::new(
-                    record.tree.clone(),
+                    tree,
                     BuildVolumeRole::Seed {
                         target: destination.name.clone(),
                         incarnation: destination.incarnation.clone(),
@@ -339,18 +394,6 @@ impl BuildVolumes {
                 ),
             )
             .map_err(storage)?;
-            let (live, mount) = host
-                .fork_build_volume(
-                    layout,
-                    &seed,
-                    &BuildVolumeRecord::new(
-                        record.tree,
-                        BuildVolumeRole::Linked {
-                            checkout: destination.name.clone(),
-                        },
-                    ),
-                )
-                .map_err(storage)?;
             link::point(&checkout, &mount)?;
             // The own seed holds everything the live volume does but its mount's writes and the
             // dropped daemon record, so it starts as fresh as the live volume.
@@ -367,6 +410,31 @@ impl BuildVolumes {
             Ok(Some(live))
         })
         .await
+    }
+
+    /// Release what [`Self::prepare_fork`] answered for a checkout that never staged: no checkout
+    /// links its live volume and nothing has run in it. The failed clone is the caller's error,
+    /// so a release that fails too is said on stderr and left to `gc`.
+    pub async fn abandon_fork(&self, prepared: Result<Option<PreparedFork>>) {
+        let Ok(Some(prepared)) = prepared else {
+            return;
+        };
+        let live = prepared.live.clone();
+        let released = self
+            .blocking(move |host, layout| {
+                host.release_build_volume(layout, &prepared.live)
+                    .map_err(storage)
+            })
+            .await;
+        match released {
+            Ok(BuildVolumeRelease::Deleted) => {}
+            Ok(BuildVolumeRelease::Busy(diagnostic)) => eprintln!(
+                "cowshed: build volume {live} of a fork that never staged stays: still in use: {diagnostic}; `cowshed gc` retries it"
+            ),
+            Err(error) => eprintln!(
+                "cowshed: build volume {live} of a fork that never staged stays: {error}; `cowshed gc` retries it"
+            ),
+        }
     }
 
     /// Land step 4, after the landing workspace's supervisor has stopped its jobs: the landing
@@ -1414,9 +1482,14 @@ mod tests {
         let lane = owner("lane", '1');
         let staged = scratch.root.path().join("staged-lane");
         fs::create_dir_all(staged.join(".cowshed")).unwrap();
+        let prepared = scratch
+            .volumes
+            .prepare_fork(main.clone(), main_checkout, lane.name.clone())
+            .await
+            .expect("prepare the fork from main's seed");
         let forked = scratch
             .volumes
-            .fork(main.clone(), main_checkout, lane.clone(), staged.clone())
+            .finish_fork(prepared, lane.clone(), staged.clone())
             .await
             .expect("fork from main's seed")
             .expect("main has a seed");
@@ -1643,13 +1716,12 @@ mod tests {
             incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
         };
         let topic_checkout = checkout("topic");
+        let prepared = volumes
+            .prepare_fork(main.clone(), main_checkout.clone(), topic.name.clone())
+            .await
+            .expect("prepare the fork from main's seed");
         let forked = volumes
-            .fork(
-                main.clone(),
-                main_checkout.clone(),
-                topic,
-                topic_checkout.clone(),
-            )
+            .finish_fork(prepared, topic, topic_checkout.clone())
             .await
             .expect("fork from main's seed")
             .expect("main has a seed");

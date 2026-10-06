@@ -306,15 +306,30 @@ fn git(directory: &Path, args: &[&str]) {
     );
 }
 
+/// Dispatch one CLI command. Its start and end go to stderr beside the runtime's own spans, as
+/// [`git`]'s do: an exec has no span of its own, so a slow job reads as the time between these.
 async fn run(
     service: &mut ActorBridge,
     args: impl IntoIterator<Item = impl Into<OsString>>,
 ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
     let cli = parse_args(args).expect("valid CLI command");
+    let verb = format!("{:?}", cli.command);
+    let verb = verb
+        .split(['(', ' ', '{'])
+        .next()
+        .unwrap_or("command")
+        .to_owned();
+    eprintln!("dispatch fixture cowshed: {verb} start");
+    let started = Instant::now();
     let mut output = Output::new(Vec::new(), Vec::new(), cli.global.quiet);
     let result = dispatch(service, cli, tokio::io::empty(), &mut output)
         .await
         .map(|exit| exit.code);
+    eprintln!(
+        "dispatch fixture cowshed: {verb} done elapsed={:?} ok={}",
+        started.elapsed(),
+        result.is_ok()
+    );
     let (stdout, stderr) = output.into_inner();
     (result, stdout, stderr)
 }
@@ -1531,7 +1546,6 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
         cold.iter().all(|(_, fresh)| !fresh),
         "w1 forks main's empty first seed, so it builds every unit: {cold:?}"
     );
-    sh(&mut service, "w1", &nx_check).await;
     let report = land(&mut service, "w1", true, &[&nx_check, CARGO_BUILD]).await;
     assert!(report.build_volume.seeded, "{report:?}");
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
@@ -1757,7 +1771,10 @@ async fn nx_statuses(
 /// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
 /// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
-/// main's run. Main then runs once more and the next fork reseeds on its own.
+/// main's run. A fork that reseeds its source on its own is
+/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run`]: `new` and `fork`
+/// reseed through the one fork path, so a second fork of main here would only pay two more
+/// attaches for it.
 #[tokio::test]
 async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it() {
     let (nx, node) = repository_nx();
@@ -1836,25 +1853,6 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         hits.iter()
             .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
         "a fork hits what main ran after the land: {hits:?}"
-    );
-
-    // Again with no reseed verb: the fork reseeds main itself.
-    fs::write(main.join("a/src.txt"), b"src, changed in main again\n").unwrap();
-    git(&main, &["commit", "-q", "-am", "change a in main again"]);
-    nx_statuses(&mut service, "main", &main, &nx_check).await;
-    let (_, stderr) = succeed(&mut service, ["new", "w2"]).await;
-    assert!(!stderr.contains("seed stays"), "{stderr}");
-    let w2 = service
-        .path("w2", false)
-        .await
-        .expect("w2 is mounted")
-        .mount;
-    let hits = nx_statuses(&mut service, "w2", &w2, &nx_check).await;
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "a fork reseeds main first and hits main's latest run: {hits:?}"
     );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;

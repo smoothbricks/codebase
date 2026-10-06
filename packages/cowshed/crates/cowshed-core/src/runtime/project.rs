@@ -8190,61 +8190,83 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             let home = &self.home;
             let build_volumes = self.build_volumes()?;
-            let seed_source = super::build_volumes::Owner {
-                name: source_name.clone(),
-                incarnation: source.derived.workspace.incarnation().clone(),
-            };
-            let receipt = self
-                .substrate
-                .execute_create_staged(plan, move |stage| async move {
-                    // Before any Git runs in the clone: a lock a source writer held when the
-                    // image was cloned is held by nobody here, and would refuse every write to
-                    // the file it guards.
-                    timed_async(
-                        "new",
-                        "locks",
-                        crate::inherited_git_locks::discard_in(&stage.mount_point),
-                    )
-                    .await?;
-                    timed_async(
-                        "new",
-                        "daemons",
-                        crate::inherited_daemons::macos::discard_in(
-                            &stage.mount_point,
-                            crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
-                        ),
-                    )
-                    .await?;
-                    // Under the source's image lock, which every fork of the source holds here:
-                    // the seed the fork clones is first the source's own work up to now, unless
-                    // something still writes the source's volume.
+            // Under the source's image lock, which every fork of the source holds while its
+            // clone is staged: the seed the fork clones is first the source's own work up to
+            // now, unless something still writes the source's volume. The fork's live volume is
+            // attached beside the clone's own attach, so the two wait on `storagekitd` once.
+            let preparing = build_volumes.clone();
+            let abandoning = build_volumes.clone();
+            let prepare = {
+                let (source_mount, destination) = (source_mount.clone(), destination.clone());
+                let seed_source = super::build_volumes::Owner {
+                    name: source_name.clone(),
+                    incarnation: source.derived.workspace.incarnation().clone(),
+                };
+                async move {
                     timed_async(
                         "new",
                         "build-volume",
-                        build_volumes.fork(
-                            seed_source,
-                            source_mount.clone(),
-                            super::build_volumes::Owner {
-                                name: destination.clone(),
-                                incarnation: stage.workspace.incarnation().clone(),
-                            },
-                            stage.mount_point.clone(),
-                        ),
+                        preparing.prepare_fork(seed_source, source_mount, destination),
                     )
-                    .await?;
-                    crate::git::GitRepository::from_root(&stage.mount_point)
-                        .mint_workspace(
-                            &destination.to_string(),
-                            crate::git::CloneOrigin {
-                                source: &source_mount,
-                                main: &main_mount,
-                            },
-                            repository_shape,
-                            start,
-                            stage.resuming,
+                    .await
+                }
+            };
+            let receipt = self
+                .substrate
+                .execute_create_staged(
+                    plan,
+                    crate::storage::apfs::Alongside {
+                        work: prepare,
+                        abandon: move |prepared| async move {
+                            abandoning.abandon_fork(prepared).await;
+                        },
+                    },
+                    move |stage, prepared| async move {
+                        // Before any Git runs in the clone: a lock a source writer held when the
+                        // image was cloned is held by nobody here, and would refuse every write to
+                        // the file it guards.
+                        timed_async(
+                            "new",
+                            "locks",
+                            crate::inherited_git_locks::discard_in(&stage.mount_point),
                         )
-                        .await
-                })
+                        .await?;
+                        timed_async(
+                            "new",
+                            "daemons",
+                            crate::inherited_daemons::macos::discard_in(
+                                &stage.mount_point,
+                                crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                            ),
+                        )
+                        .await?;
+                        timed_async(
+                            "new",
+                            "build-volume-seed",
+                            build_volumes.finish_fork(
+                                prepared?,
+                                super::build_volumes::Owner {
+                                    name: destination.clone(),
+                                    incarnation: stage.workspace.incarnation().clone(),
+                                },
+                                stage.mount_point.clone(),
+                            ),
+                        )
+                        .await?;
+                        crate::git::GitRepository::from_root(&stage.mount_point)
+                            .mint_workspace(
+                                &destination.to_string(),
+                                crate::git::CloneOrigin {
+                                    source: &source_mount,
+                                    main: &main_mount,
+                                },
+                                repository_shape,
+                                start,
+                                stage.resuming,
+                            )
+                            .await
+                    },
+                )
                 .await
                 .map_err(native_staged_error)?;
             // Published, the image owns its block: the kernel claim ends with publication, or a
@@ -8429,46 +8451,67 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.mark_lifecycle_intent_mutating(&destination).await?;
             let home = &self.home;
             let build_volumes = self.build_volumes()?;
-            let seed_source = super::build_volumes::Owner {
-                name: source.clone(),
-                incarnation: source_fact.derived.workspace.incarnation().clone(),
+            // Under the source's image lock, as for `create`: the source's seed first catches up
+            // with its live volume, and the fork's live volume attaches beside the clone.
+            let preparing = build_volumes.clone();
+            let abandoning = build_volumes.clone();
+            let prepare = {
+                let (source_mount, forked) = (source_mount.clone(), forked.clone());
+                let seed_source = super::build_volumes::Owner {
+                    name: source.clone(),
+                    incarnation: source_fact.derived.workspace.incarnation().clone(),
+                };
+                async move {
+                    timed_async(
+                        "fork",
+                        "build-volume",
+                        preparing.prepare_fork(seed_source, source_mount, forked),
+                    )
+                    .await
+                }
             };
             let receipt = self
                 .substrate
-                .execute_fork_staged(plan, move |stage| async move {
-                    crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
-                    crate::inherited_daemons::macos::discard_in(
-                        &stage.mount_point,
-                        crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
-                    )
-                    .await?;
-                    // Under the source's image lock, as for `create`: the source's seed first
-                    // catches up with its live volume.
-                    build_volumes
-                        .fork(
-                            seed_source,
-                            source_mount.clone(),
-                            super::build_volumes::Owner {
-                                name: forked.clone(),
-                                incarnation: stage.workspace.incarnation().clone(),
-                            },
-                            stage.mount_point.clone(),
+                .execute_fork_staged(
+                    plan,
+                    crate::storage::apfs::Alongside {
+                        work: prepare,
+                        abandon: move |prepared| async move {
+                            abandoning.abandon_fork(prepared).await;
+                        },
+                    },
+                    move |stage, prepared| async move {
+                        crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
+                        crate::inherited_daemons::macos::discard_in(
+                            &stage.mount_point,
+                            crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
                         )
                         .await?;
-                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                    repository.restore_inherited_links(&source_mount).await?;
-                    if source_is_git_worktree {
-                        repository
-                            .adopt_as_linked_worktree_resumable(
-                                &forked.to_string(),
-                                &main_mount,
-                                None,
-                                stage.resuming,
+                        build_volumes
+                            .finish_fork(
+                                prepared?,
+                                super::build_volumes::Owner {
+                                    name: forked.clone(),
+                                    incarnation: stage.workspace.incarnation().clone(),
+                                },
+                                stage.mount_point.clone(),
                             )
                             .await?;
-                    }
-                    Ok::<_, CowshedError>(())
-                })
+                        let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                        repository.restore_inherited_links(&source_mount).await?;
+                        if source_is_git_worktree {
+                            repository
+                                .adopt_as_linked_worktree_resumable(
+                                    &forked.to_string(),
+                                    &main_mount,
+                                    None,
+                                    stage.resuming,
+                                )
+                                .await?;
+                        }
+                        Ok::<_, CowshedError>(())
+                    },
+                )
                 .await
                 .map_err(native_staged_error)?;
             // Published, the image owns its block; see `create`.

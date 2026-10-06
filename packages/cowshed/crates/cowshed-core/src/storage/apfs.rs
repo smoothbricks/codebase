@@ -176,6 +176,29 @@ pub struct WorkspaceStage {
 pub type AdoptStage = WorkspaceStage;
 pub type CreateStage = WorkspaceStage;
 pub type ForkStage = WorkspaceStage;
+
+/// Work a staged create or fork runs beside staging its clone, under the plan's locks: it starts
+/// once the locks are held and the plan's facts revalidated, runs while the clone is attached
+/// and mounted, and its output goes to the initializer with the stage. When the clone cannot be
+/// staged, `abandon` gets that output instead, so nothing the work made outlives the failure.
+///
+/// It exists for a second image the operation attaches anyway (a fork's build volume): every
+/// `diskutil image attach` waits in the host's one `storagekitd` queue (01_storage.md, "How the
+/// APFS host degrades"), and two attaches in flight together wait in it once, not twice.
+pub struct Alongside<W, D> {
+    pub work: W,
+    pub abandon: D,
+}
+
+impl Alongside<std::future::Ready<()>, fn(()) -> std::future::Ready<()>> {
+    /// No work beside the clone: the initializer gets `()`.
+    pub fn none() -> Self {
+        Self {
+            work: std::future::ready(()),
+            abandon: std::future::ready,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointStage {
     pub checkpoint: CheckpointRef,
@@ -998,43 +1021,58 @@ where
         }
     }
 
-    pub async fn execute_create_staged<F, Fut, E>(
+    pub async fn execute_create_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: CreatePlan,
+        alongside: Alongside<W, D>,
         initialize: F,
     ) -> Result<LifecycleReceipt, CreateExecutionError<E>>
     where
-        F: FnOnce(CreateStage) -> Fut + Send,
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
+        F: FnOnce(CreateStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
-        self.execute_clone_staged(plan, CloneKind::Create, initialize)
+        self.execute_clone_staged(plan, CloneKind::Create, alongside, initialize)
             .await
     }
 
-    pub async fn execute_fork_staged<F, Fut, E>(
+    pub async fn execute_fork_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: ForkPlan,
+        alongside: Alongside<W, D>,
         initialize: F,
     ) -> Result<LifecycleReceipt, ForkExecutionError<E>>
     where
-        F: FnOnce(ForkStage) -> Fut + Send,
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
+        F: FnOnce(ForkStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
-        self.execute_clone_staged(plan, CloneKind::Fork, initialize)
+        self.execute_clone_staged(plan, CloneKind::Fork, alongside, initialize)
             .await
     }
 
-    async fn execute_clone_staged<P, F, Fut, E>(
+    async fn execute_clone_staged<P, W, D, DFut, F, Fut, E>(
         &self,
         plan: P,
         kind: CloneKind,
+        alongside: Alongside<W, D>,
         initialize: F,
     ) -> Result<LifecycleReceipt, StagedExecutionError<E>>
     where
         P: ImmutablePlan,
-        F: FnOnce(WorkspaceStage) -> Fut + Send,
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
+        F: FnOnce(WorkspaceStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
@@ -1056,46 +1094,52 @@ where
         let incarnations = Arc::clone(&self.incarnations);
         let expected = plan.expected().to_vec();
         let operation = plan.operation().clone();
-        let prepared = self
-            .lane
-            .dispatch(move || {
-                let (source, destination, identity, operation_kind) = match &operation {
-                    Operation::Create {
-                        source,
-                        destination,
-                        identity,
-                    } => (source, destination, identity, CloneKind::Create),
-                    Operation::Fork {
-                        source,
-                        destination,
-                        identity,
-                    } => (source, destination, identity, CloneKind::Fork),
-                    _ => {
-                        return Err(ApfsStorageError::InvalidPlan(
-                            "staged clone executor requires a create or fork operation",
-                        ));
-                    }
-                };
-                if operation_kind != kind {
+        let staging = self.lane.dispatch(move || {
+            let (source, destination, identity, operation_kind) = match &operation {
+                Operation::Create {
+                    source,
+                    destination,
+                    identity,
+                } => (source, destination, identity, CloneKind::Create),
+                Operation::Fork {
+                    source,
+                    destination,
+                    identity,
+                } => (source, destination, identity, CloneKind::Fork),
+                _ => {
                     return Err(ApfsStorageError::InvalidPlan(
-                        "staged clone executor operation kind mismatch",
+                        "staged clone executor requires a create or fork operation",
                     ));
                 }
-                prepare_clone_stage(
-                    host.as_ref(),
-                    &config,
-                    &expected,
-                    CloneExecution {
-                        source,
-                        destination,
-                        fork: kind == CloneKind::Fork,
-                        identity,
-                    },
-                    incarnations.as_ref(),
-                    false,
-                )
-            })
-            .await?;
+            };
+            if operation_kind != kind {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "staged clone executor operation kind mismatch",
+                ));
+            }
+            prepare_clone_stage(
+                host.as_ref(),
+                &config,
+                &expected,
+                CloneExecution {
+                    source,
+                    destination,
+                    fork: kind == CloneKind::Fork,
+                    identity,
+                },
+                incarnations.as_ref(),
+                false,
+            )
+        });
+        let Alongside { work, abandon } = alongside;
+        let (prepared, beside) = tokio::join!(staging, work);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                abandon(beside).await;
+                return Err(error.into());
+            }
+        };
         let prepared = StagedCallbackGuard::new(
             Arc::clone(&self.host),
             prepared,
@@ -1105,7 +1149,7 @@ where
         let initialized = timed_async(
             "apfs",
             "canonical/init",
-            initialize(prepared.get().stage.clone()),
+            initialize(prepared.get().stage.clone(), beside),
         )
         .await;
         if let Err(initializer) = initialized {

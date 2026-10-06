@@ -12,10 +12,10 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
-    AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
-    ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingAdoption, PublicationError, ResumableClone, RetireExecutionError,
-    volume_key,
+    AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
+    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
+    MarkerExpectation, MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
+    RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
@@ -1793,7 +1793,8 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                     },
                 )
                 .expect("create plan"),
-            |_| async { Ok::<(), &'static str>(()) },
+            Alongside::none(),
+            |_, ()| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("create");
@@ -1813,7 +1814,8 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                     },
                 )
                 .expect("fork plan"),
-            |_| async { Ok::<(), &'static str>(()) },
+            Alongside::none(),
+            |_, ()| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("fork");
@@ -1970,7 +1972,8 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
             substrate
                 .plan_create(&source, destination("created", 8))
                 .expect("create plan"),
-            |_| async { Ok::<(), &'static str>(()) },
+            Alongside::none(),
+            |_, ()| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("create");
@@ -1985,7 +1988,8 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
             substrate
                 .plan_fork(&source, destination("forked", 10))
                 .expect("fork plan"),
-            |_| async { Ok::<(), &'static str>(()) },
+            Alongside::none(),
+            |_, ()| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("fork");
@@ -2259,7 +2263,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
                 .expect("fork plan");
             tokio::spawn(async move {
                 initial_substrate
-                    .execute_fork_staged(plan, move |_| async move {
+                    .execute_fork_staged(plan, Alongside::none(), move |_, ()| async move {
                         callback_entered.store(true, Ordering::SeqCst);
                         std::future::pending::<Result<(), &'static str>>().await
                     })
@@ -2271,7 +2275,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
                 .expect("create plan");
             tokio::spawn(async move {
                 initial_substrate
-                    .execute_create_staged(plan, move |_| async move {
+                    .execute_create_staged(plan, Alongside::none(), move |_, ()| async move {
                         callback_entered.store(true, Ordering::SeqCst);
                         std::future::pending::<Result<(), &'static str>>().await
                     })
@@ -2308,7 +2312,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
                 .plan_fork(&source, destination)
                 .expect("resume fork plan");
             retry_substrate
-                .execute_fork_staged(plan, |stage| async move {
+                .execute_fork_staged(plan, Alongside::none(), |stage, ()| async move {
                     assert!(stage.resuming);
                     Ok::<(), &'static str>(())
                 })
@@ -2319,7 +2323,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
                 .plan_create(&source, destination)
                 .expect("resume create plan");
             retry_substrate
-                .execute_create_staged(plan, |stage| async move {
+                .execute_create_staged(plan, Alongside::none(), |stage, ()| async move {
                     assert!(stage.resuming);
                     Ok::<(), &'static str>(())
                 })
@@ -2567,7 +2571,7 @@ proptest! {
                             },
                         ).expect("create plan");
                         substrate
-                            .execute_create_staged(plan, |_| async {
+                            .execute_create_staged(plan, Alongside::none(), |_, ()| async {
                                 Ok::<(), &'static str>(())
                             })
                             .await
@@ -2586,7 +2590,7 @@ proptest! {
                             },
                         ).expect("fork plan");
                         substrate
-                            .execute_fork_staged(plan, |_| async {
+                            .execute_fork_staged(plan, Alongside::none(), |_, ()| async {
                                 Ok::<(), &'static str>(())
                             })
                             .await
@@ -2637,7 +2641,7 @@ async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
         )
         .expect("create plan");
     substrate
-        .execute_create_staged(plan, |stage| async move {
+        .execute_create_staged(plan, Alongside::none(), |stage, ()| async move {
             assert!(!stage.resuming);
             assert!(
                 !stage
@@ -2728,7 +2732,7 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
     let callback_seen = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&callback_seen);
     let receipt = substrate
-        .execute_create_staged(plan, move |stage| async move {
+        .execute_create_staged(plan, Alongside::none(), move |stage, ()| async move {
             assert!(stage.resuming);
             assert_eq!(stage.workspace, resumed);
             seen.store(true, Ordering::SeqCst);
