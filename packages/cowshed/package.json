@@ -304,8 +304,22 @@
         }
       },
       "napi-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "dependsOn": [
+          "cargo-test",
+          "napi-debug",
+          "tsc-js",
+          "^build"
+        ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 native.test.ts attachment.napi.test.ts"
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 native.test.ts attachment.napi.test.ts",
+          "cwd": "{projectRoot}/src",
+          "env": {
+            "NAPI_DEBUG_ADDON": "1"
+          },
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
         }
       },
       "launcher-test": {

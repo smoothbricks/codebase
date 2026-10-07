@@ -2852,12 +2852,14 @@ impl StdinDelivery {
             self.retained_bytes -= oldest.len();
         }
         let delivered = self.delivered;
-        let (due, waiting) = std::mem::take(&mut self.waiters)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(end, _)| *end <= delivered);
-        self.waiters = waiting;
-        for (_, reply) in due {
-            let _ = reply.send(Ok(()));
+        let mut index = 0;
+        while index < self.waiters.len() {
+            if self.waiters[index].0 <= delivered {
+                let (_, reply) = self.waiters.swap_remove(index);
+                let _ = reply.send(Ok(()));
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -2867,12 +2869,14 @@ impl StdinDelivery {
         self.queued.clear();
         self.queued_bytes = 0;
         let reachable = self.admitted();
-        let (refused, waiting) = std::mem::take(&mut self.waiters)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(end, _)| *end > reachable);
-        self.waiters = waiting;
-        for (_, reply) in refused {
-            let _ = reply.send(Err(error.clone()));
+        let mut index = 0;
+        while index < self.waiters.len() {
+            if self.waiters[index].0 > reachable {
+                let (_, reply) = self.waiters.swap_remove(index);
+                let _ = reply.send(Err(error.clone()));
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -4367,7 +4371,10 @@ impl SupervisorActor {
             let _ = reply.send(Err(stdin_delivery_unknown(cursor, broken)));
             return;
         }
-        if !job.stdin_delivery.queued.is_empty() || job.close_stdin_when_drained {
+        if !job.stdin_delivery.in_lane.is_empty()
+            || !job.stdin_delivery.queued.is_empty()
+            || job.close_stdin_when_drained
+        {
             job.close_stdin_when_drained = true;
             job.close_waiters.push(reply);
             return;
@@ -4793,7 +4800,8 @@ impl SupervisorActor {
                 }
             }
         }
-        if delivery.queued.is_empty() && job.close_stdin_when_drained {
+        if delivery.in_lane.is_empty() && delivery.queued.is_empty() && job.close_stdin_when_drained
+        {
             let closed = job
                 .process
                 .as_mut()
@@ -7302,6 +7310,51 @@ mod tail_tests {
 #[cfg(test)]
 mod stdin_lane_tests {
     use super::*;
+
+    #[test]
+    fn delivered_and_refused_waiters_keep_their_storage() {
+        let mut delivery = StdinDelivery {
+            in_lane: VecDeque::from([Bytes::from_static(b"one")]),
+            waiters: Vec::with_capacity(4),
+            ..StdinDelivery::default()
+        };
+        let (due, mut due_reply) = oneshot::channel();
+        let (queued, mut queued_reply) = oneshot::channel();
+        let (repeated, mut repeated_reply) = oneshot::channel();
+        delivery
+            .waiters
+            .extend([(3, due), (6, queued), (3, repeated)]);
+        let storage = delivery.waiters.as_ptr();
+        delivery.deliver_front();
+        assert_eq!(delivery.waiters.as_ptr(), storage);
+        assert!(due_reply.try_recv().unwrap().is_ok());
+        assert!(repeated_reply.try_recv().unwrap().is_ok());
+        assert!(matches!(
+            queued_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        delivery.in_lane.push_back(Bytes::from_static(b"x"));
+        delivery.queued.push_back(Bytes::from_static(b"yz"));
+        delivery.queued_bytes = 2;
+        let (reachable, mut reachable_reply) = oneshot::channel();
+        delivery.waiters.push((4, reachable));
+        let refusal = CowshedError::conflict("input ended", "inspect the job");
+        delivery.drop_queued(&refusal);
+        assert_eq!(delivery.waiters.as_ptr(), storage);
+        let rejected = queued_reply.try_recv().unwrap().unwrap_err();
+        assert_eq!(rejected.code, refusal.code);
+        assert_eq!(rejected.message, refusal.message);
+        assert_eq!(rejected.hint, refusal.hint);
+        assert!(matches!(
+            reachable_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        delivery.deliver_front();
+        assert_eq!(delivery.waiters.as_ptr(), storage);
+        assert!(reachable_reply.try_recv().unwrap().is_ok());
+        assert!(delivery.waiters.is_empty());
+    }
 
     /// A close that arrives while the lane's one slot still holds a write its pump has not taken
     /// is the ordinary end of a write-then-close: it waits for the lane instead of refusing, and

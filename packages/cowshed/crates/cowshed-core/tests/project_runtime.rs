@@ -3282,6 +3282,112 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
     );
 }
 
+/// A pump can own an unfinished write while its channel slot is free. Closing through another
+/// handle must wait for that write, not mistake a free slot for delivered input and acknowledge
+/// EOF early. Complete and retire the real child before checking the captured refusal boundary.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
+    use cowshed_core::fork_lock::Run as _;
+    use std::io::Write as _;
+    use std::task::Poll;
+
+    let root = test_root();
+    let supervisor = system_supervisor(&root);
+    let jobs = SupervisedJobs::connect(&root, supervisor.clone()).await;
+    let gate = root.join("workspace").join("read-gate");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&gate)
+        .status_locked()
+        .expect("mkfifo");
+    assert!(made.success());
+    let job = jobs
+        .worker
+        .exec(ExecRequest {
+            command: ExecCommand::Argv(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "printf 'ready\\n'; IFS= read -r go < read-gate; /bin/cat",
+                ]
+                .into_iter()
+                .map(CommandArg::from)
+                .collect(),
+            ),
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Open,
+            stdout_copy: None,
+            stderr_copy: None,
+        })
+        .await
+        .expect("exec");
+    assert_eq!(
+        until_admitted(&job, JobStream::Stdout, 0, 6).await,
+        b"ready\n"
+    );
+    supervisor
+        .stdin_write(job.id(), 0, Bytes::from(vec![1; 16 * 1024]))
+        .await
+        .expect("prefix delivered into the pipe");
+    let mut held =
+        Box::pin(supervisor.stdin_write(job.id(), 16 * 1024, Bytes::from(vec![2; 64 * 1024])));
+    std::future::poll_fn(|cx| {
+        assert!(held.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        supervisor.info(job.id()).await.unwrap().stdin.bytes,
+        16 * 1024
+    );
+    let mut closing = Box::pin(supervisor.stdin_close(job.id()));
+    let first = std::future::poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await;
+    let during = supervisor
+        .info(job.id())
+        .await
+        .expect("close admission fence");
+    let close_result = match first {
+        Poll::Ready(answer) => Some(answer),
+        Poll::Pending => {
+            match std::future::poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await {
+                Poll::Ready(answer) => Some(answer),
+                Poll::Pending => None,
+            }
+        }
+    };
+    let early = close_result.is_some();
+    tokio::task::spawn_blocking(move || {
+        let mut fifo = std::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .expect("open gate");
+        fifo.write_all(b"go\n").expect("release child");
+    })
+    .await
+    .expect("gate task");
+    held.await.expect("held write delivered");
+    match close_result {
+        Some(answer) => answer.expect("early close answered"),
+        None => closing.await.expect("close after delivery"),
+    }
+    let ended = job.wait().await.expect("child exit");
+    let echoed = until_admitted(&job, JobStream::Stdout, 6, 6 + 80 * 1024).await;
+    supervisor.retire().await.expect("retire");
+    assert_eq!(&echoed[..16 * 1024], &[1; 16 * 1024]);
+    assert_eq!(&echoed[16 * 1024..], &[2; 64 * 1024]);
+    assert_eq!(ended.stdin.bytes, 80 * 1024);
+    assert!(
+        !early && !during.stdin.complete,
+        "close answered before delivery: early={early}, complete={}, delivered={}",
+        during.stdin.complete,
+        during.stdin.bytes,
+    );
+}
+
 /// Every byte `stream` yields until it closes.
 async fn drain(mut stream: cowshed_core::RawByteStream) -> Vec<u8> {
     let mut bytes = Vec::new();

@@ -98,7 +98,6 @@ impl SpawnSink for FakeSpawner {
             events,
             backpressure: self.backpressure,
             writes: 0,
-            closes: 0,
         }))
     }
 }
@@ -109,12 +108,11 @@ struct FakeProcess {
     observations: mpsc::UnboundedSender<ProcessObservation>,
     /// Where an unbackpressured fake reports each write it took as written to the child.
     events: mpsc::Sender<ProcessEvent>,
-    /// A backpressured fake refuses its second write and its first close: its one-slot lane is
-    /// still busy with the write before. It reports no write written; the test sends each
-    /// `StdinReady` itself.
+    /// A backpressured fake refuses its second write: the lane is still busy with the write
+    /// before. It reports no write written; the test sends each `StdinReady` itself. The actor
+    /// closes only once those writes are delivered, when the modeled lane is free.
     backpressure: bool,
     writes: usize,
-    closes: usize,
 }
 
 impl RunningProcess for FakeProcess {
@@ -139,10 +137,6 @@ impl RunningProcess for FakeProcess {
     }
 
     fn close_stdin(&mut self) -> bool {
-        self.closes += 1;
-        if self.backpressure && self.closes == 1 {
-            return false;
-        }
         self.observations
             .send(ProcessObservation::StdinClosed(self.job_id))
             .expect("process observer");
@@ -1676,7 +1670,6 @@ impl SpawnSink for ReapedGroupSpawner {
             events,
             backpressure: false,
             writes: 0,
-            closes: 0,
         }))
     }
 }
@@ -3019,9 +3012,8 @@ async fn an_open_stdin_answers_before_one_eof_and_never_ends_the_job() {
     );
 }
 
-/// A close that finds the job's lane still holding its last write waits for the lane rather than
-/// failing, refuses every write after it at once, and sends its one EOF when the pump reports
-/// the write taken.
+/// A close that finds the job's last write undelivered waits for it, refuses every later write
+/// at once, and sends its one EOF only after the pump reports the preceding write delivered.
 #[tokio::test]
 async fn a_close_behind_a_busy_lane_waits_for_it_and_refuses_later_writes() {
     let (mut h, _root) = harness(1, 1024, false, true);
