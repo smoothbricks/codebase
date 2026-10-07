@@ -1061,11 +1061,20 @@ mod tests {
         }
     }
 
-    /// Write `write` MiB to a new file at `path`, flushed to storage, then read `read` MiB of
-    /// it back, every transfer past the page cache: macOS `F_NOCACHE`, Linux `O_DIRECT`, each
+    /// Write `write` MiB to a new file at `path`, flushed to storage, then read back its last
+    /// `read` MiB, every transfer past the cache: macOS `F_NOCACHE`, Linux `O_DIRECT`, each
     /// from a page-aligned buffer.
+    ///
+    /// The read skips the file's head because a filesystem may cache it despite `O_DIRECT`:
+    /// OpenZFS writes the first block of a file whose block size is still growing through its
+    /// ARC (`zfs_write`'s `o_direct_defer`), and `fsync` commits the intent log without evicting
+    /// that block, so reading it back is a cache hit that counts no storage bytes (measured on
+    /// the Linux CI's ZFS: the first 1 MiB read of a fresh file counted 128 KiB less than every
+    /// later one). Blocks written directly are not cached, and reading them is a storage read.
     fn uncached_io(path: &str, write: usize, read: usize) {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        assert!(read <= write, "reads back only what it wrote");
 
         const CHUNK: usize = 1 << 20;
         let open = |flags: libc::c_int| -> OwnedFd {
@@ -1116,9 +1125,10 @@ mod tests {
         drop(file);
 
         let file = open(libc::O_RDONLY);
-        for _ in 0..read {
+        for chunk in write - read..write {
+            let offset = libc::off_t::try_from(chunk * CHUNK).expect("an offset");
             // SAFETY: CHUNK writable bytes of the mapping.
-            let got = unsafe { libc::read(file.as_raw_fd(), buffer, CHUNK) };
+            let got = unsafe { libc::pread(file.as_raw_fd(), buffer, CHUNK, offset) };
             assert_eq!(
                 usize::try_from(got).ok(),
                 Some(CHUNK),
@@ -1569,6 +1579,9 @@ mod tests {
         let delta =
             |before: (u64, u64), after: (u64, u64)| (after.0 - before.0, after.1 - before.1);
         let (first_io, second_io) = (delta(before.0, after.0), delta(before.1, after.1));
+        // At least the bytes moved, and at most a mebibyte more: a source may count a storage
+        // read above what it returned (the Linux CI's ZFS counts each uncached 128 KiB record
+        // read as 135168 bytes, measured), never below.
         let near =
             |bytes: u64, mebibytes: u64| (mebibytes * MIB..=mebibytes * MIB + MIB).contains(&bytes);
         assert!(
