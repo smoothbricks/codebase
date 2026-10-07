@@ -471,7 +471,6 @@ impl Fixture {
             b"--exact",
             ROOT_TEST.as_bytes(),
             b"--nocapture",
-            b"--test-threads=1",
         ]
         .iter()
         .map(|argument| CString::new(argument.to_vec()).expect("argv"))
@@ -857,78 +856,74 @@ impl Root {
         let before = rusage(libc::RUSAGE_THREAD);
         resume(self.pid, 0);
         let released = self.release();
-        set_nonblocking(self.done.as_raw_fd());
-        let mut wall_ns = None;
         let mut observed = Observed::default();
         let mut started = HashSet::from([self.pid]);
-        loop {
-            let mut status = 0;
-            // SAFETY: waiting for any tracee.
-            let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
-            if pid == -1 {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::ECHILD) => break,
-                    Some(libc::EINTR) => continue,
-                    _ => panic!("waitpid: {error}"),
+        // The tracer must stay on this thread; another reads the root's DONE byte, so the wall
+        // time ends at the same boundary as in every other mode.
+        let wall_ns = std::thread::scope(|scope| {
+            let done = scope.spawn(|| self.await_done(released));
+            loop {
+                let mut status = 0;
+                // SAFETY: waiting for any tracee.
+                let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+                if pid == -1 {
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ECHILD) => break,
+                        Some(libc::EINTR) => continue,
+                        _ => panic!("waitpid: {error}"),
+                    }
+                }
+                if !libc::WIFSTOPPED(status) {
+                    if pid == self.pid {
+                        assert!(
+                            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                            "root wait status {status}"
+                        );
+                    }
+                    continue;
+                }
+                let signal = libc::WSTOPSIG(status);
+                let event = status >> 16;
+                let tracee = u32::try_from(pid).expect("pid");
+                match event {
+                    libc::PTRACE_EVENT_FORK
+                    | libc::PTRACE_EVENT_VFORK
+                    | libc::PTRACE_EVENT_CLONE => {
+                        let child = event_message(pid);
+                        let child = libc::pid_t::try_from(child).expect("child pid");
+                        observed.births.push(Birth {
+                            pid: u32::try_from(child).expect("pid"),
+                            ppid: thread_group(pid),
+                            start: start_time(child).ok_or_else(|| "unreadable".to_owned()),
+                            pidfd: open_pidfd(child),
+                        });
+                        resume(pid, 0);
+                    }
+                    libc::PTRACE_EVENT_EXEC => {
+                        observed.execs.push(Exec {
+                            pid: tracee,
+                            start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
+                            argv: command_line(pid),
+                        });
+                        resume(pid, 0);
+                    }
+                    libc::PTRACE_EVENT_EXIT => {
+                        let wait_status = event_message(pid);
+                        observed.exits.push(Exit {
+                            pid: tracee,
+                            start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
+                            wait_status: i32::try_from(wait_status).ok(),
+                        });
+                        resume(pid, 0);
+                    }
+                    _ if signal == libc::SIGSTOP && started.insert(pid) => resume(pid, 0),
+                    _ => resume(pid, signal),
                 }
             }
-            if wall_ns.is_none() && try_read_byte(self.done.as_raw_fd()) {
-                wall_ns = Some(u64::try_from(released.elapsed().as_nanos()).expect("wall"));
-            }
-            if !libc::WIFSTOPPED(status) {
-                if pid == self.pid {
-                    assert!(
-                        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                        "root wait status {status}"
-                    );
-                }
-                continue;
-            }
-            let signal = libc::WSTOPSIG(status);
-            let event = status >> 16;
-            let tracee = u32::try_from(pid).expect("pid");
-            match event {
-                libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
-                    let child = event_message(pid);
-                    let child = libc::pid_t::try_from(child).expect("child pid");
-                    observed.births.push(Birth {
-                        pid: u32::try_from(child).expect("pid"),
-                        ppid: tracee,
-                        start: start_time(child).ok_or_else(|| "unreadable".to_owned()),
-                        pidfd: open_pidfd(child),
-                    });
-                    resume(pid, 0);
-                }
-                libc::PTRACE_EVENT_EXEC => {
-                    observed.execs.push(Exec {
-                        pid: tracee,
-                        start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
-                        argv: command_line(pid),
-                    });
-                    resume(pid, 0);
-                }
-                libc::PTRACE_EVENT_EXIT => {
-                    let wait_status = event_message(pid);
-                    observed.exits.push(Exit {
-                        pid: tracee,
-                        start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
-                        wait_status: i32::try_from(wait_status).ok(),
-                    });
-                    resume(pid, 0);
-                }
-                _ if signal == libc::SIGSTOP && started.insert(pid) => resume(pid, 0),
-                _ => resume(pid, signal),
-            }
-        }
+            done.join().expect("done reader")
+        });
         let observer = rusage(libc::RUSAGE_THREAD).minus(before);
-        let wall_ns = match wall_ns {
-            Some(wall_ns) => wall_ns,
-            None => {
-                read_byte(self.done.as_raw_fd()).expect("done");
-                u64::try_from(released.elapsed().as_nanos()).expect("wall")
-            }
-        };
         Ok(Sight {
             wall_ns,
             observer,
@@ -1100,15 +1095,21 @@ fn score(
     }
 }
 
-/// Every process now in the tree under `root`, read through `/proc/<pid>/task/<pid>/children`.
+/// Every process now in the tree under `root`, read through each of its threads'
+/// `/proc/<pid>/task/<tid>/children`: a child belongs to the thread that forked it.
 fn census(root: libc::pid_t, observed: &mut Observed, seen: &mut HashSet<Identity>) {
     let mut parents = vec![root];
     while let Some(parent) = parents.pop() {
-        let path = format!("/proc/{parent}/task/{parent}/children");
-        let Ok(children) = fs::read_to_string(&path) else {
+        let Ok(threads) = fs::read_dir(format!("/proc/{parent}/task")) else {
             continue;
         };
-        for child in children.split_whitespace() {
+        let children: Vec<String> = threads
+            .filter_map(|thread| fs::read_to_string(thread.ok()?.path().join("children")).ok())
+            .collect();
+        for child in children
+            .iter()
+            .flat_map(|children| children.split_whitespace())
+        {
             let child: libc::pid_t = child.parse().expect("child pid");
             let start = start_time(child).ok_or_else(|| "unreadable".to_owned());
             let pid = u32::try_from(child).expect("pid");
@@ -1131,6 +1132,16 @@ fn census(root: libc::pid_t, observed: &mut Observed, seen: &mut HashSet<Identit
             });
         }
     }
+}
+
+/// The process a thread belongs to: a ptrace event names the thread that forked.
+fn thread_group(tid: libc::pid_t) -> u32 {
+    fs::read_to_string(format!("/proc/{tid}/status"))
+        .expect("a stopped tracee's status")
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|tgid| tgid.trim().parse().ok())
+        .expect("Tgid")
 }
 
 fn command_line(pid: libc::pid_t) -> Result<Vec<String>, String> {
@@ -1198,20 +1209,6 @@ fn resume(pid: libc::pid_t, signal: c_int) {
             Some(libc::ESRCH),
             "PTRACE_CONT: {error}"
         );
-    }
-}
-
-fn try_read_byte(fd: RawFd) -> bool {
-    let mut byte = 0_u8;
-    // SAFETY: one byte into a stack variable on a nonblocking fd.
-    unsafe { libc::read(fd, ptr::from_mut(&mut byte).cast(), 1) == 1 }
-}
-
-fn set_nonblocking(fd: RawFd) {
-    // SAFETY: fcntl on an fd we own.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        assert!(flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0);
     }
 }
 
