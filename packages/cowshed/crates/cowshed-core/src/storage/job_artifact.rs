@@ -35,7 +35,6 @@ use crate::api::resources::{
     JobVolumeUsage, ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes,
     StreamLines, VolumeUsage, WallMicros,
 };
-use crate::error::AdmissionField;
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -394,37 +393,6 @@ pub struct JobAdmission {
     pub session: AdmittedSession,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
-}
-
-impl JobAdmission {
-    /// The fields in which `other`, for `other_command`, asks for something else than this
-    /// admission did for `command`; empty when it repeats it.
-    pub fn differences(
-        &self,
-        command: &ExecCommand,
-        other: &Self,
-        other_command: &ExecCommand,
-    ) -> Vec<AdmissionField> {
-        [
-            (AdmissionField::Command, command != other_command),
-            (AdmissionField::Cwd, self.cwd != other.cwd),
-            (AdmissionField::Mode, self.mode != other.mode),
-            (AdmissionField::Env, self.env != other.env),
-            (AdmissionField::Stdin, self.stdin != other.stdin),
-            (AdmissionField::Session, self.session != other.session),
-            (
-                AdmissionField::StdoutCopy,
-                self.stdout_copy != other.stdout_copy,
-            ),
-            (
-                AdmissionField::StderrCopy,
-                self.stderr_copy != other.stderr_copy,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(field, differs)| differs.then_some(field))
-        .collect()
-    }
 }
 
 /// Where a keyed exec's stdin came from. Inline bytes are part of the request, so they are

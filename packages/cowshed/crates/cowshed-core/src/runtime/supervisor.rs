@@ -24,7 +24,7 @@ use crate::api::dto::{
     WorkspacePath,
 };
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
-use crate::error::{AdmissionRefusal, CowshedError, Result};
+use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
@@ -3517,6 +3517,73 @@ impl SupervisorActor {
         })
     }
 
+    /// Compare the authored request by borrowing it; only a new admission needs owned metadata.
+    fn admission_differences(
+        &self,
+        admitted: &JobAdmission,
+        command: &ExecCommand,
+        request: &ExecRequest,
+        session: Option<&SessionToken>,
+    ) -> Vec<AdmissionField> {
+        let mut env_entries = 0;
+        let mut env_matches = true;
+        for (name, value) in &request.env {
+            if self.credential_env_names.contains(name) {
+                continue;
+            }
+            env_entries += 1;
+            if admitted.env.get(name) != Some(value) {
+                env_matches = false;
+                break;
+            }
+        }
+        env_matches &= env_entries == admitted.env.len();
+        let stdin_matches = match &request.stdin {
+            StdinSource::Empty => matches!(admitted.stdin, AdmittedStdin::Empty),
+            StdinSource::Inline(input) => matches!(
+                &admitted.stdin,
+                AdmittedStdin::Inline { sha256, bytes }
+                    if *bytes == byte_count(input.len()) && *sha256 == Sha256Digest::compute(input)
+            ),
+            StdinSource::Stream(_) => matches!(admitted.stdin, AdmittedStdin::Stream),
+            StdinSource::WorkspaceFile(path) => matches!(
+                &admitted.stdin,
+                AdmittedStdin::WorkspaceFile(known) if known == path
+            ),
+        };
+        let session_matches = match &admitted.session {
+            AdmittedSession::None => session.is_none(),
+            AdmittedSession::Named(name) => {
+                session.and_then(|token| token.name.as_deref()) == Some(name.as_str())
+            }
+            AdmittedSession::Unnamed(identity) => {
+                session
+                    .and_then(|token| self.sessions.get(&token.identity))
+                    .and_then(|state| state.admission_identity)
+                    == Some(*identity)
+            }
+        };
+        [
+            (AdmissionField::Command, command != &request.command),
+            (AdmissionField::Cwd, admitted.cwd != request.cwd),
+            (AdmissionField::Mode, admitted.mode != request.mode),
+            (AdmissionField::Env, !env_matches),
+            (AdmissionField::Stdin, !stdin_matches),
+            (AdmissionField::Session, !session_matches),
+            (
+                AdmissionField::StdoutCopy,
+                admitted.stdout_copy != request.stdout_copy,
+            ),
+            (
+                AdmissionField::StderrCopy,
+                admitted.stderr_copy != request.stderr_copy,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
+    }
+
     /// Admit and spawn one job, granted `build_volume`.
     async fn admit_exec(
         &mut self,
@@ -3545,37 +3612,37 @@ impl SupervisorActor {
         // environment it had, no build volume is held and no job id is taken.
         let admission = match &request.admission_key {
             None => None,
-            Some(key) => {
-                let admission = self.job_admission(key.clone(), &request, session.as_ref())?;
-                match self.artifacts.admitted(key) {
-                    AdmissionLookup::Absent => Some(admission),
-                    AdmissionLookup::Admitted {
-                        job_id,
-                        command,
-                        admission: admitted,
-                    } => {
-                        let fields = admitted.differences(command, &admission, &request.command);
-                        return if !fields.is_empty() {
-                            Err(CowshedError::admission_refusal(
-                                AdmissionRefusal::KeyConflict { job_id, fields },
-                            ))
-                        } else if admission.stdin == AdmittedStdin::Stream {
-                            Err(CowshedError::admission_refusal(
-                                AdmissionRefusal::StdinBound { job_id },
-                            ))
-                        } else {
-                            Ok(job_id)
-                        };
-                    }
-                    AdmissionLookup::Unprovable { set_aside } => {
-                        return Err(CowshedError::admission_refusal(
-                            AdmissionRefusal::Unprovable {
-                                set_aside: set_aside.to_path_buf(),
-                            },
-                        ));
-                    }
+            Some(key) => match self.artifacts.admitted(key) {
+                AdmissionLookup::Absent => {
+                    Some(self.job_admission(key.clone(), &request, session.as_ref())?)
                 }
-            }
+                AdmissionLookup::Admitted {
+                    job_id,
+                    command,
+                    admission: admitted,
+                } => {
+                    let fields =
+                        self.admission_differences(admitted, command, &request, session.as_ref());
+                    return if !fields.is_empty() {
+                        Err(CowshedError::admission_refusal(
+                            AdmissionRefusal::KeyConflict { job_id, fields },
+                        ))
+                    } else if matches!(request.stdin, StdinSource::Stream(_)) {
+                        Err(CowshedError::admission_refusal(
+                            AdmissionRefusal::StdinBound { job_id },
+                        ))
+                    } else {
+                        Ok(job_id)
+                    };
+                }
+                AdmissionLookup::Unprovable { set_aside } => {
+                    return Err(CowshedError::admission_refusal(
+                        AdmissionRefusal::Unprovable {
+                            set_aside: set_aside.to_path_buf(),
+                        },
+                    ));
+                }
+            },
         };
         let build_hold = self.hold_build_volume(build_volume.as_deref())?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this

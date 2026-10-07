@@ -890,6 +890,12 @@ mod tests {
             #[derive(Serialize, Deserialize)]
             #[serde(rename_all = "camelCase")]
             pub struct LogsChunk { pub eof: bool, pub next_offset: u64 }
+            #[derive(Serialize, Deserialize)]
+            pub struct CowshedError {
+                pub code: ErrorCode,
+                pub message: String,
+                pub hint: String,
+            }
             "#,
             &mut api,
         )

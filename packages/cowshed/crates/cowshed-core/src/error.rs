@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 
@@ -422,22 +422,33 @@ impl CowshedError {
     /// key's job, else a `Conflict`, carrying the reason as [`AdmissionRefusal`].
     pub fn admission_refusal(refusal: AdmissionRefusal) -> Self {
         let error = match &refusal {
-            AdmissionRefusal::KeyConflict { job_id, fields } => Self::conflict(
-                format!(
-                    "the admission key already admitted job {} for another request: this one \
-                     changes its {}",
-                    job_id.get(),
-                    fields
-                        .iter()
-                        .map(|field| field.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                format!(
-                    "reach job {} with jobByKey, or exec the changed request under a new key",
-                    job_id.get()
-                ),
-            ),
+            AdmissionRefusal::KeyConflict { job_id, fields } => {
+                const PREFIX: &str = "the admission key already admitted job ";
+                const SUFFIX: &str = " for another request: this one changes its ";
+                let names_bytes: usize = fields.iter().map(|field| field.as_str().len()).sum();
+                let mut message = String::with_capacity(
+                    PREFIX.len()
+                        + 20
+                        + SUFFIX.len()
+                        + names_bytes
+                        + 2 * fields.len().saturating_sub(1),
+                );
+                write!(message, "{PREFIX}{}{SUFFIX}", job_id.get())
+                    .expect("formatting into a String cannot fail");
+                for (index, field) in fields.iter().enumerate() {
+                    if index != 0 {
+                        message.push_str(", ");
+                    }
+                    message.push_str(field.as_str());
+                }
+                Self::conflict(
+                    message,
+                    format!(
+                        "reach job {} with jobByKey, or exec the changed request under a new key",
+                        job_id.get()
+                    ),
+                )
+            }
             AdmissionRefusal::StdinBound { job_id } => Self::usage(
                 format!(
                     "stdin already bound to job {}; attach to write",

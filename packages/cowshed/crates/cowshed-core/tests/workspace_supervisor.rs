@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
-    AdmissionKey,
-    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
-    ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark, JobTailBytes,
-    JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
-    OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinSource,
-    StreamInfo, WorkspacePath,
+    AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand,
+    ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark,
+    JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
+    StdinSource, StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
@@ -2665,6 +2664,87 @@ async fn a_keyed_stream_repeat_names_its_job_and_binds_no_second_stream() {
     assert!(
         h.process.try_recv().is_err(),
         "no byte of the second stream reached the job"
+    );
+}
+
+#[tokio::test]
+async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() {
+    let (mut supervisor_config, _root) = isolated_config("keyed-fields");
+    supervisor_config
+        .credential_env_names
+        .insert("TEST_SECRET".to_owned());
+    let mut h = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, keyed("op-fields", StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"once\n", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(job).await.unwrap();
+    let mut same = keyed("op-fields", StdinSource::Empty);
+    same.env
+        .insert("TEST_SECRET".to_owned(), "not an admitted field".to_owned());
+    assert_eq!(remote.exec(None, None, same).await.unwrap(), job);
+
+    let named = remote
+        .open_session(Some("different".to_owned()))
+        .await
+        .unwrap();
+    for field in [
+        AdmissionField::Command,
+        AdmissionField::Cwd,
+        AdmissionField::Mode,
+        AdmissionField::Env,
+        AdmissionField::Stdin,
+        AdmissionField::Session,
+        AdmissionField::StdoutCopy,
+        AdmissionField::StderrCopy,
+    ] {
+        let mut changed = keyed("op-fields", StdinSource::Empty);
+        let mut session = None;
+        match field {
+            AdmissionField::Command => {
+                changed.command = ExecCommand::Argv(vec!["other".into()]);
+            }
+            AdmissionField::Cwd => changed.cwd = None,
+            AdmissionField::Mode => changed.mode = RunSandboxMode::ReadOnly,
+            AdmissionField::Env => {
+                changed
+                    .env
+                    .insert("LANG".to_owned(), "different".to_owned());
+            }
+            AdmissionField::Stdin => {
+                changed.stdin = StdinSource::Inline(Bytes::from_static(b"input"));
+            }
+            AdmissionField::Session => session = Some(&named),
+            AdmissionField::StdoutCopy => {
+                changed.stdout_copy = Some(OutputPublication {
+                    path: WorkspacePath::new("stdout-copy").unwrap(),
+                    policy: PublicationPolicy::CreateNew,
+                });
+            }
+            AdmissionField::StderrCopy => {
+                changed.stderr_copy = Some(OutputPublication {
+                    path: WorkspacePath::new("stderr-copy").unwrap(),
+                    policy: PublicationPolicy::CreateNew,
+                });
+            }
+        }
+        let refused = remote.exec(session, None, changed).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert_eq!(
+            refused.admission_source(),
+            Some(&AdmissionRefusal::KeyConflict {
+                job_id: job,
+                fields: vec![field],
+            }),
+            "the changed field is {field:?}"
+        );
+    }
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "every repeat spawned nothing"
     );
 }
 
