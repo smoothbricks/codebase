@@ -2132,14 +2132,16 @@ async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
         .expect("a successful rebase report")
 }
 
-/// A process other than main's daemon holding main's Nx task database open makes the land skip
-/// the swap and name that process (16_build_volumes.md, "The adoption needs the target's Nx
-/// database closed"). So does an Nx process opening it as the swap begins, holding the lock
-/// stock Nx opens it under: let past the look, it would open the database the link names before
-/// the rename and keep it after, while the daemon it starts next opens the adopted one. The seed
-/// is still frozen; main keeps its own volume.
-#[tokio::test]
-async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
+/// The common warm project for the two independent ways a foreign process blocks adoption.
+struct DatabaseHolderFixture {
+    fixture: Fixture,
+    service: ActorBridge,
+    layout: BuildVolumeLayout,
+    database: PathBuf,
+    nx_check: String,
+}
+
+async fn database_holder_fixture() -> DatabaseHolderFixture {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2148,11 +2150,9 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
-
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
-    // Main's own task database, written by a run in main.
     sh(&mut service, "main", &nx_check).await;
     let data = fixture.checkout.join(".nx/workspace-data");
     let databases: Vec<PathBuf> = fs::read_dir(&data)
@@ -2163,10 +2163,27 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     let [database] = databases.as_slice() else {
         panic!("one task database in {}: {databases:?}", data.display());
     };
-    let before = linked_volume(&layout, &fixture.checkout);
+    DatabaseHolderFixture {
+        fixture,
+        service,
+        layout,
+        database: database.clone(),
+        nx_check,
+    }
+}
 
-    // An Nx process opening main's database: `lockf` takes the database's open lock as Nx does
-    // (`flock`), then runs its command.
+/// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
+/// named, while the target keeps its volume and the landing tree still freezes its seed.
+#[tokio::test]
+async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv() {
+    let DatabaseHolderFixture {
+        mut fixture,
+        mut service,
+        layout,
+        database,
+        nx_check,
+    } = database_holder_fixture().await;
+    let before = linked_volume(&layout, &fixture.checkout);
     let mut opening = Holder(
         Command::new("/usr/bin/lockf")
             .arg("-k")
@@ -2187,6 +2204,10 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     }
     let lockf = i32::try_from(opening.0.id()).expect("a pid fits i32");
     let report = land(&mut service, "topic", false, &[&nx_check]).await;
+    assert!(
+        report.build_volume.seeded,
+        "a skipped swap still freezes its seed: {report:?}"
+    );
     match report.build_volume.adoption {
         Adoption::Skipped {
             reason:
@@ -2200,10 +2221,9 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
                 database.canonicalize().expect("main's database exists")
             );
             assert!(
-                holders
-                    .iter()
-                    .any(|holder| holder.pid == lockf
-                        && holder.command.starts_with("/usr/bin/lockf")),
+                holders.iter().any(|holder| {
+                    holder.pid == lockf && holder.command.starts_with("/usr/bin/lockf")
+                }),
                 "lockf is named among {holders:?}"
             );
         }
@@ -2215,27 +2235,39 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     drop(opening.0.stdin.take());
     opening.0.wait().expect("lockf exits with its command");
     drop(opening);
-    fs::write(topic.join("a/src.txt"), b"src, changed again\n").unwrap();
-    git(&topic, &["commit", "-q", "-am", "change a again"]);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
 
+/// A process other than main's daemon holding its task database open skips the swap and is
+/// named (16_build_volumes.md, "The adoption needs the target's Nx database closed").
+#[tokio::test]
+async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
+    let DatabaseHolderFixture {
+        mut fixture,
+        mut service,
+        layout,
+        database,
+        nx_check,
+    } = database_holder_fixture().await;
+    let before = linked_volume(&layout, &fixture.checkout);
     let holder = Holder(
         Command::new("/usr/bin/tail")
             .arg("-f")
-            .arg(database)
+            .arg(&database)
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn a database holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     eventually("tail holds the task database open", || {
-        nx::holders(database)
+        nx::holders(&database)
             .expect("query the database's holders")
             .iter()
             .any(|holder| holder.pid == pid)
     })
     .await;
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
-
     assert!(
         report.build_volume.seeded,
         "forks still start from the new seed: {report:?}"
