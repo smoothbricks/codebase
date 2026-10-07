@@ -5,18 +5,17 @@ is a thin third client of the same core — anything the CLI can do is assembled
 with identical semantics and error taxonomy.
 
 > **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
-> duration, protected per-stream output, offset reads, attach/detach, and complete-group termination. Job resource
-> samples and terminal persistence, progress streams, bounded cursor tails, keyed admission/lookup, and generation of
-> the controller protocol and N-API surface from one API declaration are unbuilt. The N-API addon exposes exec,
-> sessions, numeric job lookup, status/wait/kill, attach/detach, and buffered output reads from byte zero; resumable raw
-> streams, attachment stdio, attachment stdin EOF, group-listener queries, and abort plumbing are unbuilt. Core
-> attachment stdin writes exist, but `JobStdin` has no close operation. Its request DTO and TypeScript types are
-> hand-maintained; the shared wire corpus checks agreement, not generated parity. Complete fork/exec process-tree
-> observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work identity, and the compact
-> process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies groups for safe termination; it
-> does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux fork/exec event-source
-> selection, macOS exit observation and rusage reconciliation, charged-memory counters, and explicit unattributed-usage
-> rows are also unbuilt.
+> duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
+> and complete-group termination. Core job resource samples and terminal persistence are implemented; periodic progress
+> streams and keyed admission/lookup are not yet complete. Controller request/result codecs, TypeScript types and
+> validators, and N-API operation bindings derive from one Rust API declaration. The addon exposes the declared offset
+> log reads and bounded `job.tail` operation; async stream backpressure, attachment stdin EOF, group-listener queries,
+> and abort plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no
+> close operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts,
+> process event streams, leaf-work identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The
+> ownership ledger identifies groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2
+> accounting, measured Linux fork/exec event-source selection, macOS exit observation and rusage reconciliation,
+> charged-memory counters, and explicit unattributed-usage rows are also unbuilt.
 
 ## Authority model (frozen)
 
@@ -753,10 +752,13 @@ failure to sample an existing volume is a typed error, never absence or zero usa
 
 Stream watermarks count admitted bytes and newline-delimited lines separately for stdout/stderr; a non-empty trailing
 partial line counts as one line. `bytes` is also the next byte cursor. `tail(cursor, limits)` returns a bounded raw
-slice after each supplied cursor and its next cursor; an omitted cursor selects the latest bounded tail. Limits are
-positive, with at most 64 KiB per stream. Truncation is explicit, offsets remain representation-transparent through
-inline/file promotion, and a cursor beyond admitted bytes is a typed usage error. `attach(cursor)` resumes each stream
-at its supplied offset; omission means byte zero. It never starts a process.
+slice after each supplied cursor and its next cursor; an omitted cursor selects the latest bounded tail and is absent on
+the wire, never `null`. Limits are positive, with at most 64 KiB per stream. Each byte window is then cut to
+`linesPerStream` lines: the first lines after a cursor, the last lines for the latest tail. Truncation is explicit:
+admitted bytes lie after a cursor slice or before the latest slice. Both cursors are checked against one admitted
+snapshot before either stream is read. Offsets remain representation-transparent through inline/file promotion, and a
+cursor beyond admitted bytes is a typed usage error. `attach(cursor)` resumes each stream at its supplied offset;
+omission means byte zero. It never starts a process.
 
 All monitoring methods retain the immutable repo/workspace/incarnation fence of the `JobHandle`. The same handle exposes
 `kill()` for explicit complete-group cancellation; a monitoring executor maps its own operation key to this exact job
@@ -916,10 +918,10 @@ set the heartbeat cadence; changed-state and terminal events are immediate. A bl
 crossing a power of two (`[2ⁿ⁻¹, 2ⁿ)` is one step), a busy/idle CPU flip, and a process's first usage read produce
 change records; a sample that only moves counters does not. A live process whose usage no record restated for
 `PROCESS_HEARTBEAT` gets its own heartbeat restating its whole record; a blocker change restates no usage, so it does
-not postpone one. A read taken after a process exited is withheld from every record until its `Exited` event carries
-it, once, as final usage: from that read the process is no longer live, so no heartbeat restates it, no blocker read of
-it is accepted, and a late exec event still shows the usage read before the exit. Nothing about that process follows
-its exit. Closing a reader never kills the process. Consumers use these observed facts without declaring or deriving an
+not postpone one. A read taken after a process exited is withheld from every record until its `Exited` event carries it,
+once, as final usage: from that read the process is no longer live, so no heartbeat restates it, no blocker read of it
+is accepted, and a late exec event still shows the usage read before the exit. Nothing about that process follows its
+exit. Closing a reader never kills the process. Consumers use these observed facts without declaring or deriving an
 expectation from a command's argv. Events name a process by `index`, its record's position in birth-observation order,
 never by a pid that another life may reuse. The generated sparse delta changes exactly one field, usage or blocker;
 absent is unchanged. A blocker observed afresh, `none` included, is SET, and a blocker no longer observed is CLEAR.

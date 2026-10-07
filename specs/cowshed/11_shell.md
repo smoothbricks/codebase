@@ -6,11 +6,11 @@ supervisor per workspace holding warm exec hosts with the workspace shell alread
 over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
 > **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
-> journals, offset-addressed reads, attach/detach, and complete-group termination. Job resource samples and their
-> terminal persistence, periodic progress subscriptions, bounded cursor tails, and generation of controller and N-API
-> monitoring bindings from one API declaration are unbuilt. Group-owned TCP-listener queries and attachment stdin EOF
-> are also unbuilt; Rust attachment writes exist, while N-API exposes no attachment stdio. The process-group ownership
-> ledger is implemented; it is not a resource-sampling API. Fork/exec tree observation, per-process usage and blocker
+> journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
+> termination. Core job resource samples and terminal persistence are implemented; periodic progress subscriptions are
+> not yet complete. Controller and N-API operation bindings derive from one API declaration. Group-owned TCP-listener
+> queries and attachment stdin EOF remain unbuilt; Rust attachment writes exist. The process-group ownership ledger
+> identifies groups for sampling and termination. Complete fork/exec tree observation, per-process usage and blocker
 > samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
 > Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead measurement and
 > unattributed-usage reconciliation are unbuilt too.
