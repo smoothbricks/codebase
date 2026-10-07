@@ -1178,7 +1178,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
         BuildVolumeRelease::Deleted {
             refused: Some(BuildVolumeRefusal { open, forced }),
         } if open.is_empty() => eprintln!(
-            "cowshed: {whose} build volume {id} was held only by processes this user cannot see; {}",
+            "cowshed: {whose} build volume {id}: its unforced unmount was refused with no visible holder; {}",
             outcome(*forced)
         ),
         BuildVolumeRelease::Deleted {
