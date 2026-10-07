@@ -114,9 +114,17 @@ fn bound(served: &str, operation: &str, class: &str) -> String {
     list[..=list.find(';').expect("the BOUND list's end")].to_owned()
 }
 
+/// The cowshed package root of the checkout running this test, read at run time: a test binary
+/// built in one checkout must not read another's declarations.
+fn project() -> PathBuf {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    Path::new(&manifest).join("../..")
+}
+
 #[test]
 fn a_mutated_request_field_moves_the_napi_construction_and_its_declarations() {
-    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let project = project();
     let scratch = renamed_field(
         &project,
         "LogsRequest",
@@ -175,7 +183,7 @@ fn a_mutated_request_field_moves_the_napi_construction_and_its_declarations() {
 /// The projection refuses the table instead.
 #[test]
 fn a_request_that_stops_naming_its_incarnation_is_refused() {
-    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let project = project();
     let scratch = renamed_field(
         &project,
         "JobRequest",
@@ -195,7 +203,7 @@ fn a_request_that_stops_naming_its_incarnation_is_refused() {
 /// own job, so the projection refuses the table rather than let a caller name another job.
 #[test]
 fn a_request_that_stops_naming_its_job_is_refused() {
-    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let project = project();
     let scratch = renamed_field(
         &project,
         "JobRequest",
