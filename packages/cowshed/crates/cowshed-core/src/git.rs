@@ -672,6 +672,9 @@ impl GitRepository {
             .collect())
     }
 
+    /// Exclude cowshed's runtime metadata and the volume's own bookkeeping
+    /// ([`crate::apfs::VOLUME_METADATA`]) in `.git/info/exclude`: a checkout is its volume's root,
+    /// so neither is the repository's work, for a dirty check or for a clean.
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
@@ -724,7 +727,9 @@ impl GitRepository {
                 )
             })?;
             let mut addition = Vec::new();
-            for pattern in [b".cowshed/".as_slice(), b".fseventsd/".as_slice()] {
+            for name in std::iter::once(".cowshed").chain(crate::apfs::VOLUME_METADATA) {
+                let pattern = format!("{name}/");
+                let pattern = pattern.as_bytes();
                 if !existing
                     .split(|byte| *byte == b'\n')
                     .any(|line| line == pattern)
@@ -1515,13 +1520,17 @@ impl GitRepository {
     /// other mtime is kept.
     ///
     /// Runs against the clone's own `.git` directory, before a linked worktree replaces it; once
-    /// it is a pointer, an earlier pass of this resumed mint already ran it.
+    /// it is a pointer, an earlier pass of this resumed mint already ran it. The clone's excludes
+    /// are brought up to date first: the clone is its volume's root, whose bookkeeping macOS
+    /// may have grown at mount (a root-owned `.Trashes` this user cannot empty), and main's
+    /// exclude file may predate the patterns that keep a clean off it.
     async fn discard_uncommitted(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             return Ok(());
         }
         let reset = self.run(["reset", "-q", "--hard", "HEAD"]).await?;
         ensure_git_success("reset main's uncommitted edits in the clone", reset)?;
+        self.ensure_cowshed_excludes().await?;
         let clean = self.run(["clean", "-q", "-f", "-d"]).await?;
         ensure_git_success("delete main's untracked files in the clone", clean)
     }
@@ -3301,6 +3310,49 @@ mod tests {
         );
     }
 
+    /// macOS keeps its own bookkeeping at every volume's root, and a clone's checkout is its
+    /// volume's root: a fresh mount grew a root-owned `.Trashes` nobody else may empty, and the
+    /// clone's cleanup of main's untracked files failed on it ('failed to delete main's untracked
+    /// files in the clone: .Trashes/ Permission denied'), leaving the create unfinished. The
+    /// cleanup leaves the volume's bookkeeping alone, even under an exclude file main wrote
+    /// before it named all of it, and so does every dirty check after.
+    #[tokio::test]
+    async fn a_clone_of_main_leaves_the_volumes_own_bookkeeping_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = repository();
+        let workspace = root.with_extension("bookkeeping-workspace");
+        copy_tree(&root, &workspace);
+        fs::write(
+            workspace.join(".git/info/exclude"),
+            ".cowshed/\n.fseventsd/\n",
+        )
+        .expect("main's earlier excludes");
+        let trashes = workspace.join(".Trashes");
+        fs::create_dir(&trashes).expect("the volume's trash");
+        fs::write(trashes.join("501"), "").expect("an entry in the volume's trash");
+        // Not this user's to empty, as root's is not.
+        fs::set_permissions(&trashes, fs::Permissions::from_mode(0o500)).expect("read-only trash");
+        let repository = GitRepository::from_root(&workspace);
+        let minted = repository
+            .mint_workspace(
+                "bookkeeping",
+                CloneOrigin {
+                    source: &root,
+                    main: &root,
+                },
+                WorkspaceRepository::Standalone,
+                None,
+                false,
+            )
+            .await;
+        let status = git_stdout(&workspace, &["status", "--porcelain"]);
+        let kept = trashes.join("501").exists();
+        fs::set_permissions(&trashes, fs::Permissions::from_mode(0o700)).expect("restore trash");
+        minted.expect("mint beside the volume's bookkeeping");
+        assert_eq!(status, "");
+        assert!(kept, "the volume's trash stays as macOS made it");
+    }
+
     #[tokio::test]
     async fn minting_preserves_project_shell_hooks_without_a_managed_loader() {
         for linked in [false, true] {
@@ -3456,10 +3508,14 @@ mod tests {
             .expect("idempotent wiring");
         assert_eq!(
             fs::read(&exclude).expect("read excludes"),
-            b"user-pattern\n.cowshed/\n.fseventsd/\n"
+            b"user-pattern\n.cowshed/\n.DocumentRevisions-V100/\n.Spotlight-V100/\n.TemporaryItems/\n.Trashes/\n.fseventsd/\n"
         );
         fs::create_dir(root.join(".cowshed")).expect("runtime metadata");
-        fs::create_dir(root.join(".fseventsd")).expect("APFS metadata");
+        fs::write(root.join(".cowshed/state"), b"").expect("runtime state");
+        for metadata in crate::apfs::VOLUME_METADATA {
+            fs::create_dir(root.join(metadata)).expect("APFS metadata");
+            fs::write(root.join(metadata).join("entry"), b"").expect("APFS metadata entry");
+        }
         assert!(!repo.is_dirty().await.expect("runtime state is ignored"));
     }
 

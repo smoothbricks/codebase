@@ -2694,6 +2694,18 @@ pub const EVENT_LOG_DIRECTORY: &str = ".fseventsd";
 /// still delivers the volume's live events to every stream.
 pub const EVENT_LOG_OPT_OUT: &str = "no_log";
 
+/// What macOS keeps at every volume's root for itself: the event log, the Spotlight index, the
+/// trash, temporary items and document revisions. They describe the volume they live on, not
+/// the repository, every mount may grow them (some root-owned and not this user's to empty), and
+/// a checkout mounted at a volume's root holds them beside its files.
+pub const VOLUME_METADATA: [&str; 5] = [
+    ".DocumentRevisions-V100",
+    ".Spotlight-V100",
+    ".TemporaryItems",
+    ".Trashes",
+    EVENT_LOG_DIRECTORY,
+];
+
 /// Where a mounted volume stands with fseventsd's persistent event log.
 #[derive(Debug, Eq, PartialEq)]
 enum EventLog {

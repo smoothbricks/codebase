@@ -37,17 +37,6 @@ const DEFAULT_PASS_BUDGET: usize = 6;
 const CHURN_SAMPLE_LIMIT: usize = 8;
 const CHURN_PATH_LIMIT: usize = 120;
 
-/// Per-volume stores that APFS maintains for itself. They describe the volume
-/// they live on, not the repository, and the image volume grows its own, so they
-/// are neither copied from the source nor deleted from the destination.
-const APFS_VOLUME_METADATA: [&str; 5] = [
-    ".DocumentRevisions-V100",
-    ".Spotlight-V100",
-    ".TemporaryItems",
-    ".Trashes",
-    ".fseventsd",
-];
-
 /// Mode a destination directory holds while its subtree is being written.
 ///
 /// The source mode is applied afterwards, so this never leaks into the adopted
@@ -573,8 +562,10 @@ fn classify(metadata: &fs::Metadata) -> Option<EntryKind> {
     }
 }
 
+/// The volume's own bookkeeping ([`crate::apfs::VOLUME_METADATA`]): the image volume grows its
+/// own, so it is neither copied from the source nor deleted from the destination.
 fn is_apfs_volume_metadata(name: &OsStr) -> bool {
-    APFS_VOLUME_METADATA
+    crate::apfs::VOLUME_METADATA
         .iter()
         .any(|reserved| name == OsStr::new(reserved))
 }
