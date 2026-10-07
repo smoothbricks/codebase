@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
-import { applyCollectedOutputs, collectNxOutputs } from './outputs.js';
+import { applyCollectedOutputs, collectNxOutputs, resolveDeclaredOutput } from './outputs.js';
 
 const SOURCE_SHA = 'c'.repeat(40);
 
@@ -225,12 +225,13 @@ async function plantDeclaredOutputs(
   const planted: string[] = [];
   for (const run of runs) {
     for (const project of run.projects) {
-      // Declared outputs are `{projectRoot}`-relative, so a project that
-      // reports no root has no place to put one.
-      const projectRoot = project.root;
-      if (projectRoot === undefined) continue;
+      // An output resolves against the project's root, so a project that
+      // reports none has no place to put one.
+      if (project.root === undefined) continue;
       for (const output of project.targetOutputs?.get(run.target) ?? []) {
-        const directory = join(root, output.replace('{projectRoot}', projectRoot));
+        // The collector's own resolution, so every placeholder a declaration
+        // may use (`{workspaceRoot}` included) lands where it will look.
+        const directory = join(root, resolveDeclaredOutput(output, project));
         await mkdir(directory, { recursive: true });
         const file = join(directory, run.target);
         // 0o755 because `applyCollectedOutputs` must carry the executable bit
