@@ -659,6 +659,14 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   a path another daemon has bound alone, so that daemon's socket is not unlinked. A holder starts when it claims, so a
   live one that has not answered by the time its record is a minute old (a pid reused after a crash) is stale and
   replaced. On a filesystem without hard links the record is created exclusively instead. Not yet proposed upstream.
+- **A run that throws part way through does not report success.** The default tasks runner ends its life cycle in a
+  `finally`, so the static summary also prints when the orchestrator throws mid-run. It printed "Successfully ran"
+  whenever no task had failed or stopped, and counted each task the run never reported as skipped: a focused `run-many`
+  whose daemon socket died while recording output hashes printed success with "10 skipped", then `Error: write EPIPE`.
+  The orchestrator reports every task it finishes except one it skips, and it skips a task only behind a failed or
+  stopped one, so the patch prints success only when every task was reported. Otherwise the summary says the run did not
+  complete and names the unreported tasks: under "Tasks not run" after a failure, as before, and under "Tasks the run
+  ended without finishing" when none failed. Nx `master` prints the same summary. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -667,10 +675,11 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit and
-daemon-claim regressions pass; preserve any repair not yet released. The restore-time regression fails without its hunk
-only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping
-the hunk. When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim
+and incomplete-run summary regressions pass; preserve any repair not yet released. The restore-time regression fails
+without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on
+macOS before dropping the hunk. When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and
+the workflow together.
 
 ## Bun Test Tracing Generator
 

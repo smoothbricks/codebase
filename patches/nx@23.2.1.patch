@@ -986,6 +986,235 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
  }
  /**
   * Converts a string representation of a max cache size to a number.
+diff --git a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts b/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts
+index b948965217d385e31f5f49895bb09aa5d11afedb..6fff5d5e42ba9ff87f074ccba1045960a5501fe5 100644
+--- a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts
++++ b/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts
+@@ -30,10 +30,11 @@ export declare class StaticRunManyTerminalOutputLifeCycle implements LifeCycle {
+     startCommand(): void;
+     endCommand(): void;
+     /**
+-     * Tasks with a `skipped` status are never reported through `endTasks`, so
+-     * they are derived by subtracting everything that did complete.
++     * The tasks the orchestrator never reported through `endTasks`: those it
++     * skipped, which it never reports, and those a run that threw part way
++     * through never finished.
+      */
+-    private skippedTasks;
++    private unreportedTasks;
+     /**
+      * Whether this run prints every task's output in full rather than collapsing
+      * the ones that succeeded.
+@@ -44,11 +45,6 @@ export declare class StaticRunManyTerminalOutputLifeCycle implements LifeCycle {
+      * printing something worth reading is not silently swallowed.
+      */
+     private hiddenOutputHint;
+-    /**
+-     * Tasks that never produced output worth printing are summarized as counts,
+-     * with their names available behind --verbose.
+-     */
+-    private tasksNotRunSummary;
+     endTasks(taskResults: TaskResult[]): void;
+     printTaskTerminalOutput(task: Task, taskStatus: TaskStatus, terminalOutput: string): void;
+ }
+diff --git a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.js b/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.js
+index a389729defdaac06c0e710369c27569a98b077e8..e92595278c7e07fd55d724c47e62882cae49e73e 100644
+--- a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.js
+@@ -59,17 +59,22 @@ class StaticRunManyTerminalOutputLifeCycle {
+             output_1.output.logSingleLine(`No tasks were run`);
+             return;
+         }
+-        // A stopped task was killed mid-flight, so the run did not complete even
+-        // though nothing outright failed. `didCommandComplete` already treats it
+-        // that way; reporting "Successfully ran" here would contradict it.
+-        if (this.failedTasks.length === 0 && this.stoppedTasks.length === 0) {
++        // The orchestrator reports every task it finishes through `endTasks`
++        // except one it skips, and it skips a task only behind a failed or
++        // stopped one. With neither, a task it never reported is one the run
++        // ended without finishing: the orchestrator threw part way through, and
++        // `endCommand` runs from the runner's `finally`. Only a run that
++        // reported every task, none failed or stopped, ran successfully.
++        const unreportedTasks = this.unreportedTasks();
++        if (this.failedTasks.length === 0 &&
++            this.stoppedTasks.length === 0 &&
++            unreportedTasks.length === 0) {
+             output_1.output.addVerticalSeparatorWithoutNewLines('green');
+             const bodyLines = this.cachedTasks.length > 0
+                 ? [
+                     output_1.output.dim(`Nx read the output from the cache instead of running the command for ${this.cachedTasks.length} out of ${this.tasks.length} tasks.`),
+                 ]
+                 : [];
+-            bodyLines.push(...this.tasksNotRunSummary());
+             bodyLines.push(...this.hiddenOutputHint());
+             output_1.output.success({
+                 title: `Successfully ran ${(0, formatting_utils_1.formatTargetsAndProjects)(this.projectNames, this.args.targets, this.tasks)}`,
+@@ -79,9 +84,10 @@ class StaticRunManyTerminalOutputLifeCycle {
+         else {
+             output_1.output.addVerticalSeparatorWithoutNewLines('red');
+             const bodyLines = [];
+-            const skippedTasks = this.skippedTasks();
+-            if (skippedTasks.length > 0) {
+-                bodyLines.push(output_1.output.dim('Tasks not run because their dependencies failed or --nx-bail=true:'), '', ...skippedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
++            if (unreportedTasks.length > 0) {
++                bodyLines.push(output_1.output.dim(this.failedTasks.length > 0
++                    ? 'Tasks not run because their dependencies failed or --nx-bail=true:'
++                    : 'Tasks the run ended without finishing:'), '', ...unreportedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
+             }
+             if (this.stoppedTasks.length > 0) {
+                 bodyLines.push(output_1.output.dim('Tasks stopped before they finished:'), '', ...this.stoppedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
+@@ -100,10 +106,11 @@ class StaticRunManyTerminalOutputLifeCycle {
+         }
+     }
+     /**
+-     * Tasks with a `skipped` status are never reported through `endTasks`, so
+-     * they are derived by subtracting everything that did complete.
++     * The tasks the orchestrator never reported through `endTasks`: those it
++     * skipped, which it never reports, and those a run that threw part way
++     * through never finished.
+      */
+-    skippedTasks() {
++    unreportedTasks() {
+         return this.tasks.filter((t) => !this.allCompletedTasks.has(t.id));
+     }
+     /**
+@@ -136,28 +143,6 @@ class StaticRunManyTerminalOutputLifeCycle {
+             `${output_1.output.dim(`Output of ${withheld.join(' and ')} ${total === 1 && withheld.length === 1 ? 'was' : 'were'} not shown. Run with`)} --verbose ${output_1.output.dim('or')} --output-style=static ${output_1.output.dim('to see it.')}`,
+         ];
+     }
+-    /**
+-     * Tasks that never produced output worth printing are summarized as counts,
+-     * with their names available behind --verbose.
+-     */
+-    tasksNotRunSummary() {
+-        const skippedTasks = this.skippedTasks();
+-        const counts = [];
+-        if (skippedTasks.length > 0) {
+-            counts.push(`${skippedTasks.length} skipped`);
+-        }
+-        if (this.stoppedTasks.length > 0) {
+-            counts.push(`${this.stoppedTasks.length} stopped`);
+-        }
+-        if (counts.length === 0) {
+-            return [];
+-        }
+-        const lines = [output_1.output.dim(counts.join(', '))];
+-        if (this.printsFullOutput) {
+-            lines.push('', ...[...skippedTasks, ...this.stoppedTasks].map((task) => `${output_1.output.dim('-')} ${task.id}`));
+-        }
+-        return lines;
+-    }
+     endTasks(taskResults) {
+         for (let t of taskResults) {
+             this.allCompletedTasks.set(t.task.id, t.task);
+diff --git a/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.d.ts b/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.d.ts
+index 5748cbb88fa16e495c206ce8281b25ac8e481082..cc8e908f64e389d00f11414d41b4256ae18c1630 100644
+--- a/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.d.ts
++++ b/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.d.ts
+@@ -40,15 +40,11 @@ export declare class StaticRunOneTerminalOutputLifeCycle implements LifeCycle {
+     startCommand(): void;
+     endCommand(): void;
+     /**
+-     * Tasks with a `skipped` status are never reported through `endTasks`, so
+-     * they are derived by subtracting everything that did complete.
++     * The tasks the orchestrator never reported through `endTasks`: those it
++     * skipped, which it never reports, and those a run that threw part way
++     * through never finished.
+      */
+-    private skippedTasks;
+-    /**
+-     * Tasks that never produced output worth printing are summarized as counts,
+-     * with their names available behind --verbose.
+-     */
+-    private tasksNotRunSummary;
++    private unreportedTasks;
+     endTasks(taskResults: TaskResult[]): void;
+     printTaskTerminalOutput(task: Task, status: TaskStatus, terminalOutput: string): void;
+ }
+diff --git a/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.js b/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.js
+index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab1af1d676 100644
+--- a/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/static-run-one-terminal-output-life-cycle.js
+@@ -69,16 +69,22 @@ class StaticRunOneTerminalOutputLifeCycle {
+     }
+     endCommand() {
+         output_1.output.addNewline();
+-        // A stopped task was killed mid-flight, so the run did not complete even
+-        // though nothing outright failed — matching run-many and didCommandComplete.
+-        if (this.failedTasks.length === 0 && this.stoppedTasks.length === 0) {
++        // The orchestrator reports every task it finishes through `endTasks`
++        // except one it skips, and it skips a task only behind a failed or
++        // stopped one. With neither, a task it never reported is one the run
++        // ended without finishing: the orchestrator threw part way through, and
++        // `endCommand` runs from the runner's `finally`. Only a run that
++        // reported every task, none failed or stopped, ran successfully.
++        const unreportedTasks = this.unreportedTasks();
++        if (this.failedTasks.length === 0 &&
++            this.stoppedTasks.length === 0 &&
++            unreportedTasks.length === 0) {
+             output_1.output.addVerticalSeparatorWithoutNewLines('green');
+             const bodyLines = this.cachedTasks.length > 0
+                 ? [
+                     output_1.output.dim(`Nx read the output from the cache instead of running the command for ${this.cachedTasks.length} out of ${this.tasks.length} tasks.`),
+                 ]
+                 : [];
+-            bodyLines.push(...this.tasksNotRunSummary());
+             bodyLines.push(...this.hiddenOutputHint());
+             output_1.output.success({
+                 title: `Successfully ran ${(0, formatting_utils_1.formatTargetsAndProjects)(this.projectNames, this.args.targets, this.tasks)}`,
+@@ -88,9 +94,10 @@ class StaticRunOneTerminalOutputLifeCycle {
+         else {
+             output_1.output.addVerticalSeparatorWithoutNewLines('red');
+             const bodyLines = [];
+-            const skippedTasks = this.skippedTasks();
+-            if (skippedTasks.length > 0) {
+-                bodyLines.push(output_1.output.dim('Tasks not run because their dependencies failed or --nx-bail=true:'), '', ...skippedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
++            if (unreportedTasks.length > 0) {
++                bodyLines.push(output_1.output.dim(this.failedTasks.length > 0
++                    ? 'Tasks not run because their dependencies failed or --nx-bail=true:'
++                    : 'Tasks the run ended without finishing:'), '', ...unreportedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
+             }
+             if (this.stoppedTasks.length > 0) {
+                 bodyLines.push(output_1.output.dim('Tasks stopped before they finished:'), '', ...this.stoppedTasks.map((task) => `${output_1.output.dim('-')} ${task.id}`), '');
+@@ -110,34 +117,13 @@ class StaticRunOneTerminalOutputLifeCycle {
+         }
+     }
+     /**
+-     * Tasks with a `skipped` status are never reported through `endTasks`, so
+-     * they are derived by subtracting everything that did complete.
++     * The tasks the orchestrator never reported through `endTasks`: those it
++     * skipped, which it never reports, and those a run that threw part way
++     * through never finished.
+      */
+-    skippedTasks() {
++    unreportedTasks() {
+         return this.tasks.filter((t) => !this.allCompletedTasks.has(t.id));
+     }
+-    /**
+-     * Tasks that never produced output worth printing are summarized as counts,
+-     * with their names available behind --verbose.
+-     */
+-    tasksNotRunSummary() {
+-        const skippedTasks = this.skippedTasks();
+-        const counts = [];
+-        if (skippedTasks.length > 0) {
+-            counts.push(`${skippedTasks.length} skipped`);
+-        }
+-        if (this.stoppedTasks.length > 0) {
+-            counts.push(`${this.stoppedTasks.length} stopped`);
+-        }
+-        if (counts.length === 0) {
+-            return [];
+-        }
+-        const lines = [output_1.output.dim(counts.join(', '))];
+-        if (this.printsFullOutput) {
+-            lines.push('', ...[...skippedTasks, ...this.stoppedTasks].map((task) => `${output_1.output.dim('-')} ${task.id}`));
+-        }
+-        return lines;
+-    }
+     endTasks(taskResults) {
+         for (let t of taskResults) {
+             this.allCompletedTasks.set(t.task.id, t.task);
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
 index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..e64948e720a0a4ce916d2e5071439276ff61e9e4 100644
 --- a/dist/src/tasks-runner/run-command.js

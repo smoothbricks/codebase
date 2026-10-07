@@ -55,6 +55,10 @@ const NOT_YET_UPSTREAM = [
     'daemon claim',
     'start at most one daemon per workspace, and never close a socket another daemon bound (`startServer`)',
   ],
+  [
+    'run summary',
+    'report success only when every task ended, and name the tasks a run that threw never finished (`endCommand`)',
+  ],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
