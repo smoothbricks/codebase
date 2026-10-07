@@ -13533,6 +13533,7 @@ async fn rebased_task_hashes(
             )),
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         };
         let hashes = probe_task_hashes(handle, build_volume.clone(), request).await;
         match hashes {

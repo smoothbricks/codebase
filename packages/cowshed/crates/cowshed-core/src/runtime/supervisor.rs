@@ -2707,6 +2707,9 @@ struct PendingLog {
 struct SessionState {
     identity: u64,
     name: Option<String>,
+    /// Unnamed sessions have no stable name, so their admission identity must not be a reused
+    /// supervisor-local counter. Named sessions retain their existing name identity.
+    admission_identity: Option<Uuid>,
     cwd: Option<WorkspacePath>,
     env: BTreeMap<String, String>,
     background_jobs: BTreeSet<JobId>,
@@ -3318,6 +3321,7 @@ impl SupervisorActor {
         let state = SessionState {
             identity,
             name: name.clone(),
+            admission_identity: name.is_none().then(Uuid::new_v4),
             cwd: self.default_cwd.clone(),
             env: BTreeMap::new(),
             background_jobs: BTreeSet::new(),
@@ -3497,10 +3501,16 @@ impl SupervisorActor {
             stdin,
             session: match session {
                 None => AdmittedSession::None,
-                Some(token) => token
-                    .name
-                    .clone()
-                    .map_or(AdmittedSession::Unnamed, AdmittedSession::Named),
+                Some(token) => match &token.name {
+                    Some(name) => AdmittedSession::Named(name.clone()),
+                    None => AdmittedSession::Unnamed(
+                        self.sessions
+                            .get(&token.identity)
+                            .expect("validated session exists")
+                            .admission_identity
+                            .expect("unnamed session has an admission identity"),
+                    ),
+                },
             },
             stdout_copy: request.stdout_copy.clone(),
             stderr_copy: request.stderr_copy.clone(),

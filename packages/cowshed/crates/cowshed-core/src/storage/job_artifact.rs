@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::api::dto::{
     AdmissionCommitment, AdmissionKey, BinaryData, CheckpointCommitment, CommandArg,
@@ -440,7 +441,7 @@ pub enum AdmittedStdin {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmittedSession {
     None,
-    Unnamed,
+    Unnamed(Uuid),
     Named(String),
 }
 
@@ -4562,9 +4563,13 @@ fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, 
             ("workspaceFile", Some(workspace_path_str(path)), None, None)
         }
     };
-    let (session, session_name) = match &admission.session {
+    let mut session_uuid = [0_u8; 32];
+    let (session, session_name): (&str, Option<&str>) = match &admission.session {
         AdmittedSession::None => ("none", None),
-        AdmittedSession::Unnamed => ("unnamed", None),
+        AdmittedSession::Unnamed(identity) => (
+            "unnamed",
+            Some(identity.simple().encode_lower(&mut session_uuid)),
+        ),
         AdmittedSession::Named(name) => ("named", Some(name.as_str())),
     };
     fn publication(copy: Option<&OutputPublication>) -> (Option<&str>, Option<&'static str>) {
@@ -4684,7 +4689,11 @@ fn decode_admission(
     };
     let session = match (required(8, "session")?, text(9)?) {
         ("none", None) => AdmittedSession::None,
-        ("unnamed", None) => AdmittedSession::Unnamed,
+        ("unnamed", Some(identity)) => {
+            AdmittedSession::Unnamed(Uuid::parse_str(identity).map_err(|error| {
+                ArtifactError::Arrow(format!("invalid unnamed admission session: {error}"))
+            })?)
+        }
         ("named", Some(name)) => AdmittedSession::Named(name.to_owned()),
         (kind, name) => {
             return Err(ArtifactError::Arrow(format!(

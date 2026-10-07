@@ -2046,6 +2046,7 @@ async fn exec_in(
             stdin: StdinSource::Empty,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         })
         .await
         .expect("exec")
@@ -2690,6 +2691,81 @@ async fn host_controller_a_job_s_listening_ports_are_its_own_group_s() {
         );
     }
     drop(host);
+}
+
+/// Distinct unnamed sessions cannot share a keyed admission, even when their authored
+/// arguments are identical. The first job is a real child and its counter is the effect oracle.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
+    use cowshed_core::error::{AdmissionField, AdmissionRefusal};
+    let root = test_root();
+    let config = supervisor_config(&root);
+    let supervisor = system_supervisor_of(config.clone());
+    let first_session = supervisor.open_session(None).await.expect("first session");
+    let second_session = supervisor.open_session(None).await.expect("second session");
+    let request = || ExecRequest {
+        command: ExecCommand::Argv(
+            ["/bin/sh", "-c", "printf 'once\\n' >> counter"]
+                .into_iter()
+                .map(CommandArg::from)
+                .collect(),
+        ),
+        cwd: None,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: Some(cowshed_core::api::AdmissionKey::new("session-op").unwrap()),
+    };
+    let job = supervisor
+        .exec(Some(&first_session), None, request())
+        .await
+        .expect("first admission");
+    let ended = supervisor.wait(job).await.expect("first job ends");
+    assert_eq!(
+        ended.exit,
+        Some(cowshed_core::api::ExitStatus::Exited { code: 0 })
+    );
+    let repeated = supervisor
+        .exec(Some(&second_session), None, request())
+        .await;
+    let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
+    supervisor.retire().await.expect("retire supervisor");
+    let refusal = repeated.expect_err("another unnamed session is not the same request");
+    assert_eq!(refusal.code, ErrorCode::Conflict);
+    assert_eq!(
+        refusal.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Session],
+        })
+    );
+    assert_eq!(counter, b"once\n");
+
+    // The new supervisor allocates its local session counters from one again. That reused
+    // counter must not alias the admission's earlier unnamed session.
+    let restarted = system_supervisor_of(config);
+    let new_session = restarted.open_session(None).await.expect("new session");
+    let repeated = restarted.exec(Some(&new_session), None, request()).await;
+    let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
+    restarted
+        .retire()
+        .await
+        .expect("retire restarted supervisor");
+    let refusal = repeated.expect_err("a restarted unnamed session is a different request");
+    assert_eq!(refusal.code, ErrorCode::Conflict);
+    assert_eq!(
+        refusal.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Session],
+        })
+    );
+    assert_eq!(counter, b"once\n");
 }
 
 /// Every byte `stream` yields until it closes.
