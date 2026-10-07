@@ -5857,10 +5857,21 @@ impl NativeProjectRuntimeHost {
             }
             self.sessions.retain(|(workspace, _), _| workspace != name);
         }
+        // Cowshed's runtime state and the volume's own bookkeeping, excluded where this checkout's
+        // Git reads its excludes: its own `.git/info/exclude` for a standalone clone, and main's,
+        // the common directory's, for a git-worktree workspace, whose `.git` is a pointer file.
+        // Main is mounted: the precondition above refused otherwise.
+        let main_mount;
+        let excludes_in: &Path = if is_git_worktree(&current.metadata) {
+            main_mount = self.workspace_mount_path(&main_name())?;
+            &main_mount
+        } else {
+            &mount
+        };
         crate::timing::spanned(
             "supervisor",
             "excludes",
-            crate::git::GitRepository::from_root(&mount).ensure_cowshed_excludes(),
+            crate::git::GitRepository::from_root(excludes_in).ensure_cowshed_excludes(),
         )
         .await?;
         let needed = super::supervisor::WorkspaceAuthoritySnapshot {

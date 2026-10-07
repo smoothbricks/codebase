@@ -857,6 +857,83 @@ async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without
     fixture.stop_gateway().await;
 }
 
+/// A `--git-worktree` workspace's checkout holds a `.git` pointer file, not a repository: its
+/// excludes are main's, the common directory's. Its supervisor wrote cowshed's excludes into
+/// the checkout's own `.git/info/exclude` as for a standalone clone, refused the pointer file
+/// ('Git metadata path is not a real directory'), and so every verb that runs work in such a
+/// workspace failed. The supervisor starts, writes the excludes into main's, and the
+/// workspace's runtime state and the volume's own bookkeeping stay out of its status.
+#[tokio::test]
+async fn real_apfs_a_git_worktree_workspace_starts_its_supervisor_and_executes() {
+    let mut fixture = Fixture::new();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let (created, _, stderr) = run(&mut service, ["new", "linked-topic", "--git-worktree"]).await;
+    assert_eq!(
+        created.unwrap_or_else(|error| panic!(
+            "git-worktree clone: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let topic = service
+        .path("linked-topic", false)
+        .await
+        .expect("git-worktree clone mount");
+    assert!(
+        fs::symlink_metadata(topic.mount.join(".git"))
+            .expect("the checkout's .git")
+            .is_file(),
+        "a git-worktree checkout holds a pointer file"
+    );
+    let (executed, stdout, stderr) = run(
+        &mut service,
+        [
+            "exec",
+            "linked-topic",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'linked-sandbox\\n'",
+        ],
+    )
+    .await;
+    assert_eq!(
+        executed.unwrap_or_else(|error| panic!(
+            "git-worktree exec: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"linked-sandbox\n");
+    let excludes = fs::read_to_string(fixture.checkout.join(".git/info/exclude"))
+        .expect("main's exclude file");
+    for pattern in [".cowshed/", ".Trashes/", ".fseventsd/"] {
+        assert!(
+            excludes.lines().any(|line| line == pattern),
+            "main's excludes, which the worktree reads, name {pattern}: {excludes}"
+        );
+    }
+    assert!(
+        topic.mount.join(".cowshed").is_dir(),
+        "the workspace holds cowshed's runtime state"
+    );
+    assert_eq!(
+        git_stdout(&topic.mount, &["status", "--porcelain"]),
+        "",
+        "the worktree's runtime state and volume bookkeeping are excluded"
+    );
+    service.shutdown().await.expect("stop git-worktree runtime");
+    fixture.stop_gateway().await;
+}
+
 /// `rm` stops the checkout's Nx daemon as `detach` does. A daemon detaches from the job that
 /// started it, so stopping the supervisor leaves it running with its cwd on the checkout: the
 /// unmount was refused for its whole grace, then forced, and the daemon outlived the removal.

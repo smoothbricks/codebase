@@ -30,11 +30,13 @@ rewrites only files that differ, so every other mtime survives and the clone sta
 a Markdown edit or a stray export from main gated a tree that was not its commit, so Nx missed, and its land then
 refused it as dirty. The clone is its volume's root, where macOS keeps its own bookkeeping (`.Trashes`, `.fseventsd`,
 `.Spotlight-V100`, `.TemporaryItems`, `.DocumentRevisions-V100`), which a mount may grow root-owned. Cowshed excludes
-each in the clone's `info/exclude` before the clean, and in a standalone checkout's when its supervisor starts (main's
-is the one a linked worktree reads), so the clean leaves them alone and dirty checks ignore them: a fresh mount's
-root-owned `.Trashes` made the clean fail ('Permission denied') and left the create unfinished. A fork of another
-workspace (`--from`, `cowshed fork`) still carries that workspace's live state, which is the point of a handoff fork
-(below).
+each in the clone's `info/exclude` before the clean, and again whenever a checkout's supervisor starts: in its own for a
+standalone checkout, and in main's for a git-worktree workspace, whose `.git` is a pointer file and whose Git reads the
+common directory's. So the clean leaves them alone and dirty checks ignore them: a fresh mount's root-owned `.Trashes`
+made the clean fail ('Permission denied') and left the create unfinished, and a supervisor that wrote a git-worktree
+workspace's own `.git/info/exclude` refused its pointer file, so `new --git-worktree` and every verb after it failed. A
+fork of another workspace (`--from`, `cowshed fork`) still carries that workspace's live state, which is the point of a
+handoff fork (below).
 
 ### Secrets enforcement
 
