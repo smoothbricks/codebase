@@ -59,8 +59,8 @@
       "fsckFull": "OK",
       "mounts_and_all_files_present": true
     },
-    "sync_finding": "A clone taken WITHOUT sync can miss the most-recent writes (smoke test: a just-written file was absent from the clone). All clones are crash-consistent and fsck-clean regardless; sync flushes recent writes but is not required for VALIDITY.",
-    "verdict": "Crash-consistent live cloning is reliably fsck-clean and mountable under heavy churn, on both SPARSE and ASIF. `cowshed new` should: sync the mounted volume before clonefile (freshness, not correctness), attach the clone -nomount, fsck (fsck_apfs for SPARSE; diskutil image attach --noMount + fsck_apfs for ASIF) as a cheap safety net, then mount. The delete-and-retry-once fallback is unlikely to ever trigger from write churn alone."
+    "sync_finding": "The sampled clone taken WITHOUT sync missed a just-written file. All ten sampled clones were fsck-clean and readable; that observation does not prove an attached ASIF backing file is a consistent image-driver snapshot.",
+    "verdict": "Historical smoke result only. Later retained ASIF allocation evidence contains initialized references beyond the backing file's EOF and a duplicate physical chunk allocation; the initiating operation remains unproved. Durable captures must detach the image driver and hold the source inode against reattachment before descriptor cloning; sync and fsck alone do not establish outer-image consistency."
   },
   "q4_tmutil": {
     "observation": "Every probe path returned '[Excluded]' — but the test dir is under /private/tmp, which macOS excludes from Time Machine by default. Inconclusive for the real <state-root> location.",
