@@ -57,8 +57,7 @@ in {
       # mkfs.ext4 for the job cgroup test's loop-mounted scratch: the build's own
       # ZFS storage reaches neither memory.current's page cache nor io.stat.
       pkgs.e2fsprogs
-      pkgs.util-linux # loop mounting, probing, and unprivileged controller execution
-      pkgs.kmod # load the host's loop driver before deciding that devices are unavailable
+      pkgs.util-linux # ext4 mount/umount and unprivileged controller execution
     ];
 
   # Nix's setup hooks replace generic CC/CXX after `env` is applied, leaving
