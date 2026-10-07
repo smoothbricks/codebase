@@ -1,8 +1,9 @@
 //! Measures ptrace fork/exec/exit tracing, the Linux process event source a supervisor can run
 //! as the job's parent (07_api.md, "Complete job accounting and observation reconciliation"),
 //! against an unobserved baseline and a census that reads the tree before and after a burst, as
-//! a one-second poll would. The proc connector is measured on the same workload by a probe built
-//! against the kernel's own `cn_proc.h`: no crate this workspace locks carries those records.
+//! a one-second poll would. The proc connector is not run here: no crate this workspace locks
+//! carries its UAPI records, and a probe built against the kernel's own `cn_proc.h` found its
+//! listen request refused (`ECONNREFUSED`) on the measured runner, so no workload ran under it.
 //!
 //! One workload runs unchanged under every mode. The harness re-executes this test binary as the
 //! job's root, held on a gate pipe until the observer is ready. The root starts children one
@@ -478,6 +479,14 @@ fn linux_process_event_sources_are_measured() {
                     run.burst
                 );
                 assert!(measured.duplicates.is_empty(), "{:?}", measured.duplicates);
+                let unheld: Vec<_> = measured
+                    .observed
+                    .births
+                    .iter()
+                    .filter(|birth| birth.pidfd.is_err())
+                    .map(|birth| (birth.pid, &birth.pidfd))
+                    .collect();
+                assert!(unheld.is_empty(), "births without a held pidfd: {unheld:?}");
                 assert!(measured.unexpected.is_empty(), "{:?}", measured.unexpected);
             }
         }
@@ -709,15 +718,27 @@ impl Root {
         } == -1
         {
             let error = io::Error::last_os_error();
-            // SAFETY: killing our own stopped child, then reaping it.
-            unsafe {
-                libc::kill(self.pid, libc::SIGKILL);
-                libc::waitpid(self.pid, ptr::null_mut(), 0);
-            }
+            // SAFETY: killing our own stopped child.
+            let killed = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            assert_eq!(
+                killed,
+                0,
+                "kill the untraceable root: {}",
+                io::Error::last_os_error()
+            );
+            let mut status = 0;
+            // SAFETY: reaping our own child.
+            let reaped = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            assert_eq!(
+                reaped,
+                self.pid,
+                "reap the untraceable root: {}",
+                io::Error::last_os_error()
+            );
             return Err(Outcome::Unavailable {
                 call: "ptrace(PTRACE_SETOPTIONS)".to_owned(),
                 errno: error.raw_os_error(),
-                detail: error.to_string(),
+                detail: format!("{error}; the root was killed, wait status {status}"),
             });
         }
         write_byte(self.hold.as_raw_fd()).expect("hold");
@@ -729,8 +750,12 @@ impl Root {
         let mut started = HashSet::from([self.pid]);
         // The tracer must stay on this thread; another reads the root's DONE byte, so the wall
         // time ends at the same boundary as in every other mode.
-        let wall_ns = std::thread::scope(|scope| {
-            let done = scope.spawn(|| self.await_done(released));
+        let (wall_ns, reader) = std::thread::scope(|scope| {
+            let done = scope.spawn(|| {
+                let before = rusage(libc::RUSAGE_THREAD);
+                let wall_ns = self.await_done(released);
+                (wall_ns, rusage(libc::RUSAGE_THREAD).minus(before))
+            });
             loop {
                 let mut status = 0;
                 // SAFETY: waiting for any tracee.
@@ -798,10 +823,14 @@ impl Root {
             }
             done.join().expect("done reader")
         });
-        let observer = rusage(libc::RUSAGE_THREAD).minus(before);
+        // The tracer's thread and the thread that read DONE, which only this mode needs.
+        let tracer = rusage(libc::RUSAGE_THREAD).minus(before);
         Ok(Sight {
             wall_ns,
-            observer,
+            observer: Usage {
+                user_us: tracer.user_us + reader.user_us,
+                sys_us: tracer.sys_us + reader.sys_us,
+            },
             observed,
             pidfds,
         })
