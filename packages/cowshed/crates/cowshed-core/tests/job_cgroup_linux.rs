@@ -10,15 +10,19 @@
 //! first action is to report its own cgroup, which burns CPU it measures itself (`getrusage`) and
 //! may start children. Every comparison reads the job's `cpu.stat` directly.
 //!
-//! A host without passwordless sudo, systemd, or a delegable cgroup v2 fails here with the
-//! refused step; nothing is skipped.
+//! Workloads keep their files on test-owned scratch storage prepared by the root Delegate phase
+//! and removed on success or unwind ([`Scratch`]): a sparse image formatted ext4 and loop-mounted.
+//! `memory.stat` distinguishes regular-file cache from shmem, and `io.stat` counts only bios a
+//! block device received. ZFS ARC is neither proof. Without loop devices, tmpfs measures anonymous
+//! and shmem charges only; regular-file page-cache and block-I/O attribution remain blocked.
+//! A host without passwordless sudo, systemd, a delegable cgroup v2, or (given loop devices)
+//! `mkfs.ext4` fails naming the refused step; nothing is skipped.
 
 #![cfg(target_os = "linux")]
 
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::chown;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -36,7 +40,7 @@ const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
 const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
-/// A writable directory on block storage ([`block_storage_directory`]).
+/// The directory workloads keep their files in ([`Scratch`]).
 const STORAGE: &str = "COWSHED_JOB_CGROUP_STORAGE";
 
 /// CPU a placed process can spend outside its job: from its fork to its placement write, in the
@@ -113,14 +117,12 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
     let delegate = serde_json::to_string(&Role::Delegate { uid, gid }).expect("role");
     let mut assignment = OsString::from(format!("{ROLE}="));
     assignment.push(delegate);
-    // Chosen here, in the invoking user's own environment, which sudo does not pass on.
-    let mut storage = OsString::from(format!("{STORAGE}="));
-    storage.push(block_storage_directory());
-    let output = Command::new(find_program("sudo"))
-        .arg("-n")
-        .arg(find_program("env"))
+    // sudo does not preserve PATH: root needs the same declared test tools as the runner.
+    let mut search_path = OsString::from("PATH=");
+    search_path.push(std::env::var_os("PATH").expect("PATH"));
+    let output = sudo("env")
         .arg(assignment)
-        .arg(storage)
+        .arg(search_path)
         .arg(find_program("systemd-run"))
         .args([
             "--scope",
@@ -166,7 +168,7 @@ fn job_cgroup_role() {
 // ---------------------------------------------------------------------------------------------
 // Roles
 
-/// Hand this scope to `uid`/`gid` and continue as the controller under that identity.
+/// Delegate the scope to `uid`/`gid`; retain a root parent solely to own scratch cleanup.
 fn delegate(uid: u32, gid: u32) {
     let scope = own_cgroup_path();
     for file in [
@@ -183,20 +185,39 @@ fn delegate(uid: u32, gid: u32) {
         chown(&path, Some(uid), Some(gid))
             .unwrap_or_else(|error| panic!("chown {}: {error}", path.display()));
     }
-    // SAFETY: plain identity calls on values this process was given; each answer is checked.
-    unsafe {
-        assert_eq!(libc::setgroups(1, &gid), 0, "setgroups: {}", last_error());
-        assert_eq!(libc::setgid(gid), 0, "setgid: {}", last_error());
-        assert_eq!(libc::setuid(uid), 0, "setuid: {}", last_error());
+    // The waiting root parent must not populate the distributing scope. Both it and the
+    // controller stay in this non-job leaf; only admitted workloads enter job cgroups.
+    let leaf = scope.join(CONTROLLER_LEAF);
+    std::fs::create_dir(&leaf).expect("create the controller leaf");
+    for file in ["", "cgroup.procs", "cgroup.threads"] {
+        chown(leaf.join(file), Some(uid), Some(gid)).expect("delegate the controller leaf");
     }
-    let error = Command::new(test_binary())
+    std::fs::write(leaf.join("cgroup.procs"), "0").expect("park the root parent in the leaf");
+    // Keep this parent root until the controller ends: it owns the mount even when a scenario
+    // panics or the controller cannot be spawned. Only the controller drops privilege.
+    scratch_cleanup_survives_failure(uid, gid);
+    let scratch = Scratch::make(uid, gid);
+    let mut command = Command::new(find_program("setpriv"));
+    command
+        .arg("--reuid")
+        .arg(uid.to_string())
+        .arg("--regid")
+        .arg(gid.to_string())
+        .args(["--clear-groups", "--"])
+        .arg(test_binary())
         .args(role_arguments())
         .env(
             ROLE,
             serde_json::to_string(&Role::Controller).expect("role"),
         )
-        .exec();
-    panic!("exec the controller: {error}");
+        .env(STORAGE, &scratch.directory);
+    let output = command
+        .output_locked()
+        .expect("run the unprivileged controller");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    drop(scratch);
+    assert!(output.status.success(), "controller: {}", output.status);
 }
 
 /// Report this process's cgroup first, then do what `workload` says.
@@ -263,7 +284,9 @@ fn work(workload: &Workload) {
 
 /// The scenarios, run by the unprivileged controller that holds the delegated scope.
 fn control() {
-    let scope = own_cgroup_path();
+    let own = own_cgroup_path();
+    assert_eq!(own.file_name(), Some(std::ffi::OsStr::new(CONTROLLER_LEAF)));
+    let scope = own.parent().expect("the delegated scope");
     let authority = CgroupAuthority::delegated().expect("authority over the delegated scope");
     assert_eq!(authority.root(), scope);
     assert_eq!(
@@ -479,7 +502,7 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
     let job = jobs.admit(job_id(10)).expect("admit");
-    let file = on_block_storage("page-cache");
+    let file = in_scratch("page-cache");
     let mut running = Spawned::placed(
         &job,
         &Workload {
@@ -499,10 +522,39 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         .peak_bytes;
     let resident = live_members_resident_bytes(&job);
     let (current, peak) = (charged.current_bytes.get(), charged.peak_bytes.get());
+    let stat = std::fs::read_to_string(job.path().join("memory.stat")).expect("memory.stat");
+    let counter = |name: &str| -> u64 {
+        stat.lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.parse().expect("memory.stat count"))
+            })
+            .unwrap_or_else(|| panic!("memory.stat has no {name}: {stat}"))
+    };
+    let (file, shmem) = (counter("file"), counter("shmem"));
+    let f_type = filesystem_type(&scratch_directory()).expect("scratch statfs");
+    let regular_file = file.checked_sub(shmem).expect("shmem is part of file");
     println!(
         "charged memory: current {current} B, peak {peak} B (direct before {direct_before:?}, \
-         after {direct_after:?}); live members resident {resident} B"
+         after {direct_after:?}); live members resident {resident} B; memory.stat file {file} B, \
+         shmem {shmem} B, regular-file cache {regular_file} B; filesystem {f_type:#x}"
     );
+    if f_type == libc::EXT4_SUPER_MAGIC {
+        assert!(
+            regular_file >= 64 * MIB,
+            "the 64 MiB regular file is charged as non-shmem cache"
+        );
+    } else {
+        assert_eq!(
+            f_type,
+            libc::TMPFS_MAGIC,
+            "only ext4 or measured tmpfs scratch"
+        );
+        assert!(shmem >= 64 * MIB, "the tmpfs file is charged as shmem");
+        println!(
+            "blocked: tmpfs proves anonymous/shmem charging, not regular-file page-cache attribution"
+        );
+    }
     assert!(
         (direct_before.1..=direct_after.1).contains(&peak),
         "the reader's peak lies between two direct reads around it"
@@ -517,7 +569,7 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     );
     assert!(
         current >= resident + 48 * MIB,
-        "the 64 MiB of page cache is charged though nothing holds it resident: charged {current} \
+        "the 64 MiB of file-backed memory is charged though nothing holds it resident: charged {current} \
          B, resident {resident} B"
     );
     assert!(
@@ -545,32 +597,35 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
 /// writes stay its own.
 fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
+    let directory = scratch_directory();
+    let f_type = filesystem_type(&directory).expect("statfs");
+    assert_eq!(
+        f_type,
+        libc::EXT4_SUPER_MAGIC,
+        "blocked: storage I/O reaches io.stat only as bios a block device received, and the \
+         scratch {} is filesystem type {f_type:#x}, which no loop device backs on this host",
+        directory.display()
+    );
     let job = jobs.admit(job_id(11)).expect("admit");
     let neighbour_job = jobs.admit(job_id(12)).expect("admit");
-    let scratch = on_block_storage("probe");
-    println!(
-        "storage I/O scratch {} on filesystem type {:#x}",
-        scratch.display(),
-        filesystem_type(scratch.parent().expect("a directory")).expect("statfs")
-    );
     // Cached by the controller, outside every job: the job's read of it is served from memory.
-    let cached = on_block_storage("cached");
+    let cached = in_scratch("cached");
     fill_page_cache(&cached, 32);
     std::fs::File::open(&cached)
         .and_then(|file| file.sync_all())
         .expect("flush the cached file");
     read_through_cache(&cached);
-    let allocated = on_block_storage("allocated");
+    let allocated = in_scratch("allocated");
     let children = (0..3)
         .map(|index| Workload {
-            direct_io: Some((on_block_storage(&format!("direct-{index}")), 8, 4)),
+            direct_io: Some((in_scratch(&format!("direct-{index}")), 8, 4)),
             ..Workload::default()
         })
         .collect();
     let neighbour = Spawned::placed(
         &neighbour_job,
         &Workload {
-            direct_io: Some((on_block_storage("neighbour"), 16, 0)),
+            direct_io: Some((in_scratch("neighbour"), 16, 0)),
             ..Workload::default()
         },
     );
@@ -957,87 +1012,183 @@ fn fill_page_cache(path: &Path, mebibytes: u64) {
     }
 }
 
-/// Filesystems whose file pages the memory controller charges to the cgroup that faults them in
-/// and whose writeback and direct I/O reach a block device as that cgroup's own bios, so
-/// `memory.current` and `io.stat` see them. ZFS is not one: its ARC is no page cache, and its
-/// own threads issue its I/O.
-const BLOCK_FILESYSTEMS: [(libc::c_long, &str); 3] = [
-    (0xEF53, "ext4"),
-    (0x5846_5342, "xfs"),
-    (0x9123_683E, "btrfs"),
-];
-
-/// A scratch path in the block-storage directory the harness chose.
-fn on_block_storage(name: &str) -> PathBuf {
-    PathBuf::from(std::env::var_os(STORAGE).expect("the harness's storage directory"))
-        .join(format!("job-cgroup-{}-{name}", std::process::id()))
+/// The scratch directory the harness made ([`Scratch`]).
+fn scratch_directory() -> PathBuf {
+    PathBuf::from(std::env::var_os(STORAGE).expect("the harness's scratch directory"))
 }
 
-/// The first writable directory among the build's and the user's usual scratch places that lies
-/// on a [`BLOCK_FILESYSTEMS`] filesystem. None is a failure that lists what each candidate is and
-/// every mount, never a skipped scenario.
-fn block_storage_directory() -> PathBuf {
-    let mut candidates = vec![
-        test_binary()
-            .parent()
-            .expect("the test binary's directory")
-            .to_path_buf(),
-    ];
-    candidates.extend(
-        ["TMPDIR", "RUNNER_TEMP", "HOME"]
-            .into_iter()
-            .filter_map(std::env::var_os)
-            .map(PathBuf::from),
-    );
-    candidates.extend(["/var/tmp", "/tmp"].map(PathBuf::from));
-    let mut measured = Vec::new();
-    for candidate in candidates {
-        let f_type = filesystem_type(&candidate);
-        let writable = writable_directory(&candidate);
-        let block = f_type.as_ref().ok().and_then(|f_type| {
-            BLOCK_FILESYSTEMS
-                .iter()
-                .find(|(magic, _)| magic == f_type)
-                .map(|(_, name)| *name)
-        });
-        if let (Some(name), true) = (block, writable) {
-            println!("block storage: {} on {name}", candidate.display());
-            return candidate;
+/// A path for `name` in the [`scratch_directory`].
+fn in_scratch(name: &str) -> PathBuf {
+    scratch_directory().join(format!("job-cgroup-{}-{name}", std::process::id()))
+}
+
+/// The size of the sparse image backing [`Scratch`]: room for every scenario's files at once.
+const SCRATCH_IMAGE_BYTES: u64 = 512 << 20;
+
+/// One run's scratch storage, owned by the root Delegate parent and removed on normal exit or
+/// unwind. Without usable loop devices, tmpfs proves shmem charging, not regular-file cache or I/O.
+struct Scratch {
+    /// Owned by this run alone: holds the image and its mountpoint, or is the tmpfs directory.
+    root: PathBuf,
+    /// Where workloads keep their files.
+    directory: PathBuf,
+    /// `directory` holds the mounted image, until it is unmounted.
+    mounted: bool,
+}
+
+impl Scratch {
+    fn make(uid: u32, gid: u32) -> Self {
+        let name = format!("cowshed-job-cgroup-{}", std::process::id());
+        let loop_control = Path::new("/dev/loop-control");
+        let unavailable = match std::fs::metadata(loop_control) {
+            Ok(_) => run(Command::new(find_program("losetup")).arg("--find")).err(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(format!("{}: {error}", loop_control.display()))
+            }
+            Err(error) => panic!("inspect {}: {error}", loop_control.display()),
+        };
+        if let Some(reason) = unavailable {
+            println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
+            return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
         }
-        measured.push(format!(
-            "{}: f_type {f_type:x?}, writable {writable}",
-            candidate.display()
-        ));
+        Self::loop_ext4(std::env::temp_dir().join(name), uid, gid)
     }
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap_or_else(|error| format!("unreadable: {error}"))
-        .lines()
-        .filter_map(|line| {
-            let (before, after) = line.split_once(" - ")?;
-            let mount = before.split_whitespace().nth(4)?;
-            let mut after = after.split_whitespace();
-            Some(format!(
-                "{mount} {} {}",
-                after.next()?,
-                after.next().unwrap_or("")
-            ))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    panic!(
-        "no writable scratch directory on ext4, xfs or btrfs:\n{}\nmounts:\n{mounts}",
-        measured.join("\n")
-    );
+
+    fn loop_ext4(root: PathBuf, uid: u32, gid: u32) -> Self {
+        std::fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
+        let image = root.join("ext4.img");
+        let mut scratch = Self {
+            directory: root.join("mnt"),
+            root,
+            mounted: false,
+        };
+        std::fs::File::create(&image)
+            .and_then(|file| file.set_len(SCRATCH_IMAGE_BYTES))
+            .unwrap_or_else(|error| panic!("make the sparse {}: {error}", image.display()));
+        run(Command::new(find_program("mkfs.ext4"))
+            .arg("-q")
+            .arg(&image))
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+        std::fs::create_dir(&scratch.directory)
+            .unwrap_or_else(|error| panic!("create {}: {error}", scratch.directory.display()));
+        run(Command::new(find_program("mount"))
+            .args(["-o", "loop"])
+            .arg(&image)
+            .arg(&scratch.directory))
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+        scratch.mounted = true;
+        chown(&scratch.directory, Some(uid), Some(gid)).expect("chown scratch to the runner");
+        let f_type = filesystem_type(&scratch.directory).expect("statfs the mounted image");
+        assert_eq!(
+            f_type,
+            libc::EXT4_SUPER_MAGIC,
+            "{} is ext4 once mounted: f_type {f_type:#x}",
+            scratch.directory.display()
+        );
+        println!(
+            "scratch: {} is ext4 on a loop device",
+            scratch.directory.display()
+        );
+        scratch
+    }
+
+    fn tmpfs(root: PathBuf, uid: u32, gid: u32) -> Self {
+        std::fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
+        let scratch = Self {
+            directory: root.clone(),
+            root,
+            mounted: false,
+        };
+        chown(&scratch.directory, Some(uid), Some(gid)).expect("chown tmpfs scratch to the runner");
+        let f_type = filesystem_type(&scratch.directory).expect("statfs the tmpfs directory");
+        assert_eq!(
+            f_type,
+            libc::TMPFS_MAGIC,
+            "{} is on tmpfs: f_type {f_type:#x}",
+            scratch.directory.display()
+        );
+        scratch
+    }
 }
 
-fn writable_directory(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let mut failures = Vec::new();
+        if self.mounted {
+            match run(Command::new(find_program("umount")).arg(&self.directory)) {
+                Ok(()) => self.mounted = false,
+                Err(refusal) => failures.push(refusal),
+            }
+        }
+        // A mounted tree is the image's own: removing it would only empty the image, and its
+        // mountpoint stays busy.
+        if !self.mounted
+            && let Err(error) = std::fs::remove_dir_all(&self.root)
+        {
+            failures.push(format!("remove {}: {error}", self.root.display()));
+        }
+        if failures.is_empty() {
+            println!(
+                "scratch cleanup: {} unmounted and removed",
+                self.root.display()
+            );
+            return;
+        }
+        let report = format!(
+            "scratch storage {} is left behind:\n{}",
+            self.root.display(),
+            failures.join("\n")
+        );
+        // A second panic while the first unwinds would abort before either is reported.
+        if std::thread::panicking() {
+            eprintln!("{report}");
+        } else {
+            panic!("{report}");
+        }
+    }
+}
 
-    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: a NUL-terminated path and plain flags.
-    unsafe { libc::access(name.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+/// A refused command unwinds through the same guard as a failed scenario. Check the mount and
+/// sparse image are gone, not merely that the command returned an error.
+fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
+    let scratch = Scratch::make(uid, gid);
+    let root = scratch.root.clone();
+    let outcome = std::panic::catch_unwind(move || {
+        let _scratch = scratch;
+        run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
+    });
+    assert!(outcome.is_err(), "the refusal unwinds");
+    assert!(
+        !root.exists(),
+        "cleanup removed {} after refusal",
+        root.display()
+    );
+    println!("scratch cleanup: command failure and panic unwind verified");
+}
+
+/// `program` from `PATH`, run as root by `sudo`, which never prompts for a password.
+fn sudo(program: &str) -> Command {
+    let mut command = Command::new(find_program("sudo"));
+    command.arg("-n").arg(find_program(program));
+    command
+}
+
+/// Run `command` to its end; a refusal is what it said.
+fn run(command: &mut Command) -> Result<(), String> {
+    let output = command
+        .output_locked()
+        .map_err(|error| format!("run {command:?}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{command:?}: {}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 /// Write `write` MiB to a new file at `path`, flushed to storage, then read `read` MiB of it
