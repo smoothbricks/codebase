@@ -9,6 +9,10 @@
 //! every other land's entries, and a fork made after the next land missed tasks main had already
 //! run at that very tree.
 //!
+//! Rebase uses [`stage_rebase`] instead: only current-tree task hashes are selected, including
+//! during commit, and one row/byte/free-space budget bounds all copies in both phases. Regular
+//! file data is copied through a length-limited reader, with `copyfile(3)` preserving metadata.
+//!
 //! Stock Nx 23.2.1 keeps an entry in three places (`native/cache/cache.rs`): the directory
 //! `<cache>/<hash>` with the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a
 //! `cache_outputs` row in the task database `<workspace-data>/<machine>-v<schema>.db`, whose
@@ -33,10 +37,12 @@
 //! `copyfile(3)` keeps every file's bytes, mode and times. A crashed carry leaves only the
 //! staging directory, which the next [`stage`] or [`unstage`] on that volume deletes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::BuildVolumeState;
 use super::sqlite::Connection;
@@ -56,6 +62,11 @@ const MISSING: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM previous
      WHERE p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
        AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
      ORDER BY p.accessed_at DESC";
+const SELECTED: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM temp.wanted w \
+     JOIN previous.cache_outputs p ON p.hash = w.hash \
+     WHERE p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
+       AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
+     ORDER BY p.accessed_at DESC";
 
 /// One entry's row in the target's database, as phase 1 read it.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -69,6 +80,7 @@ struct Row {
 /// Phase 1's work for one pair of task databases.
 #[derive(Debug)]
 struct StagedDatabase {
+    selection: OwnedSelection,
     from_database: PathBuf,
     from_cache: PathBuf,
     into_database: PathBuf,
@@ -83,6 +95,7 @@ struct StagedDatabase {
 #[derive(Debug, Default)]
 pub struct Staged {
     databases: Vec<StagedDatabase>,
+    budget: Option<Budget>,
     /// Why staging stopped short. The entries staged until then are committed; nothing more is
     /// copied while the target is closed.
     stopped: Option<String>,
@@ -117,19 +130,85 @@ pub fn stage(
     into: &Path,
     into_state: &BuildVolumeState,
 ) -> Staged {
-    let mut staged = Staged::default();
+    stage_with(from, from_state, into, into_state, None, Staged::default())
+}
+
+/// Rebase carry admits only hashes Nx computed for the rebased tree, across both phases.
+/// Historical entries consume no copy bandwidth or destination space. The entire carry shares
+/// one row and byte budget; missing selection information stops it, never widens it.
+pub fn stage_rebase(
+    from: &Path,
+    from_state: &BuildVolumeState,
+    into: &Path,
+    into_state: &BuildVolumeState,
+    selections: &BTreeMap<PathBuf, BTreeSet<String>>,
+) -> Staged {
+    let rows = selections
+        .values()
+        .try_fold(0_usize, |sum, hashes| sum.checked_add(hashes.len()));
+    let budget = rows
+        .ok_or_else(|| io::Error::other("rebase carry task-hash count overflow"))
+        .and_then(|rows| Budget::new(into, rows));
+    let budget = match budget {
+        Ok(budget) => budget,
+        Err(error) => {
+            return Staged {
+                stopped: Some(format!(
+                    "budget rebase carry into {}: {error}",
+                    into.display()
+                )),
+                ..Staged::default()
+            };
+        }
+    };
+    stage_with(
+        from,
+        from_state,
+        into,
+        into_state,
+        Some(selections),
+        Staged {
+            budget: Some(budget),
+            ..Staged::default()
+        },
+    )
+}
+
+fn stage_with(
+    from: &Path,
+    from_state: &BuildVolumeState,
+    into: &Path,
+    into_state: &BuildVolumeState,
+    selections: Option<&BTreeMap<PathBuf, BTreeSet<String>>>,
+    mut staged: Staged,
+) -> Staged {
     let staging = into.join(STAGING);
     if let Err(error) = remove(&staging) {
         staged.stopped = Some(format!("clear {}: {error}", staging.display()));
         return staged;
     }
     let targets = nx_states(into_state);
+    for target in &targets {
+        if let Err(error) = selection(selections, target.checkout) {
+            staged.stopped = Some(error.to_string());
+            return staged;
+        }
+    }
     for source in nx_states(from_state) {
         let Some(destination) = targets
             .iter()
             .find(|state| state.checkout == source.checkout)
         else {
             continue;
+        };
+        let selected = selection(selections, source.checkout)
+            .expect("each destination selection was checked before staging");
+        if matches!(selected, Selection::Only(hashes) if hashes.is_empty()) {
+            continue;
+        }
+        let owned = match selected {
+            Selection::All => OwnedSelection::All,
+            Selection::Only(hashes) => OwnedSelection::Only(Arc::new(hashes.clone())),
         };
         let databases = match databases_in(&from.join(source.data)) {
             Ok(databases) => databases,
@@ -158,6 +237,13 @@ pub fn stage(
                 if ran_nx {
                     continue;
                 }
+                if matches!(selected, Selection::Only(_)) {
+                    staged.stopped = Some(format!(
+                        "rebase carry destination {} has no task database after current-tree hashing; refusing to copy the target's unbounded task history",
+                        into_database.display()
+                    ));
+                    return staged;
+                }
                 if let Err(error) = empty_copy(&from_database, &into_database) {
                     staged.stopped = Some(format!(
                         "copy {} without its cache rows to {}: {error}",
@@ -168,6 +254,7 @@ pub fn stage(
                 }
             }
             let mut database = StagedDatabase {
+                selection: owned.clone(),
                 from_database,
                 from_cache: from.join(source.cache),
                 into_database,
@@ -175,7 +262,7 @@ pub fn stage(
                 staging: staging.join(staged.databases.len().to_string()),
                 rows: Vec::new(),
             };
-            let result = stage_database(&mut database);
+            let result = stage_database(&mut database, selected, staged.budget.as_mut());
             staged.databases.push(database);
             if let Err(error) = result {
                 staged.stopped = Some(error);
@@ -184,6 +271,45 @@ pub fn stage(
         }
     }
     staged
+}
+
+#[derive(Clone, Copy)]
+enum Selection<'a> {
+    All,
+    Only(&'a BTreeSet<String>),
+}
+
+#[derive(Clone, Debug)]
+enum OwnedSelection {
+    All,
+    Only(Arc<BTreeSet<String>>),
+}
+
+impl OwnedSelection {
+    fn borrowed(&self) -> Selection<'_> {
+        match self {
+            Self::All => Selection::All,
+            Self::Only(hashes) => Selection::Only(hashes),
+        }
+    }
+}
+
+fn selection<'a>(
+    selections: Option<&'a BTreeMap<PathBuf, BTreeSet<String>>>,
+    checkout: &Path,
+) -> io::Result<Selection<'a>> {
+    match selections {
+        None => Ok(Selection::All),
+        Some(selections) => selections
+            .get(checkout)
+            .map(Selection::Only)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "rebase carry has no current-tree task hashes for {}",
+                    checkout.display()
+                ))
+            }),
+    }
 }
 
 /// Write a consistent copy of the task database `from` at `into` (`VACUUM INTO`, which reads
@@ -218,17 +344,27 @@ fn empty_copy(from: &Path, into: &Path) -> io::Result<()> {
 
 /// Phase 2, once nothing holds the target's task database: move each staged entry whose row is
 /// unchanged into place, copy what the target indexed since phase 1, and index it all.
-pub fn commit(staged: Staged, into: &Path) -> Carried {
+pub fn commit(mut staged: Staged, into: &Path) -> Carried {
     let mut carried = Carried {
         stopped: staged.stopped.clone(),
         ..Carried::default()
     };
     let complete = staged.stopped.is_none();
     for database in &staged.databases {
-        match commit_database(database, complete) {
-            Ok((entries, bytes)) => {
+        let result = commit_database(
+            database,
+            complete,
+            database.selection.borrowed(),
+            staged.budget.as_mut(),
+        );
+        match result {
+            Ok((entries, bytes, stopped)) => {
                 carried.entries += entries;
                 carried.bytes += bytes;
+                if let Some(stopped) = stopped {
+                    carried.stopped.get_or_insert(stopped);
+                    break;
+                }
             }
             Err(error) => {
                 carried.stopped.get_or_insert(format!(
@@ -259,7 +395,11 @@ pub fn unstage(into: &Path) -> io::Result<()> {
 
 /// Read the rows `database.into_database` lacks from `database.from_database`, then copy each
 /// entry's files into the staging directory, recording each entry staged whole.
-fn stage_database(database: &mut StagedDatabase) -> Result<(), String> {
+fn stage_database(
+    database: &mut StagedDatabase,
+    selected: Selection<'_>,
+    mut budget: Option<&mut Budget>,
+) -> Result<(), String> {
     let context = |error: io::Error| {
         format!(
             "stage {} into {}: {error}",
@@ -269,9 +409,15 @@ fn stage_database(database: &mut StagedDatabase) -> Result<(), String> {
     };
     // The connection closes before the copies: phase 1 holds the target's database only for
     // the one read.
-    let missing = missing(&database.into_database, &database.from_database).map_err(context)?;
+    let missing =
+        missing(&database.into_database, &database.from_database, selected).map_err(context)?;
     for row in missing {
-        match copy_entry(&database.from_cache, &database.staging, &row.hash) {
+        match copy_row(
+            &database.from_cache,
+            &database.staging,
+            &row,
+            budget.as_deref_mut(),
+        ) {
             Ok(true) => database.rows.push(row),
             Ok(false) => {}
             Err(error) => {
@@ -321,18 +467,34 @@ fn table_definition(
 }
 
 /// The target's rows the landing database lacks ([`MISSING`]).
-fn missing(into_database: &Path, from_database: &Path) -> io::Result<Vec<Row>> {
+fn missing(
+    into_database: &Path,
+    from_database: &Path,
+    selected: Selection<'_>,
+) -> io::Result<Vec<Row>> {
     let connection = attached(into_database, from_database)?;
-    rows(&connection)
+    rows(&connection, selected)
 }
 
 /// [`MISSING`]: none when the target's database has no `cache_outputs`, so indexes nothing.
-fn rows(connection: &Connection) -> io::Result<Vec<Row>> {
+fn rows(connection: &Connection, selected: Selection<'_>) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     if table_definition(connection, "previous", "cache_outputs")?.is_none() {
         return Ok(rows);
     }
-    let mut statement = connection.prepare(MISSING)?;
+    let query = match selected {
+        Selection::All => MISSING,
+        Selection::Only(hashes) => {
+            connection.execute("CREATE TEMP TABLE wanted (hash TEXT PRIMARY KEY)", &[])?;
+            let mut insert = connection.prepare("INSERT INTO temp.wanted (hash) VALUES (?1)")?;
+            for hash in hashes {
+                insert.bind(&[hash])?;
+                while insert.step()? {}
+            }
+            SELECTED
+        }
+    };
+    let mut statement = connection.prepare(query)?;
     while statement.step()? {
         rows.push(Row {
             hash: statement.text(0),
@@ -345,10 +507,15 @@ fn rows(connection: &Connection) -> io::Result<Vec<Row>> {
 }
 
 /// Phase 2 for one pair of databases: answers the entries indexed and their recorded bytes.
-fn commit_database(database: &StagedDatabase, complete: bool) -> io::Result<(u64, u64)> {
+fn commit_database(
+    database: &StagedDatabase,
+    complete: bool,
+    selected: Selection<'_>,
+    mut budget: Option<&mut Budget>,
+) -> io::Result<(u64, u64, Option<String>)> {
     let connection = attached(&database.into_database, &database.from_database)?;
-    // Every row the target indexes now that the landing volume lacks, staged or not.
-    let now = rows(&connection)?;
+    // Rebase selection also fences entries indexed since phase 1.
+    let now = rows(&connection, selected)?;
     let current: BTreeSet<&Row> = now.iter().collect();
     let unchanged: BTreeSet<&str> = database
         .rows
@@ -358,6 +525,7 @@ fn commit_database(database: &StagedDatabase, complete: bool) -> io::Result<(u64
         .collect();
     // Each entry is named here before its files move, so a failure removes it with the rest.
     let mut placed: BTreeSet<&str> = BTreeSet::new();
+    let mut stopped = None;
     let result = (|| {
         for &hash in &unchanged {
             placed.insert(hash);
@@ -368,8 +536,24 @@ fn commit_database(database: &StagedDatabase, complete: bool) -> io::Result<(u64
                 .iter()
                 .filter(|row| !unchanged.contains(row.hash.as_str()))
             {
-                if copy_entry(&database.from_cache, &database.into_cache, &row.hash)? {
-                    placed.insert(&row.hash);
+                match copy_row(
+                    &database.from_cache,
+                    &database.into_cache,
+                    row,
+                    budget.as_deref_mut(),
+                ) {
+                    Ok(true) => {
+                        placed.insert(&row.hash);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        stopped = Some(format!(
+                            "copy entry {} from {}: {error}",
+                            row.hash,
+                            database.from_cache.display()
+                        ));
+                        break;
+                    }
                 }
             }
         }
@@ -392,7 +576,9 @@ fn commit_database(database: &StagedDatabase, complete: bool) -> io::Result<(u64
         .filter(|row| placed.contains(row.hash.as_str()))
         .map(|row| u64::try_from(row.size).unwrap_or(0))
         .sum();
-    Ok((placed.len() as u64, bytes))
+    let entries = u64::try_from(placed.len())
+        .map_err(|error| io::Error::other(format!("carried entry count: {error}")))?;
+    Ok((entries, bytes, stopped))
 }
 
 /// Move staged entry `hash` from `staging` into the cache `cache`, replacing whatever stood
@@ -453,34 +639,222 @@ fn index(connection: &Connection, placed: &BTreeSet<&str>) -> io::Result<()> {
     connection.execute("COMMIT", &[])
 }
 
+/// Rebase's bound is shared by both phases and all Nx states. Reserve a tenth of the volume
+/// and carry at most another tenth (Nx's default cache-size fraction), never more than the
+/// available space above that reserve. Recorded entry sizes and actual filesystem writes have
+/// separate counters: an inaccurate row cannot turn a small-looking entry into an unbounded copy.
+#[derive(Debug)]
+struct Budget {
+    volume: std::ffi::CString,
+    reserve: u64,
+    block_size: u64,
+    rows: usize,
+    recorded_bytes: u64,
+    copy_bytes: u64,
+}
+
+impl Budget {
+    fn new(volume: &Path, rows: usize) -> io::Result<Self> {
+        let volume = super::sqlite::c_path(volume)?;
+        let space = Space::read(&volume)?;
+        let reserve = space.capacity / 10;
+        let bytes = reserve.min(space.available.saturating_sub(reserve));
+        Ok(Self {
+            volume,
+            reserve,
+            block_size: space.block_size,
+            rows,
+            recorded_bytes: bytes,
+            copy_bytes: bytes,
+        })
+    }
+
+    fn admit(&mut self, row: &Row) -> io::Result<()> {
+        let bytes = u64::try_from(row.size).map_err(|error| {
+            io::Error::other(format!(
+                "rebase carry entry {} has invalid size: {error}",
+                row.hash
+            ))
+        })?;
+        if self.rows == 0 || bytes > self.recorded_bytes {
+            return Err(io::Error::other(format!(
+                "rebase carry bound: entry {} needs {bytes} recorded bytes; {} rows and {} recorded bytes remain",
+                row.hash, self.rows, self.recorded_bytes
+            )));
+        }
+        self.rows -= 1;
+        self.recorded_bytes -= bytes;
+        Ok(())
+    }
+
+    fn charge(&mut self, bytes: u64) -> io::Result<()> {
+        // Round data to filesystem blocks and charge one more block for each object's metadata.
+        let charged = bytes
+            .div_ceil(self.block_size)
+            .checked_add(1)
+            .and_then(|blocks| blocks.checked_mul(self.block_size))
+            .ok_or_else(|| io::Error::other("rebase carry copy-size overflow"))?;
+        let available = Space::read(&self.volume)?
+            .available
+            .saturating_sub(self.reserve);
+        if charged > self.copy_bytes || charged > available {
+            return Err(io::Error::other(format!(
+                "rebase carry bound: next object needs {charged} bytes; {} copy bytes and {available} bytes above the {}-byte free-space reserve remain",
+                self.copy_bytes, self.reserve
+            )));
+        }
+        self.copy_bytes -= charged;
+        Ok(())
+    }
+
+    /// Walk once, charging each object before it is written. Recursive copyfile would hide a
+    /// huge file behind a small cache row; a preliminary whole-tree size scan would walk twice.
+    /// Directory metadata is copied last so child creation cannot change its preserved times.
+    fn copy(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        metadata: &fs::Metadata,
+    ) -> io::Result<()> {
+        if metadata.is_dir() {
+            self.charge(0)?;
+            fs::create_dir(destination)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                self.copy(
+                    &entry.path(),
+                    &destination.join(entry.file_name()),
+                    &metadata,
+                )?;
+            }
+            copyfile(
+                source,
+                destination,
+                libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW,
+            )
+        } else if metadata.is_file() {
+            let mut input = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(source)?;
+            let bytes = input.metadata()?.len();
+            self.charge(bytes)?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            copy_data(&mut input, &mut output, bytes)?;
+            drop(output);
+            copyfile(
+                source,
+                destination,
+                libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW,
+            )
+        } else {
+            self.charge(metadata.len())?;
+            copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
+        }
+    }
+}
+
+/// Never let a source rewritten during staging write more than the admitted length. A growth
+/// probe reads one byte without writing it; the caller removes the rejected partial entry.
+fn copy_data(input: &mut fs::File, output: &mut fs::File, bytes: u64) -> io::Result<()> {
+    let copied = io::copy(&mut (&mut *input).take(bytes), output)?;
+    if copied != bytes {
+        return Err(io::Error::other(
+            "rebase carry source shrank below its admitted copy size",
+        ));
+    }
+    let mut extra = [0];
+    if input.read(&mut extra)? != 0 {
+        return Err(io::Error::other(
+            "rebase carry source grew beyond its admitted copy size",
+        ));
+    }
+    Ok(())
+}
+
+struct Space {
+    capacity: u64,
+    available: u64,
+    block_size: u64,
+}
+
+impl Space {
+    fn read(volume: &std::ffi::CStr) -> io::Result<Self> {
+        let mut space = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: volume is NUL-terminated and statfs initializes the output on success.
+        if unsafe { libc::statfs(volume.as_ptr(), space.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful statfs call initialized every field read below.
+        let space = unsafe { space.assume_init() };
+        let block_size = u64::from(space.f_bsize);
+        if block_size == 0 {
+            return Err(io::Error::other(
+                "rebase carry filesystem has zero-sized blocks",
+            ));
+        }
+        let bytes = |blocks: u64| {
+            blocks
+                .checked_mul(block_size)
+                .ok_or_else(|| io::Error::other("rebase carry filesystem-size overflow"))
+        };
+        Ok(Self {
+            capacity: bytes(space.f_blocks)?,
+            available: bytes(space.f_bavail)?,
+            block_size,
+        })
+    }
+}
+
 /// Copy entry `hash`'s output directory and terminal output from the cache `from` to the same
 /// names under `into`. `false` when `from` holds no output directory for it: Nx would answer
 /// that row with a hit that restores nothing, so it is not carried. A copy that fails removes
 /// what it wrote.
-fn copy_entry(from: &Path, into: &Path, hash: &str) -> io::Result<bool> {
+fn copy_row(
+    from: &Path,
+    into: &Path,
+    row: &Row,
+    mut budget: Option<&mut Budget>,
+) -> io::Result<bool> {
+    let hash = &row.hash;
     let source = from.join(hash);
-    match fs::symlink_metadata(&source) {
-        Ok(metadata) if metadata.is_dir() => {}
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.is_dir() => metadata,
         Ok(_) => return Ok(false),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
+    };
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.admit(row)?;
     }
     remove_entry(into, hash)?;
     fs::create_dir_all(into)?;
     let output = from.join(TERMINAL_OUTPUTS).join(hash);
-    let copied = copyfile(
-        &source,
-        &into.join(hash),
-        COPYFILE_ALL | libc::COPYFILE_RECURSIVE | libc::COPYFILE_NOFOLLOW,
-    )
+    let copied = match budget.as_deref_mut() {
+        Some(budget) => budget.copy(&source, &into.join(hash), &metadata),
+        None => copyfile(
+            &source,
+            &into.join(hash),
+            COPYFILE_ALL | libc::COPYFILE_RECURSIVE | libc::COPYFILE_NOFOLLOW,
+        ),
+    }
     .and_then(|()| match fs::symlink_metadata(&output) {
-        Ok(_) => fs::create_dir_all(into.join(TERMINAL_OUTPUTS)).and_then(|()| {
-            copyfile(
-                &output,
-                &into.join(TERMINAL_OUTPUTS).join(hash),
-                COPYFILE_ALL | libc::COPYFILE_NOFOLLOW,
-            )
-        }),
+        Ok(metadata) => {
+            fs::create_dir_all(into.join(TERMINAL_OUTPUTS))?;
+            let destination = into.join(TERMINAL_OUTPUTS).join(hash);
+            match budget {
+                Some(budget) => budget.copy(&output, &destination, &metadata),
+                None => copyfile(
+                    &output,
+                    &destination,
+                    COPYFILE_ALL | libc::COPYFILE_NOFOLLOW,
+                ),
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     });
@@ -605,6 +979,450 @@ mod tests {
             .unwrap();
         assert!(count.step().unwrap());
         count.integer(0)
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        from: PathBuf,
+        into: PathBuf,
+        state: BuildVolumeState,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "cowshed-carry-bound-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let from = root.join("from");
+            let into = root.join("into");
+            for volume in [&from, &into] {
+                fs::create_dir_all(volume.join("nx/workspace-data")).unwrap();
+                database(&volume.join("nx/workspace-data/task.db"), SCHEMA);
+            }
+            Self {
+                root,
+                from,
+                into,
+                state: BuildVolumeState {
+                    paths: vec![
+                        super::super::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                        super::super::BuildStatePath::new(
+                            ".nx/workspace-data",
+                            "nx/workspace-data",
+                        )
+                        .unwrap(),
+                    ],
+                    fingerprint: None,
+                },
+            }
+        }
+
+        fn entry(&self, hash: &str, size: i64, output: &[u8]) {
+            self.entry_at(Path::new("nx"), hash, size, output);
+        }
+
+        fn entry_at(&self, namespace: &Path, hash: &str, size: i64, output: &[u8]) {
+            let database = self.from.join(namespace).join("workspace-data/task.db");
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO task_details VALUES (?1, 'a', 'build', NULL)",
+                    &[hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cache_outputs (hash, code, size) VALUES (?1, 0, ?2)",
+                    &[hash, &size.to_string()],
+                )
+                .unwrap();
+            let entry = self.from.join(namespace).join("cache").join(hash);
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("output"), output).unwrap();
+        }
+
+        fn selections(hashes: &[&str]) -> BTreeMap<PathBuf, BTreeSet<String>> {
+            BTreeMap::from([(
+                PathBuf::from(".nx"),
+                hashes.iter().map(|hash| (*hash).to_owned()).collect(),
+            )])
+        }
+
+        fn stage(&self, hashes: &[&str]) -> Staged {
+            stage_rebase(
+                &self.from,
+                &self.state,
+                &self.into,
+                &self.state,
+                &Self::selections(hashes),
+            )
+        }
+
+        fn limited(&self, hashes: &[&str], adjust: impl FnOnce(&mut Budget)) -> Staged {
+            let mut budget = Budget::new(&self.into, hashes.len()).unwrap();
+            adjust(&mut budget);
+            stage_with(
+                &self.from,
+                &self.state,
+                &self.into,
+                &self.state,
+                Some(&Self::selections(hashes)),
+                Staged {
+                    budget: Some(budget),
+                    ..Staged::default()
+                },
+            )
+        }
+
+        fn carried_hashes(&self) -> BTreeSet<String> {
+            let connection =
+                Connection::open(&self.into.join("nx/workspace-data/task.db")).unwrap();
+            let mut statement = connection
+                .prepare("SELECT hash FROM cache_outputs")
+                .unwrap();
+            let mut hashes = BTreeSet::new();
+            while statement.step().unwrap() {
+                hashes.insert(statement.text(0));
+            }
+            hashes
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("remove carry fixture");
+        }
+    }
+
+    #[test]
+    fn bounded_copy_preserves_modes_times_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let source = fixture.from.join("nx/cache/1");
+        fs::set_permissions(source.join("output"), fs::Permissions::from_mode(0o440)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        std::os::unix::fs::symlink("output", source.join("alias")).unwrap();
+        let source_time = fs::metadata(source.join("output"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let carried = commit(fixture.stage(&["1"]), &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        let destination = fixture.into.join("nx/cache/1");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        let output = fs::metadata(destination.join("output")).unwrap();
+        assert_eq!(output.permissions().mode() & 0o777, 0o440);
+        assert_eq!(output.modified().unwrap(), source_time);
+        assert_eq!(
+            fs::read_link(destination.join("alias")).unwrap(),
+            PathBuf::from("output")
+        );
+        assert_eq!(fs::read(destination.join("output")).unwrap(), b"warm");
+    }
+
+    #[test]
+    fn a_growing_source_cannot_write_past_its_admitted_length() {
+        let fixture = Fixture::new();
+        let source = fixture.from.join("growing");
+        let destination = fixture.into.join("bounded");
+        fs::write(&source, b"larger than the admitted length").unwrap();
+        let error = copy_data(
+            &mut fs::File::open(&source).unwrap(),
+            &mut fs::File::create(&destination).unwrap(),
+            4,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("grew beyond"));
+        assert_eq!(fs::read(&destination).unwrap(), b"larg");
+    }
+
+    #[test]
+    fn a_shrinking_source_is_not_treated_as_a_whole_staged_file() {
+        let fixture = Fixture::new();
+        let source = fixture.from.join("shrinking");
+        let destination = fixture.into.join("partial");
+        fs::write(&source, b"short").unwrap();
+        let error = copy_data(
+            &mut fs::File::open(&source).unwrap(),
+            &mut fs::File::create(&destination).unwrap(),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shrank below"));
+    }
+
+    #[test]
+    fn rebase_commit_filters_late_entries_without_charging_staged_entries_twice() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let mut staged = fixture.stage(&["1", "2"]);
+        assert!(staged.stopped.is_none(), "{:?}", staged.stopped);
+        // Only the late requested entry fits; moving the staged entry must not charge it again.
+        staged.budget.as_mut().unwrap().recorded_bytes = 4;
+        fixture.entry("2", 4, b"late");
+        fixture.entry("999", 1_000_000, b"old history");
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 2);
+        assert_eq!(carried.bytes, 8);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!(
+            fixture.carried_hashes(),
+            BTreeSet::from(["1".into(), "2".into()])
+        );
+        assert!(!fixture.into.join("nx/cache/999").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_row_bound_keeps_the_whole_staged_prefix() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        fixture.entry("2", 4, b"more");
+        let staged = fixture.limited(&["1", "2"], |budget| budget.rows = 1);
+        assert_eq!(staged.databases[0].rows.len(), 1);
+        assert!(staged.stopped.as_ref().unwrap().contains("0 rows"));
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(fixture.carried_hashes().len(), 1);
+        assert!(
+            carried
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("rebase carry bound")
+        );
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_recorded_byte_bound_keeps_the_whole_staged_prefix() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 1024, &[42; 1024]);
+        fixture.entry("2", 1024, &[43; 1024]);
+        let staged = fixture.limited(&["1", "2"], |budget| budget.recorded_bytes = 1024);
+        assert_eq!(staged.databases[0].rows.len(), 1);
+        assert!(
+            staged
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("0 recorded bytes remain")
+        );
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(carried.bytes, 1024);
+        assert_eq!(fixture.carried_hashes().len(), 1);
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_actual_byte_bound_removes_a_partial_entry_with_an_understated_row() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 1, &[42; 65536]);
+        let staged = fixture.limited(&["1"], |budget| budget.copy_bytes = budget.block_size * 2);
+        assert!(staged.databases[0].rows.is_empty());
+        assert!(staged.stopped.as_ref().unwrap().contains("copy bytes"));
+        assert!(!fixture.into.join(STAGING).join("0/1").exists());
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(fixture.carried_hashes().is_empty());
+        assert!(!fixture.into.join("nx/cache/1").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_free_space_reserve_stops_before_writing_an_entry() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let staged = fixture.limited(&["1"], |budget| budget.reserve = u64::MAX);
+        assert!(staged.databases[0].rows.is_empty());
+        assert!(
+            staged
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("free-space reserve")
+        );
+        assert!(!fixture.into.join(STAGING).join("0/1").exists());
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(fixture.carried_hashes().is_empty());
+    }
+
+    #[test]
+    fn rebase_commit_bound_indexes_the_staged_prefix_before_stopping_a_late_copy() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let mut staged = fixture.stage(&["1", "2"]);
+        staged.budget.as_mut().unwrap().recorded_bytes = 0;
+        fixture.entry("2", 4, b"late");
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
+        assert!(
+            carried
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("rebase carry bound")
+        );
+        assert!(!fixture.into.join("nx/cache/2").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_changed_row_never_indexes_its_stale_staged_files() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        fixture.entry("2", 4, b"old!");
+        let staged = fixture.stage(&["1", "2"]);
+        Connection::open(&fixture.from.join("nx/workspace-data/task.db"))
+            .unwrap()
+            .execute("UPDATE cache_outputs SET code = 1 WHERE hash = '2'", &[])
+            .unwrap();
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
+        assert!(carried.stopped.as_ref().unwrap().contains("0 rows"));
+        assert!(!fixture.into.join("nx/cache/2").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn rebase_empty_selection_carries_nothing_and_missing_selection_never_widens() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let empty = fixture.stage(&[]);
+        assert!(empty.stopped.is_none());
+        let carried = commit(empty, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(carried.stopped.is_none());
+        let missing = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &BTreeMap::new(),
+        );
+        assert!(missing.databases.is_empty());
+        assert!(
+            missing
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("no current-tree task hashes")
+        );
+        assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    #[test]
+    fn rebase_nested_nx_states_use_their_own_hash_selection() {
+        let mut fixture = Fixture::new();
+        for volume in [&fixture.from, &fixture.into] {
+            let data = volume.join("tools/widget/nx/workspace-data");
+            fs::create_dir_all(&data).unwrap();
+            database(&data.join("task.db"), SCHEMA);
+        }
+        fixture.state.paths.extend([
+            super::super::BuildStatePath::new("tools/widget/.nx/cache", "tools/widget/nx/cache")
+                .unwrap(),
+            super::super::BuildStatePath::new(
+                "tools/widget/.nx/workspace-data",
+                "tools/widget/nx/workspace-data",
+            )
+            .unwrap(),
+        ]);
+        fixture.entry("1", 4, b"root");
+        fixture.entry("2", 4, b"old!");
+        fixture.entry_at(Path::new("tools/widget/nx"), "2", 4, b"nest");
+        let mut selections = Fixture::selections(&["1"]);
+        selections.insert(
+            PathBuf::from("tools/widget/.nx"),
+            BTreeSet::from(["2".into()]),
+        );
+        let staged = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &selections,
+        );
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 2);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
+        assert_eq!(
+            fs::read(fixture.into.join("tools/widget/nx/cache/2/output")).unwrap(),
+            b"nest"
+        );
+        assert!(!fixture.into.join("nx/cache/2").exists());
+    }
+
+    #[test]
+    fn rebase_carry_stages_only_current_tree_hashes_even_with_large_history() {
+        let fixture = Fixture::new();
+        for hash in 1..=64 {
+            fixture.entry(&hash.to_string(), 1024, &[42; 1024]);
+        }
+        let staged = fixture.stage(&["1"]);
+        let copied: BTreeSet<_> = staged
+            .databases
+            .iter()
+            .flat_map(|database| database.rows.iter().map(|row| row.hash.clone()))
+            .collect();
+        let copied_bytes: u64 = copied
+            .iter()
+            .map(|hash| {
+                fs::metadata(
+                    fixture
+                        .into
+                        .join(STAGING)
+                        .join("0")
+                        .join(hash)
+                        .join("output"),
+                )
+                .unwrap()
+                .len()
+            })
+            .sum();
+        assert_eq!(
+            copied,
+            BTreeSet::from(["1".to_owned()]),
+            "historical hashes cannot hit the rebased tree"
+        );
+        assert_eq!(
+            copied_bytes, 1024,
+            "carry writes only the tree's needed entry"
+        );
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(carried.bytes, 1024);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+    }
+
+    #[test]
+    fn rebase_never_copies_an_unbounded_task_database_to_initialize_a_new_cache() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        fs::remove_file(fixture.into.join("nx/workspace-data/task.db")).unwrap();
+        let staged = fixture.stage(&["1"]);
+        assert!(staged.databases.is_empty());
+        assert!(
+            staged
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("unbounded task history")
+        );
+        assert!(!fixture.into.join("nx/workspace-data/task.db").exists());
+        assert!(!fixture.into.join("nx/cache/1").exists());
     }
 
     /// A target row the carry would index without its task details stops the carry and

@@ -469,19 +469,31 @@ deletes before it starts.
 
 A workspace forked before other lands holds none of what they ran. `cowshed rebase` moves its tree onto the target's,
 where the target's volume already holds those tasks' entries, so the workspace's next gate would re-run every task the
-target ran at that tree. So once a rebase has not conflicted, the workspace's build volume takes every Nx cache entry
-the target's task database indexes and its own lacks, with the land's carry (above), in the other direction: the
-target's volume is the source and the workspace's is the destination.
+target ran at that tree. So once a rebase has not conflicted, stock Nx computes task hashes in the rebased checkout.
+Only target entries with one of those current-tree hashes that the workspace lacks are eligible to carry; historical
+hashes are not copied merely because main still indexes them. Each Nx root is selected independently. An unavailable or
+failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. The target's
+volume is the source and the workspace's is the destination.
 
-1. **Stage** while both sides run: the target's missing rows are read and their files copied into the workspace volume's
-   `.carry/`, as at Land 5.1.
+1. **Select and stage** while both sides run: a temporary SQLite table indexes the current hashes, joined to the
+   target's missing rows. Only these entries are copied into the workspace volume's `.carry/`, as at Land 5.1. The hash
+   probe establishes the destination's own Nx task database. If it is absent, the carry stops rather than copying the
+   source's potentially unbounded task-history database just to initialize a cache.
 2. **Close each side**, the workspace first, as Land 5.2–5.4 close the target: when nothing but the side's daemon holds
    its task database, stop that daemon (it restarts on its next client); any other holder skips.
 3. **Take both sides' open locks and look again**, as Land 6.1–6.2 do for the target: a lock some process holds, or a
    database some process opened since the close, skips. The workspace's jobs keep running through a rebase, unlike a
    landing workspace's, so this look is what proves nothing in the workspace writes its database during the commit; an
    Nx process that starts meanwhile waits on the lock.
-4. **Commit**, as Land 5.5, then let go of the locks.
+4. **Commit**, as Land 5.5, retaining the same hash selection for entries indexed after stage, then let go of the locks.
+
+One budget spans both phases and every Nx state: at most as many entries as selected task hashes, at most a tenth of the
+destination filesystem's capacity in recorded entry bytes and in block-rounded copied bytes, and a tenth of its capacity
+kept free. The byte allowance is reduced to the currently available space above that reserve. Every filesystem object is
+charged and free space checked before its write; a cache row understating a file's size cannot hide an unbounded copy.
+Files are walked once, not sized in a preliminary second traversal, and directory metadata is restored after children.
+Hitting a bound stops with `carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves
+the rebase successful. Moving staged entries at commit consumes no second copy allowance.
 
 A skip deletes what was staged and names the side, the database and each process with its pid and command; the rebase
 itself has happened and stands. A copy that fails stops the carry and keeps what was carried until then, as at a land.
@@ -490,7 +502,9 @@ The report is `RebaseReport { oid, buildVolume }`, where `buildVolume` is `carri
 (Targets and seeds).
 
 - **Enforced by**: a real-APFS test in which a workspace forked before a land rebases after it, its report counts the
-  land's entries carried, and its run of the landed check then hits every task.
+  land's entries carried, and its run of the landed check then hits every task; a carry regression with a historical
+  cache larger than the rebased tree's selected entries that asserts only selected files are written; and row, recorded
+  byte, actual copied byte and late-entry selection tests that preserve the completed prefix without a partial entry.
 
 ### Stacks and merge queues
 
