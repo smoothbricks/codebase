@@ -441,6 +441,51 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    procfs_holders(|process| {
+        fs::read_dir(process.join("fd")).is_ok_and(|descriptors| {
+            descriptors
+                .flatten()
+                .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(|link| link == file))
+        })
+    })
+}
+
+/// Every process holding anything on the volume mounted at `mount` -- an open file, a mapped
+/// file, its working directory, its root, its executable -- which is what keeps `umount`
+/// answering `EBUSY`. From procfs, so a process of another user, or one that exited since the
+/// listing, shows none.
+#[cfg(target_os = "linux")]
+pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
+    let mount = match fs::canonicalize(mount) {
+        Ok(mount) => mount,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let on_volume = |link: PathBuf| link.starts_with(&mount);
+    procfs_holders(|process| {
+        ["cwd", "root", "exe"]
+            .iter()
+            .any(|name| fs::read_link(process.join(name)).is_ok_and(on_volume))
+            || fs::read_dir(process.join("fd")).is_ok_and(|descriptors| {
+                descriptors
+                    .flatten()
+                    .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(on_volume))
+            })
+            // A mapping's path is its line's last field and the line's first `/`: the
+            // address range, permissions, offset, device and inode before it hold none.
+            || fs::read_to_string(process.join("maps")).is_ok_and(|maps| {
+                maps.lines().any(|mapping| {
+                    mapping
+                        .find('/')
+                        .is_some_and(|start| Path::new(&mapping[start..]).starts_with(&mount))
+                })
+            })
+    })
+}
+
+/// Every process under `/proc` that `held` answers yes for, given its `/proc/<pid>` directory.
+#[cfg(target_os = "linux")]
+fn procfs_holders(held: impl Fn(&Path) -> bool) -> io::Result<Vec<Holder>> {
     let mut holders = Vec::new();
     for process in fs::read_dir("/proc")? {
         let process = process?;
@@ -451,13 +496,7 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
         else {
             continue;
         };
-        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
-            continue;
-        };
-        if descriptors
-            .flatten()
-            .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(|link| link == file))
-        {
+        if held(&process.path()) {
             holders.push(Holder {
                 pid,
                 command: command_line(pid),
@@ -923,7 +962,7 @@ fn parse_utc_millis(value: &str) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::fork_lock::Spawn as _;
 
     fn scratch(label: &str) -> PathBuf {
@@ -1165,7 +1204,7 @@ mod tests {
     /// A busy detach names what holds the volume. The holder a checkout most often has is a
     /// process whose working directory is in it -- an Nx daemon, a shell -- with no file open,
     /// which a per-file query never sees.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_process_whose_cwd_is_on_a_volume_is_one_of_its_holders() {
         let root = scratch("volume-holders");
