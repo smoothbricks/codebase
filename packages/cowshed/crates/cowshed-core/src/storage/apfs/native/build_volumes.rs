@@ -1114,8 +1114,8 @@ mod tests {
                 Ok(true)
             }
 
-            fn close_stdin(&mut self) -> crate::error::Result<()> {
-                Ok(())
+            fn close_stdin(&mut self) -> bool {
+                true
             }
 
             fn end_stdin(&mut self) {}
