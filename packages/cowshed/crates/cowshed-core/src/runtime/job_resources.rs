@@ -11,8 +11,8 @@ use super::job_groups::Birth;
 use super::supervisor::{OwnedProcess, byte_count};
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::resources::{
-    HostLoadSample, JobResourceSample, JobStreamWatermark, ResidentBytes, ResourceUnitError,
-    StreamBytes, StreamLines, WallMicros,
+    HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark, ResidentBytes,
+    ResourceUnitError, StreamBytes, StreamLines, WallMicros,
 };
 use crate::error::{CowshedError, Result};
 use crate::host_load::HostLoadError;
@@ -83,6 +83,15 @@ impl Sampling {
             )),
         }
     }
+
+    /// The sampler of a job that owns processes and has not ended.
+    #[cfg(target_os = "macos")]
+    pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
+        match self {
+            Self::Live(sampler) => Some(sampler),
+            Self::Unowned | Self::Frozen(_) => None,
+        }
+    }
 }
 
 /// What the system said about a job's processes at one sample boundary.
@@ -96,6 +105,9 @@ pub(super) struct Observation {
     /// The job's output streams as the supervisor had admitted them by the boundary.
     pub stdout: StreamTally,
     pub stderr: StreamTally,
+    /// The job's totals from its platform's independent source, read at the boundary; `None`
+    /// where no complete source exists.
+    pub accounting: Option<JobAccounting>,
 }
 
 /// One process of the job's group, as read at a sample boundary.
@@ -152,6 +164,9 @@ pub(super) struct JobSampler {
     host_start: std::result::Result<HostLoadSample, HostLoadError>,
     /// The largest group resident sum a sample of this job has observed.
     rss_peak: ResidentBytes,
+    /// The job's CPU source: each leader's own and reaped-children rusage, the activation's once.
+    #[cfg(target_os = "macos")]
+    rusage: super::job_accounting::RusageChildren,
 }
 
 impl JobSampler {
@@ -159,6 +174,8 @@ impl JobSampler {
         Self {
             job_id,
             spawned: first.spawned,
+            #[cfg(target_os = "macos")]
+            rusage: super::job_accounting::RusageChildren::charging(first.birth.clone()),
             leader: first.birth,
             host_start: first.host,
             rss_peak: ResidentBytes::ZERO,
@@ -166,7 +183,16 @@ impl JobSampler {
     }
 
     fn lead(&mut self, leader: Birth) {
+        #[cfg(target_os = "macos")]
+        self.rusage.lead(leader.clone());
         self.leader = leader;
+    }
+
+    /// The job's CPU source, which the supervisor reads at each boundary and closes at the end
+    /// of an activation.
+    #[cfg(target_os = "macos")]
+    pub(super) fn rusage(&mut self) -> &mut super::job_accounting::RusageChildren {
+        &mut self.rusage
     }
 
     /// The process whose group is the job's now.
@@ -223,6 +249,7 @@ impl JobSampler {
             rss_peak_bytes: self.rss_peak,
             stdout,
             stderr,
+            accounting: observed.accounting,
         })
     }
 }
@@ -273,6 +300,7 @@ mod tests {
                 .collect(),
             stdout: StreamTally::default(),
             stderr: StreamTally::default(),
+            accounting: None,
         }
     }
 

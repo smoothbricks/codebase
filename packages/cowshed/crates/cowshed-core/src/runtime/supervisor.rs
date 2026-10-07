@@ -421,6 +421,17 @@ pub enum ProcessEvent {
         job_id: JobId,
         process: OwnedProcess,
     },
+    /// The cold host's activation for the job ended, however it ended: its interval's cost, read
+    /// by the host's parent while it still held the host. The host's later work is not the
+    /// job's.
+    #[cfg(target_os = "macos")]
+    ActivationEnded {
+        job_id: JobId,
+        usage: std::result::Result<
+            super::job_accounting::LeaderRusage,
+            super::job_accounting::LeaderRusageError,
+        >,
+    },
     /// A command that runs in a warm exec host started after its job was admitted. The host is
     /// the command's parent and observed its group leader before it could reap it.
     Started {
@@ -4072,6 +4083,17 @@ impl SupervisorActor {
                     own_process(job, process);
                 }
             }
+            #[cfg(target_os = "macos")]
+            ProcessEvent::ActivationEnded { job_id, usage } => {
+                // An ended job's sampling stays as it ended.
+                if let Some(sampler) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|job| job.sampling.live())
+                {
+                    sampler.rusage().end(usage);
+                }
+            }
             ProcessEvent::Started { job_id, process } => {
                 let ledger = self.group_ledger.is_some();
                 if let Some(job) = self.jobs.get_mut(&job_id) {
@@ -4827,6 +4849,17 @@ fn observe(
         })?;
         members.push(Member { pid, resident });
     }
+    // The leader's own and reaped-children CPU, read after the membership: a member that exited
+    // and was reaped since is already in its parent's children total.
+    #[cfg(target_os = "macos")]
+    let accounting = Some(
+        sampler
+            .rusage()
+            .account(super::job_accounting::read_leader)
+            .map_err(|error| unaccounted(leader, error))?,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let accounting = None;
     sampler.sample(Observation {
         now: Instant::now(),
         sampled_at,
@@ -4834,7 +4867,28 @@ fn observe(
         host,
         stdout,
         stderr,
+        accounting,
     })
+}
+
+/// Why job group `leader`'s CPU totals cannot be stated: the kernel would not answer for a
+/// leader, or the readings contradict each other.
+#[cfg(target_os = "macos")]
+fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> CowshedError {
+    use super::job_accounting::AccountingError;
+    match error {
+        AccountingError::Leader(_) => CowshedError::environment_missing(
+            format!("the CPU accounting of job group {leader} is unavailable: {error}"),
+            "the job runs on; its CPU totals cannot be stated",
+        ),
+        AccountingError::Regressed { .. }
+        | AccountingError::OtherLeader { .. }
+        | AccountingError::NoneCharged { .. }
+        | AccountingError::Unclosed { .. }
+        | AccountingError::Inexact(_) => CowshedError::internal(format!(
+            "the CPU accounting of job group {leader} is inconsistent: {error}"
+        )),
+    }
 }
 
 /// A resources read: a running job observed now and kept as its latest sample, an ended job's

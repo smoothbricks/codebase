@@ -30,8 +30,9 @@ use crate::api::dto::{
     validate_command_argv,
 };
 use crate::api::resources::{
-    HostLoadSample, JobResourceSample, JobStreamWatermark, ResidentBytes, ResourceUnitError,
-    StreamBytes, StreamLines, WallMicros,
+    CpuMicros, CpuTotals, HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark,
+    ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
+    WallMicros,
 };
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
@@ -113,6 +114,20 @@ const RESOURCE_COLUMNS: [&str; 14] = [
 ];
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
+/// The terminal sample's accounting, after [`RESOURCE_COLUMNS`]: its source, its user and system
+/// CPU microseconds, and its storage read and write bytes. All null for a sample without
+/// accounting; the bytes are null together where the source has none.
+const ACCOUNTING_COLUMNS: [&str; 5] = [
+    "resources_accounting_source",
+    "resources_accounting_cpu_user_us",
+    "resources_accounting_cpu_sys_us",
+    "resources_accounting_io_read_bytes",
+    "resources_accounting_io_write_bytes",
+];
+/// The first of [`ACCOUNTING_COLUMNS`].
+const ACCOUNTING_COLUMN: usize = RESOURCE_COLUMN + RESOURCE_COLUMNS.len();
+/// [`JobAccounting::MacOsRusageChildren`] in its source column: its wire kind.
+const RUSAGE_CHILDREN_SOURCE: &str = "macOsRusageChildren";
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -3530,6 +3545,11 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(RESOURCE_COLUMNS[11], DataType::UInt64, true),
         field(RESOURCE_COLUMNS[12], DataType::UInt64, true),
         field(RESOURCE_COLUMNS[13], DataType::UInt64, true),
+        field(ACCOUNTING_COLUMNS[0], DataType::Utf8, true),
+        field(ACCOUNTING_COLUMNS[1], DataType::UInt64, true),
+        field(ACCOUNTING_COLUMNS[2], DataType::UInt64, true),
+        field(ACCOUNTING_COLUMNS[3], DataType::UInt64, true),
+        field(ACCOUNTING_COLUMNS[4], DataType::UInt64, true),
     ]))
 }
 
@@ -3738,6 +3758,12 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
     let stderr = flatten_storage(&record.stderr.storage);
     let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
     let resources = record.resources.as_ref();
+    let (source, cpu, io) = match resources.and_then(|sample| sample.accounting.as_ref()) {
+        None => (None, None, None),
+        Some(JobAccounting::MacOsRusageChildren { cpu, io }) => {
+            (Some(RUSAGE_CHILDREN_SOURCE), Some(*cpu), *io)
+        }
+    };
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
@@ -3842,6 +3868,11 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt64Array::from(vec![
             resources.map(|sample| sample.stderr.lines.get()),
         ])),
+        Arc::new(StringArray::from(vec![source])),
+        Arc::new(UInt64Array::from(vec![cpu.map(|cpu| cpu.user_us.get())])),
+        Arc::new(UInt64Array::from(vec![cpu.map(|cpu| cpu.sys_us.get())])),
+        Arc::new(UInt64Array::from(vec![io.map(|io| io.read_bytes.get())])),
+        Arc::new(UInt64Array::from(vec![io.map(|io| io.write_bytes.get())])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3960,8 +3991,14 @@ fn decode_resources(
         .clone()
         .filter(|&column| batch.column(column).is_null(0))
         .count();
+    let accounting = decode_accounting(batch)?;
     if nulls == RESOURCE_COLUMNS.len() {
-        return Ok(None);
+        return match accounting {
+            None => Ok(None),
+            Some(_) => Err(ArtifactError::Arrow(
+                "accounting columns belong to a resource sample, and this record has none".into(),
+            )),
+        };
     }
     if nulls != 0 {
         return Err(ArtifactError::Arrow(
@@ -4013,7 +4050,46 @@ fn decode_resources(
         rss_peak_bytes: rss_peak,
         stdout: stream(RESOURCE_COLUMN + 10)?,
         stderr: stream(RESOURCE_COLUMN + 12)?,
+        accounting,
     }))
+}
+
+/// A sample's accounting from [`ACCOUNTING_COLUMNS`]: absent when every one is null. A known
+/// source carries its CPU; its bytes are both present or both absent. Anything else is damage.
+fn decode_accounting(batch: &RecordBatch) -> Result<Option<JobAccounting>, ArtifactError> {
+    let present = |offset: usize| !batch.column(ACCOUNTING_COLUMN + offset).is_null(0);
+    let damaged = |why: &str| Err(ArtifactError::Arrow(format!("accounting columns: {why}")));
+    let unit = |error: ResourceUnitError| ArtifactError::Arrow(error.to_string());
+    let value = |offset: usize| -> Result<u64, ArtifactError> {
+        Ok(uint64(batch, ACCOUNTING_COLUMN + offset)?.value(0))
+    };
+    if !present(0) {
+        return if (1..ACCOUNTING_COLUMNS.len()).any(present) {
+            damaged("counters without a source")
+        } else {
+            Ok(None)
+        };
+    }
+    let source = string(batch, ACCOUNTING_COLUMN)?.value(0);
+    if source != RUSAGE_CHILDREN_SOURCE {
+        return damaged(&format!("unknown source {source:?}"));
+    }
+    if !(present(1) && present(2)) {
+        return damaged("a source without its CPU totals");
+    }
+    let cpu = CpuTotals {
+        user_us: CpuMicros::new(value(1)?).map_err(unit)?,
+        sys_us: CpuMicros::new(value(2)?).map_err(unit)?,
+    };
+    let io = match (present(3), present(4)) {
+        (false, false) => None,
+        (true, true) => Some(StorageIoTotals {
+            read_bytes: StorageIoBytes::new(value(3)?).map_err(unit)?,
+            write_bytes: StorageIoBytes::new(value(4)?).map_err(unit)?,
+        }),
+        (true, false) | (false, true) => return damaged("read bytes without write bytes"),
+    };
+    Ok(Some(JobAccounting::MacOsRusageChildren { cpu, io }))
 }
 
 fn visible_storage_name(kind: VisibleStorageKind) -> &'static str {
@@ -5397,6 +5473,13 @@ mod tests {
             host: HostLoadSample::new(3.75, 10).unwrap(),
             rss_bytes: ResidentBytes::new(128 << 20).unwrap(),
             rss_peak_bytes: ResidentBytes::new(256 << 20).unwrap(),
+            accounting: Some(JobAccounting::MacOsRusageChildren {
+                cpu: CpuTotals {
+                    user_us: CpuMicros::new(1_900_000).unwrap(),
+                    sys_us: CpuMicros::new(120_000).unwrap(),
+                },
+                io: None,
+            }),
             stdout: watermark(5, 3),
             stderr: watermark(2_097_152, 2_097_152),
         }
@@ -5482,6 +5565,91 @@ mod tests {
         ] {
             assert!(record.validate().is_err(), "{why}");
         }
+    }
+
+    /// A sample's accounting survives the record: its source, its CPU, and its storage bytes
+    /// as present or as unavailable -- never zero. A sample without accounting keeps none, and
+    /// columns that state part of a source are damage.
+    #[test]
+    fn the_current_layout_keeps_a_sample_s_accounting_and_its_unavailable_bytes() {
+        let record = |accounting| JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            resources: Some(JobResourceSample {
+                accounting,
+                ..sample(9, 1_234_567, 4242)
+            }),
+            ..valid_job_record(9)
+        };
+        let with_bytes = Some(JobAccounting::MacOsRusageChildren {
+            cpu: CpuTotals::ZERO,
+            io: Some(StorageIoTotals {
+                read_bytes: StorageIoBytes::new(4096).unwrap(),
+                write_bytes: StorageIoBytes::new(0).unwrap(),
+            }),
+        });
+        let unavailable = sample(9, 1, 1).accounting;
+        for accounting in [unavailable, None, with_bytes] {
+            let sealed = record(accounting);
+            let batch = job_record_to_batch(&sealed).unwrap();
+            let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
+                panic!("a job record");
+            };
+            assert_eq!(read, sealed, "{accounting:?} round-trips");
+        }
+        let unavailable_io = job_record_to_batch(&record(unavailable)).unwrap();
+        assert!(
+            unavailable_io.column(ACCOUNTING_COLUMN + 3).is_null(0)
+                && unavailable_io.column(ACCOUNTING_COLUMN + 4).is_null(0),
+            "bytes the source has none of are stored as absent, not zero"
+        );
+
+        let damaged = |base: &RecordBatch, column: usize, replacement: ArrayRef| {
+            let mut columns = base.columns().to_vec();
+            columns[ACCOUNTING_COLUMN + column] = replacement;
+            let batch = RecordBatch::try_new(base.schema(), columns).unwrap();
+            batch_to_protected_record(&batch).is_err()
+        };
+        let null = |base: &RecordBatch, column: usize| {
+            new_null_array(
+                base.schema().field(ACCOUNTING_COLUMN + column).data_type(),
+                1,
+            )
+        };
+        let accounted = job_record_to_batch(&record(with_bytes)).unwrap();
+        for column in [0, 1, 2, 3, 4] {
+            assert!(
+                damaged(&accounted, column, null(&accounted, column)),
+                "{} alone is null",
+                ACCOUNTING_COLUMNS[column]
+            );
+        }
+        assert!(damaged(
+            &accounted,
+            0,
+            Arc::new(StringArray::from(vec!["liveMembers"]))
+        ));
+        assert!(damaged(
+            &accounted,
+            1,
+            Arc::new(UInt64Array::from(vec![
+                crate::api::resources::MAX_EXACT_INTEGER + 1
+            ]))
+        ));
+        let unaccounted = job_record_to_batch(&record(None)).unwrap();
+        assert!(
+            damaged(&unaccounted, 1, Arc::new(UInt64Array::from(vec![7]))),
+            "CPU without a source"
+        );
+        let sampleless = job_record_to_batch(&valid_job_record(9)).unwrap();
+        assert!(
+            damaged(
+                &sampleless,
+                0,
+                Arc::new(StringArray::from(vec![RUSAGE_CHILDREN_SOURCE]))
+            ),
+            "accounting without a sample"
+        );
     }
 
     fn valid_job_record(job_id: u64) -> JobArtifactRecord {

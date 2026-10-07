@@ -59,6 +59,11 @@ impl CpuMicros {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// The CPU time `self` and `other` count together.
+    pub fn checked_add(self, other: Self) -> Result<Self, ResourceUnitError> {
+        exact("cpuUs", u128::from(self.0) + u128::from(other.0)).map(Self)
+    }
 }
 
 impl TryFrom<u64> for CpuMicros {
@@ -148,6 +153,63 @@ impl From<StorageIoBytes> for u64 {
     fn from(value: StorageIoBytes) -> Self {
         value.0
     }
+}
+
+/// User and system CPU time, each cumulative from the start of whatever it counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuTotals {
+    pub user_us: CpuMicros,
+    pub sys_us: CpuMicros,
+}
+
+impl CpuTotals {
+    pub const ZERO: Self = Self {
+        user_us: CpuMicros(0),
+        sys_us: CpuMicros(0),
+    };
+
+    /// What `self` and `other` count together, each part summed on its own.
+    pub fn checked_add(self, other: Self) -> Result<Self, ResourceUnitError> {
+        Ok(Self {
+            user_us: self.user_us.checked_add(other.user_us)?,
+            sys_us: self.sys_us.checked_add(other.sys_us)?,
+        })
+    }
+}
+
+/// Bytes a job's accounting source counted as read from and written to storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageIoTotals {
+    pub read_bytes: StorageIoBytes,
+    pub write_bytes: StorageIoBytes,
+}
+
+/// A job's complete totals and the independent source that counted them: never a sum of the
+/// processes a sampler happened to see, which misses every descendant born and reaped between
+/// two samples.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobAccounting {
+    /// macOS `proc_pid_rusage` of each process that led the job, read while its parent held it
+    /// unreaped: its own CPU (`ri_user_time`/`ri_system_time`) plus that of every child it
+    /// reaped (`ri_child_user_time`/`ri_child_system_time`, which carry their own reaped
+    /// children's in turn). A cold host's activation and the command each count once, the
+    /// activation up to its end. A descendant still running, or one orphaned and reaped by
+    /// another process, is not in it yet.
+    MacOsRusageChildren {
+        cpu: CpuTotals,
+        /// Always absent: the children accumulators carry no disk I/O bytes, so the source has
+        /// no job total. Never zero in its place, and never `ri_child_pageins` operations
+        /// converted into bytes.
+        io: Option<StorageIoTotals>,
+    },
 }
 
 /// Elapsed wall time since the job's first owned process spawned, in microseconds.
@@ -419,6 +481,9 @@ pub struct JobResourceSample {
     /// The largest `rssBytes` this job has been sampled at, this sample's included: a group's
     /// peak, never the sum of its processes' separate peaks.
     pub rss_peak_bytes: ResidentBytes,
+    /// The job's complete totals from its platform's independent source, as of this boundary:
+    /// absent only where no complete source exists yet (Linux, until its cgroup v2 totals).
+    pub accounting: Option<JobAccounting>,
     pub stdout: JobStreamWatermark,
     pub stderr: JobStreamWatermark,
 }
@@ -512,6 +577,7 @@ mod tests {
             host: host(),
             rss_bytes: bytes(0),
             rss_peak_bytes: bytes(0),
+            accounting: None,
             stdout,
             stderr: stream(0, 0),
         }
@@ -531,6 +597,7 @@ mod tests {
             host: host(),
             rss_bytes: bytes(4096),
             rss_peak_bytes: bytes(8192),
+            accounting: None,
             stdout: stream(0, 0),
             stderr: stream(0, 0),
         };
@@ -555,6 +622,7 @@ mod tests {
             host: host(),
             rss_bytes: bytes(8192),
             rss_peak_bytes: bytes(4096),
+            accounting: None,
             stdout: stream(0, 0),
             stderr: stream(0, 0),
         };
@@ -625,6 +693,13 @@ mod tests {
             host: host(),
             rss_bytes: bytes(1 << 20),
             rss_peak_bytes: bytes(3 << 20),
+            accounting: Some(JobAccounting::MacOsRusageChildren {
+                cpu: CpuTotals {
+                    user_us: CpuMicros::new(1_250_000).expect("exact"),
+                    sys_us: CpuMicros::new(80_000).expect("exact"),
+                },
+                io: None,
+            }),
             stdout: stream(5, 3),
             stderr: stream(0, 0),
         };
@@ -642,6 +717,11 @@ mod tests {
                 "host": { "load1": 1.25, "cores": 8 },
                 "rssBytes": 1_048_576,
                 "rssPeakBytes": 3_145_728,
+                "accounting": {
+                    "kind": "macOsRusageChildren",
+                    "cpu": {"userUs": 1_250_000, "sysUs": 80_000},
+                    "io": null,
+                },
                 "stdout": {"bytes": 5, "lines": 3},
                 "stderr": {"bytes": 0, "lines": 0},
             })
@@ -654,6 +734,10 @@ mod tests {
             ("/wallUs", serde_json::json!(MAX_EXACT_INTEGER + 1)),
             ("/rssBytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
             ("/rssPeakBytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            (
+                "/accounting/cpu/userUs",
+                serde_json::json!(MAX_EXACT_INTEGER + 1),
+            ),
             ("/stdout/bytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
             ("/stderr/lines", serde_json::json!(MAX_EXACT_INTEGER + 1)),
         ] {
@@ -664,11 +748,55 @@ mod tests {
                 "{pointer} is refused"
             );
         }
-        let mut unknown = json;
-        unknown["stdout"]["chars"] = serde_json::json!(5);
+        for (pointer, field, value, why) in [
+            (
+                "/stdout",
+                "chars",
+                serde_json::json!(5),
+                "a watermark has only bytes and lines",
+            ),
+            (
+                "/accounting",
+                "pageins",
+                serde_json::json!(5),
+                "no block-operation count stands in for bytes",
+            ),
+            (
+                "/accounting/cpu",
+                "childUs",
+                serde_json::json!(5),
+                "CPU totals are user and system",
+            ),
+        ] {
+            let mut unknown = json.clone();
+            unknown.pointer_mut(pointer).expect("object")[field] = value;
+            assert!(
+                serde_json::from_value::<JobResourceSample>(unknown).is_err(),
+                "{why}"
+            );
+        }
+        let mut sourceless = json;
+        sourceless["accounting"]["kind"] = serde_json::json!("liveMembers");
         assert!(
-            serde_json::from_value::<JobResourceSample>(unknown).is_err(),
-            "a watermark has only bytes and lines"
+            serde_json::from_value::<JobResourceSample>(sourceless).is_err(),
+            "totals name a declared source"
+        );
+    }
+
+    #[test]
+    fn cpu_totals_add_part_by_part_within_the_exact_boundary() {
+        let cpu = |user, sys| CpuTotals {
+            user_us: CpuMicros::new(user).expect("exact"),
+            sys_us: CpuMicros::new(sys).expect("exact"),
+        };
+        assert_eq!(cpu(300, 20).checked_add(cpu(700, 5)), Ok(cpu(1_000, 25)));
+        assert_eq!(CpuTotals::ZERO.checked_add(cpu(1, 2)), Ok(cpu(1, 2)));
+        assert_eq!(
+            cpu(MAX_EXACT_INTEGER, 0).checked_add(cpu(1, 0)),
+            Err(ResourceUnitError::Inexact {
+                unit: "cpuUs",
+                value: u128::from(MAX_EXACT_INTEGER) + 1,
+            })
         );
     }
 }

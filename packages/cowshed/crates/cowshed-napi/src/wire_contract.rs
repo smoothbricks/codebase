@@ -21,15 +21,16 @@ use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path
 
 use cowshed_core::{
     api::{
-        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
-        EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
-        GcReport, GitOid, GrantSet, HostLoadSample, JobId, JobInfo, JobResourceSample, JobState,
-        JobStreamWatermark, LandReport, LandingCommits, OutputLimitInfo, OutputStorage,
-        OutputSummary, PortBlock, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
-        RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
-        Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines,
-        TraceContext, TraceId, UtcTimestamp, WallMicros, WorkspaceIncarnation, WorkspaceInfo,
-        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros, CpuTotals,
+        DoctorReport, EgressMode, EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate,
+        GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
+        JobInfo, JobResourceSample, JobState, JobStreamWatermark, LandReport, LandingCommits,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
+        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
+        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
+        StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UtcTimestamp, WallMicros,
+        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
+        WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -198,6 +199,14 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             host: HostLoadSample::new(6.25, 10).expect("fixture host"),
             rss_bytes: ResidentBytes::new(48 << 20).expect("fixture resident bytes"),
             rss_peak_bytes: ResidentBytes::new(96 << 20).expect("fixture resident bytes"),
+            // The macOS source: its CPU in named microseconds, its byte totals unavailable.
+            accounting: Some(JobAccounting::MacOsRusageChildren {
+                cpu: CpuTotals {
+                    user_us: CpuMicros::new(2_180_500).expect("fixture cpu"),
+                    sys_us: CpuMicros::new(310_250).expect("fixture cpu"),
+                },
+                io: None,
+            }),
             stdout: JobStreamWatermark {
                 bytes: StreamBytes::new(4096).expect("fixture stream bytes"),
                 lines: StreamLines::new(64).expect("fixture stream lines"),

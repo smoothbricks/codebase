@@ -3283,11 +3283,33 @@ fn lone_group() -> std::process::Child {
         .expect("a test-owned process group")
 }
 
-/// Kill the group `leader` leads and reap its leader: nothing of it runs any more.
-fn end_group(leader: &mut std::process::Child) {
+/// Kill the group `leader` leads and wait for the leader's exit without reaping it: like a job's
+/// parent, the test holds it until the job concluded ([`reap`]).
+fn end_group(leader: &std::process::Child) {
     let pgid = i32::try_from(leader.id()).unwrap();
     // SAFETY: the unreaped test child leads this group.
     assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+    exited_unreaped(leader);
+}
+
+/// Wait for `child` to exit without reaping it.
+fn exited_unreaped(child: &std::process::Child) {
+    // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waiting for our own child without reaping it.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+}
+
+/// Reap a leader once nothing reads it any more: its job concluded, or its interval closed.
+fn reap(mut leader: std::process::Child) {
     leader.wait().unwrap();
 }
 
@@ -3362,7 +3384,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
 
     // A cold host spawned for the job five seconds ago is its first process: its leader, its
     // wall baseline, and its group's one member.
-    let mut host = lone_group();
+    let host = lone_group();
     let activation = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
     deliver(
         &handle,
@@ -3396,9 +3418,18 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         "status carries the latest sample"
     );
 
-    // The command starts now: it leads the job, whose wall still counts from the activation,
-    // and its group is the job's.
-    let mut command = lone_group();
+    // The activation ended: its parent read what it cost while it still held it. The command
+    // starts now: it leads the job, whose wall still counts from the activation, and its group
+    // is the job's.
+    #[cfg(target_os = "macos")]
+    job.events
+        .send(ProcessEvent::ActivationEnded {
+            job_id,
+            usage: cowshed_core::runtime::job_accounting::read_leader(&Birth::of(host.id())),
+        })
+        .await
+        .unwrap();
+    let command = lone_group();
     deliver(
         &handle,
         &job,
@@ -3409,7 +3440,8 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         1,
     )
     .await;
-    end_group(&mut host);
+    end_group(&host);
+    reap(host);
     let before = Instant::now();
     let running = handle.resources(job_id).await.unwrap();
     let after = Instant::now();
@@ -3419,13 +3451,18 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     );
     assert_wall(&running, activation, before, after);
 
-    end_group(&mut command);
+    end_group(&command);
 
     let before = Instant::now();
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let ended = handle.wait(job_id).await.unwrap();
     let after = Instant::now();
     let terminal = ended.resources.clone().expect("a terminal sample");
+    assert_eq!(
+        terminal.accounting.is_some(),
+        cfg!(target_os = "macos"),
+        "macOS states the job's totals; Linux has no complete source yet"
+    );
     assert_eq!(
         (terminal.leader_pid, terminal.members.clone()),
         (command.id(), Vec::new()),
@@ -3442,6 +3479,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         Some(terminal),
         "the sealed sample is the last one"
     );
+    reap(command);
 }
 
 /// What each [`Holder`] keeps resident.
@@ -3499,7 +3537,7 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
-    let mut leader = lone_group();
+    let leader = lone_group();
     deliver(
         &handle,
         &job,
@@ -3550,7 +3588,7 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         holder.release();
     }
 
-    end_group(&mut leader);
+    end_group(&leader);
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let terminal = handle
         .wait(job_id)
@@ -3558,6 +3596,7 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         .unwrap()
         .resources
         .expect("a terminal sample");
+    reap(leader);
     assert_eq!(
         (
             terminal.members.clone(),
@@ -3622,7 +3661,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
-    let mut command = lone_group();
+    let command = lone_group();
     job.events
         .send(ProcessEvent::Started {
             job_id,
@@ -3662,7 +3701,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
         "bytes is the next read cursor"
     );
 
-    end_group(&mut command);
+    end_group(&command);
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let terminal = handle
         .wait(job_id)
@@ -3670,6 +3709,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
         .unwrap()
         .resources
         .expect("a terminal sample");
+    reap(command);
     assert_eq!(
         (watermark(&terminal.stdout), watermark(&terminal.stderr)),
         ((5, 3), (0, 0))
@@ -3704,7 +3744,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
-    let mut command = lone_group();
+    let command = lone_group();
     job.events
         .send(ProcessEvent::Started {
             job_id,
@@ -3750,7 +3790,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         "after the promotion"
     );
 
-    end_group(&mut command);
+    end_group(&command);
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let terminal = handle
         .wait(job_id)
@@ -3758,6 +3798,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         .unwrap()
         .resources
         .expect("a terminal sample");
+    reap(command);
     assert_eq!(watermark(&terminal.stderr), (total, total));
     let sealed = handle.sealed(job_id).await.unwrap();
     assert!(
@@ -3782,6 +3823,257 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         Some(terminal),
         "the stored record decodes to the terminal sample"
     );
+}
+
+/// The CPU a burner spends on itself, measured by itself, before it reports `burned <us>` and
+/// exits.
+#[cfg(target_os = "macos")]
+const BURN_SECONDS: f64 = 0.5;
+
+/// What a job's leaders and the burners they reaped cost beyond what the burners measured:
+/// a Python interpreter's start per burner and `sh`'s own work. Far less than one more burner.
+#[cfg(target_os = "macos")]
+const SLACK_US: u64 = 300_000;
+
+/// A command line that burns [`BURN_SECONDS`] of its own CPU, then reports it.
+#[cfg(target_os = "macos")]
+fn burner() -> String {
+    format!(
+        "python3 -c 'import resource\n\
+         def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
+         x = 0\n\
+         while used() < {BURN_SECONDS}:\n    for _ in range(10000):\n        x += 1\n\
+         print(\"burned\", int(used() * 1e6), flush=True)\n'"
+    )
+}
+
+/// `script` run by `/bin/sh` leading a group of its own: the test is its parent, holds it
+/// unreaped, feeds its stdin and reads its stdout.
+#[cfg(target_os = "macos")]
+struct Scripted {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Scripted {
+    fn start(script: &str) -> Self {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("sh, and python3, which the development shell provides");
+        let input = child.stdin.take().unwrap();
+        let lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        Self {
+            child,
+            input,
+            lines,
+        }
+    }
+
+    /// The next line, which must be `expected`.
+    fn expect(&mut self, expected: &str) {
+        assert_eq!(self.lines.next().unwrap().unwrap(), expected);
+    }
+
+    /// The CPU microseconds the next burner to report measured itself spending.
+    fn burned(&mut self) -> u64 {
+        let line = self.lines.next().unwrap().unwrap();
+        line.strip_prefix("burned ")
+            .unwrap_or_else(|| panic!("a burner's report, not {line:?}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// One line on its stdin.
+    fn send(&mut self, line: &str) {
+        use std::io::Write as _;
+        writeln!(self.input, "{line}").unwrap();
+    }
+
+    /// Let it exit, and wait without reaping it: the test holds it as a job's parent does.
+    fn exit(mut self) -> std::process::Child {
+        self.send("end");
+        exited_unreaped(&self.child);
+        self.child
+    }
+}
+
+/// A sample's total CPU from its accounting source, whose storage bytes macOS cannot state:
+/// they are unavailable, never zero.
+#[cfg(target_os = "macos")]
+fn accounted_us(sample: &cowshed_core::api::JobResourceSample) -> u64 {
+    match sample.accounting {
+        Some(cowshed_core::api::JobAccounting::MacOsRusageChildren { cpu, io: None }) => {
+            cpu.user_us.get() + cpu.sys_us.get()
+        }
+        ref other => panic!("the leader/children rusage source with no byte totals: {other:?}"),
+    }
+}
+
+/// Two children burn CPU at once and are reaped before any sample: the group the sample reads is
+/// the leader alone, whose own CPU holds none of theirs. The job's totals hold both, once, live
+/// and in the sealed sample.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
+    let (supervisor_config, _root) = isolated_config("accounting-reaped");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut leader = Scripted::start(&format!(
+        "{burner} &\n{burner} &\nwait\necho reaped\nread line\n",
+        burner = burner()
+    ));
+    let pid = leader.child.id();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader.child, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    let burned = leader.burned() + leader.burned();
+    leader.expect("reaped");
+
+    let running = handle.resources(job_id).await.unwrap();
+    assert_eq!(
+        running.members,
+        vec![pid],
+        "both children ended before this sample"
+    );
+    let accounted = accounted_us(&running);
+    assert!(
+        (burned..burned + SLACK_US).contains(&accounted),
+        "the job's {accounted} us hold the {burned} us its reaped children burned, once"
+    );
+    let own = cowshed_core::runtime::job_accounting::read_leader(&Birth::of(pid))
+        .unwrap()
+        .own;
+    let live = own.user_us.get() + own.sys_us.get();
+    assert!(
+        live * 10 < burned,
+        "the live members' own CPU ({live} us) misses what the reaped children cost"
+    );
+
+    let leader = leader.exit();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    let sealed = accounted_us(&terminal);
+    assert!(
+        (accounted..burned + SLACK_US).contains(&sealed),
+        "the terminal {sealed} us keep the running {accounted} us and add no child again"
+    );
+    assert_eq!(
+        handle.sealed(job_id).await.unwrap().resources,
+        Some(terminal),
+        "the sealed sample keeps the totals"
+    );
+    reap(leader);
+}
+
+/// A cold host's activation counts up to its end and the command from its start, each once:
+/// what the host burns after its activation ended -- serving the command, then other jobs -- is
+/// not the job's.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_activation_and_its_command_each_count_once() {
+    let (supervisor_config, _root) = isolated_config("accounting-activation");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let burner = burner();
+    let mut host = Scripted::start(&format!(
+        "{burner}\necho activated\nread go\n{burner}\necho served\nread line\n"
+    ));
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Activating {
+            job_id,
+            process: owned(&host.child, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    let activation = host.burned();
+    host.expect("activated");
+    job.events
+        .send(ProcessEvent::ActivationEnded {
+            job_id,
+            usage: cowshed_core::runtime::job_accounting::read_leader(&Birth::of(host.child.id())),
+        })
+        .await
+        .unwrap();
+    // The host works on after its activation ended.
+    host.send("go");
+    let served = host.burned();
+    host.expect("served");
+
+    let mut command = Scripted::start(&format!("{burner}\necho ran\nread line\n"));
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&command.child, Instant::now()),
+        },
+        1,
+    )
+    .await;
+    let ran = command.burned();
+    command.expect("ran");
+    reap(host.exit());
+
+    let both = activation + ran;
+    assert!(
+        served > SLACK_US,
+        "the host's later {served} us would show if charged"
+    );
+    let running = accounted_us(&handle.resources(job_id).await.unwrap());
+    assert!(
+        (both..both + SLACK_US).contains(&running),
+        "the job's {running} us are its activation's {activation} us and its command's {ran} us, \
+         once each, without the host's later {served} us"
+    );
+
+    let command = command.exit();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    let sealed = accounted_us(&terminal);
+    assert!(
+        (running..both + SLACK_US).contains(&sealed),
+        "the terminal {sealed} us keep both intervals once"
+    );
+    reap(command);
 }
 
 /// Workspace `name`'s supervisor config, in an Nx project no daemon serves.

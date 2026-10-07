@@ -524,19 +524,27 @@ async fn run_pooled(
                 control.publish(Target::Host(Arc::clone(&host.fence))),
             )
             .await;
-            let output = match (io.stdout.try_clone(), io.stderr.try_clone()) {
-                (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-                (Err(error), _) | (_, Err(error)) => {
-                    return Outcome::NotLaunched(pipe_error(error));
-                }
+            let activation = match (io.stdout.try_clone(), io.stderr.try_clone()) {
+                (Ok(stdout), Ok(stderr)) => Ok(activator
+                    .activate_host(&mut host, ticket.predicted(), (stdout, stderr))
+                    .await),
+                (Err(error), _) | (_, Err(error)) => Err(pipe_error(error)),
             };
-            match activator
-                .activate_host(&mut host, ticket.predicted(), output)
-                .await
-            {
-                HostActivation::Ready(evidence) => ticket.activated(host, evidence).await,
-                HostActivation::Failed { status } => return decode(status),
-                HostActivation::Broken(error) => {
+            // The activation is over, however it ended, and the host is still held here: its
+            // interval's cost is read now, before anything can reap the host or it serves
+            // the command, so the job counts it once and nothing the host does later.
+            #[cfg(target_os = "macos")]
+            let _ = events
+                .send(ProcessEvent::ActivationEnded {
+                    job_id,
+                    usage: super::job_accounting::read_leader(&host.fence.process().birth),
+                })
+                .await;
+            match activation {
+                Err(error) => return Outcome::NotLaunched(error),
+                Ok(HostActivation::Ready(evidence)) => ticket.activated(host, evidence).await,
+                Ok(HostActivation::Failed { status }) => return decode(status),
+                Ok(HostActivation::Broken(error)) => {
                     // The command never ran, and the job says why. The one death that is the
                     // job's own is a signal the host took by itself while it activated for this
                     // job: a kill of the job reaches its activation, and a crash is the job's to

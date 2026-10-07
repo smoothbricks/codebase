@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_core::api::{
-    CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobInfo, JobState,
+    CommandArg, ExecCommand, ExecRequest, ExitStatus, JobAccounting, JobFailure, JobInfo, JobState,
     RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
 use cowshed_core::error::Result;
@@ -1213,5 +1213,117 @@ async fn host_controller_a_job_s_sample_names_its_whole_group_and_none_after_a_k
         handle.sealed(job).await.expect("sealed").resources,
         Some(terminal),
         "the sealed sample is the last one"
+    );
+}
+
+/// A shell line that burns CPU, then writes what the shell measured itself spending (`times`:
+/// its own user and system time) to `$TMPDIR/<name>`.
+fn burn(name: &str) -> String {
+    format!("i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done; times > \"$TMPDIR/{name}\"")
+}
+
+/// The microseconds of user and system CPU the shell that ran [`burn`] measured for itself, at
+/// least: `times` shows each in milliseconds, rounded (measured: 588.000 s shown for a shell
+/// whose rusage held 587.988), so each field may stand up to a millisecond above it.
+fn measured(workspace: &Workspace, name: &str) -> u64 {
+    let times = std::fs::read_to_string(workspace.sandbox.exec_temp_dir.join(name))
+        .expect("the shell's times");
+    let own = times.lines().next().expect("the shell's own line");
+    own.split_whitespace()
+        .map(|field| {
+            let (minutes, seconds) = field
+                .strip_suffix('s')
+                .and_then(|field| field.split_once('m'))
+                .unwrap_or_else(|| panic!("a `times` field, not {field:?}"));
+            let (whole, fraction) = seconds.split_once('.').expect("fractional seconds");
+            let minutes: u64 = minutes.parse().expect("minutes");
+            let whole: u64 = whole.parse().expect("seconds");
+            let micros: u64 = format!("{fraction:0<6}")[..6].parse().expect("fraction");
+            ((minutes * 60 + whole) * 1_000_000 + micros).saturating_sub(1_000)
+        })
+        .sum()
+}
+
+/// A sealed job's CPU from its accounting source; the source has no storage byte totals, so
+/// they are unavailable, never zero.
+fn accounted(info: &JobInfo) -> u64 {
+    match info.resources.as_ref().map(|sample| sample.accounting) {
+        Some(Some(JobAccounting::MacOsRusageChildren { cpu, io: None })) => {
+            cpu.user_us.get() + cpu.sys_us.get()
+        }
+        other => panic!("a terminal sample of the leader/children rusage source: {other:?}"),
+    }
+}
+
+/// A cold host's activation and the command it then runs each count once in the job's CPU,
+/// though each burned in a process the host and the command's shell reaped before the end. A
+/// second job on the warm host is charged its own command alone: never the host's activation,
+/// its idle time, or the first command it reaped.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_job_counts_its_activation_and_command_once_and_a_warm_host_none() {
+    let workspace = Workspace::new("shell-pool-accounting", 41_392);
+    workspace.envrc(&format!("{}\n", burn("activation-times")));
+    let handle = workspace.supervisor(false);
+    let cold = run(&handle, sh(&burn("command-times"))).await.ok();
+    let (activation, command) = (
+        measured(&workspace, "activation-times"),
+        measured(&workspace, "command-times"),
+    );
+    let total = accounted(&cold.info);
+    assert!(
+        total >= activation + command && total < activation + command + activation.min(command),
+        "the job's {total} us are its activation's {activation} us and its command's {command} \
+         us, once each"
+    );
+    assert_eq!(
+        handle
+            .sealed(cold.info.job_id)
+            .await
+            .expect("sealed")
+            .resources,
+        cold.info.resources,
+        "the sealed sample keeps the totals"
+    );
+
+    let warm = run(&handle, sh(&burn("warm-times"))).await.ok();
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "the second job reused the warm host"
+    );
+    let own = measured(&workspace, "warm-times");
+    let charged = accounted(&warm.info);
+    assert!(
+        charged >= own && charged < own + activation.min(command),
+        "the warm job's {charged} us are its own command's {own} us, without the host's \
+         {activation} us activation or the {command} us command it reaped before"
+    );
+}
+
+/// An activation that fails keeps what it cost in its job's sealed sample.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_failed_activation_keeps_its_cost() {
+    let workspace = Workspace::new("shell-pool-accounting-failure", 41_408);
+    workspace.envrc(&format!("{}\nexit 3\n", burn("activation-times")));
+    let handle = workspace.supervisor(false);
+    let failed = run(&handle, sh("printf ran > command-ran")).await;
+    assert_ne!(failed.info.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert!(!workspace.mount().join("command-ran").exists());
+    let activation = measured(&workspace, "activation-times");
+    let total = accounted(&failed.info);
+    assert!(
+        total >= activation && total < 2 * activation,
+        "the failed job's {total} us are its activation's {activation} us"
+    );
+    assert_eq!(
+        handle
+            .sealed(failed.info.job_id)
+            .await
+            .expect("sealed")
+            .resources,
+        failed.info.resources,
+        "the sealed sample keeps the activation's cost"
     );
 }

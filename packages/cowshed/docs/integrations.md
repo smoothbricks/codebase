@@ -266,6 +266,11 @@ previously warm host. Readiness uses `listeningPorts()` from the owned group rat
 `write()` and `end()` preserve binary input, backpressure, and exactly-once EOF without implicitly cancelling the
 command.
 
+On macOS a sample's `accounting` is the leader/children rusage source: each leader's own CPU plus every child it reaped,
+in microseconds converted from Mach ticks through the kernel timebase. A cold host's activation counts up to its end,
+once; descendants born and reaped between samples still count. Its storage bytes are `null`, never zero: the children
+accumulators carry none. A Linux sample's `accounting` is `null` until its cgroup v2 totals exist.
+
 `processes()` returns the identity-fenced tree, including exited descendants and their final usage;
 `processEvents(everyMs)` streams birth/exec/change/heartbeat/exit records. Both derive from the same API declaration as
 the controller. Low CPU never supplies a guessed blocker; `none` means observed unblocked state, and missing evidence

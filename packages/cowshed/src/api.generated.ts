@@ -280,6 +280,14 @@ export type CowshedError = {
  */
 export type CpuMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
+/**
+ * User and system CPU time, each cumulative from the start of whatever it counts.
+ */
+export type CpuTotals = {
+  readonly userUs: CpuMicros;
+  readonly sysUs: CpuMicros;
+};
+
 export type CreateOptions = {
   readonly revision?: RevisionTarget;
   readonly fromWorkspace?: WorkspaceName;
@@ -680,6 +688,21 @@ export type IdentityReport = {
 };
 
 /**
+ * A job's complete totals and the independent source that counted them: never a sum of the
+ * processes a sampler happened to see, which misses every descendant born and reaped between
+ * two samples.
+ */
+export type JobAccounting = { readonly kind: 'macOsRusageChildren' } & {
+  readonly cpu: CpuTotals;
+  /**
+   * Always absent: the children accumulators carry no disk I/O bytes, so the source has
+   * no job total. Never zero in its place, and never `ri_child_pageins` operations
+   * converted into bytes.
+   */
+  readonly io: StorageIoTotals | null;
+};
+
+/**
  * Why a job failed when no command's own status explains it.
  */
 export type JobFailure = 'scriptSyntax' | 'supervisorLost';
@@ -863,6 +886,11 @@ export type JobResourceSample = {
    * peak, never the sum of its processes' separate peaks.
    */
   readonly rssPeakBytes: ResidentBytes;
+  /**
+   * The job's complete totals from its platform's independent source, as of this boundary:
+   * absent only where no complete source exists yet (Linux, until its cgroup v2 totals).
+   */
+  readonly accounting: JobAccounting | null;
   readonly stdout: JobStreamWatermark;
   readonly stderr: JobStreamWatermark;
 };
@@ -1777,6 +1805,14 @@ export type StepReport =
  * volume-allocation deltas, or operation counts converted into bytes.
  */
 export type StorageIoBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * Bytes a job's accounting source counted as read from and written to storage.
+ */
+export type StorageIoTotals = {
+  readonly readBytes: StorageIoBytes;
+  readonly writeBytes: StorageIoBytes;
+};
 
 /**
  * Bytes of one output stream the supervisor admitted: also the stream's next read cursor.

@@ -533,6 +533,14 @@
         "pid": 4242,
         "repoId": "smoothbricks/codebase",
         "resources": {
+          "accounting": {
+            "cpu": {
+              "sysUs": 310250,
+              "userUs": 2180500
+            },
+            "io": null,
+            "kind": "macOsRusageChildren"
+          },
           "host": {
             "cores": 10,
             "load1": 6.25
@@ -754,6 +762,14 @@
       "pid": 4242,
       "repoId": "smoothbricks/codebase",
       "resources": {
+        "accounting": {
+          "cpu": {
+            "sysUs": 310250,
+            "userUs": 2180500
+          },
+          "io": null,
+          "kind": "macOsRusageChildren"
+        },
         "host": {
           "cores": 10,
           "load1": 6.25

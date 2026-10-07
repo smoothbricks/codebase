@@ -434,8 +434,8 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     }
     // SAFETY: a successful call filled the V4 record.
     let info = unsafe { info.assume_init() };
-    let (numerator, denominator) = mach_tick()?;
-    let cpu = |ticks| CpuMicros::of_ticks(ticks, numerator, denominator).map_err(unit);
+    let tick = MachTick::read().map_err(io::Error::other)?;
+    let cpu = |ticks| tick.micros(ticks).map_err(unit);
     let exited = info.ri_proc_exit_abstime != 0;
     Ok(Some(OwnCounters {
         started: StartStamp(info.ri_proc_start_abstime),
@@ -468,24 +468,45 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
 }
 
-/// The length of one Mach tick: `numerator / denominator` nanoseconds.
+/// Why the length of a Mach tick could not be read.
 #[cfg(target_os = "macos")]
-fn mach_tick() -> io::Result<(u32, NonZeroU32)> {
-    let mut timebase = MachTimebase { numer: 0, denom: 0 };
-    // SAFETY: one writable timebase record.
-    let result = unsafe { mach_timebase_info(&mut timebase) };
-    if result != libc::KERN_SUCCESS {
-        return Err(io::Error::other(format!(
-            "mach_timebase_info failed with kern_return_t {result}"
-        )));
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TimebaseError {
+    #[error("mach_timebase_info failed with kern_return_t {0}")]
+    Failed(libc::c_int),
+    #[error("mach_timebase_info reported a zero denominator")]
+    ZeroDenominator,
+}
+
+/// The length of one Mach tick: `numerator / denominator` nanoseconds (125/3 on Apple silicon,
+/// 1/1 on Intel). Kernel CPU times kept in ticks are converted through it once, never read as
+/// nanoseconds.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MachTick {
+    pub numerator: u32,
+    pub denominator: NonZeroU32,
+}
+
+#[cfg(target_os = "macos")]
+impl MachTick {
+    pub fn read() -> Result<Self, TimebaseError> {
+        let mut timebase = MachTimebase { numer: 0, denom: 0 };
+        // SAFETY: one writable timebase record.
+        let result = unsafe { mach_timebase_info(&mut timebase) };
+        if result != libc::KERN_SUCCESS {
+            return Err(TimebaseError::Failed(result));
+        }
+        Ok(Self {
+            numerator: timebase.numer,
+            denominator: NonZeroU32::new(timebase.denom).ok_or(TimebaseError::ZeroDenominator)?,
+        })
     }
-    let denominator = NonZeroU32::new(timebase.denom).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mach_timebase_info reported a zero denominator",
-        )
-    })?;
-    Ok((timebase.numer, denominator))
+
+    /// `ticks` of this length, in whole microseconds.
+    pub fn micros(self, ticks: u64) -> Result<CpuMicros, ResourceUnitError> {
+        CpuMicros::of_ticks(ticks, self.numerator, self.denominator)
+    }
 }
 
 /// `/proc/<pid>/stat`'s `utime` and `stime` (fields 14 and 15: the process's own, not the
@@ -1306,6 +1327,91 @@ mod tests {
         assert!(status.success(), "parent: {status}");
     }
 
+    /// A held leader's `proc_pid_rusage`, its Mach ticks converted through the timebase, is the
+    /// CPU `getrusage` independently charges its parent for it once reaped: its own and its
+    /// reaped child's, each once. Read as raw nanoseconds, or with the child counted twice, it
+    /// is not. Meanwhile its own process row -- it only waited -- holds none of the child's CPU,
+    /// which its children total holds; once reaped, nothing is read as its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_leader_s_converted_rusage_is_what_getrusage_charges_for_it() {
+        use crate::runtime::job_accounting::{LeaderRusageError, read_leader, rusage_ticks};
+        use crate::runtime::job_groups::Birth;
+
+        let mut parent = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", ROLE_TEST, "--nocapture"])
+            .env(ROLE, "parent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_locked()
+            .expect("spawn the parent");
+        let mut release = parent.stdin.take().expect("parent stdin");
+        let mut lines = BufReader::new(parent.stdout.take().expect("parent stdout")).lines();
+        let leader = Birth::of(parent.id());
+        let parent_life = observed(parent.id());
+        next_report(&mut lines, "burning");
+        let burned: u64 = next_report(&mut lines, "burned")[0]
+            .parse()
+            .expect("burned");
+        release.write_all(b"x").expect("release the burner");
+        next_report(&mut lines, "reaped");
+
+        let waiting = read_leader(&leader).expect("the held, waiting leader");
+        let mut fold = ProcessUsageFold::default();
+        assert_eq!(tick(&mut fold, &parent_life), Sampled::Read);
+        let row = total(fold.usage(parent_life.identity).expect("the parent's row"));
+        let cpu =
+            |totals: crate::api::resources::CpuTotals| totals.user_us.get() + totals.sys_us.get();
+        let children = cpu(waiting.children);
+        assert!(
+            children >= burned,
+            "the leader's children total {children} us holds the {burned} us its child burned"
+        );
+        assert!(
+            row * 4 < children && cpu(waiting.own) * 4 < children,
+            "the waiting parent's own row ({row} us) and own rusage ({} us) hold none of its \
+             child's {children} us",
+            cpu(waiting.own)
+        );
+
+        drop(release);
+        wait_unreaped(&parent);
+        let last = read_leader(&leader).expect("the exited, still held leader");
+        let pid = libc::pid_t::try_from(parent.id()).expect("pid");
+        let ticks = rusage_ticks(pid).expect("read").expect("still held");
+        let before = rusage_us(libc::RUSAGE_CHILDREN);
+        assert!(parent.wait().expect("reap the parent").success());
+        let charged = rusage_us(libc::RUSAGE_CHILDREN) - before;
+
+        // xnu snapshots an exiting process's rusage_info as its exit begins (`proc_prepareexit`),
+        // and its `getrusage` times once the exit's teardown is done (`proc_exit`): the oracle
+        // is that teardown more, never less (measured: 2.2 ms of 1.03 s). Each converts to whole
+        // microseconds, so the reader may be a few microseconds above it.
+        let agrees =
+            |value: u64| value <= charged + 10 && charged.saturating_sub(value) <= charged / 100;
+        let converted = cpu(last.total().expect("exact"));
+        assert!(
+            agrees(converted),
+            "the converted rusage {converted} us is the {charged} us getrusage charged"
+        );
+        let raw_nanoseconds =
+            (ticks.user + ticks.system + ticks.child_user + ticks.child_system) / 1_000;
+        assert!(
+            !agrees(raw_nanoseconds),
+            "Mach ticks read as nanoseconds ({raw_nanoseconds} us) are not the {charged} us"
+        );
+        let child_twice = converted + cpu(last.children);
+        assert!(
+            !agrees(child_twice),
+            "the child counted twice ({child_twice} us) is not the {charged} us"
+        );
+        assert_eq!(
+            read_leader(&leader),
+            Err(LeaderRusageError::Reaped { pid: parent.id() }),
+            "a reaped leader is read as nothing, never zero"
+        );
+    }
+
     /// A `sh` that exits once it reads a line.
     fn held_shell() -> (std::process::Child, std::process::ChildStdin) {
         let mut child = Command::new("/bin/sh")
@@ -1321,6 +1427,11 @@ mod tests {
     fn exit_unreaped(child: &std::process::Child, mut stdin: std::process::ChildStdin) {
         stdin.write_all(b"go\n").expect("release");
         drop(stdin);
+        wait_unreaped(child);
+    }
+
+    /// Wait for `child` to exit without reaping it.
+    fn wait_unreaped(child: &std::process::Child) {
         let id = libc::id_t::try_from(child.id()).expect("pid");
         // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };

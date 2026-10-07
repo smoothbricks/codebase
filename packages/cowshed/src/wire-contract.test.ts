@@ -224,6 +224,25 @@ describe('checked resource units', () => {
   }
 });
 
+describe('job accounting', () => {
+  it('names its source and keeps unavailable bytes absent, never zero', () => {
+    const accounting = { kind: 'macOsRusageChildren', cpu: { userUs: 1_250_000, sysUs: 80_000 }, io: null };
+    expect<unknown>(validators.assertJobAccounting(accounting)).toEqual(accounting);
+    expect<unknown>(validators.parseJobAccounting(JSON.stringify(accounting))).toEqual(accounting);
+    for (const refused of [
+      // The bytes are unavailable, not omitted.
+      { kind: 'macOsRusageChildren', cpu: accounting.cpu },
+      // No block-operation count stands in for bytes.
+      { ...accounting, pageins: 12 },
+      // Totals come from a declared source, never a sum of the processes a sampler saw.
+      { ...accounting, kind: 'liveMembers' },
+      { ...accounting, cpu: { userUs: Number.MAX_SAFE_INTEGER + 1, sysUs: 0 } },
+    ]) {
+      expect(() => validators.assertJobAccounting(refused)).toThrow();
+    }
+  });
+});
+
 describe('process events', () => {
   it('refuses a process change that changes nothing', () => {
     // Rust cannot build a change of nothing; the generated validator must not admit one either,
