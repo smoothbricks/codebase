@@ -13407,18 +13407,7 @@ async fn rebased_task_hashes(
             stdout_copy: None,
             stderr_copy: None,
         };
-        let job = handle.exec(None, build_volume.clone(), request).await?;
-        let info = handle.wait(job).await?;
-        let hashes = match (&info.exit, read_job_stdout(handle, job).await) {
-            (_, Err(error)) => Err(format!("cannot read the probe's output {error}")),
-            (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
-                crate::build_volume::nx::task_hashes(&stdout)
-            }
-            (exit, Ok(_)) => Err(format!(
-                "the probe ended {exit:?}: {}",
-                read_job_stderr_tail(handle, job).await
-            )),
-        };
+        let hashes = probe_task_hashes(handle, build_volume.clone(), request).await;
         match hashes {
             Ok(hashes) => {
                 selections.insert(state.to_owned(), hashes);
@@ -13432,6 +13421,35 @@ async fn rebased_task_hashes(
         }
     }
     Ok(Ok(selections))
+}
+
+/// One root's [`crate::build_volume::nx::TASK_HASHES_SCRIPT`] job: its hashes, or why there are
+/// none. A job that could not start or be waited on is that root's failure too, with the
+/// supervisor's diagnosis: the rebase has happened, and only the carry is skipped.
+#[cfg(target_os = "macos")]
+async fn probe_task_hashes(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
+    request: ExecRequest,
+) -> std::result::Result<std::collections::BTreeSet<String>, String> {
+    let job = handle
+        .exec(None, build_volume, request)
+        .await
+        .map_err(|error| format!("cannot start the probe: {error}"))?;
+    let info = handle
+        .wait(job)
+        .await
+        .map_err(|error| format!("cannot wait for the probe, job {job:?}: {error}"))?;
+    match (&info.exit, read_job_stdout(handle, job).await) {
+        (_, Err(error)) => Err(format!("cannot read the probe's output {error}")),
+        (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
+            crate::build_volume::nx::task_hashes(&stdout)
+        }
+        (exit, Ok(_)) => Err(format!(
+            "the probe ended {exit:?}: {}",
+            read_job_stderr_tail(handle, job).await
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]

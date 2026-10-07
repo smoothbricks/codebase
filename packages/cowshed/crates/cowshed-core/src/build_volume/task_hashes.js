@@ -79,8 +79,9 @@ async function main() {
   const loadDotEnvFiles = process.env.NX_LOAD_DOT_ENV_FILES !== 'false';
   // Every run sets the same variables: the arguments differ only in configuration.
   setEnvVarsBasedOnArgs(runs[0].nxArgs, loadDotEnvFiles);
-  // Plugins' `preTasksExecution` hooks set variables that declared `env` inputs hash. The hook is
-  // paired with `postTasksExecution`, as around a run, here one that ran no task.
+  // Plugins' `preTasksExecution` hooks set variables that declared `env` inputs hash. Each hook
+  // that ran is paired with `postTasksExecution`, here around a run that ran no task, whether or
+  // not the hashing succeeds: a hook's resources are released either way.
   const run = {
     id: `cowshed-carry-${process.pid}`,
     workspaceRoot: root,
@@ -89,6 +90,29 @@ async function main() {
   };
   const startTime = Date.now();
   await hooks.runPreTasksExecution(run);
+  let hashes;
+  let failure;
+  try {
+    hashes = await hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails);
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await hooks.runPostTasksExecution({ ...run, taskResults: {}, startTime, endTime: Date.now() });
+  } catch (error) {
+    // Both failures are named: the hashing's is the cause, the hook's what it left behind.
+    throw failure === undefined
+      ? error
+      : new AggregateError([failure, error], 'hashing failed, and so did postTasksExecution after it');
+  }
+  if (failure !== undefined) {
+    throw failure;
+  }
+  return hashes;
+}
+
+/** The sorted union of every cacheable task's hash over `runs`, each run's graph hashed as Nx's own. */
+async function hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails) {
   const hasher = createTaskHasher(projectGraph, nxJson, getRunnerOptions('default', nxJson, runs[0].nxArgs, false));
   const runnable = projects.filter((project) => targets.some((target) => projectHasTarget(project, target)));
   const hashes = new Set();
@@ -116,7 +140,7 @@ async function main() {
     for (const task of tasks) {
       perTaskEnvs[task.id] = getTaskSpecificEnv(task, projectGraph);
     }
-    // Recorded as a run records them, through the connection above.
+    // Recorded as a run records them, through the task database's connection.
     await hashTasks(hasher, projectGraph, taskGraph, perTaskEnvs, taskDetails, tasks);
     for (const task of tasks) {
       if (!task.hash) {
@@ -125,7 +149,6 @@ async function main() {
       hashes.add(task.hash);
     }
   }
-  await hooks.runPostTasksExecution({ ...run, taskResults: {}, startTime, endTime: Date.now() });
   return [...hashes].sort();
 }
 
