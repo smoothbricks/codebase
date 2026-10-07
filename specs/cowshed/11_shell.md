@@ -407,10 +407,12 @@ command, never idle time inherited from a reused warm host.
 ### Complete process tree, compact observations
 
 The supervisor observes fork, exec and exit, not just membership at a poll. macOS uses kqueue
-`NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`. Linux combines pidfd identity and proc metrics with an event-capable source, chosen
-by measuring proc connector `CN_PROC` through the privileged helper against ptrace fork/exec/exit tracing on the same
-fork-heavy workload. Polling alone cannot claim complete short-lived descendants. Missing events are explicit coverage
-gaps, never a shortened tree presented as complete.
+`NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT` on each member and reads a forking member's children with `proc_listchildpids`,
+since kqueue gives no child PID: its per-process coverage is best-effort with a measured gap, and its job totals stay
+exact through leader/children rusage (07_api.md, "Process-tree observations"). Linux combines pidfd identity and proc
+metrics with an event-capable source, chosen by measuring proc connector `CN_PROC` through the privileged helper against
+ptrace fork/exec/exit tracing on the same fork-heavy workload. Polling alone cannot claim complete short-lived
+descendants. Missing events are explicit coverage gaps, never a shortened tree presented as complete.
 
 `JobHandle.processes` and `process_events` expose the canonical records in 07_api.md through both controller and N-API,
 generated from the same declaration. The records carry per-process CPU user/sys microseconds, current/peak RSS,

@@ -130,7 +130,9 @@ fourteen-column process schema or duplicates process-tree JSON.
 The process event-source RED compares expected birth/exec/exit records for bursts of short-lived grandchildren entirely
 between coarse polls. Linux compares `CN_PROC` through the owning privileged helper and ptrace
 `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` for coverage and fork-heavy overhead before selecting one; pidfds alone supply
-identity and exit observation, not fork events. macOS includes `NOTE_EXIT` beside `NOTE_FORK`/`NOTE_EXEC`.
+identity and exit observation, not fork events. macOS includes `NOTE_EXIT` beside `NOTE_FORK`/`NOTE_EXEC`; its RED
+measures the gap a burst reaped before `proc_listchildpids` reads it leaves, and requires that gap to be stated as
+unattributed usage against the exact leader/children rusage totals (07_api.md).
 
 One generated column declaration owns these names, types, enum values, and event-to-row projections. No writer
 hand-copies the schema. The tree is span parentage, never JSON; no process name, metric name, or sample number creates a

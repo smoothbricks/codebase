@@ -778,10 +778,20 @@ EOF and job cancellation remain different operations.
 ### Process-tree observations
 
 `processes()` returns `JobProcessTree { jobId, sampledAt, processes, coverage }`, retaining final records of observed
-exited descendants as well as current members. The supervisor observes fork, exec and exit events: macOS uses kqueue
-`NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`; Linux requires an event source beside pidfd identity and proc metrics. Periodic
-proc children polling alone is not a complete tree. A missed observation records a typed coverage gap and an
-unattributed-usage row; it never silently claims completeness or trusts a reused PID.
+exited descendants as well as current members. The supervisor observes fork, exec and exit events. Linux requires an
+event source beside pidfd identity and proc metrics. Periodic proc children polling alone is not a complete tree. A
+missed observation records a typed coverage gap and an unattributed-usage row; it never silently claims completeness or
+trusts a reused PID.
+
+macOS per-process coverage is best-effort with a measured gap; its job totals are exact. kqueue `NOTE_FORK` on each
+member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused with `ENOTSUP`
+([xnu `filt_procattach`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1104-L1142),
+and the `NOTE_FORK` comment in `bsd/sys/event.h`). The supervisor therefore answers each `NOTE_FORK` by reading the
+member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
+(`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A child that forks,
+execs and is reaped before that read is missed: the leader/children rusage source (below) still counts its CPU, and
+reconciliation states it as unattributed usage with a coverage gap, never silently. An Endpoint Security observer is not
+used: it needs an Apple entitlement. It is revisited only if the measured gap on real gates proves large.
 
 The canonical records are:
 
@@ -883,8 +893,8 @@ The Linux per-process event source is chosen by a measured implementation unit c
 through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
 fork-heavy workload, measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither
 backend is selected by familiarity or assumed overhead. pidfd identity and proc sampling complement the chosen event
-source, not replace it. macOS observes all three kqueue event kinds and reconciles CPU against the leader's own and
-children rusage totals, including the activation interval.
+source, not replace it. macOS observes the three kqueue event kinds best-effort, as above, and reconciles CPU against
+the leader's own and children rusage totals, including the activation interval, which keep the job totals exact.
 
 Reconciliation retains the difference between independent job totals and attributed process rows in named units.
 Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,
