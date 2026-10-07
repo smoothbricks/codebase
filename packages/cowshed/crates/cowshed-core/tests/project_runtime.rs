@@ -3,7 +3,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,7 +25,7 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor::{
-    ArtifactStoreSink, CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal,
+    ArtifactStoreSink, CommitmentDraft, CommitmentSink, OwnedProcess, ProcessEvent, ProcessSignal,
     ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
     WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
@@ -1714,21 +1714,25 @@ impl SpawnSink for ScriptedSpawner {
         self.spawned.send(events).expect("spawn observer");
         Ok(Box::new(ScriptedProcess {
             // Not a process: its pid names nothing this test owns, so no group is identified.
-            birth: Birth::Unobserved {
-                pid: 10_000 + u32::try_from(request.job_id.get()).expect("test job id"),
-                reason: "a scripted process leads no group".into(),
+            process: OwnedProcess {
+                birth: Birth::Unobserved {
+                    pid: 10_000 + u32::try_from(request.job_id.get()).expect("test job id"),
+                    reason: "a scripted process leads no group".into(),
+                },
+                spawned: Instant::now(),
+                host: cowshed_core::host_load::read_host_load(),
             },
         }))
     }
 }
 
 struct ScriptedProcess {
-    birth: Birth,
+    process: OwnedProcess,
 }
 
 impl RunningProcess for ScriptedProcess {
-    fn birth(&self) -> Option<&Birth> {
-        Some(&self.birth)
+    fn process(&self) -> Option<&OwnedProcess> {
+        Some(&self.process)
     }
 
     fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {
