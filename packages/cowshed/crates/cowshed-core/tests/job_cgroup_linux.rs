@@ -1035,63 +1035,22 @@ struct Scratch {
     directory: PathBuf,
     /// `directory` holds the mounted image, until it is unmounted.
     mounted: bool,
+    /// The atomically configured loop association, with AUTOCLEAR; closing this last owned
+    /// descriptor clears it after unmount, including a failure before mount.
+    loop_file: Option<std::fs::File>,
 }
 
 impl Scratch {
     fn make(uid: u32, gid: u32) -> Self {
         let name = format!("cowshed-job-cgroup-{}", std::process::id());
-        let loop_control = Path::new("/dev/loop-control");
-        // Absence of a device node is not absence of kernel support: NixOS runners can leave
-        // the loop driver unloaded. Ask the host to load it before measuring availability.
-        let loaded = match std::fs::metadata(loop_control) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                run(Command::new(find_program("modprobe")).arg("loop"))
-            }
-            Err(error) => panic!("inspect {}: {error}", loop_control.display()),
-        };
-        let unavailable = loaded
-            .and_then(|()| {
-                std::fs::metadata(loop_control)
-                    .map_err(|error| format!("{}: {error}", loop_control.display()))?;
-                run(Command::new(find_program("losetup")).arg("--find"))
-            })
-            .err();
-        if let Some(reason) = unavailable {
-            println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
-            let status = std::fs::read_to_string("/proc/self/status").expect("root status");
-            for line in status
-                .lines()
-                .filter(|line| line.starts_with("CapEff:") || line.starts_with("NoNewPrivs:"))
-            {
-                println!("scratch availability: {line}");
-            }
-            println!(
-                "scratch availability: loop module present {}, kernel {}",
-                Path::new("/sys/module/loop").exists(),
-                std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .expect("kernel release")
-                    .trim()
-            );
-            let devices = std::fs::read_to_string("/proc/devices").expect("registered devices");
-            println!(
-                "scratch availability: loop device registered {}",
-                devices
-                    .lines()
-                    .any(|line| line.split_whitespace().eq(["7", "loop"]))
-            );
-            for entry in std::fs::read_dir("/sys/block").expect("kernel block devices") {
-                let entry = entry.expect("block device entry");
-                if entry.file_name().as_encoded_bytes().starts_with(b"loop") {
-                    println!("scratch availability: {}", entry.path().display());
-                }
-            }
-            return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
+        let scratch = Self::prepare(std::env::temp_dir().join(name), uid, gid);
+        if scratch.loop_file.is_none() {
+            return scratch;
         }
-        Self::loop_ext4(std::env::temp_dir().join(name), uid, gid)
+        scratch.mount(uid, gid)
     }
 
-    fn loop_ext4(root: PathBuf, uid: u32, gid: u32) -> Self {
+    fn prepare(root: PathBuf, uid: u32, gid: u32) -> Self {
         std::fs::create_dir(&root)
             .unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
         let image = root.join("ext4.img");
@@ -1099,6 +1058,15 @@ impl Scratch {
             directory: root.join("mnt"),
             root,
             mounted: false,
+            loop_file: None,
+        };
+        let device = match scratch_loop_device(&scratch.root) {
+            Ok(device) => device,
+            Err(reason) => {
+                report_loop_unavailable(&reason);
+                let name = scratch.root.file_name().expect("scratch name");
+                return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
+            }
         };
         std::fs::File::create(&image)
             .and_then(|file| file.set_len(SCRATCH_IMAGE_BYTES))
@@ -1107,11 +1075,19 @@ impl Scratch {
             .arg("-q")
             .arg(&image))
         .unwrap_or_else(|refusal| panic!("{refusal}"));
+        scratch.loop_file = Some(
+            associate_scratch_loop(&device, &image).unwrap_or_else(|refusal| panic!("{refusal}")),
+        );
+        scratch
+    }
+
+    fn mount(mut self, uid: u32, gid: u32) -> Self {
+        let scratch = &mut self;
+        let device = scratch.root.join("loop");
         std::fs::create_dir(&scratch.directory)
             .unwrap_or_else(|error| panic!("create {}: {error}", scratch.directory.display()));
         run(Command::new(find_program("mount"))
-            .args(["-o", "loop"])
-            .arg(&image)
+            .arg(&device)
             .arg(&scratch.directory))
         .unwrap_or_else(|refusal| panic!("{refusal}"));
         scratch.mounted = true;
@@ -1127,7 +1103,7 @@ impl Scratch {
             "scratch: {} is ext4 on a loop device",
             scratch.directory.display()
         );
-        scratch
+        self
     }
 
     fn tmpfs(root: PathBuf, uid: u32, gid: u32) -> Self {
@@ -1137,6 +1113,7 @@ impl Scratch {
             directory: root.clone(),
             root,
             mounted: false,
+            loop_file: None,
         };
         chown(&scratch.directory, Some(uid), Some(gid)).expect("chown tmpfs scratch to the runner");
         let f_type = filesystem_type(&scratch.directory).expect("statfs the tmpfs directory");
@@ -1150,6 +1127,168 @@ impl Scratch {
     }
 }
 
+/// A supported driver need not have device nodes exposed in the runner's /dev namespace.
+/// Make only this run's nodes, beneath its already-guarded root; never modify global /dev.
+fn scratch_loop_device(root: &Path) -> Result<PathBuf, String> {
+    use std::os::fd::AsRawFd as _;
+
+    let global_control = Path::new("/dev/loop-control");
+    let sys_control = Path::new("/sys/class/misc/loop-control/dev");
+    if !global_control.exists() && !sys_control.exists() {
+        run(Command::new(find_program("modprobe")).arg("loop"))?;
+    }
+    let owned_control = if global_control.exists() {
+        None
+    } else {
+        let node = root.join("loop-control");
+        make_device_node(&node, sys_control, libc::S_IFCHR)?;
+        Some(node)
+    };
+    let control = owned_control.as_deref().unwrap_or(global_control);
+    let control = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control)
+        .map_err(|error| format!("open {}: {error}", control.display()))?;
+    // SAFETY: the loop-control descriptor is live; LOOP_CTL_GET_FREE (linux/loop.h)
+    // takes no pointer argument and returns a free loop device's index or -1.
+    let index = unsafe { libc::ioctl(control.as_raw_fd(), 0x4c82) };
+    let index = u32::try_from(index).map_err(|_| format!("LOOP_CTL_GET_FREE: {}", last_error()))?;
+    let device = root.join("loop");
+    make_device_node(
+        &device,
+        &Path::new("/sys/block").join(format!("loop{index}/dev")),
+        libc::S_IFBLK,
+    )?;
+    println!(
+        "scratch loop: index {index}, test-owned node {}",
+        device.display()
+    );
+    Ok(device)
+}
+
+/// Linux's loop_info64 and loop_config UAPI (linux/loop.h). Integer/byte-array-only layouts
+/// admit an all-zero configuration; LOOP_CONFIGURE applies association and AUTOCLEAR atomically.
+#[repr(C)]
+struct LoopInfo64 {
+    device: u64,
+    inode: u64,
+    rdevice: u64,
+    offset: u64,
+    sizelimit: u64,
+    number: u32,
+    encrypt_type: u32,
+    encrypt_key_size: u32,
+    flags: u32,
+    file_name: [u8; 64],
+    crypt_name: [u8; 64],
+    encrypt_key: [u8; 32],
+    init: [u64; 2],
+}
+
+#[repr(C)]
+struct LoopConfig {
+    fd: u32,
+    block_size: u32,
+    info: LoopInfo64,
+    reserved: [u64; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<LoopInfo64>() == 232);
+const _: () = assert!(std::mem::size_of::<LoopConfig>() == 304);
+
+fn associate_scratch_loop(device: &Path, image: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd as _;
+
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open {}: {error}", path.display()))
+    };
+    let loop_file = open(device)?;
+    let image = open(image)?;
+    // SAFETY: every bit pattern of these UAPI integer/byte-array fields is valid.
+    let mut config: LoopConfig = unsafe { std::mem::zeroed() };
+    config.fd = u32::try_from(image.as_raw_fd()).expect("an open file has a nonnegative fd");
+    config.info.flags = 4; // LO_FLAGS_AUTOCLEAR
+    // SAFETY: live loop and backing descriptors and the exact loop_config UAPI layout.
+    if unsafe { libc::ioctl(loop_file.as_raw_fd(), 0x4c0a, std::ptr::from_ref(&config)) } != 0 {
+        return Err(format!(
+            "LOOP_CONFIGURE {}: {}",
+            device.display(),
+            last_error()
+        ));
+    }
+    Ok(loop_file)
+}
+
+fn loop_backing(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: the integer/byte-array-only output layout admits every bit pattern.
+    let mut info: LoopInfo64 = unsafe { std::mem::zeroed() };
+    // SAFETY: a live loop descriptor and the exact loop_info64 output buffer.
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0x4c05, std::ptr::from_mut(&mut info)) } != 0 {
+        return Err(last_error());
+    }
+    Ok((info.device, info.inode))
+}
+
+/// Use the kernel's registered device number, not a guessed host node name or major/minor.
+fn make_device_node(path: &Path, sys_dev: &Path, kind: libc::mode_t) -> Result<(), String> {
+    let text = std::fs::read_to_string(sys_dev)
+        .map_err(|error| format!("read {}: {error}", sys_dev.display()))?;
+    let (major, minor) = text
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| format!("{} has no MAJ:MIN: {text:?}", sys_dev.display()))?;
+    let major = major
+        .parse()
+        .map_err(|error| format!("device major: {error}"))?;
+    let minor = minor
+        .parse()
+        .map_err(|error| format!("device minor: {error}"))?;
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|error| format!("device path: {error}"))?;
+    // SAFETY: a NUL-terminated test-owned path and a kernel-reported device number.
+    if unsafe { libc::mknod(name.as_ptr(), kind | 0o600, libc::makedev(major, minor)) } != 0 {
+        return Err(format!("mknod {}: {}", path.display(), last_error()));
+    }
+    Ok(())
+}
+
+fn report_loop_unavailable(reason: &str) {
+    println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
+    let status = std::fs::read_to_string("/proc/self/status").expect("root status");
+    for line in status
+        .lines()
+        .filter(|line| line.starts_with("CapEff:") || line.starts_with("NoNewPrivs:"))
+    {
+        println!("scratch availability: {line}");
+    }
+    println!(
+        "scratch availability: loop module present {}, kernel {}",
+        Path::new("/sys/module/loop").exists(),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("kernel release")
+            .trim()
+    );
+    let devices = std::fs::read_to_string("/proc/devices").expect("registered devices");
+    println!(
+        "scratch availability: loop device registered {}",
+        devices
+            .lines()
+            .any(|line| line.split_whitespace().eq(["7", "loop"]))
+    );
+    for entry in std::fs::read_dir("/sys/block").expect("kernel block devices") {
+        let entry = entry.expect("block device entry");
+        if entry.file_name().as_encoded_bytes().starts_with(b"loop") {
+            println!("scratch availability: {}", entry.path().display());
+        }
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         let mut failures = Vec::new();
@@ -1159,9 +1298,32 @@ impl Drop for Scratch {
                 Err(refusal) => failures.push(refusal),
             }
         }
+        // AUTOCLEAR was part of the atomic association, not a later fallible flag update.
+        // Check the kernel actually detached our backing inode after the final close.
+        if let Some(file) = self.loop_file.take() {
+            let before = loop_backing(&file);
+            drop(file);
+            let after =
+                std::fs::File::open(self.root.join("loop")).and_then(|file| loop_backing(&file));
+            match (before, after) {
+                (_, Err(error)) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    println!("scratch cleanup: loop association cleared");
+                }
+                (Ok(before), Ok(after)) if before != after => {
+                    println!(
+                        "scratch cleanup: our loop association cleared and the device was reused"
+                    );
+                }
+                (Ok(_), Ok(_)) => failures.push("our loop association remains attached".to_owned()),
+                (Err(error), _) | (_, Err(error)) => {
+                    failures.push(format!("verify loop association cleanup: {error}"));
+                }
+            }
+        }
         // A mounted tree is the image's own: removing it would only empty the image, and its
         // mountpoint stays busy.
         if !self.mounted
+            && failures.is_empty()
             && let Err(error) = std::fs::remove_dir_all(&self.root)
         {
             failures.push(format!("remove {}: {error}", self.root.display()));
@@ -1187,22 +1349,29 @@ impl Drop for Scratch {
     }
 }
 
-/// A refused command unwinds through the same guard as a failed scenario. Check the mount and
-/// sparse image are gone, not merely that the command returned an error.
+/// A refused command unwinds through the same guard as failed setup or a failed scenario.
+/// Prove association cleanup both before mount and after it, as well as mount/image removal.
 fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
-    let scratch = Scratch::make(uid, gid);
-    let root = scratch.root.clone();
-    let outcome = std::panic::catch_unwind(move || {
-        let _scratch = scratch;
-        run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
-    });
-    assert!(outcome.is_err(), "the refusal unwinds");
-    assert!(
-        !root.exists(),
-        "cleanup removed {} after refusal",
-        root.display()
-    );
-    println!("scratch cleanup: command failure and panic unwind verified");
+    for mounted in [false, true] {
+        let scratch = if mounted {
+            Scratch::make(uid, gid)
+        } else {
+            let name = format!("cowshed-job-cgroup-{}", std::process::id());
+            Scratch::prepare(std::env::temp_dir().join(name), uid, gid)
+        };
+        let root = scratch.root.clone();
+        let outcome = std::panic::catch_unwind(move || {
+            let _scratch = scratch;
+            run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
+        });
+        assert!(outcome.is_err(), "the refusal unwinds");
+        assert!(
+            !root.exists(),
+            "cleanup removed {} after refusal",
+            root.display()
+        );
+        println!("scratch cleanup: command failure and panic unwind verified (mounted {mounted})");
+    }
 }
 
 /// `program` from `PATH`, run as root by `sudo`, which never prompts for a password.

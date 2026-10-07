@@ -995,14 +995,18 @@ share and is not that lifetime statistic. A zero-duration observation does not m
 baseline. The cgroup's peak counter is read without resetting it, and missing controllers/counters are typed operational
 errors, not zero totals.
 
-The delegated Linux accounting probe loads an available host loop driver and uses test-owned, loop-mounted ext4 storage.
-Device/module refusals include the root capability and kernel context. It compares `memory.current`/`memory.peak` to
-direct kernel reads and verifies regular-file cache separately from shmem using `memory.stat`'s `file - shmem`. Its
-direct-I/O workloads require exact parity with an independent `io.stat` read and compare those totals against
-live-process and allocation proxies; cached reads and an unrelated job's transfers are excluded. The root delegating
-parent owns unmount/removal on success and unwind, including a measured command-refusal cleanup path. If loop devices
-are unavailable, tmpfs can measure anonymous/shmem charging only: neither regular-file page-cache attribution nor
-storage-I/O attribution is proved, and the probe reports that blocked boundary rather than passing it.
+The delegated Linux accounting probe uses a supported host loop driver and test-owned ext4 storage. If a runner exposes
+the driver but masks its device nodes, the root parent creates only test-owned nodes from kernel-reported device
+numbers; global `/dev` is unchanged. `LOOP_CONFIGURE` binds the image with autoclear atomically, and the guard retains
+its descriptor until unmount. Kernel status reads verify the association cleared on final close, both before mount and
+after it. Device/module refusals include the root capability and kernel context. The probe compares
+`memory.current`/`memory.peak` to direct kernel reads and verifies regular-file cache separately from shmem using
+`memory.stat`'s `file - shmem`. Its direct-I/O workloads require exact parity with an independent `io.stat` read and
+compare those totals against live-process and allocation proxies; cached reads and an unrelated job's transfers are
+excluded. The root delegating parent owns unmount/removal on success and unwind, including a measured command-refusal
+cleanup path. If loop devices are unavailable, tmpfs can measure anonymous/shmem charging only: neither regular-file
+page-cache attribution nor storage-I/O attribution is proved, and the probe reports that blocked boundary rather than
+passing it.
 
 The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
 through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
