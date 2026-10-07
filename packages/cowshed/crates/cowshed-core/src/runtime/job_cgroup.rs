@@ -69,6 +69,9 @@ impl Controller {
     /// `io.stat` exist only where these are enabled.
     pub const ACCOUNTING: [Self; 3] = [Self::Cpu, Self::Memory, Self::Io];
 
+    /// The fixed request for [`Self::ACCOUNTING`], kept in step by the controller-request test.
+    const ACCOUNTING_REQUEST: &str = "+cpu +memory +io";
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
@@ -152,9 +155,27 @@ pub enum CgroupError {
 
 type Result<T, E = CgroupError> = std::result::Result<T, E>;
 
+/// The error of `call` on `path`, which is copied only once the call has failed.
 fn failed(call: &'static str, path: &Path) -> impl FnOnce(io::Error) -> CgroupError {
-    let path = path.to_path_buf();
-    move |source| CgroupError::Io { call, path, source }
+    move |source| CgroupError::Io {
+        call,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The error of `call` on `file` in the cgroup `directory`, joined only once the call has
+/// failed.
+fn failed_in(
+    call: &'static str,
+    directory: &Path,
+    file: &'static str,
+) -> impl FnOnce(io::Error) -> CgroupError {
+    move |source| CgroupError::Io {
+        call,
+        path: directory.join(file),
+        source,
+    }
 }
 
 fn c_path(path: &Path) -> Result<CString> {
@@ -298,16 +319,14 @@ fn make_directory(path: &Path) -> Result<bool> {
 
 /// Distribute the accounting controllers from `path` to its children.
 fn enable_accounting(path: &Path) -> Result<()> {
-    let available = fs::read_to_string(path.join("cgroup.controllers"))
-        .map_err(failed("read", &path.join("cgroup.controllers")))?;
+    let available = fs::read_to_string(path.join("cgroup.controllers")).map_err(failed_in(
+        "read",
+        path,
+        "cgroup.controllers",
+    ))?;
     require_controllers(path, &available, &Controller::ACCOUNTING)?;
-    let request = Controller::ACCOUNTING
-        .iter()
-        .map(|controller| format!("+{controller}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     let control = path.join("cgroup.subtree_control");
-    fs::write(&control, request).map_err(failed("write", &control))
+    fs::write(&control, Controller::ACCOUNTING_REQUEST).map_err(failed("write", &control))
 }
 
 /// The controller's authority over the cgroup subtree delegated to it.
@@ -358,8 +377,11 @@ impl CgroupAuthority {
         for file in ["", "cgroup.procs", "cgroup.subtree_control"] {
             writable(&root, file)?;
         }
-        let available = fs::read_to_string(root.join("cgroup.controllers"))
-            .map_err(failed("read", &root.join("cgroup.controllers")))?;
+        let available = fs::read_to_string(root.join("cgroup.controllers")).map_err(failed_in(
+            "read",
+            &root,
+            "cgroup.controllers",
+        ))?;
         require_controllers(&root, &available, &Controller::ACCOUNTING)?;
         let leaf = root.join(CONTROLLER_LEAF);
         make_directory(&leaf)?;
@@ -487,7 +509,11 @@ impl IncarnationCgroups {
         let mut identities = Vec::new();
         for entry in entries {
             let entry = entry.map_err(failed("readdir", &self.path))?;
-            let file_type = entry.file_type().map_err(failed("stat", &entry.path()))?;
+            let file_type = entry.file_type().map_err(|source| CgroupError::Io {
+                call: "stat",
+                path: entry.path(),
+                source,
+            })?;
             if !file_type.is_dir() {
                 continue;
             }
@@ -525,11 +551,14 @@ pub struct JobCgroup {
 
 impl JobCgroup {
     fn open(identity: JobCgroupIdentity, path: PathBuf, directory: OwnedFd) -> Result<Self> {
-        let available = read_at(&directory, c"cgroup.controllers")
-            .map_err(failed("read", &path.join("cgroup.controllers")))?;
+        let available = read_at(&directory, c"cgroup.controllers").map_err(failed_in(
+            "read",
+            &path,
+            "cgroup.controllers",
+        ))?;
         require_controllers(&path, &available, &Controller::ACCOUNTING)?;
         let procs = open_at(directory.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY)
-            .map_err(failed("open", &path.join("cgroup.procs")))?;
+            .map_err(failed_in("open", &path, "cgroup.procs"))?;
         Ok(Self {
             identity,
             path,
@@ -548,8 +577,11 @@ impl JobCgroup {
 
     /// Whether the cgroup or any descendant holds a live process.
     pub fn populated(&self) -> Result<bool> {
-        let events = read_at(&self.directory, c"cgroup.events")
-            .map_err(failed("read", &self.path.join("cgroup.events")))?;
+        let events = read_at(&self.directory, c"cgroup.events").map_err(failed_in(
+            "read",
+            &self.path,
+            "cgroup.events",
+        ))?;
         populated(&self.path, &events)
     }
 
@@ -744,6 +776,35 @@ mod tests {
         assert!(matches!(
             unified_membership("12:pids:/legacy\n"),
             Err(CgroupError::NoUnifiedMembership { .. })
+        ));
+    }
+
+    #[test]
+    fn the_accounting_request_enables_exactly_the_accounting_controllers() {
+        let expected = Controller::ACCOUNTING
+            .iter()
+            .map(|controller| format!("+{controller}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(Controller::ACCOUNTING_REQUEST, expected);
+    }
+
+    #[test]
+    fn failed_calls_retain_the_call_path_and_source() {
+        let path = Path::new("/sys/fs/cgroup/job-1");
+        let error = failed("open", path)(io::Error::from_raw_os_error(libc::EACCES));
+        assert!(matches!(
+            error,
+            CgroupError::Io { call: "open", path: failed_path, source }
+                if failed_path == path && source.raw_os_error() == Some(libc::EACCES)
+        ));
+        let error =
+            failed_in("read", path, "cgroup.events")(io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(matches!(
+            error,
+            CgroupError::Io { call: "read", path: failed_path, source }
+                if failed_path == path.join("cgroup.events")
+                    && source.raw_os_error() == Some(libc::ENOENT)
         ));
     }
 
