@@ -10,15 +10,14 @@
 //! table changes every projection together; no adapter restates a field list.
 
 use super::dto::{
-    AdmissionKey,
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
-    CreateOptions, DefragmentResult, DoctorReport, EmptyResult, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
-    LandOptions, LandReport, MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions,
-    PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
-    ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
-    WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
+    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, EmptyResult,
+    GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
+    JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
+    ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::resources::{JobResourceSample, SampleInterval};
 use crate::build_volume::BuildStateRefresh;
