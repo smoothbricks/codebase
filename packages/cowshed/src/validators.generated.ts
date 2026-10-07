@@ -455,6 +455,13 @@ export const parseJobStream = (json: string): Api.JobStream => assertJobStream(J
 export const assertJobStreamList = typia.createAssertEquals<readonly Api.JobStream[]>();
 export const parseJobStreamList = (json: string): readonly Api.JobStream[] => assertJobStreamList(JSON.parse(json));
 
+export const assertJobStreamWatermark = typia.createAssertEquals<Api.JobStreamWatermark>();
+export const parseJobStreamWatermark = (json: string): Api.JobStreamWatermark =>
+  assertJobStreamWatermark(JSON.parse(json));
+export const assertJobStreamWatermarkList = typia.createAssertEquals<readonly Api.JobStreamWatermark[]>();
+export const parseJobStreamWatermarkList = (json: string): readonly Api.JobStreamWatermark[] =>
+  assertJobStreamWatermarkList(JSON.parse(json));
+
 export const assertJobTail = typia.createAssertEquals<Api.JobTail>();
 export const parseJobTail = (json: string): Api.JobTail => assertJobTail(JSON.parse(json));
 export const assertJobTailList = typia.createAssertEquals<readonly Api.JobTail[]>();
@@ -989,6 +996,12 @@ export const assertStorageIoBytesList = typia.createAssertEquals<readonly Api.St
 export const parseStorageIoBytesList = (json: string): readonly Api.StorageIoBytes[] =>
   assertStorageIoBytesList(JSON.parse(json));
 
+export const assertStreamBytes = typia.createAssertEquals<Api.StreamBytes>();
+export const parseStreamBytes = (json: string): Api.StreamBytes => assertStreamBytes(JSON.parse(json));
+export const assertStreamBytesList = typia.createAssertEquals<readonly Api.StreamBytes[]>();
+export const parseStreamBytesList = (json: string): readonly Api.StreamBytes[] =>
+  assertStreamBytesList(JSON.parse(json));
+
 export const assertStreamInfo = typia.createAssertEquals<Api.StreamInfo>();
 export const parseStreamInfo = (json: string): Api.StreamInfo => assertStreamInfo(JSON.parse(json));
 export const assertStreamInfoList = typia.createAssertEquals<readonly Api.StreamInfo[]>();
@@ -999,6 +1012,12 @@ export const parseStreamInfoRef = (json: string): Api.StreamInfoRef => assertStr
 export const assertStreamInfoRefList = typia.createAssertEquals<readonly Api.StreamInfoRef[]>();
 export const parseStreamInfoRefList = (json: string): readonly Api.StreamInfoRef[] =>
   assertStreamInfoRefList(JSON.parse(json));
+
+export const assertStreamLines = typia.createAssertEquals<Api.StreamLines>();
+export const parseStreamLines = (json: string): Api.StreamLines => assertStreamLines(JSON.parse(json));
+export const assertStreamLinesList = typia.createAssertEquals<readonly Api.StreamLines[]>();
+export const parseStreamLinesList = (json: string): readonly Api.StreamLines[] =>
+  assertStreamLinesList(JSON.parse(json));
 
 export const assertSupervisorRecovery = typia.createAssertEquals<Api.SupervisorRecovery>();
 export const parseSupervisorRecovery = (json: string): Api.SupervisorRecovery =>

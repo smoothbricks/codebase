@@ -29,7 +29,10 @@ use crate::api::dto::{
     WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
     validate_command_argv,
 };
-use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, WallMicros};
+use crate::api::resources::{
+    HostLoadSample, JobResourceSample, JobStreamWatermark, ResidentBytes, ResourceUnitError,
+    StreamBytes, StreamLines, WallMicros,
+};
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -90,9 +93,9 @@ const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
 /// The terminal resource sample's columns, in order: its time, wall duration, leader, its group's
-/// members, the host's load at spawn and at the sample, and the members' resident sum and the
-/// job's peak of it. All null for a record without a sample.
-const RESOURCE_COLUMNS: [&str; 10] = [
+/// members, the host's load at spawn and at the sample, the members' resident sum and the job's
+/// peak of it, then each stream's bytes and lines. All null for a record without a sample.
+const RESOURCE_COLUMNS: [&str; 14] = [
     "resources_sampled_at",
     "resources_wall_us",
     "resources_leader_pid",
@@ -103,6 +106,10 @@ const RESOURCE_COLUMNS: [&str; 10] = [
     "resources_host_cores",
     "resources_rss_bytes",
     "resources_rss_peak_bytes",
+    "resources_stdout_bytes",
+    "resources_stdout_lines",
+    "resources_stderr_bytes",
+    "resources_stderr_lines",
 ];
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
@@ -352,8 +359,9 @@ impl JobArtifactRecord {
         {
             return Err(integrity(
                 0,
-                "a record's resource sample must be its own job's, its wallMs its wallUs and its \
-                 rssPeakBytes at least its rssBytes",
+                "a record's resource sample must be its own job's and agree with itself: its \
+                 wallMs its wallUs, its rssPeakBytes at least its rssBytes, each stream's lines \
+                 within its bytes",
             ));
         }
         if self.sequence == 0 {
@@ -3518,6 +3526,10 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(RESOURCE_COLUMNS[7], DataType::UInt16, true),
         field(RESOURCE_COLUMNS[8], DataType::UInt64, true),
         field(RESOURCE_COLUMNS[9], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[10], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[11], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[12], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[13], DataType::UInt64, true),
     ]))
 }
 
@@ -3818,6 +3830,18 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt64Array::from(vec![
             resources.map(|sample| sample.rss_peak_bytes.get()),
         ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.stdout.bytes.get()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.stdout.lines.get()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.stderr.bytes.get()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.stderr.lines.get()),
+        ])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3944,13 +3968,11 @@ fn decode_resources(
             "resource columns must all be null or all present".into(),
         ));
     }
+    let unit = |error: ResourceUnitError| ArtifactError::Arrow(error.to_string());
     let sampled_at = UtcTimestamp::new(string(batch, RESOURCE_COLUMN)?.value(0))?;
-    let wall = WallMicros::new(uint64(batch, RESOURCE_COLUMN + 1)?.value(0))
-        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    let resident = |column: usize| {
-        ResidentBytes::new(uint64(batch, column)?.value(0))
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))
-    };
+    let wall = WallMicros::new(uint64(batch, RESOURCE_COLUMN + 1)?.value(0)).map_err(unit)?;
+    let resident =
+        |column: usize| ResidentBytes::new(uint64(batch, column)?.value(0)).map_err(unit);
     let rss = resident(RESOURCE_COLUMN + 8)?;
     let rss_peak = resident(RESOURCE_COLUMN + 9)?;
     let leader_pid = uint32(batch, RESOURCE_COLUMN + 2)?.value(0);
@@ -3970,8 +3992,13 @@ fn decode_resources(
             batch.column(first + 1).as_ref(),
             batch.schema().field(first + 1).name(),
         )?;
-        HostLoadSample::new(load1.value(0), cores.value(0))
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))
+        HostLoadSample::new(load1.value(0), cores.value(0)).map_err(unit)
+    };
+    let stream = |column: usize| -> Result<JobStreamWatermark, ArtifactError> {
+        Ok(JobStreamWatermark {
+            bytes: StreamBytes::new(uint64(batch, column)?.value(0)).map_err(unit)?,
+            lines: StreamLines::new(uint64(batch, column + 1)?.value(0)).map_err(unit)?,
+        })
     };
     Ok(Some(JobResourceSample {
         job_id,
@@ -3984,6 +4011,8 @@ fn decode_resources(
         host: host(RESOURCE_COLUMN + 6)?,
         rss_bytes: rss,
         rss_peak_bytes: rss_peak,
+        stdout: stream(RESOURCE_COLUMN + 10)?,
+        stderr: stream(RESOURCE_COLUMN + 12)?,
     }))
 }
 
@@ -5347,6 +5376,13 @@ mod tests {
         );
     }
 
+    fn watermark(bytes: u64, lines: u64) -> JobStreamWatermark {
+        JobStreamWatermark {
+            bytes: StreamBytes::new(bytes).unwrap(),
+            lines: StreamLines::new(lines).unwrap(),
+        }
+    }
+
     fn sample(job_id: u64, wall_us: u64, leader_pid: u32) -> JobResourceSample {
         let wall = WallMicros::new(wall_us).unwrap();
         JobResourceSample {
@@ -5360,6 +5396,8 @@ mod tests {
             host: HostLoadSample::new(3.75, 10).unwrap(),
             rss_bytes: ResidentBytes::new(128 << 20).unwrap(),
             rss_peak_bytes: ResidentBytes::new(256 << 20).unwrap(),
+            stdout: watermark(5, 3),
+            stderr: watermark(2_097_152, 2_097_152),
         }
     }
 
@@ -5386,27 +5424,24 @@ mod tests {
             "the sealed sample keeps both the group's last resident sum and its peak"
         );
 
-        // A sample missing one of its columns is damage, not a job without a sample.
-        let missing: [(usize, ArrayRef); 2] = [
-            (
-                RESOURCE_COLUMN + 2,
-                Arc::new(UInt32Array::from(vec![Option::<u32>::None])),
-            ),
-            (
-                RESOURCE_COLUMN + 9,
-                Arc::new(UInt64Array::from(vec![Option::<u64>::None])),
-            ),
-        ];
-        for (column, missing) in missing {
+        // A sample missing any one of its columns is damage, not a job without a sample.
+        for column in RESOURCE_COLUMN..RESOURCE_COLUMN + RESOURCE_COLUMNS.len() {
             let mut columns = batch.columns().to_vec();
-            columns[column] = missing;
+            columns[column] = new_null_array(batch.schema().field(column).data_type(), 1);
             let partial = RecordBatch::try_new(batch.schema(), columns).unwrap();
             assert!(
                 batch_to_protected_record(&partial).is_err(),
-                "{} null alone",
-                RESOURCE_COLUMNS[column - RESOURCE_COLUMN]
+                "{} alone is null",
+                batch.schema().field(column).name()
             );
         }
+        // A stream count no projection holds exactly is damage, not a truncated count.
+        let mut columns = batch.columns().to_vec();
+        columns[RESOURCE_COLUMN + 13] = Arc::new(UInt64Array::from(vec![
+            crate::api::resources::MAX_EXACT_INTEGER + 1,
+        ]));
+        let inexact = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert!(batch_to_protected_record(&inexact).is_err());
 
         let mut below_peak = sample(9, 1, 1);
         below_peak.rss_peak_bytes = ResidentBytes::new(1).unwrap();
@@ -5432,6 +5467,16 @@ mod tests {
                     ..valid_job_record(9)
                 },
                 "a peak is never below the sample it includes",
+            ),
+            (
+                JobArtifactRecord {
+                    resources: Some(JobResourceSample {
+                        stdout: watermark(3, 4),
+                        ..sample(9, 1, 1)
+                    }),
+                    ..valid_job_record(9)
+                },
+                "a stream's lines fit its bytes",
             ),
         ] {
             assert!(record.validate().is_err(), "{why}");

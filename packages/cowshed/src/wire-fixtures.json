@@ -547,6 +547,14 @@
           "rssBytes": 50331648,
           "rssPeakBytes": 100663296,
           "sampledAt": "2026-01-02T03:04:05Z",
+          "stderr": {
+            "bytes": 128,
+            "lines": 3
+          },
+          "stdout": {
+            "bytes": 4096,
+            "lines": 64
+          },
           "wallMs": 1250,
           "wallUs": 1250400
         },
@@ -760,6 +768,14 @@
         "rssBytes": 50331648,
         "rssPeakBytes": 100663296,
         "sampledAt": "2026-01-02T03:04:05Z",
+        "stderr": {
+          "bytes": 128,
+          "lines": 3
+        },
+        "stdout": {
+          "bytes": 4096,
+          "lines": 64
+        },
         "wallMs": 1250,
         "wallUs": 1250400
       },

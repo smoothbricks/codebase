@@ -40,7 +40,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling};
+use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling, StreamTally};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -2622,8 +2622,9 @@ struct JobStateRecord {
     process: Option<Box<dyn RunningProcess>>,
     stdout: VecDeque<Bytes>,
     stderr: VecDeque<Bytes>,
-    stdout_len: u64,
-    stderr_len: u64,
+    /// Each stream's counts as its chunks were admitted; their bytes are the read cursors.
+    stdout_tally: StreamTally,
+    stderr_tally: StreamTally,
     stdout_eof: bool,
     stderr_eof: bool,
     exit: Option<ExitStatus>,
@@ -2697,8 +2698,8 @@ impl JobStateRecord {
 
     fn stream(&self, stream: StreamKind) -> (&VecDeque<Bytes>, u64, bool) {
         match stream {
-            StreamKind::Stdout => (&self.stdout, self.stdout_len, self.stdout_eof),
-            StreamKind::Stderr => (&self.stderr, self.stderr_len, self.stderr_eof),
+            StreamKind::Stdout => (&self.stdout, self.stdout_tally.bytes(), self.stdout_eof),
+            StreamKind::Stderr => (&self.stderr, self.stderr_tally.bytes(), self.stderr_eof),
         }
     }
 }
@@ -3490,8 +3491,8 @@ impl SupervisorActor {
             process: None,
             stdout: VecDeque::new(),
             stderr: VecDeque::new(),
-            stdout_len: 0,
-            stderr_len: 0,
+            stdout_tally: StreamTally::default(),
+            stderr_tally: StreamTally::default(),
             stdout_eof: false,
             stderr_eof: false,
             exit: None,
@@ -4102,11 +4103,11 @@ impl SupervisorActor {
                     let accepted = bytes.slice(..admission.accepted_bytes);
                     match stream {
                         StreamKind::Stdout => {
-                            job.stdout_len += byte_count(accepted.len());
+                            job.stdout_tally.admit(&accepted);
                             job.stdout.push_back(accepted);
                         }
                         StreamKind::Stderr => {
-                            job.stderr_len += byte_count(accepted.len());
+                            job.stderr_tally.admit(&accepted);
                             job.stderr.push_back(accepted);
                         }
                     }
@@ -4246,7 +4247,9 @@ impl SupervisorActor {
             .unwrap_or(u64::MAX);
         // The terminal sample, frozen into the job's record; none for a job that never owned a
         // process, or whose last observation failed -- a read says which.
-        job.info.resources = job.sampling.freeze(observe);
+        job.info.resources = job
+            .sampling
+            .freeze(|sampler| observe(sampler, job.stdout_tally, job.stderr_tally));
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
@@ -4717,7 +4720,7 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
     let job_id = job.info.job_id;
     if let Some(sampler) = job.sampling.own(job_id, process) {
-        match observe(sampler) {
+        match observe(sampler, job.stdout_tally, job.stderr_tally) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
             Err(error) => eprintln!(
@@ -4729,10 +4732,14 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
 }
 
-/// Observe the job's processes now: the one imperative step of a sample. Each member's resident
-/// memory is read right after the membership; a member that exited in between holds nothing
-/// and is no member any more.
-fn observe(sampler: &mut JobSampler) -> Result<JobResourceSample> {
+/// Observe the job's processes now, with its streams as admitted so far: the one imperative step
+/// of a sample. Each member's resident memory is read right after the membership; a member that
+/// exited in between holds nothing and is no member any more.
+fn observe(
+    sampler: &mut JobSampler,
+    stdout: StreamTally,
+    stderr: StreamTally,
+) -> Result<JobResourceSample> {
     let sampled_at = utc_now()?;
     let leader = sampler.leader().pid();
     let unreadable = |what: &str, error: std::io::Error| {
@@ -4773,13 +4780,17 @@ fn observe(sampler: &mut JobSampler) -> Result<JobResourceSample> {
         sampled_at,
         members,
         host,
+        stdout,
+        stderr,
     })
 }
 
 /// A resources read: a running job observed now and kept as its latest sample, an ended job's
 /// terminal sample or why it has none.
 fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
-    let sample = job.sampling.read(job.info.job_id, observe)?;
+    let sample = job.sampling.read(job.info.job_id, |sampler| {
+        observe(sampler, job.stdout_tally, job.stderr_tally)
+    })?;
     if !job.terminal() {
         job.info.resources = Some(sample.clone());
     }
@@ -4985,7 +4996,7 @@ pub(crate) fn utc_at_second(seconds: u64) -> Result<UtcTimestamp> {
     .map_err(|error| CowshedError::internal(error.to_string()))
 }
 
-fn byte_count(value: usize) -> u64 {
+pub(super) fn byte_count(value: usize) -> u64 {
     u64::try_from(value).expect("supported platforms have at most 64-bit usize")
 }
 

@@ -8,10 +8,11 @@
 use std::time::Instant;
 
 use super::job_groups::Birth;
-use super::supervisor::OwnedProcess;
+use super::supervisor::{OwnedProcess, byte_count};
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::resources::{
-    HostLoadSample, JobResourceSample, ResidentBytes, ResourceUnitError, WallMicros,
+    HostLoadSample, JobResourceSample, JobStreamWatermark, ResidentBytes, ResourceUnitError,
+    StreamBytes, StreamLines, WallMicros,
 };
 use crate::error::{CowshedError, Result};
 use crate::host_load::HostLoadError;
@@ -92,6 +93,9 @@ pub(super) struct Observation {
     /// Every process of the group the sampler's leader leads that was running when its resident
     /// memory was read: the complete membership, less any member that exited before its read.
     pub members: Vec<Member>,
+    /// The job's output streams as the supervisor had admitted them by the boundary.
+    pub stdout: StreamTally,
+    pub stderr: StreamTally,
 }
 
 /// One process of the job's group, as read at a sample boundary.
@@ -99,6 +103,43 @@ pub(super) struct Member {
     pub pid: u32,
     /// Its resident memory, read at this boundary.
     pub resident: ResidentBytes,
+}
+
+/// One output stream's running counts, folded over each chunk the supervisor admits. A line a
+/// chunk leaves open is the next chunk's to end, so a chunk boundary never splits one in two.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct StreamTally {
+    /// Admitted bytes: the stream's next read cursor.
+    bytes: u64,
+    /// Admitted `\n` bytes: the lines ended.
+    newlines: u64,
+    /// Whether the last admitted byte is not a `\n`: a line no `\n` has ended yet.
+    open: bool,
+}
+
+impl StreamTally {
+    /// Count `chunk`, admitted after every chunk before it.
+    pub(super) fn admit(&mut self, chunk: &[u8]) {
+        let Some(&last) = chunk.last() else {
+            return;
+        };
+        self.bytes += byte_count(chunk.len());
+        self.newlines += byte_count(chunk.iter().filter(|&&byte| byte == b'\n').count());
+        self.open = last != b'\n';
+    }
+
+    /// The stream's next read cursor.
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The stream's counts as its sample carries them: its trailing open line counts.
+    fn watermark(&self) -> std::result::Result<JobStreamWatermark, ResourceUnitError> {
+        Ok(JobStreamWatermark {
+            bytes: StreamBytes::new(self.bytes)?,
+            lines: StreamLines::new(self.newlines + u64::from(self.open))?,
+        })
+    }
 }
 
 pub(super) struct JobSampler {
@@ -133,8 +174,8 @@ impl JobSampler {
         &self.leader
     }
 
-    /// The job's sample from what was observed of it. Its resident sum joins the job's peak; a
-    /// sample that cannot be taken leaves the peak as it was.
+    /// The job's sample from what was observed of it. Every observation is checked before the
+    /// resident sum joins the job's peak: a sample that cannot be taken leaves the peak as it was.
     pub(super) fn sample(&mut self, observed: Observation) -> Result<JobResourceSample> {
         let host_start = *self.host_start.as_ref().map_err(|error| {
             CowshedError::environment_missing(
@@ -145,20 +186,29 @@ impl JobSampler {
                 "the command runs on; inspect the host's load and core reporting",
             )
         })?;
-        let unsampled = |error: ResourceUnitError| {
+        let refused = |what: &str, error: ResourceUnitError| {
             CowshedError::internal(format!(
-                "job {} cannot be sampled: {error}",
+                "job {} cannot be sampled: {what}{error}",
                 self.job_id.get()
             ))
         };
-        let wall = WallMicros::of(observed.now.duration_since(self.spawned)).map_err(unsampled)?;
+        let wall = WallMicros::of(observed.now.duration_since(self.spawned))
+            .map_err(|error| refused("", error))?;
         let rss = observed
             .members
             .iter()
             .try_fold(ResidentBytes::ZERO, |sum, member| {
                 sum.checked_add(member.resident)
             })
-            .map_err(unsampled)?;
+            .map_err(|error| refused("", error))?;
+        let stdout = observed
+            .stdout
+            .watermark()
+            .map_err(|error| refused("stdout ", error))?;
+        let stderr = observed
+            .stderr
+            .watermark()
+            .map_err(|error| refused("stderr ", error))?;
         self.rss_peak = self.rss_peak.max(rss);
         Ok(JobResourceSample {
             job_id: self.job_id,
@@ -171,6 +221,8 @@ impl JobSampler {
             host: observed.host,
             rss_bytes: rss,
             rss_peak_bytes: self.rss_peak,
+            stdout,
+            stderr,
         })
     }
 }
@@ -219,6 +271,8 @@ mod tests {
                     resident: ResidentBytes::new(resident).expect("exact"),
                 })
                 .collect(),
+            stdout: StreamTally::default(),
+            stderr: StreamTally::default(),
         }
     }
 
@@ -258,6 +312,20 @@ mod tests {
             None,
             "a sum no projection holds exactly is an error"
         );
+        // Nor does one whose stream count is inexact, however much its members hold.
+        let inexact = StreamTally {
+            bytes: MAX_EXACT_INTEGER + 1,
+            newlines: 0,
+            open: true,
+        };
+        assert!(
+            sampler
+                .sample(Observation {
+                    stdout: inexact,
+                    ..held(spawn, &[(100, 512 * MIB)])
+                })
+                .is_err()
+        );
 
         let terminal = sampling
             .freeze(|sampler| sampler.sample(seen(spawn, &[])))
@@ -273,6 +341,66 @@ mod tests {
                 .expect("frozen"),
             terminal
         );
+    }
+
+    fn tally(chunks: &[&[u8]]) -> StreamTally {
+        chunks
+            .iter()
+            .fold(StreamTally::default(), |mut tally, chunk| {
+                tally.admit(chunk);
+                tally
+            })
+    }
+
+    fn counts(watermark: JobStreamWatermark) -> (u64, u64) {
+        (watermark.bytes.get(), watermark.lines.get())
+    }
+
+    #[test]
+    fn a_stream_counts_every_admitted_byte_and_line_whatever_line_a_chunk_splits() {
+        let mut stream = StreamTally::default();
+        let mut seen = Vec::new();
+        for chunk in [&b"a"[..], b"\nb", b"\n", b"", b"c"] {
+            stream.admit(chunk);
+            seen.push(counts(stream.watermark().expect("exact")));
+        }
+        assert_eq!(
+            seen,
+            [(1, 1), (3, 2), (4, 2), (4, 2), (5, 3)],
+            "an open line counts once, however many chunks it spans; an empty chunk changes nothing"
+        );
+        assert_eq!(stream.bytes(), 5, "bytes is the next read cursor");
+        assert_eq!(counts(tally(&[]).watermark().expect("exact")), (0, 0));
+        assert_eq!(
+            counts(tally(&[b"\n\n", b"\n"]).watermark().expect("exact")),
+            (3, 3),
+            "every newline ends a line"
+        );
+        assert_eq!(
+            tally(&[b"a", b"\nb", b"\n", b"c"]),
+            tally(&[b"a\nb\nc"]),
+            "the count is the admitted bytes', not their chunking's"
+        );
+    }
+
+    #[test]
+    fn a_sample_carries_the_streams_as_admitted_by_its_boundary() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sample = sampling
+            .own(job(), owned(100, spawn))
+            .expect("live")
+            .sample(Observation {
+                stdout: tally(&[b"a", b"\nb", b"\n", b"c"]),
+                stderr: tally(&[b"oops\n"]),
+                ..seen(spawn, &[100])
+            })
+            .expect("sample");
+        assert_eq!(
+            (counts(sample.stdout), counts(sample.stderr)),
+            ((5, 3), (5, 1))
+        );
+        assert!(sample.consistent());
     }
 
     #[test]

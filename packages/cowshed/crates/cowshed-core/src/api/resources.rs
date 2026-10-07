@@ -301,6 +301,90 @@ impl HostLoadSample {
     }
 }
 
+/// Bytes of one output stream the supervisor admitted: also the stream's next read cursor.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+pub struct StreamBytes(u64);
+
+impl StreamBytes {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("bytes", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for StreamBytes {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<StreamBytes> for u64 {
+    fn from(value: StreamBytes) -> Self {
+        value.0
+    }
+}
+
+/// Lines in one output stream's admitted bytes: one per `\n`, and one more for a trailing line
+/// no `\n` ended.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+pub struct StreamLines(u64);
+
+impl StreamLines {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("lines", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for StreamLines {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<StreamLines> for u64 {
+    fn from(value: StreamLines) -> Self {
+        value.0
+    }
+}
+
+/// How far one output stream reached by the sample boundary, counted as the supervisor admitted
+/// each chunk of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobStreamWatermark {
+    pub bytes: StreamBytes,
+    pub lines: StreamLines,
+}
+
+impl JobStreamWatermark {
+    /// Whether admitted bytes could hold these lines: every line holds at least one byte, and
+    /// any byte is on a line.
+    pub fn possible(&self) -> bool {
+        self.lines.get() <= self.bytes.get() && (self.bytes.get() == 0) == (self.lines.get() == 0)
+    }
+}
+
 /// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
 /// a process: its shell activation on a cold host, otherwise its command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -329,13 +413,18 @@ pub struct JobResourceSample {
     /// The largest `rssBytes` this job has been sampled at, this sample's included: a group's
     /// peak, never the sum of its processes' separate peaks.
     pub rss_peak_bytes: ResidentBytes,
+    pub stdout: JobStreamWatermark,
+    pub stderr: JobStreamWatermark,
 }
 
 impl JobResourceSample {
-    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`, and no
-    /// peak lies below the sample it includes.
+    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`, no peak
+    /// lies below the sample it includes, and each stream's bytes could hold its lines.
     pub fn consistent(&self) -> bool {
-        self.wall_ms == self.wall_us.millis() && self.rss_bytes <= self.rss_peak_bytes
+        self.wall_ms == self.wall_us.millis()
+            && self.rss_bytes <= self.rss_peak_bytes
+            && self.stdout.possible()
+            && self.stderr.possible()
     }
 }
 
@@ -398,6 +487,30 @@ mod tests {
         ResidentBytes::new(value).expect("exact")
     }
 
+    fn stream(bytes: u64, lines: u64) -> JobStreamWatermark {
+        JobStreamWatermark {
+            bytes: StreamBytes::new(bytes).expect("exact"),
+            lines: StreamLines::new(lines).expect("exact"),
+        }
+    }
+
+    fn sample(wall: WallMicros, stdout: JobStreamWatermark) -> JobResourceSample {
+        JobResourceSample {
+            job_id: JobId::new(3).expect("job"),
+            sampled_at: timestamp(),
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid: 99,
+            members: vec![99, 100],
+            host_start: host(),
+            host: host(),
+            rss_bytes: bytes(0),
+            rss_peak_bytes: bytes(0),
+            stdout,
+            stderr: stream(0, 0),
+        }
+    }
+
     #[test]
     fn wall_milliseconds_project_the_microseconds() {
         let wall = WallMicros::of(Duration::from_micros(12_345_999)).expect("exact");
@@ -412,6 +525,8 @@ mod tests {
             host: host(),
             rss_bytes: bytes(4096),
             rss_peak_bytes: bytes(8192),
+            stdout: stream(0, 0),
+            stderr: stream(0, 0),
         };
         assert_eq!(
             (sample.wall_us.get(), sample.wall_ms.get()),
@@ -434,6 +549,8 @@ mod tests {
             host: host(),
             rss_bytes: bytes(8192),
             rss_peak_bytes: bytes(4096),
+            stdout: stream(0, 0),
+            stderr: stream(0, 0),
         };
         assert!(!sample.consistent());
     }
@@ -463,6 +580,29 @@ mod tests {
             })
         );
         assert!(WallMicros::of(Duration::MAX).is_err());
+        for refused in [
+            StreamBytes::new(MAX_EXACT_INTEGER + 1).map(StreamBytes::get),
+            StreamLines::new(MAX_EXACT_INTEGER + 1).map(StreamLines::get),
+        ] {
+            assert!(refused.is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_streams_lines_must_fit_its_bytes() {
+        let wall = WallMicros::new(1).expect("exact");
+        for (bytes, lines) in [(0, 0), (1, 1), (5, 3), (5, 5)] {
+            assert!(
+                sample(wall, stream(bytes, lines)).consistent(),
+                "{bytes} bytes hold {lines} lines"
+            );
+        }
+        for (bytes, lines) in [(0, 1), (1, 0), (3, 4)] {
+            assert!(
+                !sample(wall, stream(bytes, lines)).consistent(),
+                "{bytes} bytes cannot hold {lines} lines"
+            );
+        }
     }
 
     #[test]
@@ -479,6 +619,8 @@ mod tests {
             host: host(),
             rss_bytes: bytes(1 << 20),
             rss_peak_bytes: bytes(3 << 20),
+            stdout: stream(5, 3),
+            stderr: stream(0, 0),
         };
         let json = serde_json::to_value(&sample).expect("serialize");
         assert_eq!(
@@ -494,24 +636,34 @@ mod tests {
                 "host": { "load1": 1.25, "cores": 8 },
                 "rssBytes": 1_048_576,
                 "rssPeakBytes": 3_145_728,
+                "stdout": {"bytes": 5, "lines": 3},
+                "stderr": {"bytes": 0, "lines": 0},
             })
         );
         assert_eq!(
-            serde_json::from_value::<JobResourceSample>(json).expect("round trip"),
+            serde_json::from_value::<JobResourceSample>(json.clone()).expect("round trip"),
             sample
         );
-        let at = |field: &str, value: u64| {
-            let mut json = serde_json::to_value(&sample).expect("serialize");
-            json[field] = serde_json::json!(value);
-            json
-        };
-        for field in ["wallUs", "rssBytes", "rssPeakBytes"] {
+        for (pointer, inexact) in [
+            ("/wallUs", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            ("/rssBytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            ("/rssPeakBytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            ("/stdout/bytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            ("/stderr/lines", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+        ] {
+            let mut refused = json.clone();
+            *refused.pointer_mut(pointer).expect("field") = inexact;
             assert!(
-                serde_json::from_value::<JobResourceSample>(at(field, MAX_EXACT_INTEGER + 1))
-                    .is_err(),
-                "{field} beyond the exact bound is refused"
+                serde_json::from_value::<JobResourceSample>(refused).is_err(),
+                "{pointer} is refused"
             );
         }
+        let mut unknown = json;
+        unknown["stdout"]["chars"] = serde_json::json!(5);
+        assert!(
+            serde_json::from_value::<JobResourceSample>(unknown).is_err(),
+            "a watermark has only bytes and lines"
+        );
     }
 }
 

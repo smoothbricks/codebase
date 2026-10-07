@@ -1789,8 +1789,9 @@ impl JobInfo {
             }
             if !resources.consistent() {
                 return Err(DtoError::InvalidJobProjection(
-                    "resources.wallMs must be resources.wallUs in whole milliseconds, and \
-                     resources.rssPeakBytes at least resources.rssBytes",
+                    "resources must agree with themselves: wallMs is wallUs in whole \
+                     milliseconds, rssPeakBytes at least rssBytes, and each stream's lines fit its \
+                     bytes",
                 ));
             }
         }

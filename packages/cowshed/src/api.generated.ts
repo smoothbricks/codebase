@@ -805,6 +805,8 @@ export type JobResourceSample = {
    * peak, never the sum of its processes' separate peaks.
    */
   readonly rssPeakBytes: ResidentBytes;
+  readonly stdout: JobStreamWatermark;
+  readonly stderr: JobStreamWatermark;
 };
 
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
@@ -813,6 +815,15 @@ export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' |
  * Which captured stream a log read walks.
  */
 export type JobStream = 'stdout' | 'stderr';
+
+/**
+ * How far one output stream reached by the sample boundary, counted as the supervisor admitted
+ * each chunk of it.
+ */
+export type JobStreamWatermark = {
+  readonly bytes: StreamBytes;
+  readonly lines: StreamLines;
+};
 
 /**
  * A bounded raw slice of each stream and the cursor that continues after it. A slice after a
@@ -1682,6 +1693,11 @@ export type StepReport =
  */
 export type StorageIoBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
+/**
+ * Bytes of one output stream the supervisor admitted: also the stream's next read cursor.
+ */
+export type StreamBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
 export type StreamInfo = StreamInfoRef;
 
 export type StreamInfoRef = {
@@ -1690,6 +1706,12 @@ export type StreamInfoRef = {
   readonly sha256: Sha256Digest;
   readonly summary: OutputSummary;
 };
+
+/**
+ * Lines in one output stream's admitted bytes: one per `\n`, and one more for a trailing line
+ * no `\n` ended.
+ */
+export type StreamLines = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 /**
  * The workspace supervisors that served before the daemon started and that it has not finished

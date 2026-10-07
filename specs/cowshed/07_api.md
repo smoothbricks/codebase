@@ -686,7 +686,9 @@ pub struct JobVolumeUsage {
     pub workspace_delta_bytes: VolumeUsedBytesDelta,
     pub build_delta_bytes: Option<VolumeUsedBytesDelta>,
 }
-pub struct JobStreamWatermark { pub bytes: u64, pub lines: u64 }
+pub struct StreamBytes(u64);
+pub struct StreamLines(u64);
+pub struct JobStreamWatermark { pub bytes: StreamBytes, pub lines: StreamLines }
 pub struct JobResourceSample {
     pub job_id: JobId,                // retained in standalone progress and terminal resource receipts
     pub sampled_at: UtcTimestamp,

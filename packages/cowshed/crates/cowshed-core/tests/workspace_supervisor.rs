@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
-    ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobTailBytes, JobTailLimits,
-    MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
-    ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo,
-    WorkspacePath,
+    ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark, JobTailBytes,
+    JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
+    OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinSource,
+    StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
@@ -3600,6 +3600,186 @@ async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
     assert_eq!(handle.sealed(job_id).await.unwrap().resources, None);
     let unsampled = handle.resources(job_id).await.unwrap_err();
     assert_eq!(unsampled.code, ErrorCode::Conflict, "{}", unsampled.message);
+}
+
+/// A watermark as the bare numbers its wire projects.
+fn watermark(stream: &JobStreamWatermark) -> (u64, u64) {
+    (stream.bytes.get(), stream.lines.get())
+}
+
+/// A stream counts every chunk the supervisor admits, whatever line the chunk splits: `a`,
+/// `\nb`, `\n` and `c` are five bytes in three lines, the last one unterminated. The count is
+/// the stream's read cursor, live and terminal, and the sealed record keeps it.
+#[tokio::test]
+async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
+    let (supervisor_config, _root) = isolated_config("resources-lines");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut command = lone_group();
+    job.events
+        .send(ProcessEvent::Started {
+            job_id,
+            process: owned(&command, Instant::now()),
+        })
+        .await
+        .unwrap();
+    // Each chunk is admitted before the next is sent: a read at the stream's end waits for the
+    // chunk, and the supervisor serves it from where the chunk before it ended.
+    let mut cursor = 0;
+    for chunk in [&b"a"[..], b"\nb", b"\n", b"c"] {
+        job.events
+            .send(ProcessEvent::Output {
+                job_id,
+                stream: StreamKind::Stdout,
+                bytes: Bytes::from_static(chunk),
+            })
+            .await
+            .unwrap();
+        let admitted = handle
+            .log_read(job_id, StreamKind::Stdout, cursor, true)
+            .await
+            .unwrap();
+        assert_eq!(admitted.bytes.as_ref(), chunk);
+        cursor = admitted.next_offset;
+    }
+    assert_eq!(cursor, 5);
+
+    let running = handle.resources(job_id).await.unwrap();
+    assert_eq!(
+        (watermark(&running.stdout), watermark(&running.stderr)),
+        ((5, 3), (0, 0))
+    );
+    assert_eq!(
+        running.stdout.bytes.get(),
+        cursor,
+        "bytes is the next read cursor"
+    );
+
+    end_group(&mut command);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    assert_eq!(
+        (watermark(&terminal.stdout), watermark(&terminal.stderr)),
+        ((5, 3), (0, 0))
+    );
+    let sealed = handle.sealed(job_id).await.unwrap();
+    assert_eq!(sealed.stdout.bytes, terminal.stdout.bytes.get());
+    assert_eq!(
+        sealed.resources,
+        Some(terminal),
+        "the sealed sample is the last one"
+    );
+}
+
+/// 2 MiB of newlines on stderr spill from the inline buffer to the job's protected file midway;
+/// every one of them is a line, before and after, and the record a later supervisor reads from
+/// the store carries the very terminal sample the job ended with.
+#[tokio::test]
+async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
+    const NEWLINES: usize = 2 * 1024 * 1024;
+    let (mut supervisor_config, _root) = isolated_config("resources-promotion");
+    // Room for the stream: the harness's quota would end the job long before its last line.
+    supervisor_config.artifacts.combined_output_quota_bytes = 2 * u64::try_from(NEWLINES).unwrap();
+    let inline_cap = supervisor_config.artifacts.inline_cap_bytes;
+    assert!(
+        NEWLINES > inline_cap && NEWLINES.is_multiple_of(inline_cap),
+        "the stream outgrows the inline cap in whole chunks"
+    );
+    let mut harness = warm_harness(supervisor_config.clone());
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut command = lone_group();
+    job.events
+        .send(ProcessEvent::Started {
+            job_id,
+            process: owned(&command, Instant::now()),
+        })
+        .await
+        .unwrap();
+    // The first chunk fills the inline buffer exactly; the second promotes the stream. Each is
+    // admitted before the next is sent: a read at the stream's end waits for it.
+    let chunk = Bytes::from(vec![b'\n'; inline_cap]);
+    let cap = u64::try_from(inline_cap).unwrap();
+    let total = u64::try_from(NEWLINES).unwrap();
+    for start in (0..total).step_by(inline_cap) {
+        job.events
+            .send(ProcessEvent::Output {
+                job_id,
+                stream: StreamKind::Stderr,
+                bytes: chunk.clone(),
+            })
+            .await
+            .unwrap();
+        let admitted = handle
+            .log_read(job_id, StreamKind::Stderr, start, true)
+            .await
+            .unwrap();
+        assert!(
+            admitted.next_offset > start,
+            "the chunk at {start} is served"
+        );
+        if start == 0 {
+            let inline = handle.resources(job_id).await.unwrap();
+            assert_eq!(
+                watermark(&inline.stderr),
+                (cap, cap),
+                "before the promotion"
+            );
+        }
+    }
+    let running = handle.resources(job_id).await.unwrap();
+    assert_eq!(
+        (watermark(&running.stdout), watermark(&running.stderr)),
+        ((0, 0), (total, total)),
+        "after the promotion"
+    );
+
+    end_group(&mut command);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    assert_eq!(watermark(&terminal.stderr), (total, total));
+    let sealed = handle.sealed(job_id).await.unwrap();
+    assert!(
+        matches!(
+            &sealed.stderr.storage,
+            OutputStorage::Captured {
+                artifact: ProtectedOutput::File { .. }
+            }
+        ),
+        "stderr was promoted to its protected file: {:?}",
+        sealed.stderr.storage
+    );
+    assert_eq!(sealed.stderr.bytes, total);
+    assert_eq!(sealed.resources.as_ref(), Some(&terminal));
+    handle.quiesce().await.unwrap();
+    handle.retire().await.unwrap();
+    drop(harness);
+
+    let successor = warm_harness(supervisor_config);
+    assert_eq!(
+        successor.handle.sealed(job_id).await.unwrap().resources,
+        Some(terminal),
+        "the stored record decodes to the terminal sample"
+    );
 }
 
 /// Workspace `name`'s supervisor config, in an Nx project no daemon serves.
