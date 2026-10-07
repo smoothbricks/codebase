@@ -2131,7 +2131,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
 #[tokio::test]
 async fn control_start_failure_stops_and_joins_gateway_actor() {
     let (mut config, _cache) = test_config();
-    let missing_parent = std::env::temp_dir().join(format!(
+    let missing_parent = crate::fixture_dir::scratch_parent().join(format!(
         "cowshed-missing-control-parent-{}",
         std::process::id()
     ));
@@ -2194,10 +2194,10 @@ async fn control_socket_parent_must_be_a_private_real_directory() {
         error
     }
 
-    // Deliberately terse: `sockaddr_un.sun_path` is 104 bytes on macOS, and the per-user `TMPDIR`
-    // already spends 49 of them. A descriptive name pushes the socket past `SUN_LEN`, and then the
-    // bind refuses before the parent check is reached — which would let this test keep passing for
-    // the wrong reason if the check under test were ever removed.
+    // Deliberately terse: `sockaddr_un.sun_path` is 104 bytes on macOS. A descriptive name pushes
+    // the socket past `SUN_LEN`, and then the bind refuses before the parent check is reached —
+    // which would let this test keep passing for the wrong reason if the check under test were
+    // ever removed.
     let root = secure_fixture_dir(&format!("cowshed-ctl-parent-{}", std::process::id()));
 
     let shared = root.path().join("shared");

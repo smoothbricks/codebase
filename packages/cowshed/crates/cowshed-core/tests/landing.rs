@@ -14,29 +14,25 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{LandingCommits, WorkspaceLanding};
 use cowshed_core::fork_lock::Run as _;
 use cowshed_core::landing::{measure, resolve_target};
 
+#[path = "support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 const TARGET: &str = "main";
 
-/// A parent repository plus clones of it, deleted with the test.
-struct Fixture(PathBuf);
+/// A parent repository plus clones of it, deleted with the test. Under `/tmp`, not TMPDIR: the
+/// measurement runs controller git sandboxed, and the sandbox never grants a workspace's TMPDIR,
+/// which is inside the protected store.
+struct Fixture(TempRoot);
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-landing-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("fixture root");
-        let fixture = Self(root);
+        let fixture = Self(TempRoot::new(&format!("cowshed-landing-{label}")));
         git(
             fixture.parent_unchecked(),
             ["init", "-q", "-b", TARGET, "."],
@@ -67,7 +63,7 @@ impl Fixture {
     fn clone_workspace(&self, name: &str) -> PathBuf {
         let mount = self.0.join(name);
         git(
-            &self.0,
+            &*self.0,
             [
                 OsStr::new("clone"),
                 OsStr::new("-q"),
@@ -89,12 +85,6 @@ impl Fixture {
 
     fn parent_commit(&self, file: &str, contents: &str, message: &str) {
         self.land_content_separately(file, contents, message);
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

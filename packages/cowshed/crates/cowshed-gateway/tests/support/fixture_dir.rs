@@ -30,6 +30,14 @@ impl Drop for FixtureDir {
     }
 }
 
+/// Where every gateway test fixture lives: canonical `/tmp` (`/private/tmp` on macOS), never
+/// TMPDIR. A cowshed workspace exports a TMPDIR deep inside its store, which puts a control
+/// socket under it past `sockaddr_un.sun_path`'s 104 bytes, so `Gateway::start` refused it
+/// ("path must be shorter than SUN_LEN") whenever the tests ran in a workspace.
+pub fn scratch_parent() -> PathBuf {
+    std::fs::canonicalize("/tmp").unwrap_or_else(|error| panic!("canonical /tmp: {error}"))
+}
+
 /// A temporary directory every cowshed private-root check accepts.
 ///
 /// `create_dir` masks 0o777 with the process umask, so a permissive umask yields a group- and
@@ -41,7 +49,7 @@ impl Drop for FixtureDir {
 /// strategy that hands back a directory this fixture did not create, from resurfacing as a bare
 /// `InvalidInput` raised deep inside `Gateway::start`, which names neither the path nor the mode.
 pub fn secure_fixture_dir(name: &str) -> FixtureDir {
-    let path = std::env::temp_dir().join(name);
+    let path = scratch_parent().join(name);
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir(&path)
         .unwrap_or_else(|error| panic!("create fixture directory {}: {error}", path.display()));
