@@ -1014,6 +1014,9 @@ parent owns unmount/removal on success and unwind, including a measured command-
 are unavailable, tmpfs can measure anonymous/shmem charging only: neither regular-file page-cache attribution nor
 storage-I/O attribution is proved, and the probe reports that blocked boundary rather than passing it.
 
+The mount subprocess explicitly selects classic `mount(2)` with command-local `LIBMOUNT_FORCE_MOUNT2=always`, consuming
+the runner's narrow ext4 mount delegation rather than requiring broad authority for the newer `fsopen`/`fsmount` API.
+
 The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
 through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
 fork-heavy workload, measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither

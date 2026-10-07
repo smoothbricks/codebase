@@ -1152,7 +1152,9 @@ impl Scratch {
         let association = scratch.loop_association.as_ref().expect("prepared loop");
         std::fs::create_dir(&scratch.directory)
             .unwrap_or_else(|error| panic!("create {}: {error}", scratch.directory.display()));
+        // The trusted runner delegates mount(2) for ext4, not the fsopen/fsmount API.
         run(Command::new(find_program("mount"))
+            .env("LIBMOUNT_FORCE_MOUNT2", "always")
             .args(["-t", "ext4"])
             .arg(&association.device)
             .arg(&scratch.directory))
