@@ -5,8 +5,8 @@
 //! ORs the event bits; `NOTE_TRACK` is refused with `ENOTSUP`), so each one is answered by
 //! reading the member's children with `proc_listchildpids`: a child forked and reaped before
 //! that read is never seen. A member that forks therefore makes the tree's coverage a gap
-//! ([`ProcessCoverageGap::UncountedFork`]); the job's exact totals come from the leader's own and
-//! reaped-children rusage, not from this tree.
+//! ([`ProcessCoverageGap::UncountedFork`]). The job's CPU totals come from the leader's own and
+//! reaped-children rusage (within that source's named limits), not from this tree.
 //!
 //! Identity is the kernel's unique id (`p_uniqueid`), which no other process is given while the
 //! system runs. Every kernel read here names a pid alone, so each is fenced by that id:

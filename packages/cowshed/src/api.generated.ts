@@ -688,9 +688,9 @@ export type IdentityReport = {
 };
 
 /**
- * A job's complete totals and the independent source that counted them: never a sum of the
- * processes a sampler happened to see, which misses every descendant born and reaped between
- * two samples.
+ * A job's CPU totals and the independent source that counted them, never a sum of the
+ * processes a sampler happened to see (that sum misses every descendant born and reaped between
+ * two samples). Each variant's documentation names what its source cannot count.
  */
 export type JobAccounting = { readonly kind: 'macOsRusageChildren' } & {
   readonly cpu: CpuTotals;
@@ -887,8 +887,9 @@ export type JobResourceSample = {
    */
   readonly rssPeakBytes: ResidentBytes;
   /**
-   * The job's complete totals from its platform's independent source, as of this boundary:
-   * absent only where no complete source exists yet (Linux, until its cgroup v2 totals).
+   * The job's CPU totals as of this boundary, from its platform's independent source, within
+   * the limits that source names. Absent only where no source exists yet (Linux, until its
+   * cgroup v2 totals).
    */
   readonly accounting: JobAccounting | null;
   readonly stdout: JobStreamWatermark;

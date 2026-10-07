@@ -787,8 +787,9 @@ event source beside pidfd identity and proc metrics. Periodic proc children poll
 missed observation records a typed coverage gap and an unattributed-usage row; it never silently claims completeness or
 trusts a reused PID.
 
-macOS per-process coverage is best-effort with a measured gap; its job totals are exact. kqueue `NOTE_FORK` on each
-member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused with `ENOTSUP` (xnu
+macOS per-process coverage is best-effort with a measured gap, and its job totals carry their own named source limits
+(below). kqueue `NOTE_FORK` on each member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused
+with `ENOTSUP` (xnu
 [`filt_procattach`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1094-L1131),
 [`filt_procevent`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1210-L1212),
 and the `NOTE_FORK` comment in `bsd/sys/event.h`; measured on Darwin 25.6: 64 children forked and reaped under a watched
@@ -797,8 +798,9 @@ the member's children with `proc_listchildpids` and watches each new one for `NO
 (`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A child that forks,
 execs and is reaped before that read is missed, and a coalesced `NOTE_FORK` cannot prove how many children it stood for,
 so a macOS tree in which a member forked never claims `Complete`. The leader/children rusage source (below) still counts
-the missed children's CPU, and reconciliation states it as unattributed usage. An Endpoint Security observer is not
-used: it needs an Apple entitlement. It is revisited only if the measured gap on real gates proves large.
+the missed children's CPU once each parent up to the leader has reaped them, and reconciliation states it as
+unattributed usage. An Endpoint Security observer is not used: it needs an Apple entitlement. It is revisited only if
+the measured gap on real gates proves large.
 
 The canonical records are:
 
@@ -971,7 +973,10 @@ through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`
 fork-heavy workload, measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither
 backend is selected by familiarity or assumed overhead. pidfd identity and proc sampling complement the chosen event
 source, not replace it. macOS observes the three kqueue event kinds best-effort, as above, and reconciles CPU against
-the leader's own and children rusage totals, including the activation interval, which keep the job totals exact.
+cumulative leader-own plus reaped-children rusage. That covers the activation interval and the command once each, but it
+is not a complete job total. Descendants still running, those exited and not yet reaped, and orphans reparented to
+another reaper are missing. An exited leader's held zombie keeps the rusage fixed at its exit, so orphans that run on
+after it add nothing. These limits are stated, never presented as exact.
 
 Reconciliation retains the difference between independent job totals and attributed process rows in named units.
 Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,

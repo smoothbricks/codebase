@@ -1,5 +1,6 @@
-//! A job's complete CPU on macOS (07_api.md, "Complete job accounting and observation
-//! reconciliation"): what each process that led the job cost itself, plus every child it reaped.
+//! A job's cumulative leader-own plus reaped-children CPU on macOS (07_api.md, "Complete job
+//! accounting and observation reconciliation"). This is what each process that led the job cost
+//! itself, plus every child it reaped. It is not a complete job total; its limits are below.
 //!
 //! When a parent reaps a child, xnu adds the child's own CPU and its reaped children's to the
 //! parent's `ri_child_*` (`update_rusage_info_child` in `reap_child_locked`; a parent that
@@ -14,10 +15,13 @@
 //! work -- serving the command, then other jobs -- is never charged. The command then leads,
 //! charged from its own start. Each interval counts once.
 //!
-//! The source does not count a descendant that still runs (it reaches the total once reaped), nor
-//! one orphaned by its parent's exit, which another process reaps; the process tree's observed
-//! rows state that difference, this source never guesses it. Nor does it count bytes:
-//! `ri_child_*` holds no disk I/O, so the job's storage I/O is unavailable, never zero.
+//! The source misses three kinds of descendant: one still running (it reaches the total only
+//! once each parent up to the leader has reaped it), one that exited and was not yet reaped,
+//! and an orphan reparented to another reaper, which never reaches it. A leader that has exited is
+//! read from its held zombie, whose rusage xnu fixed at the exit (`proc_prepareexit`), so it
+//! gains no CPU from orphans that run on after it. The process tree's observed rows state that
+//! difference; this source never guesses it. Nor does it count bytes: `ri_child_*` holds no disk
+//! I/O, so the job's storage I/O is unavailable, never zero.
 //!
 //! [`ActivationEnded`]: super::supervisor::ProcessEvent::ActivationEnded
 

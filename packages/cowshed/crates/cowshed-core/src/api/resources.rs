@@ -186,9 +186,9 @@ pub struct StorageIoTotals {
     pub write_bytes: StorageIoBytes,
 }
 
-/// A job's complete totals and the independent source that counted them: never a sum of the
-/// processes a sampler happened to see, which misses every descendant born and reaped between
-/// two samples.
+/// A job's CPU totals and the independent source that counted them, never a sum of the
+/// processes a sampler happened to see (that sum misses every descendant born and reaped between
+/// two samples). Each variant's documentation names what its source cannot count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -197,12 +197,15 @@ pub struct StorageIoTotals {
     deny_unknown_fields
 )]
 pub enum JobAccounting {
-    /// macOS `proc_pid_rusage` of each process that led the job, read while its parent held it
-    /// unreaped: its own CPU (`ri_user_time`/`ri_system_time`) plus that of every child it
-    /// reaped (`ri_child_user_time`/`ri_child_system_time`, which carry their own reaped
-    /// children's in turn). A cold host's activation and the command each count once, the
-    /// activation up to its end. A descendant still running, or one orphaned and reaped by
-    /// another process, is not in it yet.
+    /// Cumulative leader-own plus reaped-children CPU: macOS `proc_pid_rusage` of each process
+    /// that led the job, read while its parent held it unreaped. That is its own CPU
+    /// (`ri_user_time`/`ri_system_time`) plus that of every child it reaped
+    /// (`ri_child_user_time`/`ri_child_system_time`, which carry their own reaped children's in
+    /// turn). A cold host's activation and the command each count once, the activation up to
+    /// its end. Not a complete job total. Missing are descendants still running, descendants
+    /// that exited but were not yet reaped, and orphans reparented to another reaper. Once a
+    /// leader exits, its held rusage is fixed at that exit, so it gains no CPU from orphans
+    /// that run on after it.
     MacOsRusageChildren {
         cpu: CpuTotals,
         /// Always absent: the children accumulators carry no disk I/O bytes, so the source has
@@ -481,8 +484,9 @@ pub struct JobResourceSample {
     /// The largest `rssBytes` this job has been sampled at, this sample's included: a group's
     /// peak, never the sum of its processes' separate peaks.
     pub rss_peak_bytes: ResidentBytes,
-    /// The job's complete totals from its platform's independent source, as of this boundary:
-    /// absent only where no complete source exists yet (Linux, until its cgroup v2 totals).
+    /// The job's CPU totals as of this boundary, from its platform's independent source, within
+    /// the limits that source names. Absent only where no source exists yet (Linux, until its
+    /// cgroup v2 totals).
     pub accounting: Option<JobAccounting>,
     pub stdout: JobStreamWatermark,
     pub stderr: JobStreamWatermark,

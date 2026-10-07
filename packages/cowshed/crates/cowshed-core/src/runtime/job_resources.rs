@@ -105,8 +105,8 @@ pub(super) struct Observation {
     /// The job's output streams as the supervisor had admitted them by the boundary.
     pub stdout: StreamTally,
     pub stderr: StreamTally,
-    /// The job's totals from its platform's independent source, read at the boundary; `None`
-    /// where no complete source exists.
+    /// The job's CPU totals from its platform's independent source, read at the boundary and
+    /// within that source's named limits; `None` where no source exists yet.
     pub accounting: Option<JobAccounting>,
 }
 
