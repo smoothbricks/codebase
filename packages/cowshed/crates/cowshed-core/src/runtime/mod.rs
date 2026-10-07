@@ -4,6 +4,7 @@ pub mod commitment_feed;
 pub mod job_groups;
 mod job_resources;
 pub(crate) mod nx_daemon;
+pub mod process_blocker;
 #[cfg(target_os = "macos")]
 pub mod process_events;
 pub mod process_stream;

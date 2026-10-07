@@ -371,7 +371,7 @@ fn fold_counters(
 /// Whether the process a pidfd names has not been reaped: signal 0 reaches an exited, unreaped
 /// process and fails with `ESRCH` only once it is reaped.
 #[cfg(target_os = "linux")]
-fn unreaped(held: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+pub(super) fn unreaped(held: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     use std::os::fd::AsRawFd as _;
 
     // SAFETY: pidfd_send_signal reads a live descriptor and takes no info pointer.
@@ -614,7 +614,7 @@ fn storage_io(pid: libc::pid_t) -> io::Result<Option<ProcessStorageIo>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     /// One byte from stdin; `false` at its end.
-    fn hold_byte() -> bool {
+    pub(in crate::runtime) fn hold_byte() -> bool {
         let mut byte = 0_u8;
         loop {
             // SAFETY: one byte into a stack variable.
@@ -1162,13 +1162,13 @@ mod tests {
 
     /// A life as the platform's observer holds it: its identity, and on Linux the pidfd opened
     /// for it.
-    struct Observed {
-        identity: ProcessIdentity,
+    pub(in crate::runtime) struct Observed {
+        pub(in crate::runtime) identity: ProcessIdentity,
         #[cfg(target_os = "linux")]
-        pidfd: std::os::fd::OwnedFd,
+        pub(in crate::runtime) pidfd: std::os::fd::OwnedFd,
     }
 
-    fn observed(pid: u32) -> Observed {
+    pub(in crate::runtime) fn observed(pid: u32) -> Observed {
         let pid_t = libc::pid_t::try_from(pid).expect("pid");
         #[cfg(target_os = "macos")]
         let birth = crate::runtime::job_groups::process_record(pid_t)
