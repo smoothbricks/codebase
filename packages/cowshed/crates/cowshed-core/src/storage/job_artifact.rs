@@ -3047,16 +3047,25 @@ fn recover_records_with_budget_under_lock(
             });
         }
         if let Some((_, floor)) = aside.as_mut() {
-            if earlier_layout(&batch).is_none() && !is_current_layout(&batch) {
-                return Err(integrity(
-                    frame_start,
-                    &format!(
-                        "a protected batch of {} columns is in no record layout",
-                        batch.num_columns()
-                    ),
-                ));
+            if earlier_layout(&batch).is_none() {
+                let intact_current = if is_current_layout(&batch) && batch.num_rows() == 1 {
+                    let version = uint64(&batch, 1)
+                        .map_err(|error| integrity(frame_start, &error.to_string()))?;
+                    version.is_valid(0) && version.value(0) == RECORD_SCHEMA_VERSION
+                } else {
+                    false
+                };
+                if !intact_current {
+                    return Err(integrity(
+                        frame_start,
+                        "a frame after an earlier layout has no intact supported allocation header",
+                    ));
+                }
             }
-            *floor = (*floor).max(leading_job_id(&batch));
+            *floor = (*floor).max(
+                leading_job_id(&batch)
+                    .map_err(|error| integrity(frame_start, &error.to_string()))?,
+            );
             retained = required;
             offset = offset
                 .checked_add(frame_len)
@@ -3070,7 +3079,11 @@ fn recover_records_with_budget_under_lock(
                     ProtectedRecord::Job(record) => Some(record.job_id.get()),
                     ProtectedRecord::CheckpointManifest(_) => None,
                 })
-                .fold(leading_job_id(&batch), u64::max);
+                .fold(
+                    leading_job_id(&batch)
+                        .map_err(|error| integrity(frame_start, &error.to_string()))?,
+                    u64::max,
+                );
             aside = Some((layout, floor));
             retained = required;
             offset = offset
@@ -3162,23 +3175,32 @@ fn recover_records_with_budget_under_lock(
     })
 }
 
-/// The `job_id` an intact frame of any layout leads with -- every layout keeps it at the same
-/// place -- or 0 when the frame holds no job. Nothing else of an earlier layout is read.
-fn leading_job_id(batch: &RecordBatch) -> u64 {
+/// The allocation identity in an intact frame's common header. A checkpoint has no job id;
+/// malformed or missing job metadata is an error, never a fabricated zero allocation floor.
+fn leading_job_id(batch: &RecordBatch) -> Result<u64, ArtifactError> {
     let current = protected_record_schema();
     if batch.num_rows() != 1
         || batch.num_columns() <= 4
         || batch.schema().fields()[4] != current.fields()[4]
     {
-        return 0;
+        return Err(ArtifactError::Arrow(
+            "protected allocation header has no canonical job_id column".into(),
+        ));
     }
-    uint64(batch, 4).map_or(0, |column| {
-        if column.is_valid(0) {
-            column.value(0)
-        } else {
-            0
-        }
-    })
+    let kind = string(batch, 0)?;
+    if kind.is_null(0) {
+        return Err(ArtifactError::Arrow(
+            "protected allocation header has no record kind".into(),
+        ));
+    }
+    let column = uint64(batch, 4)?;
+    match kind.value(0) {
+        "job" if column.is_valid(0) => Ok(JobId::new(column.value(0))?.get()),
+        "checkpointManifest" if column.is_null(0) => Ok(0),
+        value => Err(ArtifactError::Arrow(format!(
+            "protected allocation header has an invalid job_id for record kind {value:?}"
+        ))),
+    }
 }
 
 /// Move the store `lock` guards -- its records, its sequence counter and every incarnation's
@@ -5049,6 +5071,45 @@ mod tests {
         assert!(!job_root.join(SET_ASIDE_DIRECTORY).exists());
         assert!(!job_root.join(JOB_FLOOR_FILE).exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_allocation_header_never_sets_a_store_aside() {
+        let earlier = earlier_batch(&valid_job_record(4), 4, 3);
+        let mut null_columns = earlier.columns().to_vec();
+        null_columns[4] = Arc::new(UInt64Array::from(vec![Option::<u64>::None]));
+        let null_job = RecordBatch::try_new(earlier.schema(), null_columns).unwrap();
+        let mut wrong_fields = earlier.schema().fields().to_vec();
+        wrong_fields[4] = Arc::new(field("not_job_id", DataType::UInt64, true));
+        let wrong_field = RecordBatch::try_new(
+            Arc::new(Schema::new(wrong_fields)),
+            earlier.columns().to_vec(),
+        )
+        .unwrap();
+        let current = job_record_to_batch(&valid_job_record(5)).unwrap();
+        let mut mislabeled_columns = current.columns().to_vec();
+        mislabeled_columns[1] = Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION - 1]));
+        let mislabeled = RecordBatch::try_new(current.schema(), mislabeled_columns).unwrap();
+        for (malformed, follows_earlier) in
+            [(null_job, false), (wrong_field, false), (mislabeled, true)]
+        {
+            let root = temp_root("malformed-allocation-header");
+            drop(store_at(&root, ArtifactConfig::default()));
+            if follows_earlier {
+                append_batch(&root, &earlier);
+            }
+            append_batch(&root, &malformed);
+            let before = fs::read(records_path(&root)).unwrap();
+            assert!(matches!(
+                recover_records(&records_path(&root)),
+                Err(ArtifactError::Integrity { .. })
+            ));
+            assert_eq!(fs::read(records_path(&root)).unwrap(), before);
+            let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
+            assert!(!job_root.join(SET_ASIDE_DIRECTORY).exists());
+            assert!(!job_root.join(JOB_FLOOR_FILE).exists());
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// Only an intact earlier layout sets a store aside: the current layout claiming an earlier
