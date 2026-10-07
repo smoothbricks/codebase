@@ -98,6 +98,36 @@ impl From<ResidentBytes> for u64 {
     }
 }
 
+/// Bytes a kernel counted as moved to or from storage: never logical reads its cache served,
+/// volume-allocation deltas, or operation counts converted into bytes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct StorageIoBytes(u64);
+
+impl StorageIoBytes {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("ioBytes", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for StorageIoBytes {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<StorageIoBytes> for u64 {
+    fn from(value: StorageIoBytes) -> Self {
+        value.0
+    }
+}
+
 fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
     u64::try_from(value)
         .ok()

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
-use super::resources::{CpuMicros, ResidentBytes};
+use super::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
 
 /// Every process a job owned that its observer saw, the exited ones included, and whether the
 /// observer saw all of them.
@@ -69,6 +69,40 @@ pub struct ProcessUsage {
     pub rss_bytes: ResidentBytes,
     /// The most it was read holding: never another process's, nor the group's sum.
     pub rss_peak_bytes: ResidentBytes,
+    pub io: ProcessStorageIo,
+}
+
+/// What one process has moved to and from storage, as its kernel's per-process source counts
+/// it: macOS `ri_diskio_bytesread`/`ri_diskio_byteswritten`, the I/O the process issued to disk;
+/// Linux `/proc/<pid>/io` `read_bytes`/`write_bytes`, reads it caused to be fetched from storage
+/// and writes it dirtied for storage (at the time it dirtied them, not at writeback). Reads its
+/// cache served count on neither.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProcessStorageIo {
+    Read {
+        read_bytes: StorageIoBytes,
+        write_bytes: StorageIoBytes,
+    },
+    /// The source gave no bytes for this process; never zero in their place.
+    Unavailable { reason: ProcessIoUnavailable },
+}
+
+/// Why a process's storage I/O could not be read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessIoUnavailable {
+    /// The kernel refused this observer the process's counters (Linux: a process made
+    /// non-dumpable, e.g. by a set-id exec, refuses `/proc/<pid>/io`).
+    NotPermitted,
+    /// The kernel keeps no per-process storage I/O counters (Linux built without
+    /// `CONFIG_TASK_IO_ACCOUNTING`).
+    NotAccounted,
 }
 
 /// Whether the tree holds every process the job owned. A gap is absorbing: once an observation

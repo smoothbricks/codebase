@@ -16,8 +16,10 @@ use std::io;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use crate::api::process::{BUSY_CPU_PERMILLE, ProcessUsage};
-use crate::api::resources::{CpuMicros, ResidentBytes, ResourceUnitError};
+#[cfg(target_os = "linux")]
+use crate::api::process::ProcessIoUnavailable;
+use crate::api::process::{BUSY_CPU_PERMILLE, ProcessStorageIo, ProcessUsage};
+use crate::api::resources::{CpuMicros, ResidentBytes, ResourceUnitError, StorageIoBytes};
 use crate::runtime::process_tree::ProcessIdentity;
 
 /// When a process started, on the kernel clock the counters were read with: macOS
@@ -38,6 +40,7 @@ pub struct UsageReading {
     pub cpu_sys: CpuMicros,
     /// What it holds resident now: nothing once it has exited.
     pub resident: ResidentBytes,
+    pub io: ProcessStorageIo,
 }
 
 impl UsageReading {
@@ -67,7 +70,7 @@ pub enum UsageFoldError {
         first: StartStamp,
         read: StartStamp,
     },
-    #[error("process {pid}'s {counter} fell from {before} to {after} microseconds")]
+    #[error("process {pid}'s {counter} fell from {before} to {after}")]
     Regressed {
         pid: u32,
         counter: &'static str,
@@ -144,6 +147,7 @@ impl ProcessUsageFold {
             busy: counted.busy,
             rss_bytes: counted.latest.resident,
             rss_peak_bytes: counted.rss_peak,
+            io: counted.latest.io,
         })
     }
 
@@ -171,16 +175,43 @@ impl Counted {
         if reading.at < latest.at {
             return Err(UsageFoldError::Backwards { pid });
         }
+        // Storage counters are compared only between two reads that both had them.
+        let (read, written) = match (latest.io, reading.io) {
+            (
+                ProcessStorageIo::Read {
+                    read_bytes: read_before,
+                    write_bytes: written_before,
+                },
+                ProcessStorageIo::Read {
+                    read_bytes,
+                    write_bytes,
+                },
+            ) => (
+                (read_before.get(), read_bytes.get()),
+                (written_before.get(), write_bytes.get()),
+            ),
+            _ => ((0, 0), (0, 0)),
+        };
         for (counter, before, after) in [
-            ("user CPU", latest.cpu_user, reading.cpu_user),
-            ("system CPU", latest.cpu_sys, reading.cpu_sys),
+            (
+                "user CPU microseconds",
+                latest.cpu_user.get(),
+                reading.cpu_user.get(),
+            ),
+            (
+                "system CPU microseconds",
+                latest.cpu_sys.get(),
+                reading.cpu_sys.get(),
+            ),
+            ("storage read bytes", read.0, read.1),
+            ("storage write bytes", written.0, written.1),
         ] {
             if after < before {
                 return Err(UsageFoldError::Regressed {
                     pid,
                     counter,
-                    before: before.get(),
-                    after: after.get(),
+                    before,
+                    after,
                 });
             }
         }
@@ -307,6 +338,7 @@ fn fold_counters(
             cpu_user: counters.cpu_user,
             cpu_sys: counters.cpu_sys,
             resident: counters.resident,
+            io: counters.io,
         },
     })?;
     Ok(Sampled::Read)
@@ -347,6 +379,7 @@ struct OwnCounters {
     /// Zero for an exited process, whatever size the kernel last recorded for it: it holds
     /// nothing now, on either platform.
     resident: ResidentBytes,
+    io: ProcessStorageIo,
 }
 
 fn unit(error: ResourceUnitError) -> io::Error {
@@ -354,7 +387,8 @@ fn unit(error: ResourceUnitError) -> io::Error {
 }
 
 /// `proc_pid_rusage(RUSAGE_INFO_V4)`: the process's own CPU (not `ri_child_*`, the children it
-/// reaped) and resident size, which still answers for an exited process its parent has not
+/// reaped), resident size and disk I/O bytes (`ri_diskio_*`: the I/O it issued to disk, which
+/// its cache hits issue none of), which still answers for an exited process its parent has not
 /// reaped. `None` once it is reaped. Its times are Mach ticks (xnu `task_power_info_locked`
 /// stores `rm_time_mach` unconverted; measured 125/3 ns per tick on Apple silicon), converted
 /// once by the timebase. An exited process (`ri_proc_exit_abstime` set) answers with the size
@@ -386,6 +420,10 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
             ResidentBytes::ZERO
         } else {
             ResidentBytes::new(info.ri_resident_size).map_err(unit)?
+        },
+        io: ProcessStorageIo::Read {
+            read_bytes: StorageIoBytes::new(info.ri_diskio_bytesread).map_err(unit)?,
+            write_bytes: StorageIoBytes::new(info.ri_diskio_byteswritten).map_err(unit)?,
         },
     }))
 }
@@ -426,8 +464,8 @@ fn mach_tick() -> io::Result<(u32, NonZeroU32)> {
 
 /// `/proc/<pid>/stat`'s `utime` and `stime` (fields 14 and 15: the process's own, not the
 /// `cutime`/`cstime` of children it waited for), `starttime` (field 22) and `rss` pages
-/// (field 24), read at once. An exited process keeps its stat until it is reaped; `None` once it
-/// is. An exited one (state `Z` or `X`) holds no memory.
+/// (field 24), read at once, then its storage I/O ([`storage_io`]). An exited process keeps
+/// both until it is reaped; `None` once it is. An exited one (state `Z` or `X`) holds no memory.
 #[cfg(target_os = "linux")]
 fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -480,11 +518,62 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
             .ok_or_else(|| invalid("holds more resident bytes than a u64 counts"))?;
         ResidentBytes::new(bytes).map_err(unit)?
     };
+    let Some(io) = storage_io(pid)? else {
+        return Ok(None);
+    };
     Ok(Some(OwnCounters {
         started: StartStamp(field(22)?),
         cpu_user: cpu(field(14)?)?,
         cpu_sys: cpu(field(15)?)?,
         resident,
+        io,
+    }))
+}
+
+/// `/proc/<pid>/io`'s `read_bytes` (reads the process caused to be fetched from storage; its
+/// page-cache hits count none) and `write_bytes` (pages it dirtied for storage, counted when
+/// dirtied, not at writeback). A refused read is [`ProcessIoUnavailable::NotPermitted`]; a
+/// missing file, of a process whose stat was just read, is a kernel without per-task I/O
+/// accounting -- unless the process was reaped meanwhile, which the caller's fence finds.
+/// `None` when the kernel says the process is gone (`ESRCH`).
+#[cfg(target_os = "linux")]
+fn storage_io(pid: libc::pid_t) -> io::Result<Option<ProcessStorageIo>> {
+    let text = match std::fs::read_to_string(format!("/proc/{pid}/io")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(Some(ProcessStorageIo::Unavailable {
+                reason: ProcessIoUnavailable::NotPermitted,
+            }));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(ProcessStorageIo::Unavailable {
+                reason: ProcessIoUnavailable::NotAccounted,
+            }));
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let counter = |name: &str| -> io::Result<StorageIoBytes> {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("process {pid}'s io {text:?} has no {name}"),
+                )
+            })?;
+        let value = value.trim().parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("process {pid}'s io {name} {value:?} is no count"),
+            )
+        })?;
+        StorageIoBytes::new(value).map_err(unit)
+    };
+    Ok(Some(ProcessStorageIo::Read {
+        read_bytes: counter("read_bytes")?,
+        write_bytes: counter("write_bytes")?,
     }))
 }
 
@@ -498,8 +587,8 @@ mod tests {
         OwnCounters, ProcessUsageFold, Sampled, StartStamp, UsageFoldError, UsageObservation,
         UsageReading, own_counters, sample,
     };
-    use crate::api::process::ProcessUsage;
-    use crate::api::resources::{CpuMicros, ResidentBytes};
+    use crate::api::process::{ProcessIoUnavailable, ProcessStorageIo, ProcessUsage};
+    use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
     use crate::fork_lock::Spawn as _;
     use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
 
@@ -524,6 +613,13 @@ mod tests {
         ResidentBytes::new(bytes).expect("a resident size")
     }
 
+    fn moved(read: u64, written: u64) -> ProcessStorageIo {
+        ProcessStorageIo::Read {
+            read_bytes: StorageIoBytes::new(read).expect("bytes"),
+            write_bytes: StorageIoBytes::new(written).expect("bytes"),
+        }
+    }
+
     fn reading(at: Instant, user_us: u64, sys_us: u64) -> UsageReading {
         UsageReading {
             started: StartStamp(7),
@@ -531,6 +627,7 @@ mod tests {
             cpu_user: cpu(user_us),
             cpu_sys: cpu(sys_us),
             resident: resident(1 << 20),
+            io: moved(0, 0),
         }
     }
 
@@ -582,8 +679,42 @@ mod tests {
                 busy: true,
                 rss_bytes: resident(1 << 20),
                 rss_peak_bytes: resident(1 << 20),
+                io: moved(0, 0),
             })
         );
+    }
+
+    #[test]
+    fn storage_counters_never_fall_and_an_unavailable_source_stays_said() {
+        let process = identity(47);
+        let start = Instant::now();
+        let second = |n| start + Duration::from_secs(n);
+        let mut fold = ProcessUsageFold::default();
+        let doing = |io, reading| UsageReading { io, ..reading };
+        fold.apply(read(
+            process,
+            doing(moved(4096, 8192), reading(start, 0, 0)),
+        ))
+        .unwrap();
+        assert_eq!(
+            fold.apply(read(
+                process,
+                doing(moved(4095, 8192), reading(second(1), 0, 0))
+            )),
+            Err(UsageFoldError::Regressed {
+                pid: 47,
+                counter: "storage read bytes",
+                before: 4096,
+                after: 4095,
+            })
+        );
+        // An exec into a set-id image can refuse the counters: said so, never zeroes.
+        let refused = ProcessStorageIo::Unavailable {
+            reason: ProcessIoUnavailable::NotPermitted,
+        };
+        fold.apply(read(process, doing(refused, reading(second(2), 0, 0))))
+            .unwrap();
+        assert_eq!(fold.usage(process).map(|usage| usage.io), Some(refused));
     }
 
     #[test]
@@ -744,7 +875,7 @@ mod tests {
             fold.apply(read(process, reading(later, 9, 10))),
             Err(UsageFoldError::Regressed {
                 pid: 45,
-                counter: "user CPU",
+                counter: "user CPU microseconds",
                 before: 10,
                 after: 9,
             })
@@ -836,8 +967,92 @@ mod tests {
                 out.flush().expect("report");
                 assert!(hold_byte(), "the exit byte");
             }
+            Some(role) if role.starts_with("io ") => {
+                let mut words = role["io ".len()..].splitn(3, ' ');
+                let mut mebibytes =
+                    || -> usize { words.next().expect("a size").parse().expect("MiB") };
+                let (write, read) = (mebibytes(), mebibytes());
+                let path = words.next().expect("a path").to_owned();
+                writeln!(out, "{MARK} ready").expect("report");
+                out.flush().expect("report");
+                assert!(hold_byte(), "the start byte");
+                uncached_io(&path, write, read);
+                writeln!(out, "{MARK} done").expect("report");
+                out.flush().expect("report");
+                assert!(hold_byte(), "the exit byte");
+            }
             other => panic!("unknown role {other:?}"),
         }
+    }
+
+    /// Write `write` MiB to a new file at `path`, flushed to storage, then read `read` MiB of
+    /// it back, every transfer past the page cache: macOS `F_NOCACHE`, Linux `O_DIRECT`, each
+    /// from a page-aligned buffer.
+    fn uncached_io(path: &str, write: usize, read: usize) {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        const CHUNK: usize = 1 << 20;
+        let open = |flags: libc::c_int| -> OwnedFd {
+            #[cfg(target_os = "linux")]
+            let flags = flags | libc::O_DIRECT;
+            let name = std::ffi::CString::new(path).expect("a path");
+            // SAFETY: a NUL-terminated path and plain flags.
+            let fd = unsafe { libc::open(name.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+            assert!(fd >= 0, "open {path}: {}", std::io::Error::last_os_error());
+            // SAFETY: a new descriptor this role owns.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            #[cfg(target_os = "macos")]
+            {
+                // SAFETY: fcntl on a live descriptor with an integer argument.
+                let set = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) };
+                assert_eq!(set, 0, "F_NOCACHE: {}", std::io::Error::last_os_error());
+            }
+            fd
+        };
+        // SAFETY: a fresh private anonymous mapping, page-aligned by construction.
+        let buffer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CHUNK,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(buffer, libc::MAP_FAILED, "mmap");
+        // SAFETY: the whole writable mapping made above.
+        unsafe { std::ptr::write_bytes(buffer.cast::<u8>(), 0x5a, CHUNK) };
+
+        let file = open(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
+        for _ in 0..write {
+            // SAFETY: CHUNK readable bytes of the mapping.
+            let written = unsafe { libc::write(file.as_raw_fd(), buffer, CHUNK) };
+            assert_eq!(
+                usize::try_from(written).ok(),
+                Some(CHUNK),
+                "write: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: fsync on a live descriptor.
+        assert_eq!(unsafe { libc::fsync(file.as_raw_fd()) }, 0, "fsync");
+        drop(file);
+
+        let file = open(libc::O_RDONLY);
+        for _ in 0..read {
+            // SAFETY: CHUNK writable bytes of the mapping.
+            let got = unsafe { libc::read(file.as_raw_fd(), buffer, CHUNK) };
+            assert_eq!(
+                usize::try_from(got).ok(),
+                Some(CHUNK),
+                "read: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        drop(file);
+        // SAFETY: the whole mapping made above, unmapped once.
+        assert_eq!(unsafe { libc::munmap(buffer, CHUNK) }, 0, "munmap");
     }
 
     /// The user plus system CPU `getrusage` reports, in microseconds: the oracle, read by a
@@ -1091,26 +1306,27 @@ mod tests {
         assert_eq!(fold.usage(life.identity), None);
     }
 
-    /// A re-executed allocator holding `mebibytes` of touched anonymous memory.
-    struct Allocator {
+    /// A re-executed fixture role, held by its stdin and reporting on its stdout.
+    struct Fixture {
         child: std::process::Child,
         release: std::process::ChildStdin,
         lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
         life: Observed,
     }
 
-    impl Allocator {
-        fn start(mebibytes: u32) -> Self {
+    impl Fixture {
+        /// Start `role` and wait for its `ready` report.
+        fn start(role: &str, ready: &str) -> Self {
             let mut child = Command::new(std::env::current_exe().expect("test binary"))
                 .args(["--exact", ROLE_TEST, "--nocapture"])
-                .env(ROLE, format!("allocate {mebibytes}"))
+                .env(ROLE, role)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn_locked()
-                .expect("spawn an allocator");
+                .expect("spawn a fixture");
             let release = child.stdin.take().expect("stdin");
             let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
-            next_report(&mut lines, "allocated");
+            next_report(&mut lines, ready);
             let life = observed(child.id());
             Self {
                 child,
@@ -1181,10 +1397,10 @@ mod tests {
     #[test]
     fn each_process_holds_its_own_resident_memory_and_keeps_its_peak() {
         const MIB: u64 = 1 << 20;
-        let mut large = Allocator::start(96);
-        let small = Allocator::start(24);
+        let mut large = Fixture::start("allocate 96", "allocated");
+        let small = Fixture::start("allocate 24", "allocated");
         let mut fold = ProcessUsageFold::default();
-        let read = |fold: &mut ProcessUsageFold, allocator: &Allocator| {
+        let read = |fold: &mut ProcessUsageFold, allocator: &Fixture| {
             assert_eq!(tick(fold, &allocator.life), Sampled::Read);
             let usage = fold.usage(allocator.life.identity).expect("usage");
             let independent = allocator.independent_resident();
@@ -1215,5 +1431,66 @@ mod tests {
 
         large.finish();
         small.finish();
+    }
+
+    fn storage(fold: &ProcessUsageFold, fixture: &Fixture) -> (u64, u64) {
+        match fold.usage(fixture.life.identity).expect("usage").io {
+            ProcessStorageIo::Read {
+                read_bytes,
+                write_bytes,
+            } => (read_bytes.get(), write_bytes.get()),
+            unavailable => panic!("this platform's source gave no bytes: {unavailable:?}"),
+        }
+    }
+
+    /// Each process's storage counters move by the uncached I/O it did itself: a writer and
+    /// reader of known sizes, beside a second process doing other I/O, each count their own.
+    #[test]
+    fn each_process_counts_the_storage_io_it_did_itself() {
+        const MIB: u64 = 1 << 20;
+        // Beside this test binary: on the build's own storage, never a memory-backed /tmp.
+        let directory = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("its directory")
+            .to_path_buf();
+        let path = |name: &str| {
+            directory
+                .join(format!("process-usage-io-{}-{name}", std::process::id()))
+                .display()
+                .to_string()
+        };
+        let (first, second) = (path("first"), path("second"));
+        let mut writer_reader = Fixture::start(&format!("io 8 4 {first}"), "ready");
+        let mut writer = Fixture::start(&format!("io 2 0 {second}"), "ready");
+        let mut fold = ProcessUsageFold::default();
+        for fixture in [&writer_reader, &writer] {
+            assert_eq!(tick(&mut fold, &fixture.life), Sampled::Read);
+        }
+        let before = (storage(&fold, &writer_reader), storage(&fold, &writer));
+        writer_reader.step("done");
+        writer.step("done");
+        for fixture in [&writer_reader, &writer] {
+            assert_eq!(tick(&mut fold, &fixture.life), Sampled::Read);
+        }
+        let after = (storage(&fold, &writer_reader), storage(&fold, &writer));
+        let delta =
+            |before: (u64, u64), after: (u64, u64)| (after.0 - before.0, after.1 - before.1);
+        let (first_io, second_io) = (delta(before.0, after.0), delta(before.1, after.1));
+        let near =
+            |bytes: u64, mebibytes: u64| (mebibytes * MIB..=mebibytes * MIB + MIB).contains(&bytes);
+        assert!(
+            near(first_io.0, 4) && near(first_io.1, 8),
+            "the first read 4 MiB and wrote 8 MiB: counted {first_io:?}"
+        );
+        assert!(
+            near(second_io.1, 2) && second_io.0 < MIB,
+            "the second wrote 2 MiB and read nothing: counted {second_io:?}"
+        );
+        writer_reader.finish();
+        writer.finish();
+        for file in [first, second] {
+            std::fs::remove_file(file).expect("remove the fixture file");
+        }
     }
 }

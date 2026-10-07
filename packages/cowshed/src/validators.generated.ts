@@ -556,6 +556,19 @@ export const assertProcessExitList = typia.createAssertEquals<readonly Api.Proce
 export const parseProcessExitList = (json: string): readonly Api.ProcessExit[] =>
   assertProcessExitList(JSON.parse(json));
 
+export const assertProcessIoUnavailable = typia.createAssertEquals<Api.ProcessIoUnavailable>();
+export const parseProcessIoUnavailable = (json: string): Api.ProcessIoUnavailable =>
+  assertProcessIoUnavailable(JSON.parse(json));
+export const assertProcessIoUnavailableList = typia.createAssertEquals<readonly Api.ProcessIoUnavailable[]>();
+export const parseProcessIoUnavailableList = (json: string): readonly Api.ProcessIoUnavailable[] =>
+  assertProcessIoUnavailableList(JSON.parse(json));
+
+export const assertProcessStorageIo = typia.createAssertEquals<Api.ProcessStorageIo>();
+export const parseProcessStorageIo = (json: string): Api.ProcessStorageIo => assertProcessStorageIo(JSON.parse(json));
+export const assertProcessStorageIoList = typia.createAssertEquals<readonly Api.ProcessStorageIo[]>();
+export const parseProcessStorageIoList = (json: string): readonly Api.ProcessStorageIo[] =>
+  assertProcessStorageIoList(JSON.parse(json));
+
 export const assertProcessUsage = typia.createAssertEquals<Api.ProcessUsage>();
 export const parseProcessUsage = (json: string): Api.ProcessUsage => assertProcessUsage(JSON.parse(json));
 export const assertProcessUsageList = typia.createAssertEquals<readonly Api.ProcessUsage[]>();
@@ -923,6 +936,12 @@ export const assertStepReport = typia.createAssertEquals<Api.StepReport>();
 export const parseStepReport = (json: string): Api.StepReport => assertStepReport(JSON.parse(json));
 export const assertStepReportList = typia.createAssertEquals<readonly Api.StepReport[]>();
 export const parseStepReportList = (json: string): readonly Api.StepReport[] => assertStepReportList(JSON.parse(json));
+
+export const assertStorageIoBytes = typia.createAssertEquals<Api.StorageIoBytes>();
+export const parseStorageIoBytes = (json: string): Api.StorageIoBytes => assertStorageIoBytes(JSON.parse(json));
+export const assertStorageIoBytesList = typia.createAssertEquals<readonly Api.StorageIoBytes[]>();
+export const parseStorageIoBytesList = (json: string): readonly Api.StorageIoBytes[] =>
+  assertStorageIoBytesList(JSON.parse(json));
 
 export const assertStreamInfo = typia.createAssertEquals<Api.StreamInfo>();
 export const parseStreamInfo = (json: string): Api.StreamInfo => assertStreamInfo(JSON.parse(json));

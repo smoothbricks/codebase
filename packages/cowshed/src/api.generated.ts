@@ -989,6 +989,27 @@ export type ProcessExit = {
 };
 
 /**
+ * Why a process's storage I/O could not be read.
+ */
+export type ProcessIoUnavailable = 'notPermitted' | 'notAccounted';
+
+/**
+ * What one process has moved to and from storage, as its kernel's per-process source counts
+ * it: macOS `ri_diskio_bytesread`/`ri_diskio_byteswritten`, the I/O the process issued to disk;
+ * Linux `/proc/<pid>/io` `read_bytes`/`write_bytes`, reads it caused to be fetched from storage
+ * and writes it dirtied for storage (at the time it dirtied them, not at writeback). Reads its
+ * cache served count on neither.
+ */
+export type ProcessStorageIo =
+  | ({ readonly kind: 'read' } & {
+      readonly readBytes: StorageIoBytes;
+      readonly writeBytes: StorageIoBytes;
+    })
+  | ({ readonly kind: 'unavailable' } & {
+      readonly reason: ProcessIoUnavailable;
+    });
+
+/**
  * What one process has cost itself, as last read: never the usage of the children it waited
  * for, which the job's accounting source counts. Absent from a process whose counters were
  * never read, rather than zero.
@@ -1009,6 +1030,7 @@ export type ProcessUsage = {
    * The most it was read holding: never another process's, nor the group's sum.
    */
   readonly rssPeakBytes: ResidentBytes;
+  readonly io: ProcessStorageIo;
 };
 
 /**
@@ -1538,6 +1560,12 @@ export type StepReport =
        */
       readonly error?: string;
     });
+
+/**
+ * Bytes a kernel counted as moved to or from storage: never logical reads its cache served,
+ * volume-allocation deltas, or operation counts converted into bytes.
+ */
+export type StorageIoBytes = number & tags.Type<'uint64'>;
 
 export type StreamInfo = StreamInfoRef;
 
