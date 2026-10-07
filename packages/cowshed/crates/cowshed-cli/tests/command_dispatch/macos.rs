@@ -2476,6 +2476,43 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
 /// unlinked volume and reports exactly which live pid and command lost access.
 #[tokio::test]
 async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_volume() {
+    const CHILD: &str = "COWSHED_TEST_BUILD_VOLUME_HOLDER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Native release diagnostics use the process's stderr, not dispatch's Output writer.
+        // A separate test process captures them without redirecting descriptors shared by tests.
+        let output = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable"),
+        )
+        .args([
+            "--exact",
+            "macos::real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_volume",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .await
+        .expect("run the APFS holder scenario in a child test process");
+        let stdout = String::from_utf8(output.stdout).expect("child test stdout");
+        let stderr = String::from_utf8(output.stderr).expect("child test stderr");
+        assert!(
+            output.status.success(),
+            "child scenario failed\n{stdout}\n{stderr}"
+        );
+        let pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("build-volume-holder-pid="))
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .expect("the child names its real holder pid");
+        assert!(
+            stderr.contains(&format!("pid {pid} (/bin/cat)")),
+            "forced release names the holder's pid and command: {stderr}"
+        );
+        assert!(
+            stderr.contains("forced"),
+            "forced release is explicit: {stderr}"
+        );
+        return;
+    }
     let mut fixture = Fixture::with(Project::Declared);
     let mut service = serve_project(&mut fixture, &[]).await;
     let layout = build_volumes(&fixture);
@@ -2492,6 +2529,7 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
             .expect("a host process with cwd in the build volume"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    println!("build-volume-holder-pid={pid}");
     eventually("cat holds the build volume as its cwd", || {
         nx::volume_holders(&mount)
             .expect("query build volume holders")
@@ -2506,14 +2544,6 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
         "rm must reclaim a merely kernel-busy image: {stderr}"
     );
     assert!(!layout.record(&volume).exists(), "rm reclaims its record");
-    assert!(
-        stderr.contains(&format!("pid {pid} (/bin/cat)")),
-        "forced release names the holder's pid and command: {stderr}"
-    );
-    assert!(
-        stderr.contains("forced"),
-        "forced release is explicit: {stderr}"
-    );
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
     drop(holder);
     service.shutdown().await.expect("stop the runtime");
