@@ -81,6 +81,14 @@ jobs:
       - name: 🌐 Browser Tests
         run: smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 9
 
+      - name: Measure delegated ext4 accounting and complete CPU lifetime
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        working-directory: .
+        run: >-
+          bun nx run cowshed:cargo-test-cowshed-core-shard7
+          --output-style=static
+          --command='extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && cargo --frozen nextest run --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" --workspace-remap . -E "package(cowshed-core) and binary(job_cgroup_linux)" --no-tests=fail --user-config-file none --tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml" --success-output=immediate'
+
       # Step 10
       - name: 🩺 Check monorepo policies and managed-file drift
         id: managed-drift
