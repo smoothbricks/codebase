@@ -41,6 +41,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::JobId;
+use crate::api::resources::{CpuMicros, ResourceUnitError};
 use crate::metadata::WorkspaceIncarnation;
 
 /// Where the unified cgroup hierarchy is mounted.
@@ -135,6 +136,18 @@ pub enum CgroupError {
     Populated { path: PathBuf },
     #[error("{path}: {detail}")]
     Malformed { path: PathBuf, detail: String },
+    #[error("{path} has no {counter} counter")]
+    MissingCounter {
+        path: PathBuf,
+        counter: &'static str,
+    },
+    #[error("{path} {counter}: {source}")]
+    OutOfRange {
+        path: PathBuf,
+        counter: &'static str,
+        #[source]
+        source: ResourceUnitError,
+    },
 }
 
 type Result<T, E = CgroupError> = std::result::Result<T, E>;
@@ -540,6 +553,11 @@ impl JobCgroup {
         populated(&self.path, &events)
     }
 
+    /// The job's CPU so far: every process that has run in it, live or reaped.
+    pub fn cpu(&self) -> Result<CgroupCpu> {
+        read_cpu(&self.directory, &self.path)
+    }
+
     /// The means for one process to enter this cgroup before it executes anything.
     pub fn placement(&self) -> Result<Placement> {
         // SAFETY: F_DUPFD_CLOEXEC on a live descriptor; a non-negative answer is a new one.
@@ -629,8 +647,16 @@ impl TerminalJobCgroup {
         &self.path
     }
 
-    /// Remove the cgroup, while its name still holds the cgroup admission created.
-    pub fn retire(self) -> Result<()> {
+    /// The job's final CPU.
+    pub fn cpu(&self) -> Result<CgroupCpu> {
+        read_cpu(&self.directory, &self.path)
+    }
+
+    /// Collect the job's final counters, then remove the cgroup while its name still holds the
+    /// cgroup admission created. A counter that cannot be read leaves the cgroup in place: once
+    /// it is gone, nothing could ever read it again.
+    pub fn retire(self) -> Result<JobCgroupTotals> {
+        let totals = JobCgroupTotals { cpu: self.cpu()? };
         let current = open_directory(&self.path)?;
         let found = cgroup_id(&current).map_err(failed("fstat", &self.path))?;
         if found != self.identity.cgroup_id {
@@ -641,8 +667,67 @@ impl TerminalJobCgroup {
             });
         }
         drop((current, self.directory));
-        fs::remove_dir(&self.path).map_err(failed("rmdir", &self.path))
+        fs::remove_dir(&self.path).map_err(failed("rmdir", &self.path))?;
+        Ok(totals)
     }
+}
+
+/// What a job cgroup counted over its whole life, read after its last process ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobCgroupTotals {
+    pub cpu: CgroupCpu,
+}
+
+/// A job cgroup's CPU as its `cpu.stat` counts it: every process that ran in the cgroup or
+/// beneath it, those reaped long before any observer looked included. `usage` is the kernel's
+/// exact runtime; `user` and `system` split it by the tick-sampled ratio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CgroupCpu {
+    pub usage_us: CpuMicros,
+    pub user_us: CpuMicros,
+    pub system_us: CpuMicros,
+}
+
+fn read_cpu(directory: &OwnedFd, cgroup: &Path) -> Result<CgroupCpu> {
+    let path = cgroup.join("cpu.stat");
+    let text = read_at(directory, c"cpu.stat").map_err(failed("read", &path))?;
+    parse_cpu_stat(&path, &text)
+}
+
+fn parse_cpu_stat(path: &Path, text: &str) -> Result<CgroupCpu> {
+    let micros = |counter: &'static str| -> Result<CpuMicros> {
+        CpuMicros::new(keyed_counter(path, text, counter)?).map_err(|source| {
+            CgroupError::OutOfRange {
+                path: path.to_path_buf(),
+                counter,
+                source,
+            }
+        })
+    };
+    Ok(CgroupCpu {
+        usage_us: micros("usage_usec")?,
+        user_us: micros("user_usec")?,
+        system_us: micros("system_usec")?,
+    })
+}
+
+/// The value of the `<counter> <value>` line of a flat-keyed cgroup file.
+fn keyed_counter(path: &Path, text: &str, counter: &'static str) -> Result<u64> {
+    let value = text
+        .lines()
+        .find_map(|line| {
+            line.split_once(' ')
+                .filter(|(key, _)| *key == counter)
+                .map(|(_, value)| value)
+        })
+        .ok_or_else(|| CgroupError::MissingCounter {
+            path: path.to_path_buf(),
+            counter,
+        })?;
+    value.parse().map_err(|_| CgroupError::Malformed {
+        path: path.to_path_buf(),
+        detail: format!("{counter} {value:?} is not a count"),
+    })
 }
 
 #[cfg(test)]
@@ -695,6 +780,51 @@ mod tests {
         assert!(matches!(
             populated(path, "populated 2\n"),
             Err(CgroupError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn every_cpu_counter_is_read_and_none_is_assumed() {
+        let path = Path::new("/sys/fs/cgroup/x/cpu.stat");
+        let stat = "usage_usec 1055017791\nuser_usec 889772499\nsystem_usec 165245292\n\
+                    nice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 0\n";
+        let cpu = parse_cpu_stat(path, stat).expect("all three counters");
+        assert_eq!(cpu.usage_us.get(), 1_055_017_791);
+        assert_eq!(cpu.user_us.get(), 889_772_499);
+        assert_eq!(cpu.system_us.get(), 165_245_292);
+        // A missing counter is named, never read as zero.
+        let missing = parse_cpu_stat(path, "usage_usec 10\nuser_usec 7\n");
+        assert!(
+            matches!(
+                missing,
+                Err(CgroupError::MissingCounter {
+                    counter: "system_usec",
+                    ..
+                })
+            ),
+            "{missing:?}"
+        );
+        // A key that only starts like the counter is not it.
+        assert!(matches!(
+            parse_cpu_stat(path, "usage_usec_x 1\nuser_usec 1\nsystem_usec 1\n"),
+            Err(CgroupError::MissingCounter {
+                counter: "usage_usec",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_cpu_stat(path, "usage_usec -1\nuser_usec 1\nsystem_usec 1\n"),
+            Err(CgroupError::Malformed { .. })
+        ));
+        assert!(matches!(
+            parse_cpu_stat(
+                path,
+                "usage_usec 9007199254740992\nuser_usec 1\nsystem_usec 1\n"
+            ),
+            Err(CgroupError::OutOfRange {
+                counter: "usage_usec",
+                ..
+            })
         ));
     }
 
