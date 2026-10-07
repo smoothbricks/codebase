@@ -212,9 +212,17 @@ peer observes — the supervisor listener and its `.sock.lock` lease, the APFS i
 lifecycle locks, the intent lease and journal lock, the job records lock, cargo's cache locks — is fenced from the
 moment it is opened: its close takes the lock exclusive, waiting only for spawns in flight. A socket, which Darwin
 cannot create close-on-exec in one system call, is also created exclusive, or a child forked between `socket` and
-`fcntl` would keep it for life. cowshed-core's clippy configuration refuses unlocked `spawn`/`output`/`status`. Perf
-finding: a spawn holds the shared guard for a whole `fork` of a large supervisor address space, which a release then
-waits out; a `posix_spawn` spawner, which forks nothing, is the later improvement.
+`fcntl` would keep it for life. A job's pipe pair is close-on-exec from birth too: `pipe2(O_CLOEXEC)` on Linux; on
+Darwin, which has no `pipe2`, it is created and marked under the exclusive lock (`fork_lock::create`), so no unrelated
+spawn holds a job's end of stream open. cowshed-core's clippy configuration refuses unlocked `spawn`/`output`/`status`.
+Perf finding: a spawn holds the shared guard for a whole `fork` of a large supervisor address space, which a release
+then waits out; a `posix_spawn` spawner, which forks nothing, is the later improvement.
+
+The supervisor retains the job's diagnostics stderr before it acquires a warm host. If cloning that descriptor fails,
+the job fails with `EnvironmentMissing`, naming the clone operation and its syscall cause (including `EMFILE` for
+descriptor exhaustion); no command starts. The reason is written through the original stderr descriptor. Retained
+diagnostics are written through a borrowed file, never another descriptor clone, and their writer closes as soon as the
+command starts so it cannot hold output EOF open.
 
 Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
 stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
