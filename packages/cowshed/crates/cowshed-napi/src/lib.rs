@@ -19,8 +19,8 @@ use std::{
 
 use bytes::Bytes;
 use cowshed_core::{
-    AdmissionRefusal, Coordinator as CoreCoordinator, Cowshed, CowshedError,
-    JobHandle as CoreJobHandle, Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
+    Coordinator as CoreCoordinator, Cowshed, CowshedError, JobHandle as CoreJobHandle,
+    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
@@ -28,7 +28,7 @@ use cowshed_core::{
     },
 };
 use napi::{
-    Env, JsError, JsObject,
+    Env, JsObject,
     bindgen_prelude::{Buffer, ToNapiValue},
 };
 use napi_derive::napi;
@@ -39,17 +39,9 @@ mod operations;
 
 const CONSUMED_FD: i32 = -1;
 
-struct AddonFailure {
-    code: &'static str,
-    message: String,
-    hint: String,
-    /// The keyed exec refusal core typed, carried to JavaScript as its own property.
-    admission: Option<AdmissionRefusal>,
-}
+/// Retains the complete canonical error until its generated native projection settles the call.
+struct AddonFailure(CowshedError);
 
-// Constructors delegate to `CowshedError` so the addon can never invent a code spelling or a
-// default hint that disagrees with core's taxonomy; this type exists only as the flattened form
-// `to_napi_error` needs.
 impl AddonFailure {
     fn usage(message: impl Into<String>, hint: impl Into<String>) -> Self {
         CowshedError::usage(message, hint).into()
@@ -66,61 +58,18 @@ impl AddonFailure {
 
 impl From<CowshedError> for AddonFailure {
     fn from(error: CowshedError) -> Self {
-        Self {
-            code: error.code.as_str(),
-            admission: error.admission_source().cloned(),
-            message: error.message,
-            hint: error.hint,
-        }
+        Self(error)
     }
 }
 
 type AddonResult<T> = std::result::Result<T, AddonFailure>;
 
-/// Hands JavaScript a `CowshedError`-shaped rejection: `code` from core's taxonomy, `message`
-/// unmodified, and `hint` as a real property on the JS `Error`; a typed admission refusal rides
-/// as an `admission` property holding its canonical JSON, which `src/index.ts` decodes with the
-/// generated validator.
-///
-/// The hint used to be appended to `message` behind a `\nnext: ` delimiter that `src/index.ts`
-/// split back off, which made one wire delimiter a literal in two languages and turned any
-/// message containing that sequence into a mis-parsed hint. A property has no delimiter to agree
-/// on, and `index.ts` reading `error.hint` directly means an error without one is no longer
-/// dressed up with an invented hint.
+/// Projects all canonical error details; failure to build that object remains an explicit
+/// native environment error, never a silently hintless or causeless operational refusal.
 fn to_napi_error(env: Env, failure: AddonFailure) -> napi::Error {
-    let AddonFailure {
-        code,
-        message,
-        hint,
-        admission,
-    } = failure;
-    if let Ok(hinted) = hinted_error(env, code, &message, &hint, admission.as_ref()) {
-        return hinted;
+    match operations::cowshed_error(env, failure.0) {
+        Ok(error) | Err(error) => error,
     }
-    // Setting a property is the only fallible step, and only the environment can refuse it. The
-    // code and message still have to reach JavaScript when it does; `index.ts` then declines to
-    // recognise a hintless error as ours rather than inventing a hint for it.
-    napi::Error::from(JsError::from(napi::Error::new(code, message)).into_unknown(env))
-}
-
-fn hinted_error(
-    env: Env,
-    code: &'static str,
-    message: &str,
-    hint: &str,
-    admission: Option<&AdmissionRefusal>,
-) -> napi::Result<napi::Error> {
-    let mut error = JsError::from(napi::Error::new(code, message.to_owned()))
-        .into_unknown(env)
-        .coerce_to_object()?;
-    error.set_named_property("hint", hint)?;
-    if let Some(admission) = admission {
-        let admission = serde_json::to_string(admission).map_err(|error| {
-            napi::Error::from_reason(format!("cannot encode an admission refusal: {error}"))
-        })?;
-        error.set_named_property("admission", admission)?;
-    }
-    Ok(napi::Error::from(error.into_unknown()))
 }
 
 fn spawn_promise<T, F>(env: Env, future: F) -> napi::Result<JsObject>

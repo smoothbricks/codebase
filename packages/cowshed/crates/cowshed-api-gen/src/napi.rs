@@ -268,7 +268,7 @@ pub fn emit(operations: &[Operation], api: &Api) -> Result<Output, String> {
     }
     Ok(Output {
         served: serves(&classes)?,
-        rust: rust(&classes)?,
+        rust: rust(&classes)? + &crate::errors::emit(api)?,
         typescript: typescript(&classes, &served, api)?,
     })
 }

@@ -49,7 +49,7 @@ const WRITE_ENV: &str = "COWSHED_WIRE_FIXTURES";
 /// One JSON document exactly as a napi export would resolve it.
 fn document<T: Serialize>(kind: &'static str, value: &T) -> Value {
     let json = canonical_json(kind, value)
-        .unwrap_or_else(|failure| panic!("fixture {kind} must serialize: {}", failure.message));
+        .unwrap_or_else(|failure| panic!("fixture {kind} must serialize: {}", failure.0.message));
     serde_json::from_str(&json).unwrap_or_else(|error| panic!("{kind} emits valid JSON: {error}"))
 }
 

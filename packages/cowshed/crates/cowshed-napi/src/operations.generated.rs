@@ -479,3 +479,57 @@ impl JobHandle {
         super::json_call::<operations::JobKill, _>(env, Arc::clone(&self.inner), arguments)
     }
 }
+
+/// The canonical core error, with every serialized detail retained on the JS Error.
+pub(super) fn cowshed_error(
+    env: Env,
+    source: cowshed_core::CowshedError,
+) -> napi::Result<napi::Error> {
+    let details = env.to_js_value(&source)?.coerce_to_object()?;
+    let mut error = napi::JsError::from(napi::Error::new(source.code.as_str(), source.message))
+        .into_unknown(env)
+        .coerce_to_object()?;
+    if details.has_named_property("hint")? {
+        error.set_named_property(
+            "hint",
+            details.get_named_property::<napi::JsUnknown>("hint")?,
+        )?;
+    }
+    if details.has_named_property("otherBuild")? {
+        error.set_named_property(
+            "otherBuild",
+            details.get_named_property::<napi::JsUnknown>("otherBuild")?,
+        )?;
+    }
+    if details.has_named_property("recovering")? {
+        error.set_named_property(
+            "recovering",
+            details.get_named_property::<napi::JsUnknown>("recovering")?,
+        )?;
+    }
+    if details.has_named_property("healing")? {
+        error.set_named_property(
+            "healing",
+            details.get_named_property::<napi::JsUnknown>("healing")?,
+        )?;
+    }
+    if details.has_named_property("fence")? {
+        error.set_named_property(
+            "fence",
+            details.get_named_property::<napi::JsUnknown>("fence")?,
+        )?;
+    }
+    if details.has_named_property("retry")? {
+        error.set_named_property(
+            "retry",
+            details.get_named_property::<napi::JsUnknown>("retry")?,
+        )?;
+    }
+    if details.has_named_property("admission")? {
+        error.set_named_property(
+            "admission",
+            details.get_named_property::<napi::JsUnknown>("admission")?,
+        )?;
+    }
+    Ok(napi::Error::from(error.into_unknown()))
+}

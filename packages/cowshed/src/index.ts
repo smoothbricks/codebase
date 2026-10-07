@@ -15,7 +15,6 @@ import {
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
-  type ErrorCode,
   type ExecRequest,
   type JobHandle,
   type JobLogs,
@@ -27,7 +26,7 @@ import {
   type WorkspaceHandle,
   type WorkspaceRef,
 } from './types.js';
-import { parseAdmissionRefusal, parseWorkspaceTarget } from './validators.generated.js';
+import { parseWorkspaceTarget } from './validators.generated.js';
 
 export type * from './types.js';
 export { CowshedError } from './types.js';
@@ -36,15 +35,10 @@ export { CowshedError } from './types.js';
  * The napi rejection shape. `hint` is a real property on the JS `Error`, set by `to_napi_error`
  * in crates/cowshed-napi/src/lib.rs — not a suffix on `message` behind a delimiter both languages
  * had to spell identically. An error missing any of the three is not ours and is rethrown as-is
- * rather than dressed up with an invented hint. `admission`, when present, is the canonical JSON
- * of core's typed admission refusal, decoded by the generated validator.
+ * rather than dressed up with an invented hint. Every typed refusal detail follows the generated
+ * canonical CowshedError declaration without a JSON-string roundtrip.
  */
-interface NativeError {
-  readonly code: ErrorCode;
-  readonly message: string;
-  readonly hint: string;
-  readonly admission?: string;
-}
+type NativeError = Api.CowshedError;
 
 const native = loadNativeModule();
 const isNativeError = typia.createIs<NativeError>();
@@ -56,7 +50,7 @@ function normalizeNativeError(error: unknown): unknown {
 
   return new CowshedError(error.code, error.message, error.hint, {
     cause: error,
-    ...(error.admission === undefined ? {} : { admission: parseAdmissionRefusal(error.admission) }),
+    admission: error.admission,
   });
 }
 

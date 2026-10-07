@@ -208,7 +208,14 @@ describe('Cowshed Node-API bindings', () => {
           await worker.exec(request);
           return 'resolved';
         } catch (error) {
-          return { ours: error instanceof CowshedError, code: error.code, admission: error.admission ?? null };
+          return {
+            ours: error instanceof CowshedError,
+            code: error.code,
+            admission: error.admission ?? null,
+            nativeObject: error.cause instanceof Error &&
+              typeof error.cause.admission === 'object' && error.cause.admission !== null &&
+              JSON.stringify(error.cause.admission) === JSON.stringify(error.admission),
+          };
         }
       };
       const job = await worker.exec({ argv: ['build'], admissionKey: 'op-1' });
@@ -265,16 +272,19 @@ describe('Cowshed Node-API bindings', () => {
             ours: true,
             code: 'usage',
             admission: { reason: 'stdinBound', jobId: 7 },
+            nativeObject: true,
           },
           changed: {
             ours: true,
             code: 'conflict',
             admission: { reason: 'keyConflict', jobId: 7, fields: ['command'] },
+            nativeObject: true,
           },
           unprovable: {
             ours: true,
             code: 'conflict',
             admission: { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-8' },
+            nativeObject: true,
           },
         }),
         JSON.stringify([

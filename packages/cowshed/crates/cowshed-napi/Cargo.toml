@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 bytes = "1"
 cowshed-core.workspace = true
 libc = "0.2"
-napi.workspace = true
+napi = { workspace = true, features = ["serde-json"] }
 napi-derive.workspace = true
 serde.workspace = true
 serde_json.workspace = true
