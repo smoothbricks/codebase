@@ -1039,6 +1039,7 @@ impl Serves<JobTailRead> for JobHandle {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Caller {
+            #[serde(default)]
             cursor: Option<JobJournalCursor>,
             limits: JobTailLimits,
         }
