@@ -50,6 +50,7 @@ const NOT_YET_UPSTREAM = [
     'stamp each restored output with the time of the restore, not the time its cache entry was written',
   ],
   ['file hashes', 'hash every file again when the archive may hold a hash taken in the second its file was rewritten'],
+  ['exit status', 'exit 1, not 130, when a failure skips the tasks that depend on it (`invokeTasksRunner`)'],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;

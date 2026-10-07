@@ -532,6 +532,33 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
  }
  /**
   * Converts a string representation of a max cache size to a number.
+diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
+index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..e64948e720a0a4ce916d2e5071439276ff61e9e4 100644
+--- a/dist/src/tasks-runner/run-command.js
++++ b/dist/src/tasks-runner/run-command.js
+@@ -739,8 +739,20 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+     if (promiseOrObservable.subscribe) {
+         promiseOrObservable = convertObservableToPromise(promiseOrObservable);
+     }
+-    await promiseOrObservable;
+-    return taskResultsLifecycle.getTaskResults();
++    const statuses = await promiseOrObservable;
++    const taskResults = taskResultsLifecycle.getTaskResults();
++    // The orchestrator tells no life cycle about a task it skips because a
++    // dependency failed (the terminal output lists it among the tasks it never
++    // saw end), so only the runner's own answer knows of it. Without a result
++    // for it, didCommandComplete takes the run for an interrupted one and an
++    // ordinary failure exits 130 instead of 1. A custom runner's answer is
++    // typed `any`, so a runner that answers nothing adds nothing.
++    for (const [taskId, status] of Object.entries(statuses ?? {})) {
++        if (status === 'skipped' && !taskResults[taskId]) {
++            taskResults[taskId] = { task: taskGraph.tasks[taskId], status, code: 1 };
++        }
++    }
++    return taskResults;
+ }
+ function constructLifeCycles(lifeCycle, taskGraph, nxJson, skipNxCache) {
+     const lifeCycles = [];
 diff --git a/dist/src/tasks-runner/task-graph-utils.d.ts b/dist/src/tasks-runner/task-graph-utils.d.ts
 index 2ba00c254450c7d3b93e288b1f0bb28361ef8cf3..5f76eee85731e34fbf1edc4ebc0c7593dd2abdbd 100644
 --- a/dist/src/tasks-runner/task-graph-utils.d.ts

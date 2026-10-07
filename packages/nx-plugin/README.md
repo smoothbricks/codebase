@@ -639,6 +639,13 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   another Nx process rewrites between the check and the native read; on Windows, whose native mtime is a FILETIME, it
   does nothing. The native fix records every entry dated from the second its pass started on as racy and has none of
   these limits. Not yet proposed upstream.
+- **A failed run exits 1, not 130, when it skips the tasks behind a failure.** Nx skips every task that depends on a
+  failed one, and tells no life cycle about a skipped task, so the results `nx` reads its exit status from had none for
+  it; `didCommandComplete` takes a discrete task without a result for one the run never finished, and `nx` exited 130,
+  the status of an interrupted run. A gate then reported `Failed to run "nx" due to exit code 130` for an ordinary test
+  failure. The patch records each task the runner reports skipped as a skipped result, so the exit status is 1; the
+  terminal output, which already listed it under "Tasks not run", is unchanged. Not yet proposed upstream: Nx `master`
+  reports skipped tasks the same way.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -647,10 +654,10 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution, task-graph, restore-time and racy-archive regressions pass; preserve any
-repair not yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on
-Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream,
-drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive and skipped-task exit regressions
+pass; preserve any repair not yet released. The restore-time regression fails without its hunk only on macOS, where the
+copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every
+hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 
