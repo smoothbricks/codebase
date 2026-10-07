@@ -19,6 +19,12 @@
       "require": "./dist/version-actions.cjs",
       "default": "./dist/version-actions.cjs"
     },
+    "./eslint-file-set": {
+      "types": "./dist/eslint-file-set.d.ts",
+      "development": "./src/eslint-file-set.ts",
+      "import": "./dist/eslint-file-set.js",
+      "default": "./dist/eslint-file-set.js"
+    },
     "./bounded-test-policy": {
       "types": "./dist/bounded-test-policy.d.ts",
       "development": "./src/bounded-test-policy.ts",

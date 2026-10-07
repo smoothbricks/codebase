@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeF
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
+import { isEslintFileSet } from '@smoothbricks/nx-plugin/eslint-file-set';
 import type {
   CreateNodesContextV2,
   CreateNodesV2,
@@ -981,6 +981,17 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(lint?.options?.commands).toEqual([
         "eslint 'packages/contract/schema.d.ts' 'packages/example/src/index.ts' 'packages/example/tests/check.test.ts' 'packages/example/tests/helper.ts'",
       ]);
+      expect(lint?.metadata?.eslintFileSet).toEqual({
+        command: lint?.options?.commands?.[0],
+        files: [
+          'packages/contract/schema.d.ts',
+          'packages/example/src/index.ts',
+          'packages/example/tests/check.test.ts',
+          'packages/example/tests/helper.ts',
+        ],
+      });
+      expect(isEslintFileSet(lint?.metadata?.eslintFileSet)).toBe(true);
+      expect(isEslintFileSet({ command: 'eslint invalid', files: [null] })).toBe(false);
       expect(lint?.inputs).toEqual(
         expect.arrayContaining([
           '{projectRoot}/tsconfig.test.json',

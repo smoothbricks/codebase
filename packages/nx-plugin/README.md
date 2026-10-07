@@ -34,7 +34,10 @@ flat configuration enables ESLint for existing JavaScript/TypeScript files under
 `tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`; the
 same sources, the test declaration and its existing `extends` chain are explicit lint cache inputs. Rust-only source
 trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs. Adding
-JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically.
+JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The target's
+`metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
+`@smoothbricks/nx-plugin/eslint-file-set` owns its type and generated validator; an inspector can resolve each file's
+actual ESLint parser program instead of guessing from the project or target name.
 
 Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
 `^production` unless the workspace opts into the versionless production input described below. Keep

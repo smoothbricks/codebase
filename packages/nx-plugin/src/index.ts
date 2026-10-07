@@ -55,6 +55,7 @@ import {
   cargoCrossTestTargetName,
   cargoFrozen,
 } from './cross-check-policy.js';
+import type { EslintFileSet } from './eslint-file-set.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import {
   EXTRACTED_BINARIES_METADATA,
@@ -324,9 +325,10 @@ async function javaScriptSourceFiles(directory: string): Promise<string[]> {
 async function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
-): Promise<{ commands: string[]; inputs: string[] }> {
+): Promise<{ commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null }> {
   const commands: string[] = [];
   const inputs: string[] = [];
+  let eslintFileSet: EslintFileSet | null = null;
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
@@ -346,7 +348,7 @@ async function projectLintCommands(
           `${testConfig}: ${errors.map(({ code, messageText }) => `TS${code}: ${JSON.stringify(messageText)}`).join('; ')}`,
         );
       }
-      inputs.push('{projectRoot}/tsconfig.test.json', ...typescriptConfigChainInputs([testConfig], workspaceRoot));
+      inputs.push('{projectRoot}/tsconfig.test.json');
       for (const file of program.fileNames) {
         const path = relative(workspaceRoot, file).split(sep).join('/');
         if (path === '..' || path.startsWith('../') || isAbsolute(path)) {
@@ -358,15 +360,12 @@ async function projectLintCommands(
       }
     }
     if (sourceFiles.size > 0) {
-      commands.push(
-        `eslint ${[...sourceFiles]
-          .sort()
-          .map((file) => quote(relative(workspaceRoot, file)))
-          .join(' ')}`,
-      );
+      const files = [...sourceFiles].sort().map((file) => relative(workspaceRoot, file).split(sep).join('/'));
+      eslintFileSet = { command: `eslint ${files.map(quote).join(' ')}`, files };
+      commands.push(eslintFileSet.command);
     }
   }
-  return { commands, inputs: [...new Set(inputs)] };
+  return { commands, inputs: [...new Set(inputs)], eslintFileSet };
 }
 
 type NapiArchitecture = 'arm64' | 'x64';
@@ -1800,10 +1799,15 @@ async function createProjectTargets(
     }
   }
 
-  const { commands: lintCommands, inputs: lintProgramInputs } = await projectLintCommands(projectRoot, workspaceRoot);
+  const {
+    commands: lintCommands,
+    inputs: lintProgramInputs,
+    eslintFileSet,
+  } = await projectLintCommands(projectRoot, workspaceRoot);
   if (validationTargets.length > 0 || lintCommands.length > 0) {
     targets.lint = {
       executor: lintCommands.length > 0 ? 'nx:run-commands' : 'nx:noop',
+      ...(eslintFileSet === null ? {} : { metadata: { eslintFileSet } }),
       cache: true,
       dependsOn: validationTargets,
       outputs: [],
