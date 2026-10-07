@@ -1619,7 +1619,7 @@ index 74bf8f9..8034019 100644
 +}
 +export declare function foreignWorkspaceEnvironment(cwd: string, env: NodeJS.ProcessEnv): ForeignWorkspaceEnvironment | null;
 diff --git a/dist/src/utils/workspace-root.js b/dist/src/utils/workspace-root.js
-index 74f0682..8987475 100644
+index 74f0682..03686ff 100644
 --- a/dist/src/utils/workspace-root.js
 +++ b/dist/src/utils/workspace-root.js
 @@ -3,7 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
@@ -1649,7 +1649,7 @@ index 74f0682..8987475 100644
      if (path.dirname(dir) === dir)
          return candidateRoot;
      const matches = [
-@@ -32,9 +44,97 @@ function workspaceRootInner(dir, candidateRoot) {
+@@ -32,9 +44,120 @@ function workspaceRootInner(dir, candidateRoot) {
          // thus located in //packages/my-lib/node_modules/nx/package.json
      }
      else if ((0, fileutils_1.fileExists)(path.join(dir, 'node_modules', 'nx', 'package.json'))) {
@@ -1695,20 +1695,20 @@ index 74f0682..8987475 100644
 + *   /tmp, cannot be attributed by its path and is not reported. Nothing on disk
 + *   says which workspace owns it short of asking the daemon behind it, and
 + *   that daemon is what must not be reached.
-+ * Paths are compared after resolving symlinks, so an alias of `cwd`'s own
-+ * workspace is that workspace.
++ * Directories are compared by device and inode (`sameDirectory`), so every path
++ * to `cwd`'s own workspace, a symlink, a bind mount or a firmlink, is that
++ * workspace.
 + */
 +function foreignWorkspaceEnvironment(cwd, env) {
 +    const found = workspaceRootFromMarkers(cwd, null);
 +    if (found === null)
 +        return null;
-+    const workspace = realLocation(found);
 +    const variables = [];
 +    const rootPath = env.NX_WORKSPACE_ROOT_PATH;
 +    if (rootPath) {
-+        const named = realLocation(path.resolve(cwd, rootPath));
-+        if (named !== workspace) {
-+            variables.push({ name: 'NX_WORKSPACE_ROOT_PATH', value: rootPath, workspace: named });
++        const named = path.resolve(cwd, rootPath);
++        if (!sameDirectory(named, found)) {
++            variables.push({ name: 'NX_WORKSPACE_ROOT_PATH', value: rootPath, workspace: realLocation(named) });
 +        }
 +    }
 +    const nxRoot = rootPath ? path.resolve(cwd, rootPath) : found;
@@ -1720,12 +1720,35 @@ index 74f0682..8987475 100644
 +        const owner = workspaceRootFromMarkers(location, null);
 +        if (owner === null)
 +            continue;
-+        const ownerWorkspace = realLocation(owner);
-+        if (ownerWorkspace !== workspace) {
-+            variables.push({ name, value, workspace: ownerWorkspace });
++        if (!sameDirectory(owner, found)) {
++            variables.push({ name, value, workspace: realLocation(owner) });
 +        }
 +    }
-+    return variables.length === 0 ? null : { workspace, variables };
++    return variables.length === 0 ? null : { workspace: realLocation(found), variables };
++}
++/**
++ * Whether `left` and `right` are one directory: the same device and inode,
++ * which every path to a directory shares. Resolving symlinks does not join the
++ * paths of a bind mount (CI binds the checkout at `/work/...` and runs steps in
++ * the checkout itself) or a firmlink (macOS's `/System/Volumes/Data/Users` and
++ * `/Users`): each is a second canonical path to the one directory. Where either
++ * cannot be read, or its filesystem reports no inode, the resolved paths decide.
++ */
++function sameDirectory(left, right) {
++    const leftIdentity = directoryIdentity(left);
++    const rightIdentity = directoryIdentity(right);
++    return leftIdentity !== null && rightIdentity !== null
++        ? leftIdentity === rightIdentity
++        : realLocation(left) === realLocation(right);
++}
++function directoryIdentity(location) {
++    try {
++        const { dev, ino } = fs_1.statSync(location, { bigint: true });
++        return ino === 0n ? null : `${dev}:${ino}`;
++    }
++    catch {
++        return null;
++    }
 +}
 +/**
 + * `location` with every symlink resolved. A directory Nx has not created yet

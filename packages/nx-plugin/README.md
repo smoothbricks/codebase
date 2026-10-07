@@ -676,12 +676,17 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   `NX_PROJECT_GRAPH_CACHE_DIRECTORY` names another workspace. The error names each such variable with its value and both
   workspaces, and says to run under the current workspace's own environment (`direnv exec <workspace> nx ...`).
   `NX_WORKSPACE_ROOT_PATH` names the directory it holds; a data, cache or socket directory belongs to the workspace
-  whose root contains it; paths are compared with symlinks resolved. A current directory inside no workspace is not
-  refused. A directory outside every workspace, such as a socket directory under `/tmp`, is left unchecked: only the
-  daemon behind it could say whose it is, and reaching that daemon is what the check prevents. The daemon, plugin
-  workers and tasks do not start through the CLI and are not checked; an `nx` a task runs from a project directory
-  resolves to the task's own workspace and passes. A cache or data directory that several checkouts share on purpose has
-  to lie outside every workspace, or it is refused. Not yet proposed upstream.
+  whose root contains it, found by walking the directory's ancestors to a workspace marker (`nx.json`, `nx` or
+  `nx.bat`). Workspaces are compared by the device and inode of their root directory, not by path, so every path to the
+  current workspace is that workspace: a symlink, a bind mount or a firmlink. CI depends on it: `setup-devenv`
+  bind-mounts the checkout at `/work/...` for devenv's evaluation cache, the environment names that mount, and the steps
+  run in the checkout. Compared as resolved paths the two were different workspaces, and every `nx` of the job refused.
+  A current directory inside no workspace is not refused. A directory outside every workspace, such as a socket
+  directory under `/tmp`, is left unchecked: only the daemon behind it could say whose it is, and reaching that daemon
+  is what the check prevents. The daemon, plugin workers and tasks do not start through the CLI and are not checked; an
+  `nx` a task runs from a project directory resolves to the task's own workspace and passes. A cache or data directory
+  that several checkouts share on purpose has to lie outside every workspace, or it is refused. Not yet proposed
+  upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
