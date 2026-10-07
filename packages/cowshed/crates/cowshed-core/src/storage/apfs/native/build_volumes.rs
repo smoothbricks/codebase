@@ -33,8 +33,8 @@ pub enum Release {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Refusal {
     /// Each process that had the volume open when the unmount was refused, as the kernel
-    /// answers for this user's processes: empty when only processes this user cannot see held
-    /// it (`mds`, `fseventsd`).
+    /// answers for this user's processes: empty when no holder is visible in that listing.
+    /// The kernel or another user's process may still hold the volume.
     pub open: Vec<Holder>,
     /// The grace ran out and the unmount was forced past them; otherwise they let go in time.
     pub forced: bool,

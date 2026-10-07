@@ -812,13 +812,26 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
 #[tokio::test]
 async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     let root = workspace_root("build-volume");
-    let supervisor_config = config(&root);
-    let volumes = supervisor_config
-        .sandbox
-        .mount_root
-        .join(".build/acme/widget");
-    let before = volumes.join("a".repeat(32));
-    let adopted = volumes.join("b".repeat(32));
+    use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use cowshed_core::repository::ProjectPaths;
+
+    let mut supervisor_config = config(&root);
+    let project = ProjectPaths::with_mount_root(
+        root.join("store"),
+        &supervisor_config.sandbox.mount_root,
+        &supervisor_config.authority.repo_id,
+    )
+    .unwrap();
+    let layout = BuildVolumeLayout::new(&project).unwrap();
+    let before_id = BuildVolumeId::parse(&"a".repeat(32)).unwrap();
+    let adopted_id = BuildVolumeId::parse(&"b".repeat(32)).unwrap();
+    std::fs::create_dir_all(layout.images()).unwrap();
+    for id in [&before_id, &adopted_id] {
+        std::fs::File::create(layout.image(id)).unwrap();
+    }
+    let before = layout.mount(&before_id);
+    let adopted = layout.mount(&adopted_id);
+    supervisor_config.build_volume_layout = Some(layout.clone());
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let first = h
         .handle
@@ -832,6 +845,14 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         .await
         .unwrap();
     let second_spawn = h.spawned.recv().await.unwrap();
+    assert!(
+        layout.held(&before_id).unwrap(),
+        "the first job retains its admitted volume"
+    );
+    assert!(
+        layout.held(&adopted_id).unwrap(),
+        "the later job retains the adopted volume"
+    );
     let granted = |spawn: &Spawned, mode| {
         spawn
             .request
@@ -868,6 +889,14 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         complete(spawn, b"", b"", ExitStatus::Exited { code: 0 }).await;
         h.handle.wait(job).await.unwrap();
     }
+    assert!(
+        !layout.held(&before_id).unwrap(),
+        "the concluded job drops its old-volume hold"
+    );
+    assert!(
+        !layout.held(&adopted_id).unwrap(),
+        "the concluded job drops its new-volume hold"
+    );
 }
 
 #[tokio::test]
