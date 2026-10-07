@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import {
   existsSync,
   mkdirSync,
@@ -11,15 +12,17 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { isRunning } from '../../testing.js';
+import { pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   createHostCommands,
   type HostCommands,
   hostLeaseProcesses,
   imagesBackedUnder,
+  leaseProcessesOn,
   mountsBelow,
   operationDisk,
   type RamDisk,
@@ -367,21 +370,163 @@ function registryDevice(url: string, disk: string): string[] {
 describe('processes a task left working in its RAM lease', () => {
   const scratch = (): string => mkdtempSync(join(realpathSync(tmpdir()), 'lease-leftovers-'));
 
+  /**
+   * A fixture's Nx daemon, as Nx leaves it: its own session, working in the fixture, with a child of
+   * its own (a plugin worker), so the command's process-group kill never reaches it. It starts the
+   * child once a line can be read from `gate`, and prints the child's pid once it has.
+   */
+  function detachedDaemon(lease: string, gate: string) {
+    const daemon = spawn('sh', ['-c', 'read go < "$1"; sleep 600 & echo $!; wait', 'daemon', gate], {
+      cwd: lease,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const pid = daemon.pid;
+    if (pid === undefined) {
+      throw new Error('sh did not start');
+    }
+    const childPid = once(daemon.stdout, 'data').then(([line]) => Number(String(line).trim()));
+    const exited = once(daemon, 'close');
+    return { daemon, pid, childPid, exited };
+  }
+
+  async function liveAmong(pids: readonly number[]): Promise<number[]> {
+    const live = (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid);
+    return pids.filter((pid) => live.includes(pid));
+  }
+
   it('stops a detached process working in the lease and what it started, and names them', async () => {
     const lease = scratch();
-    // A fixture's Nx daemon, as Nx leaves it: its own session, working in the fixture, with a
-    // child of its own (a plugin worker), so the command's process-group kill never reaches it.
-    const daemon = spawn('sh', ['-c', 'sleep 600 & wait'], { cwd: lease, detached: true, stdio: 'ignore' });
-    const daemonPid = daemon.pid;
-    expect(daemonPid).toBeDefined();
+    const gate = join(lease, 'gate');
+    execFileSync('mkfifo', [gate]);
+    const { pid, childPid, exited } = detachedDaemon(lease, gate);
+    let child = 0;
     try {
+      await writeFile(gate, 'go\n');
+      child = await childPid;
+
       const stopped = await hostLeaseProcesses.stopWorkingIn(lease);
 
-      expect(stopped.some((entry) => entry.startsWith(`${daemonPid} (`))).toBe(true);
-      expect(stopped.length).toBeGreaterThanOrEqual(2);
-      expect(isRunning(daemonPid ?? 0) && daemon.exitCode === null && daemon.signalCode === null).toBe(false);
+      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
+        [pid, child].sort((a, b) => a - b),
+      );
+      expect(await liveAmong([pid, child])).toEqual([]);
     } finally {
-      daemon.kill('SIGKILL');
+      terminate(pid, 'SIGKILL');
+      if (child !== 0) {
+        terminate(child, 'SIGKILL');
+      }
+      await exited;
+      rmSync(lease, { recursive: true, force: true });
+    }
+  });
+
+  it('stops what a process starts after the process table was read, before it was signalled', async () => {
+    const lease = scratch();
+    const gate = join(lease, 'gate');
+    execFileSync('mkfifo', [gate]);
+    const { pid, childPid, exited } = detachedDaemon(lease, gate);
+    let child = 0;
+    // The daemon starts its child right after the table is read, so the table cannot name it.
+    let reads = 0;
+    const processes = leaseProcessesOn({
+      workingIn: pidsWorkingIn,
+      async table() {
+        const table = await processTable();
+        reads += 1;
+        if (reads === 1) {
+          expect(table.some((entry) => entry.ppid === pid)).toBe(false);
+          await writeFile(gate, 'go\n');
+          child = await childPid;
+        }
+        return table;
+      },
+    });
+    try {
+      const stopped = await processes.stopWorkingIn(lease);
+
+      expect(child).not.toBe(0);
+      expect(await liveAmong([pid, child])).toEqual([]);
+      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
+        [pid, child].sort((a, b) => a - b),
+      );
+    } finally {
+      terminate(pid, 'SIGKILL');
+      if (child !== 0) {
+        terminate(child, 'SIGKILL');
+      }
+      await exited;
+      rmSync(lease, { recursive: true, force: true });
+    }
+  });
+
+  it('finds a child whose lease root exits before the process table is read', async () => {
+    const lease = scratch();
+    const gate = join(lease, 'gate');
+    execFileSync('mkfifo', [gate]);
+    const { daemon, pid, childPid, exited } = detachedDaemon(lease, gate);
+    let child = 0;
+    let reads = 0;
+    const processes = leaseProcessesOn({
+      workingIn: pidsWorkingIn,
+      async table() {
+        reads += 1;
+        if (reads === 1) {
+          await writeFile(gate, 'go\n');
+          child = await childPid;
+          const ended = once(daemon, 'exit');
+          terminate(pid, 'SIGKILL');
+          await ended;
+        }
+        return processTable();
+      },
+    });
+    try {
+      const stopped = await processes.stopWorkingIn(lease);
+      expect(stopped.map((entry) => Number(entry.split(' ')[0]))).toEqual([child]);
+      expect(await liveAmong([pid, child])).toEqual([]);
+    } finally {
+      terminate(pid, 'SIGKILL');
+      if (child !== 0) {
+        terminate(child, 'SIGKILL');
+      }
+      await exited;
+      rmSync(lease, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes a process held during discovery when a host read fails', async () => {
+    const lease = scratch();
+    const gate = join(lease, 'gate');
+    execFileSync('mkfifo', [gate]);
+    const { pid, childPid, exited } = detachedDaemon(lease, gate);
+    let child = 0;
+    let observedStopped = false;
+    const failed = new Error('process table unavailable after SIGSTOP');
+    const processes = leaseProcessesOn({
+      workingIn: pidsWorkingIn,
+      async table() {
+        const table = await processTable();
+        if (table.some((entry) => entry.pid === pid && entry.stat.startsWith('T'))) {
+          observedStopped = true;
+          throw failed;
+        }
+        return table;
+      },
+    });
+    try {
+      await expect(processes.stopWorkingIn(lease)).rejects.toBe(failed);
+      expect(observedStopped).toBe(true);
+      // Reading the FIFO and starting the child requires the daemon to have resumed.
+      await writeFile(gate, 'go\n');
+      child = await childPid;
+      expect(child).toBeGreaterThan(0);
+    } finally {
+      terminate(pid, 'SIGKILL');
+      if (child !== 0) {
+        terminate(child, 'SIGKILL');
+      }
+      await exited;
       rmSync(lease, { recursive: true, force: true });
     }
   });

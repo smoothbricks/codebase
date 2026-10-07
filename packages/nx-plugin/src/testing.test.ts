@@ -12,6 +12,7 @@ import {
   pidsWorkingIn,
   processTable,
   terminate,
+  withDescendants,
 } from './testing.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
@@ -49,6 +50,22 @@ async function stillRunning(processes: readonly ProcessEntry[]): Promise<string[
   const live = (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid);
   return processes.filter((entry) => live.includes(entry.pid)).map((entry) => `${entry.pid} ${entry.command}`);
 }
+
+it('lists a process once when it descends from another of the pids it is asked about', () => {
+  const table: ProcessEntry[] = [
+    { pid: 1, ppid: 0, stat: 'Ss', command: 'launchd' },
+    { pid: 10, ppid: 1, stat: 'Ss', command: 'sh -c sleep 600 & wait' },
+    { pid: 11, ppid: 10, stat: 'S', command: 'sleep 600' },
+    { pid: 12, ppid: 11, stat: 'S', command: 'sleep 1' },
+    { pid: 20, ppid: 1, stat: 'S', command: 'bystander' },
+  ];
+
+  expect(
+    withDescendants(table, [11, 10])
+      .map((entry) => entry.pid)
+      .sort((a, b) => a - b),
+  ).toEqual([10, 11, 12]);
+});
 
 it('stops the Nx daemon of a fixture whose body throws, and deletes its root', async () => {
   let root = '';
