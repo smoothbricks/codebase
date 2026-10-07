@@ -148,19 +148,40 @@ fn empty_stdin() -> StdinInfo {
     }
 }
 
-/// An ended job's terminal sample: one leader, nothing of its group left, and `volumes`.
-fn sample(job: u64, volumes: JobVolumeUsage) -> JobResourceSample {
-    let wall = WallMicros::new(1_234_000).expect("fixture wall");
-    let stream = JobStreamWatermark {
-        bytes: StreamBytes::new(3).expect("fixture stream bytes"),
-        lines: StreamLines::new(1).expect("fixture stream lines"),
+/// An inline stream's bytes as a sample counts them: each `\n` ends a line, and a trailing line no
+/// `\n` ended counts too.
+fn watermark(stream: &StreamInfo) -> JobStreamWatermark {
+    let OutputStorage::Captured {
+        artifact: ProtectedOutput::Inline { data },
+    } = &stream.storage
+    else {
+        panic!("an ended fixture job's streams are inline");
     };
+    let bytes = data.as_bytes();
+    let ended = bytes.iter().filter(|&&byte| byte == b'\n').count();
+    let open = bytes.last().is_some_and(|&byte| byte != b'\n');
+    let lines = u64::try_from(ended).expect("fixture line count") + u64::from(open);
+    JobStreamWatermark {
+        bytes: StreamBytes::new(stream.bytes).expect("fixture stream bytes"),
+        lines: StreamLines::new(lines).expect("fixture stream lines"),
+    }
+}
+
+/// An ended job's terminal sample, taken from the job itself: its leader is the job's process,
+/// its wall time the job's duration and its streams the job's output. Nothing of its group is
+/// left, and its volumes are `volumes`.
+fn ended_sample(job: &JobInfo, volumes: JobVolumeUsage) -> JobResourceSample {
+    let wall = job
+        .duration_ms
+        .and_then(|millis| millis.checked_mul(1_000))
+        .expect("an ended fixture job has a duration");
+    let wall = WallMicros::new(wall).expect("fixture wall");
     JobResourceSample {
-        job_id: JobId::new(job).expect("fixture job id"),
+        job_id: job.job_id,
         sampled_at: timestamp(),
         wall_ms: wall.millis(),
         wall_us: wall,
-        leader_pid: 4243,
+        leader_pid: job.pid.expect("an ended fixture job had a process"),
         members: Vec::new(),
         host_start: HostLoadSample::new(2.0, 10).expect("fixture host"),
         host: HostLoadSample::new(2.5, 10).expect("fixture host"),
@@ -168,8 +189,8 @@ fn sample(job: u64, volumes: JobVolumeUsage) -> JobResourceSample {
         rss_peak_bytes: ResidentBytes::new(12 << 20).expect("fixture resident bytes"),
         accounting: None,
         volumes,
-        stdout: stream,
-        stderr: stream,
+        stdout: watermark(&job.stdout),
+        stderr: watermark(&job.stderr),
     }
 }
 
@@ -283,16 +304,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(1_234),
-        // A supervisor configured with no volume sampled it: its volumes say so.
-        resources: Some(sample(
-            3,
-            JobVolumeUsage {
-                workspace: VolumeUsage::Unavailable {
-                    reason: VolumeUnavailable::Unconfigured,
-                },
-                build: None,
-            },
-        )),
+        resources: None,
         exit: Some(ExitStatus::Exited { code: 0 }),
         stdout: inline_stream("ok\n"),
         stderr: inline_stream(""),
@@ -305,6 +317,19 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
+    };
+    // A supervisor configured with no volume sampled it: its volumes say so.
+    let exited = JobInfo {
+        resources: Some(ended_sample(
+            &exited,
+            JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Unconfigured,
+                },
+                build: None,
+            },
+        )),
+        ..exited
     };
 
     // A signalled job carrying a non-UTF-8 argument. This is the case a `string[]` argv cannot
@@ -324,19 +349,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(9),
-        // A platform with no used-bytes stat for the workspace volume, and a build volume that
-        // shrank.
-        resources: Some(sample(
-            4,
-            JobVolumeUsage {
-                workspace: VolumeUsage::Unavailable {
-                    reason: VolumeUnavailable::UnsupportedPlatform,
-                },
-                build: Some(VolumeUsage::Read {
-                    delta_bytes: VolumeUsedBytesDelta::new(-(16 << 20)).expect("fixture delta"),
-                }),
-            },
-        )),
+        resources: None,
         exit: Some(ExitStatus::Signaled {
             signal: 9,
             core_dumped: true,
@@ -347,6 +360,21 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
+    };
+    // A platform with no used-bytes stat for the workspace volume, and a build volume that shrank.
+    let signaled = JobInfo {
+        resources: Some(ended_sample(
+            &signaled,
+            JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::UnsupportedPlatform,
+                },
+                build: Some(VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(-(16 << 20)).expect("fixture delta"),
+                }),
+            },
+        )),
+        ..signaled
     };
 
     // The output-limit state is the only one that carries `outputLimit`, and an incomplete
@@ -1052,4 +1080,35 @@ fn every_volume_usage_appears_in_the_corpus() {
             .any(|sample| sample["volumes"].get("build").is_none()),
         "a sample without a build volume omits it"
     );
+}
+
+/// An ended job's sample in the committed corpus is that job's own: its leader is the job's
+/// process, its wall time the job's duration and each stream's sampled bytes the job's output, so
+/// a regenerated corpus cannot bless a terminal sample no job could have produced.
+#[test]
+fn each_ended_jobs_sample_in_the_corpus_is_its_own() {
+    let corpus: Value = serde_json::from_str(GOLDEN).expect("the committed corpus is JSON");
+    let jobs = corpus["JobInfo"]
+        .as_object()
+        .expect("the corpus holds job documents");
+    let ended: Vec<(&String, &Value)> = jobs
+        .iter()
+        .filter(|(_, job)| !job["resources"].is_null() && !job["durationMs"].is_null())
+        .collect();
+    assert!(
+        ended.len() >= 2,
+        "the corpus carries ended jobs' samples: {ended:?}"
+    );
+    for (name, job) in ended {
+        let sample = &job["resources"];
+        assert_eq!(sample["jobId"], job["jobId"], "{name}: job id");
+        assert_eq!(sample["leaderPid"], job["pid"], "{name}: leader");
+        assert_eq!(sample["wallMs"], job["durationMs"], "{name}: wall time");
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(
+                sample[stream]["bytes"], job[stream]["bytes"],
+                "{name}: {stream} bytes"
+            );
+        }
+    }
 }

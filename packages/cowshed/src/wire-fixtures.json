@@ -195,8 +195,8 @@
         "rssPeakBytes": 12582912,
         "sampledAt": "2026-01-02T03:04:05Z",
         "stderr": {
-          "bytes": 3,
-          "lines": 1
+          "bytes": 0,
+          "lines": 0
         },
         "stdout": {
           "bytes": 3,
@@ -1013,18 +1013,18 @@
           "load1": 2.0
         },
         "jobId": 4,
-        "leaderPid": 4243,
+        "leaderPid": 4244,
         "members": [],
         "rssBytes": 0,
         "rssPeakBytes": 12582912,
         "sampledAt": "2026-01-02T03:04:05Z",
         "stderr": {
-          "bytes": 3,
+          "bytes": 7,
           "lines": 1
         },
         "stdout": {
-          "bytes": 3,
-          "lines": 1
+          "bytes": 0,
+          "lines": 0
         },
         "volumes": {
           "build": {
@@ -1038,8 +1038,8 @@
             }
           }
         },
-        "wallMs": 1234,
-        "wallUs": 1234000
+        "wallMs": 9,
+        "wallUs": 9000
       },
       "started": "2026-01-02T03:04:05Z",
       "state": "signaled",
