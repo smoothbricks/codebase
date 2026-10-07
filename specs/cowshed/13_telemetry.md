@@ -14,15 +14,26 @@ debugging (span waterfalls), security (audit joins), and fleet ops (SLOs from re
 specifically because it is trace-first and **deterministic** — with an injected `Clock` and `Entropy` it emits
 bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao`).
 
-**Dependency honesty**: cowshed does not depend on lmao's crates. The gateway writes lmao's Arrow trace schema itself
-(`cowshed-gateway/src/telemetry.rs`), byte-for-byte aligned with `lmao-arrow`'s, because that crate cannot be imported
-without its `lmao-core` runtime; nothing in cowshed queries traces with `lmao-query`, and no golden trace fixture
-exists.
+**Dependency honesty**: cowshed does not depend on lmao's crates. One `cowshed-core` module writes lmao's Arrow trace
+schema — the system-column prefix, the entry-type dictionary and sealed-segment publication — byte-for-byte aligned with
+`lmao-arrow`'s, because that crate cannot be imported without its `lmao-core` runtime. The gateway's request spans and
+the supervisor's job spans both use that module; neither keeps a copy. Nothing in cowshed queries traces with
+`lmao-query`.
 
-> **Implementation status — process monitoring:** fork/exec tree observation, per-process resource/blocker events,
-> `process.run` spans, their on-change/heartbeat rows, and job-span host/volume columns below are unbuilt. Existing
-> gateway trace segments and controller commitments do not implement that process tree. Cgroup job-total and
-> charged-memory columns and unattributed-usage reconciliation rows are unbuilt as well.
+**Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
+adopted for it (`JobInfo.trace`): a `span-start` row at admission and a `span-ok`/`span-err` row at its terminal state,
+each as its own sealed segment `job-<order:020>-<writer>.arrow` under `<host-telemetry-root>/<yyyy-mm-dd>/`, sealed like
+the gateway's (create-new `0600` temporary, fsync, rename, directory fsync). The rows carry `repo_id`,
+`workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its state. The
+writes run off the supervisor's actor; a refused write is counted in the supervisor's trace health and never fails or
+delays the job. This job span is the anchor `process.run` spans parent from. `env_hash` is not yet computed by the
+supervisor, so job spans do not carry it.
+
+> **Implementation status — process monitoring:** the job span segments above are being built (86 B26a0). Fork/exec tree
+> observation, per-process resource/blocker events, `process.run` spans, their on-change/heartbeat rows, and job-span
+> host/volume columns below are unbuilt. Existing gateway trace segments and controller commitments do not implement
+> that process tree. Cgroup job-total and charged-memory columns and unattributed-usage reconciliation rows are unbuilt
+> as well.
 
 ## Trace context propagation
 
