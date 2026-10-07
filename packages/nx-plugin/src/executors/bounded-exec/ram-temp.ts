@@ -126,12 +126,13 @@ export interface LeaseProcesses {
   stopWorkingIn(directory: string): Promise<string[]>;
 }
 
-/** What `stopWorkingIn` reads of the host. A seam so a test can start a process between two reads. */
-export interface ProcessReader {
+/** The host reads and signals cleanup uses; a seam for process ordering and signal failures. */
+export interface ProcessHost {
   /** The processes whose working directory is `directory` or lies beneath it. */
   workingIn(directory: string): Promise<number[]>;
   /** Every process on the host. */
   table(): Promise<ProcessEntry[]>;
+  signal(pid: number, signal: NodeJS.Signals): void;
 }
 
 /** A `ps` state in which a process starts nothing: stopped (`T`, `t` when traced) or exited (`Z`). */
@@ -154,7 +155,7 @@ const STARTS_NOTHING = /^[TtZ]/;
  * Only then does each get SIGTERM, and SIGCONT to act on it. A child whose parent exited before it
  * could be held has lost its ancestry, so every round also asks again what works in the lease.
  */
-export function leaseProcessesOn(host: ProcessReader): LeaseProcesses {
+export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
   return {
     async stopWorkingIn(directory) {
       let working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
@@ -164,6 +165,7 @@ export function leaseProcessesOn(host: ProcessReader): LeaseProcesses {
       const deadline = Date.now() + LEFTOVER_GRACE_MS;
       const known = new Map<number, ProcessEntry>();
       let held = new Set<number>();
+      let failures: unknown[] | undefined;
       try {
         for (;;) {
           const roots = [...working, ...known.keys()];
@@ -184,25 +186,46 @@ export function leaseProcessesOn(host: ProcessReader): LeaseProcesses {
             );
           }
           for (const entry of current) {
-            terminate(entry.pid, 'SIGSTOP');
+            host.signal(entry.pid, 'SIGSTOP');
           }
           held = new Set(current.filter((entry) => STARTS_NOTHING.test(entry.stat)).map((entry) => entry.pid));
         }
         for (const entry of known.values()) {
-          terminate(entry.pid);
+          host.signal(entry.pid, 'SIGTERM');
         }
+      } catch (error) {
+        failures = [error];
       } finally {
-        // SIGTERM is pending while stopped. Also release the hold if a host read or signal failed.
+        // SIGTERM is pending while stopped. One failed resume must not strand the other holds.
         for (const entry of known.values()) {
-          terminate(entry.pid, 'SIGCONT');
+          try {
+            host.signal(entry.pid, 'SIGCONT');
+          } catch (error) {
+            failures ??= [];
+            failures.push(
+              new Error(
+                `${entry.pid} (${entry.command}): SIGCONT failed: ${error instanceof Error ? error.message : String(error)}`,
+                { cause: error },
+              ),
+            );
+          }
         }
+      }
+      if (failures !== undefined) {
+        if (failures.length === 1) {
+          throw failures[0];
+        }
+        throw new AggregateError(
+          failures,
+          `processes working in ${directory}: ${failures.map((error) => (error instanceof Error ? error.message : String(error))).join('; ')}`,
+        );
       }
       const leftovers = [...known.values()];
       try {
         await awaitExit(leftovers, `processes working in ${directory}`, LEFTOVER_GRACE_MS);
       } catch {
         for (const entry of leftovers) {
-          terminate(entry.pid, 'SIGKILL');
+          host.signal(entry.pid, 'SIGKILL');
         }
         await awaitExit(leftovers, `processes working in ${directory} after SIGKILL`, LEFTOVER_GRACE_MS);
       }
@@ -211,7 +234,11 @@ export function leaseProcessesOn(host: ProcessReader): LeaseProcesses {
   };
 }
 
-export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({ workingIn: pidsWorkingIn, table: processTable });
+export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({
+  workingIn: pidsWorkingIn,
+  table: processTable,
+  signal: terminate,
+});
 
 export interface RamTempPaths {
   /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */

@@ -431,6 +431,7 @@ describe('processes a task left working in its RAM lease', () => {
     let reads = 0;
     const processes = leaseProcessesOn({
       workingIn: pidsWorkingIn,
+      signal: terminate,
       async table() {
         const table = await processTable();
         reads += 1;
@@ -469,6 +470,7 @@ describe('processes a task left working in its RAM lease', () => {
     let reads = 0;
     const processes = leaseProcessesOn({
       workingIn: pidsWorkingIn,
+      signal: terminate,
       async table() {
         reads += 1;
         if (reads === 1) {
@@ -505,6 +507,7 @@ describe('processes a task left working in its RAM lease', () => {
     const failed = new Error('process table unavailable after SIGSTOP');
     const processes = leaseProcessesOn({
       workingIn: pidsWorkingIn,
+      signal: terminate,
       async table() {
         const table = await processTable();
         if (table.some((entry) => entry.pid === pid && entry.stat.startsWith('T'))) {
@@ -521,6 +524,54 @@ describe('processes a task left working in its RAM lease', () => {
       await writeFile(gate, 'go\n');
       child = await childPid;
       expect(child).toBeGreaterThan(0);
+    } finally {
+      terminate(pid, 'SIGKILL');
+      if (child !== 0) {
+        terminate(child, 'SIGKILL');
+      }
+      await exited;
+      rmSync(lease, { recursive: true, force: true });
+    }
+  });
+
+  it('attempts every resume and preserves discovery failure when the first SIGCONT fails', async () => {
+    const lease = scratch();
+    const gate = join(lease, 'gate');
+    execFileSync('mkfifo', [gate]);
+    const { pid, childPid, exited } = detachedDaemon(lease, gate);
+    let child = 0;
+    const continued: number[] = [];
+    const failedRead = new Error('process table unavailable after SIGSTOP');
+    const failedResume = new Error('SIGCONT denied');
+    const processes = leaseProcessesOn({
+      workingIn: pidsWorkingIn,
+      async table() {
+        const table = await processTable();
+        if (table.some((entry) => entry.pid === pid && entry.stat.startsWith('T'))) {
+          throw failedRead;
+        }
+        return table;
+      },
+      signal(processId, signal) {
+        if (signal === 'SIGCONT') {
+          continued.push(processId);
+          if (continued.length === 1) {
+            throw failedResume;
+          }
+        }
+        terminate(processId, signal);
+      },
+    });
+    try {
+      await writeFile(gate, 'go\n');
+      child = await childPid;
+      const cleanup = processes.stopWorkingIn(lease);
+      await expect(cleanup).rejects.toBeInstanceOf(AggregateError);
+      await expect(cleanup).rejects.toMatchObject({
+        errors: [failedRead, expect.objectContaining({ cause: failedResume })],
+      });
+      expect(continued.slice().sort((a, b) => a - b)).toEqual([pid, child].sort((a, b) => a - b));
+      await expect(cleanup).rejects.toThrow(`${continued[0]} (`);
     } finally {
       terminate(pid, 'SIGKILL');
       if (child !== 0) {

@@ -753,8 +753,9 @@ deleting its record, which an idle daemon notices within a second and a wedged o
 volume keeps it from detaching. So the task's own release, and the next task's reclaim of a dead lease, first hold
 discovered processes with SIGSTOP and rescan their descendants and lease working directories until a stopped census is
 stable. A process can fork after a table read but before its signal; only a table read after it is stopped closes that
-gap. Discovery failures resume held processes and name the failure. The settled census gets SIGTERM then SIGCONT,
-SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
+gap. Discovery failures attempt to resume every held process; one denied SIGCONT cannot strand the rest. Errors retain
+the original discovery failure and name any denied continuation with its PID and command. The settled census gets
+SIGTERM then SIGCONT, SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
 (`stopped <pid> (<command>), which the command left working in its lease`). A lease with nothing in it costs no scan.
 The line is the leak check: a suite that prints it has a fixture to fix.
 
