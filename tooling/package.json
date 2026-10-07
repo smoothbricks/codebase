@@ -7,9 +7,9 @@
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 direnv",
+          "command": "bun test --timeout=30000 direnv land-host.test land-judge.test",
           "cwd": "{projectRoot}",
-          "timeoutMs": 120000,
+          "timeoutMs": 600000,
           "killAfterMs": 10000
         }
       }

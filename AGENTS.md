@@ -408,6 +408,28 @@ wrong evidence.
 main is red, because a branch replayed onto main cannot retroactively update a caller that landed after its commits were
 authored. Cheapest sufficient gate: `cargo check -p <crate> --all-targets` after each land.
 
+**Land with `tooling/land-host.sh <ws>`, never a hand-rolled `cowshed rebase && gate && cowshed land`.** It rebases onto
+main, stops the workspace's Nx daemon (its file map can be stale across a rebase), gates the rebased tree with
+`nx run-many -t lint test build --nx-bail=false`, and fast-forwards main with `cowshed land` to exactly the gated
+commit; when main moved meanwhile it rebases and gates again. A failed gate is re-run once, and lands only if every
+failed task failed on a wall-clock bound alone (the failed tasks its own gate run names, judged by their `bounded-exec`
+verdicts). That rule is the script's, so do not restate it by hand:
+
+- A task whose report shows a panic or failed assertion behind its timeout is a real failure (a test thread can panic
+  and then hang until the bound, which nextest reports as a timeout).
+- A bound is tolerated only when every test ran: each failed task is re-run alone, nextest with `--no-fail-fast`, and a
+  task that passes then has nothing left to tolerate. One that fails again must fail on per-test timeouts alone, with a
+  JUnit report holding every test the runner started. A task that outlives its total ceiling even alone ran an unknown
+  number of tests and blocks the land.
+- The tasks Nx skipped behind a failed task run afterwards, one target at a time without their dependencies, under the
+  same rule.
+- Each tolerated task is appended to `agent-todo/land-ledger.md` and to the message of the one commit the script adds on
+  top of the gated one; that commit is what main fast-forwards to.
+
+An assertion failure, a build or lint failure, a wedged task or a task with no verdict stops the land with the task and
+the reason named. `tooling/land-judge.ts` is the classifier and `tooling/land-host.test.ts` plants the failures it must
+block.
+
 **`cowshed rm <ws>` immediately after each land, and never `git merge` a shed by hand.** Sheds are attached APFS images:
 leaving them mounted grows a host-wide inventory that every real-APFS test enumerates, so `diskutil`/`hdiutil` slow down
 until those tests miss their timeout — 62 images attached, only 27 this project's. `cowshed rm` also refuses a workspace
