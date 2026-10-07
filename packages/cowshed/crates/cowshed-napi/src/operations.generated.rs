@@ -437,6 +437,13 @@ impl JobHandle {
         )
     }
 
+    /// Streams one job's resource samples: the latest at once, one every interval while it runs,
+    /// then its terminal sample once.
+    #[napi(js_name = "progress")]
+    pub fn progress(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::stream_call::<operations::JobProgress, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Writes to an attached job's stdin.
     #[napi(js_name = "attachWrite")]
     pub fn attach_write(

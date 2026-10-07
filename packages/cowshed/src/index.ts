@@ -71,6 +71,15 @@ async function callNativeAsync<T>(call: () => Promise<T>): Promise<T> {
   }
 }
 
+/** A native stream's events, its rejections normalized as `callNativeAsync` normalizes a call's. */
+async function* callNativeEvents<T>(events: AsyncIterable<T>): AsyncGenerator<T, void, undefined> {
+  try {
+    yield* events;
+  } catch (error) {
+    throw normalizeNativeError(error);
+  }
+}
+
 class ProjectImpl implements Project {
   readonly #native: NativeProjectHandle;
 
@@ -318,6 +327,10 @@ class JobHandleImpl implements JobHandle {
 
   async status(): Promise<Api.JobInfo> {
     return callNativeAsync(() => N.jobStatus(this.#native, {}));
+  }
+
+  progress(everyMs: number): AsyncIterable<Api.JobResourceSample> {
+    return callNativeEvents(N.jobProgress(this.#native, { everyMs }));
   }
 
   async logs(args: N.JobLogsArguments): Promise<JobLogs> {

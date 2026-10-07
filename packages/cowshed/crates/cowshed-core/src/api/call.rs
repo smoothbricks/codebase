@@ -15,11 +15,13 @@
 //! a second field list, decides what the call accepts.
 
 use super::capability::{
-    ControllerRuntime, Coordinator, JobHandle, Project, WorkspaceHandle, WorkspaceRef, invoke,
-    invoke_download, invoke_upload,
+    ControllerRuntime, Coordinator, EventStream, JobHandle, Project, WorkspaceHandle, WorkspaceRef,
+    invoke, invoke_download, invoke_stream, invoke_upload,
 };
 use super::dto::{JobId, JobInfo, WorkspaceIncarnation};
-use super::operations::{Lane, LogsChunk, Operation, Scope, WorkerView, WorkspaceView};
+use super::operations::{
+    Lane, LogsChunk, Operation, Scope, StreamOperation, WorkerView, WorkspaceView,
+};
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::RepoId;
@@ -173,6 +175,17 @@ pub async fn call_download<O: Operation<Result = LogsChunk>, H: Serves<O>>(
     const { assert!(matches!(O::LANE, Lane::Download) && !matches!(O::SCOPE, Scope::Internal)) };
     let (runtime, request) = bind::<O, H>(handle, arguments)?;
     invoke_download::<O>(&**runtime, request).await
+}
+
+/// Opens a call of a stream-lane operation through `handle`: its events, each sent for one
+/// demand. Dropping the stream before its end closes the call.
+pub async fn call_stream<O: StreamOperation, H: Serves<O>>(
+    handle: &H,
+    arguments: Arguments,
+) -> Result<EventStream<O>> {
+    const { assert!(matches!(O::LANE, Lane::Stream) && !matches!(O::SCOPE, Scope::Internal)) };
+    let (runtime, request) = bind::<O, H>(handle, arguments)?;
+    invoke_stream::<O>(&**runtime, &request).await
 }
 
 /// Calls a JSON-lane operation whose result is one workspace, as a reference to it.
