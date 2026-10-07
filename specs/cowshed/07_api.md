@@ -1438,10 +1438,12 @@ One boundary answer, no ambiguity:
   `job.kill` until the job has stopped. So calls are multiplexed by id: the client sends each call under the next id in
   order, and the controller answers each as it completes, not in arrival order, writing an answer and its frame whole.
   The controller's router resolves such a call's job under its own lock and awaits the job on a task of its own; it
-  never holds another request, of any client, while a job gets there. A connection holds at most 64 open calls and reads
-  no further request past that. A job's output therefore reaches a client while the client waits for the job's end, and
-  a status read is answered while a wait is open on the same connection. A frame that breaks the protocol ends the
-  connection and fails every call still open on it with that error.
+  never holds another request, of any client, while a job gets there. A connection holds at most 64 open calls; a call
+  past that waits, unrouted, until an open one completes, up to 64 waiting calls, and one past both is refused with a
+  conflict. The controller never stops reading a connection, so a demand on an open stream is always read. A job's
+  output therefore reaches a client while the client waits for the job's end, and a status read is answered while a wait
+  is open on the same connection. A frame that breaks the protocol ends the connection and fails every call still open
+  on it with that error.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step
