@@ -4542,6 +4542,11 @@ pub(crate) fn utc_now() -> Result<UtcTimestamp> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| CowshedError::internal(format!("system clock is before epoch: {error}")))?
         .as_secs();
+    utc_at_second(seconds)
+}
+
+/// The UTC second `seconds` after the epoch as the API's timestamp type.
+pub(crate) fn utc_at_second(seconds: u64) -> Result<UtcTimestamp> {
     let (year, month, day) = crate::storage::civil_from_days(seconds / 86_400);
     let clock = seconds % 86_400;
     UtcTimestamp::new(format!(

@@ -603,38 +603,15 @@ fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
 /// placeholder naming why neither could be read.
 #[cfg(target_os = "macos")]
 fn command_line(pid: libc::pid_t) -> String {
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let mut argmax: libc::c_int = 0;
-    let mut argmax_size = size_of::<libc::c_int>();
-    // SAFETY: `mib` names KERN_ARGMAX, whose value is one c_int written into `argmax`.
-    let ok = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&raw mut argmax).cast(),
-            &mut argmax_size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } == 0;
-    if ok && let Ok(capacity) = usize::try_from(argmax) {
-        let mut buffer = vec![0u8; capacity];
-        let mut size: libc::size_t = capacity;
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        // SAFETY: `buffer` is writable for `size` bytes; the kernel writes at most that many.
-        let read = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                3,
-                buffer.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0;
-        if read && let Some(command) = parse_procargs(&buffer[..size]) {
-            return command;
-        }
+    if let Ok(arguments) = crate::process::process_arguments(pid)
+        && !arguments.argv.is_empty()
+    {
+        return arguments
+            .argv
+            .iter()
+            .map(|argument| String::from_utf8_lossy(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `path` is writable for its whole length.
@@ -643,25 +620,6 @@ fn command_line(pid: libc::pid_t) -> String {
         return String::from_utf8_lossy(&path[..length as usize]).into_owned();
     }
     "command unreadable".to_owned()
-}
-
-/// `KERN_PROCARGS2`: a native-endian `argc`, the executable path, NUL padding, then `argc`
-/// NUL-terminated arguments (then the environment, which is never read).
-#[cfg(target_os = "macos")]
-fn parse_procargs(buffer: &[u8]) -> Option<String> {
-    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
-    let mut rest = &buffer[4..];
-    let executable_end = rest.iter().position(|&byte| byte == 0)?;
-    rest = &rest[executable_end..];
-    let first = rest.iter().position(|&byte| byte != 0)?;
-    rest = &rest[first..];
-    let mut arguments = Vec::new();
-    for _ in 0..argc {
-        let end = rest.iter().position(|&byte| byte == 0)?;
-        arguments.push(String::from_utf8_lossy(&rest[..end]).into_owned());
-        rest = &rest[end + 1..];
-    }
-    (!arguments.is_empty()).then(|| arguments.join(" "))
 }
 
 /// The last Nx run recorded in a cache directory.
@@ -1150,15 +1108,6 @@ mod tests {
         assert!(!root.join("nx/workspace-data/d").exists());
         discard_daemon_records(&root, &state()).unwrap();
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn procargs_yield_the_argument_vector() {
-        let mut buffer = 2i32.to_ne_bytes().to_vec();
-        buffer.extend_from_slice(b"/usr/bin/node\0\0\0node\0nx.js\0HOME=/x\0");
-        assert_eq!(parse_procargs(&buffer).as_deref(), Some("node nx.js"));
-        assert_eq!(parse_procargs(&[1, 0]), None);
     }
 
     #[cfg(target_os = "macos")]

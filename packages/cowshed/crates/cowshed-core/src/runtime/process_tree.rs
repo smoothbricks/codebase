@@ -19,8 +19,10 @@ use crate::api::process::{
     JobProcessSample, JobProcessTree, ProcessCoverage, ProcessCoverageGap, ProcessExit,
 };
 
-/// A value the kernel never gives two lives of the same pid while the observer holds the job:
-/// the unique id of macOS's `proc_uniqidentifierinfo`, the pidfd inode or birth time on Linux.
+/// A value the kernel never gives two lives of the same pid: macOS's `p_uniqueid`
+/// (`proc_uniqidentifierinfo`), unique while the system runs. Linux's observer chooses its own
+/// token with its event source; a stat `starttime` is not one, since a pid reused within one
+/// clock tick repeats it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BirthToken(pub u64);
 
@@ -204,12 +206,24 @@ impl ProcessTreeFold {
         })
     }
 
+    /// The image `process` runs now, as last observed.
+    pub fn image(&self, process: ProcessIdentity) -> Option<&ProcessImage> {
+        self.by_identity
+            .get(&process)
+            .map(|&index| &*self.lives[index].image)
+    }
+
+    /// Whether `process` is a life the fold retains, running or exited.
+    pub fn holds(&self, process: ProcessIdentity) -> bool {
+        self.by_identity.contains_key(&process)
+    }
+
     pub fn coverage(&self) -> &ProcessCoverage {
         &self.coverage
     }
 
-    /// The life of `pid` with no observed exit: a kernel event that names only a pid (kqueue's
-    /// `NOTE_EXEC`/`NOTE_EXIT`) belongs to it.
+    /// The life of `pid` with no observed exit, if any. A pid alone never names a life in an
+    /// event: an older life's late event would land on the newer one.
     pub fn live(&self, pid: u32) -> Option<ProcessIdentity> {
         self.running
             .get(&pid)

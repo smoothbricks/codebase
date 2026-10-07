@@ -66,6 +66,138 @@ pub(crate) fn sandboxed(pid: libc::pid_t) -> io::Result<bool> {
     }
 }
 
+/// A process's executable path and its byte-exact argument vector, as `KERN_PROCARGS2` reports
+/// them. Fails for a process that has exited, reaped or not.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessArguments {
+    pub executable: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut argmax_size = size_of::<libc::c_int>();
+    // SAFETY: `mib` names KERN_ARGMAX, whose value is one c_int written into `argmax`.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&raw mut argmax).cast(),
+            &mut argmax_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let capacity = usize::try_from(argmax).map_err(io::Error::other)?;
+    let mut buffer = vec![0u8; capacity];
+    let mut size: libc::size_t = capacity;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: `buffer` is writable for `size` bytes; the kernel writes at most that many.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    parse_procargs(&buffer[..size]).map_err(|unreadable| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("KERN_PROCARGS2 of process {pid} is {unreadable}"),
+        )
+    })
+}
+
+/// Why `KERN_PROCARGS2`'s bytes yield no argv.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum UnreadableProcargs {
+    #[error("malformed")]
+    Malformed,
+    /// The kernel's stand-in for arguments it hides: the saved path, not the exec's argv.
+    #[error("the kernel's saved-path stand-in, not the process's arguments")]
+    SavedPath,
+}
+
+/// The kernel's `executable_path=` key, saved before the path and stripped from the answer.
+#[cfg(target_os = "macos")]
+const EXECUTABLE_KEY: usize = "executable_path=".len();
+
+/// The pointer size of a 64-bit image, to which the strings before argv are padded.
+#[cfg(target_os = "macos")]
+const ARGV_ALIGNMENT: usize = 8;
+
+/// `KERN_PROCARGS2`: a native-endian `argc`, the executable path and its NUL, NUL padding, then
+/// `argc` NUL-terminated arguments (then the environment, which is never read).
+///
+/// The kernel saves the path after the 16-byte `executable_path=` key and pads key, path and
+/// NUL to the pointer size of a 64-bit image before argv (xnu `exec_save_path`,
+/// `exec_extract_strings`); `sysctl_procargsx` strips the key. So argv starts at an offset the
+/// path's length alone sets, as measured on Darwin 25.6 for paths of 8 to 23 bytes. Skipping
+/// every NUL after the path instead would take an empty `argv[0]` for padding and hand out the
+/// environment's first entry as an argument.
+///
+/// A process holding the `no-read-procargs` entitlement is answered from its saved path instead
+/// (`sysctl_procargs_no_read`): `argc` 1, the path, two NULs, and the path again as `argv[0]`.
+/// Those are not the arguments it was exec'd with, so that shape is refused rather than read as
+/// argv, even where the padded layout could also produce it.
+#[cfg(target_os = "macos")]
+fn parse_procargs(buffer: &[u8]) -> Result<ProcessArguments, UnreadableProcargs> {
+    let (argc, strings) = buffer
+        .split_first_chunk::<4>()
+        .ok_or(UnreadableProcargs::Malformed)?;
+    let argc =
+        usize::try_from(i32::from_ne_bytes(*argc)).map_err(|_| UnreadableProcargs::Malformed)?;
+    let path_end = strings
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(UnreadableProcargs::Malformed)?;
+    let executable = &strings[..path_end];
+    if argc == 1
+        && strings[path_end..]
+            .strip_prefix(b"\0\0")
+            .and_then(|rest| rest.strip_prefix(executable))
+            == Some(&b"\0"[..])
+    {
+        return Err(UnreadableProcargs::SavedPath);
+    }
+    let argv = padded_argv(strings, path_end, argc).ok_or(UnreadableProcargs::Malformed)?;
+    Ok(ProcessArguments {
+        executable: executable.to_vec(),
+        argv,
+    })
+}
+
+/// The `argc` arguments of the padded layout, whose path ends at `path_end`; `None` when the
+/// padding holds anything but NULs or an argument is cut short.
+#[cfg(target_os = "macos")]
+fn padded_argv(strings: &[u8], path_end: usize, argc: usize) -> Option<Vec<Vec<u8>>> {
+    let start = (EXECUTABLE_KEY + path_end + 1).next_multiple_of(ARGV_ALIGNMENT) - EXECUTABLE_KEY;
+    if strings.get(path_end..start)?.iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    let mut rest = &strings[start..];
+    let mut argv = Vec::with_capacity(argc.min(rest.len()));
+    for _ in 0..argc {
+        let end = rest.iter().position(|&byte| byte == 0)?;
+        argv.push(rest[..end].to_vec());
+        rest = &rest[end + 1..];
+    }
+    Some(argv)
+}
+
 /// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
 /// (dead) has exited.
 #[cfg(target_os = "linux")]
@@ -274,6 +406,99 @@ impl fmt::Display for DiagnosticBytes<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn procargs(argc: i32, strings: &[u8]) -> Vec<u8> {
+        [&argc.to_ne_bytes()[..], strings].concat()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn arguments(executable: &[u8], argv: &[&[u8]]) -> ProcessArguments {
+        ProcessArguments {
+            executable: executable.to_vec(),
+            argv: argv.iter().map(|argument| argument.to_vec()).collect(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs_yield_the_executable_and_byte_exact_argv() {
+        let buffer = procargs(4, b"/usr/bin/node\0\0\0node\0nx.js\0\0\xff\xfe\0HOME=/x\0");
+        assert_eq!(
+            parse_procargs(&buffer),
+            Ok(arguments(
+                b"/usr/bin/node",
+                &[b"node", b"nx.js", b"", b"\xff\xfe"]
+            ))
+        );
+        let malformed = Err(UnreadableProcargs::Malformed);
+        assert_eq!(parse_procargs(&[1, 0]), malformed);
+        assert_eq!(parse_procargs(&[1, 0, 0, 0, b'/', 0, 0, b'a']), malformed);
+        // Padding is NULs only.
+        assert_eq!(
+            parse_procargs(&procargs(1, b"/bin/cat\0\0\0x\0\0\0\0\0\0a\0")),
+            malformed
+        );
+    }
+
+    /// An empty `argv[0]` is an argument, not padding (bytes as measured on Darwin 25.6).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs_keep_an_empty_leading_argument() {
+        let empty = procargs(1, b"/bin/cat\0\0\0\0\0\0\0\0\0HOME=/x\0");
+        assert_eq!(parse_procargs(&empty), Ok(arguments(b"/bin/cat", &[b""])));
+        let longer = procargs(2, b"/bin//////////cat\0\0\0\0\0\0\0\0-\0HOME=/x\0");
+        assert_eq!(
+            parse_procargs(&longer),
+            Ok(arguments(b"/bin//////////cat", &[b"", b"-"]))
+        );
+    }
+
+    /// The saved-path stand-in for hidden arguments (its path twice) is never read as argv,
+    /// whatever padding the path's length leaves (7, 1 and 0 bytes here).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs_refuse_the_saved_path_stand_in() {
+        for path in [&b"/bin/cat"[..], b"/bin////////ls", b"/bin/////////ls"] {
+            let saved = procargs(1, &[path, b"\0\0", path, b"\0"].concat());
+            assert_eq!(parse_procargs(&saved), Err(UnreadableProcargs::SavedPath));
+        }
+    }
+
+    /// A process exec'd with an empty `argv[0]` reads back with it, whatever padding its path
+    /// length leaves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_process_s_empty_leading_argument_is_read_back() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::process::CommandExt;
+        for path in ["/bin/cat", "/bin////////cat", "/bin/////////cat"] {
+            let mut child = crate::fork_lock::Spawn::spawn_locked(
+                std::process::Command::new(path)
+                    .arg0("")
+                    .arg("-")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped()),
+            )
+            .expect("spawn");
+            // An echoed line proves cat runs: its exec is complete.
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"x\n").unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "x\n");
+            let pid = libc::pid_t::try_from(child.id()).unwrap();
+            assert_eq!(
+                process_arguments(pid).unwrap(),
+                arguments(path.as_bytes(), &[b"", b"-"]),
+                "{path}"
+            );
+            drop(stdin);
+            assert!(child.wait().unwrap().success());
+        }
+    }
 
     /// An exited child its parent has not reaped is a zombie: the null signal still reaches it,
     /// and it has exited all the same. Reaped, it is gone. This process itself runs.

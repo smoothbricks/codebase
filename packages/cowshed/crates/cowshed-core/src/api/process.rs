@@ -72,4 +72,9 @@ pub enum ProcessCoverageGap {
     UnobservedBirth { pid: u32 },
     /// A pid was born again while its previous life had no observed exit.
     UnobservedExit { pid: u32 },
+    /// The kernel reported that a member forked without naming or counting the children
+    /// (macOS kqueue `NOTE_FORK`): a child reaped before it was enumerated is unseen.
+    UncountedFork { pid: u32 },
+    /// A member exec'd, and exited before its new image could be read.
+    UnreadImage { pid: u32 },
 }

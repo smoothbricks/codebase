@@ -618,11 +618,13 @@ pub struct Process {
 
 /// `struct proc_uniqidentifierinfo` (`<sys/proc_info.h>`), which the `libc` crate does not
 /// declare: `p_uuid[16]`, `p_uniqueid`, `p_puniqueid`, then `p_idversion`, then 20 reserved
-/// bytes. Only the pid version is read; the rest is kept as opaque bytes of the same layout.
+/// bytes. The unique ids are never given to another process while the system runs.
 #[cfg(target_os = "macos")]
 #[repr(C, align(8))]
 struct UniqueIdentifierInfo {
-    _identity: [u8; 32],
+    _uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
     id_version: i32,
     _reserved: [u8; 20],
 }
@@ -707,6 +709,34 @@ fn running_info(pid: i32) -> io::Result<Option<BsdInfoWithUniqueId>> {
     }
     // SAFETY: proc_pidinfo filled all `size` bytes.
     Ok(Some(unsafe { info.assume_init() }))
+}
+
+/// A running process as the kernel names it: its pid, its parent's pid, the unique ids the
+/// kernel never gives another process for both, its effective uid and its start second.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessRecord {
+    pub pid: u32,
+    pub ppid: u32,
+    pub unique_id: u64,
+    pub parent_unique_id: u64,
+    pub uid: u32,
+    pub started_seconds: u64,
+}
+
+/// The record of the process `pid` names now, read in one call; `None` once it has exited,
+/// reaped or not.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
+    Ok(running_info(pid)?.map(|info| ProcessRecord {
+        pid: info.bsd.pbi_pid,
+        ppid: info.bsd.pbi_ppid,
+        unique_id: info.unique.unique_id,
+        parent_unique_id: info.unique.parent_unique_id,
+        // xnu `proc_pidbsdinfo`: `pbi_uid` is the credential's effective uid.
+        uid: info.bsd.pbi_uid,
+        started_seconds: info.bsd.pbi_start_tvsec,
+    }))
 }
 
 #[cfg(target_os = "macos")]

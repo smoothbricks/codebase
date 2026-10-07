@@ -966,6 +966,12 @@ export type ProcessCoverageGap =
     })
   | ({ readonly kind: 'unobservedExit' } & {
       readonly pid: number & tags.Type<'uint32'>;
+    })
+  | ({ readonly kind: 'uncountedFork' } & {
+      readonly pid: number & tags.Type<'uint32'>;
+    })
+  | ({ readonly kind: 'unreadImage' } & {
+      readonly pid: number & tags.Type<'uint32'>;
     });
 
 /**

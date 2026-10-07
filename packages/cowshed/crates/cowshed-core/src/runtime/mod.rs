@@ -3,6 +3,8 @@ pub(crate) mod build_volumes;
 pub mod commitment_feed;
 pub mod job_groups;
 pub(crate) mod nx_daemon;
+#[cfg(target_os = "macos")]
+pub mod process_events;
 pub mod process_tree;
 pub mod project;
 pub mod shell_host;
