@@ -167,6 +167,7 @@ impl Workspace {
             shell_pool: ShellPoolConfig::default(),
             group_ledger: None,
             inherited_groups: Vec::new(),
+            volume_labels: None,
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
