@@ -198,7 +198,7 @@ describe('Cowshed Node-API bindings', () => {
    * controller's typed refusal, field for field: the conversion keeps the cause, not only the
    * code, message and hint.
    */
-  it('carries an admission key to exec and its typed refusal back', async () => {
+  it('reaches the keyed job and preserves conflict and stream-binding causes', async () => {
     const client = `
       import { connectCoordinator, coordinatorEndpoint, CowshedError } from ${JSON.stringify(moduleUrl)};
       const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
@@ -212,31 +212,40 @@ describe('Cowshed Node-API bindings', () => {
         }
       };
       const job = await worker.exec({ argv: ['build'], admissionKey: 'op-1' });
+      const reached = await worker.jobByKey('op-1');
+      const bound = await refusal({ argv: ['stream'], admissionKey: 'op-stream' });
       const changed = await refusal({ argv: ['test'], admissionKey: 'op-1' });
       const unprovable = await refusal({ argv: ['build'], admissionKey: 'op-2' });
-      console.log(JSON.stringify({ job: job.id, changed, unprovable }));
+      console.log(JSON.stringify({ job: job.id, reached: reached.id, bound, changed, unprovable }));
       process.exit(0);
     `;
     const calls = `
       const seen = [];
       process.on('exit', () => console.log(JSON.stringify(seen)));
-      const refuse = (id, admission) =>
+      const refuse = (id, admission, code = 'conflict') =>
         send({
           id,
           ok: false,
           result: null,
-          error: { code: 'conflict', message: 'refused', hint: 'reach the keyed job', admission },
+          error: { code, message: 'refused', hint: 'reach the keyed job', admission },
           binaryLength: null,
         });
       const call = (message) => {
+        if (message.method === 'worker.jobByKey') {
+          seen.push(['lookup', message.params.admissionKey]);
+          answer(message.id, 7);
+          return true;
+        }
         if (message.method !== 'worker.exec') {
           return false;
         }
         const { admissionKey } = message.params;
         const argv = message.params.argv.map((arg) => arg.data);
         seen.push([admissionKey, argv]);
-        if (admissionKey === 'op-2') {
-          refuse(message.id, { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-6' });
+        if (admissionKey === 'op-stream') {
+          refuse(message.id, { reason: 'stdinBound', jobId: 7 }, 'usage');
+        } else if (admissionKey === 'op-2') {
+          refuse(message.id, { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-8' });
         } else if (argv[0] === 'test') {
           refuse(message.id, { reason: 'keyConflict', jobId: 7, fields: ['command'] });
         } else {
@@ -251,6 +260,12 @@ describe('Cowshed Node-API bindings', () => {
       stdout: [
         JSON.stringify({
           job: 7,
+          reached: 7,
+          bound: {
+            ours: true,
+            code: 'usage',
+            admission: { reason: 'stdinBound', jobId: 7 },
+          },
           changed: {
             ours: true,
             code: 'conflict',
@@ -259,11 +274,13 @@ describe('Cowshed Node-API bindings', () => {
           unprovable: {
             ours: true,
             code: 'conflict',
-            admission: { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-6' },
+            admission: { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-8' },
           },
         }),
         JSON.stringify([
           ['op-1', ['build']],
+          ['lookup', 'op-1'],
+          ['op-stream', ['stream']],
           ['op-1', ['test']],
           ['op-2', ['build']],
         ]),
