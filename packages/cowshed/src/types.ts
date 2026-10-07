@@ -112,6 +112,13 @@ export interface JobHandle {
   readonly id: number;
   status(): Promise<Api.JobInfo>;
   /**
+   * The job's resource samples: the latest once it owns a process, another every `everyMs` while
+   * it runs, then its terminal sample once. Each step of the loop asks the controller for one
+   * sample, so a slow reader gets the latest, never a backlog; leaving the loop ends the
+   * subscription, never the job.
+   */
+  progress(everyMs: number): AsyncIterable<Api.JobResourceSample>;
+  /**
    * One stream's bytes from `offset`, at most one chunk. Reading again from `nextOffset` continues
    * where this chunk ended; `follow` waits for bytes or the stream's end instead of answering an
    * empty chunk while the job runs.

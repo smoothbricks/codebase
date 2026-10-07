@@ -11,6 +11,15 @@ export interface NativeDownload {
   readonly bytes: Buffer;
 }
 
+/**
+ * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,
+ * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes.
+ */
+export interface NativeEvents {
+  next(): Promise<string | null>;
+  close(): Promise<void>;
+}
+
 /** The operations a `Project` serves: exactly those its authority admits. */
 export interface NativeProjectOperations extends NativeProjectWorkspace, NativeProjectWorkspaceAt, NativeProjectList {}
 
@@ -69,6 +78,7 @@ export interface NativeJobHandleOperations
     NativeJobSealed,
     NativeJobLogs,
     NativeJobTail,
+    NativeJobProgress,
     NativeJobAttachWrite,
     NativeJobDetach,
     NativeJobWait,
@@ -610,6 +620,32 @@ export async function jobLogs(
 ): Promise<Api.LogsChunk & { readonly bytes: Uint8Array }> {
   const answer = await handle.logs(JSON.stringify(args));
   return { ...V.parseLogsChunk(answer.json), bytes: answer.bytes };
+}
+
+/** A handle that serves `job.progress`. */
+export interface NativeJobProgress {
+  progress(argumentsJson: string): Promise<NativeEvents>;
+}
+
+/** The request fields a `job.progress` caller names; its handle binds the rest. */
+export type JobProgressArguments = Pick<Api.ProgressRequest, 'everyMs'>;
+
+/**
+ * Streams one job's resource samples: the latest at once, one every interval while it runs,
+ * then its terminal sample once.
+ */
+export async function* jobProgress(
+  handle: NativeJobProgress,
+  args: JobProgressArguments,
+): AsyncGenerator<Api.JobResourceSample, void, undefined> {
+  const events = await handle.progress(JSON.stringify(args));
+  try {
+    for (let event = await events.next(); event !== null; event = await events.next()) {
+      yield V.parseJobResourceSample(event);
+    }
+  } finally {
+    await events.close();
+  }
 }
 
 /** A handle that serves `job.sealed`. */
