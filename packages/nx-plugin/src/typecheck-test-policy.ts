@@ -1,10 +1,10 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, posix, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
-import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
+import { getProjects, parseJson, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
 import typia from 'typia';
-import { ManagedContentConflict } from './managed-files/managed-content.js';
-import { jsonFileText } from './managed-files/managed-format.js';
+import { editJsonText } from './managed-files/json-edit.js';
+import { formatJsonWithBiome, jsonFileText } from './managed-files/managed-format.js';
 import type { ManagedFile } from './managed-files/tree.js';
 import {
   includeGlobsFor,
@@ -14,6 +14,7 @@ import {
   type TestProgramFault,
   testProgramFault,
 } from './test-program.js';
+import { isRecord } from './type-guards.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
 export type TestRunner = 'bun' | 'vitest';
@@ -244,16 +245,14 @@ export function applyTypecheckTestDefaults(
 }
 
 /**
- * Remove the ./tsconfig.test.json reference from a tsconfig.json object.
- * Returns whether anything changed.
+ * Remove the ./tsconfig.test.json reference from a tsconfig.json object (in-memory mutation).
  */
-export function removeTsconfigTestReference(projectTsconfig: Record<string, unknown>): boolean {
+export function removeTsconfigTestReference(projectTsconfig: Record<string, unknown>): void {
   if (!projectTsconfigHasTestReference(projectTsconfig)) {
-    return false;
+    return;
   }
   const references = Array.isArray(projectTsconfig.references) ? projectTsconfig.references : [];
   projectTsconfig.references = references.filter((entry) => !isRecord(entry) || entry.path !== './tsconfig.test.json');
-  return true;
 }
 
 /**
@@ -342,7 +341,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     const referencePaths = collectReferencePathsTree(tree, config.root, pkg, workspacePackages);
 
     const program = treeProgram(tree, config.root);
-    const changed = applyTypecheckTestDefaults(tsconfigTest, {
+    applyTypecheckTestDefaults(tsconfigTest, {
       testRunners,
       testExtends,
       libCompilerOptions: libCompilerOptions ?? undefined,
@@ -356,7 +355,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     const fault = testProgramFault(program, tsconfigTest);
     files.push(
       fault === null
-        ? renderTsconfig(tree, tsconfigTestPath, tsconfigTest, changed || isNew)
+        ? renderTsconfig(tree, tsconfigTestPath, tsconfigTest)
         : {
             target: tsconfigTestPath,
             content: null,
@@ -368,24 +367,33 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     const tsconfigPath = `${config.root}/tsconfig.json`;
     if (tree.exists(tsconfigPath)) {
       const tsconfig = readJson<Record<string, unknown>>(tree, tsconfigPath);
-      files.push(renderTsconfig(tree, tsconfigPath, tsconfig, removeTsconfigTestReference(tsconfig)));
+      removeTsconfigTestReference(tsconfig);
+      files.push(renderTsconfig(tree, tsconfigPath, tsconfig));
     }
   }
 
   return files;
 }
 
-function renderTsconfig(tree: Tree, target: string, config: Record<string, unknown>, changed: boolean): ManagedFile {
+/**
+ * The bytes a tsconfig the policy touches should have. A file that does not exist is rendered whole. One that does
+ * is edited where the policy changed it, so what its authors wrote beside those fields (the comments explaining why
+ * a program extends what it extends) survives, and is then laid out as the commit hook would leave it. A policy that
+ * changes nothing leaves the file's bytes alone.
+ */
+function renderTsconfig(tree: Tree, target: string, after: Record<string, unknown>): ManagedFile {
+  const path = join(tree.root, target);
   const current = tree.read(target, 'utf8');
-  if (!changed) return { target, content: current };
-  // A documented config cannot survive JSON.stringify. Preserve its reasoning
-  // and refuse before the shared generator stages or flushes any managed file.
-  if (current !== null && hasJsonComments(current)) {
-    throw new ManagedContentConflict(
-      `${target} carries comments a rewrite would delete; apply the no-emit test typecheck policy by hand`,
-    );
+  if (current === null) return { target, content: jsonFileText(path, after) };
+  let edited: string;
+  try {
+    edited = editJsonText(current, after);
+  } catch (error) {
+    throw new Error(`${target}: the policy's change could not be applied to the existing file's text`, {
+      cause: error,
+    });
   }
-  return { target, content: jsonFileText(join(tree.root, target), config) };
+  return { target, content: edited === current ? current : formatJsonWithBiome(path, edited) };
 }
 
 function treeProgram(tree: Tree, projectRoot: string): TestProgram {
@@ -737,82 +745,24 @@ function collectTsconfigTestReferencePaths(
 }
 
 /**
- * Read a tsconfig or package.json. tsconfig files are JSONC — TypeScript
- * permits comments and trailing commas — so a plain `JSON.parse` fails on a
- * documented one. Returning null there meant "file absent", and the caller
- * regenerated it from scratch: a `lib` the test program declared, an
- * `exclude`, an extra `include` glob and every comment explaining them
- * disappeared on the next update. Comments are stripped for parsing only;
- * renderTsconfig refuses a policy repair that would discard them.
+ * Read a tsconfig or package.json. tsconfig files are JSONC — TypeScript permits comments and trailing commas — so a
+ * plain `JSON.parse` fails on a documented one. Returning null there meant "file absent", and the caller regenerated
+ * it from scratch: a `lib` the test program declared, an `exclude`, an extra `include` glob and every comment
+ * explaining them disappeared on the next update. The text is parsed as JSONC; `renderTsconfig` edits the text, so
+ * what was parsed past is not lost.
  */
 function readJsonObject(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) {
     return null;
   }
-  const text = readFileSync(path, 'utf8');
   try {
-    const parsed: unknown = JSON.parse(stripJsonComments(text));
+    const parsed: unknown = parseJson(readFileSync(path, 'utf8'));
     return isRecord(parsed) ? parsed : null;
   } catch (error) {
     // A file that exists but cannot be parsed is a configuration error, not an
     // invitation to overwrite it.
     throw new Error(`${path} is not valid JSON/JSONC: ${error instanceof Error ? error.message : String(error)}`);
   }
-}
-
-/** Whether the file carries comments a rewrite would destroy. */
-function hasJsonComments(text: string): boolean {
-  return stripJsonComments(text) !== text;
-}
-
-/**
- * Remove `//` and block comments outside string literals, and trailing commas.
- * Small on purpose: the alternative is a JSONC dependency in a plugin whose
- * only JSONC inputs are tsconfig files.
- */
-function stripJsonComments(text: string): string {
-  let output = '';
-  let inString = false;
-  let escaped = false;
-  let index = 0;
-  while (index < text.length) {
-    const char = text[index];
-    if (inString) {
-      output += char;
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      index += 1;
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      output += char;
-      index += 1;
-      continue;
-    }
-    if (char === '/' && text[index + 1] === '/') {
-      while (index < text.length && text[index] !== '\n') index += 1;
-      continue;
-    }
-    if (char === '/' && text[index + 1] === '*') {
-      index += 2;
-      while (index < text.length && !(text[index] === '*' && text[index + 1] === '/')) index += 1;
-      index += 2;
-      continue;
-    }
-    output += char;
-    index += 1;
-  }
-  return output.replace(/,(\s*[}\]])/g, '$1');
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /** TypeScript 5 accepts ordered base-config arrays as well as a single base. */

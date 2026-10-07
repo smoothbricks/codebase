@@ -99,16 +99,26 @@ describe('managed test tsconfig reconciliation', () => {
     expect(existsSync(join(tree.root, testConfigPath))).toBe(false);
   });
 
-  it('refuses a documented drifted config rather than deleting comments or flushing other managed files', async () => {
+  it('repairs a documented drifted config in place, keeps its comments, and writes every other managed file', async () => {
     const tree = workspace();
     const documented =
       '{\n  // Bun owns this test runtime.\n  "compilerOptions": { "lib": ["es2023"], "noEmit": false }\n}\n';
     tree.write(testConfigPath, documented);
     flushChanges(tree.root, tree.listChanges());
 
-    await expect(reconcile(new FsTree(tree.root, false), 'update')).rejects.toThrow(testConfigPath);
-    expect(readFileSync(join(tree.root, testConfigPath), 'utf8')).toBe(documented);
-    expect(existsSync(join(tree.root, '.github/workflows/ci.yml'))).toBe(false);
+    await reconcile(new FsTree(tree.root, false), 'update');
+
+    const written = readFileSync(join(tree.root, testConfigPath), 'utf8');
+    expect(written).toContain('// Bun owns this test runtime.');
+    expect(readJson(new FsTree(tree.root, false), testConfigPath)).toMatchObject({
+      extends: ['../../tsconfig.base.json', './tsconfig.runtime.json'],
+      compilerOptions: { lib: ['es2023'], noEmit: true, composite: false, declaration: false },
+      references: [{ path: './tsconfig.lib.json' }],
+    });
+    expect(existsSync(join(tree.root, '.github/workflows/ci.yml'))).toBe(true);
+    expect(
+      (await reconcile(new FsTree(tree.root, false), 'check')).filter((result) => result.action === 'drifted'),
+    ).toEqual([]);
   });
 
   describe('a project whose test program would select no file', () => {

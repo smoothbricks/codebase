@@ -223,6 +223,7 @@
       },
       "dependencies": {
         "@nx/js": "latest",
+        "jsonc-parser": "^3.3.1",
         "nx": "latest",
         "prettier": "^3.9.8",
         "smol-toml": "^1.6.1",

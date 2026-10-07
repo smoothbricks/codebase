@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { addProjectConfiguration, readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
+import { addProjectConfiguration, parseJson, readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import { FsTree, flushChanges } from 'nx/src/generators/tree.js';
 import { inspectManagedPaths } from './managed-files/paths.js';
@@ -362,20 +362,22 @@ describe('removeTsconfigTestReference', () => {
     const tsconfig: Record<string, unknown> = {
       references: [{ path: './tsconfig.lib.json' }, { path: './tsconfig.test.json' }],
     };
-    expect(removeTsconfigTestReference(tsconfig)).toBe(true);
+    removeTsconfigTestReference(tsconfig);
     expect(tsconfig.references).toEqual([{ path: './tsconfig.lib.json' }]);
   });
 
-  it('returns false when no test reference', () => {
+  it('leaves a document with no test reference as it was', () => {
     const tsconfig: Record<string, unknown> = {
       references: [{ path: './tsconfig.lib.json' }],
     };
-    expect(removeTsconfigTestReference(tsconfig)).toBe(false);
+    removeTsconfigTestReference(tsconfig);
+    expect(tsconfig).toEqual({ references: [{ path: './tsconfig.lib.json' }] });
   });
 
-  it('returns false when no references', () => {
+  it('does not invent a references list', () => {
     const tsconfig: Record<string, unknown> = {};
-    expect(removeTsconfigTestReference(tsconfig)).toBe(false);
+    removeTsconfigTestReference(tsconfig);
+    expect(tsconfig).toEqual({});
   });
 });
 
@@ -684,6 +686,110 @@ describe('typecheck test policy', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  describe('a documented config that drifts from the policy', () => {
+    const BIOME_SPACES = '{"formatter":{"indentStyle":"space","indentWidth":2,"lineWidth":120}}\n';
+
+    /** An app that depends on a composite lib, so the policy wants a reference its tsconfig.test.json lacks. */
+    async function appWithCompositeDependency(root: string): Promise<void> {
+      await writeFile(join(root, 'biome.json'), BIOME_SPACES);
+      await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });
+      await writeJsonFs(join(root, 'tsconfig.base.json'), { compilerOptions: { composite: true } });
+      await writeJsonFs(join(root, 'packages/lib/package.json'), { name: '@scope/lib' });
+      await writeJsonFs(join(root, 'packages/lib/tsconfig.lib.json'), { extends: '../../tsconfig.base.json' });
+      await writeJsonFs(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        scripts: { test: 'bun test' },
+        dependencies: { '@scope/lib': 'workspace:*' },
+      });
+      // The program extends it, so the policy can read what the program selects through it.
+      await writeJsonFs(join(root, 'packages/app/tsconfig.json'), { extends: '../../tsconfig.base.json' });
+      await writeSource(join(root, 'packages/app/scripts/app.test.ts'));
+    }
+
+    const documented = [
+      '{',
+      "  // WHY the program extends the package's own config: these are Bun programs.",
+      '  "extends": "./tsconfig.json",',
+      '  "compilerOptions": {',
+      '    "composite": false,',
+      '    "declaration": false,',
+      '    "declarationMap": false,',
+      '    "emitDeclarationOnly": false,',
+      '    "noEmit": true, // kept as the policy requires',
+      '    "types": ["bun"]',
+      '  },',
+      '  /* the suites live beside the scripts they exercise */',
+      '  "include": ["scripts/**/*.test.ts"],',
+      '}',
+      '',
+    ].join('\n');
+
+    it('is repaired in place: the policy edits what it owns and every comment survives', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-documented-'));
+      try {
+        await appWithCompositeDependency(root);
+        const path = join(root, 'packages/app/tsconfig.test.json');
+        await writeFile(path, documented);
+
+        expect(checkTypecheckTestPolicy(root).map((issue) => issue.message)).toEqual([
+          'must match the canonical no-emit test typecheck configuration',
+        ]);
+        expect(applyTypecheckTestPolicy(root)).toBe(true);
+
+        const written = await readFile(path, 'utf8');
+        expect(written).toContain("// WHY the program extends the package's own config: these are Bun programs.");
+        expect(written).toContain('// kept as the policy requires');
+        expect(written).toContain('/* the suites live beside the scripts they exercise */');
+        expect(parseJson(written)).toEqual({
+          extends: './tsconfig.json',
+          compilerOptions: {
+            composite: false,
+            declaration: false,
+            declarationMap: false,
+            emitDeclarationOnly: false,
+            noEmit: true,
+            types: ['bun'],
+          },
+          include: ['scripts/**/*.test.ts'],
+          references: [{ path: '../lib/tsconfig.lib.json' }],
+        });
+        expect(checkTypecheckTestPolicy(root)).toEqual([]);
+        // The policy is at its own fixed point: a second run changes nothing.
+        expect(applyTypecheckTestPolicy(root)).toBe(false);
+        expect(await readFile(path, 'utf8')).toBe(written);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('has its test reference removed from tsconfig.json without losing the comments around it', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-documented-'));
+      try {
+        await appWithCompositeDependency(root);
+        await writeFile(join(root, 'packages/app/tsconfig.test.json'), documented);
+        const path = join(root, 'packages/app/tsconfig.json');
+        await writeFile(
+          path,
+          [
+            '{',
+            '  // The project is its lib program; the tests are typechecked on their own.',
+            '  "references": [{ "path": "./tsconfig.lib.json" }, { "path": "./tsconfig.test.json" }]',
+            '}',
+            '',
+          ].join('\n'),
+        );
+
+        applyTypecheckTestPolicy(root);
+
+        const written = await readFile(path, 'utf8');
+        expect(written).toContain('// The project is its lib program; the tests are typechecked on their own.');
+        expect(parseJson(written)).toEqual({ references: [{ path: './tsconfig.lib.json' }] });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
   });
 
   it('creates tsconfig.test.json for bun test package', async () => {
