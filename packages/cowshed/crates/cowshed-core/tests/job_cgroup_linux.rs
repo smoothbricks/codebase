@@ -61,6 +61,11 @@ struct Workload {
     /// Report [`PAUSED`] and wait for one byte on stdin.
     pause: bool,
     burn_after_ms: u64,
+    /// Anonymous memory to touch page by page and release again.
+    allocate_mib: u64,
+    /// A file beside this binary to fill with this many MiB through the page cache, held until
+    /// the workload ends and removed then.
+    page_cache: Option<(PathBuf, u64)>,
     /// Started one after another once the burns are done, each waited for.
     children: Vec<Workload>,
     /// Once every child was reaped, report [`HELD`] and wait for one byte on stdin.
@@ -192,6 +197,10 @@ fn work(workload: &Workload) {
         std::io::stdin().read_exact(&mut byte).expect("resume");
     }
     burn(workload.burn_after_ms);
+    touch_and_release(workload.allocate_mib);
+    if let Some((path, mebibytes)) = &workload.page_cache {
+        fill_page_cache(path, *mebibytes);
+    }
     let children = workload
         .children
         .iter()
@@ -208,6 +217,9 @@ fn work(workload: &Workload) {
         std::io::stdout().flush().expect("flush");
         let mut byte = [0];
         std::io::stdin().read_exact(&mut byte).expect("release");
+    }
+    if let Some((path, _)) = &workload.page_cache {
+        std::fs::remove_file(path).expect("remove the page cache file");
     }
     let report = WorkloadReport {
         pid: std::process::id(),
@@ -245,6 +257,7 @@ fn control() {
     a_spawners_earlier_work_is_not_charged(&jobs);
     late_migration_misses_initial_cpu(&jobs);
     burst_cpu_outlives_its_processes(&jobs);
+    charged_memory_is_not_resident_memory(&jobs);
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
 
@@ -433,6 +446,72 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
     assert_accounted(&unrelated, &neighbour_report, "burst neighbour");
 }
 
+/// A job that fills the page cache is charged for it while no process of it holds that memory
+/// resident; anonymous memory it released leaves its mark on the peak, which reading never
+/// resets.
+fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
+    const MIB: u64 = 1 << 20;
+    let job = jobs.admit(job_id(10)).expect("admit");
+    let file = beside_test_binary("page-cache");
+    let mut running = Spawned::placed(
+        &job,
+        &Workload {
+            allocate_mib: 128,
+            page_cache: Some((file, 64)),
+            hold: true,
+            ..Workload::default()
+        },
+    );
+    running.await_marker(HELD);
+    let direct_before = direct_charged_memory(&job);
+    let charged = job.charged_memory().expect("charged memory");
+    let direct_after = direct_charged_memory(&job);
+    let peak_again = job
+        .charged_memory()
+        .expect("charged memory again")
+        .peak_bytes;
+    let resident = live_members_resident_bytes(&job);
+    let (current, peak) = (charged.current_bytes.get(), charged.peak_bytes.get());
+    println!(
+        "charged memory: current {current} B, peak {peak} B (direct before {direct_before:?}, \
+         after {direct_after:?}); live members resident {resident} B"
+    );
+    assert!(
+        (direct_before.1..=direct_after.1).contains(&peak),
+        "the reader's peak lies between two direct reads around it"
+    );
+    let (low, high) = (
+        direct_before.0.min(direct_after.0),
+        direct_before.0.max(direct_after.0),
+    );
+    assert!(
+        (low.saturating_sub(4 * MIB)..=high + 4 * MIB).contains(&current),
+        "the reader's current charge {current} B lies near two direct reads around it"
+    );
+    assert!(
+        current >= resident + 48 * MIB,
+        "the 64 MiB of page cache is charged though nothing holds it resident: charged {current} \
+         B, resident {resident} B"
+    );
+    assert!(
+        peak >= 128 * MIB && peak >= current + 32 * MIB,
+        "the released 128 MiB stays in the peak: peak {peak} B, current {current} B"
+    );
+    assert!(
+        peak_again.get() >= peak,
+        "reading the peak never resets it: {peak} B, then {} B",
+        peak_again.get()
+    );
+    running.release();
+    running.finish();
+    let terminal = job.terminal().expect("its last process was reaped");
+    let ended = terminal.charged_memory().expect("final charged memory");
+    assert!(
+        ended.peak_bytes.get() >= peak,
+        "the peak outlives the job's processes"
+    );
+}
+
 fn retirement_waits_for_the_last_process(jobs: &IncarnationCgroups) {
     let job = jobs.admit(job_id(6)).expect("admit");
     let identity = job.identity().clone();
@@ -485,7 +564,11 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
         .iter()
         .map(|identity| identity.job_id().get())
         .collect();
-    assert_eq!(outstanding, [1, 2, 3, 4, 5, 7, 8, 9], "job 6 was retired");
+    assert_eq!(
+        outstanding,
+        [1, 2, 3, 4, 5, 7, 8, 9, 10],
+        "job 6 was retired"
+    );
 
     let other = authority.incarnation(&incarnation(2)).expect("incarnation");
     assert!(matches!(
@@ -631,6 +714,35 @@ fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
     );
 }
 
+/// What a census of the job's live members holds resident, from `/proc/<pid>/statm`.
+fn live_members_resident_bytes(job: &JobCgroup) -> u64 {
+    // SAFETY: sysconf takes a constant.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    let procs = job.path().join("cgroup.procs");
+    std::fs::read_to_string(&procs)
+        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
+        .lines()
+        .filter_map(|pid| {
+            let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+            let pages: u64 = statm.split_whitespace().nth(1)?.parse().expect("resident");
+            Some(pages * page)
+        })
+        .sum()
+}
+
+/// `memory.current` and `memory.peak`, read directly.
+fn direct_charged_memory(job: &JobCgroup) -> (u64, u64) {
+    let read = |name: &str| -> u64 {
+        let path = job.path().join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .expect("a count")
+    };
+    (read("memory.current"), read("memory.peak"))
+}
+
 /// What a census of the job's live members finds: each one's own user + system CPU from
 /// `/proc/<pid>/stat`, summed. Reaped processes are in no census.
 fn live_members_cpu_us(job: &JobCgroup) -> u64 {
@@ -679,6 +791,52 @@ fn cpu_us(who: libc::c_int) -> u64 {
             + u64::try_from(time.tv_usec).expect("microseconds")
     };
     micros(usage.ru_utime) + micros(usage.ru_stime)
+}
+
+/// Touch `mebibytes` of fresh anonymous memory page by page, then release it.
+fn touch_and_release(mebibytes: u64) {
+    if mebibytes == 0 {
+        return;
+    }
+    let length = usize::try_from(mebibytes << 20).expect("length");
+    // SAFETY: a fresh private anonymous mapping.
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(region, libc::MAP_FAILED, "mmap: {}", last_error());
+    for offset in (0..length).step_by(4096) {
+        // SAFETY: within the writable mapping made above.
+        unsafe { region.cast::<u8>().add(offset).write_volatile(1) };
+    }
+    // SAFETY: the whole mapping made above, unmapped once.
+    assert_eq!(unsafe { libc::munmap(region, length) }, 0, "munmap");
+}
+
+/// Write `mebibytes` to `path` through the page cache, from one reused 1 MiB buffer.
+fn fill_page_cache(path: &Path, mebibytes: u64) {
+    let mut file = std::fs::File::create(path)
+        .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+    let chunk = vec![0x5a_u8; 1 << 20];
+    for _ in 0..mebibytes {
+        file.write_all(&chunk)
+            .expect("write through the page cache");
+    }
+}
+
+/// A scratch path beside this test binary: on the build's own storage, never a memory-backed
+/// temporary directory.
+fn beside_test_binary(name: &str) -> PathBuf {
+    test_binary()
+        .parent()
+        .expect("the test binary's directory")
+        .join(format!("job-cgroup-{}-{name}", std::process::id()))
 }
 
 /// Spend `millis` of this process's own CPU, as `getrusage` measures it.

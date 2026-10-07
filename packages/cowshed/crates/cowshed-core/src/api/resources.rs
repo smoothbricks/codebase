@@ -215,6 +215,41 @@ pub enum JobAccounting {
     },
 }
 
+/// Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel
+/// memory together. Never resident memory: cache a job filled is charged to it while no process
+/// of it maps a page.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ChargedMemoryBytes(u64);
+
+impl ChargedMemoryBytes {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("chargedBytes", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ChargedMemoryBytes {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ChargedMemoryBytes> for u64 {
+    fn from(value: ChargedMemoryBytes) -> Self {
+        value.0
+    }
+}
+
 /// Elapsed wall time since the job's first owned process spawned, in microseconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -454,6 +489,15 @@ impl JobStreamWatermark {
     pub fn possible(&self) -> bool {
         self.lines.get() <= self.bytes.get() && (self.bytes.get() == 0) == (self.lines.get() == 0)
     }
+}
+
+/// A cgroup's charged memory: what it is charged now, and the most it was ever charged. The peak
+/// is the kernel's own high watermark, read without resetting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChargedMemoryUsage {
+    pub current_bytes: ChargedMemoryBytes,
+    pub peak_bytes: ChargedMemoryBytes,
 }
 
 /// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
