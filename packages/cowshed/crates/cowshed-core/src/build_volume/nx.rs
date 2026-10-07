@@ -206,11 +206,12 @@ pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Bu
 /// go once it is (pinned Nx 23.2.1, `native/db/mod.rs` `connect_to_nx_db`,
 /// `native/db/initialize.rs` `create_lock_file`). So while these are held no Nx process opens
 /// one of the databases: an opener waits on the lock, then opens the database by its path, so
-/// through whatever the checkout's build link names once they are let go.
+/// through whatever the checkout's build link names once they are let go. Fenced (`fork_lock`):
+/// Nx gets them back when this is dropped, whatever this process is spawning.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub struct Opens {
-    _locks: Vec<fs::File>,
+    _locks: Vec<crate::fork_lock::Fenced<fs::File>>,
 }
 
 /// A task database an Nx process is opening: the processes that have its open lock open, the
@@ -256,7 +257,8 @@ pub fn hold_opens(
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&lock)?;
+                .open(&lock)
+                .map(crate::fork_lock::Fenced::new)?;
             match file.try_lock() {
                 Ok(()) => locks.push(file),
                 Err(fs::TryLockError::WouldBlock) => {

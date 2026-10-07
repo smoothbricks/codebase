@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::BuildVolumeState;
+use crate::fork_lock::Fenced;
 
 /// The file Cargo locks in each profile directory it builds into.
 pub const BUILD_LOCK: &str = ".cargo-lock";
@@ -18,10 +19,11 @@ const PROFILE_DEPTH: usize = 3;
 
 /// A volume's Cargo build locks, held by this process until dropped. While they are held no
 /// Cargo build of the volume runs, and one that starts waits for them ("Blocking waiting for
-/// file lock on build directory").
+/// file lock on build directory"). Fenced (`fork_lock`): Cargo gets them back when this is
+/// dropped, whatever this process is spawning.
 #[must_use]
 pub struct Held {
-    _locks: Vec<File>,
+    _locks: Vec<Fenced<File>>,
 }
 
 /// Take every Cargo build lock in the volume rooted at `volume` without waiting. Answers the
@@ -31,7 +33,7 @@ pub fn hold(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<Held, 
     for target in state.cargo_targets() {
         for lock in locks_in(&volume.join(target))? {
             let file = match File::open(&lock) {
-                Ok(file) => file,
+                Ok(file) => Fenced::new(file),
                 // A profile directory deleted since it was listed holds no build.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),

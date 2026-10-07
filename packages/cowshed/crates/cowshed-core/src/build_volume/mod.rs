@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::GitOid;
 use crate::capabilities::BuildStatePath;
+use crate::fork_lock::Fenced;
 use crate::metadata::{
     IMAGE_EXTENSION, MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
 };
@@ -589,10 +590,11 @@ impl BuildVolumeLayout {
     }
 
     /// Whether a job holds `id` now, asked without taking or creating anything: what a dry run
-    /// reports in place of a release.
+    /// reports in place of a release. The probe's own momentary lock is fenced too, so no child
+    /// spawned meanwhile keeps it and refuses a hold taken after this answer.
     pub fn held(&self, id: &BuildVolumeId) -> io::Result<bool> {
         let file = match fs::File::open(self.hold_path(id)) {
-            Ok(file) => file,
+            Ok(file) => Fenced::new(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
@@ -825,17 +827,19 @@ impl BuildVolumeLayout {
 /// One job's claim on the build volume it was admitted with ([`BuildVolumeLayout::hold`]): a
 /// shared lock that keeps every release from unmounting the volume until it is dropped, when the
 /// job ends. The kernel drops it with the process that held it, so a crashed supervisor leaves
-/// no stale claim.
+/// no stale claim. It is fenced (`fork_lock`): a child spawned while the claim was open copied
+/// its descriptor, and an unfenced drop would leave that copy holding the volume until the child
+/// runs `exec`; the drop waits for such a spawn instead, so the claim is gone when it returns.
 #[derive(Debug)]
 pub struct BuildVolumeHold {
-    _file: fs::File,
+    _file: Fenced<fs::File>,
 }
 
 /// A release's exclusive claim on build volume `id` ([`BuildVolumeLayout::claim_release`]).
 #[derive(Debug)]
 pub struct ReleaseClaim {
     id: BuildVolumeId,
-    _file: fs::File,
+    _file: Fenced<fs::File>,
 }
 
 impl ReleaseClaim {
@@ -845,13 +849,16 @@ impl ReleaseClaim {
     }
 }
 
-fn open_hold(path: &Path) -> io::Result<fs::File> {
+/// Open (creating) `path`, the lock file every hold and release claim of one volume shares,
+/// fenced from the moment it is opened.
+fn open_hold(path: &Path) -> io::Result<Fenced<fs::File>> {
     fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
+        .map(Fenced::new)
 }
 
 fn unknown_version(path: &Path, version: u32) -> crate::CowshedError {
@@ -1189,6 +1196,63 @@ mod tests {
             layout.resolve_link(&gone, &released).unwrap(),
             LinkResolution::Vanished,
             "a record left beside no image does not keep the link"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A job's hold on its build volume is free the moment its drop returns, even while a spawn
+    /// of this process that copied the hold's descriptor has not run `exec` yet: the drop waits
+    /// for that spawn (`fork_lock`). Unfenced, the parked child's copy keeps the shared lock, so
+    /// a release finds the volume held by a job that ended -- what `held` saw after `wait` in
+    /// the supervisor suite whenever another test was mid-spawn.
+    ///
+    /// No timer orders the race. The child is parked before the hold is dropped; the dropping
+    /// thread either answers first, having closed its descriptor without waiting (unfenced), or
+    /// is queued for the exclusive fork lock behind the parked spawn, which a reader then sees
+    /// refused ([`crate::fork_lock::held_exclusive`]) -- only then is the child let go.
+    #[test]
+    fn a_dropped_hold_is_free_though_a_spawn_that_copied_it_is_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-build-hold-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project = ProjectPaths::with_mount_root(
+            &root,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let id = BuildVolumeId::mint();
+        fs::write(layout.image(&id), b"").unwrap();
+        let hold = layout.hold(&id).unwrap();
+        assert!(layout.held(&id).unwrap());
+
+        let in_flight = crate::fork_lock::in_flight::InFlight::start();
+        let (answer, answered) = std::sync::mpsc::channel();
+        let release = {
+            let (layout, id) = (layout.clone(), id.clone());
+            std::thread::spawn(move || {
+                drop(hold);
+                answer.send(layout.held(&id).unwrap()).unwrap();
+            })
+        };
+        let early = loop {
+            if let Ok(held) = answered.try_recv() {
+                break Some(held);
+            }
+            if crate::fork_lock::held_exclusive() {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        in_flight.finish();
+        let held = early.unwrap_or_else(|| answered.recv().unwrap());
+        release.join().unwrap();
+        assert!(
+            !held,
+            "a released hold keeps nothing held, whatever spawn copied it"
         );
         fs::remove_dir_all(&root).unwrap();
     }

@@ -230,26 +230,25 @@ impl<T> Drop for Fenced<T> {
     }
 }
 
+/// A spawn this crate's tests hold in flight, for any lease's release to be tried against.
 #[cfg(test)]
-mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::os::fd::{AsRawFd as _, OwnedFd};
+pub(crate) mod in_flight {
+    use std::io::{self, Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
-    use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::TryLockError;
 
-    use super::*;
+    use super::Spawn as _;
 
     /// A spawn held in flight: its child is parked in `pre_exec`, after the fork and before the
     /// `exec`, holding a copy of every descriptor of this process, until [`InFlight::finish`].
-    struct InFlight {
+    pub(crate) struct InFlight {
         go: std::io::PipeWriter,
         spawn: std::thread::JoinHandle<io::Result<std::process::Child>>,
     }
 
     impl InFlight {
-        fn start() -> Self {
+        pub(crate) fn start() -> Self {
             let (mut started, started_writer) = std::io::pipe().unwrap();
             let (go_reader, go) = std::io::pipe().unwrap();
             let (started_fd, go_fd) = (started_writer.as_raw_fd(), go_reader.as_raw_fd());
@@ -284,12 +283,23 @@ mod tests {
         }
 
         /// Let the parked child run `exec`, and the spawn return.
-        fn finish(mut self) {
+        pub(crate) fn finish(mut self) {
             self.go.write_all(&[0]).unwrap();
             let mut child = self.spawn.join().unwrap().unwrap();
             assert!(child.wait().unwrap().success());
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::TryLockError;
+
+    use super::in_flight::InFlight;
+    use super::*;
 
     fn lease_path() -> PathBuf {
         std::env::temp_dir().join(format!(
