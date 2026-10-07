@@ -159,7 +159,8 @@ mod tests {
     use super::*;
     use crate::api::dto::{JobId, UtcTimestamp};
     use crate::api::resources::{
-        HostLoadSample, JobStreamWatermark, ResidentBytes, StreamBytes, StreamLines, WallMicros,
+        HostLoadSample, JobStreamWatermark, JobVolumeUsage, ResidentBytes, StreamBytes,
+        StreamLines, VolumeUnavailable, VolumeUsage, WallMicros,
     };
 
     fn sample(wall_us: u64) -> JobResourceSample {
@@ -181,6 +182,12 @@ mod tests {
             rss_bytes: ResidentBytes::ZERO,
             rss_peak_bytes: ResidentBytes::ZERO,
             accounting: None,
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Unconfigured,
+                },
+                build: None,
+            },
             stdout: quiet,
             stderr: quiet,
         }

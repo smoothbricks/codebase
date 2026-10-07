@@ -82,6 +82,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
       host: { load1: 2.5, cores: 10 },
       rssBytes: running ? 4096 : 0,
       rssPeakBytes: 4096,
+      volumes: { workspace: { kind: 'unavailable', reason: { kind: 'unconfigured' } } },
       stdout: { bytes: 0, lines: 0 },
       stderr: { bytes: 0, lines: 0 },
     });
