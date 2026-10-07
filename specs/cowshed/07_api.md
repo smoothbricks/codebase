@@ -681,9 +681,15 @@ pub struct HostLoad1(f64);
 pub struct OneCoreCpuPercent(f64);
 pub struct HostCores(u16);
 pub struct HostLoadSample { pub load1: HostLoad1, pub cores: HostCores }
+pub enum VolumeUnavailable {
+    Unconfigured,                     // the supervisor was configured with no volume to stat
+    UnsupportedPlatform,              // this platform's substrate has no used-bytes stat yet
+    Failed { message: String },       // the stat failed at spawn or at this sample, or its delta is inexact
+}
+pub enum VolumeUsage { Read { delta_bytes: VolumeUsedBytesDelta }, Unavailable { reason: VolumeUnavailable } }
 pub struct JobVolumeUsage {
-    pub workspace_delta_bytes: VolumeUsedBytesDelta,
-    pub build_delta_bytes: Option<VolumeUsedBytesDelta>,
+    pub workspace: VolumeUsage,
+    pub build: Option<VolumeUsage>,   // absent when the job runs with no build volume
 }
 pub struct StreamBytes(u64);
 pub struct StreamLines(u64);
@@ -744,11 +750,17 @@ generated frame bound is a typed error, not a silently shortened list. `leaderPi
 after exit; terminal membership may be empty. An incomplete kernel membership read is an operational error, never
 evidence of an empty group.
 
-`volumes` compares the used bytes of the workspace volume and its build volume at spawn with those at the sample
+`volumes` compares the used bytes of the workspace volume and the job's build volume at spawn with those at the sample
 boundary. Deltas are signed and never clamped: deletion can shrink a volume. They describe volume-wide usage, not
 per-process write syscalls or exclusive attribution when commands overlap. Usage is a volume stat, never a recursive
-scan or a shared-store/container free-space proxy. `buildDeltaBytes` is absent when the workspace has no build volume;
-failure to sample an existing volume is a typed error, never absence or zero usage.
+scan or a shared-store/container free-space proxy. Each volume answers for itself: `Read` with its delta, or
+`Unavailable` with why, so one volume that cannot be read never fails the sample or hides the other's reading. `build`
+is absent when the job runs with no build volume. A stat that fails at spawn or at the sample is that volume's `Failed`,
+never absence or zero usage; a platform whose substrate has no used-bytes stat reports `UnsupportedPlatform` (Linux
+until the ZFS dataset stat), and a supervisor configured with no volumes reports `Unconfigured`. The supervisor's
+configuration carries the workspace volume's mountpoint, refused at construction when nothing is mounted there; each
+job's build volume is the one its admission grants. Both baselines are read at admission, immediately before the job's
+first process is dispatched, so nothing the job writes precedes them.
 
 Stream watermarks count admitted bytes and newline-delimited lines separately for stdout/stderr; a non-empty trailing
 partial line counts as one line. `bytes` is also the next byte cursor. `tail(cursor, limits)` returns a bounded raw

@@ -127,8 +127,9 @@ transition kind preserves clearing semantics without carrying a JSON payload or 
 The job span, not each process span, carries signed `disk_ws_delta_bytes` and optional `disk_build_delta_bytes`,
 `load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. Host load converts once to nearest
 milliload with the declared checked conversion; non-finite, negative, or overflowing load and an overflowing core count
-are typed errors, never truncation. A missing build volume leaves its delta null. Process I/O and volume allocation
-remain different facts.
+are typed errors, never truncation. A missing build volume leaves its delta null. A volume whose usage is `Unavailable`
+(07_api.md: unconfigured, an unsupported platform, or a failed stat) also leaves its delta null, never zero; the job's
+resource sample carries the reason. Process I/O and volume allocation remain different facts.
 
 Linux job accounting retains the complete cgroup-v2 CPU and storage-I/O counters and separate charged-memory
 current/peak; charged memory includes cache/kernel charges and is never written into an RSS column. macOS retains the

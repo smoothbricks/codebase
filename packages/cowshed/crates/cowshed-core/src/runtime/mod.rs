@@ -20,6 +20,7 @@ pub mod shell_watch;
 pub mod supervisor;
 pub mod supervisor_manager;
 pub mod supervisor_socket;
+pub mod volume_usage;
 
 pub use project::{
     JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,

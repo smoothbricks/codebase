@@ -515,6 +515,12 @@ export const assertJobTailLimitsList = typia.createAssertEquals<readonly Api.Job
 export const parseJobTailLimitsList = (json: string): readonly Api.JobTailLimits[] =>
   assertJobTailLimitsList(JSON.parse(json));
 
+export const assertJobVolumeUsage = typia.createAssertEquals<Api.JobVolumeUsage>();
+export const parseJobVolumeUsage = (json: string): Api.JobVolumeUsage => assertJobVolumeUsage(JSON.parse(json));
+export const assertJobVolumeUsageList = typia.createAssertEquals<readonly Api.JobVolumeUsage[]>();
+export const parseJobVolumeUsageList = (json: string): readonly Api.JobVolumeUsage[] =>
+  assertJobVolumeUsageList(JSON.parse(json));
+
 export const assertLandAdoptionCommitment = typia.createAssertEquals<Api.LandAdoptionCommitment>();
 export const parseLandAdoptionCommitment = (json: string): Api.LandAdoptionCommitment =>
   assertLandAdoptionCommitment(JSON.parse(json));
@@ -1134,6 +1140,26 @@ export const parseUtcTimestamp = (json: string): Api.UtcTimestamp => assertUtcTi
 export const assertUtcTimestampList = typia.createAssertEquals<readonly Api.UtcTimestamp[]>();
 export const parseUtcTimestampList = (json: string): readonly Api.UtcTimestamp[] =>
   assertUtcTimestampList(JSON.parse(json));
+
+export const assertVolumeUnavailable = typia.createAssertEquals<Api.VolumeUnavailable>();
+export const parseVolumeUnavailable = (json: string): Api.VolumeUnavailable =>
+  assertVolumeUnavailable(JSON.parse(json));
+export const assertVolumeUnavailableList = typia.createAssertEquals<readonly Api.VolumeUnavailable[]>();
+export const parseVolumeUnavailableList = (json: string): readonly Api.VolumeUnavailable[] =>
+  assertVolumeUnavailableList(JSON.parse(json));
+
+export const assertVolumeUsage = typia.createAssertEquals<Api.VolumeUsage>();
+export const parseVolumeUsage = (json: string): Api.VolumeUsage => assertVolumeUsage(JSON.parse(json));
+export const assertVolumeUsageList = typia.createAssertEquals<readonly Api.VolumeUsage[]>();
+export const parseVolumeUsageList = (json: string): readonly Api.VolumeUsage[] =>
+  assertVolumeUsageList(JSON.parse(json));
+
+export const assertVolumeUsedBytesDelta = typia.createAssertEquals<Api.VolumeUsedBytesDelta>();
+export const parseVolumeUsedBytesDelta = (json: string): Api.VolumeUsedBytesDelta =>
+  assertVolumeUsedBytesDelta(JSON.parse(json));
+export const assertVolumeUsedBytesDeltaList = typia.createAssertEquals<readonly Api.VolumeUsedBytesDelta[]>();
+export const parseVolumeUsedBytesDeltaList = (json: string): readonly Api.VolumeUsedBytesDelta[] =>
+  assertVolumeUsedBytesDeltaList(JSON.parse(json));
 
 export const assertWallMicros = typia.createAssertEquals<Api.WallMicros>();
 export const parseWallMicros = (json: string): Api.WallMicros => assertWallMicros(JSON.parse(json));

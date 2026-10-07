@@ -951,6 +951,15 @@ export type JobTailLimits = {
 };
 
 /**
+ * The job's volumes at a sample: its workspace volume, and its build volume when the job runs
+ * with one.
+ */
+export type JobVolumeUsage = {
+  readonly workspace: VolumeUsage;
+  readonly build?: VolumeUsage;
+};
+
+/**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted
  * build volume (16_build_volumes.md, Land step 7): a defect in the project's build
  * configuration, recorded once per miss so a coordinator can turn each into fix work.
@@ -1934,6 +1943,37 @@ export type UnattributedRun =
     });
 
 export type UtcTimestamp = string;
+
+/**
+ * Why one of a job's volumes has no used-bytes delta in a sample.
+ */
+export type VolumeUnavailable =
+  | { readonly kind: 'unconfigured' }
+  | { readonly kind: 'unsupportedPlatform' }
+  | ({ readonly kind: 'failed' } & {
+      readonly message: string;
+    });
+
+/**
+ * One owned volume's usage at a sample: its change since spawn, or why it has none. Each
+ * volume answers for itself; one that cannot be read never fails the sample.
+ */
+export type VolumeUsage =
+  | ({ readonly kind: 'read' } & {
+      readonly deltaBytes: VolumeUsedBytesDelta;
+    })
+  | ({ readonly kind: 'unavailable' } & {
+      readonly reason: VolumeUnavailable;
+    });
+
+/**
+ * The signed change of an owned volume's used bytes since the job spawned: deletion shrinks a
+ * volume, so it is never clamped.
+ */
+export type VolumeUsedBytesDelta = number &
+  tags.Type<'int64'> &
+  tags.Minimum<-9007199254740991> &
+  tags.Maximum<9007199254740991>;
 
 /**
  * Elapsed wall time since the job's first owned process spawned, in microseconds.

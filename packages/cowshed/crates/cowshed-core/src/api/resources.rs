@@ -24,6 +24,10 @@ pub enum ResourceUnitError {
     InvalidHostLoad { value: f64 },
     #[error("host core count must be positive")]
     ZeroHostCores,
+    #[error(
+        "{unit} {value} exceeds {MAX_EXACT_INTEGER} in magnitude, the largest every projection holds exactly"
+    )]
+    InexactSigned { unit: &'static str, value: i128 },
 }
 
 /// CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
@@ -456,6 +460,99 @@ impl JobStreamWatermark {
     }
 }
 
+/// The signed change of an owned volume's used bytes since the job spawned: deletion shrinks a
+/// volume, so it is never clamped.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
+    )
+)]
+pub struct VolumeUsedBytesDelta(i64);
+
+impl VolumeUsedBytesDelta {
+    pub fn new(value: i64) -> Result<Self, ResourceUnitError> {
+        Self::exact(i128::from(value))
+    }
+
+    /// `current` less `baseline`, exactly.
+    pub fn between(baseline: u64, current: u64) -> Result<Self, ResourceUnitError> {
+        Self::exact(i128::from(current) - i128::from(baseline))
+    }
+
+    fn exact(value: i128) -> Result<Self, ResourceUnitError> {
+        i64::try_from(value)
+            .ok()
+            .filter(|value| value.unsigned_abs() <= MAX_EXACT_INTEGER)
+            .map(Self)
+            .ok_or(ResourceUnitError::InexactSigned {
+                unit: "volumeUsedBytesDelta",
+                value,
+            })
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for VolumeUsedBytesDelta {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<VolumeUsedBytesDelta> for i64 {
+    fn from(value: VolumeUsedBytesDelta) -> Self {
+        value.0
+    }
+}
+
+/// Why one of a job's volumes has no used-bytes delta in a sample.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum VolumeUnavailable {
+    /// The supervisor was given no volume to stat for it.
+    Unconfigured,
+    /// This platform's volume substrate has no used-bytes stat.
+    UnsupportedPlatform,
+    /// The volume's stat failed, at spawn or at this sample, or its change is no exact delta.
+    Failed { message: String },
+}
+
+/// One owned volume's usage at a sample: its change since spawn, or why it has none. Each
+/// volume answers for itself; one that cannot be read never fails the sample.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum VolumeUsage {
+    Read { delta_bytes: VolumeUsedBytesDelta },
+    Unavailable { reason: VolumeUnavailable },
+}
+
+/// The job's volumes at a sample: its workspace volume, and its build volume when the job runs
+/// with one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobVolumeUsage {
+    pub workspace: VolumeUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<VolumeUsage>,
+}
+
 /// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
 /// a process: its shell activation on a cold host, otherwise its command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -836,5 +933,94 @@ mod host_tests {
         assert_eq!(HostLoad1::new(0.0).expect("idle").get(), 0.0);
         assert_eq!(HostCores::new(u16::MAX).expect("maximum").get(), u16::MAX);
         assert!(HostCores::new(0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    fn delta(value: i64) -> VolumeUsedBytesDelta {
+        VolumeUsedBytesDelta::new(value).expect("exact")
+    }
+
+    #[test]
+    fn a_volume_delta_is_signed_exact_and_never_clamped() {
+        for (baseline, current, expected) in [(100, 40, -60), (50, 80, 30), (100, 100, 0)] {
+            assert_eq!(
+                VolumeUsedBytesDelta::between(baseline, current).map(VolumeUsedBytesDelta::get),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            VolumeUsedBytesDelta::between(u64::MAX, u64::MAX - 3).map(VolumeUsedBytesDelta::get),
+            Ok(-3),
+            "large readings, a small exact change"
+        );
+        for refused in [
+            VolumeUsedBytesDelta::between(0, u64::MAX),
+            VolumeUsedBytesDelta::between(u64::MAX, 0),
+            VolumeUsedBytesDelta::new(i64::MIN),
+            VolumeUsedBytesDelta::new(i64::MAX),
+            VolumeUsedBytesDelta::between(0, MAX_EXACT_INTEGER + 1),
+        ] {
+            assert!(
+                matches!(refused, Err(ResourceUnitError::InexactSigned { .. })),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            VolumeUsedBytesDelta::between(MAX_EXACT_INTEGER, 0).map(VolumeUsedBytesDelta::get),
+            Ok(-i64::try_from(MAX_EXACT_INTEGER).expect("fits"))
+        );
+    }
+
+    #[test]
+    fn the_volume_wire_names_each_volume_and_omits_only_an_absent_build_volume() {
+        let usage = JobVolumeUsage {
+            workspace: VolumeUsage::Read {
+                delta_bytes: delta(-60),
+            },
+            build: Some(VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::Failed {
+                    message: "volume usage read failed".into(),
+                },
+            }),
+        };
+        let json = serde_json::json!({
+            "workspace": { "kind": "read", "deltaBytes": -60 },
+            "build": {
+                "kind": "unavailable",
+                "reason": { "kind": "failed", "message": "volume usage read failed" },
+            },
+        });
+        assert_eq!(serde_json::to_value(&usage).expect("serialize"), json);
+        assert_eq!(
+            serde_json::from_value::<JobVolumeUsage>(json).expect("decode"),
+            usage
+        );
+        let no_build = JobVolumeUsage {
+            workspace: VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::UnsupportedPlatform,
+            },
+            build: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&no_build).expect("serialize"),
+            serde_json::json!({
+                "workspace": { "kind": "unavailable", "reason": { "kind": "unsupportedPlatform" } },
+            })
+        );
+        for refused in [
+            serde_json::json!({ "workspace": { "kind": "read", "deltaBytes": MAX_EXACT_INTEGER + 1 } }),
+            serde_json::json!({ "workspace": { "kind": "read" } }),
+            serde_json::json!({ "workspace": { "kind": "read", "deltaBytes": 1, "reason": {} } }),
+            serde_json::json!({ "build": { "kind": "read", "deltaBytes": 1 } }),
+        ] {
+            assert!(
+                serde_json::from_value::<JobVolumeUsage>(refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
     }
 }
