@@ -22,7 +22,7 @@ use crate::api::dto::{
     Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
     UtcTimestamp, WorkspacePath,
 };
-use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
+use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, SampleInterval};
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
@@ -41,6 +41,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
+use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
 use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling, StreamTally};
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
@@ -2267,6 +2268,44 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// The job's progress: its latest sample once it owns a process, another every `every`
+    /// while it runs, then its terminal sample once, and the end. A job that owns no process
+    /// yet is sampled once it does; one that ended with no sample ends the stream with why.
+    /// Dropping the stream ends the subscription and nothing else.
+    pub async fn progress(
+        &self,
+        job_id: JobId,
+        every: SampleInterval,
+    ) -> Result<JobProgressStream> {
+        let first = self.read_progress(job_id).await?;
+        let reader = self.clone();
+        let waiter = self.clone();
+        crate::runtime::job_progress::subscribe(
+            first,
+            every.duration(),
+            move || {
+                let reader = reader.clone();
+                async move { reader.read_progress(job_id).await }
+            },
+            async move {
+                // Only the wake matters: the read that follows answers how the job ended, and
+                // says why when it cannot.
+                let _ = waiter.wait(job_id).await;
+            },
+        )
+    }
+
+    /// Where the job is, for its progress: unowned, running and observed now, or ended with
+    /// its terminal sample.
+    pub(super) async fn read_progress(&self, job_id: JobId) -> Result<ProgressRead> {
+        self.call(|reply| Command::Progress {
+            authority: self.authority.clone(),
+            job_id,
+            reply,
+        })
+        .await
+    }
+
     pub async fn list(&self) -> Result<Vec<JobInfo>> {
         self.call(|reply| Command::List {
             authority: self.authority.clone(),
@@ -2607,6 +2646,11 @@ pub(super) enum Command {
         authority: WorkspaceAuthoritySnapshot,
         key: AdmissionKey,
         reply: oneshot::Sender<Result<JobId>>,
+    },
+    Progress {
+        authority: WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+        reply: oneshot::Sender<Result<ProgressRead>>,
     },
     List {
         authority: WorkspaceAuthoritySnapshot,
@@ -3078,6 +3122,17 @@ impl SupervisorActor {
                         ),
                     }
                 });
+                let _ = reply.send(result);
+            }
+            Command::Progress {
+                authority,
+                job_id,
+                reply,
+            } => {
+                let result = self
+                    .validate_authority(&authority)
+                    .and_then(|()| self.job_mut(job_id))
+                    .and_then(job_progress);
                 let _ = reply.send(result);
             }
             Command::List { authority, reply } => {
@@ -5220,6 +5275,18 @@ fn listening_ports(job: &JobStateRecord) -> Result<JobListeningPorts> {
         sampled_at,
         ports: ports.into_iter().collect(),
     })
+}
+
+/// A progress read: an ended job's terminal sample, a running job observed now, or nothing yet
+/// for one that owns no process. A read never answers a running job with a frozen sample.
+fn job_progress(job: &mut JobStateRecord) -> Result<ProgressRead> {
+    if job.terminal() {
+        sample_job(job).map(ProgressRead::Ended)
+    } else if job.sampling.owns() {
+        sample_job(job).map(ProgressRead::Running)
+    } else {
+        Ok(ProgressRead::Unowned)
+    }
 }
 
 /// Record the job's process as its parent observed it. A leader no one could identify keeps the

@@ -9,8 +9,8 @@ pub mod resources;
 pub mod server;
 
 pub use capability::{
-    Coordinator, CoordinatorToken, Cowshed, JobAttachment, JobHandle, JobStdin, Project,
-    RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
+    Coordinator, CoordinatorToken, Cowshed, EventStream, JobAttachment, JobHandle, JobStdin,
+    Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
 };
 pub use dto::*;
 pub use operations::JobStream;
