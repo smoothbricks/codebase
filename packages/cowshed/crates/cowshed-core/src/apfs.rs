@@ -1446,6 +1446,18 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     ) -> Result<(), ApfsError> {
         let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
+        self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
+    }
+
+    /// `umount` the attachment's volume, the caller holding its image lease and pin. A volume
+    /// something still holds is waited on for the detach grace and then, under
+    /// [`DetachIntent::Release`], forced; [`DetachIntent::WhenIdle`] answers the first dissent.
+    fn unmount_volume_unlocked(
+        &self,
+        attachment: &AttachedImage,
+        intent: DetachIntent,
+        operation: &'static str,
+    ) -> Result<(), ApfsError> {
         let mut waited = Duration::ZERO;
         let mut force = false;
         loop {
@@ -1455,10 +1467,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             }
             args.push(OsString::from(&attachment.volume_device));
             let result = timed_apfs_step(apfs_step_leg(&attachment.image), "unmount", || {
-                self.run_checked(
-                    "unmount verified APFS volume",
-                    CommandRequest::new(UMOUNT, args),
-                )
+                self.run_checked(operation, CommandRequest::new(UMOUNT, args))
             });
             match result {
                 Ok(_) => return Ok(()),
@@ -1647,9 +1656,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         mount_point: &Path,
         options: &str,
     ) -> Result<(), ApfsError> {
-        let unmount = || CommandRequest::new(UMOUNT, [OsString::from(&attachment.volume_device)]);
-        if let Err(error) = self.run_checked("unmount to retire an inherited event log", unmount())
-        {
+        // Both mounts unmounted here are this call's own and not yet handed back, so whatever
+        // holds one is a host daemon that opened the fresh volume (measured: `Resource busy`
+        // within 40 ms of the mount, on a live host): wait out the detach grace, then force.
+        let unmount =
+            |operation| self.unmount_volume_unlocked(attachment, DetachIntent::Release, operation);
+        if let Err(error) = unmount("unmount to retire an inherited event log") {
             eprintln!(
                 "cowshed: apfs {} keeps fseventsd's inherited event log: {error}",
                 mount_point.display()
@@ -1668,10 +1680,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                         path: mount_point.join(EVENT_LOG_DIRECTORY),
                         source,
                     });
-                let unmounted = self.run_checked("unmount the ownership-ignoring mount", unmount());
+                let unmounted = unmount("unmount the ownership-ignoring mount");
                 match (replaced, unmounted) {
-                    (Ok(()), unmounted) => unmounted.map(|_| ()),
-                    (Err(replaced), Ok(_)) => Err(replaced),
+                    (Ok(()), unmounted) => unmounted,
+                    (Err(replaced), Ok(())) => Err(replaced),
                     (Err(replaced), Err(unmounted)) => {
                         eprintln!(
                             "cowshed: apfs {} keeps fseventsd's inherited event log: {replaced}",
