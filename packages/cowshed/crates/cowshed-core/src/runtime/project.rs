@@ -3430,22 +3430,49 @@ impl NativeProjectRuntimeHost {
         )
         .await
         .map_err(native_storage_error)?;
-        self.conclude_adoption(&current.derived.workspace).await
+        self.conclude_adoption(
+            &current.derived.workspace,
+            super::build_volumes::FirstMint::Nothing,
+        )
+        .await
     }
 
     /// Everything adoption does once main is mounted at the checkout. Each step is safe to repeat
-    /// on a replay: the commitment is append-safe and completion overwrites.
+    /// on a replay: the commitment is append-safe, completion overwrites, and the first touch
+    /// finds the volume an interrupted one linked.
+    ///
+    /// Main's first touch runs before the intent completes: until then the unfinished adopt
+    /// keeps collection off the volume in `first`, which [`Self::adopt`] minted beside main's
+    /// image and which nothing links and no record names before the first touch links it.
+    /// Whatever the first touch did, and when the commitment fails before it runs, `first` is
+    /// settled before this returns: released unless the checkout links it. The intent completes
+    /// even when the first touch failed: main is adopted, and its build state is refreshed again
+    /// before its first job.
     async fn conclude_adoption(
         &mut self,
         workspace: &crate::storage::lifecycle::LifecycleWorkspace,
+        first: super::build_volumes::FirstMint,
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
-        self.commitments
+        let introduced = self
+            .commitments
             .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
                 repo_id: self.descriptor.repo_id.clone(),
                 workspace_incarnation: workspace.incarnation().clone(),
             })
-            .await?;
+            .await
+            .and_then(|()| self.workspace_mount_path(workspace.name()));
+        let mount = match introduced {
+            Ok(mount) => mount,
+            Err(error) => {
+                first.settle().await;
+                return Err(error);
+            }
+        };
+        let touched = self
+            .first_build_state(workspace.name(), &mount, first.lend())
+            .await;
+        crate::timing::spanned("adopt", "build-volume-release", first.settle()).await;
         self.complete_lifecycle_intent(
             workspace.name(),
             crate::storage::recovery::LifecycleIntentCompletion::Workspace(
@@ -3453,23 +3480,28 @@ impl NativeProjectRuntimeHost {
             ),
         )
         .await?;
-        timed_async(
-            "adopt",
-            "supervisor",
-            self.ensure_supervisor(workspace.name()),
-        )
-        .await?;
-        // Main's first touch: its build state moves onto its first build volume, and main gets
-        // the seed its forks clone (16_build_volumes.md, "Targets and seeds").
-        let current = self.current(workspace.name()).await?;
-        let mount = self.workspace_mount_path(workspace.name())?;
+        touched?;
+        timed_async("adopt", "snapshot", self.snapshot_named(workspace.name())).await
+    }
+
+    /// Main's first touch: its supervisor, then its build state moves onto its first build
+    /// volume, the one `lent` names when it fits, and main gets the seed its forks clone
+    /// (16_build_volumes.md, "Targets and seeds").
+    async fn first_build_state(
+        &mut self,
+        name: &WorkspaceName,
+        mount: &Path,
+        lent: super::build_volumes::Lent,
+    ) -> Result<()> {
+        timed_async("adopt", "supervisor", self.ensure_supervisor(name)).await?;
+        let current = self.current(name).await?;
         timed_async(
             "adopt",
             "build-state",
-            self.refresh_build_state_for(&current, &mount),
+            self.refresh_build_state_for(&current, mount, lent),
         )
         .await?;
-        timed_async("adopt", "snapshot", self.snapshot_named(workspace.name())).await
+        Ok(())
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
@@ -3489,23 +3521,36 @@ impl NativeProjectRuntimeHost {
         ))
     }
 
-    /// What links build volumes now (16_build_volumes.md, "Garbage collection"): each mounted
-    /// checkout's build link, every workspace at its incarnation (whose seed a seed may be), the
-    /// detached workspaces, whose links cannot be read and whose volumes their records name, and
-    /// the workspaces an unfinished create or fork is forming, in this process or any other.
+    /// Every build volume image now, and then what links them (16_build_volumes.md, "Garbage
+    /// collection"): each mounted checkout's build link, every workspace at its incarnation
+    /// (whose seed a seed may be), the detached workspaces, whose links cannot be read and whose
+    /// volumes their records name, and the workspaces an unfinished create, fork or adopt is
+    /// forming, in this process or any other.
     ///
     /// A create or fork forks its build volume and seed into its staged checkout, which no other
-    /// process can see, and completes its intent only after publishing the workspace; without
-    /// the journal, an `rm` in another process collected a fresh fork's volume and seed as
-    /// unlinked garbage, and the fork's own mount then refused its dangling link. The journal is
-    /// read from disk, before the workspaces: every such volume is then named by one of the two
-    /// reads, where the other order lets a create publish and complete between them.
-    async fn build_volume_links(&self) -> Result<super::build_volumes::Links> {
+    /// process can see, and an adopt mints main's first volume beside main's image; each completes
+    /// its intent only after publishing the workspace. Without the journal, an `rm` in another
+    /// process collected a fresh fork's volume and seed as unlinked garbage, and the fork's own
+    /// mount then refused its dangling link. The reads go images, journal, workspaces: such a verb
+    /// joins the journal's forming set before it makes a volume and leaves it only once its
+    /// workspace is published, so every listed volume is named by one of the two later reads.
+    /// Listed last, an image made after the journal read was decided from links that predate it.
+    async fn build_volume_links(
+        &self,
+    ) -> Result<(
+        Vec<crate::build_volume::BuildVolumeId>,
+        super::build_volumes::Links,
+    )> {
         let volumes = self.build_volumes()?;
         let journal = self.lifecycle_intents_path.clone();
-        let creating = crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::storage::recovery::LifecycleIntentJournal::load(&journal)
-                .map(|journal| journal.forming().cloned().collect())
+        let layout = volumes.layout.clone();
+        let (images, creating) = crate::storage::lifecycle::dispatch_blocking(move || {
+            let images = layout.list()?;
+            let creating = crate::storage::recovery::LifecycleIntentJournal::load(&journal)?
+                .forming()
+                .cloned()
+                .collect();
+            Ok::<_, CowshedError>((images, creating))
         })
         .await
         .map_err(|error| {
@@ -3532,7 +3577,7 @@ impl NativeProjectRuntimeHost {
                 links.detached.insert(name);
             }
         }
-        Ok(links)
+        Ok((images, links))
     }
 
     /// The build-volume collection `rm` and `land` run once a checkout let go of its volume
@@ -3541,8 +3586,8 @@ impl NativeProjectRuntimeHost {
     /// routine ones (a detached or still-forming workspace's own) counted on one line, so a
     /// volume that stays is never a silent skip.
     async fn collect_build_volumes(&self) -> Result<()> {
-        let links = self.build_volume_links().await?;
-        let collection = self.build_volumes()?.collect(links, false).await?;
+        let (images, links) = self.build_volume_links().await?;
+        let collection = self.build_volumes()?.collect(images, links, false).await?;
         let mut routine = 0_usize;
         for deferred in collection.deferred {
             if deferred.deferral.is_routine() {
@@ -3783,11 +3828,13 @@ impl NativeProjectRuntimeHost {
     /// environment is asked with that toolchain, and a `CARGO_TARGET_DIR` of the controller's
     /// shell names no checkout's build state. Discovery runs only when the tracked build inputs'
     /// fingerprint moved off the one the volume's state records; otherwise only displaced links
-    /// are restored.
+    /// are restored. A first touch takes the volume `lent` names when it fits rather than
+    /// minting one of its own ([`super::build_volumes::Lent`]).
     async fn refresh_build_state_for(
         &mut self,
         current: &NativeWorkspace,
         mount: &Path,
+        lent: super::build_volumes::Lent,
     ) -> Result<crate::build_volume::BuildStateRefresh> {
         use super::build_volumes::Discovered;
         let name = current.derived.workspace.name().clone();
@@ -3853,6 +3900,7 @@ impl NativeProjectRuntimeHost {
                 },
                 mount.to_owned(),
                 discovered,
+                lent,
             )
             .await?
             .map_err(|refusal| {
@@ -3895,7 +3943,8 @@ impl NativeProjectRuntimeHost {
         let handle = self.ensure_supervisor(workspace).await?;
         let current = self.current(workspace).await?;
         let mount = self.workspace_mount_path(workspace)?;
-        self.refresh_build_state_for(&current, &mount).await?;
+        self.refresh_build_state_for(&current, &mount, super::build_volumes::Lent::Nothing)
+            .await?;
         let grant = self.build_volume_layout()?.grant(workspace, &mount)?;
         Ok((handle, grant))
     }
@@ -7746,48 +7795,73 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 identity,
             })
             .map_err(native_integrity_error)?;
+        // Before main's first build volume is minted below: from here until the intent
+        // completes, collection in any process leaves that volume alone, which nothing links and
+        // no record names until main's first touch links it.
+        self.mark_lifecycle_intent_mutating(&main_name()).await?;
         let binding = self.descriptor.binding.clone();
         let binding_path = self.layout.project().repository_binding.clone();
         let home = &self.home;
-        let receipt = self
+        // Main's first build volume is minted beside main's image, so the two attaches wait on
+        // `storagekitd` once (16_build_volumes.md, "Targets and seeds"), at the capacity the
+        // checkout's `.cowshed.toml` asks, which main's image is copied from; none for a checkout
+        // in which nothing can name build state. The answer owns the volume until main's first
+        // touch has run, and releases it when the adopt is dropped first.
+        let volumes = self.build_volumes()?;
+        let mint = crate::timing::spanned(
+            "adopt",
+            "build-volume",
+            volumes.mint_first(
+                self.descriptor.git_root.to_path_buf(),
+                self.workspace_mount_path(&main_name())?,
+            ),
+        );
+        let (receipt, first) = self
             .substrate
-            .execute_adopt_staged(plan, move |stage| async move {
-                timed_async(
-                    "adopt",
-                    "locks",
-                    crate::inherited_git_locks::discard_in(&stage.mount_point),
-                )
-                .await?;
-                timed_async(
-                    "adopt",
-                    "daemons",
-                    crate::inherited_daemons::macos::discard_in(
-                        &stage.mount_point,
-                        crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
-                    ),
-                )
-                .await?;
-                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                // The image's volume is case-sensitive; the tree it was copied from may not be.
-                timed_async(
-                    "adopt",
-                    "case",
-                    repository.record_case_sensitive_filesystem(),
-                )
-                .await?;
-                crate::storage::lifecycle::dispatch_blocking(move || {
-                    crate::metadata::write_json(&binding_path, &binding)
-                })
-                .await
-                .map_err(|error| CowshedError::internal(error.to_string()))?
-                .map_err(native_integrity_error)
-            })
+            .execute_adopt_staged(
+                plan,
+                crate::storage::apfs::Alongside {
+                    work: mint,
+                    abandon: super::build_volumes::FirstMint::abandon,
+                },
+                move |stage| async move {
+                    timed_async(
+                        "adopt",
+                        "locks",
+                        crate::inherited_git_locks::discard_in(&stage.mount_point),
+                    )
+                    .await?;
+                    timed_async(
+                        "adopt",
+                        "daemons",
+                        crate::inherited_daemons::macos::discard_in(
+                            &stage.mount_point,
+                            crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                        ),
+                    )
+                    .await?;
+                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                    // The image's volume is case-sensitive; the tree it was copied from may not be.
+                    timed_async(
+                        "adopt",
+                        "case",
+                        repository.record_case_sensitive_filesystem(),
+                    )
+                    .await?;
+                    crate::storage::lifecycle::dispatch_blocking(move || {
+                        crate::metadata::write_json(&binding_path, &binding)
+                    })
+                    .await
+                    .map_err(|error| CowshedError::internal(error.to_string()))?
+                    .map_err(native_integrity_error)
+                },
+            )
             .await
             .map_err(native_staged_error)?;
         // Published, main's image owns its block: the kernel claim ends here, before anything
         // that lets another process's gateway reconcile install main's session on the block.
         drop(reservation);
-        self.conclude_adoption(&receipt.workspace).await
+        self.conclude_adoption(&receipt.workspace, first).await
     }
 
     async fn create(
@@ -9064,11 +9138,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 },
             })
             .collect::<Vec<_>>();
-        let links = self.build_volume_links().await?;
+        let (images, links) = self.build_volume_links().await?;
         let build = timed_async(
             "gc",
             "build-volumes",
-            self.build_volumes()?.collect(links, options.dry_run),
+            self.build_volumes()?
+                .collect(images, links, options.dry_run),
         )
         .await?;
         if options.dry_run {
@@ -9986,7 +10061,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ));
         }
         let mount = self.workspace_mount_path(&workspace)?;
-        self.refresh_build_state_for(&current, &mount).await
+        self.refresh_build_state_for(&current, &mount, super::build_volumes::Lent::Nothing)
+            .await
     }
 
     async fn build_volume(&mut self, workspace: WorkspaceName) -> Result<Option<PathBuf>> {

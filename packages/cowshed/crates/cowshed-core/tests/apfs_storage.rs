@@ -1120,8 +1120,8 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let callback_host = host.clone();
-    let receipt = substrate
-        .execute_adopt_staged(plan, move |stage| async move {
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), move |stage| async move {
             assert!(stage.workspace.name().is_main());
             assert!(
                 stage
@@ -1255,8 +1255,8 @@ async fn interrupted_adopt_resumes_its_canonical_image_in_place() {
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
-    let receipt = substrate
-        .execute_adopt_staged(plan, |stage| async move {
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), |stage| async move {
             assert!(
                 stage.resuming,
                 "the initializer reruns with resume authority"
@@ -1304,8 +1304,10 @@ async fn adopt_replaces_an_unpublished_main_copied_from_another_commit() {
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
-    let receipt = substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect("fresh adopt");
 
@@ -1333,8 +1335,10 @@ async fn adopt_replaces_a_pending_main_whose_volume_was_never_formatted() {
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
-    let receipt = substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect("fresh adopt");
 
@@ -1366,7 +1370,9 @@ async fn failed_resumed_adopt_keeps_the_pending_image_for_the_next_attempt() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect_err("credential mint failure");
 
@@ -1376,6 +1382,124 @@ async fn failed_resumed_adopt_keeps_the_pending_image_for_the_next_attempt() {
     assert!(!events.contains(&"activate-pending".to_owned()));
     assert_eq!(host.pending_adopt(), Some(pending));
     assert!(host.list(&repo()).expect("listing").is_empty());
+}
+
+/// Side work an adopt runs beside staging main (main's first build volume, minted beside it):
+/// the value it answers, which says when it is dropped.
+#[derive(Debug)]
+struct SideWork {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for SideWork {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A staged adopt answers its side work's output with the receipt once main is committed, and
+/// hands it to `abandon` when main is not: a staging failure or an initializer failure. Nothing
+/// of it is dropped unanswered on the way.
+#[tokio::test]
+async fn a_staged_adopt_answers_its_side_work_or_abandons_it() {
+    let (abandoning, abandoned) = std::sync::mpsc::channel();
+    let side = |dropped: &Arc<AtomicBool>, label: &'static str| Alongside {
+        work: {
+            let dropped = Arc::clone(dropped);
+            async move { (label, SideWork { dropped }) }
+        },
+        abandon: {
+            let abandoning = abandoning.clone();
+            move |(label, work): (&'static str, SideWork)| async move {
+                abandoning.send(label).expect("the test holds the receiver");
+                drop(work);
+            }
+        },
+    };
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let host = FakeHost::default();
+    let committing = substrate(host.clone(), CountingLane::default());
+    let plan = committing.plan_adopt(adopt_request()).expect("adopt plan");
+    let (_, (label, work)) = committing
+        .execute_adopt_staged(plan, side(&dropped, "committed"), |_| async {
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("adopt");
+    assert_eq!(label, "committed");
+    assert!(!dropped.load(Ordering::SeqCst), "answered, not dropped");
+    drop(work);
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let host = FakeHost::default();
+    host.resume_adopt_from(pending_adoption(&identity()));
+    host.fail_next_credentials();
+    let failing = substrate(host.clone(), CountingLane::default());
+    let plan = failing.plan_adopt(adopt_request()).expect("adopt plan");
+    failing
+        .execute_adopt_staged(plan, side(&dropped, "unstaged"), |_| async {
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect_err("credential mint failure");
+    assert!(dropped.load(Ordering::SeqCst));
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let host = FakeHost::default();
+    let initializing = substrate(host.clone(), CountingLane::default());
+    let plan = initializing
+        .plan_adopt(adopt_request())
+        .expect("adopt plan");
+    initializing
+        .execute_adopt_staged(plan, side(&dropped, "uninitialized"), |_| async {
+            Err::<(), &'static str>("initializer failure")
+        })
+        .await
+        .expect_err("initializer failure");
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        abandoned.try_iter().collect::<Vec<_>>(),
+        ["unstaged", "uninitialized"]
+    );
+}
+
+/// An adopt dropped while its initializer runs drops its side work's output with it, unanswered
+/// and unabandoned: what owns a resource there releases it when dropped (main's first build
+/// volume does), since nothing after the drop runs for it.
+#[tokio::test]
+async fn a_dropped_staged_adopt_drops_its_side_work_output() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let host = FakeHost::default();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
+    let (started, initializing) = tokio::sync::oneshot::channel();
+    let adopt = substrate.execute_adopt_staged(
+        plan,
+        Alongside {
+            work: {
+                let dropped = Arc::clone(&dropped);
+                async move { SideWork { dropped } }
+            },
+            abandon: {
+                let abandoned = Arc::clone(&abandoned);
+                move |_: SideWork| async move { abandoned.store(true, Ordering::SeqCst) }
+            },
+        },
+        move |_| async move {
+            started
+                .send(())
+                .expect("the test waits for the initializer");
+            std::future::pending::<Result<(), &'static str>>().await
+        },
+    );
+    tokio::select! {
+        _ = adopt => panic!("the initializer never returns"),
+        started = initializing => started.expect("the initializer ran"),
+    }
+    assert!(dropped.load(Ordering::SeqCst), "dropped with the adopt");
+    assert!(!abandoned.load(Ordering::SeqCst));
 }
 
 /// The mountpoint *is* the checkout path and cannot exist until the swap creates it, so the swap
@@ -1388,7 +1512,9 @@ async fn direct_mount_adopt_swaps_the_checkout_before_mounting_it() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
-        .execute_adopt_staged(plan, |_stage| async { Ok::<(), &'static str>(()) })
+        .execute_adopt_staged(plan, Alongside::none(), |_stage| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect("adopt");
 
@@ -1474,7 +1600,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     let callback_host = host.clone();
 
     let error = substrate
-        .execute_adopt_staged(plan, move |stage| async move {
+        .execute_adopt_staged(plan, Alongside::none(), move |stage| async move {
             assert_eq!(
                 callback_host.mounted_paths_now(),
                 BTreeSet::from([stage.mount_point])
@@ -1514,7 +1640,9 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect_err("credential mint failure");
 
@@ -1541,7 +1669,9 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let error = substrate
-        .execute_adopt_staged(plan, |_| async { Err("tool wiring rejected") })
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Err("tool wiring rejected")
+        })
         .await
         .expect_err("initializer and cleanup fail");
 
@@ -1578,7 +1708,9 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         let plan = substrate.plan_adopt(request).expect("adopt plan");
 
         let error = substrate
-            .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+            .execute_adopt_staged(plan, Alongside::none(), |_| async {
+                Ok::<(), &'static str>(())
+            })
             .await
             .unwrap_err();
 
@@ -1602,11 +1734,13 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
     let host = FakeHost::default();
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
-    let workspace = substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
-        .expect("adopt")
-        .workspace;
+        .expect("adopt");
+    let workspace = receipt.workspace;
     host.clear_events();
 
     let path = substrate
@@ -1631,7 +1765,9 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
     let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let error = substrate
-        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect_err("marker mismatch");
     assert!(matches!(
@@ -2218,7 +2354,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     let callback_entered = Arc::clone(&entered);
     let task = tokio::spawn(async move {
         substrate
-            .execute_adopt_staged(plan, move |_| async move {
+            .execute_adopt_staged(plan, Alongside::none(), move |_| async move {
                 callback_entered.store(true, Ordering::SeqCst);
                 std::future::pending::<Result<(), &'static str>>().await
             })

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cowshed_core::api::{CreateOptions, RemoveOptions, RemoveReport};
+use cowshed_core::api::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
 use cowshed_core::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
@@ -334,35 +334,41 @@ fn only_a_prepared_clone_intent_can_be_withdrawn() {
 }
 
 /// Build-volume collection keeps what a create or fork past its mutation fence may have forked
-/// into its unpublished clone: only those intents name a forming workspace. A prepared clone has
-/// made nothing, a completed one is published, and a retirement forms nothing.
+/// into its unpublished clone, and the first build volume an adopt past its fence may have minted
+/// beside main's image: only those intents name a forming workspace. A prepared verb has made
+/// nothing, a completed one is published, and a retirement forms nothing.
 #[test]
-fn only_a_mutating_unfinished_clone_is_forming() {
+fn only_a_mutating_unfinished_clone_or_adoption_is_forming() {
     let mut journal = LifecycleIntentJournal::default();
     let forming = |journal: &LifecycleIntentJournal| journal.forming().cloned().collect::<Vec<_>>();
+    journal.begin(LifecycleIntent::Adopt {
+        options: AdoptOptions::default(),
+    });
     journal.begin(intent("create"));
     journal.begin(intent("fork"));
     journal.begin(intent("remove"));
     assert_eq!(forming(&journal), Vec::<WorkspaceName>::new());
 
-    for name in ["created", "forked", "removed"] {
+    for name in ["main", "created", "forked", "removed"] {
         journal
             .mark_mutating(&workspace(name))
             .expect("cross the mutation fence");
     }
     assert_eq!(
         forming(&journal),
-        [workspace("created"), workspace("forked")]
+        [workspace("created"), workspace("forked"), workspace("main")]
     );
 
-    journal
-        .complete(
-            &workspace("created"),
-            LifecycleIntentCompletion::Workspace(
-                WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
-            ),
-        )
-        .expect("publish the created workspace");
+    for name in ["created", "main"] {
+        journal
+            .complete(
+                &workspace(name),
+                LifecycleIntentCompletion::Workspace(
+                    WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
+                ),
+            )
+            .expect("publish the workspace");
+    }
     assert_eq!(forming(&journal), [workspace("forked")]);
 }
 

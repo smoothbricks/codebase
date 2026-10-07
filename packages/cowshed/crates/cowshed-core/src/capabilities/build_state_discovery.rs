@@ -143,6 +143,46 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
     Ok(digest.finalize().to_hex().to_string())
 }
 
+/// Whether discovery at `workspace` can name any build state: it names only a tracked Cargo
+/// manifest's targets, a tracked package manifest's installed tool caches, a declared `[build]
+/// state`, or what an enabled Nx or codegraph detector contributes. The other tracked build
+/// inputs (`.cargo/config*`, `go.mod`, whose caches are the host's) name none. A checkout with
+/// none of them has its first touch make no volume, so `adopt` mints none beside main's image
+/// for it.
+pub fn may_name_build_state(workspace: &Path) -> Result<bool> {
+    let mut tracked = TrackedManifests::default();
+    if tracked
+        .inputs(workspace)?
+        .split(|byte| *byte == 0)
+        .map(|name| Path::new(std::ffi::OsStr::from_bytes(name)))
+        .any(|path| {
+            tracked_manifest(path, Path::new(""), "Cargo.toml")
+                || tracked_manifest(path, Path::new(""), PACKAGE_MANIFEST)
+        })
+    {
+        return Ok(true);
+    }
+    let settings = super::workspace_config(workspace)?;
+    if !settings.build_state().is_empty() {
+        return Ok(true);
+    }
+    for detector in [&super::nx::DETECTOR, &super::codegraph::DETECTOR] {
+        let setting = settings.capabilities().get(&detector.id);
+        if setting.is_some_and(|setting| setting.disabled) {
+            continue;
+        }
+        let project = setting
+            .and_then(|setting| setting.directory.as_ref())
+            .map(|directory| workspace.join(directory))
+            .unwrap_or_else(|| workspace.to_owned());
+        super::validate_project_directory(workspace, &project)?;
+        if detector.matches(workspace, &project, &mut tracked)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Cargo's answer to one query discovery asks of it: its stdout, or why it gave none.
 pub type CargoAnswer = std::result::Result<Vec<u8>, String>;
 

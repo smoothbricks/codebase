@@ -142,7 +142,17 @@ where the link belongs is discarded and relinked, never copied, and reported). W
 again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a checkout's build
 state): new paths join the volume, held ones never move. A checkout with build state and no volume gets its first one
 (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
-A build-state path that holds tracked source refuses before anything is deleted.
+Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted checkout's
+`.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01_storage.md, "How the APFS host degrades"),
+unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`,
+no enabled Nx or codegraph detector match), whose first touch makes no volume. Main's first touch links it once main is
+mounted at the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's
+`.cowshed.toml` may change while main is copied; the first touch then mints its own at the capacity asked now). A mint
+that failed fails only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption
+releases the volume before it completes whenever its first touch does not link it (nothing to hold, a refusal, a
+failure, a volume already linked, another capacity), and an adoption dropped before that (a cancelled request) releases
+it as it is dropped, the mint itself when it was still running. A build-state path that holds tracked source refuses
+before anything is deleted.
 
 A link displaced between refreshes detaches the checkout from its volume until the next one: what a tool writes there
 reaches no fork, land or seed. A tool that removes the path itself (`nx reset`, an `rm -rf` of the path) leaves its next
@@ -484,8 +494,8 @@ again at any level above it.
 - The last checkout link is the reclaim moment. Removing or retiring a checkout, adopting a replacement, failing a fork,
   or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
-- Ownership is a job hold or an unfinished create/fork in the lifecycle intent journal, not the kernel's refusal to
-  unmount. Every admitted cowshed job holds a shared flock on the build volume's `<id>.asif.hold` for its lifetime;
+- Ownership is a job hold or an unfinished create/fork/adopt in the lifecycle intent journal, not the kernel's refusal
+  to unmount. Every admitted cowshed job holds a shared flock on the build volume's `<id>.asif.hold` for its lifetime;
   release must claim it exclusively. A running job therefore keeps main's previous volume across a swap.
 - Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
   to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
@@ -497,15 +507,20 @@ again at any level above it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
   when the target retires. Detached seeds do not need an attach or a rename to be deleted.
 - A fork's volume and seed exist before its workspace does: `cowshed new` and `cowshed fork` clone them into the staged
-  checkout, which no other process can read, and publish the workspace afterwards. While the create or fork is past its
-  mutation fence and unfinished in the lifecycle intent journal, collection in any process defers the volumes recorded
-  as that workspace's or as its seed, and every image without a record, naming the workspace. Without this, an `rm` in
-  one process deleted the volume and seed of a `new` running in another, and the new workspace's mount refused its link
-  to a volume nobody owned.
-- Collection says why it skips: a job hold, an unfinished create/fork, an unreadable detached checkout or record, or a
-  failed release names the volume and reason. Opportunistic collection counts routine detached/still-forming deferrals
-  on one line. One volume's release failure does not hide later candidates. `--dry-run` changes nothing and reports the
-  same ownership reasons.
+  checkout, which no other process can read, and publish the workspace afterwards. Main's first volume likewise exists
+  before main's first touch links it: `cowshed adopt` mints it beside main's image, and completes its intent only once
+  the first touch linked it or the adoption released it. While the create, fork or adopt is past its mutation fence and
+  unfinished in the lifecycle intent journal, collection in any process defers the volumes recorded as that workspace's
+  or as its seed, and every image without a record, naming the workspace. Without this, an `rm` in one process deleted
+  the volume and seed of a `new` running in another, and the new workspace's mount refused its link to a volume nobody
+  owned. A verb crosses its fence before it makes a volume, so collection lists the images first and then reads the
+  journal and the workspaces, and decides only the images it listed: one made after the listing is left to a later pass,
+  never decided from links read before it existed. An adoption killed between the mint and the link leaves an image
+  without a record, deferred until the replayed adoption completes and collected after.
+- Collection says why it skips: a job hold, an unfinished create/fork/adopt, an unreadable detached checkout or record,
+  or a failed release names the volume and reason. Opportunistic collection counts routine detached/still-forming
+  deferrals on one line. One volume's release failure does not hide later candidates. `--dry-run` changes nothing and
+  reports the same ownership reasons.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
   database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in

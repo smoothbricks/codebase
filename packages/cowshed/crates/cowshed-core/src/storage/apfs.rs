@@ -177,14 +177,20 @@ pub type AdoptStage = WorkspaceStage;
 pub type CreateStage = WorkspaceStage;
 pub type ForkStage = WorkspaceStage;
 
-/// Work a staged create or fork runs beside staging its clone, under the plan's locks: it starts
-/// once the locks are held and the plan's facts revalidated, runs while the clone is attached
-/// and mounted, and its output goes to the initializer with the stage. When the clone cannot be
-/// staged, `abandon` gets that output instead, so nothing the work made outlives the failure.
+/// Work a staged create, fork or adopt runs beside staging its image, under the plan's locks: it
+/// starts once the locks are held and the plan's facts revalidated, and runs while the image is
+/// attached and mounted. A create or fork gives its output to the initializer with the stage; an
+/// adopt answers it with the receipt once main is committed. When the image cannot be staged (or
+/// an adopt's be initialized or committed), `abandon` gets that output instead, so nothing the
+/// work made outlives the failure. An operation dropped before either drops the work and its
+/// output with it, and nothing runs for them after: an output that owns a resource releases it
+/// when dropped (main's first build volume does), and work dropped while it runs releases what
+/// it makes once nobody is there to take it.
 ///
-/// It exists for a second image the operation attaches anyway (a fork's build volume): every
-/// `diskutil image attach` waits in the host's one `storagekitd` queue (01_storage.md, "How the
-/// APFS host degrades"), and two attaches in flight together wait in it once, not twice.
+/// It exists for a second image the operation attaches anyway (a fork's build volume, main's
+/// first one): every `diskutil image attach` waits in the host's one `storagekitd` queue
+/// (01_storage.md, "How the APFS host degrades"), and two attaches in flight together wait in it
+/// once, not twice.
 pub struct Alongside<W, D> {
     pub work: W,
     pub abandon: D,
@@ -927,16 +933,22 @@ where
     }
 
     /// Create main's canonical image behind its `PendingFence`, mount it at a staging mountpoint
-    /// for the controller to initialize, then publish it and mount it at the checkout.
+    /// for the controller to initialize, then publish it and mount it at the checkout, with
+    /// `alongside`'s work run beside the staging; its output is answered with the receipt.
     ///
     /// The lifecycle lock remains owned across the callback. The image stays unpublished and the
     /// checkout untouched until `initialize` returns success.
-    pub async fn execute_adopt_staged<F, Fut, E>(
+    pub async fn execute_adopt_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: AdoptPlan,
+        alongside: Alongside<W, D>,
         initialize: F,
-    ) -> Result<LifecycleReceipt, AdoptExecutionError<E>>
+    ) -> Result<(LifecycleReceipt, W::Output), AdoptExecutionError<E>>
     where
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
         F: FnOnce(AdoptStage) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send,
@@ -959,36 +971,42 @@ where
         let incarnations = Arc::clone(&self.incarnations);
         let expected = plan.expected().to_vec();
         let operation = plan.operation().clone();
-        let prepared = self
-            .lane
-            .dispatch(move || {
-                let Operation::Adopt {
+        let staging = self.lane.dispatch(move || {
+            let Operation::Adopt {
+                repo,
+                capacity,
+                source_checkout,
+                pre_cowshed_checkout,
+                identity,
+            } = &operation
+            else {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "staged adopt executor requires an adopt operation",
+                ));
+            };
+            prepare_adopt_stage(
+                host.as_ref(),
+                &config,
+                &expected,
+                AdoptExecution {
                     repo,
-                    capacity,
+                    capacity: *capacity,
                     source_checkout,
                     pre_cowshed_checkout,
                     identity,
-                } = &operation
-                else {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "staged adopt executor requires an adopt operation",
-                    ));
-                };
-                prepare_adopt_stage(
-                    host.as_ref(),
-                    &config,
-                    &expected,
-                    AdoptExecution {
-                        repo,
-                        capacity: *capacity,
-                        source_checkout,
-                        pre_cowshed_checkout,
-                        identity,
-                    },
-                    incarnations.as_ref(),
-                )
-            })
-            .await?;
+                },
+                incarnations.as_ref(),
+            )
+        });
+        let Alongside { work, abandon } = alongside;
+        let (prepared, beside) = tokio::join!(staging, work);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                abandon(beside).await;
+                return Err(error.into());
+            }
+        };
         let prepared =
             StagedCallbackGuard::new(Arc::clone(&self.host), prepared, abort_prepared_adopt::<H>);
 
@@ -999,6 +1017,7 @@ where
                 .lane
                 .dispatch(move || abort_prepared_adopt(host.as_ref(), prepared))
                 .await;
+            abandon(beside).await;
             return Err(match cleanup {
                 Ok(()) => StagedExecutionError::Initializer(initializer),
                 Err(cleanup) => StagedExecutionError::InitializerCleanup {
@@ -1014,10 +1033,17 @@ where
         let applied = self
             .lane
             .dispatch(move || commit_prepared_adopt(host.as_ref(), &config, prepared))
-            .await?;
+            .await;
         match applied {
-            Applied::Lifecycle(receipt) => Ok(receipt),
-            _ => Err(ApfsStorageError::UnexpectedResult.into()),
+            Ok(Applied::Lifecycle(receipt)) => Ok((receipt, beside)),
+            Ok(_) => {
+                abandon(beside).await;
+                Err(ApfsStorageError::UnexpectedResult.into())
+            }
+            Err(error) => {
+                abandon(beside).await;
+                Err(error.into())
+            }
         }
     }
 

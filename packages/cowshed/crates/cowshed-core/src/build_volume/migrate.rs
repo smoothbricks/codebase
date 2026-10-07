@@ -22,8 +22,34 @@ pub struct FirstTouch<'a> {
     pub checkout: &'a Path,
     pub paths: &'a [BuildStatePath],
     pub fingerprint: String,
+    /// The capacity the checkout's `.cowshed.toml` asks of its first volume.
     pub capacity: ImageCapacity,
+    pub beside: MintedBeside,
     pub record: BuildVolumeRecord,
+}
+
+/// What `adopt` minted beside main's image for main's first touch, which decides it only when
+/// the checkout links no volume and needs one: the first touch of any other checkout, or of a
+/// replayed adoption, mints its own.
+#[derive(Clone, Debug)]
+pub enum MintedBeside {
+    /// Nothing: no adopt minted one, or nothing in the checkout can name build state.
+    Nothing,
+    /// Mounted, linked by nothing and without a record. The first touch links it when it was
+    /// minted at the capacity asked now, and mints its own otherwise; the adopt releases it when
+    /// the checkout does not link it.
+    Volume(MintedVolume),
+    /// The mint failed. A first touch that needs a volume answers this error and does not mint
+    /// again: it is the volume's creation failing, as when the first touch minted it.
+    Failed(CowshedError),
+}
+
+/// An empty build volume minted and mounted at its layout mountpoint at `capacity`, without a
+/// record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintedVolume {
+    pub id: BuildVolumeId,
+    pub capacity: ImageCapacity,
 }
 
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
@@ -41,6 +67,7 @@ pub fn first_touch(
         paths,
         fingerprint,
         capacity,
+        beside,
         record,
     } = migration;
     let found = preflight(checkout, paths)?;
@@ -59,12 +86,18 @@ pub fn first_touch(
             )
         })?,
         None => {
-            let id = BuildVolumeId::mint();
-            let mount = host
-                .create_build_volume(layout, &id, capacity)
-                .map_err(storage_error)?;
+            let id = match beside {
+                MintedBeside::Volume(minted) if minted.capacity == capacity => minted.id,
+                MintedBeside::Failed(error) => return Err(error),
+                MintedBeside::Nothing | MintedBeside::Volume(_) => {
+                    let id = BuildVolumeId::mint();
+                    host.create_build_volume(layout, &id, capacity)
+                        .map_err(storage_error)?;
+                    id
+                }
+            };
             // The actual link protects this unrecorded image from GC and lets a retry find it.
-            link::point(checkout, &mount)?;
+            link::point(checkout, &layout.mount(&id))?;
             id
         }
     };

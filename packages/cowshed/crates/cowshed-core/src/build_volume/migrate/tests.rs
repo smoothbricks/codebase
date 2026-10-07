@@ -310,6 +310,7 @@ fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_dele
             paths: &discovery.paths,
             fingerprint: "fixture".to_owned(),
             capacity: ImageCapacity::from_gibibytes(1),
+            beside: MintedBeside::Nothing,
             record: linked_record(),
         },
     )
@@ -371,6 +372,7 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 paths: &paths(),
                 fingerprint: "fixture".to_owned(),
                 capacity: ImageCapacity::from_gibibytes(1),
+                beside: MintedBeside::Nothing,
                 record: linked_record(),
             }
         )
@@ -395,6 +397,7 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 paths: &paths(),
                 fingerprint: "fixture".to_owned(),
                 capacity: ImageCapacity::from_gibibytes(1),
+                beside: MintedBeside::Nothing,
                 record: linked_record(),
             },
         )

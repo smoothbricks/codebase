@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::apfs::SystemCommandRunner;
@@ -20,6 +20,7 @@ use crate::api::dto::{
     AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry,
     RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
 };
+use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
     BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
@@ -44,8 +45,9 @@ pub(crate) struct Owner {
 
 /// What links build volumes right now: every mounted checkout's build link, every existing
 /// workspace (whose seed a seed may be), the detached ones, whose links cannot be read, and the
-/// ones being created: a create or fork forks its build volume and seed into the staged checkout
-/// before the workspace exists, so until its intent completes nothing readable names either.
+/// ones being created: a create or fork forks its build volume and seed into the staged checkout,
+/// and an adopt mints main's first one beside main's image, before the workspace exists, so until
+/// its intent completes nothing readable names either.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Links {
     pub volumes: BTreeSet<BuildVolumeId>,
@@ -147,6 +149,180 @@ pub(crate) struct Collection {
     pub deferred: Vec<Deferred>,
 }
 
+/// What [`BuildVolumes::mint_first`] did beside main's image, owned by the adopt until it
+/// settles or abandons it.
+#[must_use = "settle or abandon releases a minted volume main's first touch did not link"]
+pub(crate) enum FirstMint {
+    /// Nothing minted: nothing in the checkout can name build state, or a replayed adoption,
+    /// whose first touch mints its own.
+    Nothing,
+    Minted(OwnedMint),
+    Failed(CowshedError),
+}
+
+/// A volume minted beside main's image that nothing has decided yet, in the slot main's first
+/// touch holds locked while it runs ([`Lent`]): its release takes the same lock, so it waits for
+/// a first touch that is running and then decides on the link that first touch left. Dropped
+/// before [`FirstMint::settle`] or [`FirstMint::abandon`] emptied the slot (an adopt cancelled
+/// in its staging, initializer, commit or conclusion), it is released unless the checkout links
+/// it: on the blocking lane when a runtime is there to run it, at once otherwise, and at once
+/// too when that runtime refuses or cancels the task ([`DroppedMint`]).
+pub(crate) struct OwnedMint {
+    volumes: BuildVolumes,
+    checkout: PathBuf,
+    slot: MintSlot,
+}
+
+/// The volume an [`OwnedMint`] holds until its release takes it.
+pub(crate) type MintSlot = Arc<Mutex<Option<MintedVolume>>>;
+
+/// The slot's volume, under its lock. The lock guards no invariant a panic can break: a
+/// poisoned slot still names the volume or nothing.
+fn lock(slot: &MintSlot) -> MutexGuard<'_, Option<MintedVolume>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl OwnedMint {
+    /// Release the slot's volume unless the checkout links it, once a first touch that holds the
+    /// slot has finished. Blocking.
+    fn release_now(&self, host: &Host, layout: &BuildVolumeLayout, whose: &str) {
+        release_slot(host, layout, &self.slot, &self.checkout, whose);
+    }
+}
+
+fn release_slot(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    slot: &MintSlot,
+    checkout: &Path,
+    whose: &str,
+) {
+    if let Some(volume) = lock(slot).take() {
+        release_minted(host, layout, &volume, checkout, whose);
+    }
+}
+
+/// The release a dropped [`OwnedMint`] owes, run when this is dropped: by the blocking task it is
+/// handed to, or by a runtime that refuses that task or shuts down before it starts, which drops
+/// it unrun. Plain values, not an `OwnedMint`, so its drop never spawns again.
+struct DroppedMint {
+    volumes: BuildVolumes,
+    checkout: PathBuf,
+    slot: MintSlot,
+}
+
+impl Drop for DroppedMint {
+    fn drop(&mut self) {
+        release_slot(
+            &self.volumes.host,
+            &self.volumes.layout,
+            &self.slot,
+            &self.checkout,
+            CANCELLED,
+        );
+    }
+}
+
+impl Drop for OwnedMint {
+    fn drop(&mut self) {
+        // Settled already: nothing to spawn. A first touch holding the slot leaves it to the
+        // release, which waits for it on the blocking lane.
+        if let Ok(slot) = self.slot.try_lock()
+            && slot.is_none()
+        {
+            return;
+        }
+        let dropped = DroppedMint {
+            volumes: self.volumes.clone(),
+            checkout: self.checkout.clone(),
+            slot: Arc::clone(&self.slot),
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || drop(dropped))),
+            Err(_) => drop(dropped),
+        }
+    }
+}
+
+/// Whose volume [`release_minted`] says it released when an adopt was dropped before it decided.
+const CANCELLED: &str = "a cancelled adoption's first";
+
+/// What main's first touch is lent of a [`FirstMint`]: the minted volume's slot, which the first
+/// touch holds locked while it runs, so no release of the volume overlaps it.
+#[derive(Clone)]
+pub(crate) enum Lent {
+    Nothing,
+    Volume(MintSlot),
+    Failed(CowshedError),
+}
+
+impl FirstMint {
+    /// What main's first touch is lent; this keeps the volume until it settles.
+    pub fn lend(&self) -> Lent {
+        match self {
+            Self::Nothing => Lent::Nothing,
+            Self::Minted(owned) => Lent::Volume(Arc::clone(&owned.slot)),
+            Self::Failed(error) => Lent::Failed(error.clone()),
+        }
+    }
+
+    /// Release the minted volume unless main's checkout links it now: whatever main's first
+    /// touch did not take, whether it refused, failed, found a volume already linked, minted its
+    /// own at another capacity, found nothing to hold, or never ran. Kept when linked, even with
+    /// no record yet: the link protects it and a retried first touch finds it. A link that cannot
+    /// be read or a release that fails keeps it too, said on stderr, for collection once the
+    /// adopt's intent is resolved.
+    pub async fn settle(self) {
+        self.release("main's unlinked first").await;
+    }
+
+    /// Release what was minted for an adoption that never committed; a mint that failed is said
+    /// on stderr beside the adoption's own failure, which the caller answers.
+    pub async fn abandon(self) {
+        if let Self::Failed(error) = &self {
+            eprintln!(
+                "cowshed: main's first build volume could not be minted beside its image either: {error}"
+            );
+        }
+        self.release("an adoption that never committed its").await;
+    }
+
+    async fn release(self, whose: &'static str) {
+        let Self::Minted(owned) = self else {
+            return;
+        };
+        let volumes = owned.volumes.clone();
+        let released = volumes
+            .blocking(move |host, layout| {
+                owned.release_now(host, layout, whose);
+                Ok(())
+            })
+            .await;
+        if let Err(error) = released {
+            eprintln!(
+                "cowshed: {whose} build volume minted beside main stays: {error}; `cowshed gc` retries it"
+            );
+        }
+    }
+}
+
+impl Lent {
+    /// Run `touch` with what was minted, holding the slot locked throughout.
+    fn hold<T>(&self, touch: impl FnOnce(MintedBeside) -> T) -> T {
+        match self {
+            Self::Nothing => touch(MintedBeside::Nothing),
+            Self::Failed(error) => touch(MintedBeside::Failed(error.clone())),
+            Self::Volume(slot) => {
+                let held = lock(slot);
+                touch(
+                    held.clone()
+                        .map_or(MintedBeside::Nothing, MintedBeside::Volume),
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BuildVolumes {
     host: Arc<Host>,
@@ -187,15 +363,19 @@ impl BuildVolumes {
     /// paths are re-linked where a tool displaced them. With fresh discovery, new paths join the
     /// volume's state (held ones never move), every path is linked, and the state records the new
     /// fingerprint. A checkout whose volume is not published yet (none, or an interrupted first
-    /// touch's) gets its first one at `capacity`, unless it links none and nothing was
-    /// discovered; `owner` then also gets its seed, a clone of that volume, when it has none, so
-    /// it is a target others fork from (16_build_volumes.md, "Targets and seeds"). A path that
-    /// holds tracked source refuses before anything is deleted.
+    /// touch's) gets its first one at `capacity`, or the one `lent` names when it links none
+    /// ([`MintedBeside`]), unless it links none and nothing was discovered; `owner` then also gets
+    /// its seed, a clone of that volume, when it has none, so it is a target others fork from
+    /// (16_build_volumes.md, "Targets and seeds"). A path that holds tracked source refuses
+    /// before anything is deleted. A volume `lent` names that this does not link stays its
+    /// [`FirstMint`]'s to release; its slot is held locked for the first touch, so no release
+    /// overlaps it.
     pub async fn refresh(
         &self,
         owner: Owner,
         checkout: PathBuf,
         discovered: Discovered,
+        lent: Lent,
     ) -> Result<std::result::Result<BuildStateRefresh, TrackedBuildStateRefusal>> {
         let linked = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| {
@@ -222,22 +402,25 @@ impl BuildVolumes {
                         capacity,
                     },
                 ) => {
-                    let touched = crate::build_volume::migrate::first_touch(
-                        host,
-                        layout,
-                        crate::build_volume::migrate::FirstTouch {
-                            checkout: &checkout,
-                            paths: &paths,
-                            fingerprint,
-                            capacity,
-                            record: BuildVolumeRecord::new(
-                                None,
-                                BuildVolumeRole::Linked {
-                                    checkout: owner.name.clone(),
-                                },
-                            ),
-                        },
-                    )?;
+                    let touched = lent.hold(|beside| {
+                        crate::build_volume::migrate::first_touch(
+                            host,
+                            layout,
+                            crate::build_volume::migrate::FirstTouch {
+                                checkout: &checkout,
+                                paths: &paths,
+                                fingerprint,
+                                capacity,
+                                beside,
+                                record: BuildVolumeRecord::new(
+                                    None,
+                                    BuildVolumeRole::Linked {
+                                        checkout: owner.name.clone(),
+                                    },
+                                ),
+                            },
+                        )
+                    })?;
                     let (id, displaced) = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
@@ -297,6 +480,55 @@ impl BuildVolumes {
             }))
         })
         .await
+    }
+
+    /// Main's first build volume, minted and mounted beside main's own image while `adopt`
+    /// copies `source` into it, so the two attaches wait on `storagekitd` once
+    /// (16_build_volumes.md, "Targets and seeds"): at the capacity `source`'s `.cowshed.toml`
+    /// asks, and none when nothing in `source` can name build state, whose first touch makes no
+    /// volume. Nothing links it and it has no record until main's first touch at `checkout` links
+    /// it; until then the adopt's unfinished intent keeps collection off it
+    /// ([`Links::creating`]). A failed mint is answered, for the first touch to answer in turn if
+    /// it needs a volume.
+    ///
+    /// The volume is the answer's to release: dropped unsettled, it releases itself. An adopt
+    /// dropped while the mint runs leaves nobody to answer, so the mint releases what it made.
+    pub async fn mint_first(&self, source: PathBuf, checkout: PathBuf) -> FirstMint {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let volumes = self.clone();
+        let minting = self.blocking(move |host, layout| {
+            let minted = may_mint(&source).and_then(|capacity| {
+                capacity
+                    .map(|capacity| {
+                        let id = BuildVolumeId::mint();
+                        host.create_build_volume(layout, &id, capacity)
+                            .map_err(storage)?;
+                        Ok(MintedVolume { id, capacity })
+                    })
+                    .transpose()
+            });
+            let first = match minted {
+                Ok(None) => FirstMint::Nothing,
+                Ok(Some(volume)) => FirstMint::Minted(OwnedMint {
+                    volumes,
+                    checkout,
+                    slot: Arc::new(Mutex::new(Some(volume))),
+                }),
+                Err(error) => FirstMint::Failed(error),
+            };
+            if let Err(FirstMint::Minted(unanswered)) = answer.send(first) {
+                unanswered.release_now(host, layout, CANCELLED);
+            }
+            Ok(())
+        });
+        if let Err(error) = minting.await {
+            return FirstMint::Failed(error);
+        }
+        answered.await.unwrap_or_else(|_| {
+            FirstMint::Failed(CowshedError::internal(
+                "main's first build volume mint ended without an answer",
+            ))
+        })
     }
 
     /// Fork steps 2 and 3 (16_build_volumes.md, "Fork"), up to the checkout: `source`'s seed
@@ -825,13 +1057,18 @@ impl BuildVolumes {
         .await
     }
 
-    /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms. A volume a job
-    /// still holds, or whose release fails, is deferred to the next pass with the reason, beside
-    /// what the plan itself deferred; one release that fails never keeps the others. Every
-    /// process a forced unmount cut off is named on stderr.
-    pub async fn collect(&self, links: Links, dry_run: bool) -> Result<Collection> {
+    /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms of `images`, listed
+    /// before `links` was read. A volume a job still holds, or whose release fails, is deferred
+    /// to the next pass with the reason, beside what the plan itself deferred; one release that
+    /// fails never keeps the others. Every process a forced unmount cut off is named on stderr.
+    pub async fn collect(
+        &self,
+        images: Vec<BuildVolumeId>,
+        links: Links,
+        dry_run: bool,
+    ) -> Result<Collection> {
         self.blocking(move |host, layout| {
-            let plan = plan(layout, &links)?;
+            let plan = plan(layout, &images, &links)?;
             let mut collection = Collection {
                 examined: plan.examined,
                 deferred: plan
@@ -916,13 +1153,13 @@ pub(crate) enum Deferral {
     /// Its record names `0` as its checkout, which is detached: that checkout's link cannot be
     /// read until it is attached, so nothing proves the volume unreachable.
     DetachedCheckout(WorkspaceName),
-    /// Its record names `0` as its checkout or seed target, whose create or fork has not
+    /// Its record names `0` as its checkout or seed target, whose create, fork or adopt has not
     /// finished: the staged checkout's link cannot be read, and the workspace does not exist
     /// yet, so nothing proves the volume unreachable.
     Creating(WorkspaceName),
     /// It has no record, and workspaces whose links cannot be read yet may name it: the
-    /// detached ones until they are attached, the ones being created until their create or fork
-    /// finishes.
+    /// detached ones until they are attached, the ones being created until their create, fork
+    /// or adopt finishes.
     Unrecorded {
         detached: Vec<WorkspaceName>,
         creating: Vec<WorkspaceName>,
@@ -966,7 +1203,7 @@ impl std::fmt::Display for Deferral {
             ),
             Self::Creating(workspace) => write!(
                 formatter,
-                "its record names {workspace}, whose create or fork has not finished; decided once it has"
+                "its record names {workspace}, whose create, fork or adopt has not finished; decided once it has"
             ),
             Self::Unrecorded { detached, creating } => {
                 formatter.write_str("it has no record, and the links of")?;
@@ -981,7 +1218,7 @@ impl std::fmt::Display for Deferral {
                 if !creating.is_empty() {
                     formatter.write_str(" still-forming ")?;
                     names(formatter, creating)?;
-                    formatter.write_str(" (until their create or fork finishes)")?;
+                    formatter.write_str(" (until their create, fork or adopt finishes)")?;
                 }
                 formatter.write_str(" cannot be read")
             }
@@ -1031,11 +1268,21 @@ pub(crate) struct Plan {
 /// created may name, whose staged link no other process can read and whose seed belongs to a
 /// workspace that does not exist yet; so is a volume whose record or size cannot be read.
 /// Nothing is deleted on a guess.
-pub(crate) fn plan(layout: &BuildVolumeLayout, links: &Links) -> Result<Plan> {
+///
+/// Only `images` are decided: those listed before `links` was read. A create, fork or adopt
+/// joins [`Links::creating`] before it makes a volume, and stays there until it has published
+/// the workspace that links it, so a volume listed first is named by one of the later reads.
+/// One made after the listing is in no `images`; deciding it from links read before it existed
+/// collected a fresh fork's volume as unlinked garbage.
+pub(crate) fn plan(
+    layout: &BuildVolumeLayout,
+    images: &[BuildVolumeId],
+    links: &Links,
+) -> Result<Plan> {
     let mut plan = Plan::default();
     let mut latest = std::collections::BTreeMap::<Owner, (String, BuildVolumeId)>::new();
     let mut doomed = Vec::new();
-    for id in layout.list()? {
+    for id in images.iter().cloned() {
         plan.examined += 1;
         if links.volumes.contains(&id) {
             continue;
@@ -1159,6 +1406,44 @@ fn retire_seeds(
         }
     }
     Ok(())
+}
+
+/// The capacity main's first build volume is minted at beside its image, from `source`'s
+/// `.cowshed.toml`, or `None` when nothing in `source` can name build state.
+fn may_mint(source: &Path) -> Result<Option<ImageCapacity>> {
+    if !crate::capabilities::may_name_build_state(source)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        crate::storage::bootstrap::main_cowshed_config(source)?.build_capacity(),
+    ))
+}
+
+/// Release a volume minted beside main's image unless `checkout` links it, and say on stderr
+/// what the release did or why the volume stays.
+fn release_minted(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    volume: &MintedVolume,
+    checkout: &Path,
+    whose: &str,
+) {
+    let id = &volume.id;
+    let released = layout.linked(checkout).and_then(|linked| {
+        if linked.as_ref() == Some(id) {
+            return Ok(None);
+        }
+        host.release_build_volume(layout, id)
+            .map(Some)
+            .map_err(storage)
+    });
+    match released {
+        Ok(None) => {}
+        Ok(Some(release)) => say_release(id, whose, &release),
+        Err(error) => eprintln!(
+            "cowshed: {whose} build volume {id}, minted beside main, stays: {error}; `cowshed gc` retries it"
+        ),
+    }
 }
 
 /// Say on stderr what a release did beyond deleting a volume nothing had open: each process its
@@ -1584,7 +1869,7 @@ mod tests {
             volumes: [unrecorded, recorded_elsewhere].into_iter().collect(),
             ..Links::default()
         };
-        let plan = plan(&store.layout, &links).unwrap();
+        let plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
         assert_eq!(
             doomed(&plan),
             [(garbage, GcReason::UnlinkedBuildVolume)],
@@ -1607,7 +1892,7 @@ mod tests {
             detached: [name("topic")].into_iter().collect(),
             ..Links::default()
         };
-        let mut plan = plan(&store.layout, &links).unwrap();
+        let mut plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
         plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
         let mut expected = vec![
             (named, Deferral::DetachedCheckout(name("topic"))),
@@ -1627,7 +1912,12 @@ mod tests {
             _ => !deferral.is_routine(),
         }));
         // With nothing detached, the same unrecorded image is an interrupted creation.
-        let plan = super::plan(&store.layout, &Links::default()).unwrap();
+        let plan = super::plan(
+            &store.layout,
+            &store.layout.list().unwrap(),
+            &Links::default(),
+        )
+        .unwrap();
         assert!(
             doomed(&plan).contains(&(
                 plan.doomed
@@ -1643,10 +1933,11 @@ mod tests {
     }
 
     /// A create or fork forks its volume and seed into a staged checkout no other process can
-    /// read, before its workspace exists. Until its intent completes, whatever may be its own —
-    /// its live volume, its seed, an image still being cloned for it — is deferred, never
-    /// collected. Another process's `rm` collected exactly these, and the new workspace's mount
-    /// then refused a link to a volume that was gone.
+    /// read, and an adopt mints main's first volume beside main's image, before the workspace
+    /// exists. Until its intent completes, whatever may be its own — its live volume, its seed,
+    /// an image still being cloned or minted for it — is deferred, never collected. Another
+    /// process's `rm` collected exactly these, and the new workspace's mount then refused a link
+    /// to a volume that was gone.
     #[test]
     fn a_forming_workspace_defers_its_volume_seed_and_unrecorded_clones() {
         let store = Store::new();
@@ -1661,7 +1952,8 @@ mod tests {
             creating: [name("lane")].into_iter().collect(),
             ..Links::default()
         };
-        let mut plan = plan(&store.layout, &links).unwrap();
+        let images = store.layout.list().unwrap();
+        let mut plan = plan(&store.layout, &images, &links).unwrap();
         plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
         let unrecorded = Deferral::Unrecorded {
             detached: Vec::new(),
@@ -1682,12 +1974,12 @@ mod tests {
         assert!(!unrecorded.is_routine());
         assert_eq!(
             unrecorded.to_string(),
-            "it has no record, and the links of still-forming lane (until their create or fork \
-             finishes) cannot be read"
+            "it has no record, and the links of still-forming lane (until their create, fork or \
+             adopt finishes) cannot be read"
         );
         // Without the forming workspace, all three read as garbage: the collection that left
         // a new workspace linking a volume nobody owned.
-        let mut doomed = doomed(&super::plan(&store.layout, &Links::default()).unwrap());
+        let mut doomed = doomed(&super::plan(&store.layout, &images, &Links::default()).unwrap());
         doomed.sort_by(|left, right| left.0.cmp(&right.0));
         let mut expected = vec![
             (live, GcReason::UnlinkedBuildVolume),
@@ -1697,6 +1989,49 @@ mod tests {
         ];
         expected.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(doomed, expected);
+    }
+
+    /// Collection decides only the images it listed before it read what links them. A verb that
+    /// crosses its mutation fence and makes a volume after the collection read the journal is
+    /// absent from those links, and its volume is not one of the images listed: it is left to a
+    /// later pass, whose links are read after the volume exists. Listed after the links, it was
+    /// decided from links that predate it, and collected as an interrupted creation.
+    #[test]
+    fn an_image_made_after_the_listing_is_left_to_a_later_pass() {
+        let store = Store::new();
+        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        // The collection lists the images, then reads the journal and the workspaces: no verb
+        // is forming yet.
+        let images = store.layout.list().unwrap();
+        let links = Links::default();
+        // Only then does an adopt cross its fence and mint main's first volume.
+        let minted = store.image();
+        let plan = plan(&store.layout, &images, &links).unwrap();
+        assert_eq!(
+            doomed(&plan),
+            [(garbage.clone(), GcReason::UnlinkedBuildVolume)],
+            "{plan:?}"
+        );
+        assert_eq!(plan.examined, 1);
+        assert_eq!(plan.deferred, []);
+        // The next pass lists it, and reads the journal after: main is forming until its first
+        // touch links the volume.
+        let next = Links {
+            creating: [name("main")].into_iter().collect(),
+            ..Links::default()
+        };
+        let plan = super::plan(&store.layout, &store.layout.list().unwrap(), &next).unwrap();
+        assert_eq!(doomed(&plan), [(garbage, GcReason::UnlinkedBuildVolume)]);
+        assert_eq!(
+            plan.deferred,
+            [(
+                minted,
+                Deferral::Unrecorded {
+                    detached: Vec::new(),
+                    creating: vec![name("main")],
+                }
+            )]
+        );
     }
 
     /// The `cowshed new` that another process's `rm` broke, on real APFS: a fork clones main's
@@ -1755,7 +2090,7 @@ mod tests {
 
         let kept = scratch
             .volumes
-            .collect(links(&[&lane]), false)
+            .collect(scratch.layout.list().unwrap(), links(&[&lane]), false)
             .await
             .unwrap();
         assert_eq!(kept.reclaimed, 0, "{:?}", kept.candidates);
@@ -1788,7 +2123,11 @@ mod tests {
         );
 
         // The collection that ran beside the broken `cowshed new`, which knew nothing of the fork.
-        let collected = scratch.volumes.collect(links(&[]), false).await.unwrap();
+        let collected = scratch
+            .volumes
+            .collect(scratch.layout.list().unwrap(), links(&[]), false)
+            .await
+            .unwrap();
         assert_eq!(collected.reclaimed, 2, "{:?}", collected.candidates);
         let refusal = scratch
             .layout
@@ -1826,7 +2165,12 @@ mod tests {
             )
             .unwrap();
         let garbage = store.volume(BuildVolumeRole::Unlinked);
-        let plan = plan(&store.layout, &Links::default()).unwrap();
+        let plan = plan(
+            &store.layout,
+            &store.layout.list().unwrap(),
+            &Links::default(),
+        )
+        .unwrap();
         assert_eq!(
             doomed(&plan),
             [(garbage, GcReason::UnlinkedBuildVolume)],
@@ -2208,5 +2552,374 @@ mod tests {
             .expect("nothing holds the landing volume");
         assert_eq!(capacity(&other), ImageCapacity::from_gibibytes(3));
         scratch.release_all();
+    }
+
+    /// A git checkout under `scratch` with `tracked` files (each `{}`) and a `.cowshed.toml`
+    /// asking `toml`, everything added to the index.
+    #[cfg(target_os = "macos")]
+    fn tracked_checkout(scratch: &Scratch, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
+        use crate::fork_lock::Run as _;
+        let checkout = scratch.root.path().join(name);
+        fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+        fs::write(checkout.join(".cowshed.toml"), toml).unwrap();
+        for file in tracked {
+            let path = checkout.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}\n").unwrap();
+        }
+        for args in [&["init", "--quiet"][..], &["add", "--", "."][..]] {
+            let output = crate::git::git_command_at(&checkout)
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        checkout
+    }
+
+    /// At the test cap, so a mint clones the run's template rather than making one.
+    #[cfg(target_os = "macos")]
+    const AT_THE_CAP: &str = "[build]\ncapacity = \"1g\"\n";
+
+    #[cfg(target_os = "macos")]
+    fn minted(first: &FirstMint) -> MintedVolume {
+        match first {
+            FirstMint::Minted(owned) => lock(&owned.slot)
+                .clone()
+                .expect("an unsettled mint holds its volume"),
+            FirstMint::Nothing => panic!("nothing was minted beside main's image"),
+            FirstMint::Failed(error) => panic!("the mint beside main's image failed: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn discovered(paths: Vec<BuildStatePath>) -> Discovered {
+        Discovered::Changed {
+            paths,
+            fingerprint: "fixture".to_owned(),
+            capacity: ImageCapacity::from_gibibytes(1),
+        }
+    }
+
+    /// Main's first build volume is minted beside main's image and handed to its first touch:
+    /// with build state discovered, the first touch links that volume, records it and seeds main
+    /// from it, and settling keeps it. With nothing discovered, nothing links it, and settling
+    /// deletes it before the adoption completes, so it never outlives the intent that protects it
+    /// from collection. A checkout in which nothing can name build state gets none minted at all:
+    /// no tracked manifest, or only tracked build inputs whose state is the host's.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_main_links_the_volume_minted_beside_its_image_or_releases_it() {
+        let scratch = Scratch::new("build-minted-first");
+        let main = owner("main", '0');
+        for (name, tracked) in [
+            ("bare", &[][..]),
+            ("go", &["go.mod"][..]),
+            ("cargo-config", &[".cargo/config.toml"][..]),
+        ] {
+            let checkout = tracked_checkout(&scratch, name, AT_THE_CAP, tracked);
+            let first = scratch.volumes.mint_first(checkout.clone(), checkout).await;
+            assert!(matches!(first, FirstMint::Nothing), "{name}");
+        }
+        assert_eq!(scratch.layout.list().unwrap(), []);
+
+        // A tracked package that is not installed: discovery may name its caches, and names none.
+        let checkout = tracked_checkout(&scratch, "main", AT_THE_CAP, &["package.json"]);
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let unused = minted(&first);
+        assert_eq!(unused.capacity, ImageCapacity::from_gibibytes(1));
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                checkout.clone(),
+                discovered(Vec::new()),
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh.volume, None, "nothing to hold links nothing");
+        first.settle().await;
+        assert!(!scratch.layout.image(&unused.id).exists());
+        assert_eq!(scratch.layout.list().unwrap(), []);
+
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let linked_now = minted(&first);
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                checkout.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh.volume, Some(linked_now.id.clone()));
+        assert!(refresh.created);
+        first.settle().await;
+        assert_eq!(
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(linked_now.id.clone())
+        );
+        assert_eq!(
+            scratch
+                .layout
+                .read_record_present(&linked_now.id)
+                .unwrap()
+                .map(|record| record.role),
+            Some(linked("main")),
+            "recorded once the first touch linked it"
+        );
+        assert!(
+            scratch
+                .layout
+                .seed_of(&main.name, &main.incarnation)
+                .unwrap()
+                .is_some(),
+            "main is seeded from its first volume"
+        );
+        scratch.release_all();
+    }
+
+    /// Every first touch that does not take the volume minted beside main's image leaves it to
+    /// settling, which releases it: a tracked-source refusal and a volume the checkout already
+    /// links. A volume the checkout links stays, record or not: an interrupted first touch's link
+    /// protects it and its retry finds it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
+        let scratch = Scratch::new("build-minted-left");
+        let main = owner("main", '0');
+        let source = tracked_checkout(&scratch, "source", AT_THE_CAP, &["package.json"]);
+
+        let refusing = tracked_checkout(&scratch, "refusing", AT_THE_CAP, &["target/lib.rs"]);
+        let first = scratch
+            .volumes
+            .mint_first(source.clone(), refusing.clone())
+            .await;
+        let refused = minted(&first);
+        let refusal = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                refusing.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await
+            .unwrap();
+        assert!(refusal.is_err(), "target holds tracked source: {refusal:?}");
+        first.settle().await;
+        assert!(!scratch.layout.image(&refused.id).exists());
+
+        let (holding, held, _) = scratch.linked_checkout("holding", 1);
+        let first = scratch
+            .volumes
+            .mint_first(source.clone(), holding.clone())
+            .await;
+        let unused = minted(&first);
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                holding.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh.volume, Some(held.clone()), "the linked volume wins");
+        first.settle().await;
+        assert!(!scratch.layout.image(&unused.id).exists());
+        assert!(scratch.layout.image(&held).exists());
+
+        let interrupted = tracked_checkout(&scratch, "interrupted", AT_THE_CAP, &[]);
+        let first = scratch
+            .volumes
+            .mint_first(source.clone(), interrupted.clone())
+            .await;
+        let kept = minted(&first);
+        link::point(&interrupted, &scratch.layout.mount(&kept.id)).unwrap();
+        first.settle().await;
+        assert!(scratch.layout.image(&kept.id).exists(), "linked, so kept");
+        assert_eq!(scratch.layout.read_record_present(&kept.id).unwrap(), None);
+        scratch.release_all();
+    }
+
+    /// A volume minted beside main's image at a capacity other than the one asked once main is
+    /// copied (the source's `.cowshed.toml` edited meanwhile) is not linked: the first touch
+    /// mints its own at the asked capacity, and settling releases the minted one. Its own test,
+    /// since a mint at a capacity off the test cap makes a template of its own.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_main_mints_its_own_when_the_volume_minted_beside_it_is_another_capacity() {
+        let scratch = Scratch::new("build-minted-resized");
+        let source = tracked_checkout(&scratch, "source", AT_THE_CAP, &["package.json"]);
+        // The source asked 1 GiB when main's volume was minted and asks 2 GiB once copied.
+        let capacity = |id: &BuildVolumeId| {
+            scratch
+                .host
+                .build_volume_capacity(&scratch.layout, id)
+                .unwrap()
+        };
+        let resized = tracked_checkout(&scratch, "resized", AT_THE_CAP, &[]);
+        let first = scratch
+            .volumes
+            .mint_first(source.clone(), resized.clone())
+            .await;
+        let stale = minted(&first);
+        assert_eq!(stale.capacity, ImageCapacity::from_gibibytes(1));
+        assert_eq!(capacity(&stale.id), ImageCapacity::from_gibibytes(1));
+        let refresh = scratch
+            .volumes
+            .refresh(
+                owner("resized", '1'),
+                resized.clone(),
+                Discovered::Changed {
+                    paths: vec![BuildStatePath::new("target", "target").unwrap()],
+                    fingerprint: "fixture".to_owned(),
+                    capacity: ImageCapacity::from_gibibytes(2),
+                },
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let own = refresh.volume.expect("the first touch mints its own");
+        assert_ne!(own, stale.id);
+        assert_eq!(capacity(&own), ImageCapacity::from_gibibytes(2));
+        first.settle().await;
+        assert!(!scratch.layout.image(&stale.id).exists());
+        assert_eq!(scratch.layout.linked(&resized).unwrap(), Some(own));
+        scratch.release_all();
+    }
+
+    /// A failed mint beside main's image is no reason to mint again: a first touch that needs a
+    /// volume answers the mint's own error and makes none; one that needs none (nothing
+    /// discovered) is not failed by it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_failed_mint_beside_main_fails_only_a_first_touch_that_needs_it() {
+        let scratch = Scratch::new("build-minted-failed");
+        let checkout = tracked_checkout(
+            &scratch,
+            "main",
+            "[build]\ncapacity = \"not a size\"\n",
+            &["package.json"],
+        );
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let FirstMint::Failed(cause) = &first else {
+            panic!("an unreadable capacity fails the mint");
+        };
+        let cause = cause.clone();
+        let refresh = scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                discovered(Vec::new()),
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh.volume, None);
+        let failed = scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failed, cause);
+        assert_eq!(scratch.layout.list().unwrap(), [], "no second mint");
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), None);
+        first.abandon().await;
+    }
+
+    /// An adopt dropped before it settled what it minted beside main's image leaves no volume
+    /// behind: dropped while its mint waits for the blocking lane, the mint still runs, and
+    /// releases what it made since nobody is there to take it. Dropped after, the unsettled
+    /// answer releases it on the blocking lane, which dropping the runtime runs or cancels -- and
+    /// a cancelled release runs as its task is dropped; under a runtime already shut down, which
+    /// refuses the task, it runs at once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_a_dropped_adopt_releases_the_volume_minted_beside_main() {
+        use std::task::Poll;
+        let scratch = Scratch::new("build-minted-dropped");
+        let checkout = tracked_checkout(&scratch, "main", AT_THE_CAP, &["package.json"]);
+
+        // The runtime's one blocking thread is held, so the mint is queued behind it: one poll
+        // leaves it unanswered, and it runs only once the adopt is gone.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        runtime.block_on(async {
+            let held = tokio::task::spawn_blocking(move || gate.recv());
+            {
+                let mut mint = std::pin::pin!(
+                    scratch
+                        .volumes
+                        .mint_first(checkout.clone(), checkout.clone())
+                );
+                std::future::poll_fn(|context| {
+                    assert!(mint.as_mut().poll(context).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            open.send(()).unwrap();
+            held.await.unwrap().unwrap();
+            // Queued behind the mint on the one blocking thread: done once the mint is.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+        });
+        drop(runtime);
+        assert_eq!(scratch.layout.list().unwrap(), []);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = runtime.block_on(
+            scratch
+                .volumes
+                .mint_first(checkout.clone(), checkout.clone()),
+        );
+        let dropped = minted(&first);
+        runtime.block_on(async move { drop(first) });
+        drop(runtime);
+        assert!(!scratch.layout.image(&dropped.id).exists());
+        assert_eq!(scratch.layout.list().unwrap(), []);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+        let first = runtime.block_on(
+            scratch
+                .volumes
+                .mint_first(checkout.clone(), checkout.clone()),
+        );
+        let dropped = minted(&first);
+        drop(runtime);
+        let entered = handle.enter();
+        drop(first);
+        drop(entered);
+        assert!(!scratch.layout.image(&dropped.id).exists());
+        assert_eq!(scratch.layout.list().unwrap(), []);
     }
 }

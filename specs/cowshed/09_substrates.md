@@ -88,35 +88,50 @@ where
     H: ApfsExecutionHost,
     L: ApfsBlockingLane,
 {
-    pub async fn execute_adopt_staged<F, Fut, E>(
+    pub async fn execute_adopt_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: AdoptPlan,
+        alongside: Alongside<W, D>,
         initialize: F,
-    ) -> Result<LifecycleReceipt, AdoptExecutionError<E>>
+    ) -> Result<(LifecycleReceipt, W::Output), AdoptExecutionError<E>>
     where
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
         F: FnOnce(AdoptStage) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send;
 
-    pub async fn execute_create_staged<F, Fut, E>(
+    pub async fn execute_create_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: CreatePlan,
+        alongside: Alongside<W, D>,
         initialize: F,
     ) -> Result<LifecycleReceipt, CreateExecutionError<E>>
     where
-        F: FnOnce(CreateStage) -> Fut + Send,
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
+        F: FnOnce(CreateStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
-        E: Send;
+        E: Send + std::fmt::Display;
 
-    pub async fn execute_fork_staged<F, Fut, E>(
+    pub async fn execute_fork_staged<W, D, DFut, F, Fut, E>(
         &self,
         plan: ForkPlan,
+        alongside: Alongside<W, D>,
         initialize: F,
     ) -> Result<LifecycleReceipt, ForkExecutionError<E>>
     where
-        F: FnOnce(ForkStage) -> Fut + Send,
+        W: Future + Send,
+        W::Output: Send,
+        D: FnOnce(W::Output) -> DFut + Send,
+        DFut: Future<Output = ()> + Send,
+        F: FnOnce(ForkStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
-        E: Send;
+        E: Send + std::fmt::Display;
 
     pub async fn execute_checkpoint_staged<F, Fut, E>(
         &self,
@@ -150,6 +165,14 @@ The executor contract is:
   controller-private staging namespace, then awaits `initialize`, and publishes the canonical image and metadata only
   after the callback succeeds. A callback error aborts the prepared stage and is returned as `Initializer` or, if abort
   also fails, `InitializerCleanup`.
+- **Side work runs beside staging and is owned until it is answered.** `Alongside { work, abandon }` is a second image
+  the operation attaches anyway (a fork's build volume, main's first one), started once the locks are held and the plan
+  revalidated and run while the stage is prepared, so the two attaches wait in `storagekitd` once. A create or fork
+  hands its output to `initialize` with the stage; an adopt answers it with the receipt once main is committed. A
+  staging, initializer or commit failure hands it to `abandon` instead. An operation dropped before either (a cancelled
+  request) drops the work and its output with it and runs nothing for them after, so the output is the resource's owner:
+  dropped, it releases what it holds, and work dropped mid-flight releases what it makes once nobody is there to take
+  it. A crash leaves the resource to the replayed operation's intent and to collection.
 - **The checkpoint callback is the artifact barrier.** With the lifecycle lock held and before cloning the checkpoint
   image, the executor awaits `initialize`. The controller must flush live job writers, append and fsync the
   `CheckpointManifestRecord` and its `barrier_id`, and return success only when that barrier is durable. Only then may

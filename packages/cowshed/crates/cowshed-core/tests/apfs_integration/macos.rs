@@ -194,11 +194,13 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())),
             identity: identity()?,
         })?;
-        let main = substrate
-            .execute_adopt_staged(adopt, |_| async { Ok::<(), std::io::Error>(()) })
+        let (receipt, ()) = substrate
+            .execute_adopt_staged(adopt, Alongside::none(), |_| async {
+                Ok::<(), std::io::Error>(())
+            })
             .await
-            .map_err(|error| std::io::Error::other(format!("adopt: {error}")))?
-            .workspace;
+            .map_err(|error| std::io::Error::other(format!("adopt: {error}")))?;
+        let main = receipt.workspace;
         // Main mounts at the adopted checkout path itself, with the original tree retained beside
         // it.
         assert_eq!(
@@ -663,11 +665,12 @@ impl KillWindow {
             pre_cowshed_checkout: self.pre_cowshed.clone(),
             identity: self.identity.clone(),
         })?;
-        let receipt = self
-            .block_on(
-                self.substrate
-                    .execute_adopt_staged(plan, |_| async { Ok::<(), std::io::Error>(()) }),
-            )?
+        let (receipt, ()) =
+            self.block_on(self.substrate.execute_adopt_staged(
+                plan,
+                Alongside::none(),
+                |_| async { Ok::<(), std::io::Error>(()) },
+            ))?
             .map_err(|error| format!("adopt: {error}"))?;
         Ok(receipt.workspace)
     }

@@ -17,7 +17,8 @@ mod build_state_discovery;
 pub(crate) use build_state_discovery::HostCargo;
 pub use build_state_discovery::{
     BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
-    CargoRunner, JobCargo, discover_build_state, tracked_manifest_fingerprint,
+    CargoRunner, JobCargo, discover_build_state, may_name_build_state,
+    tracked_manifest_fingerprint,
 };
 pub mod bun;
 pub mod cache;

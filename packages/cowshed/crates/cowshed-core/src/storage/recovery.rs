@@ -277,11 +277,11 @@ impl LifecycleIntentJournal {
         self.entries.iter()
     }
 
-    /// The workspaces an unfinished create or fork is bringing into existence, from its
+    /// The workspaces an unfinished create, fork or adopt is bringing into existence, from its
     /// mutation fence until it completes. Everything such a verb makes before publication — its
-    /// staged clone, the build volume and seed it forks into that clone — is named only by the
-    /// verb itself until then, so no other process may take it for garbage. A clone still
-    /// `Prepared` has made nothing yet.
+    /// staged clone, the build volume and seed it forks into that clone, the first build volume
+    /// an adopt mints beside main's image — is named only by the verb itself until then, so no
+    /// other process may take it for garbage. A verb still `Prepared` has made nothing yet.
     pub fn forming(&self) -> impl Iterator<Item = &WorkspaceName> {
         self.entries
             .iter()
@@ -290,7 +290,9 @@ impl LifecycleIntentJournal {
                     && record.phase == LifecycleIntentPhase::Mutating
                     && matches!(
                         record.operation,
-                        LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                        LifecycleIntent::Adopt { .. }
+                            | LifecycleIntent::Create { .. }
+                            | LifecycleIntent::Fork { .. }
                     )
             })
             .map(|(workspace, _)| workspace)
