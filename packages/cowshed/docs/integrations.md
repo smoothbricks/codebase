@@ -246,19 +246,19 @@ running-command tail.
 ### Implementation status — monitoring gaps
 
 Job resource samples, progress events, cursor-addressed bounded tails, resumable N-API raw-byte streams, attachment
-stdio/EOF, identity-fenced group-listener queries, and `AbortSignal` plumbing are unbuilt. The Rust core already
-supports numeric-job reattachment and attachment stdin writes; its `JobStdin` has no explicit close operation. The addon
-does not yet expose attachment. One-use worker descriptor connection is also unbuilt. Fork/exec tree observations,
-per-process CPU/RSS/I/O and blocker facts, typed process event streams, CPU-winning leaf identity, and their
-`process.run`/job spans are also unbuilt. Complete cgroup job totals, separate charged-memory counters, measured
-fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt as well.
+stdio/EOF, and `AbortSignal` plumbing are unbuilt. The Rust core already supports numeric-job reattachment and
+attachment stdin writes; its `JobStdin` has no explicit close operation. The addon does not yet expose attachment.
+One-use worker descriptor connection is also unbuilt. Fork/exec tree observations, per-process CPU/RSS/I/O and blocker
+facts, typed process event streams, CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt.
+Complete cgroup job totals, separate charged-memory counters, measured fork/exec/exit observation and explicit
+unattributed-usage reconciliation are unbuilt as well.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
 TypeScript public types and validators are generated projections, never a second hand-maintained field list. Every
 declared controller operation reaches the addon as a generated adapter on the handle that binds its authority, with a
 generated TypeScript declaration whose argument type picks exactly the request fields the caller names. Of the
-monitoring surface above, only `kill` is declared yet; the rest is generated once it is declared.
+monitoring surface above, `kill`, `tail` and `listeningPorts` are declared; the rest is generated once it is declared.
 
 Each `JobResourceSample` carries its own `jobId`. Its start baseline is the first job-owned process, including a cold
 shell's activation; progress and terminal accounting include that activation, but never charge the idle time of a

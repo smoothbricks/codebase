@@ -9,7 +9,7 @@ with identical semantics and error taxonomy.
 > and complete-group termination. Core job resource samples and terminal persistence are implemented; periodic progress
 > streams and keyed admission/lookup are not yet complete. Controller request/result codecs, TypeScript types and
 > validators, and N-API operation bindings derive from one Rust API declaration. The addon exposes the declared offset
-> log reads and bounded `job.tail` operation; async stream backpressure, attachment stdin EOF, group-listener queries,
+> log reads, the bounded `job.tail` operation and `job.listeningPorts`; async stream backpressure, attachment stdin EOF,
 > and abort plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no
 > close operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts,
 > process event streams, leaf-work identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The
@@ -772,6 +772,14 @@ bound, connected, or host-unrelated socket is not readiness. A port another proc
 readiness, even if a host-wide connection probe succeeds. The same process-birth fence used for group sampling protects
 socket ownership from PID reuse. Missing ownership evidence is a typed error, never an empty list that pretends
 readiness was checked. The query starts no process and preserves the workspace incarnation fence.
+
+Each member's sockets are read by pid and count only if that member's identity (its pidfd on Linux, its pid version on
+macOS), read afterwards, shows it still running: a member shown exited holds none, and a failed read of a running member
+is an error. Linux matches the socket inodes of `/proc/<pid>/fd` against the `LISTEN` rows of `/proc/<pid>/net/tcp` and
+`tcp6`; those tables are the member's own network namespace, which is complete because a job never leaves its
+workspace's one private namespace (04_sandbox.md). macOS reads each socket descriptor's `socket_fdinfo`
+(`PROC_PIDFDSOCKETINFO`) and keeps TCP sockets in `TSI_S_LISTEN`. A job that has not yet owned a process is a conflict;
+an ended job's group answers what its ended group still holds, normally nothing.
 
 Attachment stdin is the same bounded, backpressured raw-byte lane as exec stdin, not text interpolated into the command.
 `JobStdin.write` waits until its chunk is admitted to the job's input queue; `close()` sends EOF exactly once and is
