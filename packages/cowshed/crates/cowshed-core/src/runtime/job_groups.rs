@@ -1133,17 +1133,12 @@ fn stat_while_running(
     handle: &std::os::fd::OwnedFd,
     read: io::Result<String>,
 ) -> io::Result<Option<String>> {
-    let stat = match read {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    // Still running after the stat was read, the process the pidfd names ran throughout,
-    // so the stat was that process's.
+    // A departed process is no current member, even when its proc-stat read returned ESRCH.
+    // Only a process still live afterwards can contribute its stat or its read failure.
     if pidfd_exited(handle)? {
         return Ok(None);
     }
-    Ok(Some(stat))
+    read.map(Some)
 }
 
 #[cfg(target_os = "linux")]
