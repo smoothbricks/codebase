@@ -132,6 +132,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
     let released = false;
     const waits = [];
     const statuses = [];
+    const heldStatuses = [];
     const release = () => {
       released = true;
       for (const id of waits.splice(0)) answer(id, job(true));
@@ -149,6 +150,13 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
     };
     const demand = (id) => {
       const stream = streams.get(id);
+      // The review fixture withholds the second demand. A status answer is its causal barrier:
+      // the client cannot attempt close until this controller actually heard the pending next.
+      if (stream.held && stream.running === 1) {
+        stream.blocked = true;
+        for (const id of heldStatuses.splice(0)) answer(id, job(false));
+        return;
+      }
       if (stream.terminal) {
         end(id);
       } else if (released) {
@@ -173,8 +181,13 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
         answer(message.id, results[message.method]);
       } else if (message.method === 'job.progress') {
         heard.push('open every ' + message.params.everyMs);
-        streams.set(message.id, { running: 0, terminal: false });
+        streams.set(message.id, {
+          running: 0, terminal: false, held: message.params.everyMs === 999, blocked: false,
+        });
         demand(message.id);
+      } else if (message.method === 'job.status' && [...streams.values()].some((stream) => stream.held)) {
+        if ([...streams.values()].some((stream) => stream.blocked)) answer(message.id, job(false));
+        else heldStatuses.push(message.id);
       } else if (message.method === 'job.status' && streams.size > 0) {
         statuses.push(message.id);
       } else if (message.method === 'job.status') {
@@ -379,6 +392,68 @@ describe('Cowshed Node-API bindings', () => {
       stdout: JSON.stringify({ seen: [0, 10], state: 'running', refused: 'usage' }),
       stderr: '',
       heard: ['open every 25', 'next', 'close'],
+    });
+  }, 30_000);
+
+  it('review: native close cancels an unanswered next demand', async () => {
+    const nativeUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'native.js')).href;
+    const execUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'exec.js')).href;
+    const generatedUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'native.generated.js')).href;
+    const client = `
+      import { loadNativeModule } from ${JSON.stringify(nativeUrl)};
+      import { exec } from ${JSON.stringify(execUrl)};
+      import * as N from ${JSON.stringify(generatedUrl)};
+      import { setTimeout as after } from 'node:timers/promises';
+      const native = loadNativeModule();
+      const coordinator = await native.connectCoordinator(native.coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker(JSON.stringify({ workspace: 'main' }));
+      const job = await exec(worker, null, { argv: ['build'] });
+      const events = await job.progress(JSON.stringify({ everyMs: 999 }));
+      await events.next();
+      const pending = events.next();
+      const status = await N.jobStatus(job, {});
+      // A deadline bounds a deadlocked real addon; fake JS time cannot drive its Tokio worker.
+      const closed = await Promise.race([
+        events.close().then(() => true),
+        after(200, false),
+      ]);
+      const nextEnded = closed ? (await pending) === null : false;
+      console.log(JSON.stringify({ closed, nextEnded, state: status.state }));
+      process.exit(0);
+    `;
+    expect(await scriptedController(client)).toEqual({
+      exitCode: 0,
+      stdout: JSON.stringify({ closed: true, nextEnded: true, state: 'running' }),
+      stderr: '',
+      heard: ['open every 999', 'next', 'close'],
+    });
+  }, 30_000);
+
+  it('review: iterator return cancels an unanswered next demand', async () => {
+    const client = `
+      import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
+      import { setTimeout as after } from 'node:timers/promises';
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker('main');
+      const job = await worker.exec({ argv: ['build'] });
+      const iterator = job.progress(999)[Symbol.asyncIterator]();
+      await iterator.next();
+      const pending = iterator.next();
+      const status = await job.status();
+      // A deadline bounds a deadlocked real addon; fake JS time cannot drive its Tokio worker.
+      const closed = await Promise.race([
+        iterator.return().then((result) => result.done),
+        after(200, false),
+      ]);
+      const nextEnded = closed ? (await pending).done : false;
+      console.log(JSON.stringify({ closed, nextEnded, state: status.state }));
+      process.exit(0);
+    `;
+    expect(await scriptedController(client)).toEqual({
+      exitCode: 0,
+      stdout: JSON.stringify({ closed: true, nextEnded: true, state: 'running' }),
+      stderr: '',
+      heard: ['open every 999', 'next', 'close'],
     });
   }, 30_000);
 });
