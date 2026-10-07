@@ -99,6 +99,12 @@ impl sealed::Sealed for Coordinator {}
 impl sealed::Sealed for WorkspaceHandle {}
 impl sealed::Sealed for JobHandle {}
 
+/// A bound field's value, owned for the request: one clone of what the handle validated, whatever
+/// the field's type, so the generated construction need not know which fields are `Copy`.
+pub(super) fn owned<T: Clone>(value: &T) -> T {
+    value.clone()
+}
+
 /// Decodes the caller's fields of `O`'s request as `C`, the generated record of exactly those
 /// fields.
 pub(super) fn decode<O: Operation, C: DeserializeOwned>(arguments: Arguments) -> Result<C> {

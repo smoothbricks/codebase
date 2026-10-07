@@ -999,6 +999,31 @@ export type ProjectGrantRequest = {
   readonly delta: ProjectGrantDelta;
 };
 
+/**
+ * Policy every workspace of the project holds from its first supervisor launch.
+ *
+ * Reads, egress and workspace-relative denies are standing decisions. A standing write allow
+ * would hand every workspace a shared writable tree outside its image; that stays per-workspace.
+ */
+export type ProjectGrants = {
+  /**
+   * Advanced by every change, never reset. A workspace's effective revision is its own plus
+   * this one, so a project change reaches the gateway's strictly increasing session revision
+   * and relaunches every supervisor exactly as a workspace grant change does.
+   */
+  readonly revision: number & tags.Type<'uint64'>;
+  readonly read: ReadonlyArray<string>;
+  readonly egress: ReadonlyArray<EgressRule>;
+  /**
+   * Workspace-relative paths forbidden to every job, including main's.
+   */
+  readonly denyWrite?: ReadonlyArray<string>;
+  /**
+   * Workspace-relative paths no job may read or write, including main's.
+   */
+  readonly deny?: ReadonlyArray<string>;
+};
+
 export type ProjectOpenRequest = {
   /**
    * Absolute, lexically normalized path inside the project.

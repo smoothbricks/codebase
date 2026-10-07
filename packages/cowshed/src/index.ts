@@ -1,65 +1,33 @@
 import typia from 'typia';
+import type * as Api from './api.generated.js';
+import { exec } from './exec.js';
 import { packageRootFromModule, runLauncher } from './launcher.js';
+import * as N from './native.generated.js';
 import {
   loadNativeModule,
   type NativeCoordinatorHandle,
-  type NativeJobAttachmentHandle,
   type NativeJobHandle,
   type NativeProjectHandle,
-  type NativeSessionHandle,
   type NativeWorkspaceHandle,
   type NativeWorkspaceRefHandle,
 } from './native.js';
 import {
-  type AdoptOptions,
-  type AttachOptions,
-  type CheckpointOptions,
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
-  type CreateOptions,
-  type DoctorReport,
   type ErrorCode,
   type ExecRequest,
-  type GcOptions,
-  type GcReport,
-  type GrantDelta,
-  type GrantSet,
-  type JobAttachment,
   type JobHandle,
-  type JobInfo,
+  type JobLogs,
   type LandOptions,
-  type LandReport,
   type PathOptions,
   type Project,
-  type PushOptions,
-  type PushReport,
   type RebaseOptions,
-  type RebaseReport,
-  type RemoveOptions,
-  type RemoveReport,
-  type ResizeResult,
-  type ResizeVolume,
   type Session,
   type WorkspaceHandle,
-  type WorkspaceInfo,
   type WorkspaceRef,
 } from './types.js';
-import {
-  assertAttachOptions,
-  parseDoctorReport,
-  parseGcReport,
-  parseGrantSet,
-  parseJobInfo,
-  parseJobInfoList as parseJobInfos,
-  parseLandReport,
-  parsePushReport,
-  parseRebaseReport,
-  parseRemoveReport,
-  parseResizeResult,
-  parseWorkspaceInfo,
-  parseWorkspaceInfoList as parseWorkspaceInfos,
-} from './validators.generated.js';
+import { parseWorkspaceTarget } from './validators.generated.js';
 
 export type * from './types.js';
 export { CowshedError } from './types.js';
@@ -103,72 +71,6 @@ async function callNativeAsync<T>(call: () => Promise<T>): Promise<T> {
   }
 }
 
-function encodeAttachOptions(options: AttachOptions | undefined): string | undefined {
-  if (options === undefined) {
-    return undefined;
-  }
-
-  const encoded = JSON.stringify(assertAttachOptions(options));
-  if (encoded === undefined) {
-    // invariant throw: a validated plain AttachOptions object is JSON-serializable.
-    throw new Error('validated attach options did not serialize');
-  }
-  return encoded;
-}
-
-function encodeJson(kind: string, value: object): string {
-  const encoded = JSON.stringify(value);
-  if (encoded === undefined) {
-    // invariant throw: validated option objects are JSON-serializable.
-    throw new Error(`validated ${kind} did not serialize`);
-  }
-  return encoded;
-}
-
-function encodeAdoptOptions(options: AdoptOptions | undefined): string {
-  return encodeJson('adopt options', typia.assert<AdoptOptions>(options ?? {}));
-}
-
-function encodeCreateOptions(options: CreateOptions | undefined): string {
-  return encodeJson('create options', typia.assert<CreateOptions>(options ?? {}));
-}
-
-function encodeCheckpointOptions(options: CheckpointOptions | undefined): string {
-  return encodeJson('checkpoint options', typia.assert<CheckpointOptions>(options ?? {}));
-}
-
-function encodeGrantDelta(delta: GrantDelta): string {
-  return encodeJson('grant delta', typia.assert<GrantDelta>(delta));
-}
-
-/**
- * The JSON half of rebase or land options: everything but `into`, which crosses to the addon as
- * the reference itself so it cannot be named by a string.
- */
-function encodeRebaseOptions(options: Omit<RebaseOptions, 'into'>): string {
-  return encodeJson('rebase options', typia.assert<Omit<RebaseOptions, 'into'>>(options));
-}
-
-function encodeLandOptions(options: Omit<LandOptions, 'into'>): string {
-  return encodeJson('land options', typia.assert<Omit<LandOptions, 'into'>>(options));
-}
-
-function encodeRemoveOptions(options: RemoveOptions | undefined): string {
-  return encodeJson('remove options', typia.assert<RemoveOptions>(options ?? {}));
-}
-
-function encodeGcOptions(options: GcOptions | undefined): string {
-  return encodeJson('GC options', typia.assert<GcOptions>(options ?? {}));
-}
-
-function encodeExecRequest(request: ExecRequest): string {
-  return encodeJson('exec request', typia.assert<ExecRequest>(request));
-}
-
-function encodePushOptions(options: PushOptions | undefined): string {
-  return encodeJson('push options', typia.assert<PushOptions>(options ?? {}));
-}
-
 class ProjectImpl implements Project {
   readonly #native: NativeProjectHandle;
 
@@ -185,23 +87,28 @@ class ProjectImpl implements Project {
   }
 
   async main(): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.main()));
+    return this.workspace('main');
   }
 
   async workspace(name: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.workspace(name)));
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.projectWorkspace(this.#native, { workspace: name })));
   }
+
   async workspaceAt(path: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.workspaceAt(path)));
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.projectWorkspaceAt(this.#native, { path })));
   }
 
-  async path(name: string, options?: PathOptions): Promise<WorkspaceInfo> {
-    const parsed = typia.assert<PathOptions>(options ?? {});
-    return parseWorkspaceInfo(await callNativeAsync(() => this.#native.path(name, parsed.noAttach ?? false)));
+  async path(name: string, options?: PathOptions): Promise<Api.WorkspaceInfo> {
+    const workspace = await this.workspace(name);
+    if (!(options?.noAttach ?? false)) {
+      await workspace.attach();
+    }
+    return workspace.info();
   }
 
-  async listWorkspaces(): Promise<readonly WorkspaceInfo[]> {
-    return parseWorkspaceInfos(await callNativeAsync(() => this.#native.listWorkspaces()));
+  async listWorkspaces(): Promise<readonly Api.WorkspaceInfo[]> {
+    const views = await callNativeAsync(() => N.projectList(this.#native, {}));
+    return views.map((view) => view.info);
   }
 }
 
@@ -213,10 +120,11 @@ class WorkspaceRefImpl implements WorkspaceRef {
   }
 
   /**
-   * The addon handle behind a reference this module handed out. A `WorkspaceRef` built anywhere
-   * else has no resolved incarnation behind it, so it is refused rather than trusted by name.
+   * The incarnation-pinned target behind a reference this module handed out. A `WorkspaceRef`
+   * built anywhere else has no resolved incarnation behind it, so it is refused rather than
+   * trusted by name.
    */
-  static handleOf(reference: WorkspaceRef): NativeWorkspaceRefHandle {
+  static targetOf(reference: WorkspaceRef): Api.WorkspaceTarget {
     if (!(#native in reference)) {
       throw new CowshedError(
         'usage',
@@ -224,7 +132,7 @@ class WorkspaceRefImpl implements WorkspaceRef {
         'resolve the workspace with project.workspace(name) and pass that reference',
       );
     }
-    return reference.#native;
+    return parseWorkspaceTarget(reference.#native.targetJson);
   }
 
   get name(): string {
@@ -235,16 +143,16 @@ class WorkspaceRefImpl implements WorkspaceRef {
     return this.#native.mountPath;
   }
 
-  async info(): Promise<WorkspaceInfo> {
-    return parseWorkspaceInfo(await callNativeAsync(() => this.#native.infoJson()));
+  async info(): Promise<Api.WorkspaceInfo> {
+    return callNativeAsync(() => N.workspaceInfo(this.#native, {}));
   }
 
-  async attach(options?: AttachOptions): Promise<void> {
-    await callNativeAsync(() => this.#native.attach(encodeAttachOptions(options)));
+  async attach(options?: Api.AttachOptions): Promise<void> {
+    await callNativeAsync(() => N.workspaceAttach(this.#native, { options: options ?? {} }));
   }
 
-  async grants(): Promise<GrantSet> {
-    return parseGrantSet(await callNativeAsync(() => this.#native.grantsJson()));
+  async grants(): Promise<Api.GrantSet> {
+    return callNativeAsync(() => N.workspaceGrants(this.#native, {}));
   }
 }
 
@@ -255,74 +163,79 @@ class CoordinatorImpl implements Coordinator {
     this.#native = nativeCoordinator;
   }
 
-  async adopt(options?: AdoptOptions): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.adopt(encodeAdoptOptions(options))));
+  async adopt(options?: Api.AdoptOptions): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(
+      await callNativeAsync(() => N.coordinatorAdopt(this.#native, { options: options ?? {} })),
+    );
   }
 
-  async create(name: string, options?: CreateOptions): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.create(name, encodeCreateOptions(options))));
+  async create(name: string, options?: Api.CreateOptions): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(
+      await callNativeAsync(() => N.coordinatorCreate(this.#native, { workspace: name, options: options ?? {} })),
+    );
   }
 
   async fork(source: string, destination: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.fork(source, destination)));
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.coordinatorFork(this.#native, { source, destination })));
   }
+
   async rename(source: string, destination: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.rename(source, destination)));
+    return new WorkspaceRefImpl(
+      await callNativeAsync(() => N.coordinatorRename(this.#native, { source, destination })),
+    );
   }
 
   async moveCheckout(destination: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.moveCheckout(destination)));
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.coordinatorMoveCheckout(this.#native, { destination })));
   }
 
-  async grant(workspace: string, delta: GrantDelta): Promise<GrantSet> {
-    return parseGrantSet(await callNativeAsync(() => this.#native.grant(workspace, encodeGrantDelta(delta))));
+  async grant(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet> {
+    return callNativeAsync(() => N.coordinatorGrant(this.#native, { workspace, delta }));
   }
 
-  async revoke(workspace: string, delta: GrantDelta): Promise<GrantSet> {
-    return parseGrantSet(await callNativeAsync(() => this.#native.revoke(workspace, encodeGrantDelta(delta))));
+  async revoke(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet> {
+    return callNativeAsync(() => N.coordinatorRevoke(this.#native, { workspace, delta }));
   }
 
-  async rebase(workspace: string, options?: RebaseOptions): Promise<RebaseReport> {
+  async rebase(workspace: string, options?: RebaseOptions): Promise<Api.RebaseReport> {
     // `into` with `onto` is refused by the controller, the one place that decides a destination.
     const { into, ...rest } = options ?? {};
-    const handle = into === undefined ? undefined : WorkspaceRefImpl.handleOf(into);
-    return parseRebaseReport(
-      await callNativeAsync(() => this.#native.rebase(workspace, encodeRebaseOptions(rest), handle)),
-    );
+    const target = into === undefined ? undefined : WorkspaceRefImpl.targetOf(into);
+    return callNativeAsync(() => N.coordinatorRebase(this.#native, { workspace, into: target, options: rest }));
   }
 
-  async land(workspace: string, options?: LandOptions): Promise<LandReport> {
+  async land(workspace: string, options?: LandOptions): Promise<Api.LandReport> {
     const { into, ...rest } = options ?? {};
-    const handle = into === undefined ? undefined : WorkspaceRefImpl.handleOf(into);
-    return parseLandReport(await callNativeAsync(() => this.#native.land(workspace, encodeLandOptions(rest), handle)));
+    const target = into === undefined ? undefined : WorkspaceRefImpl.targetOf(into);
+    return callNativeAsync(() => N.coordinatorLand(this.#native, { workspace, into: target, options: rest }));
   }
 
   async restore(workspace: string, label: string): Promise<void> {
-    await callNativeAsync(() => this.#native.restore(workspace, label));
+    await callNativeAsync(() => N.coordinatorRestore(this.#native, { workspace, label }));
   }
 
   async detach(workspace: string): Promise<void> {
-    await callNativeAsync(() => this.#native.detach(workspace));
-  }
-  async resize(workspace: string, capacity: string, volume: ResizeVolume): Promise<ResizeResult> {
-    return parseResizeResult(
-      await callNativeAsync(() => this.#native.resize(workspace, capacity, JSON.stringify(volume))),
-    );
+    await callNativeAsync(() => N.coordinatorDetach(this.#native, { workspace }));
   }
 
-  async remove(workspace: string, options?: RemoveOptions): Promise<RemoveReport> {
-    return parseRemoveReport(await callNativeAsync(() => this.#native.remove(workspace, encodeRemoveOptions(options))));
+  async resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult> {
+    return callNativeAsync(() => N.coordinatorResize(this.#native, { workspace, capacity, volume }));
   }
 
-  async gc(options?: GcOptions): Promise<GcReport> {
-    return parseGcReport(await callNativeAsync(() => this.#native.gc(encodeGcOptions(options))));
+  async remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport> {
+    return callNativeAsync(() => N.coordinatorDestroy(this.#native, { workspace, options: options ?? {} }));
   }
-  async doctor(): Promise<DoctorReport> {
-    return parseDoctorReport(await callNativeAsync(() => this.#native.doctor()));
+
+  async gc(options?: Api.GcOptions): Promise<Api.GcReport> {
+    return callNativeAsync(() => N.coordinatorGc(this.#native, { options: options ?? {} }));
+  }
+
+  async doctor(): Promise<Api.DoctorReport> {
+    return callNativeAsync(() => N.coordinatorDoctor(this.#native, {}));
   }
 
   async worker(workspace: string): Promise<WorkspaceHandle> {
-    return new WorkspaceHandleImpl(await callNativeAsync(() => this.#native.worker(workspace)));
+    return new WorkspaceHandleImpl(await callNativeAsync(() => N.coordinatorWorker(this.#native, { workspace })));
   }
 }
 
@@ -342,46 +255,53 @@ class WorkspaceHandleImpl implements WorkspaceHandle {
   }
 
   async exec(request: ExecRequest): Promise<JobHandle> {
-    return new JobHandleImpl(await callNativeAsync(() => this.#native.exec(encodeExecRequest(request))));
+    return new JobHandleImpl(await callNativeAsync(() => exec(this.#native, null, request)));
   }
 
   async shell(session?: string): Promise<Session> {
-    return new SessionImpl(await callNativeAsync(() => this.#native.shell(session)));
+    const name = session ?? null;
+    await callNativeAsync(() => N.workerShell(this.#native, { session: name }));
+    return new SessionImpl(this.#native, name);
   }
 
-  async listJobs(): Promise<readonly JobInfo[]> {
-    return parseJobInfos(await callNativeAsync(() => this.#native.listJobs()));
+  async listJobs(): Promise<readonly Api.JobInfo[]> {
+    return callNativeAsync(() => N.workerListJobs(this.#native, {}));
   }
 
   async job(id: number): Promise<JobHandle> {
-    return new JobHandleImpl(await callNativeAsync(() => this.#native.job(id)));
-  }
-  async checkpoint(options?: CheckpointOptions): Promise<string> {
-    return callNativeAsync(() => this.#native.checkpoint(encodeCheckpointOptions(options)));
+    return new JobHandleImpl(await callNativeAsync(() => N.workerJob(this.#native, { jobId: id })));
   }
 
-  async push(options?: PushOptions): Promise<PushReport> {
-    return parsePushReport(await callNativeAsync(() => this.#native.push(encodePushOptions(options))));
+  async checkpoint(options?: Api.CheckpointOptions): Promise<string> {
+    const { label } = await callNativeAsync(() => N.workerCheckpoint(this.#native, { options: options ?? {} }));
+    return label;
   }
 
-  async grants(): Promise<GrantSet> {
-    return parseGrantSet(await callNativeAsync(() => this.#native.grantsJson()));
+  async push(options?: Api.PushOptions): Promise<Api.PushReport> {
+    return callNativeAsync(() => N.workerPush(this.#native, { options: options ?? {} }));
+  }
+
+  async grants(): Promise<Api.GrantSet> {
+    return callNativeAsync(() => N.workspaceGrants(this.#native, {}));
   }
 }
 
+/** A shell session: the worker it was opened through, and its name, which each exec names. */
 class SessionImpl implements Session {
-  readonly #native: NativeSessionHandle;
+  readonly #worker: NativeWorkspaceHandle;
+  readonly #name: string | null;
 
-  constructor(nativeSession: NativeSessionHandle) {
-    this.#native = nativeSession;
+  constructor(worker: NativeWorkspaceHandle, name: string | null) {
+    this.#worker = worker;
+    this.#name = name;
   }
 
   get isNamed(): boolean {
-    return this.#native.isNamed;
+    return this.#name !== null;
   }
 
   async exec(request: ExecRequest): Promise<JobHandle> {
-    return new JobHandleImpl(await callNativeAsync(() => this.#native.exec(encodeExecRequest(request))));
+    return new JobHandleImpl(await callNativeAsync(() => exec(this.#worker, this.#name, request)));
   }
 }
 
@@ -396,40 +316,24 @@ class JobHandleImpl implements JobHandle {
     return this.#native.id;
   }
 
-  async status(): Promise<JobInfo> {
-    return parseJobInfo(await callNativeAsync(() => this.#native.statusJson()));
+  async status(): Promise<Api.JobInfo> {
+    return callNativeAsync(() => N.jobStatus(this.#native, {}));
   }
 
-  async readLogs(stream: 'stdout' | 'stderr', follow = false): Promise<Uint8Array> {
-    return callNativeAsync(() => this.#native.readLogs(stream, follow));
-  }
-
-  async attach(): Promise<JobAttachment> {
-    return new JobAttachmentImpl(await callNativeAsync(() => this.#native.attach()));
+  async logs(args: N.JobLogsArguments): Promise<JobLogs> {
+    return callNativeAsync(() => N.jobLogs(this.#native, args));
   }
 
   async detach(): Promise<void> {
-    await callNativeAsync(() => this.#native.detach());
+    await callNativeAsync(() => N.jobDetach(this.#native, {}));
   }
 
-  async wait(): Promise<JobInfo> {
-    return parseJobInfo(await callNativeAsync(() => this.#native.wait()));
+  async wait(): Promise<Api.JobInfo> {
+    return callNativeAsync(() => N.jobWait(this.#native, {}));
   }
 
   async kill(): Promise<void> {
-    await callNativeAsync(() => this.#native.kill());
-  }
-}
-
-class JobAttachmentImpl implements JobAttachment {
-  readonly #native: NativeJobAttachmentHandle;
-
-  constructor(nativeAttachment: NativeJobAttachmentHandle) {
-    this.#native = nativeAttachment;
-  }
-
-  async detach(): Promise<void> {
-    await callNativeAsync(() => this.#native.detach());
+    await callNativeAsync(() => N.jobKill(this.#native, {}));
   }
 }
 

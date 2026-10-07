@@ -2,75 +2,42 @@
 
 import { createRequire } from 'node:module';
 import typia from 'typia';
+import type {
+  NativeCoordinatorOperations,
+  NativeJobHandleOperations,
+  NativeProjectOperations,
+  NativeWorkspaceHandleOperations,
+  NativeWorkspaceRefOperations,
+} from './native.generated.js';
 import { platformDirectory } from './platform.js';
 import type { CoordinatorEndpoint } from './types.js';
 
-export interface NativeProjectHandle {
+// Every controller operation's method is declared in `native.generated.ts`, from the operation
+// table the addon's adapters are generated from, and each handle extends exactly the operations
+// its authority admits. What follows is only what no operation declares: each handle's identity,
+// read from the call that minted it.
+
+export interface NativeProjectHandle extends NativeProjectOperations {
   readonly repoId: string;
   readonly gitRoot: string;
-  main(): Promise<NativeWorkspaceRefHandle>;
-  workspace(name: string): Promise<NativeWorkspaceRefHandle>;
-  workspaceAt(path: string): Promise<NativeWorkspaceRefHandle>;
-  path(name: string, noAttach: boolean): Promise<string>;
-  listWorkspaces(): Promise<string>;
 }
 
-export interface NativeWorkspaceRefHandle {
+export interface NativeWorkspaceRefHandle extends NativeWorkspaceRefOperations {
   readonly name: string;
   readonly mountPath: string;
-  infoJson(): Promise<string>;
-  attach(optionsJson?: string): Promise<void>;
-  grantsJson(): Promise<string>;
+  /** The reference as a land or rebase target, pinned to the incarnation it was resolved at. */
+  readonly targetJson: string;
 }
 
-export interface NativeCoordinatorHandle {
-  adopt(optionsJson: string): Promise<NativeWorkspaceRefHandle>;
-  create(name: string, optionsJson: string): Promise<NativeWorkspaceRefHandle>;
-  fork(source: string, destination: string): Promise<NativeWorkspaceRefHandle>;
-  rename(source: string, destination: string): Promise<NativeWorkspaceRefHandle>;
-  moveCheckout(destination: string): Promise<NativeWorkspaceRefHandle>;
-  grant(workspace: string, deltaJson: string): Promise<string>;
-  revoke(workspace: string, deltaJson: string): Promise<string>;
-  rebase(workspace: string, optionsJson: string, into?: NativeWorkspaceRefHandle): Promise<string>;
-  land(workspace: string, optionsJson: string, into?: NativeWorkspaceRefHandle): Promise<string>;
-  restore(workspace: string, label: string): Promise<void>;
-  detach(workspace: string): Promise<void>;
-  resize(workspace: string, capacity: string, volumeJson: string): Promise<string>;
-  remove(workspace: string, optionsJson: string): Promise<string>;
-  gc(optionsJson: string): Promise<string>;
-  doctor(): Promise<string>;
-  worker(workspace: string): Promise<NativeWorkspaceHandle>;
-}
+export type NativeCoordinatorHandle = NativeCoordinatorOperations;
 
-export interface NativeWorkspaceHandle {
+export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
   readonly name: string;
   readonly mountPath: string;
-  exec(requestJson: string): Promise<NativeJobHandle>;
-  shell(session?: string): Promise<NativeSessionHandle>;
-  listJobs(): Promise<string>;
-  job(id: number): Promise<NativeJobHandle>;
-  checkpoint(optionsJson: string): Promise<string>;
-  push(optionsJson: string): Promise<string>;
-  grantsJson(): Promise<string>;
 }
 
-export interface NativeSessionHandle {
-  readonly isNamed: boolean;
-  exec(requestJson: string): Promise<NativeJobHandle>;
-}
-
-export interface NativeJobHandle {
+export interface NativeJobHandle extends NativeJobHandleOperations {
   readonly id: number;
-  statusJson(): Promise<string>;
-  readLogs(stream: string, follow: boolean): Promise<Buffer>;
-  attach(): Promise<NativeJobAttachmentHandle>;
-  detach(): Promise<void>;
-  wait(): Promise<string>;
-  kill(): Promise<void>;
-}
-
-export interface NativeJobAttachmentHandle {
-  detach(): Promise<void>;
 }
 
 interface NativeModule {

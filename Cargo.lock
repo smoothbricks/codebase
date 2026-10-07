@@ -935,6 +935,7 @@ dependencies = [
 name = "cowshed-napi"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cowshed-cli",
  "cowshed-core",
  "libc",

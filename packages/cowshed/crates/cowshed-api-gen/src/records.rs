@@ -243,7 +243,9 @@ fn serde_for(attrs: &[Attribute], output_only: bool) -> syn::Result<Serde> {
                 result.from = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("default") {
                 result.default = true;
-                consume_value(&meta)?;
+                if meta.input.peek(syn::Token![=]) {
+                    result.default_with = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+                }
             } else if meta.path.is_ident("untagged") {
                 result.untagged = true;
             } else if meta.path.is_ident("transparent") {

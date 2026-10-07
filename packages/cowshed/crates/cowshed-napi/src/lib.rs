@@ -1,24 +1,30 @@
 //! Node-API bindings for the capability-safe cowshed client surface.
+//!
+//! Every controller operation reaches JavaScript through an adapter `cowshed-api-gen` emits from
+//! cowshed-core's operation table into `operations.generated.rs`: one method per operation, on
+//! the handle its namespace names, taking the request fields that handle does not bind as one
+//! JSON object. What is written here by hand is what no operation declares — the inherited
+//! endpoint, each handle's identity getters — and the error and promise plumbing the generated
+//! adapters share.
 
 use std::{
-    collections::HashMap,
     future::Future,
     io,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicI32, Ordering},
     },
 };
 
+use bytes::Bytes;
 use cowshed_core::{
-    Coordinator as CoreCoordinator, Cowshed, CowshedError, JobAttachment as CoreJobAttachment,
-    JobHandle as CoreJobHandle, JobStream, Project as CoreProject, Session as CoreSession,
-    WorkspaceHandle as CoreWorkspaceHandle, WorkspaceRef as CoreWorkspaceRef,
+    Coordinator as CoreCoordinator, Cowshed, CowshedError, JobHandle as CoreJobHandle,
+    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
+    WorkspaceRef as CoreWorkspaceRef,
     api::{
-        AdoptOptions, AttachOptions, CheckpointOptions, CreateOptions, ExecRequest, GcOptions,
-        GrantDelta, JobId, LandOptions, MAX_JOB_ID, OutputPublication, PushOptions, RebaseOptions,
-        RemoveOptions, ResizeVolume, RunSandboxMode, StdinSource, TraceContext, WorkspacePath,
+        call::{self, Arguments, NamesJob, Serves},
+        operations::{LogsChunk, Operation, WorkerView, WorkspaceView},
     },
 };
 use napi::{
@@ -26,7 +32,10 @@ use napi::{
     bindgen_prelude::{Buffer, ToNapiValue},
 };
 use napi_derive::napi;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::Serialize;
+
+#[path = "operations.generated.rs"]
+mod operations;
 
 const CONSUMED_FD: i32 = -1;
 
@@ -119,88 +128,155 @@ fn canonical_json<T: Serialize>(kind: &'static str, value: &T) -> AddonResult<St
         .map_err(|error| AddonFailure::internal(format!("failed to serialize {kind}: {error}")))
 }
 
-fn parse_json<T: DeserializeOwned>(kind: &'static str, value: &str) -> AddonResult<T> {
-    serde_json::from_str(value).map_err(|error| {
+/// A call's caller fields: one JSON object, never a number JavaScript has already rounded. JSON
+/// text crosses the boundary because napi's own value conversion turns an integer above
+/// `u32::MAX` into a float, which no `u64` request field accepts.
+fn arguments(method: &'static str, json: &str) -> AddonResult<Arguments> {
+    serde_json::from_str(json).map_err(|error| {
         AddonFailure::usage(
-            format!("invalid {kind} JSON: {error}"),
-            format!("pass a valid {kind} object"),
+            format!("{method} arguments are not one JSON object: {error}"),
+            "pass the operation's request fields as one JSON object",
         )
     })
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NapiExecRequest {
-    /// Exactly one of `argv` and `script`.
-    #[serde(default)]
-    argv: Option<Vec<String>>,
-    #[serde(default)]
-    script: Option<cowshed_core::api::ScriptCommand>,
-    #[serde(default)]
-    cwd: Option<WorkspacePath>,
-    #[serde(default)]
-    mode: RunSandboxMode,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    trace: Option<TraceContext>,
-    #[serde(default)]
-    stdin: Option<String>,
-    #[serde(default)]
-    stdin_workspace_path: Option<WorkspacePath>,
-    #[serde(default)]
-    stdout_copy: Option<OutputPublication>,
-    #[serde(default)]
-    stderr_copy: Option<OutputPublication>,
+/// An upload's raw-byte frame, when the caller sent one.
+fn frame(buffer: Option<Buffer>) -> Option<Bytes> {
+    buffer.map(|buffer| Bytes::from(Vec::<u8>::from(buffer)))
 }
 
-impl TryFrom<NapiExecRequest> for ExecRequest {
-    type Error = AddonFailure;
+/// A download's answer: the chunk's metadata as JSON, and its bytes.
+#[napi(object)]
+pub struct Download {
+    pub json: String,
+    pub bytes: Buffer,
+}
 
-    fn try_from(request: NapiExecRequest) -> AddonResult<Self> {
-        let stdin = match (request.stdin, request.stdin_workspace_path) {
-            (Some(_), Some(_)) => {
-                return Err(AddonFailure::usage(
-                    "exec request cannot provide both stdin and stdinWorkspacePath",
-                    "provide inline stdin or a workspace-relative stdinWorkspacePath",
-                ));
-            }
-            (Some(stdin), None) => StdinSource::Inline(stdin.into_bytes().into()),
-            (None, Some(path)) => StdinSource::WorkspaceFile(path),
-            (None, None) => StdinSource::Empty,
-        };
-        let command = cowshed_core::api::ExecCommand::from_fields(
-            request
-                .argv
-                .map(|argv| argv.into_iter().map(Into::into).collect()),
-            request.script,
-        )
-        .map_err(|error| {
-            AddonFailure::usage(
-                error.to_string(),
-                "provide argv for a command or script for shell text",
-            )
-        })?;
-        Ok(Self {
-            command,
-            cwd: request.cwd,
-            mode: request.mode,
-            env: request.env,
-            trace: request.trace,
-            stdin,
-            stdout_copy: request.stdout_copy,
-            stderr_copy: request.stderr_copy,
+// The adapters `operations.generated.rs` emits, one shape per kind of declared answer. Each runs
+// the call on the addon's runtime and settles the promise JavaScript holds.
+
+/// A JSON-lane operation whose result crosses as its canonical JSON.
+fn json_call<O, H>(env: Env, handle: Arc<H>, json: String) -> napi::Result<JsObject>
+where
+    O: Operation,
+    H: Serves<O> + Send + Sync + 'static,
+{
+    spawn_promise(env, async move {
+        let result = call::call::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
+        canonical_json(O::METHOD, &result)
+    })
+}
+
+/// An upload-lane operation, with the caller's bytes as its raw-byte frame when it sent any.
+fn upload_call<O, H>(
+    env: Env,
+    handle: Arc<H>,
+    json: String,
+    bytes: Option<Buffer>,
+) -> napi::Result<JsObject>
+where
+    O: Operation,
+    H: Serves<O> + Send + Sync + 'static,
+{
+    let bytes = frame(bytes);
+    spawn_promise(env, async move {
+        let result =
+            call::call_upload::<O, H>(&*handle, arguments(O::METHOD, &json)?, bytes).await?;
+        canonical_json(O::METHOD, &result)
+    })
+}
+
+/// A download-lane operation: the chunk's metadata and the bytes it describes.
+fn download_call<O, H>(env: Env, handle: Arc<H>, json: String) -> napi::Result<JsObject>
+where
+    O: Operation<Result = LogsChunk>,
+    H: Serves<O> + Send + Sync + 'static,
+{
+    spawn_promise(env, async move {
+        let (chunk, bytes) =
+            call::call_download::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
+        Ok(Download {
+            json: canonical_json(O::METHOD, &chunk)?,
+            bytes: Buffer::from(Vec::from(bytes)),
         })
-    }
+    })
 }
 
-async fn read_all_logs(mut logs: cowshed_core::RawByteStream) -> AddonResult<Buffer> {
-    let mut output = Vec::new();
-    while let Some(chunk) = logs.next().await {
-        let chunk = chunk.map_err(AddonFailure::from)?;
-        output.extend_from_slice(&chunk);
-    }
-    Ok(Buffer::from(output))
+/// An operation whose result is one workspace, as a reference to it.
+fn workspace_call<O, H>(env: Env, handle: Arc<H>, json: String) -> napi::Result<JsObject>
+where
+    O: Operation<Result = WorkspaceView>,
+    H: Serves<O> + Send + Sync + 'static,
+{
+    spawn_promise(env, async move {
+        let workspace =
+            call::call_workspace::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
+        Ok(WorkspaceRef {
+            inner: Arc::new(workspace),
+        })
+    })
+}
+
+/// The operation that mints a worker capability, as that capability.
+fn worker_call<O>(
+    env: Env,
+    coordinator: Arc<CoreCoordinator>,
+    json: String,
+) -> napi::Result<JsObject>
+where
+    O: Operation<Result = WorkerView>,
+    CoreCoordinator: Serves<O>,
+{
+    spawn_promise(env, async move {
+        let worker = coordinator
+            .call_worker::<O>(arguments(O::METHOD, &json)?)
+            .await?;
+        Ok(WorkspaceHandle {
+            inner: Arc::new(worker),
+        })
+    })
+}
+
+/// A JSON-lane operation of a workspace whose result names one of its jobs, as that job.
+fn job_call<O>(
+    env: Env,
+    workspace: Arc<CoreWorkspaceHandle>,
+    json: String,
+) -> napi::Result<JsObject>
+where
+    O: Operation<Result: NamesJob>,
+    CoreWorkspaceHandle: Serves<O>,
+{
+    spawn_promise(env, async move {
+        let job = workspace
+            .call_job::<O>(arguments(O::METHOD, &json)?)
+            .await?;
+        Ok(JobHandle {
+            inner: Arc::new(job),
+        })
+    })
+}
+
+/// [`job_call`] for an upload-lane operation.
+fn job_upload_call<O>(
+    env: Env,
+    workspace: Arc<CoreWorkspaceHandle>,
+    json: String,
+    bytes: Option<Buffer>,
+) -> napi::Result<JsObject>
+where
+    O: Operation<Result: NamesJob>,
+    CoreWorkspaceHandle: Serves<O>,
+{
+    let bytes = frame(bytes);
+    spawn_promise(env, async move {
+        let job = workspace
+            .call_job_upload::<O>(arguments(O::METHOD, &json)?, bytes)
+            .await?;
+        Ok(JobHandle {
+            inner: Arc::new(job),
+        })
+    })
 }
 
 fn set_cloexec(descriptor: &OwnedFd) -> io::Result<()> {
@@ -296,7 +372,9 @@ pub fn open_project(
             .map_err(AddonFailure::from)?;
         let project = cowshed.open(path).await.map_err(AddonFailure::from)?;
         drop(coordinator_token);
-        Ok(Project { inner: project })
+        Ok(Project {
+            inner: Arc::new(project),
+        })
     })
 }
 
@@ -326,241 +404,67 @@ pub fn connect_coordinator(
     })
 }
 
+fn utf8_path(env: Env, path: &std::path::Path, what: &str) -> napi::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        to_napi_error(
+            env,
+            AddonFailure::internal(format!("controller returned a non-UTF-8 {what}")),
+        )
+    })
+}
+
+/// Sole project mutation and cross-workspace authority.
 #[napi]
 pub struct Coordinator {
     inner: Arc<CoreCoordinator>,
 }
 
+/// Discovery-only project identity.
 #[napi]
-impl Coordinator {
-    #[napi]
-    pub fn adopt(&self, env: Env, options_json: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<AdoptOptions>("adopt options", &options_json)?;
-            let workspace = coordinator
-                .adopt(options)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
+pub struct Project {
+    inner: Arc<CoreProject>,
+}
+
+#[napi]
+impl Project {
+    #[napi(getter, js_name = "repoId")]
+    pub fn repo_id(&self) -> String {
+        self.inner.repo_id().to_string()
     }
 
-    #[napi]
-    pub fn create(&self, env: Env, name: String, options_json: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<CreateOptions>("create options", &options_json)?;
-            let workspace = coordinator
-                .create(&name, options)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-
-    #[napi]
-    pub fn fork(&self, env: Env, source: String, destination: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let workspace = coordinator
-                .fork(&source, &destination)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-    #[napi]
-    pub fn rename(&self, env: Env, source: String, destination: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let workspace = coordinator
-                .rename(&source, &destination)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-
-    #[napi(js_name = "moveCheckout")]
-    pub fn move_checkout(&self, env: Env, destination: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let workspace = coordinator
-                .move_checkout(std::path::Path::new(&destination))
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-
-    #[napi]
-    pub fn grant(&self, env: Env, workspace: String, delta_json: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let delta = parse_json::<GrantDelta>("grant delta", &delta_json)?;
-            let grants = coordinator
-                .grant(&workspace, delta)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("grant set", &grants)
-        })
-    }
-
-    #[napi]
-    pub fn revoke(
-        &self,
-        env: Env,
-        workspace: String,
-        delta_json: String,
-    ) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let delta = parse_json::<GrantDelta>("grant delta", &delta_json)?;
-            let grants = coordinator
-                .revoke(&workspace, delta)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("grant set", &grants)
-        })
-    }
-
-    /// `into` is the workspace reference the unit lands into — a lane base — or absent for main.
-    /// It arrives as the reference itself, never as a name, so it carries the incarnation it was
-    /// resolved at; `strict` makes the addon refuse anything that is not one of its references.
-    #[napi(strict)]
-    pub fn rebase(
-        &self,
-        env: Env,
-        workspace: String,
-        options_json: String,
-        into: Option<&WorkspaceRef>,
-    ) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        let into = into.map(|reference| reference.inner.clone());
-        spawn_promise(env, async move {
-            let options = parse_json::<RebaseOptions>("rebase options", &options_json)?;
-            let report = coordinator
-                .rebase(&workspace, into.as_ref(), options)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("rebase report", &report)
-        })
-    }
-
-    /// `into` as for [`Self::rebase`]: the lane base the unit lands into, or absent for main.
-    #[napi(strict)]
-    pub fn land(
-        &self,
-        env: Env,
-        workspace: String,
-        options_json: String,
-        into: Option<&WorkspaceRef>,
-    ) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        let into = into.map(|reference| reference.inner.clone());
-        spawn_promise(env, async move {
-            let options = parse_json::<LandOptions>("land options", &options_json)?;
-            let report = coordinator
-                .land(&workspace, into.as_ref(), options)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("land report", &report)
-        })
-    }
-
-    #[napi]
-    pub fn restore(&self, env: Env, workspace: String, label: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            coordinator
-                .restore(&workspace, &label)
-                .await
-                .map_err(AddonFailure::from)
-        })
-    }
-
-    #[napi]
-    pub fn detach(&self, env: Env, workspace: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            coordinator
-                .detach(&workspace)
-                .await
-                .map_err(AddonFailure::from)
-                .map(|_| ())
-        })
-    }
-    #[napi]
-    pub fn resize(
-        &self,
-        env: Env,
-        workspace: String,
-        capacity: String,
-        volume_json: String,
-    ) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let volume = parse_json::<ResizeVolume>("resize volume", &volume_json)?;
-            let result = coordinator
-                .resize(&workspace, &capacity, volume)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("resize result", &result)
-        })
-    }
-
-    #[napi]
-    pub fn remove(
-        &self,
-        env: Env,
-        workspace: String,
-        options_json: String,
-    ) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<RemoveOptions>("remove options", &options_json)?;
-            let report = coordinator
-                .destroy(&workspace, options)
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("remove report", &report)
-        })
-    }
-
-    #[napi]
-    pub fn gc(&self, env: Env, options_json: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<GcOptions>("GC options", &options_json)?;
-            let report = coordinator.gc(options).await.map_err(AddonFailure::from)?;
-            canonical_json("GC report", &report)
-        })
-    }
-    #[napi]
-    pub fn doctor(&self, env: Env) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let report = coordinator.doctor().await.map_err(AddonFailure::from)?;
-            canonical_json("doctor report", &report)
-        })
-    }
-
-    #[napi]
-    pub fn worker(&self, env: Env, workspace: String) -> napi::Result<JsObject> {
-        let coordinator = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let worker = coordinator
-                .worker(&workspace)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceHandle {
-                inner: Arc::new(worker),
-            })
-        })
+    #[napi(getter, js_name = "gitRoot")]
+    pub fn git_root(&self, env: Env) -> napi::Result<String> {
+        utf8_path(env, self.inner.git_root(), "Git root")
     }
 }
 
+/// One workspace incarnation, as the call that resolved it saw it.
+#[napi]
+pub struct WorkspaceRef {
+    inner: Arc<CoreWorkspaceRef>,
+}
+
+#[napi]
+impl WorkspaceRef {
+    #[napi(getter)]
+    pub fn name(&self) -> String {
+        self.inner.name().to_string()
+    }
+
+    #[napi(getter, js_name = "mountPath")]
+    pub fn mount_path(&self, env: Env) -> napi::Result<String> {
+        utf8_path(env, self.inner.mount_path(), "workspace mount path")
+    }
+
+    /// This reference as a land or rebase target, pinned to the incarnation it was resolved at.
+    #[napi(getter, js_name = "targetJson")]
+    pub fn target_json(&self, env: Env) -> napi::Result<String> {
+        canonical_json("workspace target", &self.inner.target())
+            .map_err(|failure| to_napi_error(env, failure))
+    }
+}
+
+/// Non-escalating capability for exactly one workspace incarnation.
 #[napi]
 pub struct WorkspaceHandle {
     inner: Arc<CoreWorkspaceHandle>,
@@ -575,136 +479,11 @@ impl WorkspaceHandle {
 
     #[napi(getter, js_name = "mountPath")]
     pub fn mount_path(&self, env: Env) -> napi::Result<String> {
-        self.inner
-            .mount_path()
-            .to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                to_napi_error(
-                    env,
-                    AddonFailure::internal("controller returned a non-UTF-8 workspace mount path"),
-                )
-            })
-    }
-
-    #[napi]
-    pub fn exec(&self, env: Env, request_json: String) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let request = parse_json::<NapiExecRequest>("exec request", &request_json)?;
-            let job = worker
-                .exec(request.try_into()?)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(JobHandle {
-                inner: Arc::new(job),
-            })
-        })
-    }
-
-    #[napi]
-    pub fn shell(&self, env: Env, session: Option<String>) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let session = worker
-                .shell(session.as_deref())
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(Session {
-                inner: Arc::new(session),
-            })
-        })
-    }
-
-    #[napi(js_name = "listJobs")]
-    pub fn list_jobs(&self, env: Env) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let jobs = worker.list_jobs().await.map_err(AddonFailure::from)?;
-            canonical_json("job list", &jobs)
-        })
-    }
-
-    #[napi]
-    pub fn job(&self, env: Env, id: f64) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            // JS `number` is not a `u64`, so the finite/integral gate is the addon's job; the
-            // bound is not, and is read from core rather than respelled as a shift. `JobId::new`
-            // is the authority on the range and rejects anything this misses.
-            if !id.is_finite() || id.fract() != 0.0 || id < 1.0 || id > MAX_JOB_ID as f64 {
-                return Err(AddonFailure::usage(
-                    format!("invalid job id {id}"),
-                    "pass a positive safe integer job id",
-                ));
-            }
-            let id = JobId::new(id as u64).map_err(|error| {
-                AddonFailure::usage(error.to_string(), "pass a valid positive job id")
-            })?;
-            let job = worker.job(id).await.map_err(AddonFailure::from)?;
-            Ok(JobHandle {
-                inner: Arc::new(job),
-            })
-        })
-    }
-    #[napi]
-    pub fn checkpoint(&self, env: Env, options_json: String) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<CheckpointOptions>("checkpoint options", &options_json)?;
-            worker.checkpoint(options).await.map_err(AddonFailure::from)
-        })
-    }
-
-    #[napi]
-    pub fn push(&self, env: Env, options_json: String) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let options = parse_json::<PushOptions>("push options", &options_json)?;
-            let report = worker.push(options).await.map_err(AddonFailure::from)?;
-            canonical_json("push report", &report)
-        })
-    }
-
-    #[napi(js_name = "grantsJson")]
-    pub fn grants_json(&self, env: Env) -> napi::Result<JsObject> {
-        let worker = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let grants = worker.grants().await.map_err(AddonFailure::from)?;
-            canonical_json("workspace grants", &grants)
-        })
+        utf8_path(env, self.inner.mount_path(), "workspace mount path")
     }
 }
 
-/// A shell session retains worker authority and can launch jobs through that named session.
-#[napi]
-pub struct Session {
-    inner: Arc<CoreSession>,
-}
-
-#[napi]
-impl Session {
-    #[napi(getter, js_name = "isNamed")]
-    pub fn is_named(&self) -> bool {
-        self.inner.is_named()
-    }
-
-    #[napi]
-    pub fn exec(&self, env: Env, request_json: String) -> napi::Result<JsObject> {
-        let session = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let request = parse_json::<NapiExecRequest>("exec request", &request_json)?;
-            let job = session
-                .run(request.try_into()?)
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(JobHandle {
-                inner: Arc::new(job),
-            })
-        })
-    }
-}
-
+/// One job of one workspace incarnation.
 #[napi]
 pub struct JobHandle {
     inner: Arc<CoreJobHandle>,
@@ -712,265 +491,14 @@ pub struct JobHandle {
 
 #[napi]
 impl JobHandle {
+    /// A job id is at most `MAX_JOB_ID`, a safe integer, so JavaScript's number holds it exactly.
     #[napi(getter)]
-    pub fn id(&self) -> f64 {
-        self.inner.id().get() as f64
-    }
-
-    #[napi(js_name = "statusJson")]
-    pub fn status_json(&self, env: Env) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let status = job.status().await.map_err(AddonFailure::from)?;
-            canonical_json("job status", &status)
-        })
-    }
-
-    /// Returns a buffered stream. `follow` remains asynchronous and resolves when the stream closes.
-    #[napi(js_name = "readLogs")]
-    pub fn read_logs(&self, env: Env, stream: String, follow: bool) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let stream = match stream.as_str() {
-                "stdout" => JobStream::Stdout,
-                "stderr" => JobStream::Stderr,
-                _ => {
-                    return Err(AddonFailure::usage(
-                        format!("invalid job log stream {stream:?}"),
-                        "use stdout or stderr",
-                    ));
-                }
-            };
-            read_all_logs(
-                job.logs(stream, 0, follow)
-                    .await
-                    .map_err(AddonFailure::from)?,
+    pub fn id(&self, env: Env) -> napi::Result<i64> {
+        i64::try_from(self.inner.id().get()).map_err(|_| {
+            to_napi_error(
+                env,
+                AddonFailure::internal("a job id exceeded the safe integer range"),
             )
-            .await
-        })
-    }
-
-    #[napi]
-    pub fn attach(&self, env: Env) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let attachment = job.attach().await.map_err(AddonFailure::from)?;
-            Ok(JobAttachment {
-                inner: Arc::new(Mutex::new(Some(attachment))),
-            })
-        })
-    }
-
-    #[napi]
-    pub fn detach(&self, env: Env) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            job.detach().await.map_err(AddonFailure::from)
-        })
-    }
-
-    #[napi]
-    pub fn wait(&self, env: Env) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let status = job.wait().await.map_err(AddonFailure::from)?;
-            canonical_json("job status", &status)
-        })
-    }
-
-    #[napi]
-    pub fn kill(&self, env: Env) -> napi::Result<JsObject> {
-        let job = Arc::clone(&self.inner);
-        spawn_promise(
-            env,
-            async move { job.kill().await.map_err(AddonFailure::from) },
-        )
-    }
-}
-
-/// Active job attachment. Dropping it releases local stream receivers; call `detach` to notify
-/// the controller explicitly that the attached session is finished.
-#[napi]
-pub struct JobAttachment {
-    inner: Arc<Mutex<Option<CoreJobAttachment>>>,
-}
-
-#[napi]
-impl JobAttachment {
-    #[napi]
-    pub fn detach(&self, env: Env) -> napi::Result<JsObject> {
-        let attachment = Arc::clone(&self.inner);
-        spawn_promise(env, async move {
-            let attachment = attachment
-                .lock()
-                .map_err(|_| {
-                    AddonFailure::from(CowshedError::new(
-                        cowshed_core::ErrorCode::Internal,
-                        "job attachment mutex was poisoned",
-                        "restart the coordinator process",
-                    ))
-                })?
-                .take()
-                .ok_or_else(|| {
-                    AddonFailure::conflict(
-                        "job attachment has already been detached",
-                        "create a new job attachment before detaching again",
-                    )
-                })?;
-            attachment.detach().await.map_err(AddonFailure::from)
-        })
-    }
-}
-
-#[napi]
-pub struct Project {
-    inner: CoreProject,
-}
-
-#[napi]
-impl Project {
-    #[napi(getter, js_name = "repoId")]
-    pub fn repo_id(&self) -> String {
-        self.inner.repo_id().to_string()
-    }
-
-    #[napi(getter, js_name = "gitRoot")]
-    pub fn git_root(&self, env: Env) -> napi::Result<String> {
-        self.inner
-            .git_root()
-            .to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                to_napi_error(
-                    env,
-                    AddonFailure::internal("controller returned a non-UTF-8 Git root"),
-                )
-            })
-    }
-
-    #[napi]
-    pub fn main(&self, env: Env) -> napi::Result<JsObject> {
-        let project = self.inner.clone();
-        spawn_promise(env, async move {
-            let workspace = project.main().await.map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-
-    #[napi]
-    pub fn workspace(&self, env: Env, name: String) -> napi::Result<JsObject> {
-        let project = self.inner.clone();
-        spawn_promise(env, async move {
-            let workspace = project.workspace(&name).await.map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-    #[napi(js_name = "workspaceAt")]
-    pub fn workspace_at(&self, env: Env, path: String) -> napi::Result<JsObject> {
-        let project = self.inner.clone();
-        spawn_promise(env, async move {
-            let workspace = project
-                .workspace_at(std::path::Path::new(&path))
-                .await
-                .map_err(AddonFailure::from)?;
-            Ok(WorkspaceRef { inner: workspace })
-        })
-    }
-
-    #[napi]
-    pub fn path(&self, env: Env, name: String, no_attach: bool) -> napi::Result<JsObject> {
-        let project = self.inner.clone();
-        spawn_promise(env, async move {
-            let workspace = project.workspace(&name).await.map_err(AddonFailure::from)?;
-            if !no_attach {
-                workspace
-                    .attach(AttachOptions::default())
-                    .await
-                    .map_err(AddonFailure::from)?;
-            }
-            canonical_json(
-                "workspace info",
-                &workspace.refresh_info().await.map_err(AddonFailure::from)?,
-            )
-        })
-    }
-
-    #[napi(js_name = "listWorkspaces")]
-    pub fn list_workspaces(&self, env: Env) -> napi::Result<JsObject> {
-        let project = self.inner.clone();
-        spawn_promise(env, async move {
-            let infos = project
-                .list()
-                .await
-                .map_err(AddonFailure::from)?
-                .into_iter()
-                .map(CoreWorkspaceRef::into_info)
-                .collect::<Vec<_>>();
-            canonical_json("workspace list", &infos)
-        })
-    }
-}
-
-#[napi]
-pub struct WorkspaceRef {
-    inner: CoreWorkspaceRef,
-}
-
-#[napi]
-impl WorkspaceRef {
-    #[napi(getter)]
-    pub fn name(&self) -> String {
-        self.inner.name().to_string()
-    }
-
-    #[napi(getter, js_name = "mountPath")]
-    pub fn mount_path(&self, env: Env) -> napi::Result<String> {
-        self.inner
-            .mount_path()
-            .to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                to_napi_error(
-                    env,
-                    AddonFailure::internal("controller returned a non-UTF-8 workspace mount path"),
-                )
-            })
-    }
-
-    #[napi(js_name = "infoJson")]
-    pub fn info_json(&self, env: Env) -> napi::Result<JsObject> {
-        let workspace = self.inner.clone();
-        spawn_promise(env, async move {
-            let info = workspace.refresh_info().await.map_err(AddonFailure::from)?;
-            canonical_json("workspace info", &info)
-        })
-    }
-
-    #[napi]
-    pub fn attach(&self, env: Env, options_json: Option<String>) -> napi::Result<JsObject> {
-        let workspace = self.inner.clone();
-        spawn_promise(env, async move {
-            let options =
-                serde_json::from_str::<AttachOptions>(options_json.as_deref().unwrap_or("{}"))
-                    .map_err(|error| {
-                        AddonFailure::usage(
-                            format!("invalid workspace attach options JSON: {error}"),
-                            "pass attach options JSON such as {\"browse\":false}",
-                        )
-                    })?;
-            workspace.attach(options).await.map_err(AddonFailure::from)
-        })
-    }
-
-    #[napi(js_name = "grantsJson")]
-    pub fn grants_json(&self, env: Env) -> napi::Result<JsObject> {
-        let workspace = self.inner.clone();
-        spawn_promise(env, async move {
-            let grants = workspace
-                .refresh_grants()
-                .await
-                .map_err(AddonFailure::from)?;
-            canonical_json("workspace grants", &grants)
         })
     }
 }
@@ -983,74 +511,39 @@ mod parity_tests {
     use std::collections::BTreeSet;
 
     use cowshed_cli::args::{COMMANDS, Command, parse_args};
-    use cowshed_core::api::StdinSource;
+    use cowshed_core::api::operations::{OPERATIONS, Scope};
 
-    /// Compile-visible seam over core's `StdinSource`: every variant must name the JS wire field
-    /// that produces it, or state that it deliberately has none (`NapiExecRequest`'s `TryFrom`
-    /// maps the other direction and therefore cannot be exhaustive over core). Adding a core
-    /// variant breaks this match instead of silently becoming a mode the wire cannot express.
-    fn wire_stdin_spelling(source: &StdinSource) -> &'static str {
-        match source {
-            StdinSource::Empty => "omit stdin and stdinWorkspacePath",
-            StdinSource::Inline(_) => "stdin",
-            StdinSource::WorkspaceFile(_) => "stdinWorkspacePath",
-            StdinSource::Stream(_) => "(no wire spelling: process stdin is CLI-only)",
-        }
-    }
-
-    #[test]
-    fn every_core_stdin_variant_has_a_wire_verdict() {
-        // All four, not just the two that were asserted before: an unasserted arm means the JS
-        // field name it pins can be renamed without a single test going red, which is exactly
-        // what `stdinWorkspacePath` needs protecting from.
-        assert_eq!(
-            wire_stdin_spelling(&StdinSource::Empty),
-            "omit stdin and stdinWorkspacePath"
-        );
-        assert_eq!(
-            wire_stdin_spelling(&StdinSource::Inline(Vec::new().into())),
-            "stdin"
-        );
-        assert_eq!(
-            wire_stdin_spelling(&StdinSource::WorkspaceFile(
-                cowshed_core::api::WorkspacePath::new("fixtures/input.txt")
-                    .expect("a relative fixture path")
-            )),
-            "stdinWorkspacePath"
-        );
-        assert_eq!(
-            wire_stdin_spelling(&StdinSource::Stream(Box::pin(&b""[..]))),
-            "(no wire spelling: process stdin is CLI-only)"
-        );
-    }
-
-    /// The capability export a CLI verb corresponds to, or `None` when the verb has no export at
-    /// all: host management runs the packaged binary through the `cli.ts` trampoline, and the
-    /// addon deliberately does not link the CLI to offer a second in-process copy of it.
+    /// The controller operations a CLI verb reaches through the addon, or `None` when the verb
+    /// has none: host management runs the packaged binary through the `cli.ts` trampoline, and
+    /// the addon deliberately does not link the CLI to offer a second in-process copy of it.
+    /// Every declared operation outside the controller's own is an addon method generated from
+    /// the operation table, so naming the operation names the export.
     ///
     /// Adding a `Command` variant breaks this match. Adding an arm without adding it to `SAMPLES`
-    /// breaks `every_napi_export_is_exercised_by_a_sample`.
-    fn napi_export(command: &Command) -> Option<&'static str> {
+    /// breaks `every_cli_command_maps_to_its_named_operations`.
+    fn napi_operations(command: &Command) -> Option<&'static [&'static str]> {
         match command {
-            Command::Adopt(_) => Some("Coordinator.adopt"),
-            Command::New(_) => Some("Coordinator.create"),
-            Command::Fork(_) => Some("Coordinator.fork"),
-            Command::Move(_) => Some("Coordinator.rename|Coordinator.moveCheckout"),
-            Command::Checkpoint(_) => Some("WorkspaceHandle.checkpoint"),
-            Command::Restore(_) => Some("Coordinator.restore"),
-            Command::List(_) => Some("Project.listWorkspaces"),
-            Command::Path(_) => Some("Project.path"),
-            Command::Exec(_) => Some("WorkspaceHandle.exec"),
-            Command::Grant(_) => Some("Coordinator.grant|WorkspaceRef.grants"),
-            Command::Remove(_) => Some("Coordinator.remove"),
-            Command::Attach(_) => Some("WorkspaceRef.attach"),
-            Command::Detach(_) => Some("Coordinator.detach"),
-            Command::Resize(_) => Some("Coordinator.resize"),
-            Command::Gc(_) => Some("Coordinator.gc"),
-            Command::Push(_) => Some("WorkspaceHandle.push"),
-            Command::Rebase(_) => Some("Coordinator.rebase"),
-            Command::Land(_) => Some("Coordinator.land"),
-            Command::Doctor(_) => Some("Coordinator.doctor"),
+            Command::Adopt(_) => Some(&["coordinator.adopt"]),
+            Command::New(_) => Some(&["coordinator.create"]),
+            Command::Fork(_) => Some(&["coordinator.fork"]),
+            Command::Move(_) => Some(&["coordinator.rename", "coordinator.moveCheckout"]),
+            Command::Checkpoint(_) => Some(&["worker.checkpoint"]),
+            Command::Restore(_) => Some(&["coordinator.restore"]),
+            Command::List(_) => Some(&["project.list"]),
+            Command::Path(_) => Some(&["project.workspace", "workspace.info"]),
+            Command::Exec(_) => Some(&["worker.exec"]),
+            Command::Grant(_) => Some(&["coordinator.grant", "workspace.grants"]),
+            Command::Remove(_) => Some(&["coordinator.destroy"]),
+            Command::Attach(_) => Some(&["workspace.attach"]),
+            Command::Detach(_) => Some(&["coordinator.detach"]),
+            Command::Resize(_) => Some(&["coordinator.resize"]),
+            Command::Defrag(_) => Some(&["coordinator.defragment"]),
+            Command::Reseed(_) => Some(&["coordinator.reseed"]),
+            Command::Gc(_) => Some(&["coordinator.gc"]),
+            Command::Push(_) => Some(&["worker.push"]),
+            Command::Rebase(_) => Some(&["coordinator.rebase"]),
+            Command::Land(_) => Some(&["coordinator.land"]),
+            Command::Doctor(_) => Some(&["coordinator.doctor"]),
             // The verb serves the endpoint `coordinatorEndpoint` wraps; the addon is its peer, not a
             // second copy of it.
             Command::Controller
@@ -1062,8 +555,6 @@ mod parity_tests {
             | Command::Setup(_)
             | Command::Mount(_)
             | Command::Rekey(_)
-            | Command::Defrag(_)
-            | Command::Reseed(_)
             | Command::Version
             // A read-only lint helper over the checkout's recorded volume state; no controller call.
             | Command::BuildState
@@ -1071,41 +562,41 @@ mod parity_tests {
         }
     }
 
-    /// One representative argv per `Command` arm, paired with the export it must map to. The
-    /// pairing is the assertion: the previous `!is_empty()` check passed for every arm that
-    /// returned any literal at all, so no rename and no re-pointing of a verb could fail it.
-    const SAMPLES: &[(&[&str], Option<&str>)] = &[
-        (&["adopt"], Some("Coordinator.adopt")),
-        (&["new", "parity"], Some("Coordinator.create")),
-        (&["fork", "main", "parity"], Some("Coordinator.fork")),
+    /// One representative argv per `Command` arm, paired with the operations it must map to.
+    const SAMPLES: &[(&[&str], Option<&[&str]>)] = &[
+        (&["adopt"], Some(&["coordinator.adopt"])),
+        (&["new", "parity"], Some(&["coordinator.create"])),
+        (&["fork", "main", "parity"], Some(&["coordinator.fork"])),
         (
             &["mv", "parity", "renamed"],
-            Some("Coordinator.rename|Coordinator.moveCheckout"),
+            Some(&["coordinator.rename", "coordinator.moveCheckout"]),
         ),
+        (&["checkpoint", "parity"], Some(&["worker.checkpoint"])),
         (
-            &["checkpoint", "parity"],
-            Some("WorkspaceHandle.checkpoint"),
+            &["restore", "parity", "saved"],
+            Some(&["coordinator.restore"]),
         ),
-        (&["restore", "parity", "saved"], Some("Coordinator.restore")),
-        (&["ls"], Some("Project.listWorkspaces")),
-        (&["path", "parity"], Some("Project.path")),
+        (&["ls"], Some(&["project.list"])),
         (
-            &["exec", "parity", "--", "true"],
-            Some("WorkspaceHandle.exec"),
+            &["path", "parity"],
+            Some(&["project.workspace", "workspace.info"]),
         ),
+        (&["exec", "parity", "--", "true"], Some(&["worker.exec"])),
         (
             &["grant", "parity"],
-            Some("Coordinator.grant|WorkspaceRef.grants"),
+            Some(&["coordinator.grant", "workspace.grants"]),
         ),
-        (&["rm", "parity"], Some("Coordinator.remove")),
-        (&["attach", "parity"], Some("WorkspaceRef.attach")),
-        (&["detach", "parity"], Some("Coordinator.detach")),
-        (&["resize", "parity", "200g"], Some("Coordinator.resize")),
-        (&["gc"], Some("Coordinator.gc")),
-        (&["push", "parity"], Some("WorkspaceHandle.push")),
-        (&["rebase", "parity"], Some("Coordinator.rebase")),
-        (&["land", "parity"], Some("Coordinator.land")),
-        (&["doctor"], Some("Coordinator.doctor")),
+        (&["rm", "parity"], Some(&["coordinator.destroy"])),
+        (&["attach", "parity"], Some(&["workspace.attach"])),
+        (&["detach", "parity"], Some(&["coordinator.detach"])),
+        (&["resize", "parity", "200g"], Some(&["coordinator.resize"])),
+        (&["defrag", "parity"], Some(&["coordinator.defragment"])),
+        (&["reseed", "parity"], Some(&["coordinator.reseed"])),
+        (&["gc"], Some(&["coordinator.gc"])),
+        (&["push", "parity"], Some(&["worker.push"])),
+        (&["rebase", "parity"], Some(&["coordinator.rebase"])),
+        (&["land", "parity"], Some(&["coordinator.land"])),
+        (&["doctor"], Some(&["coordinator.doctor"])),
         (&["gateway", "status"], None),
         (&["controller"], None),
         (&["credential", "status"], None),
@@ -1114,8 +605,6 @@ mod parity_tests {
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["rekey", "parity"], None),
-        (&["defrag", "parity"], None),
-        (&["reseed", "parity"], None),
         (&["help"], None),
         (&["setup"], None),
         (&["build-state"], None),
@@ -1123,23 +612,42 @@ mod parity_tests {
     ];
 
     #[test]
-    fn every_cli_command_maps_to_its_named_napi_export() {
+    fn every_cli_command_maps_to_its_named_operations() {
         for (argv, expected) in SAMPLES {
             let parsed =
                 parse_args(argv.iter().copied()).expect("representative CLI command parses");
             assert_eq!(
-                napi_export(&parsed.command),
+                napi_operations(&parsed.command),
                 *expected,
-                "CLI command {argv:?} does not map to the export the parity table names"
+                "CLI command {argv:?} does not map to the operations the parity table names"
             );
+        }
+    }
+
+    /// Every operation the table names is declared and projected onto the addon: a renamed or
+    /// controller-internal operation is red here, not a verb JavaScript silently lost.
+    #[test]
+    fn every_named_operation_is_a_projected_declaration() {
+        let projected: BTreeSet<&str> = OPERATIONS
+            .iter()
+            .filter(|operation| operation.scope != Scope::Internal)
+            .map(|operation| operation.method)
+            .collect();
+        for (argv, operations) in SAMPLES {
+            for method in operations.iter().copied().flatten() {
+                assert!(
+                    projected.contains(method),
+                    "{argv:?} names {method}, which the addon does not project"
+                );
+            }
         }
     }
 
     /// Every verb the CLI dispatches must appear in the parity table.
     ///
     /// `COMMANDS` is the command map `cowshed --help` prints and the list the parser is generated
-    /// from, so this is red the moment a verb is added without naming the capability export it
-    /// corresponds to — which is the hole the old `!napi_export(..).is_empty()` left wide open.
+    /// from, so this is red the moment a verb is added without naming the operations it
+    /// corresponds to.
     #[test]
     fn every_cli_verb_has_a_parity_sample() {
         let dispatched: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
@@ -1162,19 +670,20 @@ mod parity_tests {
         );
     }
 
-    /// No two verbs may claim one export: that would mean the table has stopped describing the
+    /// No two verbs may claim one operation: that would mean the table has stopped describing the
     /// seam it is named after.
     #[test]
-    fn no_two_verbs_claim_one_napi_export() {
-        let mut claimed: Vec<&str> = SAMPLES.iter().filter_map(|(_, export)| *export).collect();
+    fn no_two_verbs_claim_one_operation() {
+        let mut claimed: Vec<&str> = SAMPLES
+            .iter()
+            .filter_map(|(_, operations)| *operations)
+            .flatten()
+            .copied()
+            .collect();
         let distinct: BTreeSet<&str> = claimed.iter().copied().collect();
         claimed.sort_unstable();
 
-        assert_eq!(
-            claimed.len(),
-            distinct.len(),
-            "duplicate N-API export claim"
-        );
+        assert_eq!(claimed.len(), distinct.len(), "duplicate operation claim");
     }
 }
 

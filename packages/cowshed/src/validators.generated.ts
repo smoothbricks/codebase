@@ -565,6 +565,12 @@ export const assertProjectGrantRequestList = typia.createAssertEquals<readonly A
 export const parseProjectGrantRequestList = (json: string): readonly Api.ProjectGrantRequest[] =>
   assertProjectGrantRequestList(JSON.parse(json));
 
+export const assertProjectGrants = typia.createAssertEquals<Api.ProjectGrants>();
+export const parseProjectGrants = (json: string): Api.ProjectGrants => assertProjectGrants(JSON.parse(json));
+export const assertProjectGrantsList = typia.createAssertEquals<readonly Api.ProjectGrants[]>();
+export const parseProjectGrantsList = (json: string): readonly Api.ProjectGrants[] =>
+  assertProjectGrantsList(JSON.parse(json));
+
 export const assertProjectOpenRequest = typia.createAssertEquals<Api.ProjectOpenRequest>();
 export const parseProjectOpenRequest = (json: string): Api.ProjectOpenRequest =>
   assertProjectOpenRequest(JSON.parse(json));

@@ -413,7 +413,11 @@ fn documentation(output: &mut String, docs: &[String], indentation: &str) {
     writeln!(output, "{indentation} */").unwrap();
 }
 
-fn renamed(name: &str, explicit: Option<&str>, rule: Option<&str>) -> Result<String, String> {
+pub(crate) fn renamed(
+    name: &str,
+    explicit: Option<&str>,
+    rule: Option<&str>,
+) -> Result<String, String> {
     if let Some(explicit) = explicit {
         return Ok(explicit.to_owned());
     }

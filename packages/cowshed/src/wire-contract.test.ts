@@ -7,6 +7,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import typia from 'typia';
+import type { JobKillArguments } from './native.generated.js';
 import type { GrantDelta } from './types.js';
 import * as validators from './validators.generated.js';
 
@@ -160,6 +161,17 @@ describe('napi wire contract', () => {
     expect(() => assertDelta({ servicePorts: '80' })).toThrow();
   });
 
+  it('types the arguments of a handle that binds every request field as exactly empty', () => {
+    // A job handle binds every `job.kill` field. `Pick<JobRequest, never>` would be `{}`, which
+    // admits any non-nullish value; the generated type admits exactly an empty object.
+    // @ts-expect-error a primitive is not a job.kill caller's arguments
+    const _primitive: JobKillArguments = 1;
+    const isKillArguments = typia.createEquals<JobKillArguments>();
+    expect(isKillArguments({})).toBe(true);
+    expect(isKillArguments({ jobId: 7 })).toBe(false);
+    expect(isKillArguments(1)).toBe(false);
+  });
+
   it('keeps blocks a relocated workspace still reserves apart from its current block', () => {
     // The `open` corpus document carries both: `portBlock` is the gateway endpoint and job env, while
     // `retainedPortBlocks` are the blocks it moved away from and still owns. A singular or misspelled
@@ -191,6 +203,7 @@ describe('canonical DTO generation', () => {
       mkdirSync(gateway, { recursive: true });
       cpSync(join(project, 'crates/cowshed-gateway-types/src/status.rs'), join(gateway, 'status.rs'));
       mkdirSync(join(scratch, 'src'));
+      mkdirSync(join(scratch, 'crates/cowshed-napi/src'), { recursive: true });
       // A separate project snapshots the mutant after it exists; the running test's program
       // was already snapshotted before the scratch files were created.
       writeFileSync(

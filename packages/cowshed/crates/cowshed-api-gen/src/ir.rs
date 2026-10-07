@@ -51,6 +51,8 @@ pub struct Serde {
     pub untagged: bool,
     pub transparent: bool,
     pub default: bool,
+    /// The function a `default = "…"` names; `None` for a bare `default`, which is `Default`.
+    pub default_with: Option<String>,
     pub skip_serializing_if: Option<String>,
     pub skip: bool,
     pub flatten: bool,

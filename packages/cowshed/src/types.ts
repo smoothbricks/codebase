@@ -1,6 +1,8 @@
 import type * as Api from './api.generated.js';
+import type { JobLogsArguments } from './native.generated.js';
 
 export type * from './api.generated.js';
+export type { JobLogsArguments } from './native.generated.js';
 
 export class CowshedError extends Error {
   readonly code: Api.ErrorCode;
@@ -27,7 +29,16 @@ export type LandOptions = Api.LandOptions & { readonly into?: WorkspaceRef };
 type Utf8Command<Command> = Command extends { readonly argv: readonly Api.CommandArg[] }
   ? Omit<Command, 'argv'> & { readonly argv: readonly string[] }
   : Command;
-export type ExecCommand = Utf8Command<Api.ExecCommand>;
+
+/**
+ * Exactly one member of a union of records: each member forbids the keys only the others declare,
+ * so naming two members' keys at once does not type-check rather than silently choosing one.
+ */
+type Exclusive<Union, Keys extends PropertyKey = Union extends unknown ? keyof Union : never> = Union extends unknown
+  ? Union & { readonly [Key in Exclude<Keys, keyof Union>]?: never }
+  : never;
+
+export type ExecCommand = Exclusive<Utf8Command<Api.ExecCommand>>;
 
 type ExecOptionFields = Omit<
   Api.ExecParams,
@@ -37,10 +48,10 @@ type ExecOptionFields = Omit<
 /** Defaults and UTF-8 stdin sugar over the generated controller request, never another DTO list. */
 export type ExecOptions = {
   readonly [Key in keyof ExecOptionFields]?: Exclude<ExecOptionFields[Key], null>;
-} & {
-  readonly stdin?: string;
-  readonly stdinWorkspacePath?: Api.WorkspacePath;
-};
+} & (
+  | { readonly stdin?: string; readonly stdinWorkspacePath?: never }
+  | { readonly stdin?: never; readonly stdinWorkspacePath?: Api.WorkspacePath }
+);
 export type ExecRequest = ExecCommand & ExecOptions;
 
 /** Affine inherited descriptor; it may be consumed by exactly one connection attempt. */
@@ -94,19 +105,21 @@ export interface Session {
   exec(request: ExecRequest): Promise<JobHandle>;
 }
 
+/** One `job.logs` chunk: where it ends, whether the stream had ended, and its bytes. */
+export type JobLogs = Api.LogsChunk & { readonly bytes: Uint8Array };
+
 export interface JobHandle {
   readonly id: number;
   status(): Promise<Api.JobInfo>;
-  /** Buffered output; follow resolves after the followed stream closes. */
-  readLogs(stream: Api.JobStream, follow?: boolean): Promise<Uint8Array>;
-  attach(): Promise<JobAttachment>;
+  /**
+   * One stream's bytes from `offset`, at most one chunk. Reading again from `nextOffset` continues
+   * where this chunk ended; `follow` waits for bytes or the stream's end instead of answering an
+   * empty chunk while the job runs.
+   */
+  logs(args: JobLogsArguments): Promise<JobLogs>;
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;
-}
-
-export interface JobAttachment {
-  detach(): Promise<void>;
 }
 
 export interface WorkspaceRef {

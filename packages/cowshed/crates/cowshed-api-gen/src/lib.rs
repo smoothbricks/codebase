@@ -1,4 +1,6 @@
 pub mod ir;
+pub mod napi;
+pub mod operations;
 pub mod records;
 pub mod typescript;
 
@@ -43,7 +45,12 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     let gateway_status = project.join("crates/cowshed-gateway-types/src/status.rs");
     records::parse_support(&read_source(&gateway_status)?, &mut api)
         .map_err(|error| format!("{}: {error}", gateway_status.display()))?;
+    let table = core.join("api/operations.rs");
+    let operations = operations::parse(&read_source(&table)?)
+        .map_err(|error| format!("{}: {error}", table.display()))?;
+    napi::export_records(&operations, &mut api)?;
     let output = typescript::emit(&api)?;
+    let projection = napi::emit(&operations, &api)?;
     Ok(vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),
@@ -52,6 +59,18 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         GeneratedFile {
             path: project.join("src/validators.generated.ts"),
             contents: output.validators,
+        },
+        GeneratedFile {
+            path: core.join("api/served.generated.rs"),
+            contents: projection.served,
+        },
+        GeneratedFile {
+            path: project.join("crates/cowshed-napi/src/operations.generated.rs"),
+            contents: projection.rust,
+        },
+        GeneratedFile {
+            path: project.join("src/native.generated.ts"),
+            contents: projection.typescript,
         },
     ])
 }
