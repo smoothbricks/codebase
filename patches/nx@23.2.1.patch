@@ -717,3 +717,111 @@ index 34dbaa2..09f95b7 100644
      }
  }
  exports.TaskHistory = TaskHistory;
+diff --git a/dist/src/utils/workspace-context.js b/dist/src/utils/workspace-context.js
+index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab9902876c34b593 100644
+--- a/dist/src/utils/workspace-context.js
++++ b/dist/src/utils/workspace-context.js
+@@ -13,6 +13,9 @@ exports.getAllFileDataInContext = getAllFileDataInContext;
+ exports.getFilesInDirectoryUsingContext = getFilesInDirectoryUsingContext;
+ exports.updateProjectFiles = updateProjectFiles;
+ exports.resetWorkspaceContext = resetWorkspaceContext;
++const node_fs_1 = require("node:fs");
++const node_os_1 = require("node:os");
++const node_path_1 = require("node:path");
+ const perf_hooks_1 = require("perf_hooks");
+ const cache_directory_1 = require("./cache-directory");
+ const is_on_daemon_1 = require("../daemon/is-on-daemon");
+@@ -22,10 +25,92 @@ let workspaceContext;
+ function setupWorkspaceContext(workspaceRoot) {
+     const { WorkspaceContext } = require('../native');
+     perf_hooks_1.performance.mark('workspace-context');
+-    workspaceContext = new WorkspaceContext(workspaceRoot, (0, cache_directory_1.workspaceDataDirectoryForWorkspace)(workspaceRoot));
++    const workspaceDataDirectory = (0, cache_directory_1.workspaceDataDirectoryForWorkspace)(workspaceRoot);
++    dropRacyFilesArchive(workspaceDataDirectory);
++    workspaceContext = new WorkspaceContext(workspaceRoot, workspaceDataDirectory);
+     perf_hooks_1.performance.mark('workspace-context:end');
+     perf_hooks_1.performance.measure('workspace context init', 'workspace-context', 'workspace-context:end');
+ }
++/**
++ * Seconds before the archive's write that a file hashed into it can carry: a
++ * bound on one hashing pass. The native context walks and hashes the files
++ * before it writes the archive; a full pass over 6,370 files measured 288 to
++ * 753 ms at load average 70 to 110.
++ */
++const RACY_ARCHIVE_SECONDS = 10n;
++/** Bytes of one archived entry, which holds the file's i64 mtime at +8. */
++const ARCHIVE_ENTRY_BYTES = 24;
++/**
++ * Removes the file-hash archive when it may hold a hash its file no longer
++ * has, so the native context hashes every file instead of reusing one.
++ *
++ * On Unix the native context reuses an archived hash while the file's
++ * whole-second `st_mtime` equals the archived one (`selective_files_hash`);
++ * neither size nor nanoseconds are compared. A file written again within the
++ * second it was hashed in keeps that mtime, so the next context, daemon or
++ * not, reuses the old hash: a revert hashes as the edit it reverts and Nx
++ * replays the edit's cache entry. Git calls such index entries racily clean,
++ * and distrusts every entry whose mtime is not older than the index. Here a
++ * racy entry's mtime lies in the seconds its hashing pass ran, which end with
++ * the archive's own write; an mtime after that write (a file dated ahead, a
++ * clock that differs) is as suspect.
++ *
++ * The archive is the rkyv form of a map from path to (hash, mtime), in native
++ * byte order, as Nx 23.2.1's binary writes it. Its root is its last 12 bytes:
++ * the entry count (u32) at end-12 and the entries' position (i32, relative to
++ * itself) at end-4. Each entry is ARCHIVE_ENTRY_BYTES long. An archive whose
++ * root does not fit is removed; the native reader would reject it anyway. On
++ * Windows the native mtime is a FILETIME, not seconds, and this check does
++ * nothing.
++ */
++function dropRacyFilesArchive(workspaceDataDirectory) {
++    if (process.platform === 'win32') {
++        return;
++    }
++    const archivePath = (0, node_path_1.join)(workspaceDataDirectory, 'nx_files.nxt');
++    let fd;
++    try {
++        fd = (0, node_fs_1.openSync)(archivePath, 'r');
++    }
++    catch (error) {
++        if (error?.code === 'ENOENT') {
++            return;
++        }
++        throw error;
++    }
++    let archive;
++    let written;
++    try {
++        archive = (0, node_fs_1.readFileSync)(fd);
++        // After the read: the write that left these bytes ended no later.
++        written = Math.floor((0, node_fs_1.fstatSync)(fd).mtimeMs / 1000);
++    }
++    finally {
++        (0, node_fs_1.closeSync)(fd);
++    }
++    const racyFrom = BigInt(written) - RACY_ARCHIVE_SECONDS;
++    const littleEndian = (0, node_os_1.endianness)() === 'LE';
++    const drop = () => (0, node_fs_1.rmSync)(archivePath, { force: true });
++    if (archive.length < 12) {
++        drop();
++        return;
++    }
++    const count = littleEndian ? archive.readUInt32LE(archive.length - 12) : archive.readUInt32BE(archive.length - 12);
++    const pointer = archive.length - 4;
++    const entries = pointer + (littleEndian ? archive.readInt32LE(pointer) : archive.readInt32BE(pointer));
++    if (entries < 0 || entries + count * ARCHIVE_ENTRY_BYTES > archive.length - 12) {
++        drop();
++        return;
++    }
++    for (let entry = 0; entry < count; entry++) {
++        const at = entries + entry * ARCHIVE_ENTRY_BYTES + 8;
++        const mtime = littleEndian ? archive.readBigInt64LE(at) : archive.readBigInt64BE(at);
++        if (mtime >= racyFrom) {
++            drop();
++            return;
++        }
++    }
++}
+ async function getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, useDaemonProcess = true) {
+     if (!useDaemonProcess || (0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+         ensureContextAvailable(workspaceRoot);

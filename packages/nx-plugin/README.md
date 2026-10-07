@@ -623,6 +623,22 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   which untars the artifact with its stored mtimes and restores it with the same copy. Restoring one directory output of
   10,000 1 KiB files took a median 3.4 s for the native remove and copy and 0.79 s more for the stamp, on a machine at
   load average 70–120. Not yet proposed upstream.
+- **A file rewritten within the second it was hashed in is hashed again.** Every Nx context (each run without the
+  daemon, and the daemon when it starts) hashes the workspace's files through `<workspace-data>/nx_files.nxt`, which on
+  Unix keeps each file's hash beside its mtime in whole seconds, and reuses an archived hash while that second is
+  unchanged; size and nanoseconds are not compared. A file written again within the second it was hashed in keeps its
+  mtime and hashes as the bytes it replaced: a revert replays the cache entry of the edit it reverts. The patch applies
+  Git's racy-index rule before the native context reads the archive: when the archive holds an mtime from ten seconds
+  before its own write (the longest a hashing pass is assumed to run) or later, it is removed and every file is hashed
+  again. A full pass over 6,370 files measured 288–753 ms at load average 70–110. The check reads each entry's mtime
+  from the archive's rkyv layout as Nx 23.2.1's binary writes it (the root's entry count and entry pointer in the last
+  12 bytes, 24-byte entries with the i64 mtime at +8), in under 1 ms for 6,396 files. In 134 synthetic workspaces of 1
+  to 400 files dated 2001 it kept every archive, and it removed every one once a file was written in the pass. An
+  archive whose root does not fit is removed. A file dated ahead of the archive keeps it distrusted, so every run hashes
+  everything until the clock passes that date. The check cannot see a pass longer than ten seconds, nor an archive
+  another Nx process rewrites between the check and the native read; on Windows, whose native mtime is a FILETIME, it
+  does nothing. The native fix records every entry dated from the second its pass started on as racy and has none of
+  these limits. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -631,10 +647,10 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution, task-graph and restore-time regressions pass; preserve any repair not
-yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux
-`std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, drop
-the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph, restore-time and racy-archive regressions pass; preserve any
+repair not yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on
+Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream,
+drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 

@@ -1,5 +1,5 @@
 import { expect, it } from 'bun:test';
-import { mkdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -70,14 +70,8 @@ async function restoreFixture(workspace: string, env: Record<string, string>) {
     }),
   );
   const source = join(workspace, 'app', 'source.txt');
-  // Nx 23.2.1 reuses a file's archived hash while its whole-second `st_mtime` is unchanged
-  // (`selective_files_hash`), so every write of the input gets a second of its own: a rewrite
-  // within the same second would hash as the previous bytes.
-  let inputSecond = Math.floor(Date.now() / 1000) - 60;
   return async (text: string): Promise<Run> => {
     await writeFile(source, text);
-    inputSecond += 1;
-    await utimes(source, inputSecond, inputSecond);
     // Spawned asynchronously: a remote case's cache server answers from this process.
     const child = Bun.spawn(['bun', nxEntry, 'run', 'app:build', '--outputStyle=static'], {
       cwd: workspace,
