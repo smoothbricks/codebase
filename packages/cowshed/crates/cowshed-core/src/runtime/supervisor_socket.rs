@@ -293,6 +293,11 @@ enum Call {
     ListeningPorts {
         job_id: JobId,
     },
+    /// One progress read; the subscription that makes them runs on the caller's side.
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        job_id: JobId,
+    },
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
@@ -1115,6 +1120,10 @@ async fn answer(
             to_value(&supervisor.listening_ports(job_id).await?)?,
             Bytes::new(),
         ),
+        Call::Progress { job_id } => (
+            to_value(&supervisor.read_progress(job_id).await?)?,
+            Bytes::new(),
+        ),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
@@ -1600,6 +1609,14 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 )
                 .await,
             );
+        }
+        Command::Progress {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ =
+                reply.send(call(path, &authority, Call::Progress { job_id }, Bytes::new()).await);
         }
         Command::List { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);

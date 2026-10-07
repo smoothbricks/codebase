@@ -154,6 +154,13 @@
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
     "jobId": 7
   },
+  "job.progress": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7,
+    "everyMs": 1000
+  },
   "job.attachWrite": {
     "repoId": "acme/widget",
     "workspace": "feature",

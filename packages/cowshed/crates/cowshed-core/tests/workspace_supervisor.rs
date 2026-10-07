@@ -3482,6 +3482,62 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     reap(command);
 }
 
+/// Through a served supervisor, a progress subscription opened before the job owns a process
+/// sends nothing until it does, then its samples, then the terminal one its sealed record keeps.
+#[tokio::test]
+async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_sealed_sample() {
+    let (supervisor_config, _root) = isolated_config("progress-served");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let (remote, _path) = served(&handle).await;
+    let job_id = remote
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let every = cowshed_core::api::SampleInterval::new(20).unwrap();
+    let mut progress = remote.progress(job_id, every).await.unwrap();
+
+    let command = lone_group();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&command, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    for _ in 0..2 {
+        let sample = progress.next().await.unwrap().unwrap();
+        assert_eq!(
+            (sample.job_id, sample.leader_pid, sample.members.clone()),
+            (job_id, command.id(), vec![command.id()])
+        );
+    }
+
+    end_group(&command);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(job_id).await.unwrap();
+    let sealed = remote.sealed(job_id).await.unwrap().resources.unwrap();
+    let mut after = Vec::new();
+    while let Some(sample) = progress.next().await {
+        after.push(sample.unwrap());
+    }
+    assert_eq!(
+        after.last(),
+        Some(&sealed),
+        "the last sample is the sealed one"
+    );
+    assert_eq!(
+        after.iter().filter(|sample| **sample == sealed).count(),
+        1,
+        "the terminal sample is sent once: {after:?}"
+    );
+    reap(command);
+}
+
 /// What each [`Holder`] keeps resident.
 const HELD: u64 = 128 << 20;
 

@@ -455,6 +455,13 @@ fn function(operation: &Operation) -> String {
     format!("{}{}", operation.prefix(), capitalized(operation.name()))
 }
 
+/// Whether the addon gets an adapter for `operation`. A stream-lane operation gets none yet: core
+/// serves it, and its `AsyncIterable` projection is unbuilt (07_api.md, status), so the addon
+/// names no method it could only call wrongly.
+fn adapted(operation: &Operation) -> bool {
+    operation.lane != Lane::Stream
+}
+
 /// cowshed-core's `Serves` impls, generated as a child of the operation table's module so they
 /// name request records and field types as the table does; and, for tests, every pair visited.
 fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
@@ -623,7 +630,11 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
     );
     for (class, methods) in classes {
         writeln!(output, "\n#[napi]\nimpl {} {{", class.rust).unwrap();
-        for (index, method) in methods.iter().enumerate() {
+        for (index, method) in methods
+            .iter()
+            .filter(|method| adapted(method.operation))
+            .enumerate()
+        {
             if index > 0 {
                 output.push('\n');
             }
@@ -690,9 +701,13 @@ fn typescript(
          /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */\n\
          export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n"
     );
-    for (class, methods) in classes.iter().filter(|(_, methods)| !methods.is_empty()) {
+    for (class, methods) in classes
+        .iter()
+        .filter(|(_, methods)| methods.iter().any(|method| adapted(method.operation)))
+    {
         let extends = methods
             .iter()
+            .filter(|method| adapted(method.operation))
             .map(|method| format!("Native{}", capitalized(&function(method.operation))))
             .collect::<Vec<_>>()
             .join(", ");
@@ -714,7 +729,7 @@ fn typescript(
             .clone()
             .unwrap_or_else(|| rust.to_owned()))
     };
-    for method in served.values() {
+    for method in served.values().filter(|method| adapted(method.operation)) {
         let operation = method.operation;
         let function = function(operation);
         let interface = format!("Native{}", capitalized(&function));
@@ -947,6 +962,42 @@ mod tests {
             output
                 .typescript
                 .contains("export type JobLogsArguments = Pick<Api.LogsRequest, 'offset'>;"),
+            "{}",
+            output.typescript
+        );
+        assert!(
+            output
+                .typescript
+                .contains("export interface NativeJobHandleOperations extends NativeJobLogs {}"),
+            "{}",
+            output.typescript
+        );
+    }
+
+    /// A stream-lane operation is served by its handle, and the addon gets no adapter for it:
+    /// no method its JavaScript callers could only call wrongly.
+    #[test]
+    fn a_stream_operation_is_served_without_an_addon_adapter() {
+        let output = output(
+            r#"operations! {
+                /// Reads one stream's bytes from an offset.
+                worker download(offset) "job.logs" JobLogs(LogsRequest) -> LogsChunk;
+                /// Streams one job's chunks.
+                worker stream "job.chunks" JobChunks(JobRequest) -> LogsChunk;
+            }"#,
+        )
+        .expect("projection");
+        served_impl(&output.served, "JobChunks", "JobHandle");
+        assert!(
+            output
+                .served
+                .contains("    check.served::<JobChunks, _>(job_handle, &[]);"),
+            "{}",
+            output.served
+        );
+        assert!(!output.rust.contains("JobChunks"), "{}", output.rust);
+        assert!(
+            !output.typescript.contains("chunks"),
             "{}",
             output.typescript
         );
