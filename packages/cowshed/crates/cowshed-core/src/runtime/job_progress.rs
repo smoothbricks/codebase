@@ -123,7 +123,13 @@ async fn publish<R, F, E>(
             () = &mut ended, if !ending => ending = true,
             () = tokio::time::sleep_until(deadline) => {}
         }
-        progress = read().await;
+        // A dropped reader ends the subscription even while a read is in flight: the read is
+        // abandoned, never awaited for a sample nobody will take.
+        progress = tokio::select! {
+            biased;
+            () = slot.closed() => return,
+            progress = read() => progress,
+        };
     }
 }
 
@@ -358,27 +364,36 @@ mod tests {
         assert!(script.asked.recv().await.is_none());
     }
 
-    /// Dropping while the read is pending must release the subscription, not await that read.
-    #[tokio::test]
-    async fn review_drop_stops_a_subscription_during_a_pending_read() {
-        let (mut script, read) = script();
-        let mut stream = subscribe(
+    /// Dropping the reader abandons a read in flight: the subscription ends without waiting for
+    /// an answer that may never come, and drops the read. The clock is paused, so the hour-long
+    /// sleep fires only once nothing else can run: the read was kept past its reader.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_reader_abandons_a_read_in_flight() {
+        let (reading, mut reads) = mpsc::unbounded_channel::<oneshot::Receiver<()>>();
+        let stream = subscribe(
             ProgressRead::Running(sample(0)),
-            Duration::from_millis(1),
-            read,
+            Duration::from_secs(1),
+            move || {
+                // The read holds `held` until it is dropped; it never answers.
+                let (held, released) = oneshot::channel::<()>();
+                reading.send(released).expect("the test watches each read");
+                async move {
+                    let _held = held;
+                    std::future::pending::<Result<ProgressRead>>().await
+                }
+            },
             std::future::pending(),
         )
         .expect("subscribe");
-        stream.next().await.expect("first").expect("sample");
-        script.asked.recv().await.expect("a read started");
+        let released = reads.recv().await.expect("a read in flight");
         drop(stream);
-        let stopped = tokio::time::timeout(Duration::from_millis(200), script.asked.recv()).await;
-        // Let the pending read finish even on the old implementation before asserting.
-        let _ = script.answers.send(Ok(ProgressRead::Running(sample(1))));
-        assert_eq!(
-            stopped.expect("dropping the reader must cancel its pending read"),
-            None
-        );
+        tokio::select! {
+            biased;
+            _ = released => {}
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {
+                panic!("the read in flight outlived its reader")
+            }
+        }
     }
 
     #[tokio::test]
