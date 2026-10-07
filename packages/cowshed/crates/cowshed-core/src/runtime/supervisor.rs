@@ -3901,7 +3901,7 @@ impl SupervisorActor {
         }
         let (stdout, stderr) = match self.job_mut(job_id) {
             Ok(job) if !job.sealed() => {
-                let lengths = (job.stdout_len, job.stderr_len);
+                let lengths = (job.stdout_tally.bytes(), job.stderr_tally.bytes());
                 let _ = reply.send(job_tail(cursor, limits, lengths, |stream, range| {
                     read_live_range(job.stream(stream).0, range)
                 }));
