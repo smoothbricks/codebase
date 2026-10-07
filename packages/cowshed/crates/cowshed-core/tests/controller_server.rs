@@ -981,11 +981,13 @@ async fn invalid_version_nonce_replay_and_non_socket_peer_fail_before_router_eff
     assert!(records.try_recv().is_err());
 }
 
-/// Saturating ordinary calls must not stop a stream's close demand from being read.
+/// A connection with 64 open ordinary calls keeps reading: 64 more wait unrouted, one past
+/// those is refused with a conflict, and a stream's close is still read and answered. As open
+/// calls complete, the waiting ones are routed in order, and every one is answered.
 #[tokio::test]
-async fn review_stream_close_is_read_at_the_ordinary_call_cap() {
+async fn a_full_connection_queues_then_refuses_calls_and_still_reads_a_close() {
     let (router, mut commands) =
-        RouterHandle::channel(NonZeroUsize::new(128).expect("router capacity"));
+        RouterHandle::channel(NonZeroUsize::new(256).expect("router capacity"));
     let (held, mut pending) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
@@ -1007,46 +1009,71 @@ async fn review_stream_close_is_read_at_the_ordinary_call_cap() {
         read_value(&mut client).await,
         json!({ "id": 1, "event": { "n": 1 } })
     );
-    let mut replies = Vec::new();
+    let mut open = Vec::new();
     for id in 2..=65 {
         client
             .write_json(
                 &json!({ "id": id, "method": "job.status", "params": params("job.status") }),
             )
             .await;
-        replies.push(pending.recv().await.expect("ordinary call routed"));
+        open.push(pending.recv().await.expect("an open call is routed"));
     }
+    for id in 66..=130 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.status", "params": params("job.status") }),
+            )
+            .await;
+    }
+    // Nothing has been answered, so the first frame is the refusal of the call past both caps.
+    let refusal: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refusal.id, refusal.ok), (130, false));
+    assert_eq!(
+        refusal.error.expect("typed cap error").code,
+        ErrorCode::Conflict
+    );
     client
         .write_json(&json!({ "id": 1, "demand": "close" }))
         .await;
-    let closed = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        read_value(&mut client),
-    )
-    .await;
-    // Release ordinary calls before asserting so the measured failure owns no hanging jobs.
-    for reply in replies {
-        let _ = reply.send(Ok(RouterResponse::json(json!({}))));
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null }),
+        "the close is read and answered while every call slot is taken"
+    );
+    // Completing the open calls routes the waiting ones.
+    for reply in open {
+        reply
+            .send(Ok(RouterResponse::json(json!({}))))
+            .expect("the connection awaits its call");
     }
-    for _ in 0..if closed.is_ok() { 64 } else { 65 } {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), read_value(&mut client))
+    for _ in 66..=129 {
+        pending
+            .recv()
             .await
-            .expect("released ordinary calls and close all answer");
+            .expect("a waiting call is routed")
+            .send(Ok(RouterResponse::json(json!({}))))
+            .expect("the connection awaits its call");
     }
+    let mut answered = Vec::new();
+    for _ in 2..=129 {
+        let answer: RpcResponse =
+            serde_json::from_slice(&client.read_frame().await).expect("an answer");
+        assert!(answer.ok, "{answer:?}");
+        answered.push(answer.id);
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, (2..=129).collect::<Vec<_>>());
     drop(client);
     server
         .await
         .expect("server joins")
         .expect("clean disconnect");
-    assert_eq!(
-        closed.expect("the ordinary-call cap must not starve a stream close"),
-        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null })
-    );
 }
 
-/// The stream cap refuses the sixty-fifth stream without disabling demand frames.
+/// A sixty-fifth open stream is refused with a conflict, and the connection still reads a close
+/// on one of the 64.
 #[tokio::test]
-async fn review_stream_cap_refuses_an_extra_stream_and_allows_close() {
+async fn the_stream_cap_refuses_a_sixty_fifth_stream_and_still_reads_a_close() {
     let (router, mut commands) =
         RouterHandle::channel(NonZeroUsize::new(128).expect("router capacity"));
     tokio::spawn(async move {
@@ -1083,11 +1110,8 @@ async fn review_stream_cap_refuses_an_extra_stream_and_allows_close() {
     client
         .write_json(&json!({ "id": 1, "demand": "close" }))
         .await;
-    let close = tokio::time::timeout(std::time::Duration::from_secs(1), read_value(&mut client))
-        .await
-        .expect("stream-only saturation still reads close");
     assert_eq!(
-        close,
+        read_value(&mut client).await,
         json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null })
     );
     drop(client);
