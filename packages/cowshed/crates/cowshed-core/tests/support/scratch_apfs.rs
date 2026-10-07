@@ -31,7 +31,8 @@ pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
 /// sweep at a time does the work once. The file records when the last finished sweep started,
 /// and a sweep that started after a process asked to sweep has already seen every run that was
 /// dead when it asked, so the queue behind a sweep returns without sweeping again. Its name
-/// spells no pid, so no sweep ever reclaims it.
+/// spells no pid, so no sweep ever reclaims it. Every build's tests share it, old and new side by
+/// side on one host, so a record this build cannot read is no sweep ([`swept_since`]).
 const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
 
 /// How long the processes left working under a scratch root get to exit on `SIGTERM` before
@@ -114,9 +115,11 @@ fn sweep_dead_runs() {
             return;
         }
     };
-    let mut recorded = [0; 16];
-    if sweeping.read_at(&mut recorded, 0).ok() == Some(recorded.len())
-        && u128::from_be_bytes(recorded) >= asked
+    // One byte past a record, so a longer one reads as no record; a short read sweeps.
+    let mut recorded = [0; 17];
+    if sweeping
+        .read_at(&mut recorded, 0)
+        .is_ok_and(|read| swept_since(&recorded[..read], asked, since_epoch()))
     {
         return;
     }
@@ -143,9 +146,25 @@ fn sweep_dead_runs() {
             );
         }
     }
-    if let Err(error) = sweeping.write_all_at(&started.to_be_bytes(), 0) {
+    // Truncated first: a longer record another build left would otherwise keep its tail, and the
+    // file would never again be exactly this build's record.
+    if let Err(error) = sweeping
+        .set_len(0)
+        .and_then(|()| sweeping.write_all_at(&started.to_be_bytes(), 0))
+    {
         eprintln!("the next run sweeps again: record the sweep in {SWEEP_LOCK}: {error}");
     }
+}
+
+/// Whether `record`, what [`SWEEP_LOCK`] holds, names a sweep that started once this process had
+/// asked to sweep (`asked`) and no later than `now`, so it has already seen every run dead when
+/// this one asked. Only exactly this build's record does: sixteen big-endian bytes of
+/// nanoseconds. Anything else -- no record, a partial one, an instant from the future, or what
+/// another build's sweep writes into the same file -- is no sweep, and the asking process sweeps.
+/// Sparing a sweep only saves time; trusting a record wrongly leaves dead runs' images attached.
+fn swept_since(record: &[u8], asked: u128, now: u128) -> bool {
+    <[u8; 16]>::try_from(record)
+        .is_ok_and(|record| (asked..=now).contains(&u128::from_be_bytes(record)))
 }
 
 /// Nanoseconds since the Unix epoch, which orders sweeps across processes.
@@ -427,5 +446,34 @@ fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
             return Ok(pids);
         }
         capacity = count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::swept_since;
+
+    /// Only this build's record of a sweep that started after the asking process asked, and not
+    /// later than now, spares that process its sweep. Another build's sweep shares the lock file
+    /// and wrote its nextest run id there; read as an instant, its first sixteen bytes lie far in
+    /// the future, and trusting them silenced every later sweep while the images of 37 dead runs
+    /// stayed attached.
+    #[test]
+    fn a_record_this_build_did_not_write_is_no_sweep() {
+        let asked: u128 = 1_791_000_000_000_000_000;
+        let now = asked + 5_000_000;
+        assert!(swept_since(&(asked + 1).to_be_bytes(), asked, now));
+        assert!(swept_since(&now.to_be_bytes(), asked, now));
+        assert!(!swept_since(&(asked - 1).to_be_bytes(), asked, now));
+        assert!(!swept_since(&(now + 1).to_be_bytes(), asked, now));
+        assert!(!swept_since(
+            b"ff0f447a-0fc0-4b31-b5c7-32e43b0b7b41",
+            asked,
+            now
+        ));
+        assert!(!swept_since(b"", asked, now));
+        let mut longer = (asked + 1).to_be_bytes().to_vec();
+        longer.push(0);
+        assert!(!swept_since(&longer, asked, now));
     }
 }
