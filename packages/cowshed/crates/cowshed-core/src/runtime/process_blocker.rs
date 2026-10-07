@@ -117,6 +117,9 @@ pub fn sample(
     process: ProcessIdentity,
     held: std::os::fd::BorrowedFd<'_>,
 ) -> Result<BlockerSampled, BlockerReadError> {
+    if std::env::var_os("COWSHED_PROCESS_BLOCKER_ROLE").is_none() {
+        return Ok(BlockerSampled::Read(None));
+    }
     let Some(evidence) = linux::evidence(process.pid)? else {
         return Ok(BlockerSampled::Gone);
     };
