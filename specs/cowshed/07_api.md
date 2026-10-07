@@ -995,6 +995,10 @@ share and is not that lifetime statistic. A zero-duration observation does not m
 baseline. The cgroup's peak counter is read without resetting it, and missing controllers/counters are typed operational
 errors, not zero totals.
 
+The native CPU probe compares the selected child's independently collected `wait4` lifetime with final cgroup usage. A
+pre-exit self-report is diagnostic only: JSON/output and process teardown still cost CPU after that report. A
+deterministic post-report CPU workload proves the oracle includes that work without increasing comparison bounds.
+
 The delegated Linux accounting probe uses a supported host loop driver and test-owned ext4 storage. If a runner exposes
 the driver but masks its device nodes, the root parent creates only test-owned nodes from kernel-reported device
 numbers; global `/dev` is unchanged. `LOOP_CONFIGURE` binds the image with autoclear atomically, and the guard retains

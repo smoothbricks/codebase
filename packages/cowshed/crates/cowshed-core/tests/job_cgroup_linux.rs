@@ -3,12 +3,12 @@
 //! delegated to an unprivileged controller.
 //!
 //! The harness asks `sudo -n systemd-run --scope -p Delegate=yes` for a fresh delegated scope and
-//! re-executes this test binary there as root, only to hand the scope to the invoking user the way
-//! cgroup-v2.rst "Delegation" describes (its directory, `cgroup.procs`, `cgroup.threads` and
-//! `cgroup.subtree_control`) and drop to that user. The unprivileged controller then takes
-//! authority with [`CgroupAuthority::delegated`] and runs workloads: this binary again, whose
-//! first action is to report its own cgroup, which burns CPU it measures itself (`getrusage`) and
-//! may start children. Every comparison reads the job's `cpu.stat` directly.
+//! re-executes this test binary there as a root parent that delegates the scope to the invoking
+//! user and owns scratch cleanup. The unprivileged controller then takes authority with
+//! [`CgroupAuthority::delegated`] and runs workloads: this binary again, whose first action
+//! reports its cgroup. It burns CPU measured by `getrusage` and may start children. The controller
+//! collects each selected child's complete lifetime with `wait4`, including report/exit overhead,
+//! and compares it with an independent final `cpu.stat` read.
 //!
 //! Workloads keep their files on test-owned scratch storage prepared by the root Delegate phase
 //! and removed on success or unwind ([`Scratch`]): a sparse image formatted ext4 and loop-mounted.
@@ -23,6 +23,7 @@
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::chown;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -83,6 +84,8 @@ struct Workload {
     children: Vec<Workload>,
     /// Once every child was reaped, report [`HELD`] and wait for one byte on stdin.
     hold: bool,
+    /// CPU deliberately spent after the self-report, for the complete-lifetime oracle control.
+    burn_after_report_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -104,6 +107,30 @@ impl WorkloadReport {
     fn total_cpu_us(&self) -> u64 {
         self.self_cpu_us + self.children_cpu_us
     }
+}
+
+/// The selected child's complete lifetime, collected on reap, separate from its pre-exit report.
+struct WorkloadExit {
+    report: WorkloadReport,
+    cpu_us: u64,
+}
+
+#[test]
+fn workload_exit_cpu_includes_work_after_its_report() {
+    let exit = Spawned::unplaced(&Workload {
+        burn_after_report_ms: 20,
+        ..Workload::default()
+    })
+    .finish();
+    let reported = exit.report.total_cpu_us();
+    println!(
+        "CPU oracle control: pre-report {reported} us; wait4 lifetime {} us",
+        exit.cpu_us
+    );
+    assert!(
+        exit.cpu_us >= reported + 20_000,
+        "a pre-report oracle omits the deliberate 20 ms of post-report CPU"
+    );
 }
 
 /// The harness: everything else runs in the delegated scope.
@@ -280,6 +307,9 @@ fn work(workload: &Workload) {
         "{REPORT}{}",
         serde_json::to_string(&report).expect("report")
     );
+    if workload.burn_after_report_ms != 0 {
+        burn(workload.burn_after_report_ms);
+    }
 }
 
 /// The scenarios, run by the unprivileged controller that holds the delegated scope.
@@ -331,7 +361,7 @@ fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
         burn_before_ms: 100,
         ..Workload::default()
     };
-    let report = Spawned::placed(
+    let exit = Spawned::placed(
         &job,
         &Workload {
             burn_before_ms: 50,
@@ -342,13 +372,13 @@ fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
     .finish();
     let path = relative(job.path());
     assert_eq!(
-        report.first_cgroup, path,
+        exit.report.first_cgroup, path,
         "the first instruction ran in the job"
     );
-    for child in &report.children {
+    for child in &exit.report.children {
         assert_eq!(child.first_cgroup, path, "a descendant is born in the job");
     }
-    assert_accounted(&job, &report, "inheritance");
+    assert_accounted(&job, &exit, "inheritance");
 }
 
 fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
@@ -375,12 +405,12 @@ fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
             ..Workload::default()
         },
     );
-    let small_report = running_small.finish();
-    let large_report = running_large.finish();
-    assert_eq!(small_report.first_cgroup, relative(small.path()));
-    assert_eq!(large_report.first_cgroup, relative(large.path()));
-    assert_accounted(&small, &small_report, "concurrent small");
-    assert_accounted(&large, &large_report, "concurrent large");
+    let small_exit = running_small.finish();
+    let large_exit = running_large.finish();
+    assert_eq!(small_exit.report.first_cgroup, relative(small.path()));
+    assert_eq!(large_exit.report.first_cgroup, relative(large.path()));
+    assert_accounted(&small, &small_exit, "concurrent small");
+    assert_accounted(&large, &large_exit, "concurrent large");
 }
 
 /// A reused host's idle work before a job is its own: here the spawner itself burns before it
@@ -390,7 +420,7 @@ fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
     let before = cpu_us(libc::RUSAGE_SELF);
     burn(300);
     let spawner_burned = cpu_us(libc::RUSAGE_SELF) - before;
-    let report = Spawned::placed(
+    let exit = Spawned::placed(
         &job,
         &Workload {
             burn_before_ms: 50,
@@ -401,9 +431,9 @@ fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
     let usage = usage_us(&job);
     println!(
         "spawner burned {spawner_burned} us; the job's cgroup read {usage} us for its own {} us",
-        report.total_cpu_us()
+        exit.cpu_us
     );
-    assert_accounted(&job, &report, "spawner");
+    assert_accounted(&job, &exit, "spawner");
 }
 
 /// The control: a process that ran before it was moved into the job's cgroup took its first
@@ -421,15 +451,15 @@ fn late_migration_misses_initial_cpu(jobs: &IncarnationCgroups) {
     std::fs::write(&procs, late.child.id().to_string())
         .unwrap_or_else(|error| panic!("migrate into {}: {error}", procs.display()));
     late.resume();
-    let report = late.finish();
+    let exit = late.finish();
     assert_eq!(
-        report.first_cgroup,
+        exit.report.first_cgroup,
         relative(&own_cgroup_path()),
         "the control started outside the job"
     );
-    assert_eq!(report.last_cgroup, relative(job.path()));
+    assert_eq!(exit.report.last_cgroup, relative(job.path()));
     let usage = usage_us(&job);
-    let total = report.total_cpu_us();
+    let total = exit.cpu_us;
     println!("late migration: cgroup {usage} us of the workload's own {total} us");
     assert!(
         usage + PLACEMENT_WINDOW_US < total,
@@ -485,15 +515,15 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
         during.usage_us.get()
     );
     running.release();
-    let report = running.finish();
-    let neighbour_report = neighbour.finish();
+    let exit = running.finish();
+    let neighbour_exit = neighbour.finish();
     assert!(
-        report.children_cpu_us >= 8 * 40_000,
+        exit.report.children_cpu_us >= 8 * 40_000,
         "the children burned what they were told: {} us",
-        report.children_cpu_us
+        exit.report.children_cpu_us
     );
-    assert_accounted(&burst, &report, "burst");
-    assert_accounted(&unrelated, &neighbour_report, "burst neighbour");
+    assert_accounted(&burst, &exit, "burst");
+    assert_accounted(&unrelated, &neighbour_exit, "burst neighbour");
 }
 
 /// A job that fills the page cache is charged for it while no process of it holds that memory
@@ -829,14 +859,17 @@ impl Spawned {
         self.stdin.write_all(b"r").expect("release the workload");
     }
 
-    fn finish(mut self) -> WorkloadReport {
+    fn finish(mut self) -> WorkloadExit {
         let mut rest = String::new();
         self.stdout
             .read_to_string(&mut rest)
             .expect("workload output");
-        let status = self.child.wait().expect("wait for the workload");
+        let (status, cpu_us) = reap_workload(&self.child).expect("reap the workload with rusage");
         assert!(status.success(), "workload: {status}\n{rest}");
-        report_in(&rest)
+        WorkloadExit {
+            report: report_in(&rest),
+            cpu_us,
+        }
     }
 }
 
@@ -857,13 +890,36 @@ fn report_in(output: &str) -> WorkloadReport {
     serde_json::from_str(line).expect("workload report")
 }
 
+/// Reap only this child, collecting the same completed lifetime the final cgroup read covers.
+/// Linux wait4 includes the child's own CPU and that of descendants it already reaped.
+fn reap_workload(child: &Child) -> std::io::Result<(std::process::ExitStatus, u64)> {
+    let pid = libc::pid_t::try_from(child.id()).expect("an owned child's pid fits pid_t");
+    let mut status = 0;
+    // SAFETY: an all-zero rusage is valid output storage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: the selected child is owned by this caller and both output buffers are valid.
+        let waited = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if waited == pid {
+            return Ok((
+                std::process::ExitStatus::from_raw(status),
+                rusage_cpu_us(&usage),
+            ));
+        }
+        let error = last_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Kernel reads
 
-/// The job's cgroup accounts at least the workload's own CPU, less the fork-to-placement window,
-/// and at most that CPU: nothing outside the workload's tree is charged to it. The reader agrees
-/// with an independent read of the same final counters, and its user and system split the usage.
-fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
+/// Compare the job's final CPU to this selected child's independently reaped complete lifetime,
+/// less only the fork-to-placement window. The pre-exit report is diagnostic, never that oracle.
+/// The reader agrees with a direct final cpu.stat read, and its user/system counters split usage.
+fn assert_accounted(job: &JobCgroup, exit: &WorkloadExit, scenario: &str) {
     let cpu = job.cpu().expect("the job's cpu.stat");
     let usage = usage_us(job);
     assert_eq!(
@@ -878,12 +934,13 @@ fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
         cpu.user_us.get(),
         cpu.system_us.get()
     );
-    let total = report.total_cpu_us();
+    let total = exit.cpu_us;
     println!(
-        "{scenario}: cgroup {usage} us (user {} us, system {} us), workload's own {total} us, \
-         deficit {} us",
+        "{scenario}: cgroup {usage} us (user {} us, system {} us), wait4 lifetime {total} us, \
+         pre-report {} us, deficit {} us",
         cpu.user_us.get(),
         cpu.system_us.get(),
+        exit.report.total_cpu_us(),
         i128::from(total) - i128::from(usage)
     );
     assert!(
@@ -969,6 +1026,10 @@ fn cpu_us(who: libc::c_int) -> u64 {
         "getrusage: {}",
         last_error()
     );
+    rusage_cpu_us(&usage)
+}
+
+fn rusage_cpu_us(usage: &libc::rusage) -> u64 {
     let micros = |time: libc::timeval| {
         u64::try_from(time.tv_sec).expect("seconds") * 1_000_000
             + u64::try_from(time.tv_usec).expect("microseconds")
