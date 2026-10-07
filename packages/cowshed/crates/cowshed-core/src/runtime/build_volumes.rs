@@ -881,7 +881,15 @@ impl BuildVolumes {
             let into_state = BuildVolumeState::read(&into)?;
             let from = host.mount_build_volume(layout, &target).map_err(storage)?;
             let from_state = BuildVolumeState::read(&from)?;
-            let staged = carry::stage_rebase(&from, &from_state, &into, &into_state, &selections);
+            // The volume's image is sparse: what it reports free, its store may not hold.
+            let staged = carry::stage_rebase(
+                &from,
+                &from_state,
+                &into,
+                &into_state,
+                &selections,
+                layout.images(),
+            );
             let staged_in = started.elapsed();
             let sides = [
                 (CarrySide::Workspace, into.as_path(), &into_state),
