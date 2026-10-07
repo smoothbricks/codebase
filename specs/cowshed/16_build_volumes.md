@@ -378,7 +378,9 @@ same for main and for an integration workspace; "the target" is whichever one it
       go of the locks;
    5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
       `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless a
-      running job's hold still owns it. This applies with `--no-retire` too.
+      running job's hold still owns it. This applies with `--no-retire` too. Nothing links it any more, so its release
+      runs beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption
+      check of step 7), so the release's unmount, detach and delete can overlap them.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until

@@ -3702,26 +3702,53 @@ impl NativeProjectRuntimeHost {
         .await?
         {
             Err(reason) => Adoption::Skipped { reason },
-            Ok(elapsed_ms) => {
-                // Each moved link's volume carries the label of the checkout that built it: the
-                // target's supervisor names the adopted one now, in the background, and a kept
-                // workspace's supervisor, started on its fresh clone, names that one as it starts.
-                let target = self.ensure_supervisor(&into.name).await?;
-                target
-                    .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
-                    .await?;
-                if !retire {
-                    volumes
-                        .refork(owner, workspace.clone(), landing.to_owned())
-                        .await?;
-                    self.ensure_supervisor(workspace).await?;
-                }
-                let check = timed_async(
+            Ok(super::build_volumes::Adopted {
+                elapsed_ms,
+                previous,
+            }) => {
+                // Nothing links the previous volume and its record says Unlinked, so its release
+                // (an unmount, detach and delete, each waiting on storagekitd) needs nothing the
+                // target's next steps touch, and runs beside them.
+                let release = timed_async(
                     "land",
-                    "adoption-check",
-                    self.check_adoption(&into.name, &into.mount, checks),
-                )
-                .await?;
+                    "release-previous",
+                    volumes.release_previous(previous),
+                );
+                let in_target = async {
+                    // Each moved link's volume carries the label of the checkout that built it:
+                    // the target's supervisor names the adopted one now, in the background, and a
+                    // kept workspace's supervisor, started on its fresh clone, names that one as
+                    // it starts.
+                    let target = self.ensure_supervisor(&into.name).await?;
+                    target
+                        .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
+                        .await?;
+                    if !retire {
+                        volumes
+                            .refork(owner, workspace.clone(), landing.to_owned())
+                            .await?;
+                        self.ensure_supervisor(workspace).await?;
+                    }
+                    timed_async(
+                        "land",
+                        "adoption-check",
+                        self.check_adoption(&into.name, &into.mount, checks),
+                    )
+                    .await
+                };
+                let check = match tokio::join!(release, in_target) {
+                    (Ok(()), check) => check?,
+                    (Err(release), Ok(_)) => return Err(release),
+                    // The land fails for what failed in the target; the volume nothing links is
+                    // collection's to retry.
+                    (Err(release), Err(error)) => {
+                        eprintln!(
+                            "cowshed: {}'s previous build volume stays: {release}; `cowshed gc` retries it",
+                            into.name
+                        );
+                        return Err(error);
+                    }
+                };
                 Adoption::Adopted {
                     elapsed_ms,
                     carried,

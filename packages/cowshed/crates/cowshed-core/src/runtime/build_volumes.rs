@@ -86,6 +86,24 @@ pub(crate) struct Closed {
     state: BuildVolumeState,
 }
 
+/// What [`BuildVolumes::adopt`] did: how long the move took, and the target's previous volume.
+#[derive(Debug)]
+#[must_use = "its previous volume is released by release_previous"]
+pub(crate) struct Adopted {
+    pub elapsed_ms: u64,
+    pub previous: Unlinked,
+}
+
+/// A target's previous build volume once an adoption moved its link off it and recorded it
+/// Unlinked: [`BuildVolumes::release_previous`] releases it, and `gc` does if that fails or never
+/// runs.
+#[derive(Debug)]
+#[must_use = "release_previous releases the target's previous build volume"]
+pub(crate) struct Unlinked {
+    id: BuildVolumeId,
+    target: WorkspaceName,
+}
+
 /// A carry's first phase, done while the target still ran (Land step 5, "Carry").
 #[derive(Debug)]
 pub(crate) struct Staging {
@@ -899,7 +917,8 @@ impl BuildVolumes {
     /// Land step 6: when nothing opened the closed target's task database since
     /// [`Self::close_target`], give the landing volume the target's daemon records in place of
     /// its own and rename the target's build link onto it. The target's previous volume is
-    /// unlinked and released at once unless a running job holds it. Answers how long the move took.
+    /// recorded Unlinked and answered, for [`Self::release_previous`] beside what the land does
+    /// in the target next. Answers how long the move took.
     ///
     /// The look and the rename happen under Nx's own open locks on the target's databases
     /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:
@@ -916,10 +935,10 @@ impl BuildVolumes {
         target: WorkspaceName,
         target_checkout: PathBuf,
         tree: GitOid,
-    ) -> Result<std::result::Result<u64, AdoptionSkip>> {
+    ) -> Result<std::result::Result<Adopted, AdoptionSkip>> {
         let linked = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
-        self.blocking(move |host, layout| {
+        self.blocking(move |_, layout| {
             let started = Instant::now();
             if linked.as_ref() != Some(&previous.id) {
                 return Err(CowshedError::internal(format!(
@@ -966,13 +985,26 @@ impl BuildVolumes {
                     ..layout.read_record(&previous)?
                 },
             )?;
-            // Nothing links the previous volume now, so it goes now: only a job admitted on it
-            // before the move keeps it, and the collection after that job ends reclaims it.
-            let release = host
-                .release_build_volume(layout, &previous)
-                .map_err(storage)?;
-            say_release(&previous, &format!("{target}'s previous"), &release);
-            Ok(Ok(millis(elapsed)))
+            Ok(Ok(Adopted {
+                elapsed_ms: millis(elapsed),
+                previous: Unlinked {
+                    id: previous,
+                    target,
+                },
+            }))
+        })
+        .await
+    }
+
+    /// Release a target's previous volume after its adoption: nothing links it, so only a job
+    /// admitted on it before the move keeps it, and the collection after that job ends
+    /// reclaims it.
+    pub async fn release_previous(&self, previous: Unlinked) -> Result<()> {
+        self.blocking(move |host, layout| {
+            let Unlinked { id, target } = previous;
+            let release = host.release_build_volume(layout, &id).map_err(storage)?;
+            say_release(&id, &format!("{target}'s previous"), &release);
+            Ok(())
         })
         .await
     }
@@ -2498,7 +2530,7 @@ mod tests {
                 .build_volume_capacity(&scratch.layout, id)
                 .unwrap()
         };
-        let (main_checkout, _, _) = scratch.linked_checkout("main", 2);
+        let (main_checkout, previous, _) = scratch.linked_checkout("main", 2);
         let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
             .volumes
@@ -2525,7 +2557,7 @@ mod tests {
             .await
             .unwrap()
             .expect("nothing holds the target's volume");
-        scratch
+        let adopted = scratch
             .volumes
             .adopt(
                 &quiet,
@@ -2541,6 +2573,17 @@ mod tests {
             scratch.volumes.layout.linked(&main_checkout).unwrap(),
             Some(topic.clone())
         );
+        // The previous volume is recorded Unlinked by the move and released by its caller.
+        assert!(matches!(
+            scratch.layout.read_record(&previous).unwrap().role,
+            BuildVolumeRole::Unlinked
+        ));
+        scratch
+            .volumes
+            .release_previous(adopted.previous)
+            .await
+            .unwrap();
+        assert!(!scratch.layout.image(&previous).exists());
 
         // A landing volume larger than its target keeps its capacity.
         let (other_checkout, other, _) = scratch.linked_checkout("other", 3);
