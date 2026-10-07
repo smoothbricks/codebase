@@ -1114,3 +1114,75 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
         "the sealed sample is the last one"
     );
 }
+
+/// A job's sample names every running process of its group: the command's shell and the two
+/// children it started, each held on a FIFO the test never opens. A kill empties the group, and
+/// the sealed sample still names the leader.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_job_s_sample_names_its_whole_group_and_none_after_a_kill() {
+    let workspace = Workspace::new("shell-pool-members", 41_376);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["pids", "hold-a", "hold-b"] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    let job = handle
+        .exec(
+            None,
+            None,
+            sh(concat!(
+                "(read _ < \"$TMPDIR/hold-a\") & a=$!; ",
+                "(read _ < \"$TMPDIR/hold-b\") & b=$!; ",
+                "printf '%s %s %s\\n' $$ $a $b > \"$TMPDIR/pids\"; wait",
+            )),
+        )
+        .await
+        .expect("admit");
+
+    // Both children were born before the shell wrote their pids.
+    let pids = tmp.join("pids");
+    let text = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(pids)),
+    )
+    .await
+    .expect("the job writes its pids")
+    .expect("reader task")
+    .expect("read the pids");
+    let mut group: Vec<u32> = text
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("a pid"))
+        .collect();
+    let leader = group[0];
+    group.sort_unstable();
+    let mut running = handle
+        .resources(job)
+        .await
+        .expect("a running job is sampled");
+    running.members.sort_unstable();
+    assert_eq!(
+        (running.leader_pid, running.members),
+        (leader, group),
+        "the leader and both children, nothing more"
+    );
+
+    handle.kill(job).await.expect("kill");
+    let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
+        .await
+        .expect("the killed job ends")
+        .expect("job outcome");
+    assert_eq!(ended.state, JobState::Killed);
+    let terminal = ended.resources.expect("a terminal sample");
+    assert_eq!(
+        (terminal.leader_pid, terminal.members.clone()),
+        (leader, Vec::new()),
+        "the leader is named after its group emptied"
+    );
+    assert_eq!(
+        handle.sealed(job).await.expect("sealed").resources,
+        Some(terminal),
+        "the sealed sample is the last one"
+    );
+}

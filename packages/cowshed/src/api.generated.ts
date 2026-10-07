@@ -767,6 +767,11 @@ export type JobResourceSample = {
    * command's. Retained after it exits.
    */
   readonly leaderPid: number & tags.Type<'uint32'>;
+  /**
+   * The pid of every running process in the job's group, the leader's among them while it
+   * runs: the complete membership, never a truncated one. Empty once nothing of the group runs.
+   */
+  readonly members: ReadonlyArray<number & tags.Type<'uint32'>>;
 };
 
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';

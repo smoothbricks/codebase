@@ -193,6 +193,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             wall_ms: WallMicros::new(1_250_400).expect("fixture wall").millis(),
             wall_us: WallMicros::new(1_250_400).expect("fixture wall"),
             leader_pid: 4242,
+            members: vec![4242, 4243],
         }),
         exit: None,
         stdout: redirect_stream(2, "out", "build.log", 4096),

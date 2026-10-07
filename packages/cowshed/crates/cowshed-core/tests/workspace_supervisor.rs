@@ -3268,12 +3268,29 @@ fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
     }
 }
 
-fn owned(pid: u32, spawned: Instant) -> OwnedProcess {
+/// A group this test owns whose one process is its leader, held unreaped until [`end_group`].
+fn lone_group() -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+    std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .process_group(0)
+        .spawn_locked()
+        .expect("a test-owned process group")
+}
+
+/// Kill the group `leader` leads and reap its leader: nothing of it runs any more.
+fn end_group(leader: &mut std::process::Child) {
+    let pgid = i32::try_from(leader.id()).unwrap();
+    // SAFETY: the unreaped test child leads this group.
+    assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+    leader.wait().unwrap();
+}
+
+/// `leader` as the job's owned process, identified while its parent holds it unreaped.
+fn owned(leader: &std::process::Child, spawned: Instant) -> OwnedProcess {
     OwnedProcess {
-        birth: Birth::Unobserved {
-            pid,
-            reason: "a sampling test names no process".into(),
-        },
+        birth: Birth::of(leader.id()),
         spawned,
     }
 }
@@ -3339,14 +3356,15 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     assert_eq!(unsampled.code, ErrorCode::Conflict, "{}", unsampled.message);
 
     // A cold host spawned for the job five seconds ago is its first process: its leader, its
-    // wall baseline.
+    // wall baseline, and its group's one member.
+    let mut host = lone_group();
     let activation = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
     deliver(
         &handle,
         &job,
         ProcessEvent::Activating {
             job_id,
-            process: owned(100, activation),
+            process: owned(&host, activation),
         },
         0,
     )
@@ -3354,7 +3372,14 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     let before = Instant::now();
     let activating = handle.resources(job_id).await.unwrap();
     let after = Instant::now();
-    assert_eq!((activating.job_id, activating.leader_pid), (job_id, 100));
+    assert_eq!(
+        (
+            activating.job_id,
+            activating.leader_pid,
+            activating.members.clone()
+        ),
+        (job_id, host.id(), vec![host.id()])
+    );
     assert_wall(&activating, activation, before, after);
     let before = Instant::now();
     let still_activating = handle.resources(job_id).await.unwrap();
@@ -3366,22 +3391,30 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         "status carries the latest sample"
     );
 
-    // The command starts now: it leads the job, whose wall still counts from the activation.
+    // The command starts now: it leads the job, whose wall still counts from the activation,
+    // and its group is the job's.
+    let mut command = lone_group();
     deliver(
         &handle,
         &job,
         ProcessEvent::Started {
             job_id,
-            process: owned(200, Instant::now()),
+            process: owned(&command, Instant::now()),
         },
         1,
     )
     .await;
+    end_group(&mut host);
     let before = Instant::now();
     let running = handle.resources(job_id).await.unwrap();
     let after = Instant::now();
-    assert_eq!(running.leader_pid, 200);
+    assert_eq!(
+        (running.leader_pid, running.members.clone()),
+        (command.id(), vec![command.id()])
+    );
     assert_wall(&running, activation, before, after);
+
+    end_group(&mut command);
 
     let before = Instant::now();
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
@@ -3389,8 +3422,9 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     let after = Instant::now();
     let terminal = ended.resources.clone().expect("a terminal sample");
     assert_eq!(
-        terminal.leader_pid, 200,
-        "the leader is named after it exits"
+        (terminal.leader_pid, terminal.members.clone()),
+        (command.id(), Vec::new()),
+        "the leader is named after its group emptied"
     );
     assert_wall(&terminal, activation, before, after);
     assert_eq!(

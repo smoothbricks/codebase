@@ -523,6 +523,65 @@ pub fn group_has_live_members(pgid: i32) -> io::Result<bool> {
     Ok(!members_of(pgid)?.is_empty())
 }
 
+/// The pid of every running process in the job's group, which `leader` leads.
+///
+/// While its parent holds the leader unreaped, the leader holding its pid -- the group id --
+/// before the members are read and still after proves every process read the job's; an exited
+/// leader is no member but still proves the group, which may then be empty. Once the leader is
+/// reaped nothing proves the id the job's, but an id no running process holds names an empty
+/// group whoever held it. Anything else -- an unidentified leader, a pid that names another
+/// process, processes holding the id of a leader gone, a membership not read in full -- is an
+/// error, never a guessed or empty membership.
+pub fn job_members(leader: &Birth) -> io::Result<Vec<u32>> {
+    let pgid = i32::try_from(leader.pid()).map_err(io::Error::other)?;
+    // `Some(true)` while the leader holds its pid, `Some(false)` while another process does,
+    // `None` once no process holds it.
+    let holds = |leader: GroupLeader| -> io::Result<Option<bool>> {
+        Ok(birth_time(leader.pgid)?.map(|birth| birth == leader.birth))
+    };
+    let pids = |members: Vec<Process>| -> io::Result<Vec<u32>> {
+        members
+            .iter()
+            .map(|member| u32::try_from(member.pid()).map_err(io::Error::other))
+            .collect()
+    };
+    if let Birth::Observed(leader) = leader {
+        match holds(*leader)? {
+            Some(true) => {
+                let members = members_of(pgid)?;
+                if holds(*leader)? == Some(true) {
+                    return pids(members);
+                }
+            }
+            Some(false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "process {pgid} no longer leads the job's group: its pid names another process"
+                    ),
+                ));
+            }
+            None => {}
+        }
+    }
+    if members_of(pgid)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        match leader {
+            Birth::Observed(_) => format!(
+                "the job's group leader {pgid} is gone while processes hold its group id: \
+                 nothing proves them the job's"
+            ),
+            Birth::Unobserved { reason, .. } => format!(
+                "the job's group leader {pgid} was never identified ({reason}): nothing proves \
+                 the processes holding its group id the job's"
+            ),
+        },
+    ))
+}
+
 /// Signal the group `pgid` leads. Only for the leader's parent, while it holds the leader
 /// unreaped -- running, or exited and not yet collected: until the parent reaps it, the leader's
 /// pid, and with it the group's id, names nothing else. A group with nothing left running in it
@@ -1259,6 +1318,81 @@ mod tests {
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
             let _ = self.0.wait();
         }
+    }
+
+    /// A group led by `sh` whose child is `script`'s last background job: the leader, held
+    /// unreaped by the test, and the child's pid, which `script` prints.
+    fn group_with_child(script: &str) -> (std::process::Child, u32) {
+        use std::io::BufRead as _;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn a job group");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("the group's child pid");
+        (child, line.trim().parse().expect("a pid"))
+    }
+
+    fn sorted(mut pids: Vec<u32>) -> Vec<u32> {
+        pids.sort_unstable();
+        pids
+    }
+
+    #[test]
+    fn a_job_s_members_are_its_whole_running_group_and_none_once_it_ended() {
+        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!; wait");
+        let birth = super::Birth::of(job.id());
+        assert_eq!(
+            sorted(super::job_members(&birth).expect("members")),
+            sorted(vec![job.id(), sleeper])
+        );
+
+        // SAFETY: plain kill of the test's own grandchild, which is still running.
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(sleeper).unwrap(), libc::SIGKILL) },
+            0
+        );
+        // The leader's `wait` returns once its child died, and the leader exits.
+        super::await_exit_unreaped(i32::try_from(job.id()).unwrap()).expect("leader exit");
+        assert_eq!(
+            super::job_members(&birth).expect("an exited, unreaped leader proves its group"),
+            Vec::<u32>::new()
+        );
+        job.wait().expect("reap the leader");
+        assert_eq!(
+            super::job_members(&birth).expect("an id nothing holds names an empty group"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn members_nothing_proves_the_job_s_are_an_error_never_a_membership() {
+        // The leader exits at once and is reaped, while its child holds the group id on.
+        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!");
+        let birth = super::Birth::of(job.id());
+        job.wait().expect("reap the leader");
+        let orphaned = super::job_members(&birth);
+        // SAFETY: plain kill of the test's own orphaned grandchild.
+        unsafe { libc::kill(i32::try_from(sleeper).unwrap(), libc::SIGKILL) };
+        assert!(orphaned.is_err(), "{orphaned:?}");
+
+        let mut group = job_group();
+        let unidentified = super::Birth::Unobserved {
+            pid: group.id(),
+            reason: "a test that identified nothing".into(),
+        };
+        let members = super::job_members(&unidentified);
+        let pgid = i32::try_from(group.id()).unwrap();
+        // SAFETY: this unreaped child leads the group spawned by this test.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        group.wait().expect("reap the group leader");
+        assert!(members.is_err(), "{members:?}");
     }
 
     #[cfg(target_os = "macos")]

@@ -81,6 +81,14 @@ impl Sampling {
     }
 }
 
+/// What the system said about a job's processes at one sample boundary.
+pub(super) struct Observation {
+    pub now: Instant,
+    pub sampled_at: UtcTimestamp,
+    /// The complete running membership of the group the sampler's leader leads.
+    pub members: Vec<u32>,
+}
+
 pub(super) struct JobSampler {
     job_id: JobId,
     /// When the job's first owned process spawned.
@@ -102,13 +110,14 @@ impl JobSampler {
         self.leader = leader;
     }
 
-    /// The job as observed at `now`, stamped `sampled_at`.
-    pub(super) fn observe(
-        &self,
-        now: Instant,
-        sampled_at: UtcTimestamp,
-    ) -> Result<JobResourceSample> {
-        let wall = WallMicros::of(now.duration_since(self.spawned)).map_err(|error| {
+    /// The process whose group is the job's now.
+    pub(super) fn leader(&self) -> &Birth {
+        &self.leader
+    }
+
+    /// The job's sample from what was observed of it.
+    pub(super) fn sample(&self, observed: Observation) -> Result<JobResourceSample> {
+        let wall = WallMicros::of(observed.now.duration_since(self.spawned)).map_err(|error| {
             CowshedError::internal(format!(
                 "job {} cannot be sampled: {error}",
                 self.job_id.get()
@@ -116,9 +125,10 @@ impl JobSampler {
         })?;
         Ok(JobResourceSample::new(
             self.job_id,
-            sampled_at,
+            observed.sampled_at,
             wall,
             self.leader.pid(),
+            observed.members,
         ))
     }
 }
@@ -147,6 +157,14 @@ mod tests {
         JobId::new(5).expect("job")
     }
 
+    fn seen(now: Instant, members: &[u32]) -> Observation {
+        Observation {
+            now,
+            sampled_at: at(),
+            members: members.to_vec(),
+        }
+    }
+
     #[test]
     fn the_spawn_fixes_the_wall_baseline_and_the_command_takes_the_lead() {
         let spawn = Instant::now();
@@ -154,7 +172,7 @@ mod tests {
         let activating = sampling
             .own(job(), owned(100, spawn))
             .expect("live")
-            .observe(spawn + Duration::from_micros(2_500), at())
+            .sample(seen(spawn + Duration::from_micros(2_500), &[100, 101]))
             .expect("sample");
         assert_eq!(
             (
@@ -165,13 +183,19 @@ mod tests {
             (job(), 100, 2_500)
         );
         assert_eq!(activating.wall_ms.get(), 2);
+        assert_eq!(activating.members, [100, 101]);
 
         let running = sampling
             .own(job(), owned(200, spawn + Duration::from_millis(30)))
             .expect("live")
-            .observe(spawn + Duration::from_millis(40), at())
+            .sample(seen(spawn + Duration::from_millis(40), &[200]))
             .expect("sample");
         assert_eq!((running.leader_pid, running.wall_ms.get()), (200, 40));
+        assert_eq!(
+            running.members,
+            [200],
+            "the command's group is the job's now"
+        );
         assert_eq!(
             running.wall_us.get(),
             40_000,
@@ -207,8 +231,13 @@ mod tests {
         let mut sampling = Sampling::Unowned;
         sampling.own(job(), owned(100, spawn));
         let terminal = sampling
-            .freeze(|sampler| sampler.observe(spawn + Duration::from_millis(7), at()))
+            .freeze(|sampler| sampler.sample(seen(spawn + Duration::from_millis(7), &[])))
             .expect("a terminal sample");
+        assert_eq!(
+            (terminal.leader_pid, terminal.members.len()),
+            (100, 0),
+            "the leader is named after its group emptied"
+        );
         assert_eq!(terminal.wall_ms.get(), 7);
         assert_eq!(
             sampling

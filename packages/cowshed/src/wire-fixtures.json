@@ -535,6 +535,7 @@
         "resources": {
           "jobId": 2,
           "leaderPid": 4242,
+          "members": [4242, 4243],
           "sampledAt": "2026-01-02T03:04:05Z",
           "wallMs": 1250,
           "wallUs": 1250400
@@ -737,6 +738,7 @@
       "resources": {
         "jobId": 2,
         "leaderPid": 4242,
+        "members": [4242, 4243],
         "sampledAt": "2026-01-02T03:04:05Z",
         "wallMs": 1250,
         "wallUs": 1250400

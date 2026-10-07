@@ -12,7 +12,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray,
     StructArray, UInt32Array, UInt64Array, new_null_array,
 };
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
@@ -89,12 +89,13 @@ const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
-/// The terminal resource sample's columns, in order: its time, wall duration and leader. All
-/// null for a record without a sample.
-const RESOURCE_COLUMNS: [&str; 3] = [
+/// The terminal resource sample's columns, in order: its time, wall duration, leader and its
+/// group's members. All null for a record without a sample.
+const RESOURCE_COLUMNS: [&str; 4] = [
     "resources_sampled_at",
     "resources_wall_us",
     "resources_leader_pid",
+    "resources_members",
 ];
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
@@ -3502,7 +3503,25 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(RESOURCE_COLUMNS[0], DataType::Utf8, true),
         field(RESOURCE_COLUMNS[1], DataType::UInt64, true),
         field(RESOURCE_COLUMNS[2], DataType::UInt32, true),
+        field(RESOURCE_COLUMNS[3], members_type(), true),
     ]))
+}
+
+fn members_type() -> DataType {
+    DataType::List(Arc::new(field("item", DataType::UInt32, false)))
+}
+
+/// A sample's members as one list row; a null row for a record without a sample.
+fn members_array(resources: Option<&JobResourceSample>) -> Result<ListArray, ArtifactError> {
+    let members = resources.map_or(&[][..], |sample| sample.members.as_slice());
+    let count = i32::try_from(members.len())
+        .map_err(|_| ArtifactError::Arrow("too many resource sample members".into()))?;
+    Ok(ListArray::new(
+        Arc::new(field("item", DataType::UInt32, false)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, count])),
+        Arc::new(UInt32Array::from(members.to_vec())),
+        resources.is_none().then(|| NullBuffer::from(vec![false])),
+    ))
 }
 
 /// Whether a batch is in the one layout this build reads.
@@ -3766,6 +3785,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt32Array::from(vec![
             resources.map(|sample| sample.leader_pid),
         ])),
+        Arc::new(members_array(resources)?),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3873,7 +3893,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
     })
 }
 
-/// The terminal resource sample of a version-6 job batch: absent when every one of
+/// The terminal resource sample of a current-layout job batch: absent when every one of
 /// [`RESOURCE_COLUMNS`] is null; a partly null sample is damage.
 fn decode_resources(
     batch: &RecordBatch,
@@ -3896,8 +3916,19 @@ fn decode_resources(
     let wall = WallMicros::new(uint64(batch, RESOURCE_COLUMN + 1)?.value(0))
         .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
     let leader_pid = uint32(batch, RESOURCE_COLUMN + 2)?.value(0);
+    let members = list(batch, RESOURCE_COLUMN + 3)?.value(0);
+    let members = downcast::<UInt32Array>(members.as_ref(), "resources_members.values")?;
+    if members.null_count() != 0 {
+        return Err(ArtifactError::Arrow(
+            "a resource sample's members are never null".into(),
+        ));
+    }
     Ok(Some(JobResourceSample::new(
-        job_id, sampled_at, wall, leader_pid,
+        job_id,
+        sampled_at,
+        wall,
+        leader_pid,
+        members.values().to_vec(),
     )))
 }
 
@@ -5267,6 +5298,7 @@ mod tests {
             UtcTimestamp::new("2026-10-07T12:00:00Z").unwrap(),
             WallMicros::new(wall_us).unwrap(),
             leader_pid,
+            vec![leader_pid, leader_pid + 1],
         )
     }
 

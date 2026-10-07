@@ -40,7 +40,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::job_resources::{JobSampler, Sampling};
+use crate::runtime::job_resources::{JobSampler, Observation, Sampling};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -4725,8 +4725,23 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
 }
 
+/// Observe the job's processes now: the one imperative step of a sample.
 fn observe(sampler: &JobSampler) -> Result<JobResourceSample> {
-    sampler.observe(Instant::now(), utc_now()?)
+    let sampled_at = utc_now()?;
+    let members = super::job_groups::job_members(sampler.leader()).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "the membership of job group {} could not be read: {error}",
+                sampler.leader().pid()
+            ),
+            "the job runs on; read its resources again",
+        )
+    })?;
+    sampler.sample(Observation {
+        now: Instant::now(),
+        sampled_at,
+        members,
+    })
 }
 
 /// A resources read: a running job observed now and kept as its latest sample, an ended job's
