@@ -222,6 +222,22 @@ export type ChangeRepoIdRequest = {
   readonly newRepoId: RepoId;
 };
 
+/**
+ * Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel
+ * memory together. Never resident memory: cache a job filled is charged to it while no process
+ * of it maps a page.
+ */
+export type ChargedMemoryBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * A cgroup's charged memory: what it is charged now, and the most it was ever charged. The peak
+ * is the kernel's own high watermark, read without resetting it.
+ */
+export type ChargedMemoryUsage = {
+  readonly currentBytes: ChargedMemoryBytes;
+  readonly peakBytes: ChargedMemoryBytes;
+};
+
 export type CheckpointCommitment = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly order: number & tags.Type<'uint64'>;

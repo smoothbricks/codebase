@@ -136,6 +136,20 @@ export const assertChangeRepoIdRequestList = typia.createAssertEquals<readonly A
 export const parseChangeRepoIdRequestList = (json: string): readonly Api.ChangeRepoIdRequest[] =>
   assertChangeRepoIdRequestList(JSON.parse(json));
 
+export const assertChargedMemoryBytes = typia.createAssertEquals<Api.ChargedMemoryBytes>();
+export const parseChargedMemoryBytes = (json: string): Api.ChargedMemoryBytes =>
+  assertChargedMemoryBytes(JSON.parse(json));
+export const assertChargedMemoryBytesList = typia.createAssertEquals<readonly Api.ChargedMemoryBytes[]>();
+export const parseChargedMemoryBytesList = (json: string): readonly Api.ChargedMemoryBytes[] =>
+  assertChargedMemoryBytesList(JSON.parse(json));
+
+export const assertChargedMemoryUsage = typia.createAssertEquals<Api.ChargedMemoryUsage>();
+export const parseChargedMemoryUsage = (json: string): Api.ChargedMemoryUsage =>
+  assertChargedMemoryUsage(JSON.parse(json));
+export const assertChargedMemoryUsageList = typia.createAssertEquals<readonly Api.ChargedMemoryUsage[]>();
+export const parseChargedMemoryUsageList = (json: string): readonly Api.ChargedMemoryUsage[] =>
+  assertChargedMemoryUsageList(JSON.parse(json));
+
 export const assertCheckpointCommitment = typia.createAssertEquals<Api.CheckpointCommitment>();
 export const parseCheckpointCommitment = (json: string): Api.CheckpointCommitment =>
   assertCheckpointCommitment(JSON.parse(json));
