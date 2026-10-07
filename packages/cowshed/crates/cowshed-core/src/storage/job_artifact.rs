@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray,
-    StructArray, UInt32Array, UInt64Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, ListArray, RecordBatch,
+    StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
@@ -29,7 +29,7 @@ use crate::api::dto::{
     WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
     validate_command_argv,
 };
-use crate::api::resources::{JobResourceSample, WallMicros};
+use crate::api::resources::{HostLoadSample, JobResourceSample, WallMicros};
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -89,13 +89,18 @@ const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
-/// The terminal resource sample's columns, in order: its time, wall duration, leader and its
-/// group's members. All null for a record without a sample.
-const RESOURCE_COLUMNS: [&str; 4] = [
+/// The terminal resource sample's columns, in order: its time, wall duration, leader, its group's
+/// members, and the host's load at spawn and at the sample. All null for a record without a
+/// sample.
+const RESOURCE_COLUMNS: [&str; 8] = [
     "resources_sampled_at",
     "resources_wall_us",
     "resources_leader_pid",
     "resources_members",
+    "resources_host_start_load1",
+    "resources_host_start_cores",
+    "resources_host_load1",
+    "resources_host_cores",
 ];
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
@@ -3504,6 +3509,10 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(RESOURCE_COLUMNS[1], DataType::UInt64, true),
         field(RESOURCE_COLUMNS[2], DataType::UInt32, true),
         field(RESOURCE_COLUMNS[3], members_type(), true),
+        field(RESOURCE_COLUMNS[4], DataType::Float64, true),
+        field(RESOURCE_COLUMNS[5], DataType::UInt16, true),
+        field(RESOURCE_COLUMNS[6], DataType::Float64, true),
+        field(RESOURCE_COLUMNS[7], DataType::UInt16, true),
     ]))
 }
 
@@ -3786,6 +3795,18 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             resources.map(|sample| sample.leader_pid),
         ])),
         Arc::new(members_array(resources)?),
+        Arc::new(Float64Array::from(vec![
+            resources.map(|sample| sample.host_start.load1.get()),
+        ])),
+        Arc::new(UInt16Array::from(vec![
+            resources.map(|sample| sample.host_start.cores.get()),
+        ])),
+        Arc::new(Float64Array::from(vec![
+            resources.map(|sample| sample.host.load1.get()),
+        ])),
+        Arc::new(UInt16Array::from(vec![
+            resources.map(|sample| sample.host.cores.get()),
+        ])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3923,12 +3944,26 @@ fn decode_resources(
             "a resource sample's members are never null".into(),
         ));
     }
+    let host = |first: usize| -> Result<HostLoadSample, ArtifactError> {
+        let load1 = downcast::<Float64Array>(
+            batch.column(first).as_ref(),
+            batch.schema().field(first).name(),
+        )?;
+        let cores = downcast::<UInt16Array>(
+            batch.column(first + 1).as_ref(),
+            batch.schema().field(first + 1).name(),
+        )?;
+        HostLoadSample::new(load1.value(0), cores.value(0))
+            .map_err(|error| ArtifactError::Arrow(error.to_string()))
+    };
     Ok(Some(JobResourceSample::new(
         job_id,
         sampled_at,
         wall,
         leader_pid,
         members.values().to_vec(),
+        host(RESOURCE_COLUMN + 4)?,
+        host(RESOURCE_COLUMN + 6)?,
     )))
 }
 
@@ -5299,6 +5334,8 @@ mod tests {
             WallMicros::new(wall_us).unwrap(),
             leader_pid,
             vec![leader_pid, leader_pid + 1],
+            HostLoadSample::new(0.5, 4).unwrap(),
+            HostLoadSample::new(3.75, 10).unwrap(),
         )
     }
 

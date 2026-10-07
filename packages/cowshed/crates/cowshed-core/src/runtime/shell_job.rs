@@ -569,11 +569,12 @@ async fn run_pooled(
     // The host forked the command just before it replied: this is the first moment this
     // process knows of it.
     let spawned = Instant::now();
-    let birth = match started {
+    let (birth, host_at_spawn) = match started {
         Ok(Started::Running(birth)) => {
+            let host_at_spawn = crate::host_load::read_host_load();
             // The command runs and holds the job's streams; nothing here may.
             *diagnostics = None;
-            birth
+            (birth, host_at_spawn)
         }
         Ok(Started::Unexecutable(exit)) => return Outcome::Exited(exit),
         Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
@@ -589,7 +590,11 @@ async fn run_pooled(
     let _ = events
         .send(ProcessEvent::Started {
             job_id,
-            process: OwnedProcess { birth, spawned },
+            process: OwnedProcess {
+                birth,
+                spawned,
+                host: host_at_spawn,
+            },
         })
         .await;
     let exit = match host.exited(&mut forwarded, job_id, events).await {

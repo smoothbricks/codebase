@@ -21,7 +21,7 @@ use crate::api::dto::{
     OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind,
     StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
 };
-use crate::api::resources::JobResourceSample;
+use crate::api::resources::{HostLoadSample, JobResourceSample};
 use crate::error::{CowshedError, Result};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
@@ -446,6 +446,8 @@ pub struct OwnedProcess {
     /// When the parent saw the spawn return. A command a warm host forks is stamped when the
     /// host's report of its start arrives, the first moment this process knows of it.
     pub spawned: Instant,
+    /// Read by the spawning task, not when the supervisor later handles its event.
+    pub host: std::result::Result<HostLoadSample, crate::host_load::HostLoadError>,
 }
 
 /// A job's running process. The leader is held unreaped until the handle is dropped -- once the
@@ -1652,11 +1654,13 @@ impl ChildFence {
             .ok_or_else(|| {
                 CowshedError::internal("process id is not a signalable process group")
             })?;
+        let host = crate::host_load::read_host_load();
         Ok(Self {
             pid: leader,
             process: OwnedProcess {
                 birth: Birth::of(pid),
                 spawned,
+                host,
             },
             hold: Mutex::new(Hold::Held),
         })
@@ -4737,10 +4741,17 @@ fn observe(sampler: &JobSampler) -> Result<JobResourceSample> {
             "the job runs on; read its resources again",
         )
     })?;
+    let host = crate::host_load::read_host_load().map_err(|error| {
+        CowshedError::environment_missing(
+            format!("the sample's host observation could not be read: {error}"),
+            "the command runs on; inspect the host's load and core reporting",
+        )
+    })?;
     sampler.sample(Observation {
         now: Instant::now(),
         sampled_at,
         members,
+        host,
     })
 }
 

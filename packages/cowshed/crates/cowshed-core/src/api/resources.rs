@@ -314,6 +314,10 @@ pub struct JobResourceSample {
     /// The pid of every running process in the job's group, the leader's among them while it
     /// runs: the complete membership, never a truncated one. Empty once nothing of the group runs.
     pub members: Vec<u32>,
+    /// Captured once with the first owned process, even when that process is activation.
+    pub host_start: HostLoadSample,
+    /// The host's load and online cores at this sample boundary.
+    pub host: HostLoadSample,
 }
 
 impl JobResourceSample {
@@ -323,6 +327,8 @@ impl JobResourceSample {
         wall: WallMicros,
         leader_pid: u32,
         members: Vec<u32>,
+        host_start: HostLoadSample,
+        host: HostLoadSample,
     ) -> Self {
         Self {
             job_id,
@@ -331,6 +337,8 @@ impl JobResourceSample {
             wall_us: wall,
             leader_pid,
             members,
+            host_start,
+            host,
         }
     }
 
@@ -391,11 +399,22 @@ mod tests {
         UtcTimestamp::new("2026-10-07T12:00:00Z").expect("timestamp")
     }
 
+    fn host() -> HostLoadSample {
+        HostLoadSample::new(1.25, 8).expect("host snapshot")
+    }
+
     #[test]
     fn wall_milliseconds_project_the_microseconds() {
         let wall = WallMicros::of(Duration::from_micros(12_345_999)).expect("exact");
-        let sample =
-            JobResourceSample::new(JobId::new(7).expect("job"), timestamp(), wall, 41, vec![41]);
+        let sample = JobResourceSample::new(
+            JobId::new(7).expect("job"),
+            timestamp(),
+            wall,
+            41,
+            vec![41],
+            host(),
+            host(),
+        );
         assert_eq!(
             (sample.wall_us.get(), sample.wall_ms.get()),
             (12_345_999, 12_345)
@@ -425,6 +444,8 @@ mod tests {
             wall,
             99,
             vec![99, 100],
+            host(),
+            host(),
         );
         let json = serde_json::to_value(&sample).expect("serialize");
         assert_eq!(
@@ -436,6 +457,8 @@ mod tests {
                 "wallUs": 1_500,
                 "leaderPid": 99,
                 "members": [99, 100],
+                "hostStart": { "load1": 1.25, "cores": 8 },
+                "host": { "load1": 1.25, "cores": 8 },
             })
         );
         assert_eq!(
@@ -449,6 +472,8 @@ mod tests {
             "wallUs": MAX_EXACT_INTEGER + 1,
             "leaderPid": 99,
             "members": [99, 100],
+            "hostStart": { "load1": 1.25, "cores": 8 },
+            "host": { "load1": 1.25, "cores": 8 },
         });
         assert!(serde_json::from_value::<JobResourceSample>(inexact).is_err());
     }

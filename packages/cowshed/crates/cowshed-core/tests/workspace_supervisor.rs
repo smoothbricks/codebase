@@ -88,6 +88,7 @@ impl SpawnSink for FakeSpawner {
                     reason: "a fake process leads no group".into(),
                 },
                 spawned: Instant::now(),
+                host: cowshed_core::host_load::read_host_load(),
             },
             observations: self.process_observations.clone(),
             backpressure: self.backpressure,
@@ -1617,6 +1618,7 @@ impl SpawnSink for ReapedGroupSpawner {
             process: OwnedProcess {
                 birth,
                 spawned: Instant::now(),
+                host: cowshed_core::host_load::read_host_load(),
             },
             observations: self.process_observations.clone(),
             backpressure: false,
@@ -3292,6 +3294,7 @@ fn owned(leader: &std::process::Child, spawned: Instant) -> OwnedProcess {
     OwnedProcess {
         birth: Birth::of(leader.id()),
         spawned,
+        host: cowshed_core::host_load::read_host_load(),
     }
 }
 

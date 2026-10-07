@@ -40,7 +40,7 @@ impl fmt::Display for HostLoad {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum HostLoadError {
     #[error("getloadavg did not report the one-minute host load (returned {returned})")]
     LoadUnavailable { returned: libc::c_int },

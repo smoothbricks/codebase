@@ -533,6 +533,14 @@
         "pid": 4242,
         "repoId": "smoothbricks/codebase",
         "resources": {
+          "host": {
+            "cores": 10,
+            "load1": 6.25
+          },
+          "hostStart": {
+            "cores": 10,
+            "load1": 1.5
+          },
           "jobId": 2,
           "leaderPid": 4242,
           "members": [4242, 4243],
@@ -736,6 +744,14 @@
       "pid": 4242,
       "repoId": "smoothbricks/codebase",
       "resources": {
+        "host": {
+          "cores": 10,
+          "load1": 6.25
+        },
+        "hostStart": {
+          "cores": 10,
+          "load1": 1.5
+        },
         "jobId": 2,
         "leaderPid": 4242,
         "members": [4242, 4243],

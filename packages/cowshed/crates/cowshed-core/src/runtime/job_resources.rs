@@ -10,8 +10,9 @@ use std::time::Instant;
 use super::job_groups::Birth;
 use super::supervisor::OwnedProcess;
 use crate::api::dto::{JobId, UtcTimestamp};
-use crate::api::resources::{JobResourceSample, WallMicros};
+use crate::api::resources::{HostLoadSample, JobResourceSample, WallMicros};
 use crate::error::{CowshedError, Result};
+use crate::host_load::HostLoadError;
 
 /// What a job's resource reads answer, through its life.
 pub(super) enum Sampling {
@@ -87,6 +88,7 @@ pub(super) struct Observation {
     pub sampled_at: UtcTimestamp,
     /// The complete running membership of the group the sampler's leader leads.
     pub members: Vec<u32>,
+    pub host: HostLoadSample,
 }
 
 pub(super) struct JobSampler {
@@ -95,6 +97,8 @@ pub(super) struct JobSampler {
     spawned: Instant,
     /// The process that leads the job's group now, as its parent observed it.
     leader: Birth,
+    /// The first spawn's observation, never replaced by a later process or sample.
+    host_start: std::result::Result<HostLoadSample, HostLoadError>,
 }
 
 impl JobSampler {
@@ -103,6 +107,7 @@ impl JobSampler {
             job_id,
             spawned: first.spawned,
             leader: first.birth,
+            host_start: first.host,
         }
     }
 
@@ -117,6 +122,15 @@ impl JobSampler {
 
     /// The job's sample from what was observed of it.
     pub(super) fn sample(&self, observed: Observation) -> Result<JobResourceSample> {
+        let host_start = self.host_start.as_ref().map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "job {} spawn host observation failed: {error}",
+                    self.job_id.get()
+                ),
+                "the command runs on; inspect the host's load and core reporting",
+            )
+        })?;
         let wall = WallMicros::of(observed.now.duration_since(self.spawned)).map_err(|error| {
             CowshedError::internal(format!(
                 "job {} cannot be sampled: {error}",
@@ -129,6 +143,8 @@ impl JobSampler {
             wall,
             self.leader.pid(),
             observed.members,
+            *host_start,
+            observed.host,
         ))
     }
 }
@@ -146,6 +162,7 @@ mod tests {
                 reason: "a sampling test names no process".into(),
             },
             spawned,
+            host: Ok(HostLoadSample::new(1.25, 8).expect("host snapshot")),
         }
     }
 
@@ -162,6 +179,7 @@ mod tests {
             now,
             sampled_at: at(),
             members: members.to_vec(),
+            host: HostLoadSample::new(1.25, 8).expect("host snapshot"),
         }
     }
 
@@ -255,5 +273,66 @@ mod tests {
                 .code,
             crate::error::ErrorCode::Conflict
         );
+    }
+
+    #[test]
+    fn host_start_stays_at_first_ownership_while_current_host_changes() {
+        let spawn = Instant::now();
+        let start = HostLoadSample::new(1.25, 8).expect("start");
+        let current = HostLoadSample::new(9.5, 12).expect("current");
+        let later = HostLoadSample::new(3.0, 16).expect("later");
+        let mut sampling = Sampling::Unowned;
+        let activating = sampling
+            .own(
+                job(),
+                OwnedProcess {
+                    host: Ok(start),
+                    ..owned(100, spawn)
+                },
+            )
+            .expect("live")
+            .sample(Observation {
+                host: current,
+                ..seen(spawn + Duration::from_millis(10), &[100])
+            })
+            .expect("activation sample");
+        assert_eq!((activating.host_start, activating.host), (start, current));
+
+        let running = sampling
+            .own(
+                job(),
+                OwnedProcess {
+                    host: Ok(later),
+                    ..owned(200, spawn + Duration::from_millis(20))
+                },
+            )
+            .expect("live")
+            .sample(Observation {
+                host: later,
+                ..seen(spawn + Duration::from_millis(30), &[200])
+            })
+            .expect("command sample");
+        assert_eq!((running.host_start, running.host), (start, later));
+    }
+
+    #[test]
+    fn an_unavailable_spawn_load_remains_a_typed_failure_not_a_later_baseline() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sampler = sampling
+            .own(
+                job(),
+                OwnedProcess {
+                    host: Err(HostLoadError::LoadUnavailable { returned: -1 }),
+                    ..owned(100, spawn)
+                },
+            )
+            .expect("live process");
+        let failure = sampler
+            .sample(seen(spawn + Duration::from_millis(10), &[100]))
+            .expect_err("the spawn baseline is unavailable");
+        assert_eq!(failure.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert!(failure.message.contains("spawn host observation failed"));
+        assert!(failure.message.contains("getloadavg"));
     }
 }

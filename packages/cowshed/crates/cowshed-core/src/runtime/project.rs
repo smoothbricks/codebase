@@ -12443,6 +12443,7 @@ mod removal_supervisor_tests {
                     reason: "a test process has no process group".into(),
                 },
                 spawned: std::time::Instant::now(),
+                host: crate::host_load::read_host_load(),
             };
             events
                 .send(ProcessEvent::Started {

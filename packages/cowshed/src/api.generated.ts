@@ -787,6 +787,14 @@ export type JobResourceSample = {
    * runs: the complete membership, never a truncated one. Empty once nothing of the group runs.
    */
   readonly members: ReadonlyArray<number & tags.Type<'uint32'>>;
+  /**
+   * Captured once with the first owned process, even when that process is activation.
+   */
+  readonly hostStart: HostLoadSample;
+  /**
+   * The host's load and online cores at this sample boundary.
+   */
+  readonly host: HostLoadSample;
 };
 
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';

@@ -19,6 +19,7 @@ use cowshed_core::api::{
     RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
 use cowshed_core::error::Result;
+use cowshed_core::host_load::HostLoad;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::shell_host::ShellHostProgram;
@@ -1059,14 +1060,33 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
         "the activation's group: {}",
         std::io::Error::last_os_error()
     );
+    let load_before = HostLoad::read().expect("independent getloadavg before the read");
     let activating = handle
         .resources(job)
         .await
         .expect("an activating job is sampled");
+    let load_after = HostLoad::read().expect("independent getloadavg after the read");
     let read = std::time::Instant::now();
     assert_eq!(
         (activating.job_id, activating.leader_pid),
         (job, u32::try_from(host).expect("pid"))
+    );
+    // The sample's host is the kernel's at the read, not a constant or the spawn's: it lies
+    // between two independent reads that bracket it.
+    let load = activating.host.load1.get();
+    assert!(
+        (load_before.one.min(load_after.one) - 0.01..=load_before.one.max(load_after.one) + 0.01)
+            .contains(&load),
+        "sampled load {load}, independent before {}, after {}",
+        load_before.one,
+        load_after.one
+    );
+    // SAFETY: sysconf reads a system constant and borrows nothing.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    assert_eq!(
+        libc::c_long::from(activating.host.cores.get()),
+        online,
+        "the sample's cores are the host's online cores"
     );
     assert!(
         activating.wall_us.get() <= micros(admitted, read),
@@ -1090,6 +1110,10 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
         u32::try_from(command_pid).expect("pid"),
         "the command leads its own group"
     );
+    assert_eq!(
+        running.host_start, activating.host_start,
+        "the command keeps the activation's spawn host baseline"
+    );
     assert!(
         running.wall_us.get() >= micros(activation_seen, before),
         "the wall still counts from the activation's spawn"
@@ -1106,6 +1130,10 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
     assert_eq!(
         terminal.leader_pid, running.leader_pid,
         "the leader is named after it exits"
+    );
+    assert_eq!(
+        terminal.host_start, activating.host_start,
+        "the terminal keeps the first owned process's host baseline"
     );
     assert!(terminal.wall_us >= running.wall_us);
     assert_eq!(
