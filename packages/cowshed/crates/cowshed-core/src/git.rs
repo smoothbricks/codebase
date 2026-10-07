@@ -3315,7 +3315,7 @@ mod tests {
     /// clone's cleanup of main's untracked files failed on it ('failed to delete main's untracked
     /// files in the clone: .Trashes/ Permission denied'), leaving the create unfinished. The
     /// cleanup leaves the volume's bookkeeping alone, even under an exclude file main wrote
-    /// before it named all of it, and so does every dirty check after.
+    /// before it named all of it, and the clone's dirty checks ignore it.
     #[tokio::test]
     async fn a_clone_of_main_leaves_the_volumes_own_bookkeeping_alone() {
         use std::os::unix::fs::PermissionsExt;
@@ -3330,10 +3330,19 @@ mod tests {
         let trashes = workspace.join(".Trashes");
         fs::create_dir(&trashes).expect("the volume's trash");
         fs::write(trashes.join("501"), "").expect("an entry in the volume's trash");
+        /// The trash made this user's to empty again however the test ends, so its fixture
+        /// can be removed.
+        struct Emptiable<'a>(&'a Path);
+        impl Drop for Emptiable<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
         // Not this user's to empty, as root's is not.
         fs::set_permissions(&trashes, fs::Permissions::from_mode(0o500)).expect("read-only trash");
+        let _emptiable = Emptiable(&trashes);
         let repository = GitRepository::from_root(&workspace);
-        let minted = repository
+        repository
             .mint_workspace(
                 "bookkeeping",
                 CloneOrigin {
@@ -3344,13 +3353,13 @@ mod tests {
                 None,
                 false,
             )
-            .await;
-        let status = git_stdout(&workspace, &["status", "--porcelain"]);
-        let kept = trashes.join("501").exists();
-        fs::set_permissions(&trashes, fs::Permissions::from_mode(0o700)).expect("restore trash");
-        minted.expect("mint beside the volume's bookkeeping");
-        assert_eq!(status, "");
-        assert!(kept, "the volume's trash stays as macOS made it");
+            .await
+            .expect("mint beside the volume's bookkeeping");
+        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
+        assert!(
+            trashes.join("501").exists(),
+            "the volume's trash stays as macOS made it"
+        );
     }
 
     #[tokio::test]

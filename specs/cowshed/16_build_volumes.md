@@ -375,7 +375,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    link until it links its own (Fork steps 1 to 3), and so does every reseed, so neither reads a seed or a volume the
    land deletes. Without it, a land that froze main's seed and released main's previous volume while a `cowshed new` of
    main forked deleted the seed the new had read, and the new failed (`sync source image …: No such file or directory`).
-   A land that finds the lock held says so on stderr and waits for it.
+   A land that finds the lock held says so on stderr and waits for it. It waits with the target's daemon already stopped
+   (5.3), so the longer it waits, the likelier an Nx client restarts it and 6.2 skips the swap, reported as any skip is.
 
    A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap.
 
@@ -530,12 +531,14 @@ again at any level above it.
   distinguishing release within the grace from a forced unmount. Editors or indexers holding files or a working
   directory without a cowshed job hold cannot keep an unlinked volume attached indefinitely. Force revokes their access
   to the volume; it does not kill them.
-- Every release, a seed's or another volume's, whatever asked for it (collection, a land's release of the target's
-  previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the image to the
-  project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its sidecar recorded
-  it as a seed and `build-volume` otherwise, and the workspace that sidecar named, read before anything is deleted. A
-  held volume is not released and leaves no line. Releases were journaled nowhere, so an `rm` that released the volume a
-  land had just moved main onto left no trace of it.
+- Every release that deletes an image, a seed's or another volume's, whatever asked for it (collection, a land's release
+  of the target's previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the
+  image to the project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its
+  sidecar recorded it as a seed and `build-volume` otherwise, and the workspace that sidecar named, read before anything
+  is deleted. A target's previous volume is recorded unlinked before its release, so its line names no workspace. A held
+  volume is not released and leaves no line; a release that finds the image already gone deletes none and leaves none.
+  Releases were journaled nowhere, so an `rm` that released the volume a land had just moved main onto left no trace of
+  it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
   when the target retires. Detached seeds do not need an attach or a rename to be deleted.
 - A fork's volume and seed exist before its workspace does: `cowshed new` and `cowshed fork` clone them into the staged

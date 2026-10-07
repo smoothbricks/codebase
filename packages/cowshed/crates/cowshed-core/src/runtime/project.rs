@@ -3706,7 +3706,7 @@ impl NativeProjectRuntimeHost {
             Ok(locked) => locked,
             Err(contended) => {
                 eprintln!(
-                    "cowshed: another cowshed operation on {} holds its image lock (a new, fork, reseed or checkpoint of it); the land freezes {}'s seed and moves its build link once that ends",
+                    "cowshed: another cowshed operation on {} holds its image lock (e.g. a new, fork or reseed of it); the land freezes {}'s seed and moves its build link once that ends",
                     into.name, into.name
                 );
                 timed_async("land", "target-lock", contended.wait()).await?

@@ -3417,7 +3417,7 @@ mod tests {
             .expect("main has a seed");
         assert_eq!(seed, first_seed);
 
-        // The land reaches main's seed and link here, and waits for the new.
+        // The land reaches main's seed and link here, finds main's image lock held, and waits.
         let contended = match scratch
             .volumes
             .try_lock_target(main.clone(), scratch.image_lock(&main.name))
@@ -3427,10 +3427,12 @@ mod tests {
             Ok(_) => panic!("the land took main's image lock while a new of main held it"),
             Err(contended) => contended,
         };
+        let (waiting, waits) = tokio::sync::oneshot::channel();
         let land = {
             let volumes = scratch.volumes.clone();
             let main_checkout = main_checkout.clone();
             tokio::spawn(async move {
+                waiting.send(()).expect("the new waits for the land");
                 let locked = contended.wait().await?;
                 volumes.freeze_seed(&locked, &quiet, tree.clone()).await?;
                 let adopted = volumes
@@ -3442,6 +3444,9 @@ mod tests {
                 volumes.release_previous(adopted.previous).await
             })
         };
+        // The new goes on only once the land runs: whatever the land does next, it does while
+        // the new clones.
+        waits.await.expect("the land runs");
 
         // The rest of the new's fork, from what it read under main's lock.
         let lane = owner("lane", '1');

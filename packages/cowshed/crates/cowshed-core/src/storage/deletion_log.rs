@@ -19,11 +19,11 @@
 //!   take no project parameter — threading one through the [`ApfsExecutionHost`] trait would
 //!   couple every substrate caller to journal layout. When the layout is unrecognized the
 //!   entry is skipped, never guessed.
-//! * A build volume's release writes one line, for its image, whatever else it deletes: the
-//!   volume's sidecar record, hold file and mountpoint are its own bookkeeping, gone with it
-//!   under the release's claim. The line says whether the sidecar recorded the volume as a
-//!   seed and names the workspace it recorded, read before anything was deleted, because
-//!   that is what nothing else can tell once the volume is gone.
+//! * A build volume's release that deletes its image writes one line, for the image, whatever
+//!   else it deletes: the volume's sidecar record, hold file and mountpoint are its own
+//!   bookkeeping, gone with it under the release's claim. The line says whether the sidecar
+//!   recorded the volume as a seed and names the workspace it recorded, read before anything
+//!   was deleted, because that is what nothing else can tell once the volume is gone.
 
 use std::fs::OpenOptions;
 use std::io::Write;
