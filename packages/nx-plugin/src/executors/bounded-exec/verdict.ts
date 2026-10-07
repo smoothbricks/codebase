@@ -49,9 +49,30 @@ export const JUNIT_REPORT_ENV = 'BOUNDED_EXEC_JUNIT';
  */
 const TIMEOUT_FAILURE_TYPES: Readonly<Record<string, true>> = { 'test timeout': true, TimeoutError: true };
 
-/** The failing tests of one JUnit report, split by whether only a timeout failed them. */
+/**
+ * The JUnit failure that means "the runner stopped this test because its command was told to stop". When the
+ * SIGTERM bounded-exec sends at a bound reaches `cargo-nextest`, it ends the tests still running and reports each as
+ * a `test abort` whose message names the signal: SIGTERM, or SIGKILL once the force-kill has followed. A test that
+ * dies of any other signal (SIGSEGV, SIGABRT) is a crash of the test itself.
+ */
+const CANCELLED_ABORT_TYPE = 'test abort';
+const CANCELLED_ABORT_MESSAGE = /^process aborted with signal (?:15 \(SIGTERM\)|9 \(SIGKILL\))$/;
+
+type FailureKind = 'timedOut' | 'cancelled' | 'failed';
+
+function failureKind(type: string, message: string): FailureKind {
+  if (Object.hasOwn(TIMEOUT_FAILURE_TYPES, type)) {
+    return 'timedOut';
+  }
+  return type === CANCELLED_ABORT_TYPE && CANCELLED_ABORT_MESSAGE.test(message) ? 'cancelled' : 'failed';
+}
+
+/** The failing tests of one JUnit report, split by what failed them. */
 export interface JunitFailures {
+  /** Failed only on the runner's per-test timeout. */
   readonly timedOut: readonly string[];
+  /** Aborted by the runner because its command was told to stop, not failed by anything they did. */
+  readonly cancelled: readonly string[];
   readonly failed: readonly string[];
 }
 
@@ -62,18 +83,19 @@ export interface JunitFailures {
  */
 export function junitFailures(xml: string): JunitFailures {
   const timedOut: string[] = [];
+  const cancelled: string[] = [];
   const failed: string[] = [];
   const text = xml.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '').replace(/<!--[\s\S]*?-->/g, '');
   const tags = /<(\/?)(testcase|failure|error)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let current: { name: string; types: string[] } | null = null;
+  let current: { name: string; kinds: FailureKind[] } | null = null;
   const close = (): void => {
     if (current === null) {
       return;
     }
-    if (current.types.length > 0) {
-      (current.types.every((type) => Object.hasOwn(TIMEOUT_FAILURE_TYPES, type)) ? timedOut : failed).push(
-        current.name,
-      );
+    const [first] = current.kinds;
+    if (first !== undefined) {
+      const kind = current.kinds.every((one) => one === first) ? first : 'failed';
+      (kind === 'timedOut' ? timedOut : kind === 'cancelled' ? cancelled : failed).push(current.name);
     }
     current = null;
   };
@@ -86,7 +108,7 @@ export function junitFailures(xml: string): JunitFailures {
       close();
       const name = attribute(attributes, 'name') ?? '';
       const classname = attribute(attributes, 'classname');
-      current = { name: classname ? `${classname} ${name}` : name, types: [] };
+      current = { name: classname ? `${classname} ${name}` : name, kinds: [] };
       if (selfClosing === '/') {
         close();
       }
@@ -95,10 +117,10 @@ export function junitFailures(xml: string): JunitFailures {
     if (slash === '/' || current === null) {
       continue;
     }
-    current.types.push(attribute(attributes, 'type') ?? '');
+    current.kinds.push(failureKind(attribute(attributes, 'type') ?? '', attribute(attributes, 'message') ?? ''));
   }
   close();
-  return { timedOut, failed };
+  return { timedOut, cancelled, failed };
 }
 
 function attribute(attributes: string, name: string): string | null {
@@ -141,7 +163,8 @@ export interface RunEnd {
 
 /**
  * Judge a run. A test that failed on its own is a failure even when a bound fired too, and an
- * idle bound is never load: the report's assertions and the idle bound are read first.
+ * idle bound is never load: the report's assertions and the idle bound are read first. A test
+ * the runner aborted because the total bound told its command to stop is not one that failed.
  */
 export function judgeRun(run: RunEnd): BoundedExecVerdict {
   if (run.expiry?.kind === 'idle') {
@@ -150,8 +173,14 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
   if (run.report !== null && run.report.failed.length > 0) {
     return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.failed };
   }
+  // The tests the runner aborted when the ceiling's SIGTERM reached it are the bound's casualties: they are in the
+  // report as failures, but nothing about them failed. Aborted with no total bound to explain it, they are failures,
+  // whatever else the run shows: a zero exit or a per-test timeout does not excuse a test someone else stopped.
   if (run.expiry?.kind === 'total') {
     return { outcome: 'bound', bound: 'total', limitMs: run.expiry.limitMs, elapsedMs: run.elapsedMs };
+  }
+  if (run.report !== null && run.report.cancelled.length > 0) {
+    return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.cancelled };
   }
   if (run.exitCode === 0) {
     return { outcome: 'passed' };

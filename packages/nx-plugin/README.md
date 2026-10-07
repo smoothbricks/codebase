@@ -703,7 +703,11 @@ task id and the hash it ran at:
 
 - `bound`: nothing failed but a wall-clock bound. Either the command outlived `timeoutMs`, or every failing test in the
   runner's JUnit report failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"`,
-  `bun test` writes `type="TimeoutError"`). A loaded host produces exactly these.
+  `bun test` writes `type="TimeoutError"`). A loaded host produces exactly these. When `timeoutMs` fires, the tests
+  `cargo-nextest` was still running are reported as failures of `type="test abort"`,
+  `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the bound's casualties and
+  do not make the run `failed`. A test that dies of any other signal, or that is aborted with no `timeoutMs` to explain
+  it, does.
 - `wedged`: `idleTimeoutMs` fired. Silence means a hang, never load.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.

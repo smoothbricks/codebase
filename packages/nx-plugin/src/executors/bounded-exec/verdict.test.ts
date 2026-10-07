@@ -8,6 +8,7 @@ import {
   type BoundedExecVerdict,
   failedTasksOfRun,
   JUNIT_FILE,
+  judgeRun,
   junitFailures,
   readRecord,
   taskDirectory,
@@ -42,7 +43,7 @@ async function workspace(): Promise<{ root: string; data: string; context: Bound
  */
 async function verdictOf(
   command: string,
-  bounds: { timeoutMs: number; idleTimeoutMs?: number },
+  bounds: { timeoutMs: number; idleTimeoutMs?: number; killAfterMs?: number },
   files: Record<string, string> = {},
   links: Record<string, string> = {},
 ): Promise<BoundedExecVerdict | undefined> {
@@ -143,7 +144,89 @@ running 1 test
         </testcase>
     </testsuite>
 </testsuites>`;
-    expect(junitFailures(report)).toEqual({ timedOut: ['nt t::slow'], failed: ['nt t::assert'] });
+    expect(junitFailures(report)).toEqual({ timedOut: ['nt t::slow'], cancelled: [], failed: ['nt t::assert'] });
+  });
+
+  it("reads nextest's abort of a test its command was told to stop as neither a failure nor a timeout", () => {
+    // cargo-nextest 0.9.143, SIGTERM delivered to the run: the tests still running are reported as `test abort`.
+    // A test that dies of any other signal (here SIGSEGV) is a crash of the test itself.
+    const abort = (name: string, signal: string) =>
+      `<testcase name="${name}" classname="nt" time="0.85"><failure message="process aborted with signal ${signal}" type="test abort">process aborted with signal ${signal}</failure><system-out>\nrunning 1 test\n</system-out></testcase>`;
+    const report = `<testsuites name="nextest-run" tests="4" failures="3"><testsuite name="nt" tests="4" failures="3">
+<testcase name="t::ok" classname="nt" time="0.1"/>
+${abort('t::cut', '15 (SIGTERM)')}
+${abort('t::killed', '9 (SIGKILL)')}
+${abort('t::crash', '11 (SIGSEGV)')}
+</testsuite></testsuites>`;
+    expect(junitFailures(report)).toEqual({
+      timedOut: [],
+      cancelled: ['nt t::cut', 'nt t::killed'],
+      failed: ['nt t::crash'],
+    });
+  });
+
+  it('records a run its ceiling stopped as a bound when the only failures are the tests the stop aborted', () => {
+    const total = { kind: 'total', limitMs: 120_000 } as const;
+    const cut = { timedOut: [], cancelled: ['nt t::cut'], failed: [] };
+    expect(judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: cut })).toEqual({
+      outcome: 'bound',
+      bound: 'total',
+      limitMs: 120_000,
+      elapsedMs: 120_850,
+    });
+    // An assertion that failed before the ceiling is still a failure, and an abort nobody asked for is one too.
+    expect(
+      judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: { ...cut, failed: ['nt t::assert'] } }),
+    ).toEqual({ outcome: 'failed', exitCode: 143, tests: ['nt t::assert'] });
+    expect(judgeRun({ exitCode: 143, elapsedMs: 850, expiry: null, report: cut })).toEqual({
+      outcome: 'failed',
+      exitCode: 143,
+      tests: ['nt t::cut'],
+    });
+  });
+
+  it('records a test aborted with no total bound to explain it as a failure, whatever the exit or the other tests say', () => {
+    const cancelled = ['nt t::cut'];
+    // Exit 0 with an abort in the report: the abort is still not nothing.
+    expect(
+      judgeRun({ exitCode: 0, elapsedMs: 850, expiry: null, report: { timedOut: [], cancelled, failed: [] } }),
+    ).toEqual({
+      outcome: 'failed',
+      exitCode: 0,
+      tests: cancelled,
+    });
+    // A per-test timeout beside an abort nobody asked for is not a per-test bound: the abort failed the run.
+    expect(
+      judgeRun({
+        exitCode: 100,
+        elapsedMs: 850,
+        expiry: null,
+        report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
+      }),
+    ).toEqual({ outcome: 'failed', exitCode: 100, tests: cancelled });
+    // With the total bound fired, the same report is the bound's own casualties.
+    expect(
+      judgeRun({
+        exitCode: 143,
+        elapsedMs: 120_850,
+        expiry: { kind: 'total', limitMs: 120_000 },
+        report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
+      }),
+    ).toMatchObject({ outcome: 'bound', bound: 'total' });
+  });
+
+  it('records a runner that reports its own abort at the total ceiling as a bound, end to end', async () => {
+    // A stand-in for nextest: on SIGTERM it writes the JUnit report with the test it was running aborted, exits 143.
+    const runner = `const fs = require('node:fs');
+process.on('SIGTERM', () => {
+  fs.writeFileSync(process.env.BOUNDED_EXEC_JUNIT, '<testsuites name="nextest-run" tests="2" failures="1"><testsuite name="nt" tests="2" failures="1"><testcase name="t::ok" classname="nt"/><testcase name="t::cut" classname="nt"><failure message="process aborted with signal 15 (SIGTERM)" type="test abort">process aborted with signal 15 (SIGTERM)</failure></testcase></testsuite></testsuites>');
+  process.exit(143);
+});
+setInterval(() => console.log('running'), 10);
+`;
+    expect(
+      await verdictOf('node runner.js', { timeoutMs: 300, killAfterMs: 5_000 }, { 'runner.js': runner }),
+    ).toMatchObject({ outcome: 'bound', bound: 'total', limitMs: 300 });
   });
 
   it('asks the one runner in a command for a report, and leaves two runners alone', async () => {
