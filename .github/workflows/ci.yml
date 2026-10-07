@@ -65,9 +65,35 @@ jobs:
         if: steps.setup.outputs.host-runner != 'true'
         uses: ./.github/actions/cache-nx
 
+      - name: Capture Linux linker and runner constraints
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          uname -a
+          rustc -vV
+          cargo -V
+          printf 'linker wrapper: %s\n' "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
+          "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER" -Wl,--version
+          printf 'RUSTC_WRAPPER=%s\nCARGO_TARGET_DIR=%s\nRUSTFLAGS=%s\nCARGO_BUILD_JOBS=%s\n' "${RUSTC_WRAPPER:-unset}" "${CARGO_TARGET_DIR:-unset}" "${RUSTFLAGS:-unset}" "${CARGO_BUILD_JOBS:-unset}"
+          ulimit -a
+          cat /proc/meminfo
+          cat /proc/self/cgroup
+          for file in memory.max memory.high memory.swap.max memory.current memory.peak memory.events cpu.max pids.max; do
+            path="/sys/fs/cgroup/$file"
+            if [ -r "$path" ]; then printf '%s\n' "$path"; cat "$path"; else printf '%s unavailable\n' "$path"; fi
+          done
+          df -PkT "$PWD" "${RUNNER_TEMP:-/tmp}" /nix/store
+          if command -v sccache; then
+            if ! sccache --show-stats; then printf 'sccache statistics unavailable\n'; fi
+          else
+            printf 'sccache binary unavailable\n'
+          fi
+
       # Step 6
       - name: 🔨 Build
         run: smoo github-ci nx-smart --target build --name "Build" --step 6
+        env:
+          RUSTC_LOG: rustc_codegen_ssa::back::link=info
+          CARGO_TERM_VERBOSE: "true"
 
       # Step 7
       - name: 🔍 Lint
@@ -80,6 +106,29 @@ jobs:
       # Step 9
       - name: 🌐 Browser Tests
         run: smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 9
+
+      - name: Prove allocation error and controller invariants
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bun nx run-many -p cowshed -t cargo-test-cowshed-core-shard1 cargo-test-cowshed-core-shard2 cargo-test-cowshed-core-shard3 cargo-test-cowshed-core-shard4 cargo-test-cowshed-core-shard5 cargo-test-cowshed-core-shard6 cargo-test-cowshed-core-shard7 cargo-test-cowshed-core-shard8 --output-style=static -- --success-output=immediate runtime::job_cgroup::tests
+
+      - name: Prove corrected delegated CPU lifecycle
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bun nx run cowshed:cargo-test-cowshed-core-shard7 --output-style=static -- --success-output=immediate a_job_owns_its_cgroup_from_before_its_first_instruction
+
+      - name: Capture post-build resource evidence
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          cat /proc/meminfo
+          for file in memory.max memory.high memory.swap.max memory.current memory.peak memory.events cpu.max pids.max; do
+            path="/sys/fs/cgroup/$file"
+            if [ -r "$path" ]; then printf '%s\n' "$path"; cat "$path"; else printf '%s unavailable\n' "$path"; fi
+          done
+          df -PkT "$PWD" "${RUNNER_TEMP:-/tmp}" /nix/store
+          if command -v sccache; then
+            if ! sccache --show-stats; then printf 'sccache statistics unavailable\n'; fi
+          else
+            printf 'sccache binary unavailable\n'
+          fi
 
       # Step 10
       - name: 🩺 Check monorepo policies and managed-file drift
