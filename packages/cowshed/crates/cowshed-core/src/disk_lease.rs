@@ -314,7 +314,8 @@ mod tests {
     };
 
     /// A listening socket the client is already connected to, removed on drop. Directly under
-    /// `/private/tmp`: a bind path is capped at `sun_path`'s 104 bytes.
+    /// `/tmp`, which macOS links to `/private/tmp` and every Linux host has: a bind path is capped
+    /// at `sun_path`'s 104 bytes.
     struct Socket(std::path::PathBuf);
 
     impl Drop for Socket {
@@ -325,7 +326,7 @@ mod tests {
 
     fn pair() -> (Socket, UnixListener, UnixStream) {
         let socket = Socket(std::path::PathBuf::from(format!(
-            "/private/tmp/cowshed-dl-{}.sock",
+            "/tmp/cowshed-dl-{}.sock",
             uuid::Uuid::new_v4().simple()
         )));
         let listener = UnixListener::bind(&socket.0).expect("bind");

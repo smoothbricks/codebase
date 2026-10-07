@@ -279,9 +279,11 @@ mod tests {
     /// and it has exited all the same. Reaped, it is gone. This process itself runs.
     #[test]
     fn a_zombie_has_exited_though_the_null_signal_still_reaches_it() {
-        let mut child =
-            crate::fork_lock::Spawn::spawn_locked(&mut std::process::Command::new("/usr/bin/true"))
-                .expect("spawn");
+        // `/bin/sh` is the one program path every supported host has: NixOS keeps no `/usr/bin/true`.
+        let mut child = crate::fork_lock::Spawn::spawn_locked(
+            std::process::Command::new("/bin/sh").args(["-c", ":"]),
+        )
+        .expect("spawn");
         let pid = libc::pid_t::try_from(child.id()).expect("pid");
         // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };

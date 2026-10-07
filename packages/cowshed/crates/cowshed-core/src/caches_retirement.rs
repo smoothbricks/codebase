@@ -929,11 +929,12 @@ fn remove_tree(path: &Path) -> io::Result<()> {
 /// links. Cargo's and nix's caches are content and metadata both, and cargo's git checkouts share
 /// inodes with its databases; a copy that followed links, reset times or split hard links would
 /// not be the same cache. macOS `cp -a` splits hard links and `ditto` keeps them; GNU `cp -a`
-/// keeps them too.
+/// keeps them too. GNU `cp` is found on PATH: NixOS keeps no `/bin/cp`, and spawning it failed
+/// with ENOENT.
 #[cfg(target_os = "macos")]
 const COPY_TREE: (&str, &[&str]) = ("/usr/bin/ditto", &[]);
 #[cfg(not(target_os = "macos"))]
-const COPY_TREE: (&str, &[&str]) = ("/bin/cp", &["-a"]);
+const COPY_TREE: (&str, &[&str]) = ("cp", &["-a"]);
 
 /// Copy the tree at `from` to the new path `to` with [`COPY_TREE`].
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {

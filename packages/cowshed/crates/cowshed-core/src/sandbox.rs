@@ -2276,6 +2276,9 @@ mod tests {
             ("/Users/tester/.ssh/cache", "/Users/tester/.ssh"),
             ("/Users/tester/.cowshed", "/Users/tester/.cowshed/mnt"),
             ("/Users/tester/Library", "/Users/tester/Library/Keychains"),
+            // macOS's layout: elsewhere cowshed's cache is `$XDG_CACHE_HOME/cowshed` and
+            // `~/Library/Caches` is nothing of ours.
+            #[cfg(target_os = "macos")]
             (
                 "/Users/tester/Library/Caches",
                 "/Users/tester/Library/Caches/dev.cowshed",

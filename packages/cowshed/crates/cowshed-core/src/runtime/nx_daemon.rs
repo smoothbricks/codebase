@@ -469,9 +469,11 @@ mod tests {
         write_record(&record, own, &socket);
         assert_eq!(probe(&record), Probe::Live);
 
-        let mut exited =
-            crate::fork_lock::Spawn::spawn_locked(&mut std::process::Command::new("/usr/bin/true"))
-                .expect("spawn");
+        // `/bin/sh` is the one program path every supported host has: NixOS keeps no `/usr/bin/true`.
+        let mut exited = crate::fork_lock::Spawn::spawn_locked(
+            std::process::Command::new("/bin/sh").args(["-c", ":"]),
+        )
+        .expect("spawn");
         let dead = exited.id();
         // Exited, not yet reaped: a zombie, which the null signal still reaches. The socket is
         // still served, so only the process's own state can tell it is gone.

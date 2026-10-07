@@ -4465,10 +4465,17 @@ mod tests {
             .to_owned()
     }
 
+    /// `git <args>` in `root`, committing as the fixture's author: a CI runner has no global identity.
     fn git(root: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
             .arg(root)
+            .args([
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
             .args(args)
             .status_locked()
             .expect("run git");
