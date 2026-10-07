@@ -1329,12 +1329,15 @@ mod tests {
 
     /// A held leader's `proc_pid_rusage`, its Mach ticks converted through the timebase, is the
     /// CPU `getrusage` independently charges its parent for it once reaped: its own and its
-    /// reaped child's, each once. Read as raw nanoseconds, or with the child counted twice, it
-    /// is not. Meanwhile its own process row -- it only waited -- holds none of the child's CPU,
-    /// which its children total holds; once reaped, nothing is read as its own.
+    /// reaped child's, each once. With the child counted twice it is not; read as raw
+    /// nanoseconds it is not either, wherever a tick is not one nanosecond (Apple silicon).
+    /// Intel's 1/1 timebase makes the two agree; `job_accounting`'s injected-timebase test
+    /// covers both rationals. Meanwhile its own process row -- it only waited -- holds none of the
+    /// child's CPU, which its children total holds; once reaped, nothing is read as its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_held_leader_s_converted_rusage_is_what_getrusage_charges_for_it() {
+        use super::MachTick;
         use crate::runtime::job_accounting::{LeaderRusageError, read_leader, rusage_ticks};
         use crate::runtime::job_groups::Birth;
 
@@ -1394,12 +1397,18 @@ mod tests {
             agrees(converted),
             "the converted rusage {converted} us is the {charged} us getrusage charged"
         );
-        let raw_nanoseconds =
-            (ticks.user + ticks.system + ticks.child_user + ticks.child_system) / 1_000;
-        assert!(
-            !agrees(raw_nanoseconds),
-            "Mach ticks read as nanoseconds ({raw_nanoseconds} us) are not the {charged} us"
-        );
+        let timebase = MachTick::read().expect("the host's timebase");
+        if timebase.numerator != timebase.denominator.get() {
+            let raw_nanoseconds =
+                (ticks.user + ticks.system + ticks.child_user + ticks.child_system) / 1_000;
+            assert!(
+                !agrees(raw_nanoseconds),
+                "Mach ticks of {}/{} ns read as nanoseconds ({raw_nanoseconds} us) are not the \
+                 {charged} us",
+                timebase.numerator,
+                timebase.denominator
+            );
+        }
         let child_twice = converted + cpu(last.children);
         assert!(
             !agrees(child_twice),

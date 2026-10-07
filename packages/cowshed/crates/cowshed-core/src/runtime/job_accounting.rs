@@ -487,6 +487,61 @@ mod tests {
         );
     }
 
+    /// Every part of a reading is converted from Mach ticks through the timebase's rational, once.
+    /// On Apple silicon's 125/3 ns tick, reading the ticks as nanoseconds is 24x short of the
+    /// CPU they count, and the conversion is refused unless it uses the rational. On Intel's
+    /// 1/1 tick the two agree, so a native raw-unit control proves nothing there.
+    #[test]
+    fn mach_ticks_convert_through_the_injected_timebase_never_as_nanoseconds() {
+        let ticks = RusageTicks {
+            started: 1,
+            user: 6_000_569,
+            system: 1_200_000,
+            child_user: 24_000_000,
+            child_system: 2_400_003,
+        };
+        let raw_us = (ticks.user + ticks.system + ticks.child_user + ticks.child_system) / 1_000;
+        let tick = |numerator, denominator| MachTick {
+            numerator,
+            denominator: std::num::NonZeroU32::new(denominator).expect("a denominator"),
+        };
+
+        let apple = ticks.convert(9, tick(125, 3)).expect("exact");
+        // 6_000_569 ticks are 250_023_708 ns, 2_400_003 ticks 100_000_125 ns.
+        assert_eq!(
+            (apple.own, apple.children),
+            (cpu(250_023, 50_000), cpu(1_000_000, 100_000))
+        );
+        let converted = apple.total().expect("exact");
+        let converted = converted.user_us.get() + converted.sys_us.get();
+        assert_eq!(converted, 1_400_023);
+        assert_ne!(
+            raw_us, converted,
+            "ticks read as nanoseconds ({raw_us} us) are not the CPU they count"
+        );
+
+        let intel = ticks.convert(9, tick(1, 1)).expect("exact");
+        let intel = intel.total().expect("exact");
+        assert_eq!(
+            intel.user_us.get() + intel.sys_us.get(),
+            raw_us,
+            "a 1/1 tick is a nanosecond"
+        );
+
+        assert_eq!(
+            RusageTicks {
+                user: u64::MAX,
+                ..ticks
+            }
+            .convert(9, tick(u32::MAX, 1)),
+            Err(ResourceUnitError::Inexact {
+                unit: "cpuUs",
+                value: u128::from(u64::MAX) * u128::from(u32::MAX) / 1_000,
+            }),
+            "a count no projection holds exactly is refused, never truncated"
+        );
+    }
+
     /// A leader no one identified cannot be read as itself; a pid that names another life, or
     /// none, is never read as the leader's.
     #[test]
