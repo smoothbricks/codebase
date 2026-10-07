@@ -243,13 +243,30 @@ fn environment_entry(key: &[u8], value: &[u8]) -> CString {
     CString::new([key, b"=", value].concat()).expect("environment")
 }
 
-/// Field 22 of `/proc/<pid>/stat`: clock ticks after boot.
-fn start_time(pid: libc::pid_t) -> Option<u64> {
-    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
-    let close = stat.iter().rposition(|&byte| byte == b')')?;
+/// Field 22 of `/proc/<pid>/stat`: clock ticks after boot. A failure names the read and its
+/// errno, or the field that would not parse.
+fn start_time(pid: libc::pid_t) -> Result<u64, String> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = fs::read(&path).map_err(|error| format!("read {path}: {error}"))?;
+    let malformed = || {
+        format!(
+            "{path} has no start time: {}",
+            String::from_utf8_lossy(&stat)
+        )
+    };
+    let close = stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .ok_or_else(malformed)?;
     // Field 3 (state) follows ") "; field 22 is the 20th from there.
-    let field = stat.get(close + 2..)?.split(|&byte| byte == b' ').nth(19)?;
-    std::str::from_utf8(field).ok()?.parse().ok()
+    let field = stat
+        .get(close + 2..)
+        .and_then(|fields| fields.split(|&byte| byte == b' ').nth(19))
+        .ok_or_else(malformed)?;
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(malformed)
 }
 
 fn read_byte(fd: RawFd) -> io::Result<()> {
@@ -390,8 +407,9 @@ struct Birth {
     pid: u32,
     ppid: u32,
     start: Result<u64, String>,
-    /// Whether a pidfd could be opened when the birth was observed; it is held to the end of
-    /// the run, so the identity it names cannot be reused meanwhile.
+    /// Whether a pidfd could be opened when the birth was observed. It is held to the end of
+    /// the run, so it keeps naming this very process; it does not stop the kernel from giving
+    /// the numeric pid to a later one.
     pidfd: Result<(), String>,
 }
 
@@ -786,7 +804,7 @@ impl Root {
                             observed.births.push(Birth {
                                 pid: u32::try_from(child).expect("pid"),
                                 ppid: thread_group(pid),
-                                start: start_time(child).ok_or_else(|| "unreadable".to_owned()),
+                                start: start_time(child),
                                 pidfd: hold_pidfd(child, &mut pidfds),
                             });
                         } else {
@@ -798,7 +816,7 @@ impl Root {
                         let former = u32::try_from(event_message(pid)).expect("former tid");
                         observed.execs.push(ExecSeen {
                             pid: tracee,
-                            start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
+                            start: start_time(pid),
                             argv: command_line(pid),
                             former_tid: (former != tracee).then_some(former),
                         });
@@ -809,7 +827,7 @@ impl Root {
                         if thread_group(pid) == tracee {
                             observed.exits.push(Exit {
                                 pid: tracee,
-                                start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
+                                start: start_time(pid),
                                 wait_status: i32::try_from(wait_status).ok(),
                             });
                         } else {
@@ -965,7 +983,7 @@ fn census(
             .flat_map(|children| children.split_whitespace())
         {
             let child: libc::pid_t = child.parse().expect("child pid");
-            let start = start_time(child).ok_or_else(|| "unreadable".to_owned());
+            let start = start_time(child);
             let pid = u32::try_from(child).expect("pid");
             parents.push(child);
             if let Ok(start) = start
