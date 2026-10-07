@@ -1,5 +1,6 @@
 import { expect, it, onTestFinished } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, watch } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
@@ -106,9 +107,15 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
           },
         }),
       );
+      const ready = Promise.withResolvers<void>();
+      const readyWatcher = interrupt
+        ? watch(workspace, () => {
+            if (existsSync(join(workspace, 'ready'))) ready.resolve();
+          })
+        : undefined;
       const child = spawn(
         'bun',
-        [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--nx-bail=true', '--outputStyle=static'],
+        [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--parallel=2', '--nx-bail=true', '--outputStyle=static'],
         {
           cwd: workspace,
           env: fixtureNxEnv(workspace),
@@ -117,7 +124,6 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
         },
       );
       let output = '';
-      const ready = Promise.withResolvers<void>();
       const ended = Promise.withResolvers<number | null>();
       child.once('error', (error) => {
         if (interrupt) ready.reject(error);
@@ -126,13 +132,13 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
       child.once('close', ended.resolve);
       child.stdout.setEncoding('utf8').on('data', (text: string) => {
         output += text;
-        if (output.includes('nx-interrupt-ready')) ready.resolve();
       });
       child.stderr.setEncoding('utf8').on('data', (text: string) => {
         output += text;
       });
       const describe = () => `pid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`;
       const retire = async () => {
+        readyWatcher?.close();
         if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
           try {
             process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
