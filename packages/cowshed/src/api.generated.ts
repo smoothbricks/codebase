@@ -42,7 +42,7 @@ export type AdmissionKey = string &
     kind: 'utf8Bytes';
     target: 'string';
     value: 4096;
-    validate: 'new TextEncoder().encode($input).byteLength <= 4096';
+    validate: '(() => { let bytes = 0; for (let index = 0; index < $input.length; index += 1) { const code = $input.charCodeAt(index); if (code < 0x80) bytes += 1; else if (code < 0x800) bytes += 2; else if (code >= 0xd800 && code <= 0xdbff && index + 1 < $input.length) { const low = $input.charCodeAt(index + 1); if (low >= 0xdc00 && low <= 0xdfff) { bytes += 4; index += 1; } else bytes += 3; } else bytes += 3; if (bytes > 4096) return false; } return true; })()';
   }>;
 
 export type AdmissionKeyRequest = {

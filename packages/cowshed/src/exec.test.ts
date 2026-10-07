@@ -42,7 +42,7 @@ describe('exec', () => {
   it('refuses a field the request does not declare without sending it', async () => {
     const { worker, sent } = recordingWorker();
     // An untyped caller, as plain JavaScript passes it.
-    const request = JSON.parse('{"argv":["build"],"admissionKey":"k"}');
+    const request = JSON.parse('{"argv":["build"],"undeclaredField":"k"}');
     await expect(exec(worker, null, request)).rejects.toThrow();
     expect(sent).toEqual([]);
   });

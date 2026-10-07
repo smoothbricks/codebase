@@ -64,6 +64,28 @@ const assertCorpus = typia.createAssert<Record<string, Record<string, unknown>>>
 const corpus = assertCorpus(JSON.parse(readFileSync(new URL('./wire-fixtures.json', import.meta.url), 'utf8')));
 
 describe('napi wire contract', () => {
+  it('checks admission keys by UTF-8 bytes without allocating an encoder', () => {
+    const Encoder = globalThis.TextEncoder;
+    let encoders = 0;
+    class CountedEncoder extends Encoder {
+      constructor() {
+        super();
+        encoders += 1;
+      }
+    }
+    globalThis.TextEncoder = CountedEncoder;
+    try {
+      for (const key of ['a'.repeat(4096), 'é'.repeat(2048), `${'€'.repeat(1365)}a`, '😀'.repeat(1024)]) {
+        expect(validators.assertAdmissionKey(key)).toBe(key);
+        expect(() => validators.assertAdmissionKey(`${key}a`)).toThrow();
+      }
+      expect(() => validators.assertAdmissionKey('')).toThrow();
+    } finally {
+      globalThis.TextEncoder = Encoder;
+    }
+    expect(encoders).toBe(0);
+  });
+
   it('has a corpus and a validator for exactly the same seam types', () => {
     // A name on one side only is drift by itself: a new Rust DTO with no TypeScript validator, or
     // a validator whose corpus was deleted. Either way nothing is being witnessed.
