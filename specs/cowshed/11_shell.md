@@ -421,7 +421,8 @@ PID and job; absence of blocker evidence never means `none`. No shell flavor or 
 for these observations.
 
 The supervisor emits one `process.run` span per process under the job's trace, with parentage following the process tree
-and birth/exit as its boundaries. Changed-state rows and coarse heartbeat rows use the fixed shared columns in
+and birth/exit as its boundaries. Each unchanged live process has one heartbeat a minute, independent of any API
+sampling/subscriber interval; changed-state and terminal rows are immediate. These rows use the fixed shared columns in
 13_telemetry.md; job-level host load and volume deltas stay on the job span. There is no per-process, per-metric, or
 per-sample column proliferation, and no JSON string payload.
 

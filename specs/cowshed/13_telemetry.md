@@ -101,7 +101,8 @@ Every process span and its rows share exactly this small fixed custom column set
 | `blocked_holder_pid` | `u32`        | Evidence-backed lock-holder PID, when known.                           |
 
 Samples become log rows only on a state/blocker transition, an RSS crossing of a 2× step, or a busy/idle CPU flip, plus
-one coarse heartbeat row per progress tick. A row sets only the columns that changed; unchanged columns are null, not
+one heartbeat row a minute for each unchanged live process. API sampling/subscriber intervals do not set this cadence;
+changed-state and terminal rows are immediate. A row sets only the columns that changed; unchanged columns are null, not
 repeated payload. The terminal row carries the final usage and exact exit. A blocker transition with no other changed
 value still creates a row. Program changes at exec use `proc_program`; argv remains a single start-row display, while
 the typed process event retains the exact command arguments. Display escaping is deterministic and does not turn
