@@ -16,12 +16,11 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionKey,
-    BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
-    JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits, OutputLimitInfo,
-    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest,
-    StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp,
-    WorkspacePath,
+    AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId,
+    JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits,
+    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob,
+    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
+    UtcTimestamp, WorkspacePath,
 };
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result};

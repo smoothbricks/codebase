@@ -6099,9 +6099,8 @@ mod tests {
 
     /// Each volume's usage is kept as it was sampled, read or not; a job that ran with no build
     /// volume keeps none, and a volume's usage beside no sample, a sample without its workspace
-    /// volume, or a volume column that holds no usage, is damage. The volume columns are the
-    /// layout's tail, after layout 6's last column, so a layout-6 reader meets layout 7 as a newer
-    /// writer's (11_shell.md: layouts grow only by trailing columns).
+    /// volume, or a volume column that holds no usage, is damage. The volume columns follow
+    /// layout 6's last column in layout 7, and keyed admission follows them in layout 8.
     #[test]
     fn the_current_layout_keeps_each_volumes_usage_and_only_a_sampled_build_volume() {
         let schema = protected_record_schema();
@@ -6111,9 +6110,12 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect();
         assert_eq!(
-            (names[VOLUME_COLUMN - 1], &names[VOLUME_COLUMN..]),
+            (
+                names[VOLUME_COLUMN - 1],
+                &names[VOLUME_COLUMN..VOLUME_COLUMN + VOLUME_COLUMNS.len()],
+            ),
             ("resources_accounting_io_write_bytes", &VOLUME_COLUMNS[..]),
-            "layout 7 appends the volumes after layout 6's last column, and nothing else"
+            "volume usage keeps its exact layout-7 interval after the accounting columns"
         );
         use crate::api::resources::VolumeUnavailable;
         let mut no_build = sample(9, 1, 1);
@@ -6650,6 +6652,73 @@ mod tests {
             }),
             stderr_copy: None,
         }
+    }
+
+    #[test]
+    fn layout_eight_appends_admission_after_the_complete_layout_seven_prefix() {
+        let record = JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            resources: Some(sample(9, 1_234_567, 4242)),
+            admission: Some(JobAdmission {
+                session: AdmittedSession::Unnamed(Uuid::from_bytes([7; 16])),
+                ..keyed(
+                    "op-layout-eight",
+                    AdmittedStdin::Inline {
+                        sha256: Sha256Digest::compute(b"payload"),
+                        bytes: 7,
+                    },
+                )
+            }),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        let schema = batch.schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(RECORD_SCHEMA_VERSION, 8);
+        assert_eq!(FIRST_KEYED_LAYOUT, 8);
+        assert_eq!(ADMISSION_COLUMN, 59);
+        assert_eq!(names[ADMISSION_COLUMN - 1], "resources_volume_build");
+        assert_eq!(
+            &names[ADMISSION_COLUMN..],
+            &[
+                "admission_key",
+                "admission_cwd",
+                "admission_mode",
+                "admission_env",
+                "admission_stdin",
+                "admission_stdin_path",
+                "admission_stdin_sha256",
+                "admission_stdin_bytes",
+                "admission_session",
+                "admission_session_name",
+                "admission_stdout_copy_path",
+                "admission_stdout_copy_policy",
+                "admission_stderr_copy_path",
+                "admission_stderr_copy_policy",
+            ],
+        );
+        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
+            panic!("a job record");
+        };
+        assert_eq!(
+            read, record,
+            "accounting, volumes and admission survive together"
+        );
+
+        let prefix_schema = Arc::new(Schema::new(schema.fields()[..ADMISSION_COLUMN].to_vec()));
+        let mut prefix_columns = batch.columns()[..ADMISSION_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![7]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(7),
+            "layout 7 remains the exact prefix"
+        );
     }
 
     fn argv_true() -> ExecCommand {

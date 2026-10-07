@@ -30,8 +30,7 @@ use super::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
-    AdmissionKey,
-    CommandArg, ExecCommand, ExecRequest, JobId, JobJournalCursor, JobTailLimits,
+    AdmissionKey, CommandArg, ExecCommand, ExecRequest, JobId, JobJournalCursor, JobTailLimits,
     OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest, StdinSource, TraceContext,
     WorkspacePath,
 };
