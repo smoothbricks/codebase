@@ -2,6 +2,7 @@ pub mod call;
 pub mod capability;
 pub mod dto;
 pub(crate) mod frame;
+pub mod journal_tail;
 pub mod operations;
 pub(crate) mod peer_credentials;
 pub mod process;

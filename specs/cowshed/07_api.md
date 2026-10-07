@@ -799,6 +799,13 @@ snapshot before either stream is read. Offsets remain representation-transparent
 cursor beyond admitted bytes is a typed usage error. `attach(cursor)` resumes each stream at its supplied offset;
 omission means byte zero. It never starts a process.
 
+Rust artifact readers reuse `api::journal_tail::tail_journals` with typed `JobStream` range reads, without opening a
+controller. The public pure core is the same implementation the live and sealed controller tails use; readers must
+return each requested range exactly. Consumers requiring whole lines use `WholeLineWindow` over that same cursor/range
+plan: at most one boundary byte accompanies the bounded window, live trailing partial lines are withheld, and ended
+unterminated lines are complete. An over-long line advances by the byte bound. This opt-in cut does not change the raw
+controller tail or its wire contract.
+
 All monitoring methods retain the immutable repo/workspace/incarnation fence of the `JobHandle`. The same handle exposes
 `kill()` for explicit complete-group cancellation; a monitoring executor maps its own operation key to this exact job
 before calling it. Disconnecting a reader, detaching an attachment, or reaching a soft deadline never kills the job.

@@ -22,6 +22,7 @@ use crate::api::dto::{
     Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
     UtcTimestamp, WorkspacePath,
 };
+use crate::api::journal_tail::tail_journals;
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, SampleInterval};
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result};
 use crate::exec::{
@@ -4298,8 +4299,8 @@ impl SupervisorActor {
         let (stdout, stderr) = match self.job_mut(job_id) {
             Ok(job) if !job.sealed() => {
                 let lengths = (job.stdout_tally.bytes(), job.stderr_tally.bytes());
-                let _ = reply.send(job_tail(cursor, limits, lengths, |stream, range| {
-                    read_live_range(job.stream(stream).0, range)
+                let _ = reply.send(tail_journals(cursor, limits, lengths, |stream, range| {
+                    read_live_range(job.stream(stream.into()).0, range)
                 }));
                 return;
             }
@@ -4953,153 +4954,6 @@ fn read_live_range(chunks: &VecDeque<Bytes>, range: Range<u64>) -> Result<Vec<u8
     Ok(output)
 }
 
-/// Where one stream's slice of a tail sits.
-#[derive(Clone, Copy, Debug)]
-enum TailAnchor {
-    /// The start of what was admitted after this many bytes.
-    After(u64),
-    /// The end of what was admitted.
-    End,
-}
-
-/// One stream's tail before it is read: the admitted window to read, and where it sits.
-struct TailWindow {
-    anchor: TailAnchor,
-    len: u64,
-    range: Range<u64>,
-}
-
-impl TailWindow {
-    /// The window of at most `max` admitted bytes a tail of `stream` reads: after the anchor's
-    /// cursor, or ending at the stream's `len` admitted bytes. A cursor past them is a usage
-    /// error.
-    fn new(stream: StreamKind, len: u64, anchor: TailAnchor, max: u64) -> Result<Self> {
-        let range = match anchor {
-            TailAnchor::After(cursor) if cursor > len => {
-                let name = match stream {
-                    StreamKind::Stdout => "stdout",
-                    StreamKind::Stderr => "stderr",
-                };
-                return Err(CowshedError::usage(
-                    format!("tail cursor {cursor} is past the {len} admitted {name} bytes"),
-                    "resume from a cursor a tail of this job returned",
-                ));
-            }
-            TailAnchor::After(cursor) => cursor..len.min(cursor.saturating_add(max)),
-            TailAnchor::End => len.saturating_sub(max)..len,
-        };
-        Ok(Self { anchor, len, range })
-    }
-
-    /// The window's `bytes` cut to `lines` lines: the first ones after a cursor, the last ones
-    /// at the end. Lines cut the byte window, so the slice never exceeds the byte limit.
-    fn cut(self, mut bytes: Vec<u8>, lines: u32) -> StreamTail {
-        match self.anchor {
-            TailAnchor::After(cursor) => {
-                bytes.truncate(first_lines_len(&bytes, lines));
-                let next = cursor + byte_count(bytes.len());
-                StreamTail {
-                    bytes,
-                    next,
-                    truncated: next < self.len,
-                }
-            }
-            TailAnchor::End => {
-                let skip = last_lines_start(&bytes, lines);
-                bytes.drain(..skip);
-                StreamTail {
-                    bytes,
-                    next: self.len,
-                    truncated: self.range.start + byte_count(skip) > 0,
-                }
-            }
-        }
-    }
-}
-
-/// One stream's slice of a tail.
-struct StreamTail {
-    bytes: Vec<u8>,
-    next: u64,
-    truncated: bool,
-}
-
-/// A tail of both streams, whose admitted lengths are `lengths` and whose admitted bytes `read`
-/// returns exactly, by range. Both cursors are checked before either stream is read, so a
-/// refused tail reads nothing; the two streams are then cut independently under the same limits.
-fn job_tail(
-    cursor: Option<JobJournalCursor>,
-    limits: JobTailLimits,
-    lengths: (u64, u64),
-    mut read: impl FnMut(StreamKind, Range<u64>) -> Result<Vec<u8>>,
-) -> Result<JobTail> {
-    let max = u64::from(limits.bytes_per_stream.get());
-    let lines = limits.lines_per_stream.get();
-    let anchor = |position: Option<u64>| position.map_or(TailAnchor::End, TailAnchor::After);
-    let stdout = TailWindow::new(
-        StreamKind::Stdout,
-        lengths.0,
-        anchor(cursor.map(|cursor| cursor.stdout)),
-        max,
-    )?;
-    let stderr = TailWindow::new(
-        StreamKind::Stderr,
-        lengths.1,
-        anchor(cursor.map(|cursor| cursor.stderr)),
-        max,
-    )?;
-    let stdout_bytes = read(StreamKind::Stdout, stdout.range.clone())?;
-    let stderr_bytes = read(StreamKind::Stderr, stderr.range.clone())?;
-    let stdout = stdout.cut(stdout_bytes, lines);
-    let stderr = stderr.cut(stderr_bytes, lines);
-    let data = |bytes: Vec<u8>| {
-        BinaryData::new(bytes)
-            .map_err(|error| CowshedError::internal(format!("tail slice is unbounded: {error}")))
-    };
-    Ok(JobTail {
-        next: JobJournalCursor {
-            stdout: stdout.next,
-            stderr: stderr.next,
-        },
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
-        stdout: data(stdout.bytes)?,
-        stderr: data(stderr.bytes)?,
-    })
-}
-
-/// The length of the first `lines` lines of `bytes`; all of it when it holds no more.
-fn first_lines_len(bytes: &[u8], lines: u32) -> usize {
-    let mut seen = 0_u32;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            seen += 1;
-            if seen == lines {
-                return index + 1;
-            }
-        }
-    }
-    bytes.len()
-}
-
-/// Where the last `lines` lines of `bytes` start; zero when it holds no more. A newline followed
-/// by more bytes starts a line, so a trailing newline ends the last line and starts none.
-fn last_lines_start(bytes: &[u8], lines: u32) -> usize {
-    let Some((_, body)) = bytes.split_last() else {
-        return 0;
-    };
-    let mut seen = 0_u32;
-    for (index, byte) in body.iter().enumerate().rev() {
-        if *byte == b'\n' {
-            seen += 1;
-            if seen == lines {
-                return index + 1;
-            }
-        }
-    }
-    0
-}
-
 /// A tail of a sealed job, read out of the artifact store.
 fn sealed_tail(
     workspace_root: &Path,
@@ -5108,14 +4962,14 @@ fn sealed_tail(
     cursor: Option<JobJournalCursor>,
     limits: JobTailLimits,
 ) -> Result<JobTail> {
-    job_tail(
+    tail_journals(
         cursor,
         limits,
         (stdout.bytes, stderr.bytes),
         |stream, range| {
             let info = match stream {
-                StreamKind::Stdout => stdout,
-                StreamKind::Stderr => stderr,
+                crate::api::JobStream::Stdout => stdout,
+                crate::api::JobStream::Stderr => stderr,
             };
             read_sealed_range(workspace_root, info, range)
         },
@@ -7140,114 +6994,11 @@ mod process_death_tests {
 #[cfg(test)]
 mod tail_tests {
     use super::*;
-    use crate::api::dto::JobTailBytes;
-    use std::num::NonZeroU32;
-
-    fn limits(bytes: u32, lines: u32) -> JobTailLimits {
-        JobTailLimits {
-            bytes_per_stream: JobTailBytes::new(bytes).unwrap(),
-            lines_per_stream: NonZeroU32::new(lines).unwrap(),
-        }
-    }
-
-    /// `journal`'s slice under `anchor` and `limits`, as `(bytes, next, truncated)`.
-    fn slice(journal: &[u8], anchor: TailAnchor, limits: JobTailLimits) -> (Vec<u8>, u64, bool) {
-        let window = TailWindow::new(
-            StreamKind::Stdout,
-            byte_count(journal.len()),
-            anchor,
-            u64::from(limits.bytes_per_stream.get()),
-        )
-        .unwrap();
-        let start = usize::try_from(window.range.start).unwrap();
-        let end = usize::try_from(window.range.end).unwrap();
-        let tail = window.cut(journal[start..end].to_vec(), limits.lines_per_stream.get());
-        (tail.bytes, tail.next, tail.truncated)
-    }
-
-    #[test]
-    fn the_latest_tail_keeps_the_last_lines_counting_an_unterminated_one() {
-        let wide = limits(64, 2);
-        assert_eq!(
-            slice(b"a\nb\nc", TailAnchor::End, wide),
-            (b"b\nc".to_vec(), 5, true)
-        );
-        assert_eq!(
-            slice(b"a\nb\nc\n", TailAnchor::End, wide),
-            (b"b\nc\n".to_vec(), 6, true)
-        );
-        assert_eq!(
-            slice(b"a\nb", TailAnchor::End, wide),
-            (b"a\nb".to_vec(), 3, false)
-        );
-        assert_eq!(slice(b"", TailAnchor::End, wide), (Vec::new(), 0, false));
-        assert_eq!(
-            slice(b"0123456789", TailAnchor::End, limits(4, 2)),
-            (b"6789".to_vec(), 10, true)
-        );
-    }
-
-    #[test]
-    fn a_tail_after_a_cursor_keeps_the_first_lines_and_names_what_follows() {
-        let journal = b"a\nb\nc";
-        assert_eq!(
-            slice(journal, TailAnchor::After(0), limits(64, 2)),
-            (b"a\nb\n".to_vec(), 4, true)
-        );
-        assert_eq!(
-            slice(journal, TailAnchor::After(4), limits(64, 2)),
-            (b"c".to_vec(), 5, false)
-        );
-        assert_eq!(
-            slice(journal, TailAnchor::After(5), limits(64, 2)),
-            (Vec::new(), 5, false)
-        );
-        assert_eq!(
-            slice(journal, TailAnchor::After(1), limits(2, 9)),
-            (b"\nb".to_vec(), 3, true)
-        );
-    }
-
-    #[test]
-    fn a_bad_second_cursor_is_refused_before_either_stream_is_read() {
-        let cursor = JobJournalCursor {
-            stdout: 0,
-            stderr: 6,
-        };
-        let error = job_tail(Some(cursor), limits(64, 1), (5, 5), |_, _| {
-            unreachable!("a refused tail reads no stream")
-        })
-        .err()
-        .unwrap();
-        assert_eq!(error.code, crate::error::ErrorCode::Usage);
-        assert!(error.message.contains("stderr"), "{}", error.message);
-    }
-
     #[test]
     fn retained_chunks_short_of_the_admitted_range_are_an_error_not_a_short_slice() {
         let chunks = VecDeque::from([Bytes::from_static(b"abc"), Bytes::from_static(b"de")]);
         assert_eq!(read_live_range(&chunks, 1..4).unwrap(), b"bcd");
         let error = read_live_range(&chunks, 3..8).err().unwrap();
         assert_eq!(error.code, crate::error::ErrorCode::Internal);
-    }
-
-    #[test]
-    fn a_cursor_past_the_admitted_bytes_is_a_usage_error() {
-        let error = TailWindow::new(StreamKind::Stderr, 5, TailAnchor::After(6), 64)
-            .err()
-            .unwrap();
-        assert_eq!(error.code, crate::error::ErrorCode::Usage);
-        assert!(error.message.contains("stderr"), "{}", error.message);
-    }
-
-    #[test]
-    fn tail_bytes_are_positive_and_at_most_one_inline_frame() {
-        assert!(JobTailBytes::new(0).is_err());
-        assert!(JobTailBytes::new(65_536).is_ok());
-        assert!(JobTailBytes::new(65_537).is_err());
-        assert!(
-            serde_json::from_str::<JobTailLimits>(r#"{"bytesPerStream":1,"linesPerStream":0}"#)
-                .is_err()
-        );
     }
 }
