@@ -25,12 +25,19 @@ use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseS
 use crate::apfs::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
 use crate::device::DISKUTIL;
 
-/// The class a disk tool draws on, read off its absolute program path; `None` for every program
-/// that is not a disk tool. Every `diskutil` verb is storage — they all queue on `storagekitd` —
-/// and so are `hdiutil` and `newfs_apfs`, which add and remove disks; `mount_apfs` and `umount`
-/// change the mount table. `fsck_apfs` reads a device and needs no lease.
-pub fn class_of(program: &Path) -> Option<DiskClass> {
+/// Classify disk-changing commands, not cosmetic labels. `diskutil renameVolume` changes
+/// neither the mount table nor st_dev; concurrent renames did not slow five attach or
+/// mount/unmount probes (05_gateway.md, "Disk-lifecycle lease"), so it takes no lease.
+/// Other `diskutil` verbs, `hdiutil` and `newfs_apfs` use storage; mount tools use namespace.
+pub fn class_of(program: &Path, args: &[impl AsRef<OsStr>]) -> Option<DiskClass> {
     let program = program.to_str()?;
+    if program == DISKUTIL
+        && args
+            .first()
+            .is_some_and(|argument| argument.as_ref() == "renameVolume")
+    {
+        return None;
+    }
     if [DISKUTIL, HDIUTIL, NEWFS_APFS].contains(&program) {
         Some(DiskClass::Storage)
     } else if [MOUNT_APFS, UMOUNT].contains(&program) {
@@ -48,7 +55,7 @@ pub fn leased<T, E: fmt::Display>(
     args: &[impl AsRef<OsStr>],
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    let Some(class) = class_of(program) else {
+    let Some(class) = class_of(program, args) else {
         return run();
     };
     if predates_recently() {
@@ -344,15 +351,46 @@ mod tests {
 
     #[test]
     fn programs_are_classed_by_what_they_change() {
+        let no_args: [&str; 0] = [];
         for program in [DISKUTIL, HDIUTIL, NEWFS_APFS] {
-            assert_eq!(class_of(Path::new(program)), Some(DiskClass::Storage));
+            assert_eq!(
+                class_of(Path::new(program), &no_args),
+                Some(DiskClass::Storage)
+            );
         }
         for program in [MOUNT_APFS, UMOUNT] {
-            assert_eq!(class_of(Path::new(program)), Some(DiskClass::Namespace));
+            assert_eq!(
+                class_of(Path::new(program), &no_args),
+                Some(DiskClass::Namespace)
+            );
         }
         for program in ["/sbin/fsck_apfs", "/bin/sh", "diskutil"] {
-            assert_eq!(class_of(Path::new(program)), None, "{program}");
+            assert_eq!(class_of(Path::new(program), &no_args), None, "{program}");
         }
+    }
+
+    #[test]
+    fn cosmetic_diskutil_renames_do_not_take_a_storage_or_namespace_lease() {
+        assert_eq!(
+            class_of(Path::new(DISKUTIL), &["renameVolume", "/volume", "label"]),
+            None
+        );
+        assert_eq!(
+            class_of(Path::new(DISKUTIL), &["image", "attach", "/image"]),
+            Some(DiskClass::Storage)
+        );
+        assert_eq!(
+            class_of(Path::new(HDIUTIL), &["renameVolume"]),
+            Some(DiskClass::Storage)
+        );
+        assert_eq!(
+            class_of(Path::new(DISKUTIL), &["renameVolumeOther"]),
+            Some(DiskClass::Storage)
+        );
+        assert_eq!(
+            class_of(Path::new(DISKUTIL), &["rename", "/volume", "label"]),
+            Some(DiskClass::Storage)
+        );
     }
 
     #[test]

@@ -337,17 +337,23 @@ or `cpu-tokens` request is held for as long as its client keeps the connection o
 
 ## Disk-lifecycle lease
 
-Every disk tool cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every test's —
-runs under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the command's
-class off its program and holds a lease of that class around the child, and the setup host's commands go through the
-same client. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that
-sync does not finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"): eight attach
-loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s, while keeping the two apart made 106 attaches
-at 0.94 s p50 and 1.78 s p95 under load 167–212. Attaches among themselves only queue on `storagekitd`; so the lease is
-two classes that exclude each other rather than N interchangeable tokens.
+Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every
+test's — run under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the
+command's class from its program and arguments and holds that lease around the child; setup uses the same client. An
+attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that sync does not
+finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"): eight attach loops beside two
+mount loops made 8 attaches in 42 s, each taking 41.7 s, while keeping the two apart made 106 attaches at 0.94 s p50 and
+1.78 s p95 under load 167–212. Attaches among themselves only queue on `storagekitd`; so the lease is two classes that
+exclude each other rather than N interchangeable tokens.
 
-- **Storage**: every `diskutil` verb, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`. Other
-  programs (`fsck_apfs`, IORegistry reads) take no lease.
+- **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
+  Read-only operations (`fsck_apfs`, IORegistry reads) and cosmetic `diskutil renameVolume` take no lease.
+- **A label does not change the disk lifecycle.** On a mounted scratch APFS volume, a rename kept the same mount-table
+  position (58/58) and st_dev (16777292). Five attach probes without renames took 0.648, 0.683, 0.953, 0.896 and 0.572
+  s; with 19 renames on another volume they took 1.056, 0.596, 0.461, 0.590 and 0.477 s. Five mount/unmount probes took
+  1.123, 0.862, 0.991, 0.928 and 0.889 s; with 13 concurrent renames, 0.841, 0.556, 0.450, 0.750 and 0.567 s. Renames
+  neither starved attaches nor delayed namespace work. A background cosmetic rename therefore must not hold either phase
+  and make an attach wait behind it.
 - Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
   and nobody waiting enters at once; an idle gateway starts a phase for it.
 - Once a member of the other class waits, the running phase admits nobody new, so a steady stream of one class cannot
