@@ -19,6 +19,7 @@
 //! never signalled, and the ledger that names it is kept, and reported, until nothing holds the
 //! id.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -577,6 +578,22 @@ pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
     ))
 }
 
+/// The local ports of the TCP sockets in `LISTEN` that the running processes of the job's group,
+/// which `leader` leads, hold now: IPv4 and IPv6 alike, each port once. The membership is
+/// [`job_members`]'s, and each member's sockets count only while that very process is shown
+/// still running after they were read ([`Process::listening_ports`]), so a pid reused meanwhile
+/// lends the job no listener. A member that exited holds none. A membership or socket table that
+/// cannot be read is an error, never an empty list.
+pub fn job_listening_ports(leader: &Birth) -> io::Result<BTreeSet<u16>> {
+    let mut ports = BTreeSet::new();
+    for member in job_members(leader)? {
+        if let Some(held) = member.listening_ports()? {
+            ports.extend(held);
+        }
+    }
+    Ok(ports)
+}
+
 /// Signal the group `pgid` leads. Only for the leader's parent, while it holds the leader
 /// unreaped -- running, or exited and not yet collected: until the parent reaps it, the leader's
 /// pid, and with it the group's id, names nothing else. A group with nothing left running in it
@@ -920,6 +937,19 @@ impl Process {
             Some(_) | None => Ok(None),
         }
     }
+
+    /// The ports of the TCP sockets this process listens on now; `None` once it has exited. The
+    /// read names only the pid, so this process's identity, read afterwards, judges it: still
+    /// carrying this process's version, it ran throughout and the read -- its answer or why it
+    /// failed -- was its own; gone, or another process's now, it holds nothing, whatever the
+    /// read met.
+    pub(super) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
+        let read = crate::process::listening_ports(self.pid);
+        match running_info(self.pid)? {
+            Some(info) if info.unique.id_version.cast_unsigned() == self.version => read.map(Some),
+            Some(_) | None => Ok(None),
+        }
+    }
 }
 
 /// A process's exit, watched from a moment it ran (`Process::watch_exit`). The kernel reports
@@ -1198,6 +1228,18 @@ impl Process {
         }
         read
     }
+
+    /// The ports of the TCP sockets this process listens on now; `None` once it has exited. The
+    /// pidfd, polled after the read, judges it: still running, this process's descriptors and
+    /// network tables were read -- or failed to be -- as its own; exited, it holds nothing,
+    /// whatever the read met. A missing table of a process still running is an error.
+    pub(super) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
+        let read = crate::process::listening_ports(self.pid);
+        if pidfd_exited(&self.handle)? {
+            return Ok(None);
+        }
+        read.map(Some)
+    }
 }
 
 /// Whether the process `handle` names has exited: a pidfd becomes readable when it does.
@@ -1314,6 +1356,7 @@ fn start_time(pid: i32) -> io::Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -1901,5 +1944,263 @@ mod tests {
             taken.unwrap();
             assert!(!ledger.exists(), "successful retry consumes the ledger");
         }
+    }
+
+    /// Set in the environment of this test binary run as a [`listener_fixture_role`].
+    const LISTENER_ROLE: &str = "COWSHED_LISTENER_FIXTURE";
+
+    /// Not a test of its own. Run as a process of a [`ListeningGroup`] with [`LISTENER_ROLE`]
+    /// set, it holds every kind of socket a port read must tell apart -- a dual-stack IPv6
+    /// listener and an IPv4 listener sharing its port, a second dual-stack listener, a TCP
+    /// socket bound but not listening, both ends of a connected TCP socket and a bound UDP
+    /// socket -- prints them as a [`Fixture`] line and waits to be killed.
+    ///
+    /// Every TCP port here is first taken on the dual-stack wildcard `[::]`, which holds it in
+    /// both families, so no other socket of this fixture, of another fixture or of the test
+    /// shares its number: a port named is named for exactly one socket. The IPv4 listener joins
+    /// its dual-stack twin's port through `SO_REUSEPORT`, which both set.
+    #[test]
+    fn listener_fixture_role() {
+        if std::env::var_os(LISTENER_ROLE).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("a runtime for the fixture's sockets");
+        let _entered = runtime.enter();
+        let wildcard = || std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
+        let shared = tokio::net::TcpSocket::new_v6().expect("dual-stack socket");
+        shared
+            .set_reuseport(true)
+            .expect("share the dual-stack port");
+        shared
+            .bind(wildcard())
+            .expect("bind the dual-stack listener");
+        let shared = shared.listen(8).expect("dual-stack listener");
+        let port = shared.local_addr().expect("dual-stack address").port();
+        let four = tokio::net::TcpSocket::new_v4().expect("IPv4 socket");
+        four.set_reuseport(true).expect("share the port");
+        four.bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )))
+        .expect("bind the IPv4 listener at the dual-stack port");
+        let _four = four.listen(8).expect("IPv4 listener");
+        let other = std::net::TcpListener::bind(wildcard()).expect("second dual-stack listener");
+        let bound = tokio::net::TcpSocket::new_v6().expect("TCP socket");
+        bound.bind(wildcard()).expect("bind without listening");
+        let client = tokio::net::TcpSocket::new_v6().expect("TCP client socket");
+        client.bind(wildcard()).expect("bind the client");
+        let connected = runtime
+            .block_on(client.connect(std::net::SocketAddr::from((
+                std::net::Ipv6Addr::LOCALHOST,
+                port,
+            ))))
+            .expect("connect")
+            .into_std()
+            .expect("the connected socket");
+        let _accepted = runtime.block_on(shared.accept()).expect("accept");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP socket");
+        println!(
+            "fixture {} {} {port} {} {} {} {}",
+            std::process::id(),
+            std::os::unix::process::parent_id(),
+            other.local_addr().expect("second listener address").port(),
+            bound.local_addr().expect("bound address").port(),
+            connected.local_addr().expect("connected address").port(),
+            udp.local_addr().expect("UDP address").port(),
+        );
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// What a [`listener_fixture_role`] holds, as it printed it.
+    #[derive(Debug)]
+    struct Fixture {
+        pid: u32,
+        parent: u32,
+        /// The port its dual-stack listener and its IPv4 listener share.
+        shared: u16,
+        /// The port of its second dual-stack listener.
+        other: u16,
+        /// The port of its TCP socket that is bound and does not listen.
+        bound: u16,
+        /// The local port of its connected TCP socket's client end.
+        connected: u16,
+    }
+
+    /// A job-shaped group whose grandchild is a [`listener_fixture_role`]: the leader `sh` runs a
+    /// child `sh`, which runs the fixture. Dropping it ends a group whose leader is still
+    /// unreaped.
+    struct ListeningGroup {
+        leader: std::process::Child,
+        _output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl Drop for ListeningGroup {
+        fn drop(&mut self) {
+            // A reaped leader no longer proves the group id the test's own.
+            if let Ok(None) = self.leader.try_wait() {
+                let pgid = i32::try_from(self.leader.id()).expect("owned child pid");
+                // SAFETY: this unreaped child leads the group this test spawned.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                let _ = self.leader.wait();
+            }
+        }
+    }
+
+    fn listening_group() -> (ListeningGroup, Fixture) {
+        use std::io::BufRead as _;
+
+        let mut leader = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#""$@" & wait"#,
+                "sh",
+                "/bin/sh",
+                "-c",
+                r#""$@" & wait"#,
+                "sh",
+            ])
+            .arg(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "runtime::job_groups::tests::listener_fixture_role",
+                "--nocapture",
+            ])
+            .env(LISTENER_ROLE, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn a listening group");
+        let mut output =
+            std::io::BufReader::new(leader.stdout.take().expect("the group's piped stdout"));
+        let mut line = String::new();
+        // The test harness prints its own lines first.
+        while !line.starts_with("fixture ") {
+            line.clear();
+            let read = output.read_line(&mut line).expect("the fixture's line");
+            assert_ne!(read, 0, "the fixture ended before it printed its sockets");
+        }
+        let fields: Vec<u32> = line
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.parse().expect("a number"))
+            .collect();
+        let port = |index: usize| u16::try_from(fields[index]).expect("a port");
+        let fixture = Fixture {
+            pid: fields[0],
+            parent: fields[1],
+            shared: port(2),
+            other: port(3),
+            bound: port(4),
+            connected: port(5),
+        };
+        (
+            ListeningGroup {
+                leader,
+                _output: output,
+            },
+            fixture,
+        )
+    }
+
+    /// A job's listening ports are the TCP listeners its group's processes hold -- a grandchild's
+    /// included, IPv4 and IPv6 alike, each port once -- and nothing else: not a bound or a
+    /// connected socket, not this test's own listener, not another job's. Once the job ended it
+    /// listens on nothing.
+    #[test]
+    fn a_job_s_listening_ports_are_its_group_s_tcp_listeners_and_none_once_it_ended() {
+        // Bound to the dual-stack wildcard, its port is no fixture listener's (see the fixture).
+        let host = std::net::TcpListener::bind("[::]:0").expect("host listener");
+        let unrelated = host.local_addr().expect("host listener address").port();
+        let (mut job, fixture) = listening_group();
+        let (other, other_fixture) = listening_group();
+        assert_ne!(
+            fixture.parent,
+            job.leader.id(),
+            "the fixture is the job's grandchild, not its child"
+        );
+
+        let birth = super::Birth::of(job.leader.id());
+        let ports = super::job_listening_ports(&birth).expect("the job's listeners");
+        assert_eq!(
+            ports,
+            BTreeSet::from([fixture.shared, fixture.other]),
+            "{fixture:?}"
+        );
+        for stranger in [
+            unrelated,
+            fixture.bound,
+            fixture.connected,
+            other_fixture.shared,
+            other_fixture.other,
+        ] {
+            assert!(!ports.contains(&stranger), "{stranger} in {ports:?}");
+        }
+        assert_eq!(
+            super::job_listening_ports(&super::Birth::of(other.leader.id()))
+                .expect("the other job's listeners"),
+            BTreeSet::from([other_fixture.shared, other_fixture.other])
+        );
+
+        // SAFETY: plain kill of the test's own grandchild, which is still running.
+        let fixture_pid = i32::try_from(fixture.pid).expect("fixture pid");
+        assert_eq!(unsafe { libc::kill(fixture_pid, libc::SIGKILL) }, 0);
+        // The child `sh` ends once the fixture did, and the leader once the child did.
+        super::await_exit_unreaped(i32::try_from(job.leader.id()).expect("leader pid"))
+            .expect("leader exit");
+        assert_eq!(
+            super::job_listening_ports(&birth).expect("an exited, unreaped leader's group"),
+            BTreeSet::new()
+        );
+        job.leader.wait().expect("reap the leader");
+        assert_eq!(
+            super::job_listening_ports(&birth).expect("an id nothing holds"),
+            BTreeSet::new()
+        );
+    }
+
+    /// A member's listeners are read while it runs; once it exited it holds none, and that is no
+    /// error. Its group's other processes hold none at all.
+    #[test]
+    fn a_member_s_listeners_are_read_while_it_runs_and_none_once_it_exited() {
+        let (job, fixture) = listening_group();
+        let members = super::job_members(&super::Birth::of(job.leader.id())).expect("members");
+        assert_eq!(members.len(), 3, "the leader, its child and the fixture");
+        let fixture_pid = i32::try_from(fixture.pid).expect("fixture pid");
+        for member in &members {
+            let expected = if member.pid() == fixture_pid {
+                BTreeSet::from([fixture.shared, fixture.other])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(
+                member
+                    .listening_ports()
+                    .expect("a running member's sockets"),
+                Some(expected),
+                "process {}",
+                member.pid()
+            );
+        }
+        let listener = members
+            .iter()
+            .find(|member| member.pid() == fixture_pid)
+            .expect("the fixture is a member");
+        let exited = listener.watch_exit().expect("watch the fixture");
+        // SAFETY: plain kill of the test's own grandchild, which is still running.
+        assert_eq!(unsafe { libc::kill(fixture_pid, libc::SIGKILL) }, 0);
+        exited.wait().expect("the fixture exits");
+        assert_eq!(
+            listener
+                .listening_ports()
+                .expect("an exited member is no error"),
+            None
+        );
+        drop(job);
     }
 }
