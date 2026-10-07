@@ -977,6 +977,13 @@ storage I/O. Descendants born and reaped between polls still contribute. Cgroup 
 migrating a process after it ran is not complete accounting. These totals reach the controller and N-API through the
 same declaration as process events.
 
+The implemented Linux authority and CPU reader are proven by native fixtures in a sudo-delegated CI scope. Placement is
+a controller-owned API: no request field, environment variable or workload action selects the cgroup through that API.
+This is accounting separation, not an adversarial sandbox boundary. A workload running as the controller's UID can still
+open a writable sibling `cgroup.procs` and migrate itself; denying that access remains a stated Linux sandbox gap. The
+real-workspace admission, restart lookup and retirement proof remains blocked on a Linux execution substrate. No
+production spawn-path hook is installed before a Linux `SpawnSink` exists.
+
 Charged-memory current/peak is separate from `rssBytes`/`rssPeakBytes`: cgroup memory includes anonymous memory,
 file/page cache and kernel charges. It is never relabeled as RSS. Named resource types above have private fields,
 checked constructors and checked unit conversions, while their generated wire projection preserves the numeric
