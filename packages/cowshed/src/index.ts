@@ -7,6 +7,7 @@ import {
   type EventIterator,
   loadNativeModule,
   type NativeCoordinatorHandle,
+  type NativeJobAttachmentHandle,
   type NativeJobHandle,
   type NativeProjectHandle,
   type NativeWorkspaceHandle,
@@ -17,6 +18,8 @@ import {
   type CoordinatorEndpoint,
   CowshedError,
   type ExecRequest,
+  type JobAttachment,
+  type JobAttachOptions,
   type JobHandle,
   type JobLogs,
   type LandOptions,
@@ -52,6 +55,7 @@ function normalizeNativeError(error: unknown): unknown {
   return new CowshedError(error.code, error.message, error.hint, {
     cause: error,
     admission: error.admission,
+    stdin: error.stdin,
   });
 }
 
@@ -358,6 +362,10 @@ class JobHandleImpl implements JobHandle {
     return callNativeAsync(() => N.jobTail(this.#native, { cursor, limits }));
   }
 
+  async attach(options?: JobAttachOptions): Promise<JobAttachment> {
+    return new JobAttachmentImpl(await callNativeAsync(() => N.jobHandleAttach(this.#native, options?.cursor)));
+  }
+
   async detach(): Promise<void> {
     await callNativeAsync(() => N.jobDetach(this.#native, {}));
   }
@@ -368,6 +376,26 @@ class JobHandleImpl implements JobHandle {
 
   async kill(): Promise<void> {
     await callNativeAsync(() => N.jobKill(this.#native, {}));
+  }
+}
+
+class JobAttachmentImpl implements JobAttachment {
+  readonly #native: NativeJobAttachmentHandle;
+
+  constructor(nativeAttachment: NativeJobAttachmentHandle) {
+    this.#native = nativeAttachment;
+  }
+
+  async write(chunk: Uint8Array): Promise<void> {
+    await callNativeAsync(() => N.jobAttachmentWrite(this.#native, chunk));
+  }
+
+  async end(): Promise<void> {
+    await callNativeAsync(() => N.jobAttachmentEnd(this.#native));
+  }
+
+  async detach(): Promise<void> {
+    await callNativeAsync(() => N.jobAttachmentDetach(this.#native));
   }
 }
 

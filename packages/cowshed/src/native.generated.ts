@@ -90,6 +90,7 @@ export interface NativeJobHandleOperations
     NativeJobListeningPorts,
     NativeJobProgress,
     NativeJobAttachWrite,
+    NativeJobAttachClose,
     NativeJobDetach,
     NativeJobWait,
     NativeJobKill {}
@@ -559,16 +560,35 @@ export async function coordinatorWorker(
   return handle.worker(JSON.stringify(args));
 }
 
+/** A handle that serves `job.attachClose`. */
+export interface NativeJobAttachClose {
+  attachClose(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `job.attachClose` caller names; its handle binds the rest. */
+export type JobAttachCloseArguments = Readonly<Record<string, never>>;
+
+/**
+ * Ends an attached job's stdin: one EOF however often it is called; the job continues.
+ */
+export async function jobAttachClose(
+  handle: NativeJobAttachClose,
+  args: JobAttachCloseArguments,
+): Promise<Api.EmptyResult> {
+  return V.parseEmptyResult(await handle.attachClose(JSON.stringify(args)));
+}
+
 /** A handle that serves `job.attachWrite`. */
 export interface NativeJobAttachWrite {
   attachWrite(argumentsJson: string, bytes?: Buffer): Promise<string>;
 }
 
 /** The request fields a `job.attachWrite` caller names; its handle binds the rest. */
-export type JobAttachWriteArguments = Readonly<Record<string, never>>;
+export type JobAttachWriteArguments = Pick<Api.StdinWriteRequest, 'offset'>;
 
 /**
- * Writes to an attached job's stdin.
+ * Writes to an attached job's stdin at its byte offset, answered once the bytes reached the
+ * job's stdin pipe.
  */
 export async function jobAttachWrite(
   handle: NativeJobAttachWrite,
@@ -958,10 +978,10 @@ export interface NativeWorkerStdinChunk {
 }
 
 /** The request fields a `worker.stdinChunk` caller names; its handle binds the rest. */
-export type WorkerStdinChunkArguments = Pick<Api.JobRequest, 'jobId'>;
+export type WorkerStdinChunkArguments = Pick<Api.StdinWriteRequest, 'jobId' | 'offset'>;
 
 /**
- * Writes one chunk of a streamed stdin.
+ * Writes one chunk of a streamed stdin at its byte offset.
  */
 export async function workerStdinChunk(
   handle: NativeWorkerStdinChunk,
@@ -1064,4 +1084,35 @@ export async function workspaceInfo(
   args: WorkspaceInfoArguments,
 ): Promise<Api.WorkspaceInfo> {
   return V.parseWorkspaceInfo(await handle.info(JSON.stringify(args)));
+}
+
+/** Handle-local methods declared by the core capability. */
+export interface NativeJobAttachmentCapabilities {
+  write(bytes: Buffer): Promise<void>;
+  end(): Promise<void>;
+  detach(): Promise<void>;
+}
+
+export async function jobAttachmentWrite(handle: NativeJobAttachmentCapabilities, bytes: Uint8Array): Promise<void> {
+  return handle.write(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+}
+
+export async function jobAttachmentEnd(handle: NativeJobAttachmentCapabilities): Promise<void> {
+  return handle.end();
+}
+
+export async function jobAttachmentDetach(handle: NativeJobAttachmentCapabilities): Promise<void> {
+  return handle.detach();
+}
+
+/** Handle-local methods declared by the core capability. */
+export interface NativeJobHandleCapabilities {
+  attach(cursorJson?: string): Promise<NativeJobAttachmentHandle>;
+}
+
+export async function jobHandleAttach(
+  handle: NativeJobHandleCapabilities,
+  cursor?: Api.JobJournalCursor,
+): Promise<NativeJobAttachmentHandle> {
+  return handle.attach(cursor === undefined ? undefined : JSON.stringify(cursor));
 }

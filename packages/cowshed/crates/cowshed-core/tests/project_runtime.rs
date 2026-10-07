@@ -1272,11 +1272,17 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
         offset: u64,
         bytes: Bytes,
     ) -> Result<JobAnswer<()>> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = self.supervisors.get(&workspace) {
+            let supervisor = supervisor.clone();
+            return Ok(Box::pin(async move {
+                supervisor.stdin_write(job, offset, bytes).await
+            }));
+        }
         let gate = self.stdin_gate.clone();
         let events = self.events.clone();
         Ok(Box::pin(async move {
@@ -1292,9 +1298,13 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
     ) -> Result<JobAnswer<()>> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = self.supervisors.get(&workspace) {
+            let supervisor = supervisor.clone();
+            return Ok(Box::pin(async move { supervisor.stdin_close(job).await }));
+        }
         self.events.send(Event::StdinClose).ok();
         Ok(Box::pin(async { Ok(()) }))
     }
@@ -1897,8 +1907,8 @@ impl RunningProcess for ScriptedProcess {
         Ok(true)
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
-        Ok(())
+    fn close_stdin(&mut self) -> bool {
+        true
     }
 
     fn end_stdin(&mut self) {}
@@ -3108,6 +3118,170 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
     );
 }
 
+/// The backend half of attachment stdin: an actual sandboxed child echoes a line before EOF,
+/// stops reading at a FIFO barrier, then echoes 4 MiB of binary input. A pipe write held behind
+/// already delivered bytes is not acknowledged or counted until the child starts reading again.
+/// EOF and detach leave the child running at a second FIFO barrier, and two closes end one pipe.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe_bytes() {
+    use cowshed_core::fork_lock::Run as _;
+    use std::io::Write as _;
+    use std::task::Poll;
+
+    const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+    const PREFIX_BYTES: usize = 16 * 1024;
+    const FRAME_BYTES: usize = 64 * 1024;
+    let root = test_root();
+    let supervisor = system_supervisor(&root);
+    let jobs = SupervisedJobs::connect(&root, supervisor.clone()).await;
+    let workspace = root.join("workspace");
+    for name in ["read-gate", "finish-gate"] {
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(workspace.join(name))
+            .status_locked()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {name}");
+    }
+    let job = jobs
+        .worker
+        .exec(ExecRequest {
+            command: ExecCommand::Argv(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "printf 'ready\\n'; IFS= read -r line; printf '%s\\n' \"$line\"; \
+                     IFS= read -r go < read-gate; /bin/cat; printf 'eof\\n' >&2; \
+                     IFS= read -r done < finish-gate",
+                ]
+                .into_iter()
+                .map(CommandArg::from)
+                .collect(),
+            ),
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Open,
+            stdout_copy: None,
+            stderr_copy: None,
+        })
+        .await
+        .expect("open exec");
+    assert_eq!(
+        until_admitted(&job, JobStream::Stdout, 0, 6).await,
+        b"ready\n"
+    );
+    let (stdin, stdout, stderr) = job.attach(None).await.expect("attach").into_parts();
+    drop((stdout, stderr));
+    stdin
+        .write(Bytes::from_static(b"line\n"))
+        .await
+        .expect("line write");
+    assert_eq!(
+        until_admitted(&job, JobStream::Stdout, 6, 11).await,
+        b"line\n"
+    );
+    let payload = Bytes::from(
+        (0..PAYLOAD_BYTES)
+            .map(|index| u8::try_from(index % 256).expect("byte"))
+            .collect::<Vec<_>>(),
+    );
+    stdin
+        .write(payload.slice(..PREFIX_BYTES))
+        .await
+        .expect("the pipe takes its prefix while the child waits");
+    let delivered = u64::try_from(5 + PREFIX_BYTES).expect("cursor");
+    assert_eq!(job.status().await.expect("status").stdin.bytes, delivered);
+
+    let mut held = Box::pin(supervisor.stdin_write(
+        job.id(),
+        delivered,
+        payload.slice(PREFIX_BYTES..PREFIX_BYTES + FRAME_BYTES),
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(
+            held.as_mut().poll(cx).is_pending(),
+            "write waits for the pipe"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    // Commands to this supervisor are ordered: the status follows admission of the held write.
+    assert_eq!(
+        supervisor
+            .info(job.id())
+            .await
+            .expect("held status")
+            .stdin
+            .bytes,
+        delivered,
+        "admitting bytes into the lane does not claim they reached the pipe"
+    );
+    std::future::poll_fn(|cx| {
+        assert!(
+            held.as_mut().poll(cx).is_pending(),
+            "no acknowledgement before delivery"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    let release = |name: &'static str| {
+        let path = workspace.join(name);
+        tokio::task::spawn_blocking(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open child barrier");
+            fifo.write_all(b"go\n").expect("release child");
+        })
+    };
+    release("read-gate").await.expect("read barrier task");
+    held.await
+        .expect("the write reaches the pipe after release");
+    let (stdin, stdout, stderr) = job.attach(None).await.expect("resume input").into_parts();
+    drop((stdout, stderr));
+    stdin
+        .write(payload.slice(PREFIX_BYTES + FRAME_BYTES..))
+        .await
+        .expect("bounded binary writes");
+    stdin.close().await.expect("EOF");
+    stdin.close().await.expect("idempotent EOF");
+    let output_end = u64::try_from(11 + PAYLOAD_BYTES).expect("output cursor");
+    assert_eq!(
+        until_admitted(&job, JobStream::Stdout, 11, output_end).await,
+        payload.as_ref()
+    );
+    assert_eq!(
+        until_admitted(&job, JobStream::Stderr, 0, 4).await,
+        b"eof\n"
+    );
+    let final_cursor = u64::try_from(5 + PAYLOAD_BYTES).expect("input cursor");
+    let refused = stdin
+        .write(Bytes::from_static(b"late"))
+        .await
+        .expect_err("write after EOF");
+    assert_eq!(
+        refused.stdin_source(),
+        Some(cowshed_core::StdinRefusal::Ended {
+            cursor: final_cursor
+        })
+    );
+    job.detach().await.expect("detach");
+    assert_eq!(
+        job.status().await.expect("detached status").state,
+        JobState::Running
+    );
+    release("finish-gate").await.expect("finish barrier task");
+    let ended = job.wait().await.expect("exit");
+    assert_eq!(ended.stdin.bytes, final_cursor);
+    assert_eq!(
+        ended.exit,
+        Some(cowshed_core::api::dto::ExitStatus::Exited { code: 0 })
+    );
+}
+
 /// Every byte `stream` yields until it closes.
 async fn drain(mut stream: cowshed_core::RawByteStream) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -3296,7 +3470,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
         })
         .await
         .expect("exec");
-    let (stdin, _stdout, _stderr) = job.attach().await.expect("attach").into_parts();
+    let (stdin, _stdout, _stderr) = job.attach(None).await.expect("attach").into_parts();
     for line in [&b"line\n"[..], &b"more\n"[..]] {
         stdin.write(Bytes::from_static(line)).await.expect("write");
     }

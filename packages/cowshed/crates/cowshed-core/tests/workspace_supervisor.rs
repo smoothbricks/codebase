@@ -3872,8 +3872,8 @@ impl RunningProcess for WarmProcess {
         Ok(true)
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
-        Ok(())
+    fn close_stdin(&mut self) -> bool {
+        true
     }
 
     fn end_stdin(&mut self) {}

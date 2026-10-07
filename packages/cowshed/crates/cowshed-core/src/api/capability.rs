@@ -782,6 +782,7 @@ impl JobStdin {
     /// repeating it resends the same bytes at the same offsets: what already reached the job is
     /// answered without being delivered twice. A refusal is typed as
     /// [`crate::error::StdinRefusal`] and names how many bytes reached the job.
+    #[cfg_attr(any(), cowshed_api(napi = "JobAttachment.write"))]
     pub async fn write(&self, bytes: Bytes) -> Result<()> {
         let mut offset = self.offset.lock().await;
         let mut next = *offset;
@@ -800,7 +801,9 @@ impl JobStdin {
 
     /// Ends the job's stdin once every accepted write reached it: one EOF however often it is
     /// called. The job is not cancelled.
+    #[cfg_attr(any(), cowshed_api(napi = "JobAttachment.end"))]
     pub async fn close(&self) -> Result<()> {
+        let _offset = self.offset.lock().await;
         invoke::<operations::JobAttachClose>(&*self.runtime, &self.authority.job(self.id))
             .await
             .map(|EmptyResult {}| ())
@@ -2454,6 +2457,7 @@ impl JobHandle {
 
     /// Attaches to the running or ended job without starting a process: its stdin, and its two
     /// raw streams resumed at `cursor`, or at byte zero when it is omitted.
+    #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
     pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment> {
         self.runtime
             .attach(
@@ -2464,6 +2468,7 @@ impl JobHandle {
             .await
     }
 
+    #[cfg_attr(any(), cowshed_api(napi = "JobAttachment.detach"))]
     pub async fn detach(&self) -> Result<()> {
         invoke::<operations::JobDetach>(&*self.runtime, &self.authority.job(self.id))
             .await
@@ -2534,7 +2539,7 @@ mod tests {
     use crate::api::dto::RunSandboxMode;
     use crate::api::operations::{self, OPERATIONS, Scope};
     use serde_json::json;
-    use std::future;
+    use std::future::{self, Future};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     fn empty_params() -> Params {
@@ -3388,6 +3393,67 @@ mod tests {
         stdin.write(payload.clone()).await.unwrap();
         stdin.write(payload).await.unwrap();
         server_task.await.unwrap();
+    }
+
+    /// EOF cannot overtake the later frames of one accepted write. Poll the close while the
+    /// first delivery is explicitly held, then prove the next request is still input, not EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_stdin_close_waits_for_every_frame_of_a_concurrent_write() {
+        let (runtime, mut server) = actor_pair();
+        let stdin = Arc::new(JobStdin::new(
+            test_authority(),
+            JobId::new(7).unwrap(),
+            runtime,
+            0,
+        ));
+        let payload = Bytes::from(vec![0xff; MAX_BINARY_FRAME_BYTES + 17]);
+        let writer = Arc::clone(&stdin);
+        let write = tokio::spawn(async move { writer.write(payload).await });
+
+        let (_, first) = read_rpc_request(&mut server).await;
+        assert_eq!(first["method"], "job.attachWrite");
+        assert_eq!(first["params"]["offset"], 0);
+        assert_eq!(first["binaryLength"], MAX_BINARY_FRAME_BYTES);
+        assert_eq!(
+            read_binary_frame(&mut server, MAX_BINARY_FRAME_BYTES)
+                .await
+                .unwrap(),
+            vec![0xff; MAX_BINARY_FRAME_BYTES]
+        );
+
+        let mut close = std::pin::pin!(stdin.close());
+        future::poll_fn(|context| {
+            assert!(close.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        write_rpc_success(&mut server, first["id"].as_u64().unwrap(), json!({}), None).await;
+
+        let (_, second) = read_rpc_request(&mut server).await;
+        assert_eq!(second["method"], "job.attachWrite");
+        assert_eq!(second["params"]["offset"], MAX_BINARY_FRAME_BYTES);
+        assert_eq!(second["binaryLength"], 17);
+        assert_eq!(
+            read_binary_frame(&mut server, 17).await.unwrap(),
+            vec![0xff; 17]
+        );
+        write_rpc_success(&mut server, second["id"].as_u64().unwrap(), json!({}), None).await;
+        write.await.unwrap().unwrap();
+
+        let (closed, ()) = tokio::join!(close, async {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "job.attachClose");
+            assert!(request.get("binaryLength").is_none());
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({}),
+                None,
+            )
+            .await;
+        });
+        closed.unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

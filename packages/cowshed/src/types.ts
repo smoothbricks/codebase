@@ -4,17 +4,20 @@ import type { JobLogsArguments } from './native.generated.js';
 export type * from './api.generated.js';
 export type { JobLogsArguments } from './native.generated.js';
 
+export type CowshedErrorOptions = ErrorOptions & Pick<Api.CowshedError, 'admission' | 'stdin'>;
+
 export class CowshedError extends Error {
   readonly code: Api.ErrorCode;
   readonly hint: string;
   /** Present only on a keyed exec that spawned nothing, naming why and the job its key admitted. */
   readonly admission?: Api.AdmissionRefusal;
+  readonly stdin: Api.StdinRefusal | undefined;
 
   constructor(
     code: Api.ErrorCode,
     message: string,
     hint: string,
-    options?: ErrorOptions & { readonly admission?: Api.AdmissionRefusal },
+    options?: CowshedErrorOptions,
   ) {
     super(message, options);
     this.name = 'CowshedError';
@@ -23,6 +26,7 @@ export class CowshedError extends Error {
     if (options?.admission !== undefined) {
       this.admission = options.admission;
     }
+    this.stdin = options?.stdin;
   }
 }
 
@@ -55,11 +59,14 @@ type ExecOptionFields = Omit<
   'repoId' | 'workspace' | 'workspaceIncarnation' | 'session' | 'argv' | 'script' | 'stdin'
 >;
 
-/** Defaults and UTF-8 stdin sugar over the generated controller request, never another DTO list. */
+/** An attachment, rather than an admission-time producer, owns this job's input. */
+export type OpenStdin = Extract<Api.ExecStdin, { readonly kind: 'open' }>;
+
+/** Defaults and raw/UTF-8 stdin sugar over the generated request, never another DTO list. */
 export type ExecOptions = {
   readonly [Key in keyof ExecOptionFields]?: Exclude<ExecOptionFields[Key], null>;
 } & (
-  | { readonly stdin?: string; readonly stdinWorkspacePath?: never }
+  | { readonly stdin?: string | Uint8Array | OpenStdin; readonly stdinWorkspacePath?: never }
   | { readonly stdin?: never; readonly stdinWorkspacePath?: Api.WorkspacePath }
 );
 export type ExecRequest = ExecCommand & ExecOptions;
@@ -119,6 +126,19 @@ export interface Session {
 /** One `job.logs` chunk: where it ends, whether the stream has closed, and its bytes. */
 export type JobLogs = Api.LogsChunk & { readonly bytes: Uint8Array };
 
+export interface JobAttachOptions {
+  readonly cursor?: Api.JobJournalCursor;
+}
+
+/** Input view on one durable job. EOF and detachment never cancel the job. */
+export interface JobAttachment {
+  /** Resolves only after all bytes are delivered under the core's bounded backpressure. */
+  write(chunk: Uint8Array): Promise<void>;
+  /** Sends stdin EOF once; repeated calls are idempotent. */
+  end(): Promise<void>;
+  detach(): Promise<void>;
+}
+
 export interface JobHandle {
   readonly id: number;
   status(): Promise<Api.JobInfo>;
@@ -152,6 +172,7 @@ export interface JobHandle {
    * usage error.
    */
   tail(cursor: Api.JobJournalCursor | undefined, limits: Api.JobTailLimits): Promise<Api.JobTail>;
+  attach(options?: JobAttachOptions): Promise<JobAttachment>;
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;

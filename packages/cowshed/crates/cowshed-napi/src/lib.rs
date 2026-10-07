@@ -20,7 +20,8 @@ use std::{
 
 use bytes::Bytes;
 use cowshed_core::{
-    Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream, JobHandle as CoreJobHandle,
+    Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream,
+    JobAttachment as CoreJobAttachment, JobHandle as CoreJobHandle, JobStdin as CoreJobStdin,
     Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
@@ -37,7 +38,7 @@ use napi::{
     },
 };
 use napi_derive::napi;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 #[path = "operations.generated.rs"]
 mod operations;
@@ -107,9 +108,31 @@ fn arguments(method: &'static str, json: &str) -> AddonResult<Arguments> {
     })
 }
 
+/// Decodes a handle-local optional API record using its canonical serde declaration.
+fn optional_argument<T: DeserializeOwned>(
+    method: &'static str,
+    json: Option<&str>,
+) -> AddonResult<Option<T>> {
+    json.map(|json| {
+        serde_json::from_str(json).map_err(|error| {
+            AddonFailure::usage(
+                format!("{method} argument is invalid: {error}"),
+                "pass the declared API record",
+            )
+        })
+    })
+    .transpose()
+}
+
+/// Snapshot mutable JavaScript bytes before handing them to another runtime thread.
+/// The TS wrapper passes only a Buffer view: this is the one required ownership copy.
+fn owned_bytes(buffer: Buffer) -> Bytes {
+    Bytes::from(Vec::<u8>::from(buffer))
+}
+
 /// An upload's raw-byte frame, when the caller sent one.
 fn frame(buffer: Option<Buffer>) -> Option<Bytes> {
-    buffer.map(|buffer| Bytes::from(Vec::<u8>::from(buffer)))
+    buffer.map(owned_bytes)
 }
 
 /// A download's answer: the chunk's metadata as JSON, and its bytes.
@@ -552,6 +575,24 @@ pub struct JobHandle {
     inner: Arc<CoreJobHandle>,
 }
 
+/// A stdin view on the same durable job, retaining core's sole delivered-byte cursor.
+/// Output remains available through JobHandle.logs; no second output projection is minted.
+#[napi]
+pub struct JobAttachment {
+    inner: Arc<CoreJobHandle>,
+    stdin: Arc<CoreJobStdin>,
+}
+
+fn attachment(job: Arc<CoreJobHandle>, attachment: CoreJobAttachment) -> JobAttachment {
+    let (stdin, stdout, stderr) = attachment.into_parts();
+    drop(stdout);
+    drop(stderr);
+    JobAttachment {
+        inner: job,
+        stdin: Arc::new(stdin),
+    }
+}
+
 #[napi]
 impl JobHandle {
     /// A job id is at most `MAX_JOB_ID`, a safe integer, so JavaScript's number holds it exactly.
@@ -563,6 +604,42 @@ impl JobHandle {
                 AddonFailure::internal("a job id exceeded the safe integer range"),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod stdin_failure_tests {
+    use super::*;
+    use cowshed_core::StdinRefusal;
+
+    #[test]
+    fn every_canonical_stdin_refusal_survives_the_common_bridge() {
+        for stdin in [
+            StdinRefusal::Ended { cursor: 7 },
+            StdinRefusal::Discontinuous {
+                offset: 9,
+                cursor: 7,
+                admitted: 8,
+            },
+            StdinRefusal::ReplayMismatch {
+                offset: 0,
+                cursor: 7,
+            },
+            StdinRefusal::ReplayUnprovable {
+                offset: 0,
+                cursor: 7,
+                retained_from: 4,
+            },
+            StdinRefusal::DeliveryUnknown { cursor: 7 },
+        ] {
+            let error = CowshedError::stdin_refusal(stdin, "opaque refusal", "inspect the input");
+            assert!(error.retry_source().is_none());
+            let error = AddonFailure::from(error);
+            assert_eq!(error.0.code.as_str(), "conflict");
+            assert_eq!(error.0.message, "opaque refusal");
+            assert_eq!(error.0.hint, "inspect the input");
+            assert_eq!(error.0.stdin_source(), Some(stdin));
+        }
     }
 }
 

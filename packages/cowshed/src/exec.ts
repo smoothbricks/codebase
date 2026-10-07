@@ -33,10 +33,14 @@ export async function exec(
     stderrCopy: options.stderrCopy ?? null,
   };
   const [args, frame]: [N.WorkerExecArguments, Uint8Array | undefined] =
-    stdin !== undefined
+    typeof stdin === 'string'
       ? [{ ...fields, stdin: { kind: 'inline' } }, utf8.encode(stdin)]
-      : stdinWorkspacePath !== undefined
-        ? [{ ...fields, stdin: { kind: 'workspaceFile', workspacePath: stdinWorkspacePath } }, undefined]
-        : [{ ...fields, stdin: { kind: 'empty' } }, undefined];
+      : stdin instanceof Uint8Array
+        ? [{ ...fields, stdin: { kind: 'inline' } }, stdin]
+        : stdin !== undefined
+          ? [{ ...fields, stdin }, undefined]
+          : stdinWorkspacePath !== undefined
+            ? [{ ...fields, stdin: { kind: 'workspaceFile', workspacePath: stdinWorkspacePath } }, undefined]
+            : [{ ...fields, stdin: { kind: 'empty' } }, undefined];
   return N.workerExec(worker, args, frame);
 }

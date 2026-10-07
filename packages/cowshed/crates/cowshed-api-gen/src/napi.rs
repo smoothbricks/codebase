@@ -14,6 +14,7 @@
 //! so a request field the declaration renames, adds or drops moves the binding, the construction
 //! and the adapter's `.d.ts` together.
 
+use crate::capabilities;
 use crate::ir::{Api, Field, Fields, Record, Shape};
 use crate::operations::{Lane, Operation, Scope};
 use std::collections::BTreeMap;
@@ -183,7 +184,11 @@ pub struct Output {
     pub typescript: String,
 }
 
-pub fn emit(operations: &[Operation], api: &Api) -> Result<Output, String> {
+pub fn emit(
+    operations: &[Operation],
+    api: &Api,
+    capabilities: &[capabilities::Method],
+) -> Result<Output, String> {
     let requests = operations
         .iter()
         .filter(|operation| operation.scope != Scope::Internal)
@@ -270,10 +275,11 @@ pub fn emit(operations: &[Operation], api: &Api) -> Result<Output, String> {
             ));
         }
     }
+    let (capability_rust, capability_typescript) = capabilities::emit(capabilities, api)?;
     Ok(Output {
         served: serves(&classes)?,
-        rust: rust(&classes)? + &crate::errors::emit(api)?,
-        typescript: typescript(&classes, &served, api)?,
+        rust: rust(&classes)? + &capability_rust + &crate::errors::emit(api)?,
+        typescript: typescript(&classes, &served, api, capabilities)? + &capability_typescript,
     })
 }
 
@@ -686,16 +692,26 @@ fn typescript(
     classes: &[(&Class, Vec<Method<'_>>)],
     served: &BTreeMap<&str, Signature<'_>>,
     api: &Api,
+    capabilities: &[capabilities::Method],
 ) -> Result<String, String> {
-    // A stream operation's wrapper is the addon's iterator, which `native.ts` writes once.
+    // Stream iterators and handle-local attachments retain their canonical native carriers.
     let iterates = served
         .values()
         .any(|method| method.answer == Answer::Stream);
-    let native_imports = if iterates {
-        "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  \
-         type NativeWorkspaceRefHandle,\n} from './native.js';\n"
-    } else {
-        "import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n"
+    let attaches = capabilities
+        .iter()
+        .any(|method| method.answer == capabilities::Answer::Attachment);
+    let native_imports = match (iterates, attaches) {
+        (true, true) =>
+            "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobAttachmentHandle,\n  \
+             type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  type NativeWorkspaceRefHandle,\n} from './native.js';\n",
+        (true, false) =>
+            "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  \
+             type NativeWorkspaceRefHandle,\n} from './native.js';\n",
+        (false, true) =>
+            "import type { NativeJobAttachmentHandle, NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n",
+        (false, false) =>
+            "import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n",
     };
     let mut output = format!(
         "{HEADER}/// <reference types=\"node\" />\n\n\
@@ -940,7 +956,7 @@ mod tests {
 
     fn output(table: &str) -> Result<Output, String> {
         let operations = crate::operations::parse(table).expect("table");
-        emit(&operations, &api())
+        emit(&operations, &api(), &[])
     }
 
     #[test]
@@ -1180,7 +1196,7 @@ mod tests {
             }"#,
         )
         .expect("table");
-        let served = emit(&operations, &api).expect("projection").served;
+        let served = emit(&operations, &api, &[]).expect("projection").served;
         assert!(
             served.contains(concat!(
                 "        struct Caller {\n",
@@ -1225,7 +1241,7 @@ mod tests {
             }"#,
         )
         .expect("table");
-        let error = emit(&operations, &api)
+        let error = emit(&operations, &api, &[])
             .err()
             .expect("a skipped request field is refused");
         assert!(error.contains("skips or custom-decodes a field"), "{error}");

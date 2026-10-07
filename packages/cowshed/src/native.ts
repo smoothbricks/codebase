@@ -5,6 +5,8 @@ import typia from 'typia';
 import type {
   NativeCoordinatorOperations,
   NativeEvents,
+  NativeJobAttachmentCapabilities,
+  NativeJobHandleCapabilities,
   NativeJobHandleOperations,
   NativeProjectOperations,
   NativeWorkspaceHandleOperations,
@@ -37,7 +39,7 @@ export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
   readonly mountPath: string;
 }
 
-export interface NativeJobHandle extends NativeJobHandleOperations {
+export interface NativeJobHandle extends NativeJobHandleOperations, NativeJobHandleCapabilities {
   readonly id: number;
 }
 
@@ -93,6 +95,7 @@ export function eventIterator<T>(open: () => Promise<NativeEvents>, parse: (json
   };
   return iterator;
 }
+export type NativeJobAttachmentHandle = NativeJobAttachmentCapabilities;
 
 interface NativeModule {
   coordinatorEndpoint(descriptor: number): CoordinatorEndpoint;

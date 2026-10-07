@@ -342,7 +342,7 @@ impl WorkspaceHandle {
         )
     }
 
-    /// Writes one chunk of a streamed stdin.
+    /// Writes one chunk of a streamed stdin at its byte offset.
     #[napi(js_name = "stdinChunk")]
     pub fn stdin_chunk(
         &self,
@@ -474,6 +474,12 @@ impl JobHandle {
         )
     }
 
+    /// Ends an attached job's stdin: one EOF however often it is called; the job continues.
+    #[napi(js_name = "attachClose")]
+    pub fn attach_close(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::JobAttachClose, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Detaches from a job.
     #[napi(js_name = "detach")]
     pub fn detach(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
@@ -492,6 +498,7 @@ impl JobHandle {
         super::json_call::<operations::JobKill, _>(env, Arc::clone(&self.inner), arguments)
     }
 }
+
 
 /// The canonical core error, with every serialized detail retained on the JS Error.
 pub(super) fn cowshed_error(

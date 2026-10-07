@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod errors;
 pub mod ir;
 pub mod napi;
@@ -50,8 +51,11 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     let operations = operations::parse(&read_source(&table)?)
         .map_err(|error| format!("{}: {error}", table.display()))?;
     napi::export_records(&operations, &mut api)?;
+    let capabilities_path = core.join("api/capability.rs");
+    let capabilities = capabilities::parse(&read_source(&capabilities_path)?)
+        .map_err(|error| format!("{}: {error}", capabilities_path.display()))?;
     let output = typescript::emit(&api)?;
-    let projection = napi::emit(&operations, &api)?;
+    let projection = napi::emit(&operations, &api, &capabilities)?;
     Ok(vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),

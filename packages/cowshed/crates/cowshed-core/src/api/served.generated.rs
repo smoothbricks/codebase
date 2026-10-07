@@ -791,18 +791,20 @@ impl Serves<WorkerStdinChunk> for WorkspaceHandle {
     fn request(
         authority: &<Self as Binder>::Fields<'_>,
         arguments: Arguments,
-    ) -> Result<JobRequest> {
+    ) -> Result<StdinWriteRequest> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Caller {
             job_id: JobId,
+            offset: u64,
         }
-        let Caller { job_id } = decode::<WorkerStdinChunk, Caller>(arguments)?;
-        Ok(JobRequest {
+        let Caller { job_id, offset } = decode::<WorkerStdinChunk, Caller>(arguments)?;
+        Ok(StdinWriteRequest {
             repo_id: owned(authority.repo_id),
             workspace: owned(authority.workspace),
             workspace_incarnation: owned(authority.workspace_incarnation),
             job_id,
+            offset,
         })
     }
 }
@@ -1154,11 +1156,35 @@ impl Serves<JobAttachWrite> for JobHandle {
     fn request(
         authority: &<Self as Binder>::Fields<'_>,
         arguments: Arguments,
+    ) -> Result<StdinWriteRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            offset: u64,
+        }
+        let Caller { offset } = decode::<JobAttachWrite, Caller>(arguments)?;
+        Ok(StdinWriteRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+            offset,
+        })
+    }
+}
+
+impl Serves<JobAttachClose> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
     ) -> Result<JobRequest> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Caller {}
-        let Caller {} = decode::<JobAttachWrite, Caller>(arguments)?;
+        let Caller {} = decode::<JobAttachClose, Caller>(arguments)?;
         Ok(JobRequest {
             repo_id: owned(authority.repo_id),
             workspace: owned(authority.workspace),
@@ -1302,6 +1328,7 @@ pub(crate) fn each_served(
     check.served::<JobListeningPortsRead, _>(job_handle, &[]);
     check.served::<JobProgress, _>(job_handle, &[]);
     check.served::<JobAttachWrite, _>(job_handle, &[]);
+    check.served::<JobAttachClose, _>(job_handle, &[]);
     check.served::<JobDetach, _>(job_handle, &[]);
     check.served::<JobWait, _>(job_handle, &[]);
     check.served::<JobKill, _>(job_handle, &[]);

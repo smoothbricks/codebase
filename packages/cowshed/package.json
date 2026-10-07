@@ -303,6 +303,11 @@
           }
         }
       },
+      "napi-test": {
+        "options": {
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 native.test.ts attachment.napi.test.ts"
+        }
+      },
       "launcher-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
