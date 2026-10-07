@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { writeJsonFile } from '@smoothbricks/nx-plugin/managed-files/managed-format';
 import type {
   NxJson,
   NxProjectJson,
@@ -68,12 +69,9 @@ export function requiredJsonObject(path: string): PackageJson {
   return json;
 }
 
+/** Rewrite a JSON file in the bytes the repository's commit hook leaves, so no later hook run reformats it. */
 export function writeJsonObject(path: string, value: object): void {
-  writeFileSync(path, jsonObjectText(value));
-}
-
-export function jsonObjectText(value: object): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
+  writeJsonFile(path, value);
 }
 
 export function readJson(path: string): unknown {

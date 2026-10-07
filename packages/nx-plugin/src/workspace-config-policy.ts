@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
 import { CARGO_TEST_TARGET } from './cargo-workspace.js';
+import { writeJsonFile } from './managed-files/managed-format.js';
 
 export const MANAGED_FILES_SYNC_GENERATOR = '@smoothbricks/nx-plugin:managed-files';
 
@@ -222,7 +223,7 @@ export function applyWorkspaceConfigPolicy(root: string): boolean {
   }
   const changed = applyWorkspaceConfig(nxJson);
   if (changed) {
-    writeJsonObject(nxJsonPath, nxJson);
+    writeJsonFile(nxJsonPath, nxJson);
   }
   return changed;
 }
@@ -480,10 +481,6 @@ function readJsonObject(path: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-function writeJsonObject(path: string, value: Record<string, unknown>): void {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
+import { writeJsonFile } from './managed-files/managed-format.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/nx-plugin/version-actions';
@@ -229,7 +230,7 @@ export function applyReleaseConfigPolicy(root: string): boolean {
   }
   const changed = applyReleaseConfig(nxJson);
   if (changed) {
-    writeJsonObject(nxJsonPath, nxJson);
+    writeJsonFile(nxJsonPath, nxJson);
   }
   return changed;
 }
@@ -244,10 +245,6 @@ function readJsonObject(path: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-function writeJsonObject(path: string, value: Record<string, unknown>): void {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ciPushBranches, readSmooGithub } from './json.js';
+import { ciPushBranches, readSmooGithub, writeJsonObject } from './json.js';
 
 describe('ciPushBranches', () => {
   it('reads the configured branches in order, the first being the staging one', () => {
@@ -138,5 +138,25 @@ describe('readSmooGithub value validation', () => {
       e2eSecrets: { CONTROL_TOKEN: 'SMOO_CONTROL_TOKEN' },
       previewUrls: ['https://app.{stage}.example.test'],
     });
+  });
+});
+
+describe('writeJsonObject', () => {
+  it("writes the bytes the repository's commit hook leaves, under the repository's own Biome configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-write-json-'));
+    try {
+      await writeFile(
+        join(root, 'biome.json'),
+        '{"formatter":{"indentStyle":"space","indentWidth":2,"lineWidth":120}}\n',
+      );
+
+      // JSON.stringify expands every array; Biome keeps this one on a line, so a hook-less commit
+      // of the stringified bytes would fail `biome check`.
+      writeJsonObject(join(root, 'nx.json'), { plugins: ['@smoothbricks/nx-plugin'] });
+
+      expect(await readFile(join(root, 'nx.json'), 'utf8')).toBe('{\n  "plugins": ["@smoothbricks/nx-plugin"]\n}\n');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

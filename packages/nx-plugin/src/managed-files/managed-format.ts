@@ -1,4 +1,6 @@
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
 
@@ -13,7 +15,9 @@ import type { Options as PrettierOptions } from 'prettier';
  * parser and the content passes through untouched, exactly as
  * `prettier --ignore-unknown` leaves it in the hook.
  *
- * `managed-format.test.ts` pins this list to that config.
+ * `managed-format.test.ts` pins this list to that config. Content in these
+ * extensions that a template supplies verbatim passes through here; JSON that
+ * smoo synthesizes goes through {@link formatJsonWithBiome} instead.
  */
 export const BIOME_OWNED_EXTENSIONS: readonly string[] = [
   '.js',
@@ -98,5 +102,95 @@ export async function formatManagedContent(root: string, target: string, content
     return await prettier.format(content, { ...options, filepath: path });
   } catch (error) {
     throw new Error(`${target}: generated managed content is not valid ${info.inferredParser}`, { cause: error });
+  }
+}
+
+/**
+ * The arguments `.git-format-staged.yml` gives Biome for every file it owns,
+ * with `stdinFilePath` standing in for the hook's `{}`. A test pins the joined
+ * command to that config.
+ */
+export function biomeHookArguments(stdinFilePath: string): string[] {
+  return [
+    'check',
+    '--files-ignore-unknown=true',
+    '--use-editorconfig=true',
+    `--stdin-file-path=${stdinFilePath}`,
+    '--fix',
+  ];
+}
+
+/** The missing-Biome diagnostic is one line per process, not one per file written. */
+let missingBiomeReported = false;
+
+/**
+ * The bytes the commit hook leaves in a JSON file whose content `text` is.
+ *
+ * `formatManagedContent` passes Biome-owned content through because a template
+ * is copied from this package's own, already formatted, sources. JSON that smoo
+ * *synthesizes* is different: `JSON.stringify` expands every array that Biome
+ * keeps on one line, so a generated `tsconfig.test.json` or a rewritten
+ * `nx.json` fails `biome check` until the hook has run. Locally the hook runs on
+ * commit; the Managed files workflow commits with no hook, and its pull request
+ * arrives red. Running the hook's own Biome command here makes the written bytes
+ * a fixed point of it, under the consumer's own `biome.json`.
+ *
+ * Biome is the repository's, found as the hook finds it: the nearest
+ * `node_modules/.bin/biome` above the file, else the one on `PATH`. A tree with
+ * no Biome at all (a repository mid-bootstrap, before its first install) has no
+ * hook output to agree with, so the text passes through and the first `update`
+ * after the install converges. Every other failure is loud: a Biome that
+ * rejects the repository's configuration would fail the hook the same way.
+ */
+export function formatJsonWithBiome(path: string, text: string): string {
+  const absolute = resolve(path);
+  const cwd = nearestExistingDirectory(dirname(absolute));
+  const child = spawnSync(biomeBinary(cwd), biomeHookArguments(absolute), { cwd, input: text, encoding: 'utf8' });
+  if (child.error) {
+    if ('code' in child.error && child.error.code === 'ENOENT') {
+      if (!missingBiomeReported) {
+        missingBiomeReported = true;
+        console.warn(
+          `${path}: Biome is not installed here, so generated JSON keeps JSON.stringify's formatting; run smoo monorepo update again after the install.`,
+        );
+      }
+      return text;
+    }
+    throw new Error(`${path}: Biome could not be run to format generated JSON`, { cause: child.error });
+  }
+  if (child.status !== 0) {
+    throw new Error(
+      `${path}: Biome exited ${child.status ?? `on signal ${child.signal}`}, so generated JSON cannot be written in the bytes the commit hook would leave:\n${child.stderr}`,
+    );
+  }
+  // Biome echoes what it cannot format, so an empty answer to real input is a fault, never a result.
+  if (child.stdout === '' && text !== '') {
+    throw new Error(`${path}: Biome returned no content for generated JSON:\n${child.stderr}`);
+  }
+  return child.stdout;
+}
+
+/** `JSON.stringify` of `value`, in the bytes the commit hook leaves. */
+export function jsonFileText(path: string, value: unknown): string {
+  return formatJsonWithBiome(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/** The one writer for JSON files `smoo monorepo update` rewrites in place. */
+export function writeJsonFile(path: string, value: unknown): void {
+  writeFileSync(path, jsonFileText(path, value));
+}
+
+/** The directory a file about to be created would sit in, as far up as exists: spawning needs a real `cwd`. */
+function nearestExistingDirectory(directory: string): string {
+  let current = directory;
+  while (!existsSync(current)) current = dirname(current);
+  return current;
+}
+
+function biomeBinary(directory: string): string {
+  for (let current = directory; ; current = dirname(current)) {
+    const local = join(current, 'node_modules', '.bin', 'biome');
+    if (existsSync(local)) return local;
+    if (dirname(current) === current) return 'biome';
   }
 }

@@ -4,6 +4,7 @@ import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
 import typia from 'typia';
 import { ManagedContentConflict } from './managed-files/managed-content.js';
+import { jsonFileText } from './managed-files/managed-format.js';
 import type { ManagedFile } from './managed-files/tree.js';
 
 import type { NxPolicyIssue } from './workspace-config-policy.js';
@@ -358,7 +359,7 @@ function renderTsconfig(tree: Tree, target: string, config: Record<string, unkno
       `${target} carries comments a rewrite would delete; apply the no-emit test typecheck policy by hand`,
     );
   }
-  return { target, content: `${JSON.stringify(config, null, 2)}\n` };
+  return { target, content: jsonFileText(join(tree.root, target), config) };
 }
 
 /**

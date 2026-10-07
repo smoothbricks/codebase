@@ -1,6 +1,7 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CARGO_TEST_TARGET, listCargoWorkspacePackages, packageNameFromCargoTestTarget } from './cargo-workspace.js';
+import { writeJsonFile } from './managed-files/managed-format.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
@@ -93,9 +94,9 @@ export function applyWorkspaceBoundedTestTargetPolicy(root: string, options: Pac
     if (JSON.stringify(packageJson) === beforePackageJson && JSON.stringify(projectJson) === beforeProjectJson) {
       continue;
     }
-    writePackageJson(packageJsonPath, packageJson);
+    writeJsonFile(packageJsonPath, packageJson);
     if (projectJson) {
-      writeProjectJson(projectJsonPath, projectJson);
+      writeJsonFile(projectJsonPath, projectJson);
     }
     changed = true;
   }
@@ -606,10 +607,6 @@ function readPackageJson(path: string): BoundedTestPolicyPackageJson {
   };
 }
 
-function writePackageJson(path: string, packageJson: BoundedTestPolicyPackageJson): void {
-  writeFileSync(path, `${JSON.stringify(packageJson, null, 2)}\n`);
-}
-
 function readProjectJson(path: string): BoundedTestPolicyProjectJson {
   const parsed = readJsonObject(path);
   return {
@@ -636,10 +633,6 @@ function readTargets(value: unknown): Record<string, Record<string, unknown>> | 
     targets[name] = isRecord(target) ? target : {};
   }
   return targets;
-}
-
-function writeProjectJson(path: string, projectJson: BoundedTestPolicyProjectJson): void {
-  writeFileSync(path, `${JSON.stringify(projectJson, null, 2)}\n`);
 }
 
 function hasTestEntrypoint(

@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { getProjects, readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
 
 import { boundedTestScriptAlias } from './bounded-test-policy.js';
+import { writeJsonFile } from './managed-files/managed-format.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import {
   BUILD_OUTPUT_DEPENDENCIES,
@@ -85,10 +86,6 @@ function readJsonObject(path: string): Record<string, unknown> | null {
   }
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
   return isRecord(parsed) ? parsed : null;
-}
-
-function writeJsonObject(path: string, value: Record<string, unknown>): void {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function listWorkspacePackageJsonPaths(root: string): string[] {
@@ -1299,7 +1296,7 @@ export function applyPackageTargetPolicy(root: string, options: PackageTargetPol
       packageChanged;
 
     if (packageChanged) {
-      writeJsonObject(packageJsonPath, pkg);
+      writeJsonFile(packageJsonPath, pkg);
       changed = true;
     }
   }
