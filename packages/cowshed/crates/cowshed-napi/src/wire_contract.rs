@@ -754,6 +754,16 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                         }),
                     ),
                 ),
+                (
+                    "taskHashes",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::TaskHashes {
+                            state: PathBuf::from("apps/web/.nx"),
+                            reason: "node - /Users/fixture/Dev/widget/apps/web ended Exited { code: 1 }: Error: the task graph has a circular dependency".to_owned(),
+                        }),
+                    ),
+                ),
             ]),
         ),
         (

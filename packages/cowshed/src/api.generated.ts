@@ -1208,6 +1208,13 @@ export type RebaseCarrySkip =
   | ({ readonly kind: 'daemonStayed' } & {
       readonly side: CarrySide;
       readonly daemon: DatabaseHolder;
+    })
+  | ({ readonly kind: 'taskHashes' } & {
+      /**
+       * The root's Nx state directory (`<root>/.nx`), relative to the workspace.
+       */
+      readonly state: string;
+      readonly reason: string;
     });
 
 export type RebaseOptions = {

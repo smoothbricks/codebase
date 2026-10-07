@@ -886,6 +886,40 @@ pub fn task_inputs(
     .collect())
 }
 
+/// The program that names the cache keys the tree at an Nx root looks up: `node - <root>` with
+/// this on stdin, run as a job of the workspace (`task_hashes.js` says how it hashes).
+pub const TASK_HASHES_SCRIPT: &str = include_str!("task_hashes.js");
+
+/// What [`TASK_HASHES_SCRIPT`] prints.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskHashesWire {
+    hashes: Vec<String>,
+}
+
+/// The task hashes [`TASK_HASHES_SCRIPT`] printed. Nx names a cache entry by a decimal hash, the
+/// only name the carry joins to a path; anything else is an error naming what was read.
+pub fn task_hashes(stdout: &[u8]) -> Result<std::collections::BTreeSet<String>, String> {
+    let wire: TaskHashesWire = serde_json::from_slice(stdout).map_err(|error| {
+        format!(
+            "the task hash probe printed no hashes ({error}): {}",
+            String::from_utf8_lossy(&stdout[..stdout.len().min(512)])
+        )
+    })?;
+    wire.hashes
+        .into_iter()
+        .map(|hash| {
+            if !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_digit()) {
+                Ok(hash)
+            } else {
+                Err(format!(
+                    "the task hash probe printed {hash:?}, not an Nx hash"
+                ))
+            }
+        })
+        .collect()
+}
+
 /// Milliseconds since the epoch of `YYYY-MM-DDTHH:MM:SS.mmmZ`, as JavaScript's
 /// `Date.prototype.toISOString` writes it.
 fn parse_utc_millis(value: &str) -> Option<u128> {
@@ -1091,6 +1125,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The probe's hashes are the only names the carry selects by, so only Nx's decimal hashes
+    /// pass, and an answer of any other shape selects nothing.
+    #[test]
+    fn task_hashes_admit_only_nx_decimal_hashes() {
+        assert_eq!(
+            task_hashes(br#"{"hashes":["17526140994862843286","42"]}"#).unwrap(),
+            std::collections::BTreeSet::from(["17526140994862843286".to_owned(), "42".to_owned()])
+        );
+        assert!(task_hashes(br#"{"hashes":[]}"#).unwrap().is_empty());
+        for refused in [
+            &br#"{"hashes":["../x"]}"#[..],
+            br#"{"hashes":[""]}"#,
+            br#"{"hashes":[42]}"#,
+            br#"{"hashes":[],"extra":1}"#,
+            b"{}",
+            b"",
+        ] {
+            assert!(
+                task_hashes(refused).is_err(),
+                "{}",
+                String::from_utf8_lossy(refused)
+            );
+        }
     }
 
     #[test]

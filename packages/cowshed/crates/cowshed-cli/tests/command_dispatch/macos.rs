@@ -1001,6 +1001,10 @@ async fn succeed(
 /// default inputs include it). `declared` says whether `a:build` declares that output. Written,
 /// not committed: the caller commits once it has written all it adds.
 fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
+    // A command a workspace runs by name, as the rebase carry's task-hash probe runs `node`,
+    // resolves through its shim directory, which travels with every clone (03_caches.md).
+    fs::create_dir_all(checkout.join(".cowshed/bin")).unwrap();
+    std::os::unix::fs::symlink(node, checkout.join(".cowshed/bin/node")).unwrap();
     let node = node.display();
     let outputs = if declared {
         r#"["{projectRoot}/generated.txt"]"#
@@ -1013,7 +1017,7 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     )
     .unwrap();
     fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":false}"#).unwrap();
-    fs::write(checkout.join(".gitignore"), "node_modules\n.nx\n").unwrap();
+    fs::write(checkout.join(".gitignore"), "node_modules\n.nx\n.cowshed\n").unwrap();
     fs::create_dir_all(checkout.join("a")).unwrap();
     fs::write(checkout.join("a/src.txt"), b"src\n").unwrap();
     fs::write(
@@ -2019,10 +2023,12 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
 }
 
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
-/// (16_build_volumes.md, "Rebase carry"): `b`, forked before `a` lands and warms `a:build` and
-/// `a:test` in main, rebases after that land, and its run of the landed check hits both without
-/// re-running either. A rebase while a process holds `b`'s task database carries nothing and
-/// names that process.
+/// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
+/// before main runs the check at the original tree and before `a` lands and warms `a:build` and
+/// `a:test` at its own, rebases after that land. Main then indexes both trees' entries; `b` takes
+/// the landed tree's two and none of the original's, and its run of the landed check hits both
+/// without re-running either. A rebase while a process holds `b`'s task database carries nothing
+/// and names that process.
 #[tokio::test]
 async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace() {
     let (nx, node) = repository_nx();
@@ -2037,6 +2043,9 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
     git(&b, &["add", "unrelated.txt"]);
     git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
+    // Entries no tree after the land looks up: what a rebase that carried main's whole cache
+    // copied, entry for entry.
+    sh(&mut service, "main", &nx_check).await;
 
     let a = new_workspace(&mut service, "a").await;
     fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
@@ -2049,9 +2058,9 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
     match &rebased.build_volume {
         RebaseBuildVolume::Carried { carried } => {
             assert_eq!(carried.stopped, None, "{rebased:?}");
-            assert!(
-                carried.entries >= 2,
-                "a:build and a:test, which main held and b's volume did not: {rebased:?}"
+            assert_eq!(
+                carried.entries, 2,
+                "a:build and a:test at the landed tree, and neither entry of the original: {rebased:?}"
             );
         }
         RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),

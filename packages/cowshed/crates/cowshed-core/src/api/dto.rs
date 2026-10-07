@@ -2978,6 +2978,13 @@ pub enum RebaseCarrySkip {
         side: CarrySide,
         daemon: DatabaseHolder,
     },
+    /// Stock Nx could not name the cache keys the rebased tree looks up at one of its Nx roots,
+    /// so there was nothing the carry could select: it carries only what the tree will ask for.
+    TaskHashes {
+        /// The root's Nx state directory (`<root>/.nx`), relative to the workspace.
+        state: PathBuf,
+        reason: String,
+    },
 }
 
 impl fmt::Display for RebaseCarrySkip {
@@ -3022,6 +3029,11 @@ impl fmt::Display for RebaseCarrySkip {
                 formatter,
                 "the {side} Nx daemon pid {} ({}) did not exit after SIGTERM",
                 daemon.pid, daemon.command
+            ),
+            Self::TaskHashes { state, reason } => write!(
+                formatter,
+                "stock Nx could not hash the rebased tree's tasks for {}: {reason}",
+                state.display()
             ),
         }
     }

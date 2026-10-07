@@ -846,15 +846,19 @@ impl BuildVolumes {
     }
 
     /// Rebase carry (16_build_volumes.md, "Rebase carry"): index in the volume `checkout` links
-    /// every Nx cache entry the target's volume indexes and it lacks, with the land's carry. The
-    /// copies are staged while both sides run. Then each side's Nx state is closed as a land
-    /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
-    /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
-    /// the carry writes either while it indexes. A skip deletes what was staged.
+    /// the Nx cache entries the target's volume indexes and it lacks, among those `selections`
+    /// names: for each Nx state of the workspace's volume (its `.nx`, relative to the checkout),
+    /// the task hashes stock Nx computed for the rebased tree there. A selection that could not
+    /// be computed is the skip it carries, after the volume skips. The copies are staged while
+    /// both sides run. Then each side's Nx state is closed as a land closes the target's (its
+    /// idle daemon stopped, any other holder a skip), and the commit runs under both sides' Nx
+    /// open locks once neither database has a holder, so nothing but the carry writes either
+    /// while it indexes. A skip deletes what was staged.
     pub async fn rebase_carry(
         &self,
         checkout: PathBuf,
         target_checkout: PathBuf,
+        selections: std::result::Result<BTreeMap<PathBuf, BTreeSet<String>>, RebaseCarrySkip>,
     ) -> Result<RebaseBuildVolume> {
         let workspace = self.layout.linked(&checkout)?;
         let target = self.layout.linked(&target_checkout)?;
@@ -866,6 +870,10 @@ impl BuildVolumes {
             let Some(target) = target else {
                 return skipped(RebaseCarrySkip::NoTargetVolume);
             };
+            let selections = match selections {
+                Ok(selections) => selections,
+                Err(reason) => return skipped(reason),
+            };
             let started = Instant::now();
             let into = host
                 .mount_build_volume(layout, &workspace)
@@ -873,7 +881,7 @@ impl BuildVolumes {
             let into_state = BuildVolumeState::read(&into)?;
             let from = host.mount_build_volume(layout, &target).map_err(storage)?;
             let from_state = BuildVolumeState::read(&from)?;
-            let staged = carry::stage(&from, &from_state, &into, &into_state);
+            let staged = carry::stage_rebase(&from, &from_state, &into, &into_state, &selections);
             let staged_in = started.elapsed();
             let sides = [
                 (CarrySide::Workspace, into.as_path(), &into_state),

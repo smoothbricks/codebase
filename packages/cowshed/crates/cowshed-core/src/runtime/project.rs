@@ -9835,12 +9835,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         run_git_rebase_atomically(&root, &onto, &source_head).await?;
         let oid = git_oid(&root).await?;
         // The rebase has happened: a failed carry reads as such, never as a refused rebase.
-        let build_volume = timed_async(
-            "rebase",
-            "carry",
+        let build_volume = timed_async("rebase", "carry", async {
+            // Only what the rebased tree will look up is carried, so the hashes come from it, as
+            // it is checked out now, through jobs admitted on its own build volume.
+            let (handle, grant) = self.admit_build_state(&workspace).await?;
+            let mount = self.workspace_mount_path(&workspace)?;
+            let selections = timed_async(
+                "rebase",
+                "task-hashes",
+                rebased_task_hashes(&handle, grant, &mount),
+            )
+            .await?;
             self.build_volumes()?
-                .rebase_carry(root.clone(), into.mount.clone()),
-        )
+                .rebase_carry(root.clone(), into.mount.clone(), selections)
+                .await
+        })
         .await
         .map_err(|failed| {
             CowshedError::new(
@@ -13284,38 +13293,20 @@ async fn task_inputs(
     task: String,
     hash: String,
 ) -> Result<crate::api::dto::CacheMiss> {
-    use crate::storage::job_artifact::StreamKind;
     let request = land_check_request(&format!(
         "exec node_modules/.bin/nx show target inputs '{}' --json",
         task.replace('\'', "'\\''")
     ));
     let job = handle.exec(None, build_volume, request).await?;
     let info = handle.wait(job).await?;
-    let mut stdout = Vec::new();
-    let mut offset = 0_u64;
-    let read = loop {
-        match handle
-            .log_read(job, StreamKind::Stdout, offset, false)
-            .await
-        {
-            Ok(chunk) => {
-                stdout.extend_from_slice(&chunk.bytes);
-                offset = chunk.next_offset;
-                if chunk.eof {
-                    break Ok(());
-                }
-            }
-            Err(error) => break Err(error),
-        }
-    };
-    let described = match (&info.exit, read) {
+    let described = match (&info.exit, read_job_stdout(handle, job).await) {
         (_, Err(error)) => Err(format!(
-            "cannot read the output of nx show target inputs {task} at byte {offset}: {error}"
+            "cannot read the output of nx show target inputs {task} {error}"
         )),
-        (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(())) => {
+        (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
             crate::build_volume::nx::task_inputs(&task, &stdout)
         }
-        (exit, Ok(())) => Err(format!(
+        (exit, Ok(_)) => Err(format!(
             "nx show target inputs {task} ended {exit:?}: {}",
             read_job_stderr_tail(handle, job).await
         )),
@@ -13334,6 +13325,113 @@ async fn task_inputs(
         inputs_digest,
         inputs_error,
     })
+}
+
+/// The whole stdout of the finished job `job`, or where its read failed.
+#[cfg(target_os = "macos")]
+async fn read_job_stdout(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    job: JobId,
+) -> std::result::Result<Vec<u8>, String> {
+    use crate::storage::job_artifact::StreamKind;
+    let mut stdout = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let chunk = handle
+            .log_read(job, StreamKind::Stdout, offset, false)
+            .await
+            .map_err(|error| format!("at byte {offset}: {error}"))?;
+        stdout.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if chunk.eof {
+            return Ok(stdout);
+        }
+    }
+}
+
+/// Rebase carry's selection (16_build_volumes.md, "Rebase carry"): for each Nx state the build
+/// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
+/// the task hashes stock Nx computes for the tree now checked out at that state's root
+/// ([`crate::build_volume::nx::TASK_HASHES_SCRIPT`], run there as a job of the workspace). A root
+/// whose hashes cannot be computed is the carry's skip, naming it: no root is ever given a
+/// selection it did not compute, so the carry never copies an entry the tree will not look up.
+#[cfg(target_os = "macos")]
+async fn rebased_task_hashes(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
+    mount: &Path,
+) -> Result<
+    std::result::Result<
+        std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<String>>,
+        crate::api::dto::RebaseCarrySkip,
+    >,
+> {
+    let state =
+        crate::build_volume::BuildVolumeState::read(&mount.join(crate::build_volume::BUILD_LINK))?;
+    let states = state
+        .paths
+        .iter()
+        .filter(|path| {
+            crate::build_volume::BuildStateTool::of(path) == crate::build_volume::BuildStateTool::Nx
+        })
+        .filter_map(|path| path.checkout.as_path().parent())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selections = std::collections::BTreeMap::new();
+    for state in states {
+        // The Nx root the state sits in, and the job's directory there: a root's `.envrc` gives
+        // its own toolchain, as to any command run in it.
+        let root = state.parent().unwrap_or(Path::new(""));
+        let cwd = if root.as_os_str().is_empty() {
+            None
+        } else {
+            Some(crate::api::dto::WorkspacePath::new(root).map_err(|error| {
+                CowshedError::integrity(error.to_string(), "use a workspace-relative Nx project")
+            })?)
+        };
+        // Read-write, as a run: stock Nx records the hashes' task details in the root's database.
+        let request = ExecRequest {
+            command: crate::api::dto::ExecCommand::Argv(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec node - \"$1\"".into(),
+                "sh".into(),
+                crate::api::dto::CommandArg::new(mount.join(root)),
+            ]),
+            cwd,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Inline(bytes::Bytes::from_static(
+                crate::build_volume::nx::TASK_HASHES_SCRIPT.as_bytes(),
+            )),
+            stdout_copy: None,
+            stderr_copy: None,
+        };
+        let job = handle.exec(None, build_volume.clone(), request).await?;
+        let info = handle.wait(job).await?;
+        let hashes = match (&info.exit, read_job_stdout(handle, job).await) {
+            (_, Err(error)) => Err(format!("cannot read the probe's output {error}")),
+            (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
+                crate::build_volume::nx::task_hashes(&stdout)
+            }
+            (exit, Ok(_)) => Err(format!(
+                "the probe ended {exit:?}: {}",
+                read_job_stderr_tail(handle, job).await
+            )),
+        };
+        match hashes {
+            Ok(hashes) => {
+                selections.insert(state.to_owned(), hashes);
+            }
+            Err(reason) => {
+                return Ok(Err(crate::api::dto::RebaseCarrySkip::TaskHashes {
+                    state: state.to_owned(),
+                    reason,
+                }));
+            }
+        }
+    }
+    Ok(Ok(selections))
 }
 
 #[cfg(target_os = "macos")]

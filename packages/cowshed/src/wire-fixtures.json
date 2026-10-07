@@ -1107,6 +1107,17 @@
       },
       "oid": "7777777777777777777777777777777777777777"
     },
+    "taskHashes": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "kind": "taskHashes",
+          "reason": "node - /Users/fixture/Dev/widget/apps/web ended Exited { code: 1 }: Error: the task graph has a circular dependency",
+          "state": "apps/web/.nx"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
     "workspaceHeld": {
       "buildVolume": {
         "kind": "skipped",
