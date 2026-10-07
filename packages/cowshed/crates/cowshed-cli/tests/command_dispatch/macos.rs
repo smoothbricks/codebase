@@ -16,10 +16,11 @@ use cowshed_core::build_volume::{
 use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
-use cowshed_core::storage::apfs::ApfsSubstrateConfig;
 use cowshed_core::storage::apfs::native::{
-    MacOsApfsExecutionHost, blank_template, blank_template_path,
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource, blank_template,
+    blank_template_path,
 };
+use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{
@@ -1480,8 +1481,8 @@ async fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// Run `cowshed gc` until build volume `id`'s image is gone: collection never forces a detach,
-/// so a holder that is still exiting defers it to the next pass.
+/// Run `cowshed gc` until build volume `id`'s image is gone: a running job's shared hold
+/// defers collection until its terminal event drops that hold.
 async fn collected(service: &mut ActorBridge, layout: &BuildVolumeLayout, id: &BuildVolumeId) {
     let started = Instant::now();
     while layout.image(id).exists() {
@@ -1742,7 +1743,16 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
         Some(landed_tree.as_str()),
         "the seed is frozen at the landed tree"
     );
-    collected(&mut service, &layout, &previous).await;
+    assert!(
+        !layout.image(&previous).exists(),
+        "land immediately reclaims the previous build image"
+    );
+    assert!(
+        !layout.record(&previous).exists(),
+        "land immediately reclaims its record"
+    );
+    assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
@@ -2316,7 +2326,11 @@ async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
         layout.read_record(&old).expect("previous record").role,
         BuildVolumeRole::Unlinked
     );
-    succeed(&mut service, ["gc"]).await;
+    let (_, stderr) = succeed(&mut service, ["gc"]).await;
+    assert!(
+        stderr.contains(old.as_str()) && stderr.contains("job admitted on it"),
+        "gc names the old volume and explains its job hold: {stderr}"
+    );
     assert!(
         layout.image(&old).exists(),
         "gc never forces away a volume a running job is in"
@@ -2326,6 +2340,160 @@ async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     let exited = old_mount.join("target/ticking/exited");
     eventually("the job exits", || exited.is_file()).await;
     collected(&mut service, &layout, &old).await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// Every mounted build volume has a live checkout link, and every supplied link is mounted.
+/// Query the kernel, not sidecars: an unlinked attachment is precisely the regression.
+fn assert_linked_build_mounts(layout: &BuildVolumeLayout, checkouts: &[&Path]) {
+    let root = layout.mounts().canonicalize().expect("build mount root");
+    let expected: std::collections::BTreeSet<_> = checkouts
+        .iter()
+        .map(|checkout| {
+            layout
+                .mount(&linked_volume(layout, checkout))
+                .canonicalize()
+                .expect("linked build mount")
+        })
+        .collect();
+    let mounted: std::collections::BTreeSet<_> = SystemKernelMountSource
+        .mounts()
+        .expect("kernel mount inventory")
+        .into_iter()
+        .map(|mount| mount.mount_point)
+        .filter(|mount| mount.starts_with(&root))
+        .collect();
+    assert_eq!(
+        mounted, expected,
+        "no unlinked build volume may stay mounted"
+    );
+}
+
+async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &str) {
+    let mount = layout.mount(&linked_volume(layout, checkout));
+    let expected = build_volume_label(
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+        &WorkspaceName::new(name).expect("checkout name"),
+    );
+    eventually(
+        "the build volume has its checkout's descriptive label",
+        || {
+            cowshed_core::apfs::volume_name(&mount).expect("read build volume name")
+                == expected.as_str()
+        },
+    )
+    .await;
+}
+
+/// Adopt/new/fork name every attached build volume. Land renames the adopted volume even
+/// without a check, and rm/land reclaim unlinked volumes before returning, without a gc.
+#[tokio::test]
+async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed()
+{
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let layout = build_volumes(&fixture);
+    let previous = linked_volume(&layout, &fixture.checkout);
+    assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
+
+    let topic = new_workspace(&mut service, "topic").await;
+    assert_build_label(&layout, &topic, "topic").await;
+    assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
+
+    succeed(&mut service, ["fork", "topic", "sibling"]).await;
+    let sibling = service
+        .path("sibling", false)
+        .await
+        .expect("sibling is mounted")
+        .mount;
+    let sibling_volume = linked_volume(&layout, &sibling);
+    assert_build_label(&layout, &sibling, "sibling").await;
+    assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic, &sibling]);
+    succeed(&mut service, ["rm", "sibling"]).await;
+    assert!(
+        !layout.image(&sibling_volume).exists(),
+        "rm reclaims the unlinked image before returning"
+    );
+    assert!(
+        !layout.record(&sibling_volume).exists(),
+        "rm reclaims the unlinked record"
+    );
+    assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
+
+    fs::write(topic.join("tracked"), b"landed change\n").expect("change tracked source");
+    git(&topic, &["commit", "-q", "-am", "change tracked source"]);
+    let landing = linked_volume(&layout, &topic);
+    let report = land(&mut service, "topic", false, &[]).await;
+    assert!(!report.retired, "{report:?}");
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
+    assert!(
+        !layout.image(&previous).exists(),
+        "land --no-retire immediately reclaims main's previous image"
+    );
+    assert!(
+        !layout.record(&previous).exists(),
+        "land reclaims the previous record"
+    );
+    assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
+
+    succeed(&mut service, ["rm", "topic"]).await;
+    assert!(
+        layout.image(&landing).exists(),
+        "rm preserves main's adopted volume"
+    );
+    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// A host process's cwd is not a cowshed ownership hold: retirement force-unmounts the
+/// unlinked volume and reports exactly which live pid and command lost access.
+#[tokio::test]
+async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_volume() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let layout = build_volumes(&fixture);
+    let topic = new_workspace(&mut service, "topic").await;
+    let volume = linked_volume(&layout, &topic);
+    let mount = layout.mount(&volume);
+    let holder = Holder(
+        Command::new("/bin/cat")
+            .current_dir(&mount)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a host process with cwd in the build volume"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    eventually("cat holds the build volume as its cwd", || {
+        nx::volume_holders(&mount)
+            .expect("query build volume holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    })
+    .await;
+
+    let (_, stderr) = succeed(&mut service, ["rm", "topic"]).await;
+    assert!(
+        !layout.image(&volume).exists(),
+        "rm must reclaim a merely kernel-busy image: {stderr}"
+    );
+    assert!(!layout.record(&volume).exists(), "rm reclaims its record");
+    assert!(
+        stderr.contains(&format!("pid {pid} (/bin/cat)")),
+        "forced release names the holder's pid and command: {stderr}"
+    );
+    assert!(
+        stderr.contains("forced"),
+        "forced release is explicit: {stderr}"
+    );
+    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
+    drop(holder);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

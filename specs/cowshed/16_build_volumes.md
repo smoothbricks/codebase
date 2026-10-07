@@ -71,6 +71,12 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.asif` with its sidecar
   `<id>.asif.json`. It is attached `nobrowse` at a store-side mountpoint, `<mount-root>/.build/<owner>/<repo>/<id>`,
   never inside another volume.
+- **Names**: every attached build volume is named `[cowshed] <project> — build <checkout>` (the project is displayed as
+  `<owner> · <repo>`); main uses `build main`, and a session uses `build <ws>`. A volume is never left named only
+  `[cowshed]`. Its supervisor queues the APFS rename off the provisioning path, checks the name again on controller
+  start, and queues a new name whenever land or adopt changes the checkout that owns it. A seed is named
+  `[cowshed] <project> — seed <target>` whenever cowshed attaches it; freezing or superseding a detached seed does not
+  attach it merely to rename it.
 - **Capacity**: 100 GiB by default for a build volume created from nothing; `.cowshed.toml`
   `[build] capacity = "<size>"` overrides it per project. A sparse image costs only its written blocks, so the capacity
   is not an allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with
@@ -355,8 +361,9 @@ same for main and for an integration workspace; "the target" is whichever one it
       that runs outside every sandbox (the host daemon a client started since 5.3);
    4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
       go of the locks;
-   5. hand ownership in the sidecars: the target owns the adopted volume; its previous volume becomes unlinked (GC
-      below).
+   5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
+      `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless an
+      operation lock or a running job's hold still owns it. This applies with `--no-retire` too.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -469,18 +476,28 @@ again at any level above it.
 
 ## Garbage collection
 
-- A build volume that no checkout links, that is not a seed, and that is **not busy** is detached and deleted. "Not
-  busy" is the kernel's answer: a non-forced detach that the image driver refuses while any process has a file or
-  working directory in the volume (01_storage.md detach). Cowshed never forces it and never infers idleness from a
-  process scan. A refused detach leaves the volume for the next GC pass. A process that still runs on main's previous
-  build volume after a swap therefore keeps it alive until it exits.
-- Each target keeps only its latest seed; a target's seed is deleted when the target retires.
+- The last checkout link is the reclaim moment. Removing or retiring a checkout, adopting a replacement, failing a fork,
+  or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
+  `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
+- Ownership is an operation lock or a job hold, not the kernel's refusal to unmount. Every admitted cowshed job holds a
+  shared flock on the build volume's `<id>.asif.hold` for its lifetime; release must claim it exclusively. A running job
+  therefore keeps main's previous volume across a swap. A held lifecycle/image lock likewise defers release.
+- Once no owner remains, release first requests a non-forced unmount and allows a bounded grace for holders to release
+  it. If the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold
+  file and mountpoint. Before forcing, it records the remaining holders and names each pid and command in the release
+  span and on stderr. Editors or indexers holding files or a working directory without a cowshed job hold cannot keep an
+  unlinked volume attached indefinitely. Force here revokes their access to the volume; it does not kill them.
+- Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
+  when the target retires. Detached seeds do not need an attach or a rename to be deleted.
 - A fork's volume and seed exist before its workspace does: `cowshed new` and `cowshed fork` clone them into the staged
   checkout, which no other process can read, and publish the workspace afterwards. While the create or fork is past its
   mutation fence and unfinished in the lifecycle intent journal, collection in any process defers the volumes recorded
   as that workspace's or as its seed, and every image without a record, naming the workspace. Without this, an `rm` in
   one process deleted the volume and seed of a `new` running in another, and the new workspace's mount refused its link
   to a volume nobody owned.
+- Collection says why it skips: current checkout links and latest seeds are counted as retained; a job hold, lifecycle
+  lock, image lock, unfinished operation or failed release names the volume and reason. One volume's release failure
+  does not hide later candidates. `--dry-run` changes nothing and reports the same ownership reasons.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
   database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in
@@ -665,8 +682,9 @@ it belongs to. Each job's sandbox grants exactly the build volume the controller
 - A job admitted after a swap, and the Nx daemon the supervisor restarts after it, use the new build volume entirely.
   The keeper resolves the current pointer through the same controller-owned layout as admission on every restart, even
   when no user job has been admitted since the swap. Repository links alone never authorize a mount.
-- A job admitted before the swap keeps its grant and stays on the old volume. The target's previous volume is released
-  without force, so it stays attached, busy, until the last such job exits; GC then deletes it. Nothing is killed.
+- A job admitted before the swap keeps its grant and a shared build-volume hold, so the target's previous volume stays
+  attached until the last such job exits. Its hold prevents even a forced collection; GC releases the volume once that
+  hold is gone. A host process with no job hold does not own the unlinked volume (Garbage collection).
 - A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the
@@ -722,6 +740,11 @@ The decisions this spec records, in the order they were taken. It is kept so the
   opened the adopted one. The swap now holds stock Nx's own open locks from the look to the rename, and hands a live
   host daemon's record to the adopted volume so the swap does not end that daemon under the client that waited. The
   carry commits with foreign keys enforced, so an index Nx could not have written fails the carry instead.
+- 2026-10-07: cloning the formatted blank template had left build volumes named only `[cowshed]`, and treating a
+  kernel-busy unmount as ownership stranded unlinked images behind editors and indexers. Names now identify project,
+  checkout and build/seed role off the provisioning path, and follow land/adopt ownership changes. An operation lock or
+  running job's flock is the ownership proof; otherwise the last checkout link triggers release with grace then force,
+  naming every evicted holder and every collection deferral. Detached seeds are labelled lazily when attached.
 
 ## Open questions
 
