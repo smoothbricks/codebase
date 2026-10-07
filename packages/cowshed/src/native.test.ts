@@ -530,7 +530,6 @@ describe('Cowshed Node-API bindings', () => {
         ]),
       ],
       stderr: '',
-      heard: [],
     });
   }, 30_000);
 
@@ -695,8 +694,6 @@ describe('Cowshed Node-API bindings', () => {
     });
   }, 30_000);
 });
-
-const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
 
 /**
  * A Node controller serves the wire on one end of a socket pair and hands the other end to a Node
