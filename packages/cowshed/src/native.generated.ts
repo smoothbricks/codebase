@@ -2,7 +2,13 @@
 /// <reference types="node" />
 
 import type * as Api from './api.generated.js';
-import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';
+import {
+  type EventIterator,
+  eventIterator,
+  type NativeJobHandle,
+  type NativeWorkspaceHandle,
+  type NativeWorkspaceRefHandle,
+} from './native.js';
 import * as V from './validators.generated.js';
 
 /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */
@@ -13,7 +19,8 @@ export interface NativeDownload {
 
 /**
  * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,
- * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes.
+ * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even
+ * while a `next` waits, which then resolves to `null`.
  */
 export interface NativeEvents {
   next(): Promise<string | null>;
@@ -655,18 +662,11 @@ export type JobProgressArguments = Pick<Api.ProgressRequest, 'everyMs'>;
  * Streams one job's resource samples: the latest at once, one every interval while it runs,
  * then its terminal sample once.
  */
-export async function* jobProgress(
+export function jobProgress(
   handle: NativeJobProgress,
   args: JobProgressArguments,
-): AsyncGenerator<Api.JobResourceSample, void, undefined> {
-  const events = await handle.progress(JSON.stringify(args));
-  try {
-    for (let event = await events.next(); event !== null; event = await events.next()) {
-      yield V.parseJobResourceSample(event);
-    }
-  } finally {
-    await events.close();
-  }
+): EventIterator<Api.JobResourceSample> {
+  return eventIterator(() => handle.progress(JSON.stringify(args)), V.parseJobResourceSample);
 }
 
 /** A handle that serves `job.sealed`. */
