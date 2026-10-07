@@ -148,6 +148,13 @@
     "cursor": { "stdout": 1048576, "stderr": 0 },
     "limits": { "bytesPerStream": 4096, "linesPerStream": 100 }
   },
+  "job.progress": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7,
+    "everyMs": 1000
+  },
   "job.attachWrite": {
     "repoId": "acme/widget",
     "workspace": "feature",

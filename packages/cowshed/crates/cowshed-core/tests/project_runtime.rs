@@ -1303,10 +1303,13 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
     ) -> Result<cowshed_core::api::SealedJob> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        match &self.supervisor {
+            Some(supervisor) => supervisor.sealed(job).await,
+            None => Err(Self::worker_unavailable()),
+        }
     }
 
     async fn wait_job(
@@ -1411,6 +1414,22 @@ impl ProjectRuntimeHost for FakeHost {
             supervisor.tail(job, cursor, limits).await
         }))
     }
+
+    async fn progress_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: cowshed_core::api::SampleInterval,
+    ) -> Result<JobAnswer<cowshed_core::runtime::job_progress::JobProgressStream>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let Some(supervisor) = self.supervisor.clone() else {
+            return Err(Self::worker_unavailable());
+        };
+        Ok(Box::pin(
+            async move { supervisor.progress(job, every).await },
+        ))
+    }
 }
 
 /// Each test binds its root before the runtime that uses it, so the root drops after the runtime.
@@ -1442,7 +1461,7 @@ async fn route(
             None,
         )
         .await?;
-    let (value, binary) = response.into_parts();
+    let (value, binary) = response.into_answer()?;
     assert!(binary.is_none());
     Ok(value)
 }
@@ -1618,7 +1637,7 @@ async fn log_binary_metadata_carries_the_exact_next_offset() {
         )
         .await
         .expect("log route");
-    let (metadata, bytes) = response.into_parts();
+    let (metadata, bytes) = response.into_answer().expect("one answer");
     assert_eq!(metadata, json!({ "eof": true, "nextOffset": 7 }));
     assert_eq!(bytes, Some(Bytes::new()));
 }
@@ -1813,6 +1832,12 @@ fn scripted_supervisor(
     root: &Path,
     spawned: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
 ) -> WorkspaceSupervisorHandle {
+    supervisor_spawning(root, Box::new(ScriptedSpawner { spawned }))
+}
+
+/// A real workspace supervisor over the real artifact store under `root`, whose job processes
+/// `spawner` starts.
+fn supervisor_spawning(root: &Path, spawner: Box<dyn SpawnSink>) -> WorkspaceSupervisorHandle {
     let config = supervisor_config(root);
     let artifacts = ArtifactStoreSink::open(
         config.workspace_root.clone(),
@@ -1823,7 +1848,7 @@ fn scripted_supervisor(
     .expect("open artifact store");
     WorkspaceSupervisor::start_with_sinks(
         config,
-        Box::new(ScriptedSpawner { spawned }),
+        spawner,
         Box::new(artifacts),
         Box::new(AcceptedCommitments),
     )
@@ -2221,6 +2246,171 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
         .await
         .expect_err("sealed, past the end");
     assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+}
+
+/// A job whose leader is a real child the test holds: `/bin/cat` of a FIFO, leading a process
+/// group of its own, blocked opening the FIFO until the test opens it to write. The test speaks
+/// for the job's lifecycle through its event sender, as [`ScriptedSpawner`] does; its resource
+/// samples read the real group.
+struct GatedSpawner {
+    gate: PathBuf,
+    spawned: mpsc::UnboundedSender<(mpsc::Sender<ProcessEvent>, std::process::Child)>,
+}
+
+#[async_trait]
+impl SpawnSink for GatedSpawner {
+    async fn spawn(
+        &mut self,
+        _request: ProcessSpawnRequest,
+        events: mpsc::Sender<ProcessEvent>,
+    ) -> Result<Box<dyn RunningProcess>> {
+        use cowshed_core::fork_lock::Spawn as _;
+        use std::os::unix::process::CommandExt as _;
+        // `cat` through PATH: a Nix-built Linux host has no /bin/cat.
+        let child = std::process::Command::new("cat")
+            .arg(&self.gate)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn_locked()
+            .expect("a gated child");
+        let process = OwnedProcess {
+            // Identified while this test holds it unreaped.
+            birth: Birth::of(child.id()),
+            spawned: Instant::now(),
+            host: cowshed_core::host_load::read_host_load(),
+        };
+        self.spawned.send((events, child)).expect("spawn observer");
+        Ok(Box::new(ScriptedProcess { process }))
+    }
+}
+
+/// Over the controller, `progress(everyMs)` sends a running job's latest sample at once and one
+/// more every interval while the job writes nothing, then its terminal sample exactly once --
+/// the one its sealed record keeps -- and closes. A subscription nobody reads holds up no other
+/// call, and dropping one leaves the job running.
+#[tokio::test]
+async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_once() {
+    use std::io::Write as _;
+    let root = test_root();
+    let gate = root.join("gate");
+    // The FIFO is made in-process: a Linux host need not have /usr/bin/mkfifo.
+    let path =
+        std::ffi::CString::new(gate.as_os_str().as_bytes()).expect("a gate path without NUL");
+    // SAFETY: `path` is a NUL-terminated path under this test's own root.
+    let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(
+        made,
+        0,
+        "mkfifo {}: {}",
+        gate.display(),
+        std::io::Error::last_os_error()
+    );
+    let (spawner, mut spawned) = mpsc::unbounded_channel();
+    let jobs = SupervisedJobs::connect(
+        &root,
+        supervisor_spawning(
+            &root,
+            Box::new(GatedSpawner {
+                gate: gate.clone(),
+                spawned: spawner,
+            }),
+        ),
+    )
+    .await;
+    let job = jobs
+        .exec(ExecCommand::Argv(vec![CommandArg::from("build")]))
+        .await;
+    let (process, mut child) = spawned.recv().await.expect("the job's process");
+    let leader = child.id();
+    let every = cowshed_core::api::SampleInterval::new(50).expect("interval");
+
+    // Unread, a subscription holds up nothing else on the connection; dropped, it leaves the
+    // job as it was.
+    let unread = job.progress(every).await.expect("subscribe");
+    assert_eq!(job.status().await.expect("status").state, JobState::Running);
+    drop(unread);
+    assert_eq!(job.status().await.expect("status").state, JobState::Running);
+
+    let mut progress = job.progress(every).await.expect("subscribe");
+    let mut running = Vec::new();
+    // The latest sample at once, then three periodic ones while the job is silent.
+    for _ in 0..4 {
+        let sample = progress
+            .next()
+            .await
+            .expect("a sample while the job runs")
+            .expect("sampled");
+        assert_eq!(
+            (sample.job_id, sample.leader_pid, sample.members.clone()),
+            (job.id(), leader, vec![leader]),
+            "a running sample of the gated group"
+        );
+        assert_eq!(
+            (sample.stdout.bytes.get(), sample.stderr.bytes.get()),
+            (0, 0),
+            "the job wrote nothing"
+        );
+        running.push(sample);
+    }
+    for pair in running.windows(2) {
+        assert!(
+            pair[0].wall_us < pair[1].wall_us && pair[0].sampled_at <= pair[1].sampled_at,
+            "each sample is a later observation: {pair:?}"
+        );
+    }
+    assert_eq!(job.status().await.expect("status").state, JobState::Running);
+
+    // Release the child: opening the FIFO to write lets `cat` open it, and closing it ends
+    // `cat` at end of file.
+    let released = gate.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut gate = std::fs::OpenOptions::new()
+            .write(true)
+            .open(released)
+            .expect("open the gate");
+        gate.write_all(b"done").expect("release the child");
+    })
+    .await
+    .expect("release task");
+    // The leader stays unreaped until the job concludes, as a real parent holds it, so the
+    // terminal sample can still read its rusage.
+    // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waiting for the test's own child without reaping it.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            leader,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+    end(&job, &process).await;
+    let (sealed, _) = jobs.worker.sealed(job.id()).await.expect("sealed record");
+    assert!(child.wait().expect("reap the child").success());
+    let sealed = sealed.resources.expect("a sealed terminal sample");
+
+    let mut after = Vec::new();
+    while let Some(sample) = progress.next().await {
+        after.push(sample.expect("sampled"));
+    }
+    let (terminal, live) = after.split_last().expect("the terminal sample");
+    assert_eq!(terminal, &sealed, "the last sample is the sealed one");
+    assert_eq!(
+        (terminal.leader_pid, terminal.members.clone()),
+        (leader, Vec::new()),
+        "the leader is named after its group emptied"
+    );
+    assert!(
+        live.iter().all(|sample| sample.members == [leader]),
+        "only running samples precede the terminal one, which is sent once: {after:?}"
+    );
+    assert!(
+        progress.next().await.is_none(),
+        "the stream stays closed after its terminal sample"
+    );
 }
 
 /// Every byte `stream` yields until it closes.

@@ -6,16 +6,17 @@ with identical semantics and error taxonomy.
 
 > **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
 > duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
-> and complete-group termination. Core job resource samples and terminal persistence are implemented; periodic progress
-> streams and keyed admission/lookup are not yet complete. Controller request/result codecs, TypeScript types and
-> validators, and N-API operation bindings derive from one Rust API declaration. The addon exposes the declared offset
-> log reads and bounded `job.tail` operation; async stream backpressure, attachment stdin EOF, group-listener queries,
-> and abort plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no
-> close operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts,
-> process event streams, leaf-work identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The
-> ownership ledger identifies groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2
-> accounting, measured Linux fork/exec event-source selection, macOS exit observation and rusage reconciliation,
-> charged-memory counters, and explicit unattributed-usage rows are also unbuilt.
+> and complete-group termination. Core job resource samples and terminal persistence are implemented, and `progress`
+> streams them over the controller; the N-API projection of stream-lane calls and keyed admission/lookup are not yet
+> complete. Controller request/result codecs, TypeScript types and validators, and N-API operation bindings derive from
+> one Rust API declaration. The addon exposes the declared offset log reads and bounded `job.tail` operation; async
+> stream backpressure, attachment stdin EOF, group-listener queries, and abort plumbing remain separate implementation
+> work. Core attachment stdin writes exist, but `JobStdin` has no close operation on main yet. Complete fork/exec
+> process-tree observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work identity, and
+> the compact process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies groups for safe
+> termination; it does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux fork/exec
+> event-source selection, macOS exit observation and rusage reconciliation, charged-memory counters, and explicit
+> unattributed-usage rows are also unbuilt.
 
 ## Authority model (frozen)
 
@@ -342,7 +343,7 @@ impl JobHandle {
     pub async fn listening_ports(&self) -> Result<JobListeningPorts, CowshedError>;
     pub async fn processes(&self) -> Result<JobProcessTree, CowshedError>;
     pub async fn process_events(&self, every_ms: u64) -> Result<JobProcessStream, CowshedError>;
-    pub async fn progress(&self, every_ms: u64) -> Result<JobProgressStream, CowshedError>;
+    pub async fn progress(&self, every: SampleInterval) -> Result<EventStream<JobProgress>, CowshedError>;
     pub async fn tail(&self, cursor: Option<JobJournalCursor>, limits: JobTailLimits)
         -> Result<JobTail, CowshedError>;
     // From `offset` on: a reader holding the first `offset` bytes continues where it stopped.
@@ -1417,6 +1418,16 @@ One boundary answer, no ambiguity:
   while it is still in it; all of a call's step frames precede its answer. A request without `steps` never gets a step
   frame, so a client that never asks reads only answers. The Rust client exposes this as
   `Coordinator::create_reporting`, which sends each step to a channel the caller reads while the create runs.
+- **A stream-lane call answers each demand.** An operation declared `stream` answers with events of its declared result,
+  then ends. Its request is its first demand; each later one is a `{id, demand: "next"}` frame the caller sends only
+  after the event that answered its previous demand, and `{id, demand: "close"}` ends the call at any time. The
+  controller answers every demand with exactly one frame: an `{id, event}` frame, or the call's answer -- `{}` once the
+  events ended or the caller closed it, or the error that ended them. So an unread stream holds the controller to one
+  event and the connection to none, and a producer coalesces or holds what its reader has not asked for. A close that
+  crosses the call's end is no error; a second demand while one is unanswered, or a demand naming no open stream, ends
+  the connection. Stream-lane calls do not count against the 64 open calls: a connection holds at most 64 open streams
+  and refuses one past that, and always reads demands. The Rust client exposes a call as `EventStream<O>`; dropping it
+  before its end sends the close.
 - **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.

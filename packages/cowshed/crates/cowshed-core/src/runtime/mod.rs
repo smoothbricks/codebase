@@ -4,6 +4,7 @@ pub mod commitment_feed;
 #[cfg(target_os = "macos")]
 pub mod job_accounting;
 pub mod job_groups;
+pub mod job_progress;
 mod job_resources;
 pub mod job_spans;
 pub(crate) mod nx_daemon;

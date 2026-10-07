@@ -29,6 +29,11 @@ pub(super) enum Sampling {
 }
 
 impl Sampling {
+    /// Whether the job owns processes a read observes now.
+    pub(super) fn owns(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+
     /// The job owns `process`. Its first process starts the sampling; a later one -- its
     /// command, after its activation -- takes the lead and keeps the spawn's baselines. Returns
     /// the sampler to observe, or `None` once the job ended.

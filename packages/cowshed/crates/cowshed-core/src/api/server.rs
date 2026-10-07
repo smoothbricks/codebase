@@ -8,7 +8,9 @@ use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
 use crate::timing::StepSink;
+use async_trait::async_trait;
 use bytes::Bytes;
+use codec::Demand;
 use serde::Deserialize;
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -81,6 +83,31 @@ pub(crate) mod codec {
     struct RpcStepFields<'a> {
         id: u64,
         step: Cow<'a, StepReport>,
+    }
+
+    /// What a caller asks of a stream-lane call it opened: its next event, or its end. The
+    /// request that opens the call is its first demand.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) enum Demand {
+        Next,
+        Close,
+    }
+
+    /// A caller's demand on a stream-lane call it opened.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcDemandFields {
+        id: u64,
+        demand: Demand,
+    }
+
+    /// One event of a stream-lane call: the answer to one demand that is not the call's end.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcEventFields<'a> {
+        id: u64,
+        event: Cow<'a, Value>,
     }
 
     #[derive(Debug)]
@@ -241,12 +268,20 @@ pub(crate) mod codec {
         }
     }
 
-    /// What a client reads off the connection: one step of a call that asked for its steps, or a
-    /// call's answer.
+    /// What a client reads off the connection: one step of a call that asked for its steps, one
+    /// event of a stream-lane call, or a call's answer.
     #[derive(Debug)]
     pub(crate) enum DecodedServerFrame {
         Step { id: u64, report: StepReport },
+        Event { id: u64, event: Value },
         Response(DecodedRpcResponse),
+    }
+
+    /// What a controller reads off the connection: a call, or a demand on a stream it opened.
+    #[derive(Debug)]
+    pub(crate) enum DecodedClientFrame {
+        Request(DecodedRpcRequest),
+        Demand { id: u64, demand: Demand },
     }
 
     pub(crate) fn encode_client_hello(nonce: &str) -> Result<Vec<u8>, WireCodecError> {
@@ -301,9 +336,32 @@ pub(crate) mod codec {
         )
     }
 
-    pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<DecodedRpcRequest, WireCodecError> {
-        decode::<RpcRequestFields<'static, Value>>(bytes, MAX_JSON_FRAME_BYTES)
-            .map(DecodedRpcRequest)
+    /// A request decodes as one; only a frame that is not one is read as a demand. Neither shape
+    /// accepts the other's fields, and a frame that is neither reports why it is not a request.
+    pub(crate) fn decode_client_frame(bytes: &[u8]) -> Result<DecodedClientFrame, WireCodecError> {
+        match decode::<RpcRequestFields<'static, Value>>(bytes, MAX_JSON_FRAME_BYTES) {
+            Ok(request) => Ok(DecodedClientFrame::Request(DecodedRpcRequest(request))),
+            Err(not_a_request) => decode::<RpcDemandFields>(bytes, MAX_JSON_FRAME_BYTES)
+                .map(|fields| DecodedClientFrame::Demand {
+                    id: fields.id,
+                    demand: fields.demand,
+                })
+                .map_err(|_| not_a_request),
+        }
+    }
+
+    pub(crate) fn encode_rpc_demand(id: u64, demand: Demand) -> Result<Vec<u8>, WireCodecError> {
+        encode(&RpcDemandFields { id, demand }, MAX_JSON_FRAME_BYTES)
+    }
+
+    pub(crate) fn encode_rpc_event(id: u64, event: &Value) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcEventFields {
+                id,
+                event: Cow::Borrowed(event),
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
     }
 
     pub(crate) fn encode_rpc_step(id: u64, report: &StepReport) -> Result<Vec<u8>, WireCodecError> {
@@ -349,19 +407,27 @@ pub(crate) mod codec {
         )
     }
 
-    /// An answer decodes as one; only a frame that is not one is read as a step. Neither shape
-    /// accepts the other's fields, so no frame is both, and a frame that is neither reports why it
-    /// is not an answer.
+    /// An answer decodes as one; only a frame that is not one is read as a step, then as an
+    /// event. No shape accepts another's fields, so no frame is two, and a frame that is none
+    /// reports why it is not an answer.
     pub(crate) fn decode_server_frame(bytes: &[u8]) -> Result<DecodedServerFrame, WireCodecError> {
-        match decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES) {
-            Ok(response) => Ok(DecodedServerFrame::Response(DecodedRpcResponse(response))),
-            Err(not_an_answer) => decode::<RpcStepFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
-                .map(|fields| DecodedServerFrame::Step {
-                    id: fields.id,
-                    report: fields.step.into_owned(),
-                })
-                .map_err(|_| not_an_answer),
+        let not_an_answer = match decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
+        {
+            Ok(response) => return Ok(DecodedServerFrame::Response(DecodedRpcResponse(response))),
+            Err(not_an_answer) => not_an_answer,
+        };
+        if let Ok(fields) = decode::<RpcStepFields<'static>>(bytes, MAX_JSON_FRAME_BYTES) {
+            return Ok(DecodedServerFrame::Step {
+                id: fields.id,
+                report: fields.step.into_owned(),
+            });
         }
+        decode::<RpcEventFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
+            .map(|fields| DecodedServerFrame::Event {
+                id: fields.id,
+                event: fields.event.into_owned(),
+            })
+            .map_err(|_| not_an_answer)
     }
 
     #[cfg(test)]
@@ -399,7 +465,19 @@ pub(crate) mod codec {
                 DecodedServerFrame::Step { id, report } => {
                     panic!("call {id}'s answer decoded as step {report:?}")
                 }
+                DecodedServerFrame::Event { id, event } => {
+                    panic!("call {id}'s answer decoded as event {event}")
+                }
             }
+        }
+
+        fn decode_request(frame: &[u8]) -> Result<DecodedRpcRequest, WireCodecError> {
+            decode_client_frame(frame).map(|frame| match frame {
+                DecodedClientFrame::Request(request) => request,
+                DecodedClientFrame::Demand { id, demand } => {
+                    panic!("a request decoded as demand {demand:?} on {id}")
+                }
+            })
         }
 
         #[test]
@@ -414,7 +492,7 @@ pub(crate) mod codec {
                 request_value.get("steps").is_none(),
                 "a call that does not ask for its steps sends what a controller without them reads"
             );
-            let decoded = decode_rpc_request(&request).expect("decode request");
+            let decoded = decode_request(&request).expect("decode request");
             assert!(!decoded.steps());
             assert_eq!(
                 (
@@ -440,11 +518,7 @@ pub(crate) mod codec {
             let raw = serde_json::value::to_raw_value(&json!({})).expect("raw params");
             let request = encode_rpc_request(9, "coordinator.create", &raw, None, true)
                 .expect("encode request");
-            assert!(
-                decode_rpc_request(&request)
-                    .expect("decode request")
-                    .steps()
-            );
+            assert!(decode_request(&request).expect("decode request").steps());
 
             let report = StepReport::Started {
                 step: 3,
@@ -460,10 +534,42 @@ pub(crate) mod codec {
                 } => {
                     assert_eq!((id, decoded), (9, report));
                 }
-                DecodedServerFrame::Response(response) => {
-                    panic!("a step decoded as an answer: {:?}", response.into_parts())
+                other => panic!("a step decoded as another frame: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_stream_call_s_demands_and_events_have_frames_of_their_own() {
+            for demand in [Demand::Next, Demand::Close] {
+                let frame = encode_rpc_demand(4, demand).expect("encode demand");
+                match decode_client_frame(&frame).expect("decode demand") {
+                    DecodedClientFrame::Demand {
+                        id,
+                        demand: decoded,
+                    } => {
+                        assert_eq!((id, decoded), (4, demand));
+                    }
+                    DecodedClientFrame::Request(request) => {
+                        panic!("a demand decoded as request {}", request.method())
+                    }
                 }
             }
+            let event = json!({"jobId": 7, "wallMs": 12});
+            let frame = encode_rpc_event(4, &event).expect("encode event");
+            match decode_server_frame(&frame).expect("decode event") {
+                DecodedServerFrame::Event { id, event: decoded } => {
+                    assert_eq!((id, decoded), (4, event));
+                }
+                other => panic!("an event decoded as another frame: {other:?}"),
+            }
+            assert!(decode_client_frame(br#"{"id":4,"demand":"next","extra":true}"#).is_err());
+            assert!(decode_client_frame(br#"{"id":4,"demand":"rewind"}"#).is_err());
+            assert!(decode_server_frame(br#"{"id":4,"event":{},"extra":true}"#).is_err());
+            assert!(
+                decode_server_frame(br#"{"id":4,"event":{},"step":{"event":"ended","step":0}}"#)
+                    .is_err(),
+                "a frame is an event or a step, never both"
+            );
         }
 
         #[test]
@@ -476,7 +582,7 @@ pub(crate) mod codec {
                 .is_err()
             );
             assert!(
-                decode_rpc_request(br#"{"id":1,"method":"project.list","params":{},"extra":true}"#)
+                decode_request(br#"{"id":1,"method":"project.list","params":{},"extra":true}"#)
                     .is_err()
             );
             assert!(
@@ -587,18 +693,35 @@ impl RouterRequest {
     }
 }
 
-/// The router's JSON result and optional single bounded raw-byte lane.
-#[derive(Debug)]
+/// The events of a stream-lane call, taken one for each demand of its caller.
+#[async_trait]
+pub trait EventSource: Send {
+    /// The next event, waiting for it; `None` once the stream ended. An error ends it too.
+    async fn next(&mut self) -> Option<Result<Value>>;
+}
+
+/// The router's answer to one call.
 pub struct RouterResponse {
-    result: Value,
-    binary: Option<Bytes>,
+    body: RouterBody,
+}
+
+/// What a call is answered with: its JSON result and optional single bounded raw-byte lane, or,
+/// for a stream-lane call, the events its caller demands.
+pub enum RouterBody {
+    Answer {
+        result: Value,
+        binary: Option<Bytes>,
+    },
+    Events(Box<dyn EventSource>),
 }
 
 impl RouterResponse {
     pub fn json(result: Value) -> Self {
         Self {
-            result,
-            binary: None,
+            body: RouterBody::Answer {
+                result,
+                binary: None,
+            },
         }
     }
 
@@ -609,13 +732,48 @@ impl RouterResponse {
             ));
         }
         Ok(Self {
-            result,
-            binary: Some(binary),
+            body: RouterBody::Answer {
+                result,
+                binary: Some(binary),
+            },
         })
     }
 
-    pub fn into_parts(self) -> (Value, Option<Bytes>) {
-        (self.result, self.binary)
+    pub fn events(source: Box<dyn EventSource>) -> Self {
+        Self {
+            body: RouterBody::Events(source),
+        }
+    }
+
+    pub fn into_body(self) -> RouterBody {
+        self.body
+    }
+
+    /// The one answer of a call that is no stream: its JSON result and its raw-byte frame, if
+    /// any. Events where one answer was due are an internal error.
+    pub fn into_answer(self) -> Result<(Value, Option<Bytes>)> {
+        match self.body {
+            RouterBody::Answer { result, binary } => Ok((result, binary)),
+            RouterBody::Events(_) => Err(CowshedError::internal(
+                "controller router answered with events where one answer was due",
+            )),
+        }
+    }
+}
+
+impl std::fmt::Debug for RouterResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.body {
+            RouterBody::Answer { result, binary } => formatter
+                .debug_struct("RouterResponse")
+                .field("result", result)
+                .field("binary", binary)
+                .finish(),
+            RouterBody::Events(_) => formatter
+                .debug_struct("RouterResponse")
+                .field("events", &"…")
+                .finish(),
+        }
     }
 }
 
@@ -696,7 +854,7 @@ impl RouterHandle {
         let (result, _) = self
             .route(authority, O::request(request), None, None)
             .await?
-            .into_parts();
+            .into_answer()?;
         decode_result::<O>(result)
     }
 }
@@ -706,11 +864,14 @@ impl RouterHandle {
 /// Requests arrive in id order and are answered as each completes, not in arrival order: a
 /// request that waits on a job (its end, its next output) must not hold the answers to the
 /// requests behind it. Each answer, with its binary frame, is written whole under the writer
-/// lock. At most [`MAX_IN_FLIGHT_REQUESTS`] are open at once; past that the connection reads no
-/// further request until one completes.
+/// lock. At most [`MAX_IN_FLIGHT_REQUESTS`] calls that are not streams are open at once; past
+/// that the connection reads no further frame until one completes. A stream-lane call is open
+/// until its caller ends it, so it counts against [`MAX_OPEN_STREAMS`] instead, and a stream
+/// request past that is refused: a caller's demands are always read, and no stream waits on a
+/// demand the connection does not read.
 ///
-/// Dropping this future owns only connection state: its unanswered requests are abandoned, and
-/// routed jobs remain owned by the router actor.
+/// Dropping this future owns only connection state: its unanswered requests are abandoned, its
+/// streams end, and routed jobs remain owned by the router actor.
 pub async fn serve_controller_connection(
     descriptor: OwnedFd,
     authority: ConnectionAuthority,
@@ -754,54 +915,97 @@ pub async fn serve_controller_connection(
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut answers = tokio::task::JoinSet::new();
-    let mut incoming = std::pin::pin!(next_request(reader));
+    // Where each open stream-lane call's demands go, by call id: a subset of `answers`, entered
+    // when its answer starts and removed when that answer ends.
+    let mut streams = std::collections::HashMap::<u64, mpsc::UnboundedSender<Demand>>::new();
+    let mut incoming = std::pin::pin!(next_frame(reader));
     // Set once a request ends the connection: no further request is read, and the loop ends
     // with the answer that reports it.
     let mut closing = false;
     let mut next_id = 1_u64;
     loop {
         tokio::select! {
-            (reader, request) = incoming.as_mut(),
-                if !closing && answers.len() < MAX_IN_FLIGHT_REQUESTS =>
+            (reader, frame) = incoming.as_mut(),
+                if !closing && answers.len() - streams.len() < MAX_IN_FLIGHT_REQUESTS =>
             {
-                let Some((request, upload)) = request? else {
+                let Some(frame) = frame? else {
                     return Ok(());
                 };
-                incoming.set(next_request(reader));
-                if request.id() != next_id {
+                incoming.set(next_frame(reader));
+                let (request, upload) = match frame {
+                    ClientFrame::Request(request, upload) => (request, upload),
+                    ClientFrame::Demand { id, demand } => {
+                        let delivered = streams
+                            .get(&id)
+                            .is_some_and(|stream| stream.send(demand).is_ok());
+                        // A close may cross the end its stream answered, so one for a call
+                        // that was sent and has ended is no error; any other demand needs an
+                        // open stream to answer it.
+                        if !delivered && (demand == Demand::Next || id >= next_id) {
+                            closing = true;
+                            let error = protocol_error(
+                                "controller RPC demand names no open stream-lane call",
+                            );
+                            answers.spawn(refuse(Arc::clone(&writer), id, error, true));
+                        }
+                        continue;
+                    }
+                };
+                let id = request.id();
+                if id != next_id {
                     closing = true;
                     let error = protocol_error(
                         "controller RPC request id was replayed or arrived out of order",
                     );
-                    answers.spawn(refuse(Arc::clone(&writer), request.id(), error, true));
+                    answers.spawn(refuse(Arc::clone(&writer), id, error, true));
                     continue;
                 }
                 next_id = next_id
                     .checked_add(1)
                     .ok_or_else(|| protocol_error("controller RPC request id overflowed"))?;
-                let operation = match validate_request(&authority, &request) {
-                    Ok(operation) => operation,
+                let (operation, lane) = match validate_request(&authority, &request) {
+                    Ok(validated) => validated,
                     Err(error) => {
                         let fatal = error.code == ErrorCode::Integrity;
                         closing |= fatal;
-                        answers.spawn(refuse(Arc::clone(&writer), request.id(), error, fatal));
+                        answers.spawn(refuse(Arc::clone(&writer), id, error, fatal));
                         continue;
                     }
+                };
+                let demands = if lane == Lane::Stream {
+                    if streams.len() >= MAX_OPEN_STREAMS {
+                        let error = CowshedError::conflict(
+                            format!(
+                                "this connection already has {MAX_OPEN_STREAMS} open streams"
+                            ),
+                            "end a stream before opening another",
+                        );
+                        answers.spawn(refuse(Arc::clone(&writer), id, error, false));
+                        continue;
+                    }
+                    let (demand, demands) = mpsc::unbounded_channel();
+                    streams.insert(id, demand);
+                    Some(demands)
+                } else {
+                    None
                 };
                 answers.spawn(answer(
                     Arc::clone(&writer),
                     router.clone(),
                     authority.clone(),
-                    request.id(),
+                    id,
                     request.steps(),
                     operation,
                     upload,
+                    demands,
                 ));
             }
             Some(outcome) = answers.join_next() => {
-                outcome.map_err(|error| {
+                let (id, outcome) = outcome.map_err(|error| {
                     CowshedError::internal(format!("controller RPC answer task failed: {error}"))
-                })??;
+                })?;
+                streams.remove(&id);
+                outcome?;
             }
             // Reading stops only while an answer is open, so one is always pending here.
             else => {
@@ -813,30 +1017,45 @@ pub async fn serve_controller_connection(
     }
 }
 
-/// Requests one connection may have open at once.
+/// Calls other than streams one connection may have open at once.
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
+/// Stream-lane calls one connection may have open at once.
+const MAX_OPEN_STREAMS: usize = 64;
 
 type ConnectionWriter = Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
 
-type IncomingRequest = Option<(codec::DecodedRpcRequest, Option<Bytes>)>;
-
-/// The next request and its upload frame, or `None` at a clean disconnect. The reader comes
-/// back with it, so the connection can ask for the one after.
-async fn next_request(
-    mut reader: tokio::net::unix::OwnedReadHalf,
-) -> (tokio::net::unix::OwnedReadHalf, Result<IncomingRequest>) {
-    let request = read_request(&mut reader).await;
-    (reader, request)
+/// One frame a client sends: a request with its upload frame, or a demand on an open stream.
+enum ClientFrame {
+    Request(codec::DecodedRpcRequest, Option<Bytes>),
+    Demand { id: u64, demand: Demand },
 }
 
-async fn read_request(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<IncomingRequest> {
+/// The next frame, or `None` at a clean disconnect. The reader comes back with it, so the
+/// connection can ask for the one after.
+async fn next_frame(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+) -> (tokio::net::unix::OwnedReadHalf, Result<Option<ClientFrame>>) {
+    let frame = read_client_frame(&mut reader).await;
+    (reader, frame)
+}
+
+async fn read_client_frame(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+) -> Result<Option<ClientFrame>> {
     let Some(frame) =
         read_optional_frame(reader, MAX_JSON_FRAME_BYTES, "controller RPC request").await?
     else {
         return Ok(None);
     };
-    let request = codec::decode_rpc_request(&frame)
-        .map_err(|error| protocol_error(format!("controller RPC request is invalid: {error}")))?;
+    let request = match codec::decode_client_frame(&frame)
+        .map_err(|error| protocol_error(format!("controller RPC request is invalid: {error}")))?
+    {
+        codec::DecodedClientFrame::Request(request) => request,
+        codec::DecodedClientFrame::Demand { id, demand } => {
+            return Ok(Some(ClientFrame::Demand { id, demand }));
+        }
+    };
     // The upload frame is read with its request, so a request refused below never leaves it
     // to be misread as the next one. A declared length beyond any frame is left unread:
     // validation refuses it, and that ends the connection.
@@ -846,16 +1065,26 @@ async fn read_request(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<In
         }
         Some(_) | None => None,
     };
-    Ok(Some((request, upload)))
+    Ok(Some(ClientFrame::Request(request, upload)))
 }
 
 /// Answer one request with an error; `Err` ends the connection when the error is `fatal`.
-async fn refuse(writer: ConnectionWriter, id: u64, error: CowshedError, fatal: bool) -> Result<()> {
-    write_rpc_error(&mut *writer.lock().await, id, &error).await?;
-    if fatal { Err(error) } else { Ok(()) }
+async fn refuse(
+    writer: ConnectionWriter,
+    id: u64,
+    error: CowshedError,
+    fatal: bool,
+) -> (u64, Result<()>) {
+    let outcome = match write_rpc_error(&mut *writer.lock().await, id, &error).await {
+        Ok(()) if fatal => Err(error),
+        written => written,
+    };
+    (id, outcome)
 }
 
-/// Route one request and write its answer; `Err` ends the connection.
+/// Route one request and write its answer -- for a stream-lane call, the events `demands` asks
+/// for, then its end; `Err` ends the connection.
+#[allow(clippy::too_many_arguments)]
 async fn answer(
     writer: ConnectionWriter,
     router: RouterHandle,
@@ -864,39 +1093,112 @@ async fn answer(
     steps: bool,
     operation: OperationRequest,
     upload: Option<Bytes>,
-) -> Result<()> {
-    let download_offset = operation.download_offset();
-    let response = if steps {
-        route_reporting_steps(&writer, &router, authority, request_id, operation, upload).await?
-    } else {
-        router.route(authority, operation, upload, None).await
-    };
-    let mut writer = writer.lock().await;
-    let writer = &mut *writer;
-    match response {
-        Ok(response) => {
-            let (result, binary) = response.into_parts();
-            let lane = match (download_offset, binary.as_ref()) {
-                (Some(offset), Some(bytes)) => validate_raw_response(&result, offset, bytes.len()),
-                (Some(_), None) => Err(protocol_error(
-                    "controller router omitted the requested raw-byte lane",
-                )),
-                (None, Some(_)) => Err(protocol_error(
-                    "controller router attempted a second or unsolicited raw-byte lane",
-                )),
-                (None, None) => Ok(()),
-            };
-            if let Err(error) = lane {
-                write_rpc_error(writer, request_id, &error).await?;
-                return Err(error);
+    demands: Option<mpsc::UnboundedReceiver<Demand>>,
+) -> (u64, Result<()>) {
+    let outcome = async {
+        let download_offset = operation.download_offset();
+        let response = if steps {
+            route_reporting_steps(&writer, &router, authority, request_id, operation, upload)
+                .await?
+        } else {
+            router.route(authority, operation, upload, None).await
+        };
+        let body = match response {
+            Ok(response) => response.into_body(),
+            Err(error) => {
+                return write_rpc_error(&mut *writer.lock().await, request_id, &error).await;
             }
-            write_rpc_success(writer, request_id, &result, binary.as_ref()).await?;
-            if let Some(binary) = binary {
-                write_binary_frame(writer, &binary).await?;
+        };
+        match (body, demands) {
+            (RouterBody::Events(source), Some(demands)) => {
+                stream_events(&writer, request_id, source, demands).await
             }
-            Ok(())
+            (RouterBody::Answer { result, binary }, None) => {
+                let mut writer = writer.lock().await;
+                let writer = &mut *writer;
+                let lane = match (download_offset, binary.as_ref()) {
+                    (Some(offset), Some(bytes)) => {
+                        validate_raw_response(&result, offset, bytes.len())
+                    }
+                    (Some(_), None) => Err(protocol_error(
+                        "controller router omitted the requested raw-byte lane",
+                    )),
+                    (None, Some(_)) => Err(protocol_error(
+                        "controller router attempted a second or unsolicited raw-byte lane",
+                    )),
+                    (None, None) => Ok(()),
+                };
+                if let Err(error) = lane {
+                    write_rpc_error(writer, request_id, &error).await?;
+                    return Err(error);
+                }
+                write_rpc_success(writer, request_id, &result, binary.as_ref()).await?;
+                if let Some(binary) = binary {
+                    write_binary_frame(writer, &binary).await?;
+                }
+                Ok(())
+            }
+            (RouterBody::Answer { .. }, Some(_)) => {
+                let error = protocol_error("controller router answered a stream-lane call once");
+                write_rpc_error(&mut *writer.lock().await, request_id, &error).await?;
+                Err(error)
+            }
+            (RouterBody::Events(_), None) => {
+                let error = protocol_error(
+                    "controller router answered a call that is no stream with events",
+                );
+                write_rpc_error(&mut *writer.lock().await, request_id, &error).await?;
+                Err(error)
+            }
         }
-        Err(error) => write_rpc_error(writer, request_id, &error).await,
+    }
+    .await;
+    (request_id, outcome)
+}
+
+/// Answer each demand on a stream-lane call with its next event, or with the call's end: an
+/// empty result once the events ended or the caller closed the call, or the error that ended
+/// them. The request was the first demand. `Err` ends the connection.
+async fn stream_events(
+    writer: &ConnectionWriter,
+    id: u64,
+    mut source: Box<dyn EventSource>,
+    mut demands: mpsc::UnboundedReceiver<Demand>,
+) -> Result<()> {
+    let ended = Value::Object(serde_json::Map::new());
+    loop {
+        let event = tokio::select! {
+            biased;
+            demand = demands.recv() => match demand {
+                Some(Demand::Close) => {
+                    return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await;
+                }
+                Some(Demand::Next) => {
+                    let error = protocol_error(
+                        "controller RPC demanded a stream event while one was unanswered",
+                    );
+                    write_rpc_error(&mut *writer.lock().await, id, &error).await?;
+                    return Err(error);
+                }
+                // The connection is gone, and nobody reads an answer.
+                None => return Ok(()),
+            },
+            event = source.next() => event,
+        };
+        match event {
+            Some(Ok(event)) => write_rpc_event(&mut *writer.lock().await, id, &event).await?,
+            Some(Err(error)) => {
+                return write_rpc_error(&mut *writer.lock().await, id, &error).await;
+            }
+            None => return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await,
+        }
+        match demands.recv().await {
+            Some(Demand::Next) => {}
+            Some(Demand::Close) => {
+                return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await;
+            }
+            None => return Ok(()),
+        }
     }
 }
 
@@ -948,7 +1250,7 @@ fn validate_hello(version: u32, nonce: &str) -> Result<()> {
 fn validate_request(
     authority: &ConnectionAuthority,
     request: &codec::DecodedRpcRequest,
-) -> Result<OperationRequest> {
+) -> Result<(OperationRequest, Lane)> {
     let operation = operations::operation(request.method())
         .filter(|operation| operation.scope != Scope::Internal)
         .ok_or_else(|| {
@@ -1005,6 +1307,7 @@ fn validate_request(
         Some(_) | None => {}
     }
     OperationRequest::decode(operation.method, request.params())
+        .map(|decoded| (decoded, operation.lane))
 }
 
 /// A download's JSON half must be its declared envelope, and its `nextOffset` exactly the
@@ -1206,6 +1509,21 @@ async fn write_rpc_error(
         "controller RPC response",
     )
     .await
+}
+
+async fn write_rpc_event(
+    stream: &mut (impl AsyncWrite + Unpin),
+    id: u64,
+    event: &Value,
+) -> Result<()> {
+    let frame = codec::encode_rpc_event(id, event).map_err(|error| {
+        if error.is_too_large() {
+            protocol_error("controller RPC event has invalid length")
+        } else {
+            protocol_error(format!("controller RPC event encoding failed: {error}"))
+        }
+    })?;
+    write_frame(stream, &frame, MAX_JSON_FRAME_BYTES, "controller RPC event").await
 }
 
 async fn write_rpc_step(
