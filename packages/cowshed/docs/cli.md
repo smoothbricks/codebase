@@ -781,10 +781,13 @@ the land's adoption check — is in its live volume and not in the seed. Every `
 this verb does the same on its own. A seed that already holds every write the live volume has had is left alone
 (`fresh`); `cowshed doctor` reports a seed that is behind as `seed-age`.
 
-The live volume must have no writer while it is cloned. The workspace's Nx daemon is stopped the way a land stops it (it
-restarts on the next Nx command); any other process holding the Nx task database, or a Cargo build holding a target
-directory's `.cargo-lock`, leaves the seed as it is and is named (`skipped`). A Cargo build that starts during the clone
-waits for it. The workspace must be attached, because its build link names the volume. `--json`:
+The workspace's Nx daemon is stopped the way a land stops it (it restarts on the next Nx command). A foreign task
+database holder or a Cargo build holding an existing profile's shared `.cargo-lock` leaves the old seed unchanged and is
+named (`skipped`). Existing profile locks cannot fence a profile created later. After that admission check, cowshed
+closes its own lock descriptors and unmounts/detaches the build volume without force, validates the allocation map and
+clones by a held image descriptor. A late build, new profile or editor that prevents the seal is a `volumeBusy` skip,
+not a failed reseed or an attached raw clone. The source is restored before publication; a build starting afterwards
+cannot invalidate the captured seed. The workspace must be attached, because its build link names the volume. `--json`:
 `ReseedResult { workspace, outcome: { kind: "noBuildVolume" | "fresh" | "reseeded" | "skipped", behindMs?, elapsedMs?, reason? } }`.
 
 ### `cowshed rekey <name|main>`

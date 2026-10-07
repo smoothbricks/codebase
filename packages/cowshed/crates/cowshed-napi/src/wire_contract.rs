@@ -681,6 +681,31 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
+    let land_building = LandReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seeded: false,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::LandingBuilding {
+                    lock: PathBuf::from("/Users/fixture/Dev/widget/target/guard/.cargo-lock"),
+                    holders: vec![cowshed_core::api::dto::DatabaseHolder {
+                        pid: 4747,
+                        command: "cargo build --profile guard".to_owned(),
+                    }],
+                },
+            },
+        },
+        ..land_first.clone()
+    };
+    let reseed_busy = cowshed_core::api::dto::ReseedResult {
+        workspace: WorkspaceName::main(),
+        outcome: cowshed_core::api::dto::Reseed::Skipped {
+            behind_ms: Some(1200),
+            reason: cowshed_core::api::dto::ReseedSkip::VolumeBusy {
+                reason: "the source is held by pid 4848 (rust-analyzer); nothing was forced"
+                    .to_owned(),
+            },
+        },
+    };
     // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
     // TypeScript union is not checked against.
     let rebase_carried = RebaseReport {
@@ -822,11 +847,16 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 ("firstLanding", document("land report", &land_first)),
                 ("retired", document("land report", &land_retired)),
                 ("adoptionSkipped", document("land report", &land_held)),
+                ("landingBuilding", document("land report", &land_building)),
                 (
                     "adoptionSkippedOpening",
                     document("land report", &land_opening),
                 ),
             ]),
+        ),
+        (
+            "ReseedResult",
+            BTreeMap::from([("volumeBusy", document("reseed result", &reseed_busy))]),
         ),
         (
             "RebaseReport",

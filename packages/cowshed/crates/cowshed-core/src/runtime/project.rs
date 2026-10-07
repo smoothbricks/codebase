@@ -3803,12 +3803,15 @@ impl NativeProjectRuntimeHost {
                 timed_async("land", "target-lock", contended.wait()).await?
             }
         };
-        timed_async(
+        if let Err(reason) = timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
-        .await?;
+        .await?
+        {
+            return Ok(skipped(reason));
+        }
         let (closed, carried) = match carried {
             Ok(carried) => carried,
             Err(reason) => {

@@ -52,6 +52,7 @@ const seamTypes = {
   DoctorReport: { assertOne: validators.assertDoctorReport, parseOne: validators.parseDoctorReport },
   RemoveReport: { assertOne: validators.assertRemoveReport, parseOne: validators.parseRemoveReport },
   ResizeResult: { assertOne: validators.assertResizeResult, parseOne: validators.parseResizeResult },
+  ReseedResult: { assertOne: validators.assertReseedResult, parseOne: validators.parseReseedResult },
 } satisfies Record<string, SeamType<unknown>>;
 
 /**

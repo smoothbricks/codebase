@@ -265,14 +265,14 @@ Everything below holds for every target alike; main is the target at the root.
 A **seed** is a build volume nobody writes: a target's frozen build state at one landed tree. **Each target has its own
 latest seed.** Every fork of a target clones that target's seed, never the target's live build volume. A target's live
 build volume is written by whatever runs there (a developer's build, a reload, the target's own check); cloning it
-mid-write would copy a Cargo unit or an Nx database half-written. A seed has no writer by construction, so its clone is
-consistent without any quiescence protocol.
+mid-write would copy a Cargo unit or an Nx database half-written. An APFS seed stays detached, and its allocation map is
+validated under an inode-held shared lock before descriptor cloning (01_storage.md, "Images").
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
-at its first touch), during every land into it (below), by cloning the landing workspace's build volume after that
-workspace has been quiesced and before the target adopts it, so neither side can be writing it, and again by a
-**reseed** whenever the target's live volume holds a write its seed does not. Each target keeps only its latest seed; a
-target's seed is deleted when the target retires.
+at its first touch), during every land into it (below), by sealing and cloning the landing workspace's build volume
+before the target adopts it, and again by a **reseed** whenever the target's live volume holds a write its seed does
+not. Stopping supervised jobs alone is not writer exclusion: a host Cargo build or editor may still hold the volume.
+Each target keeps only its latest seed; a target's seed is deleted when the target retires.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's adoption check, a developer's build in main) is written to its
@@ -294,25 +294,28 @@ while it clones the seed, so a reseed never deletes a seed a fork is cloning:
 
 1. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
    step 5); any other holder, or a daemon that outlives its stop, skips the reseed;
-2. every Cargo build lock in the volume (`.cargo-lock` in each profile directory of a Cargo target directory, which a
-   running Cargo holds for its whole build) is taken without waiting; a held one skips the reseed, and holding them all
-   keeps a Cargo build from starting until the clone is cut (it waits on the lock as for any concurrent build);
-3. the live volume is cloned as the new seed, recording the live volume's tree;
-4. the task database is looked at once more: a process that opened it during the clone may have written it mid-clone, so
-   that clone is deleted and the reseed skipped; otherwise the previous seed is deleted.
+2. every existing Cargo profile's `.cargo-lock` is taken exclusively without waiting; Cargo holds that lock shared for
+   its whole build, so a held one skips the reseed with its lock path and processes;
+3. those admission-check descriptors are closed before sealing, because their open files would themselves prevent
+   unmount. Enumeration cannot fence a previously absent profile or a build starting afterwards;
+4. the APFS source is unmounted and detached without force. A late Cargo build, a new profile, an editor or any other
+   filesystem holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. The detached
+   image is flushed, its allocation map validated and its source inode held against reattachment while it is cloned;
+5. the live volume is restored with the same mount flags and current attachment identity, then the new seed replaces the
+   old one. A process starting after restoration cannot invalidate the already-sealed capture; later writes make the
+   seed behind again rather than requiring another holder query.
 
-Only the two tools whose state a half-written copy corrupts are asked. A process that writes a build-state directory
-outside their protocols (a script appending to a file under `target/`) is not looked for: the seed holds its files as
-they were at the clone, as after a crash. The kernel's own idea of idle, no process with a file or working directory in
-the volume, would be stricter and would never come: an editor's rust-analyzer keeps proc-macro libraries from the target
-directory open for as long as it runs, and the code-graph indexer keeps its database open.
+This kernel boundary also covers writers outside Cargo and Nx protocols. A Rust analyzer holding a proc-macro library or
+a script with a file open can leave the fork colder by refusing the seal; neither is forced off the volume and no
+attached-image crash-consistency claim substitutes for the refusal.
 
 Every fork reseeds its target first (Fork step 2). A skip names each holder and leaves the seed as it was: the fork is
 colder, never wrong, and the next fork tries again. `cowshed reseed <ws>` does the same on its own, and `cowshed doctor`
 reports each target whose seed is behind its live volume, with both instants (`seed-age`).
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume, `cowshed reseed main`
-  refreezes its seed, and a fork of main hits that task; and unit tests of the Cargo lock walk and hold.
+  refreezes its seed and a fork hits that task; real Cargo build-script rendezvous tests for both an existing profile
+  and a profile created after quiescence and lock enumeration; and the sealed-source holder and allocation-map tests.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
@@ -352,8 +355,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
    stops the workspace's jobs and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no
-   open file descriptors. If it still does, adoption is **skipped** and reported, as for the target below. The landing
-   volume now has no writer.
+   open file descriptors. If it still does, adoption is **skipped** and reported, as for the target below. This settles
+   supervised jobs and Nx; the later seed seal excludes host builds and other filesystem holders.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
@@ -365,10 +368,12 @@ same for main and for an integration workspace; "the target" is whichever one it
       real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
    4. query again; any holder at all, including a daemon a host client started in between, means skip;
    5. **commit the carry**: index what was staged, and copy what the target indexed since;
-   6. take the target's image lock, then clone the landing build volume's image as the target's new seed and delete the
-      target's previous seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork
-      of this target starts from at least what is landing and what the target held. What the target itself runs on the
-      adopted volume afterwards reaches the seed by a reseed (Targets and seeds).
+   6. take the target's image lock and check the landing volume's Cargo profile locks immediately before freezing. A
+      real Cargo holder is a `landingBuilding` skip with its lock and processes, with no seed publication or old-seed
+      retirement. Otherwise release the check descriptors and seal the source as above; a late or newly created profile
+      cannot write through the detached capture. A busy seal is a `landingVolumeBusy` skip. On successful capture and
+      source restoration, publish the target's new seed and delete its previous seed. What the target runs afterwards on
+      the adopted volume reaches the seed by a reseed (Targets and seeds).
 
    The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
    fresh clone of the new seed. Every fork of the target holds the same lock from before it reads the target's seed and

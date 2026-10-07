@@ -123,6 +123,10 @@ export type AdoptionSkip =
   | ({ readonly kind: 'landingDaemonStayed' } & {
       readonly daemon: DatabaseHolder;
     })
+  | ({ readonly kind: 'landingBuilding' } & {
+      readonly lock: string;
+      readonly holders: ReadonlyArray<DatabaseHolder>;
+    })
   | ({ readonly kind: 'targetHeld' } & {
       readonly database: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
@@ -1652,6 +1656,9 @@ export type ReseedSkip =
   | ({ readonly kind: 'building' } & {
       readonly lock: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
+    })
+  | ({ readonly kind: 'volumeBusy' } & {
+      readonly reason: string;
     });
 
 /**
