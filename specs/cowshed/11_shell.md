@@ -91,22 +91,27 @@ only sets the pool's dirty flag, however many inputs changed. The next command a
 is set, or an in-process stat of the listed paths finds an identity changed (the backstop for coalesced events), every
 idle host and the spare are retired and a fresh host activates for that command; a host still executing finishes its
 command and is dropped instead of returned. An activation whose own inputs moved while it ran — an input the previous
-generation listed changed identity across the evaluation, or a newly listed input's ctime is not earlier than the
-evaluation's start — serves the command that paid for it and is never reused. The start is read off the workspace
-filesystem's own clock, never the process clock, which runs up to a tick ahead of the stamps a coarse clock gives: the
-supervisor stamps a file of its own in the protected host directory, and stamps again until the clock has moved past the
-first, so every change before the start, the approval's included, stamps earlier and every change after it stamps no
-earlier — as long as the clock runs forward. A wall clock stepped back while the evaluation runs (a VM's time sync, an
-NTP step) stamps a change made during it earlier than the start, so the supervisor reads the clock again once the
-evaluation's inputs are snapshotted: when that reading is earlier than the start, no newly listed input counts as older
-than the evaluation, and the activation is never reused. That catches a step back larger than the evaluation took, and
-only that: a smaller step leaves the end reading after the start, which is what a clock that ran forward, was slewed or
-stamps coarsely also shows, and the filesystem's stamps are the only clock there is to read (a monotonic clock beside
-them drifts from the wall clock by slewing alone). A newly listed input written within such a step after the start can
-still count as older, and the shell serves until that input changes again. An input on another filesystem, which may
-stamp in whole seconds, must predate the start's second. A change to a path not on the list costs nothing. The
-repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose change must
-rerun shell entry.
+generation listed changed identity across the evaluation, or a newly listed input's ctime is later than the evaluation's
+start — serves the command that paid for it and is never reused. The start is read off the workspace filesystem's own
+clocks, never the process clock, which runs up to a tick ahead of the stamps a coarse clock gives. One filesystem need
+not stamp every change from one clock: ZFS on Linux stamps writes from the kernel's coarse tick clock, and attribute
+changes (creations too, under POSIX ACLs) from the VFS clock, which on a kernel with multigrain timestamps (6.13 and
+later) a fine-grained stamp on any other filesystem of the host moves up to a tick ahead of it. So the supervisor probes
+the protected host directory — it creates a file, writes to it and changes its mode, reading the ctime after each — and
+probes again until a probe's earliest stamp is later than the first probe's latest. That latest stamp is the start:
+every change before it, the approval's included, stamps no later, and every change after the probing stamps no earlier
+than the crossing probe's earliest — as long as the clocks run forward. A ctime between the two readings is not proven
+older than the start; a change made while the supervisor probes has no causal order against it. A wall clock stepped
+back while the evaluation runs (a VM's time sync, an NTP step) stamps a change made during it earlier than the start, so
+the supervisor reads the slowest clock again once the evaluation's inputs are snapshotted: an end reading earlier than
+the crossing proves the clock ran backwards, no newly listed input counts as older than the evaluation, and the
+activation is never reused. An end reading at or after the crossing does not rule a step back out: a clock stepped back
+and forward again past the crossing reads exactly like one that ran forward, was slewed or stamps coarsely, and the
+filesystem's stamps are the only clock there is to read (a monotonic clock beside them drifts from the wall clock by
+slewing alone). A newly listed input written while the clock was stepped back can still count as older, and the shell
+serves until that input changes again. An input on another filesystem, which may stamp in whole seconds, must predate
+the start's second. A change to a path not on the list costs nothing. The repository decides what else counts as shell
+input with `watch_file`: lockfiles and devenv inputs whose change must rerun shell entry.
 
 **One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
 revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and
