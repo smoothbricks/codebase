@@ -1410,48 +1410,128 @@ index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab
      endTasks(taskResults) {
          for (let t of taskResults) {
              this.allCompletedTasks.set(t.task.id, t.task);
+diff --git a/dist/src/tasks-runner/default-tasks-runner.js b/dist/src/tasks-runner/default-tasks-runner.js
+index 713453e37c..841eb089b9 100644
+--- a/dist/src/tasks-runner/default-tasks-runner.js
++++ b/dist/src/tasks-runner/default-tasks-runner.js
+@@ -54,12 +54,12 @@ class RemoteCacheV2 {
+     }
+ }
+ exports.RemoteCacheV2 = RemoteCacheV2;
+-const defaultTasksRunner = async (tasks, options, context) => {
++const defaultTasksRunner = async (tasks, options, context, runnerCompletion) => {
+     const { total: threadCount, discrete } = (0, task_orchestrator_1.getThreadPoolSize)(options, context.taskGraph);
+     // Total thread count drives the TUI; the discrete `--parallel` feeds the perf report.
+     await options.lifeCycle.startCommand(threadCount, discrete);
+     try {
+-        return await runAllTasks(options, context);
++        return await runAllTasks(options, context, runnerCompletion);
+     }
+     finally {
+         // Hand the TUI exit popup the perf report (multi-task TUI runs); other modes flush it.
+@@ -67,8 +67,13 @@ const defaultTasksRunner = async (tasks, options, context) => {
+     }
+ };
+ exports.defaultTasksRunner = defaultTasksRunner;
+-async function runAllTasks(options, context) {
++async function runAllTasks(options, context, runnerCompletion) {
+     const orchestrator = new task_orchestrator_1.TaskOrchestrator(context.hasher, context.initiatingProject, context.initiatingTasks, context.projectGraph, context.taskGraph, context.nxJson, options, context.nxArgs?.nxBail, context.daemon, context.nxArgs?.outputStyle);
+-    return orchestrator.run();
++    const statuses = await orchestrator.run();
++    if (runnerCompletion) {
++        runnerCompletion.bailed = orchestrator.bailed;
++        runnerCompletion.interrupted = orchestrator.stopRequested;
++    }
++    return statuses;
+ }
+ exports.default = exports.defaultTasksRunner;
+diff --git a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
+index fa73e9c05a..8eb555827d 100644
+--- a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
+@@ -12,7 +12,7 @@ const performance_analysis_1 = require("./performance-analysis");
+  * Measures how much wall-clock a run loses to parallelism contention versus its
+  * critical-path floor, and reports it at the end of a run. Added on every run by
+  * `constructLifeCycles`, but only emitted where the report is flushed (the CLI
+- * `invokeTasksRunner` path) — the programmatic `init-tasks-runner` path collects
++ * `runCommandForTasks` path) — the programmatic `init-tasks-runner` path collects
+  * timings but never displays them.
+  *
+  * overhead = runDuration − criticalPathDuration, split by CAUSE off the occupancy
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index 4e64afa..44e0eed 100644
+index 4e64afa4fb..14723620cb 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
-@@ -374,7 +374,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+@@ -41,6 +41,7 @@ const task_profiling_life_cycle_1 = require("./life-cycles/task-profiling-life-c
+ const performance_life_cycle_1 = require("./life-cycles/performance-life-cycle");
+ const performance_report_1 = require("./life-cycles/performance-report");
+ const task_results_life_cycle_1 = require("./life-cycles/task-results-life-cycle");
++const default_tasks_runner_1 = require("./default-tasks-runner");
+ const task_telemetry_life_cycle_1 = require("./life-cycles/task-telemetry-life-cycle");
+ const task_timings_life_cycle_1 = require("./life-cycles/task-timings-life-cycle");
+ const tui_summary_life_cycle_1 = require("./life-cycles/tui-summary-life-cycle");
+@@ -373,8 +374,9 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+     const initiatingTasks = tasks.filter((t) => projectNameSet.has(t.target.project) &&
          nxArgs.targets.includes(t.target.target));
      const { lifeCycle, renderIsDone, printSummary, restoreTerminal } = await getTerminalOutputLifeCycle(initiatingProject, initiatingTasks, projectNames, tasks, taskGraph, nxArgs, nxJson, overrides);
++    const runnerCompletion = { bailed: false, interrupted: false };
      try {
 -        const taskResults = await invokeTasksRunner({
 +        const { taskResults, skippedTaskIds } = await runTasks({
              tasks,
              projectGraph,
              taskGraph,
-@@ -395,7 +395,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+@@ -384,7 +386,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+             loadDotEnvFiles: extraOptions.loadDotEnvFiles,
+             initiatingProject,
+             initiatingTasks,
+-        });
++        }, runnerCompletion);
+         await renderIsDone.finally(() => restoreTerminal?.());
+         if (printSummary) {
+             printSummary();
+@@ -395,7 +397,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
              logger_1.logger.log((0, nx_key_1.createNxKeyLicenseeInformation)(nxKey));
          return {
              taskResults,
 -            completed: didCommandComplete(tasks, taskResults),
-+            completed: didCommandComplete(tasks, taskResults, skippedTaskIds),
++            completed: didCommandComplete(tasks, taskResults, skippedTaskIds, runnerCompletion),
          };
      }
      catch (e) {
-@@ -424,13 +424,15 @@ async function printConfigureAiAgentsDisclaimer() {
+@@ -424,18 +426,22 @@ async function printConfigureAiAgentsDisclaimer() {
          // Silently ignore errors
      }
  }
 -function didCommandComplete(tasks, taskResults) {
-+function didCommandComplete(tasks, taskResults, skippedTaskIds) {
-     if (tasks.length === 0)
+-    if (tasks.length === 0)
++function didCommandComplete(tasks, taskResults, skippedTaskIds, runnerCompletion) {
++    if (runnerCompletion.interrupted)
++        return false;
++    const results = Object.values(taskResults);
++    // Bail can stop active tasks during cleanup and leaves pending tasks
++    // without statuses. Only the orchestrator knows that it bailed, rather
++    // than being interrupted by a signal or forced TUI shutdown.
++    if (runnerCompletion.bailed && results.some((result) => result.status === 'failure'))
          return true;
++    if (results.some((result) => result.status === 'stopped'))
++        return false;
      for (const task of tasks) {
-         if (!task.continuous) {
+-        if (!task.continuous) {
 -            // Discrete task must have a result (was started and finished)
 -            if (!taskResults[task.id])
-+            // Discrete task must have a result (was started and finished), or
-+            // have been skipped because a dependency failed: neither is an
-+            // interrupted run.
-+            if (!taskResults[task.id] && !skippedTaskIds.has(task.id))
-                 return false;
-         }
+-                return false;
+-        }
++        if (!task.continuous && !taskResults[task.id] && !skippedTaskIds.has(task.id))
++            return false;
      }
-@@ -659,7 +661,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
+-    // Any stopped task means the run was interrupted
+-    return !Object.values(taskResults).some((r) => r.status === 'stopped');
++    return true;
+ }
+ async function ensureWorkspaceIsInSyncAndGetGraphs(projectGraph, nxJson, projectNames, nxArgs, overrides, extraTargetDependencies, extraOptions) {
+     let taskGraph = createTaskGraphAndRunValidations(projectGraph, extraTargetDependencies ?? {}, projectNames, nxArgs, overrides, extraOptions);
+@@ -659,7 +665,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
          process.env.NX_LOAD_DOT_ENV_FILES = 'true';
      }
  }
@@ -1465,11 +1545,35 @@ index 4e64afa..44e0eed 100644
 +async function invokeTasksRunner(args) {
 +    return (await runTasks(args)).taskResults;
 +}
-+async function runTasks({ tasks, projectGraph, taskGraph, lifeCycle, nxJson, nxArgs, loadDotEnvFiles, initiatingProject, initiatingTasks, }) {
++async function runTasks({ tasks, projectGraph, taskGraph, lifeCycle, nxJson, nxArgs, loadDotEnvFiles, initiatingProject, initiatingTasks, }, runnerCompletion) {
      setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
      // this needs to be done before we start to run the tasks
      const taskDetails = (0, hash_task_1.getTaskDetails)();
-@@ -739,8 +750,15 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -674,10 +689,11 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+         ...constructLifeCycles(lifeCycle, taskGraph, nxJson, nxArgs.skipNxCache),
+         taskResultsLifecycle,
+     ]);
+-    let promiseOrObservable = tasksRunner(tasks, {
++    const options = {
+         ...runnerOptions,
+         lifeCycle: compositedLifeCycle,
+-    }, {
++    };
++    const context = {
+         initiatingProject,
+         initiatingTasks,
+         projectGraph,
+@@ -735,12 +751,24 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+             },
+         },
+         daemon: client_1.daemonClient,
+-    });
++    };
++    // Completion provenance is passed only to Nx's own runner, never to a
++    // custom runner or through the public task-results map.
++    let promiseOrObservable = tasksRunner === default_tasks_runner_1.defaultTasksRunner
++        ? tasksRunner(tasks, options, context, runnerCompletion)
++        : tasksRunner(tasks, options, context);
      if (promiseOrObservable.subscribe) {
          promiseOrObservable = convertObservableToPromise(promiseOrObservable);
      }

@@ -646,8 +646,10 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   failed one, and tells no life cycle about a skipped task, so the results `nx` reads its exit status from had none for
   it; `didCommandComplete` takes a discrete task without a result for one the run never finished, and `nx` exited 130,
   the status of an interrupted run. A gate then reported `Failed to run "nx" due to exit code 130` for an ordinary test
-  failure. The patch has `didCommandComplete` also accept a task the runner reports skipped, so the exit status is 1;
-  the terminal output, which already listed it under "Tasks not run", is unchanged. Only that check sees the runner's
+  failure. The patch has `didCommandComplete` also accept a task the runner reports skipped, so the exit status is 1.
+  With `--nx-bail=true`, pending tasks have no status and active tasks can be stopped by bailout cleanup; the CLI uses
+  the orchestrator's actual bailout and interruption flags, so a known failure still exits 1, but a signal or forced TUI
+  stop wins and exits 130. The terminal output's "Tasks not run" list is unchanged. Only that check sees the runner's
   skipped tasks: `invokeTasksRunner` and the plugins' `postTasksExecution` hooks still get Nx's own results, with none
   for a skipped task, so a caller that replays Nx's skip rule over them counts it once. (An earlier version of this hunk
   added a skipped result to those results, and such a caller counted no task as skipped.) Not yet proposed upstream: Nx
