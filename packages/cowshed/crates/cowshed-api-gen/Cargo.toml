@@ -1,0 +1,9 @@
+[package]
+name = "cowshed-api-gen"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing"] }
+proc-macro2 = "1"
