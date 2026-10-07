@@ -3,6 +3,7 @@
 # kills at that bound instead of warning then waiting another period.
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 1 }
+fail-fast = false
 
 # Compile-fail tests compile fixture crates (or rustc a negative contract) as
 # their body. `cargo test --no-run` cannot pre-build those; they are generated
