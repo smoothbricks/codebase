@@ -438,16 +438,13 @@ Concrete targets come from concrete files:
   executes the inferred archive and shard commands over 26 tests and asserts that the ordinary shards ran exactly the 13
   ordinary tests once and the exceptional shards exactly the 13 exceptional ones.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
-  triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
-  GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
-  the workspace's sccache wrapper.
-- Each `--use-napi-cross` triple also gets a `napi-toolchain-<arch>-linux` prerequisite that extracts the pinned
-  `@napi-rs/cross-toolchain-<host>-target-<arch>` archive into `~/.napi-rs`, where the NAPI CLI probes for it. Every
-  cross build of that triple — the inferred `napi-<arch>-linux` and any package-local `cli-<arch>-linux` — depends on
-  it, so the CLI's own downloader never runs. That downloader `npm pack`s into its own package directory, which under
-  Bun's isolated global store is a shared (in CI host-wide) cache: two concurrent cross builds of one triple would
-  otherwise pack the same file into the same directory and one would die on the other's cleanup. The prerequisite
-  produces no artifact, so it stays out of the aggregate `build` and out of collected platform outputs.
+  triple. Platform addon and CLI builds use the managed `tooling/napi-build.sh` entry. A native build uses the compiler
+  from the entered shell; a foreign Linux build enters that checkout's locked `linux-cross` devenv profile, preserving
+  its working directory and forwarding build arguments unchanged. The profile supplies the GNU C/C++ compiler, archiver,
+  linker, libc headers and Rust standard library for each supported Linux triple.
+- No build uses `--use-napi-cross`, a registry-downloaded sysroot or a cache-prewarm target. Nix declarations and locks
+  own toolchain provisioning. NAPI target inputs include the managed build entry, shell wrapper, Nix declarations and
+  toolchain pins, so changing the producer cannot replay an artifact built with another toolchain.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
