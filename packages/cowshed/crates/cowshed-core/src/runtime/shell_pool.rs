@@ -660,7 +660,7 @@ impl<A: Activator> PoolActor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::shell_watch::{EvaluationClock, FsInstant, WatchEntry};
+    use crate::runtime::shell_watch::{EvaluationClock, FsInstant, FsSeparation, WatchEntry};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -681,7 +681,7 @@ mod tests {
         async fn activate(&self, predicted: Vec<PathBuf>, _output: Option<()>) -> Activation<u64> {
             let host = self.activations.fetch_add(1, Ordering::SeqCst) + 1;
             let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
-            let started = FsInstant::separating(&self.root).unwrap();
+            let started = FsSeparation::take(&self.root).unwrap();
             if self.disturb.load(Ordering::SeqCst) {
                 std::fs::write(&self.inputs[0], host.to_string()).unwrap();
             }

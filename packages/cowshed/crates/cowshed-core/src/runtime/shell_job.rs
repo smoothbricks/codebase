@@ -34,7 +34,7 @@ use super::shell_host::{
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
-    ActivationEvidence, EvaluationClock, FsInstant, Snapshot, decode_direnv_watches,
+    ActivationEvidence, EvaluationClock, FsInstant, FsSeparation, Snapshot, decode_direnv_watches,
 };
 use super::supervisor::{
     ChildFence, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
@@ -1087,13 +1087,13 @@ impl HostActivator {
             Err(error) => return HostActivation::Broken(error),
         }
         // Taken after approval, which rewrites direnv's allow file, and before evaluation. The
-        // start is read off the workspace filesystem's clock, which stamps the inputs; waiting
-        // for it to move past the approval costs at most one stamping tick.
+        // start is read off the workspace filesystem's clocks, which stamp the inputs; waiting
+        // for the slowest to move past the approval costs at most one stamping tick.
         let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
         let clock = self.workspace_mount.join(SHELL_HOST_DIRECTORY);
         let start_clock = clock.clone();
         let started =
-            match tokio::task::spawn_blocking(move || FsInstant::separating(&start_clock)).await {
+            match tokio::task::spawn_blocking(move || FsSeparation::take(&start_clock)).await {
                 Ok(Ok(started)) => Ok(started),
                 Ok(Err(error)) => Err(format!(
                     "cannot read the workspace filesystem's clock: {error}"

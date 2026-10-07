@@ -10,16 +10,16 @@
 //! direnv's own `modtime` is whole seconds, so two writes inside one second are invisible to
 //! it. It is never compared here; only its `exists` bit, which is exact, is.
 //!
-//! A file's timestamps come from the kernel's stamping clock at its filesystem's granularity,
+//! A file's timestamps come from the kernel's stamping clocks at its filesystem's granularity,
 //! not from the process clock: Linux without multigrain timestamps stamps from a clock up to a
 //! scheduler tick behind `SystemTime::now()`, and HFS+ keeps whole seconds. So a file written
 //! after a `now()` reading can carry an earlier ctime, and nothing here compares a timestamp
-//! with the process clock. When an activation starts is read off the filesystem's own clock
-//! ([`FsInstant`]).
+//! with the process clock. Nor need one filesystem stamp every kind of change from one clock.
+//! When an activation starts is read off the filesystem's own clocks ([`FsSeparation`]).
 
 use std::collections::BTreeMap;
-use std::io;
-use std::os::unix::fs::MetadataExt as _;
+use std::io::{self, Write as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -148,14 +148,76 @@ fn nanoseconds(seconds: i64, nanoseconds: i64) -> i128 {
     i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds)
 }
 
-/// Longest wait for a filesystem's clock to move past a reading: a stamping tick where
+/// Longest wait for a filesystem's clocks to move past a probe: a stamping tick where
 /// timestamps are fine or tick-grained, one second where they are whole seconds.
 const CLOCK_ADVANCE_BOUND: Duration = Duration::from_secs(3);
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
-/// A reading of one filesystem's own timestamp clock: the ctime a file the reader created
-/// there was stamped with.
+/// The ctimes one file in a directory was stamped with by its creation, by a write to it and
+/// by a change to its attributes.
+///
+/// Each kind of change takes its ctime from whichever clock its filesystem stamps that kind
+/// with, and they need not be one clock. ZFS on Linux stamps writes from the kernel's coarse
+/// clock, set once per scheduler tick, and attribute changes (and a creation, under POSIX
+/// ACLs) from the VFS clock, which on a kernel with multigrain timestamps (6.13 and later) never
+/// reads below the latest fine-grained stamp any multigrain filesystem on the host took. So a
+/// creation can stamp most of a tick later than a write that follows it. The earliest of the
+/// three is the slowest clock's reading, the latest the fastest's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Probe {
+    dev: u64,
+    created_ns: i128,
+    written_ns: i128,
+    attributed_ns: i128,
+}
+
+impl Probe {
+    /// Create a file in `directory`, write to it, change its mode, keeping the ctime after
+    /// each, and remove it.
+    fn take(directory: &Path) -> io::Result<Self> {
+        let path = directory.join(format!(".clock-{}", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let probe = Self::stamp(&file);
+        let removed = std::fs::remove_file(&path);
+        let probe = probe?;
+        removed?;
+        Ok(probe)
+    }
+
+    fn stamp(mut file: &std::fs::File) -> io::Result<Self> {
+        let created = file.metadata()?;
+        file.write_all(b"c")?;
+        let written = file.metadata()?;
+        // Flipping owner-write changes the mode whatever the umask left at creation.
+        file.set_permissions(std::fs::Permissions::from_mode(
+            written.permissions().mode() ^ 0o200,
+        ))?;
+        let attributed = file.metadata()?;
+        let ctime =
+            |metadata: &std::fs::Metadata| nanoseconds(metadata.ctime(), metadata.ctime_nsec());
+        Ok(Self {
+            dev: created.dev(),
+            created_ns: ctime(&created),
+            written_ns: ctime(&written),
+            attributed_ns: ctime(&attributed),
+        })
+    }
+
+    fn earliest(self) -> i128 {
+        self.created_ns.min(self.written_ns).min(self.attributed_ns)
+    }
+
+    fn latest(self) -> i128 {
+        self.created_ns.max(self.written_ns).max(self.attributed_ns)
+    }
+}
+
+/// A reading of one filesystem's slowest stamping clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FsInstant {
     dev: u64,
@@ -163,72 +225,107 @@ pub struct FsInstant {
 }
 
 impl FsInstant {
-    /// A reading in `directory` that separates every change completed there before the call,
-    /// which stamps strictly earlier, from every change after it, which stamps no earlier.
-    ///
-    /// A first stamp is no earlier than any change before it; stamping again until the clock
-    /// moves past that one yields the reading. Blocks for at most one stamping tick of the
-    /// filesystem: none where timestamps are fine-grained.
-    pub fn separating(directory: &Path) -> io::Result<Self> {
-        let floor = Self::read(directory)?;
+    /// The slowest clock in `directory` now: the earliest stamp of one [`Probe`]. No later
+    /// change stamps earlier unless that clock is stepped back.
+    pub fn read(directory: &Path) -> io::Result<Self> {
+        let probe = Probe::take(directory)?;
+        Ok(Self {
+            dev: probe.dev,
+            ctime_ns: probe.earliest(),
+        })
+    }
+}
+
+/// One filesystem's clocks read across a call, separating every change completed there
+/// before the call from every change after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsSeparation {
+    dev: u64,
+    /// The latest stamp of the call's first probe: no change completed before the call stamps
+    /// later.
+    last_before_ns: i128,
+    /// The earliest stamp of the first later probe whose every stamp is later than
+    /// `last_before_ns`: no change after the call stamps earlier unless a clock is stepped
+    /// back.
+    crossed_ns: i128,
+}
+
+impl FsSeparation {
+    /// Probe `directory` until its slowest clock has passed its fastest clock's first reading.
+    /// Takes at most one stamping tick of the filesystem: none where timestamps are
+    /// fine-grained and one clock stamps everything.
+    pub fn take(directory: &Path) -> io::Result<Self> {
+        let first = Probe::take(directory)?;
         let deadline = std::time::Instant::now() + CLOCK_ADVANCE_BOUND;
-        loop {
-            let reading = Self::read(directory)?;
-            if reading.ctime_ns > floor.ctime_ns {
-                return Ok(reading);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
+        Self::across(
+            first,
+            || Probe::take(directory),
+            || {
+                if std::time::Instant::now() < deadline {
+                    return Ok(());
+                }
+                Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
                         "the filesystem clock under {} did not advance in {CLOCK_ADVANCE_BOUND:?}",
                         directory.display()
                     ),
-                ));
+                ))
+            },
+        )
+    }
+
+    /// The separation `first` and the probes after it prove: the first later probe whose
+    /// earliest stamp is later than `first`'s latest. `within_bound` is asked before each
+    /// further probe.
+    fn across(
+        first: Probe,
+        mut next: impl FnMut() -> io::Result<Probe>,
+        mut within_bound: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let last_before_ns = first.latest();
+        loop {
+            let probe = next()?;
+            if probe.dev != first.dev {
+                return Err(io::Error::other(format!(
+                    "the clock directory moved from device {} to {} while it was probed",
+                    first.dev, probe.dev
+                )));
             }
-            std::thread::sleep(Duration::from_millis(1));
+            let crossed_ns = probe.earliest();
+            if crossed_ns > last_before_ns {
+                return Ok(Self {
+                    dev: first.dev,
+                    last_before_ns,
+                    crossed_ns,
+                });
+            }
+            within_bound()?;
         }
     }
 
-    /// The clock in `directory` now: create a file there, keep the ctime it was stamped with,
-    /// and remove it. No later change can stamp earlier unless the clock is stepped back.
-    pub fn read(directory: &Path) -> io::Result<Self> {
-        let path = directory.join(format!(".clock-{}", uuid::Uuid::new_v4().simple()));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        let metadata = file.metadata();
-        let removed = std::fs::remove_file(&path);
-        let metadata = metadata?;
-        removed?;
-        Ok(Self {
-            dev: metadata.dev(),
-            ctime_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
-        })
-    }
-
-    /// Whether a file on `dev` whose ctime is `ctime_ns` last changed before this reading.
+    /// Whether a file on `dev` whose ctime is `ctime_ns` last changed before this separation.
     ///
-    /// On the reading's own filesystem the comparison is exact. Another filesystem may stamp
-    /// more coarsely, down to whole seconds, which truncates a later change to before the
-    /// reading within its second; there only a ctime before the reading's second is earlier.
+    /// On the separation's own filesystem a ctime no later than `last_before_ns` is before it,
+    /// and a ctime between `last_before_ns` and `crossed_ns` is not proven before. A change made
+    /// while the call probed has no causal order against it. Another filesystem may stamp more
+    /// coarsely, down to whole seconds, which truncates a later change to before the reading
+    /// within its second; there only a ctime before the second of `last_before_ns` is earlier.
     fn precedes(self, dev: u64, ctime_ns: i128) -> bool {
-        let bound = if dev == self.dev {
-            self.ctime_ns
+        if dev == self.dev {
+            ctime_ns <= self.last_before_ns
         } else {
-            self.ctime_ns - self.ctime_ns.rem_euclid(NANOS_PER_SECOND)
-        };
-        ctime_ns < bound
+            ctime_ns < self.last_before_ns - self.last_before_ns.rem_euclid(NANOS_PER_SECOND)
+        }
     }
 }
 
-/// The workspace filesystem's clock, read on both sides of one evaluation.
+/// The workspace filesystem's clocks, read on both sides of one evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvaluationClock {
-    /// A [`FsInstant::separating`] reading taken after approval and before `direnv export` ran.
-    pub started: FsInstant,
-    /// A [`FsInstant::read`] taken once the evaluation's inputs were snapshotted.
+    /// An [`FsSeparation::take`] after approval and before `direnv export` ran.
+    pub started: FsSeparation,
+    /// An [`FsInstant::read`] taken once the evaluation's inputs were snapshotted.
     pub finished: FsInstant,
 }
 
@@ -238,23 +335,24 @@ impl EvaluationClock {
     ///
     /// Ordering a ctime against the start assumes the clock that stamped it did not run
     /// backwards meanwhile. A wall clock can be stepped back — a VM's time sync, an NTP step —
-    /// and then a change made during the evaluation stamps earlier than the start. A clock that
-    /// reads earlier at the end than at the start was stepped back by more than the evaluation
-    /// lasted, so nothing first seen in it is provably older than it: every such input counts
-    /// as changed, which costs one more activation.
+    /// and then a change made during the evaluation stamps earlier than the start. A slowest
+    /// clock that reads earlier at the end than at the start's crossing proves the clock ran
+    /// backwards, so nothing first seen in it is provably older than it: every such input
+    /// counts as changed, which costs one more activation.
     ///
-    /// A smaller step is not seen. Stamps are the only clock a filesystem offers, and a step
-    /// back by `d` that leaves the end reading after the start reads exactly like a clock that
-    /// ran forward, was slewed, or stamps coarsely; a monotonic reading beside it cannot tell
-    /// them apart either, because slewing alone moves the wall clock against it. So an input
-    /// first listed by this activation and written within `d` after the start can still be
-    /// judged older, and its shell reused until that input changes again.
+    /// An end reading at or after the crossing does not rule a step back out. Stamps are the
+    /// only clock a filesystem offers, and a clock stepped back and then forward again past the
+    /// crossing reads exactly like one that ran forward, was slewed, or stamps coarsely; a
+    /// monotonic reading beside it cannot tell them apart either, because slewing alone moves
+    /// the wall clock against it. So an input first listed by this activation and written
+    /// while the clock was stepped back can still be judged older, and its shell reused until
+    /// that input changes again.
     fn precedes_start(self, dev: u64, ctime_ns: i128) -> bool {
         self.ran_forward() && self.started.precedes(dev, ctime_ns)
     }
 
     fn ran_forward(self) -> bool {
-        self.started.dev == self.finished.dev && self.started.ctime_ns <= self.finished.ctime_ns
+        self.started.dev == self.finished.dev && self.started.crossed_ns <= self.finished.ctime_ns
     }
 }
 
@@ -590,7 +688,6 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn encode(json: &str) -> String {
         let compressed = miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
@@ -667,7 +764,7 @@ mod tests {
         let file = root.join("watched.lock");
         std::fs::write(&file, b"one").unwrap();
         let first = Snapshot::take([file.as_path()]);
-        FsInstant::separating(&root).unwrap();
+        FsSeparation::take(&root).unwrap();
         // Same size, same inode: only the stamps tell these apart.
         std::fs::write(&file, b"two").unwrap();
         assert!(first.changed_since());
@@ -681,7 +778,7 @@ mod tests {
         let later = root.join("later");
         for _ in 0..5 {
             std::fs::write(&earlier, b"e").unwrap();
-            let reading = FsInstant::separating(&root).unwrap();
+            let reading = FsSeparation::take(&root).unwrap();
             std::fs::write(&later, b"l").unwrap();
             let stamp = |path: &Path| match FileState::of(path) {
                 FileState::Present { dev, ctime_ns, .. } => (dev, ctime_ns),
@@ -701,23 +798,122 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// ZFS on a Linux 6.13+ kernel with POSIX ACLs, the CI host's filesystem: a write takes the
+    /// coarse clock, set at each 4 ms tick, and a creation or attribute change takes the VFS
+    /// clock. That never reads below the multigrain floor, which a fine-grained stamp on any
+    /// tmpfs or ext4 of a busy host raises to the present: here every one has.
+    struct BusyHostZfs {
+        now_ns: i128,
+    }
+
+    impl BusyHostZfs {
+        const TICK_NS: i128 = 4_000_000;
+
+        fn coarse(&self) -> i128 {
+            self.now_ns - self.now_ns.rem_euclid(Self::TICK_NS)
+        }
+
+        fn floored(&self) -> i128 {
+            self.now_ns
+        }
+
+        /// Each change and each probe takes half a millisecond.
+        fn elapse(&mut self) {
+            self.now_ns += 500_000;
+        }
+
+        fn probe(&mut self) -> Probe {
+            let probe = Probe {
+                dev: 1,
+                created_ns: self.floored(),
+                written_ns: self.coarse(),
+                attributed_ns: self.floored(),
+            };
+            self.elapse();
+            probe
+        }
+
+        fn write(&mut self) -> i128 {
+            let stamp = self.coarse();
+            self.elapse();
+            stamp
+        }
+
+        fn chmod(&mut self) -> i128 {
+            let stamp = self.floored();
+            self.elapse();
+            stamp
+        }
+    }
+
+    /// CI (3488cf976) saw a write after the reading stamped before it. Here a separation made of
+    /// creation stamps alone would be the first later probe: its VFS stamp passed the first's,
+    /// and a write after it stamps the coarse tick both probes fell in, before the reading.
     #[test]
-    fn another_filesystems_input_must_predate_the_readings_second() {
-        let second = NANOS_PER_SECOND;
-        let reading = FsInstant {
-            dev: 1,
-            ctime_ns: 10 * second + 500,
+    fn a_separation_waits_for_the_slowest_of_a_filesystems_clocks() {
+        let mut zfs = BusyHostZfs {
+            now_ns: 10 * NANOS_PER_SECOND + 100_000,
         };
-        assert!(reading.precedes(1, 10 * second + 499));
+        let written_before = zfs.write();
+        let changed_before = zfs.chmod();
+        let first = zfs.probe();
+        let mut probes = 0;
+        let separation = FsSeparation::across(
+            first,
+            || {
+                probes += 1;
+                Ok(zfs.probe())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(separation.precedes(1, written_before));
+        assert!(separation.precedes(1, changed_before));
+        let written_after = zfs.write();
         assert!(
-            !reading.precedes(1, 10 * second + 500),
-            "a tie is not earlier"
+            !separation.precedes(1, written_after),
+            "a write after the separation, stamped {written_after} by the coarse clock"
+        );
+        assert!(!separation.precedes(1, zfs.chmod()));
+        assert_eq!(
+            probes, 6,
+            "the coarse clock passes the first probe's VFS stamps at its next tick, 10.004 s"
+        );
+    }
+
+    #[test]
+    fn a_probe_of_another_device_separates_nothing() {
+        let probe = |dev, ctime_ns| Probe {
+            dev,
+            created_ns: ctime_ns,
+            written_ns: ctime_ns,
+            attributed_ns: ctime_ns,
+        };
+        let moved = FsSeparation::across(probe(1, 1), || Ok(probe(2, 2)), || Ok(()));
+        assert!(moved.is_err(), "{moved:?}");
+    }
+
+    #[test]
+    fn another_filesystems_input_must_predate_the_separations_second() {
+        let second = NANOS_PER_SECOND;
+        let separation = FsSeparation {
+            dev: 1,
+            last_before_ns: 10 * second + 500,
+            crossed_ns: 10 * second + 4_000_000,
+        };
+        assert!(
+            separation.precedes(1, 10 * second + 500),
+            "the last reading before the call ties nothing after it"
         );
         assert!(
-            !reading.precedes(2, 10 * second),
-            "a whole-second stamp inside the reading's second may be a later change"
+            !separation.precedes(1, 10 * second + 501),
+            "a stamp after the last reading before may be a change while the call probed"
         );
-        assert!(reading.precedes(2, 10 * second - 1));
+        assert!(
+            !separation.precedes(2, 10 * second),
+            "a whole-second stamp inside the separation's second may be a later change"
+        );
+        assert!(separation.precedes(2, 10 * second - 1));
     }
 
     #[test]
@@ -749,7 +945,7 @@ mod tests {
             },
         ];
         let before = Snapshot::take([known.as_path()]);
-        let started = FsInstant::separating(&root).unwrap();
+        let started = FsSeparation::take(&root).unwrap();
         // The end reading follows the snapshot it closes, as an activation takes it.
         let around = |after: Snapshot| {
             let finished = FsInstant::read(&root).unwrap();
@@ -793,7 +989,7 @@ mod tests {
 
         // direnv recorded the input as absent but it exists by the end, and did so before the
         // activation started.
-        let started = FsInstant::separating(&root).unwrap();
+        let started = FsSeparation::take(&root).unwrap();
         let after = Snapshot::take([known.as_path()]);
         let evidence = ActivationEvidence {
             entries: vec![WatchEntry {
@@ -816,7 +1012,7 @@ mod tests {
 
     /// A wall clock stepped back while the evaluation ran — a VM's time sync, an NTP step —
     /// stamps an input written mid-evaluation earlier than the start. The end reading, earlier
-    /// than the start, is what shows the clock went backwards.
+    /// than the start's crossing, is what shows the clock went backwards.
     #[test]
     fn a_clock_stepped_back_mid_evaluation_proves_no_new_input_older() {
         let second = NANOS_PER_SECOND;
@@ -828,9 +1024,10 @@ mod tests {
             }],
             before: Snapshot::default(),
             clock: Some(EvaluationClock {
-                started: FsInstant {
+                started: FsSeparation {
                     dev: 1,
-                    ctime_ns: 10 * second + second / 2,
+                    last_before_ns: 10 * second + second / 2 - 4_000_000,
+                    crossed_ns: 10 * second + second / 2,
                 },
                 finished: FsInstant {
                     dev: 1,
@@ -858,6 +1055,11 @@ mod tests {
         assert!(evidence(9 * second + 700_000_000, 10 * second + 600_000_000).stable());
         // A clock that did not move at all across the evaluation still ran forward.
         assert!(evidence(9 * second + 700_000_000, 10 * second + second / 2).stable());
+        // An end reading below the crossing ran backwards, even above the last reading before.
+        assert!(
+            !evidence(9 * second + 700_000_000, 10 * second + second / 2 - 1).stable(),
+            "a slowest clock that fell back below the crossing orders nothing"
+        );
     }
 
     #[test]
