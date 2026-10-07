@@ -146,7 +146,13 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         offset: u64,
         follow: bool,
     ) -> Result<RawByteStream>;
-    async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment>;
+    /// A view of the job's raw streams, each resumed at its offset in `cursor`.
+    async fn attach(
+        &self,
+        authority: Arc<WorkspaceAuthority>,
+        id: JobId,
+        cursor: JobJournalCursor,
+    ) -> Result<JobAttachment>;
     async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()>;
 }
 
@@ -377,12 +383,29 @@ impl ControllerRuntime for ActorRuntime {
         ))
     }
 
-    async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment> {
+    async fn attach(
+        &self,
+        authority: Arc<WorkspaceAuthority>,
+        id: JobId,
+        cursor: JobJournalCursor,
+    ) -> Result<JobAttachment> {
         let stdout = self
-            .logs(Arc::clone(&authority), id, JobStream::Stdout, 0, true)
+            .logs(
+                Arc::clone(&authority),
+                id,
+                JobStream::Stdout,
+                cursor.stdout,
+                true,
+            )
             .await?;
         let stderr = self
-            .logs(Arc::clone(&authority), id, JobStream::Stderr, 0, true)
+            .logs(
+                Arc::clone(&authority),
+                id,
+                JobStream::Stderr,
+                cursor.stderr,
+                true,
+            )
             .await?;
         let runtime: Arc<dyn ControllerRuntime> = Arc::new(self.clone());
         Ok(JobAttachment {
@@ -2057,9 +2080,15 @@ impl JobHandle {
             .await
     }
 
-    pub async fn attach(&self) -> Result<JobAttachment> {
+    /// Attaches to the running or ended job without starting a process: its stdin, and its two
+    /// raw streams resumed at `cursor`, or at byte zero when it is omitted.
+    pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment> {
         self.runtime
-            .attach(Arc::clone(&self.authority), self.id)
+            .attach(
+                Arc::clone(&self.authority),
+                self.id,
+                cursor.unwrap_or_default(),
+            )
             .await
     }
 
@@ -2267,6 +2296,7 @@ mod tests {
             &self,
             _authority: Arc<WorkspaceAuthority>,
             _id: JobId,
+            _cursor: JobJournalCursor,
         ) -> Result<JobAttachment> {
             Err(CowshedError::internal("unexpected test attach"))
         }

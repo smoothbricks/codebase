@@ -2043,6 +2043,48 @@ async fn a_tail_ends_at_the_journal_end_and_resumes_at_its_cursor() {
     );
 }
 
+/// Every byte `stream` yields until it closes.
+async fn drain(mut stream: cowshed_core::RawByteStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("read the attached stream"));
+    }
+    bytes
+}
+
+/// Over the controller, an attachment resumes each stream at the offset its cursor names: a
+/// reader that already holds the first `n` stdout bytes is never sent one of them again, while
+/// stderr, named at zero, arrives whole. Attaching starts no process.
+#[tokio::test]
+async fn an_attachment_resumes_each_stream_at_its_cursor() {
+    let root = test_root();
+    let mut jobs = SupervisedJobs::start(&root).await;
+    let (job, process) = jobs.exec().await;
+    let seen = b"already seen\n";
+    let n = u64::try_from(seen.len()).expect("test length");
+    admit(&job, &process, JobStream::Stdout, 0, seen).await;
+    admit(&job, &process, JobStream::Stderr, 0, b"warning\n").await;
+
+    let attachment = job
+        .attach(Some(JobJournalCursor {
+            stdout: n,
+            stderr: 0,
+        }))
+        .await
+        .expect("attach");
+    assert!(
+        jobs.spawned.try_recv().is_err(),
+        "attaching started no process"
+    );
+    admit(&job, &process, JobStream::Stdout, n, b"new\n").await;
+    end(&job, &process).await;
+
+    let (_stdin, stdout, stderr) = attachment.into_parts();
+    let (stdout, stderr) = tokio::join!(drain(stdout), drain(stderr));
+    assert_eq!(stdout, b"new\n", "no stdout byte before the cursor arrives");
+    assert_eq!(stderr, b"warning\n");
+}
+
 /// A create that asks for its steps hears each one as it happens, over the controller connection
 /// the embedder holds: while the create is still held inside its clone step, the clone and the
 /// first write inside it have already arrived, nested; the rest arrive before the answer, and the
