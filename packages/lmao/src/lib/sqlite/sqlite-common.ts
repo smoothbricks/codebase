@@ -5,6 +5,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import { iterateSpanTree, NO_NODE } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
+import type { SyncSQLiteDatabase } from './sqlite-db.js';
 
 export const SPANS_TABLE_INIT_SQL = `
   CREATE TABLE IF NOT EXISTS spans (
@@ -23,6 +24,20 @@ export const SPANS_TABLE_INIT_SQL = `
 `;
 
 export const SPANS_TABLE_INFO_SQL = 'PRAGMA table_info(spans)';
+
+/**
+ * Run a `PRAGMA journal_mode` statement — the query form or a setter — and return the mode SQLite reports.
+ *
+ * A setter that runs reports the mode the database settled on, which can differ from the one it asked for without any
+ * error, so the result is the only evidence of whether the change took effect.
+ */
+export function readJournalMode(db: SyncSQLiteDatabase, sql: string): string {
+  const row = db.prepare(sql).get();
+  if (!isRecord(row) || !hasOwnString(row, 'journal_mode')) {
+    throw new Error(`${sql} returned no journal_mode`);
+  }
+  return row.journal_mode.toLowerCase();
+}
 
 type SQLiteTableInfoIntegerField = keyof Pick<SQLiteTableInfoRow, 'cid' | 'notnull' | 'pk'>;
 

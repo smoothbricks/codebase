@@ -29,6 +29,7 @@ import {
   getMissingSchemaColumns,
   isSqliteDuplicateColumnError,
   parseSqliteTableInfoRows,
+  readJournalMode,
   SPANS_TABLE_INFO_SQL,
   SPANS_TABLE_INIT_SQL,
   type SpanSegment,
@@ -36,7 +37,7 @@ import {
 } from './sqlite-common.js';
 import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
 
-const JOURNAL_MODE_WAL_SQL = 'PRAGMA journal_mode = WAL';
+const JOURNAL_MODE_SQL = 'PRAGMA journal_mode';
 const DATABASE_LIST_SQL = 'PRAGMA database_list';
 
 /** Journal modes that keep no rollback record, so a killed writer leaves partially applied pages behind. */
@@ -65,25 +66,19 @@ export class SQLiteTraceWriter {
   }
 
   /**
-   * Put a file-backed sink in WAL, and refuse to write one that has no rollback record.
+   * Refuse to write a file-backed sink that has no rollback record, without changing its journal mode.
    *
-   * Several test-worker processes write this database at once and tests assert over what lands in it, so it is an
-   * oracle rather than a log. WAL keeps those readers off the writer's lock — measured at ~20ms worst-case writer
-   * stall against 200-1900ms under the rollback journal with twelve concurrent writers. Its `-wal` and `-shm`
-   * sidecars are also created once and then stay, where a rollback journal creates and unlinks one per transaction.
+   * Tests assert over what lands in this database, so it is an oracle rather than a log. `memory` and `off` keep no
+   * rollback record at all: a worker killed mid-transaction then leaves partially applied rows that
+   * `PRAGMA integrity_check` still calls "ok", turning a crashed run into wrong assertion input rather than a missing
+   * one. An in-memory database has no file to protect and legitimately reports `memory`.
    *
-   * `PRAGMA journal_mode` reports the mode it settled on instead of failing, so a refused conversion is silent.
-   * `memory` and `off` keep no rollback record at all: a worker killed mid-transaction then leaves partially applied
-   * rows that `PRAGMA integrity_check` still calls "ok", turning a crashed run into wrong assertion input rather than
-   * a missing one. An in-memory database has no file to protect and legitimately settles on `memory`.
+   * The mode is only read. Changing it here is what failed: the writer opens a database other processes have open
+   * too, and converting a shared file to WAL is refused with SQLITE_BUSY without waiting (see `./sqlite-wal.ts`). WAL
+   * is set by whoever creates the file — `openWalDatabase` and the openers built on it.
    */
   private requireRecoverableJournal(): void {
-    const modeRow = this.db.prepare(JOURNAL_MODE_WAL_SQL).get();
-    if (!isRecord(modeRow) || !hasOwnString(modeRow, 'journal_mode')) {
-      throw new Error(`${JOURNAL_MODE_WAL_SQL} returned no journal_mode`);
-    }
-
-    const mode = modeRow.journal_mode.toLowerCase();
+    const mode = readJournalMode(this.db, JOURNAL_MODE_SQL);
     if (!UNRECOVERABLE_JOURNAL_MODES[mode]) {
       return;
     }
@@ -93,9 +88,7 @@ export class SQLiteTraceWriter {
       return;
     }
 
-    throw new Error(
-      `Trace database at ${file} settled on journal_mode=${mode}, which cannot roll back a killed writer`,
-    );
+    throw new Error(`Trace database at ${file} is in journal_mode=${mode}, which cannot roll back a killed writer`);
   }
 
   /** Backing file of the `main` schema, or '' for an in-memory database. */

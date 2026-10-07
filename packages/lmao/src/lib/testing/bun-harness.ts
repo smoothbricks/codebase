@@ -54,8 +54,8 @@ import {
   mock,
 } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { cleanupDebug, cleanupDebugActiveHandles } from '../cleanupDiagnostics.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
@@ -65,6 +65,7 @@ import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { isSpanContext } from '../spanContext.js';
+import { openWalDatabase } from '../sqlite/sqlite-wal.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { DEFAULT_TRACE_DB_PATH, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME } from '../sqlite/trace-db-path.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
@@ -285,10 +286,8 @@ function createRootTracer<B extends OpContextBinding>({
   } as const;
 
   if (sqlite) {
-    const dbPath = sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
-    // The sink lives under a directory project walkers ignore, which SQLite will not create on its own.
-    mkdirSync(dirname(dbPath), { recursive: true });
-    const db = new Database(dbPath);
+    // Every test process opens this one sink at once; it must already be WAL when its path appears.
+    const db = openWalDatabase(sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, (path) => new Database(path));
     const sqliteTracer = new SQLiteTracer(binding, {
       ...tracerOptions,
       db,

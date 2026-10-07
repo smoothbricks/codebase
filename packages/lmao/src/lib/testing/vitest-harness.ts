@@ -193,7 +193,12 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
 type SQLiteRuntimeConfig = SQLiteWriterConfig &
   (
     | {
-        /** Node/bun style synchronous SQLite driver (for example better-sqlite3). */
+        /**
+         * Node/bun style synchronous SQLite driver (for example better-sqlite3). Workers share one sink, so it must
+         * already be WAL when its path appears: `createNodeSQLiteDatabase` from `@smoothbricks/lmao/sqlite/node` does
+         * that, and `openWalDatabase` from the same entry does it for any other driver. This module leaves it to the
+         * caller because it also loads inside workerd, where its sink is the async driver.
+         */
         createDatabase: (path: string) => SyncSQLiteDatabase;
         createAsyncDatabase?: never;
       }

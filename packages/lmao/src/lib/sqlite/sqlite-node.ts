@@ -1,7 +1,5 @@
 /// <reference types="node" />
 
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AsyncSQLiteDatabase,
@@ -9,6 +7,9 @@ import type {
   SyncSQLiteDatabase,
   SyncSQLiteStatement,
 } from './sqlite-db.js';
+import { openWalDatabase } from './sqlite-wal.js';
+
+export { openWalDatabase };
 
 function toSyncStatement(statement: {
   run(...params: unknown[]): unknown;
@@ -34,12 +35,11 @@ function toSyncStatement(statement: {
  * Use this in Node Vitest setup when you want trace output persisted
  * to a deterministic file path.
  *
- * The trace sink lives one directory down from the root it belongs to (see
- * `./trace-db-path.js`), and SQLite will not create that directory itself.
+ * The trace sink is a file many worker processes open at once, so the file is created already in WAL (see
+ * `./sqlite-wal.js`); an existing file is opened in whatever journal mode it has, and `:memory:` stays in memory.
  */
 export function createNodeSQLiteDatabase(dbPath: string): SyncSQLiteDatabase {
-  mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new DatabaseSync(dbPath);
+  const db = openWalDatabase(dbPath, (path) => new DatabaseSync(path));
   return {
     exec(sql: string): void {
       db.exec(sql);

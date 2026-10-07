@@ -198,6 +198,10 @@ for a failure.
 
 - **SQLite / D1** — use `SQLiteTracer`/`SQLiteAsyncTracer` with `createNodeSQLiteDatabase`
   (`@smoothbricks/lmao/sqlite/node`) or `createD1SQLiteDatabase` (`@smoothbricks/lmao/sqlite`).
+  `createNodeSQLiteDatabase` creates an absent file already in WAL, so processes sharing one file never convert it — a
+  conversion SQLite refuses with `SQLITE_BUSY` without waiting. For another driver, wrap its constructor the same way:
+  `openWalDatabase(path, (path) => new Database(path))` from the same entry. The tracer never changes a database's
+  journal mode; it rejects only `memory` and `off` on a file, which cannot roll back a killed writer.
 - **Query engine** — the companion package [`@smoothbricks/lmao-inspector`](../lmao-inspector) runs SQL over exported
   Arrow data in the browser.
 
