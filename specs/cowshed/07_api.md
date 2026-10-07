@@ -9,8 +9,9 @@ with identical semantics and error taxonomy.
 > samples and terminal persistence, progress streams, bounded cursor tails, keyed admission/lookup, and generation of
 > the controller protocol and N-API surface from one API declaration are unbuilt. The N-API addon exposes exec,
 > sessions, numeric job lookup, status/wait/kill, attach/detach, and buffered output reads from byte zero; resumable raw
-> streams, attachment stdio, and abort plumbing are unbuilt. Its request DTO and TypeScript types are hand-maintained;
-> the shared wire corpus checks agreement, not generated parity.
+> streams, attachment stdio, attachment stdin EOF, group-listener queries, and abort plumbing are unbuilt. Core
+> attachment stdin writes exist, but `JobStdin` has no close operation. Its request DTO and TypeScript types are
+> hand-maintained; the shared wire corpus checks agreement, not generated parity.
 
 ## Authority model (frozen)
 
@@ -334,6 +335,7 @@ impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
     pub async fn resources(&self) -> Result<JobResourceSample, CowshedError>;
+    pub async fn listening_ports(&self) -> Result<JobListeningPorts, CowshedError>;
     pub async fn progress(&self, every_ms: u64) -> Result<JobProgressStream, CowshedError>;
     pub async fn tail(&self, cursor: Option<JobJournalCursor>, limits: JobTailLimits)
         -> Result<JobTail, CowshedError>;
@@ -356,6 +358,7 @@ impl JobAttachment {
 pub struct JobStdin { /* same immutable fence + JobId + actor sender */ }
 impl JobStdin {
     pub async fn write(&self, bytes: Bytes) -> Result<(), CowshedError>;
+    pub async fn close(&self) -> Result<(), CowshedError>; // EOF once; the job is not cancelled
 }
 
 pub struct RawByteStream { /* bounded receiver; polling task retains the same immutable fence */ }
@@ -662,6 +665,7 @@ pub struct HostLoadSample { pub load1: f64, pub cores: u32 }
 pub struct JobVolumeUsage { pub workspace_delta_bytes: i64, pub build_delta_bytes: Option<i64> }
 pub struct JobStreamWatermark { pub bytes: u64, pub lines: u64 }
 pub struct JobResourceSample {
+    pub job_id: JobId,                // retained in standalone progress and terminal resource receipts
     pub sampled_at: UtcTimestamp,
     pub wall_ms: u64,
     pub leader_pid: u32,              // observed leader; this sample exists only after spawn
@@ -687,7 +691,19 @@ pub struct JobTail {
     pub stderr_truncated: bool,
 }
 pub struct JobProgressStream { /* bounded stream of Result<JobResourceSample, CowshedError> */ }
+pub struct JobListeningPorts {
+    pub job_id: JobId,
+    pub sampled_at: UtcTimestamp,
+    pub ports: Vec<u16>,              // current TCP LISTEN ports owned by this job's process group
+}
 ```
+
+The sample carries its own `jobId`, so a progress event or result projection cannot lose the command's cowshed identity.
+Spawn means the first process owned by the job: its shell activation on a cold host, otherwise its command. While a cold
+host activates, the job already has real resource samples; it is not an unobserved queue wait. The wall, host-start, and
+volume baselines remain at that first spawn as ownership moves to the command's group. CPU accumulates activation plus
+command without charging a warm host's earlier idle time; the current leader and members change to the command's group
+when it starts. An activation that fails preserves its observed cost in the terminal result.
 
 `sampledAt` uses the existing RFC3339 timestamp contract; elapsed wall time and CPU durations use monotonic integer
 milliseconds. `hostStart` is captured once at job spawn and survives every later sample; `host` is captured at the
@@ -719,6 +735,19 @@ All monitoring methods retain the immutable repo/workspace/incarnation fence of 
 before calling it. Disconnecting a reader, detaching an attachment, or reaching a soft deadline never kills the job.
 Sampling failure is a typed operational error with the unavailable metric's cause, not fabricated zeroes; captured
 output and the actual exit status remain preserved.
+
+`listeningPorts()` reads the current TCP LISTEN sockets held by the job's identity-proven process-group members,
+including a child that binds before its leader exits. It reports both IPv4 and IPv6 local ports, deduplicated; a merely
+bound, connected, or host-unrelated socket is not readiness. A port another process owns never satisfies this job's
+readiness, even if a host-wide connection probe succeeds. The same process-birth fence used for group sampling protects
+socket ownership from PID reuse. Missing ownership evidence is a typed error, never an empty list that pretends
+readiness was checked. The query starts no process and preserves the workspace incarnation fence.
+
+Attachment stdin is the same bounded, backpressured raw-byte lane as exec stdin, not text interpolated into the command.
+`JobStdin.write` waits until its chunk is admitted to the job's input queue; `close()` sends EOF exactly once and is
+idempotent. Writes after EOF are a typed conflict. The N-API attachment projects these as `write()` and `end()`, without
+buffering the whole input. Detaching the attachment or closing its output iterator does not kill the job; explicit input
+EOF and job cancellation remain different operations.
 
 ### Keyed admission and restart attachment
 
@@ -1034,6 +1063,7 @@ export interface JobHandle {
   readonly id: JobId;
   status(): Promise<JobInfo>;
   resources(): Promise<JobResourceSample>;
+  listeningPorts(): Promise<JobListeningPorts>;
   progress(everyMs: number): AsyncIterable<JobResourceSample>;
   tail(cursor: JobJournalCursor | undefined, limits: JobTailLimits): Promise<JobTail>;
   logs(
@@ -1050,6 +1080,7 @@ export interface JobAttachment {
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array>;
   write(chunk: Uint8Array): Promise<void>;
+  end(): Promise<void>; // explicit stdin EOF; never implicit job cancellation
   detach(): Promise<void>; // closes this view; the job continues
 }
 

@@ -8,8 +8,9 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
 > journals, offset-addressed reads, attach/detach, and complete-group termination. Job resource samples and their
 > terminal persistence, periodic progress subscriptions, bounded cursor tails, and generation of controller and N-API
-> monitoring bindings from one API declaration are unbuilt. The process-group ownership ledger is implemented; it is not
-> a resource-sampling API.
+> monitoring bindings from one API declaration are unbuilt. Group-owned TCP-listener queries and attachment stdin EOF
+> are also unbuilt; Rust attachment writes exist, while N-API exposes no attachment stdio. The process-group ownership
+> ledger is implemented; it is not a resource-sampling API.
 
 ## Shell activation and process reuse
 
@@ -394,6 +395,12 @@ build can exceed 100%. Current RSS is the group's resident-byte sum, and peak RS
 a sum of unrelated per-process peaks. A leader that exits before descendants does not end accounting: the same ownership
 fence that retains the group for cancellation retains it for sampling through terminal drain.
 
+Each sample names its native `jobId`, including a standalone progress event or a completed-output projection. The start
+boundary is the first job-owned process: the activation group on a cold host, otherwise the command. Activation receives
+real progress while it runs, and a failure preserves its cost. When the command starts, current leader/membership move
+to its group, but wall time, host-start, and volume baselines stay at that first spawn; CPU accumulates activation and
+command, never idle time inherited from a reused warm host.
+
 Workspace and build-volume used-byte deltas are separate volume statistics, never a tree scan or a claim about
 per-process write syscalls. They compare usage at spawn with usage at the sample or terminal boundary and may be
 negative after deletion. Concurrent writers on the same volume contribute to its delta; this fact remains explicit. No
@@ -407,6 +414,18 @@ never substitute a summary or merge stdout and stderr.
 
 An unavailable kernel sample reports a typed operational error with its cause; missing CPU, RSS, membership, load, or
 volume evidence never becomes invented zeroes. Job output and the actual exit status remain preserved.
+
+### Readiness and attachment stdin
+
+`JobHandle.listening_ports` reports the current TCP LISTEN ports whose sockets belong to identity-proven members of this
+job's process group. It includes listening children, supports IPv4 and IPv6, and never mistakes a port owned by an
+unrelated host process for readiness. The supervisor reads kernel socket ownership through the same birth-identity fence
+as group sampling; a failed ownership read is a typed error, not an empty census.
+
+An attachment's stdin supports bounded raw-byte writes with backpressure and explicit EOF, through
+`JobStdin::write`/`close` in Rust and `JobAttachment.write`/`end` in N-API. EOF is sent exactly once; later writes
+refuse, and repeated EOF is idempotent. Closing stdin, detaching a reader, and cancelling the process group are distinct
+operations. Neither stdin EOF nor a closed attachment stream silently kills the job.
 
 ### Exec records, stream storage, and tiered authority
 

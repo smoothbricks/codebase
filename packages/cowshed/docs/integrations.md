@@ -245,15 +245,22 @@ following; it is not a bounded running-command tail.
 ### Implementation status — monitoring gaps
 
 Job resource samples, progress events, cursor-addressed bounded tails, resumable N-API raw-byte streams, attachment
-stdio, and `AbortSignal` plumbing are unbuilt. The Rust core already supports offset-addressed raw log reads and
-reattachment by the workspace's numeric job id; the addon does not yet expose that full surface. One-use worker
-descriptor connection is also unbuilt.
+stdio/EOF, identity-fenced group-listener queries, and `AbortSignal` plumbing are unbuilt. The Rust core already
+supports offset-addressed raw log reads, numeric-job reattachment, and attachment stdin writes; its `JobStdin` has no
+explicit close operation. The addon does not yet expose that full surface. One-use worker descriptor connection is also
+unbuilt.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
 TypeScript public types and validators are generated projections, never a second hand-maintained field list. This
 generation is unbuilt: the addon serializes core DTOs, while its requests, TypeScript declarations, and adapter methods
 are handwritten; the shared wire corpus checks their agreement but does not generate them.
+
+Each `JobResourceSample` carries its own `jobId`. Its start baseline is the first job-owned process, including a cold
+shell's activation; progress and terminal accounting include that activation, but never charge the idle time of a
+previously warm host. Readiness uses `listeningPorts()` from the owned group rather than a host-wide probe. Attachment
+`write()` and `end()` preserve binary input, backpressure, and exactly-once EOF without implicitly cancelling the
+command.
 
 The CLI remains the integration point for shell-only consumers. Rust, N-API, CLI, and MCP frontends must agree on
 lifecycle, grant propagation, numeric jobs, tiered artifact storage, bounded summaries and control responses, raw
