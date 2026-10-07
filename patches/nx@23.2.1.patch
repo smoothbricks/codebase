@@ -406,11 +406,102 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      }
      /**
       * Returns the current session count for a phase. Useful for testing.
+diff --git a/dist/src/tasks-runner/cache.d.ts b/dist/src/tasks-runner/cache.d.ts
+index 34aa44f81f1df63c5d33e58d8b55d15fcf1d7619..edf41406f465726828fa447bd10d71a49a2ede8a 100644
+--- a/dist/src/tasks-runner/cache.d.ts
++++ b/dist/src/tasks-runner/cache.d.ts
+@@ -33,6 +33,7 @@ export declare class DbCache {
+     private applyRemoteCacheResults;
+     put(task: Task, terminalOutput: string | null, outputs: string[], code: number): Promise<void>;
+     copyFilesFromCache(_: string, cachedResult: CachedResult, outputs: string[]): Promise<number>;
++    private stampRestored;
+     removeOldCacheRecords(): void;
+     temporaryOutputPath(task: Task): string;
+     private getRemoteCache;
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 4a34ba2..c08789f 100644
+index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f8652d2be0c4 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
-@@ -549,7 +549,29 @@ function resolveMaxCacheSize(nxJson) {
+@@ -149,7 +149,11 @@ class DbCache {
+         return this.cache.getCacheSize();
+     }
+     applyRemoteCacheResults(hash, res, outputs) {
+-        return this.cache.applyRemoteCacheResults(hash, res, outputs);
++        this.cache.applyRemoteCacheResults(hash, res, outputs);
++        // The native call restores the outputs itself, under this same condition.
++        if (outputs?.length > 0 && res.code === 0) {
++            this.stampRestored(res.outputsPath, outputs);
++        }
+     }
+     async put(task, terminalOutput, outputs, code) {
+         return tryAndRetry(async () => {
+@@ -162,7 +166,20 @@ class DbCache {
+         });
+     }
+     copyFilesFromCache(_, cachedResult, outputs) {
+-        return tryAndRetry(async () => this.cache.copyFilesFromCache(cachedResult, outputs));
++        return tryAndRetry(async () => {
++            const size = this.cache.copyFilesFromCache(cachedResult, outputs);
++            this.stampRestored(cachedResult.outputsPath, outputs);
++            return size;
++        });
++    }
++    /**
++     * Stamps what the native restore wrote from the cache entry at
++     * `outputsPath`. The native restore makes an absolute in-workspace output
++     * relative before expanding it in the entry, so this does too.
++     */
++    stampRestored(outputsPath, outputs) {
++        const relativeOutputs = outputs.map((output) => (0, path_1.isAbsolute)(output) ? (0, path_1.relative)(workspace_root_1.workspaceRoot, output) : output);
++        stampRestoredOutputs(workspace_root_1.workspaceRoot, outputsPath, (0, native_1.expandOutputs)(outputsPath, relativeOutputs));
+     }
+     removeOldCacheRecords() {
+         return this.cache.removeOldCacheRecords();
+@@ -416,6 +433,7 @@ class Cache {
+                     await this.copy(cached, src);
+                 }
+             }));
++            stampRestoredOutputs(this.root, cachedResult.outputsPath, expandedOutputs);
+         });
+     }
+     temporaryOutputPath(task) {
+@@ -516,6 +534,35 @@ class Cache {
+     }
+ }
+ exports.Cache = Cache;
++/**
++ * Gives each file a cache restore wrote the time of the restore. The native
++ * copy (`std::fs::copy`) clones a file on macOS and keeps its timestamps, so a
++ * restored output kept the mtime it had when its cache entry was written:
++ * older than anything a tool built from a newer output since. A consumer that
++ * judges freshness by mtime (a Cargo build script's `rerun-if-changed`, make,
++ * a file watcher) then kept what it built from the newer bytes. Running the
++ * task would have written the output now, so the restore stamps it now. Links
++ * keep their own times: `utimes` would stamp what they point at.
++ */
++function stampRestoredOutputs(workspaceRoot, outputsPath, expandedOutputs) {
++    const now = new Date();
++    const stamp = (path) => {
++        const stats = (0, node_fs_1.lstatSync)(path);
++        if (stats.isDirectory()) {
++            for (const entry of (0, node_fs_1.readdirSync)(path)) {
++                stamp((0, path_1.join)(path, entry));
++            }
++        }
++        else if (stats.isFile()) {
++            (0, node_fs_1.utimesSync)(path, now, now);
++        }
++    };
++    for (const output of expandedOutputs) {
++        if ((0, node_fs_1.existsSync)((0, path_1.join)(outputsPath, output))) {
++            stamp((0, path_1.join)(workspaceRoot, output));
++        }
++    }
++}
+ function tryAndRetry(fn) {
+     let attempts = 0;
+     // Generate a random number between 2 and 4 to raise to the power of attempts
+@@ -549,7 +596,29 @@ function resolveMaxCacheSize(nxJson) {
      const rawMaxCacheSize = process.env.NX_MAX_CACHE_SIZE ?? nxJson.maxCacheSize;
      return rawMaxCacheSize !== undefined
          ? parseMaxCacheSize(rawMaxCacheSize)

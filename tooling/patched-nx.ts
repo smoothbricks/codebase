@@ -45,6 +45,10 @@ const UPSTREAM = [
 /** Repairs the patch carries that no upstream pull request proposes yet. */
 const NOT_YET_UPSTREAM = [
   ['task graph', 'give a task the same dependencies whichever other tasks the run asks for (`findCycles`)'],
+  [
+    'cache restore',
+    'stamp each restored output with the time of the restore, not the time its cache entry was written',
+  ],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;

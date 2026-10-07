@@ -614,6 +614,15 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   pre-run of one never hit the cache of the other. The patch answers with the tasks that lie on a cycle (Tarjan's
   strongly connected components), so a task's dependencies are a property of the graph behind it. Not yet proposed
   upstream: Nx `master` carries the same `findCycles`.
+- **A restored output is newer than the output it replaces.** Nx restores a cached output with `std::fs::copy`, which on
+  macOS clones the file and keeps its timestamps, so a restored output carried the mtime it had when its cache entry was
+  written. Build from input A, rebuild from B, return to A, and the restored A was older than the B output it replaced:
+  every consumer that judges freshness by mtime (a Cargo build script's `rerun-if-changed`, make, a file watcher) kept
+  what it built from B. The patch stamps each restored file with the time of the restore, as running the task would
+  have: after `copyFilesFromCache` for a local hit, and after the native `applyRemoteCacheResults` for a remote hit,
+  which untars the artifact with its stored mtimes and restores it with the same copy. Restoring one directory output of
+  10,000 1 KiB files took a median 3.4 s for the native remove and copy and 0.79 s more for the stamp, on a machine at
+  load average 70–120. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -622,8 +631,10 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution and task-graph regressions pass; preserve any repair not yet released.
-When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph and restore-time regressions pass; preserve any repair not
+yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux
+`std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, drop
+the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 

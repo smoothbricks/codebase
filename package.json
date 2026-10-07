@@ -126,7 +126,7 @@
   },
   "overrides": {
     "typia": "14.0.6",
-    "nx": "https://github.com/smoothbricks/codebase/releases/download/nx-23.2.1-patched-619c5f1e47fa/nx-23.2.1.tgz"
+    "nx": "https://github.com/smoothbricks/codebase/releases/download/nx-23.2.1-patched-331088e3ac28/nx-23.2.1.tgz"
   },
   "smoo": {
     "github": {
