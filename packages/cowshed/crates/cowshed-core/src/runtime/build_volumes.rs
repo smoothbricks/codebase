@@ -1158,14 +1158,15 @@ impl BuildVolumes {
                     .collect(),
                 ..Collection::default()
             };
-            for Doomed { id, reason, bytes } in plan.doomed {
+            for doomed in plan.doomed {
+                let (id, reason, bytes) = (doomed.id.clone(), doomed.reason, doomed.bytes);
                 let image = layout.image(&id);
                 let deferral = if dry_run {
                     // What the release would answer, asked without claiming.
-                    match (relinked(layout, &links, &id), layout.held(&id)) {
-                        (Ok(Some(checkout)), _) => Some(Deferral::Relinked(checkout)),
+                    match (still_doomed(layout, &links, &doomed), layout.held(&id)) {
+                        (Ok(Some(deferral)), _) => Some(deferral),
                         (Err(error), _) => Some(Deferral::ReleaseFailed(format!(
-                            "cannot tell whether a checkout links it: {error}"
+                            "cannot tell whether it is still garbage: {error}"
                         ))),
                         (Ok(None), Ok(false)) => None,
                         (Ok(None), Ok(true)) => Some(Deferral::Held(Vec::new())),
@@ -1174,7 +1175,7 @@ impl BuildVolumes {
                         ))),
                     }
                 } else {
-                    match release_unless_relinked(host, layout, &links, &id) {
+                    match release_if_still_doomed(host, layout, &links, &doomed) {
                         Ok(Ok(refused)) => {
                             say_release(&id, "collected", &BuildVolumeRelease::Deleted { refused });
                             collection.reclaimed += 1;
@@ -1198,7 +1199,7 @@ impl BuildVolumes {
                     Some(deferral) => {
                         // A collection names what it tried to release; a volume a checkout
                         // links is not garbage, and a dry run tries nothing.
-                        if !dry_run && !matches!(deferral, Deferral::Relinked(_)) {
+                        if !dry_run && !matches!(deferral, Deferral::Linked(_)) {
                             collection.candidates.push(candidate);
                         }
                         collection.deferred.push(Deferred {
@@ -1214,43 +1215,45 @@ impl BuildVolumes {
     }
 }
 
-/// The checkout that links `id` now, read from `id`'s record and that checkout's own link: a
-/// land records the volume it adopted as the target's only after the target's link names it,
-/// and holds the volume across both, so under a release's claim the two agree or the volume is
-/// not the target's.
-fn relinked(
+/// Why `doomed` is no longer garbage, read now: its record is not the one the plan judged it by
+/// (a creation wrote it, a land handed the volume to its target), or a checkout's build link
+/// names it. A live link proves reachability by itself, whatever any record says.
+fn still_doomed(
     layout: &BuildVolumeLayout,
     links: &Links,
-    id: &BuildVolumeId,
-) -> Result<Option<WorkspaceName>> {
-    let Some(BuildVolumeRecord {
-        role: BuildVolumeRole::Linked { checkout },
-        ..
-    }) = layout.read_record_present(id)?
-    else {
-        return Ok(None);
-    };
-    let Some(path) = links.checkouts.get(&checkout) else {
-        return Ok(None);
-    };
-    Ok((layout.linked(path)?.as_ref() == Some(id)).then_some(checkout))
+    doomed: &Doomed,
+) -> Result<Option<Deferral>> {
+    if layout.read_record_present(&doomed.id)? != doomed.seen {
+        return Ok(Some(Deferral::Changed));
+    }
+    for (checkout, path) in &links.checkouts {
+        if layout.linked(path)?.as_ref() == Some(&doomed.id) {
+            return Ok(Some(Deferral::Linked(checkout.clone())));
+        }
+    }
+    Ok(None)
 }
 
-/// Release doomed volume `id` unless, under the release's claim, something holds it or a
-/// checkout links it now. Answers the unforced unmount's refusal of a release, or why the volume
-/// stays.
-fn release_unless_relinked(
+/// Release `doomed` unless, under the release's claim, something holds it or [`still_doomed`]
+/// says it is no longer garbage. Everything that makes a volume someone's (a job, a land moving
+/// a link onto it, a clone writing its record) holds it while it does, so under the claim that
+/// work is done or has not begun. Answers the unforced unmount's refusal of a release, or why
+/// the volume stays.
+fn release_if_still_doomed(
     host: &Host,
     layout: &BuildVolumeLayout,
     links: &Links,
-    id: &BuildVolumeId,
+    doomed: &Doomed,
 ) -> Result<std::result::Result<Option<BuildVolumeRefusal>, Deferral>> {
-    let claim = match host.claim_build_volume(layout, id).map_err(storage)? {
+    let claim = match host
+        .claim_build_volume(layout, &doomed.id)
+        .map_err(storage)?
+    {
         BuildVolumeClaim::Claimed(claim) => claim,
         BuildVolumeClaim::Held { open } => return Ok(Err(Deferral::Held(open))),
     };
-    if let Some(checkout) = relinked(layout, links, id)? {
-        return Ok(Err(Deferral::Relinked(checkout)));
+    if let Some(deferral) = still_doomed(layout, links, doomed)? {
+        return Ok(Err(deferral));
     }
     host.release_claimed(layout, claim).map(Ok).map_err(storage)
 }
@@ -1281,9 +1284,13 @@ pub(crate) enum Deferral {
         detached: Vec<WorkspaceName>,
         creating: Vec<WorkspaceName>,
     },
-    /// Under the release's claim, its record names `0` as its checkout and `0`'s build link
-    /// names it: a land moved `0` onto it after this collection read the links, so it is `0`'s.
-    Relinked(WorkspaceName),
+    /// Under the release's claim, `0`'s build link names it: whatever this collection read
+    /// before (a land moved `0` onto it, a mount re-pointed `0`'s stale link), it is `0`'s.
+    Linked(WorkspaceName),
+    /// Under the release's claim, its record is not the one this collection judged it by: a
+    /// clone finished writing it, or a land handed the volume to its target. The next pass
+    /// decides it from what it is now.
+    Changed,
 }
 
 impl Deferral {
@@ -1291,6 +1298,11 @@ impl Deferral {
     /// rather than something a person should look at.
     pub fn is_routine(&self) -> bool {
         matches!(self, Self::DetachedCheckout(_) | Self::Creating(_))
+    }
+
+    /// Whether a later collection is still to decide the volume: not when a checkout links it.
+    pub fn is_pending(&self) -> bool {
+        !matches!(self, Self::Linked(_))
     }
 }
 
@@ -1308,7 +1320,7 @@ impl std::fmt::Display for Deferral {
         match self {
             Self::Held(open) => {
                 formatter.write_str(
-                    "a job admitted on it, or a land moving a link onto it, still runs",
+                    "a job admitted on it still runs, or a land or clone making it someone's still holds it",
                 )?;
                 if !open.is_empty() {
                     formatter.write_str(", open in ")?;
@@ -1327,9 +1339,12 @@ impl std::fmt::Display for Deferral {
                 formatter,
                 "its record names {workspace}, whose create, fork or adopt has not finished; decided once it has"
             ),
-            Self::Relinked(checkout) => write!(
+            Self::Linked(checkout) => write!(
                 formatter,
-                "{checkout}'s build link names it since this collection read the links: a land moved {checkout} onto it, so it is {checkout}'s"
+                "{checkout}'s build link names it now, so it is {checkout}'s"
+            ),
+            Self::Changed => formatter.write_str(
+                "its record changed since this collection read it; the next pass decides it",
             ),
             Self::Unrecorded { detached, creating } => {
                 formatter.write_str("it has no record, and the links of")?;
@@ -1368,12 +1383,15 @@ impl From<Deferred> for GcDeferred {
     }
 }
 
-/// A build volume collection deletes, with why and its allocated size.
+/// A build volume collection deletes, with why, its allocated size, and the record the plan
+/// judged it by (`None` for an unrecorded image): its release decides it again under its claim,
+/// and a record that changed since says the volume is no longer what the plan judged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Doomed {
     pub id: BuildVolumeId,
     pub reason: GcReason,
     pub bytes: u64,
+    pub seen: Option<BuildVolumeRecord>,
 }
 
 /// What collection decides from the records, the links and the images' sizes alone.
@@ -1406,7 +1424,7 @@ pub(crate) fn plan(
     links: &Links,
 ) -> Result<Plan> {
     let mut plan = Plan::default();
-    let mut latest = std::collections::BTreeMap::<Owner, (String, BuildVolumeId)>::new();
+    let mut latest = std::collections::BTreeMap::<Owner, (BuildVolumeId, BuildVolumeRecord)>::new();
     let mut doomed = Vec::new();
     for id in images.iter().cloned() {
         plan.examined += 1;
@@ -1416,7 +1434,7 @@ pub(crate) fn plan(
         let record = match layout.read_record_present(&id) {
             Ok(Some(record)) => record,
             Ok(None) if links.detached.is_empty() && links.creating.is_empty() => {
-                doomed.push((id, GcReason::UnrecordedBuildVolume));
+                doomed.push((id, GcReason::UnrecordedBuildVolume, None));
                 continue;
             }
             Ok(None) => {
@@ -1435,51 +1453,52 @@ pub(crate) fn plan(
                 continue;
             }
         };
-        match record.role {
+        match &record.role {
             BuildVolumeRole::Seed { target, .. } | BuildVolumeRole::Linked { checkout: target }
-                if links.creating.contains(&target) =>
+                if links.creating.contains(target) =>
             {
-                plan.deferred.push((id, Deferral::Creating(target)));
+                plan.deferred.push((id, Deferral::Creating(target.clone())));
             }
             BuildVolumeRole::Seed {
                 target,
                 incarnation,
             } => {
                 let owner = Owner {
-                    name: target,
-                    incarnation,
+                    name: target.clone(),
+                    incarnation: incarnation.clone(),
                 };
                 if !links.owners.contains(&owner) {
-                    doomed.push((id, GcReason::SupersededSeed));
+                    doomed.push((id, GcReason::SupersededSeed, Some(record)));
                     continue;
                 }
                 match latest.get(&owner) {
-                    Some((at, _)) if *at >= record.created_at => {
-                        doomed.push((id, GcReason::SupersededSeed));
+                    Some((_, newest)) if newest.created_at >= record.created_at => {
+                        doomed.push((id, GcReason::SupersededSeed, Some(record)));
                     }
                     _ => {
-                        if let Some((_, older)) = latest.insert(owner, (record.created_at, id)) {
-                            doomed.push((older, GcReason::SupersededSeed));
+                        if let Some((older, seen)) = latest.insert(owner, (id, record)) {
+                            doomed.push((older, GcReason::SupersededSeed, Some(seen)));
                         }
                     }
                 }
             }
-            BuildVolumeRole::Linked { checkout } if links.detached.contains(&checkout) => {
+            BuildVolumeRole::Linked { checkout } if links.detached.contains(checkout) => {
                 plan.deferred
-                    .push((id, Deferral::DetachedCheckout(checkout)));
+                    .push((id, Deferral::DetachedCheckout(checkout.clone())));
             }
             BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => {
-                doomed.push((id, GcReason::UnlinkedBuildVolume));
+                doomed.push((id, GcReason::UnlinkedBuildVolume, Some(record)));
             }
         }
     }
-    for (id, reason) in doomed {
+    for (id, reason, seen) in doomed {
         let image = layout.image(&id);
         match std::fs::metadata(&image) {
             Ok(metadata) => plan.doomed.push(Doomed {
                 id,
                 reason,
                 bytes: metadata.blocks().saturating_mul(512),
+                seen,
             }),
             Err(error) => plan.deferred.push((
                 id,
@@ -2256,7 +2275,7 @@ mod tests {
             .unwrap();
         assert_eq!(collected.reclaimed, 2, "{:?}", collected.candidates);
         // The fork's link names what that collection took: its mount no longer refuses, and
-        // settles the link from the fork's own seed, which went too.
+        // has no seed left either, so the mount removes the link.
         assert_eq!(
             scratch.layout.resolve_link(&lane.name, &forked).unwrap(),
             crate::build_volume::LinkResolution::Vanished
@@ -3168,7 +3187,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             kept(&after),
-            Some(Deferral::Relinked(main.name.clone())),
+            Some(Deferral::Linked(main.name.clone())),
             "{:?}",
             after.deferred
         );

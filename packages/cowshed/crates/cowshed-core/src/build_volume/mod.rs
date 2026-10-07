@@ -564,6 +564,23 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// Hold `id` for the operation creating it, before its image exists: a clone holds the
+    /// volume it makes until its record is written, so no collection that listed the image in
+    /// between releases it as an interrupted creation. Nothing claims an id before its image
+    /// exists, so the lock is never contended; one that is refuses as
+    /// [`io::ErrorKind::ResourceBusy`].
+    pub fn hold_new(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
+        let file = open_hold(&self.hold_path(id))?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(BuildVolumeHold { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("build volume {id} is being released"),
+            )),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     /// Whether a job holds `id` now, asked without taking or creating anything: what a dry run
     /// reports in place of a release.
     pub fn held(&self, id: &BuildVolumeId) -> io::Result<bool> {

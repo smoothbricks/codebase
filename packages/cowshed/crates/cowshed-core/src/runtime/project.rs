@@ -3599,9 +3599,14 @@ impl NativeProjectRuntimeHost {
                 continue;
             }
             eprintln!(
-                "cowshed: build volume {} stays: {}; `cowshed gc` retries it",
+                "cowshed: build volume {} stays: {}{}",
                 deferred.path.display(),
-                deferred.deferral
+                deferred.deferral,
+                if deferred.deferral.is_pending() {
+                    "; `cowshed gc` retries it"
+                } else {
+                    ""
+                }
             );
         }
         if routine > 0 {

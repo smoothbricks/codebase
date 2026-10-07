@@ -349,10 +349,11 @@ same for main and for an integration workspace; "the target" is whichever one it
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
 3. **Fast-forward the target** under its repository lock (as today).
 4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.asif.hold` a job holds,
-   GC below) from before the workspace's jobs stop until step 6 has renamed the target's link and recorded the target as
-   the volume's owner, so no collection in any process releases it in between. Its supervisor stops the workspace's jobs
-   and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no open file descriptors. If
-   it still does, adoption is **skipped** and reported, as for the target below. The landing volume now has no writer.
+   GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
+   any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
+   stops the workspace's jobs and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no
+   open file descriptors. If it still does, adoption is **skipped** and reported, as for the target below. The landing
+   volume now has no writer.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
@@ -509,9 +510,10 @@ again at any level above it.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retired
   the landing workspace while that workspace's land still ran saw the landing volume linked by nothing, and once it
   released it, main's link named a volume that no longer existed. So each release claims the volume first and reads
-  again under the claim: a volume whose sidecar names a checkout whose link names it now is that checkout's, and stays.
-  The land's hold spans its rename and its sidecar write, so under the claim the two agree or the volume is not the
-  target's.
+  again under the claim: a volume a checkout's link names now is that checkout's and stays, and one whose sidecar is no
+  longer the one the collection judged it by is left to the next pass. Whatever makes a volume someone's holds it while
+  it does: a land from before its landing workspace's jobs stop until its build-volume steps end, a clone (a seed, a
+  fork's volume) from before its image exists until its sidecar is written.
 - Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
   to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
   the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold file and

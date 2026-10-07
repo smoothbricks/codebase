@@ -92,7 +92,9 @@ where
 
     /// Clone `source`'s image to the new volume `destination`, with `record`. The clone is not
     /// attached. A mounted source's volume is flushed first; the caller guarantees nothing
-    /// writes it while it is cloned (a seed has no writer, a landing volume is quiesced).
+    /// writes it while it is cloned (a seed has no writer, a landing volume is quiesced). The
+    /// clone is held from before its image exists until its record is written, so a collection
+    /// that lists it in between never releases it as an interrupted creation.
     ///
     /// The clone keeps the modification time the source's image had when it was cloned, across
     /// the first write below: an image's mtime is the instant of the last write it holds, so a
@@ -111,8 +113,20 @@ where
         self.verify_controller_path(&to)?;
         let mount = layout.mount(source);
         let mounted = self.mounted_at(&mount)?.is_some();
-        self.backend
-            .sync_and_clone(&from, mounted.then_some(mount.as_path()), &to)?;
+        let hold = layout.hold_path(destination);
+        let _creating = layout
+            .hold_new(destination)
+            .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
+        if let Err(error) =
+            self.backend
+                .sync_and_clone(&from, mounted.then_some(mount.as_path()), &to)
+        {
+            // No image, so nothing will ever release this hold file.
+            if !to.exists() {
+                remove_if_present(&hold)?;
+            }
+            return Err(error.into());
+        }
         let written = written_at(&to)?;
         // The clone's own extent map, paid here rather than by its first write inside a mount.
         self.write_first(&to)?;
@@ -352,20 +366,26 @@ where
             }
             LinkResolution::Refork(seed) => refork(&seed),
             LinkResolution::Vanished => {
+                let lost = |error: ApfsStorageError| {
+                    ApfsStorageError::Host(format!(
+                        "{workspace}'s build link names build volume {linked}, which no longer exists, and settling the link failed: {error}"
+                    ))
+                };
                 match layout.seed_of(workspace, incarnation).map_err(host)? {
                     Some((seed, _)) => {
+                        refork(&seed).map_err(lost)?;
                         eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists; {workspace} now links a fresh clone of its seed {seed}, and what {linked} held beyond that seed is lost"
                         );
-                        refork(&seed)
                     }
                     None => {
+                        link::unlink(checkout).map_err(host).map_err(lost)?;
                         eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists, and {workspace} has no seed to clone; the link is removed, and {workspace}'s next build-state refresh makes its first volume"
                         );
-                        link::unlink(checkout).map_err(host)
                     }
                 }
+                Ok(())
             }
         }
     }
