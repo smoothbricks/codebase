@@ -42,23 +42,31 @@ pub struct ReadBlocker(ProcessBlockedOn);
 
 impl ReadBlocker {
     /// The record's blocker: a lock holder's job is what `job_of` -- the supervisor's answer to
-    /// which of its jobs owns a pid -- says, and absent where no job of its owns the holder.
-    pub fn attribute(self, job_of: impl FnOnce(u32) -> Option<JobId>) -> ProcessBlockedOn {
-        match self.0 {
-            ProcessBlockedOn::Lock { path, holder } => ProcessBlockedOn::Lock {
+    /// which of its jobs owns a pid ([`crate::runtime::job_groups::job_owning`] over its jobs) --
+    /// says, and absent where no job of its owns the holder. A lookup that fails is the error.
+    pub fn attribute<E>(
+        self,
+        job_of: impl FnOnce(u32) -> Result<Option<JobId>, E>,
+    ) -> Result<ProcessBlockedOn, E> {
+        Ok(match self.0 {
+            ProcessBlockedOn::Lock {
                 path,
-                holder: holder.map(|holder| LockHolder {
+                holder: Some(holder),
+            } => ProcessBlockedOn::Lock {
+                path,
+                holder: Some(LockHolder {
                     pid: holder.pid,
-                    job: job_of(holder.pid),
+                    job: job_of(holder.pid)?,
                 }),
             },
             blocked @ (ProcessBlockedOn::None
+            | ProcessBlockedOn::Lock { holder: None, .. }
             | ProcessBlockedOn::Socket
             | ProcessBlockedOn::Pipe
             | ProcessBlockedOn::Child
             | ProcessBlockedOn::Stdin
             | ProcessBlockedOn::Disk) => blocked,
-        }
+        })
     }
 }
 
@@ -736,6 +744,7 @@ mod tests {
         ProcessBlockedOn,
     };
     use crate::fork_lock::Spawn as _;
+    use crate::runtime::job_groups::{Birth, job_owning};
     use crate::runtime::process_stream::{JobProcessFold, JobProcessObservation};
     use crate::runtime::process_tree::{ProcessImage, ProcessObservation};
     use crate::runtime::process_usage::tests::{Observed, hold_byte, observed};
@@ -770,17 +779,28 @@ mod tests {
         };
         let read = ReadBlocker(lock(None));
         let second = JobId::new(2).expect("a job id");
+        let found = |job| move |_| Ok::<_, std::io::Error>(job);
         assert_eq!(
-            read.clone().attribute(|pid| (pid == 7).then_some(second)),
+            read.clone().attribute(found(Some(second))).unwrap(),
             lock(Some(second))
         );
         assert_eq!(
-            read.attribute(|_| None),
+            read.clone().attribute(found(None)).unwrap(),
             lock(None),
             "no job of ours holds it"
         );
+        let refused = read
+            .attribute(|_| Err(std::io::Error::from_raw_os_error(libc::EPERM)))
+            .unwrap_err();
         assert_eq!(
-            ReadBlocker(ProcessBlockedOn::Pipe).attribute(|pid| panic!("no holder, yet {pid}")),
+            refused.raw_os_error(),
+            Some(libc::EPERM),
+            "a failed lookup is its error, never an absent job"
+        );
+        assert_eq!(
+            ReadBlocker(ProcessBlockedOn::Pipe)
+                .attribute(|pid| -> std::io::Result<_> { panic!("no holder, yet {pid}") })
+                .unwrap(),
             ProcessBlockedOn::Pipe
         );
     }
@@ -852,6 +872,19 @@ mod tests {
                 report("locked");
                 spin_until_byte();
             }
+            "hold-lock" => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(argument)
+                    .expect("open the lock file");
+                // SAFETY: flock on a descriptor this role owns.
+                let locked =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(locked, 0, "flock: {}", std::io::Error::last_os_error());
+                report("locked");
+                while hold_byte() {}
+            }
             other => panic!("unknown role {other:?}"),
         }
     }
@@ -896,13 +929,31 @@ mod tests {
     impl Fixture {
         /// Start `role` and wait for its report `ready`.
         fn start(role: &str, ready: &str) -> Self {
-            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            Self::spawn(role, ready, false)
+        }
+
+        /// Start `role` leading a process group of its own, as a job's process does, and wait
+        /// for its report `ready`: the fixture, and the group's leader as its parent observed it.
+        fn lead(role: &str, ready: &str) -> (Self, Birth) {
+            let fixture = Self::spawn(role, ready, true);
+            let birth = Birth::of(fixture.life.identity.pid);
+            assert!(matches!(birth, Birth::Observed(_)), "{birth:?}");
+            (fixture, birth)
+        }
+
+        fn spawn(role: &str, ready: &str, lead: bool) -> Self {
+            use std::os::unix::process::CommandExt as _;
+
+            let mut command = Command::new(std::env::current_exe().expect("test binary"));
+            command
                 .args(["--exact", ROLE_TEST, "--nocapture"])
                 .env(ROLE, role)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn_locked()
-                .expect("spawn a fixture");
+                .stdout(Stdio::piped());
+            if lead {
+                command.process_group(0);
+            }
+            let mut child = command.spawn_locked().expect("spawn a fixture");
             let release = child.stdin.take().expect("stdin");
             let lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
             let life = observed(child.id());
@@ -935,7 +986,10 @@ mod tests {
         }
 
         /// One read of the life, its lock holder's job named by `job_of`.
-        fn read(&self, job_of: impl FnOnce(u32) -> Option<JobId>) -> Option<ProcessBlockedOn> {
+        fn read(
+            &self,
+            job_of: impl FnOnce(u32) -> std::io::Result<Option<JobId>>,
+        ) -> Option<ProcessBlockedOn> {
             #[cfg(target_os = "linux")]
             let sampled = {
                 use std::os::fd::AsFd as _;
@@ -944,7 +998,9 @@ mod tests {
             #[cfg(target_os = "macos")]
             let sampled = sample(self.life.identity);
             match sampled.expect("a blocker read") {
-                BlockerSampled::Read(read) => read.map(|read| read.attribute(job_of)),
+                BlockerSampled::Read(read) => {
+                    read.map(|read| read.attribute(job_of).expect("the holder's job"))
+                }
                 BlockerSampled::Gone => panic!("the fixture is held alive"),
             }
         }
@@ -956,7 +1012,7 @@ mod tests {
         fn shows(
             &self,
             expected: Option<ProcessBlockedOn>,
-            job_of: impl Fn(u32) -> Option<JobId>,
+            job_of: impl Fn(u32) -> std::io::Result<Option<JobId>>,
         ) -> Option<ProcessBlockedOn> {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -980,8 +1036,8 @@ mod tests {
         }
     }
 
-    fn unowned(_: u32) -> Option<JobId> {
-        None
+    fn unowned(_: u32) -> std::io::Result<Option<JobId>> {
+        Ok(None)
     }
 
     /// The real job fold over one fixture: the blocker reads it is given, the events it emitted,
@@ -1124,46 +1180,52 @@ mod tests {
         assert_eq!(parent.shows(expected.clone(), unowned), expected);
     }
 
-    /// This test holds `flock` on a file and a member blocks on it: the read names `lock`, the
-    /// path, and this process as the holder, with the job the supervisor's lookup names for it.
-    /// Released, the member runs and the fold SETs `none`, which keeps no path or holder.
-    #[test]
-    fn a_member_waiting_for_a_held_flock_names_the_lock_its_path_and_holder() {
-        // Beside this test binary: a file of the build's own tree, never a shared /tmp.
+    /// A file beside this test binary -- of the build's own tree, never a shared /tmp -- named for
+    /// this test process, and the path a descriptor of it reads as.
+    fn lock_file(name: &str) -> (std::path::PathBuf, String) {
         let path = std::env::current_exe()
             .expect("test binary")
             .parent()
             .expect("its directory")
-            .join(format!("process-blocker-lock-{}", std::process::id()));
-        let held = std::fs::File::create(&path).expect("create the lock file");
+            .join(format!("process-blocker-{name}-{}", std::process::id()));
+        std::fs::File::create(&path).expect("create the lock file");
+        let canonical = std::fs::canonicalize(&path)
+            .expect("the lock file's path")
+            .into_os_string()
+            .into_string()
+            .expect("a UTF-8 path");
+        (path, canonical)
+    }
+
+    /// This test holds `flock` on a file and a member blocks on it: the read names `lock`, the
+    /// path, and this process as the holder, which no job owns. Released, the member runs and
+    /// the fold SETs `none`, which keeps no path or holder.
+    #[test]
+    fn a_member_waiting_for_a_held_flock_names_the_lock_its_path_and_holder() {
+        let (path, canonical) = lock_file("lock");
+        let held = std::fs::File::open(&path).expect("open the lock file");
         // SAFETY: flock on a descriptor this test owns.
         let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(locked, 0, "flock: {}", std::io::Error::last_os_error());
-        let holder = std::process::id();
-        let second = JobId::new(2).expect("a job id");
-        let second_job_holds = |pid| (pid == holder).then_some(second);
+        let no_jobs = |pid| job_owning(std::iter::empty::<(JobId, &Birth)>(), pid);
 
         let mut waiter = Fixture::start(&format!("lock {}", path.display()), "waiting");
         let mut folded = Folded::of(&waiter);
         let lock = ProcessBlockedOn::Lock {
-            path: std::fs::canonicalize(&path)
-                .expect("the lock file's path")
-                .into_os_string()
-                .into_string()
-                .expect("a UTF-8 path"),
+            path: canonical,
             holder: Some(LockHolder {
-                pid: holder,
-                job: Some(second),
+                pid: std::process::id(),
+                job: None,
             }),
         };
-        let expected = on_linux_only(lock.clone());
-        let read = waiter.shows(expected.clone(), second_job_holds);
+        let expected = on_linux_only(lock);
+        let read = waiter.shows(expected.clone(), no_jobs);
         assert_eq!(read, expected);
         folded.blocked(&waiter, read);
 
         drop(held);
         waiter.expect("locked");
-        let read = waiter.shows(Some(ProcessBlockedOn::None), second_job_holds);
+        let read = waiter.shows(Some(ProcessBlockedOn::None), no_jobs);
         folded.blocked(&waiter, read);
         let mut changes = Vec::from_iter(expected.map(BlockerChange::Set));
         changes.push(BlockerChange::Set(ProcessBlockedOn::None));
@@ -1173,6 +1235,45 @@ mod tests {
             Some(ProcessBlockedOn::None),
             "released, no path or holder stays"
         );
+        std::fs::remove_file(&path).expect("remove the lock file");
+    }
+
+    /// One job's process blocks on a `flock` a second job's process holds, each leading its own
+    /// group as a job's process does: the read names the lock, its path and the holder's pid, and
+    /// the fenced lookup over the jobs' groups names the second job as the holder's.
+    #[test]
+    fn a_lock_a_second_jobs_process_holds_names_that_job() {
+        let (path, canonical) = lock_file("held-by-job");
+        let (first, second) = (
+            JobId::new(1).expect("a job id"),
+            JobId::new(2).expect("a job id"),
+        );
+        let (holder, holder_birth) =
+            Fixture::lead(&format!("hold-lock {}", path.display()), "locked");
+        let (waiter, waiter_birth) = Fixture::lead(&format!("lock {}", path.display()), "waiting");
+        let jobs = [(first, &waiter_birth), (second, &holder_birth)];
+        let job_of = |pid| job_owning(jobs, pid);
+        let holder_pid = holder.life.identity.pid;
+        assert_eq!(job_of(holder_pid).expect("a lookup"), Some(second));
+        assert_eq!(
+            job_of(waiter.life.identity.pid).expect("a lookup"),
+            Some(first)
+        );
+        assert_eq!(
+            job_of(std::process::id()).expect("a lookup"),
+            None,
+            "this test leads no job's group"
+        );
+
+        let expected = on_linux_only(ProcessBlockedOn::Lock {
+            path: canonical,
+            holder: Some(LockHolder {
+                pid: holder_pid,
+                job: Some(second),
+            }),
+        });
+        assert_eq!(waiter.shows(expected.clone(), job_of), expected);
+        drop((waiter, holder));
         std::fs::remove_file(&path).expect("remove the lock file");
     }
 }

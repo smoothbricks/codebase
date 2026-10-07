@@ -577,6 +577,42 @@ pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
     ))
 }
 
+/// Which of `jobs` owns process `pid`: the job whose group, read through [`job_members`] and so
+/// proven the job's by its leader, holds `pid`. `None` when no job's group holds it -- `pid` is in
+/// another group, or no process holds it any more. The group `pid` is in names the one candidate
+/// leader; a job whose leader's pid was since given to another leader is no candidate, and a
+/// candidate whose membership cannot be proven is an error unless another candidate holds `pid`.
+pub fn job_owning<'a, J: Copy>(
+    jobs: impl IntoIterator<Item = (J, &'a Birth)>,
+    pid: u32,
+) -> io::Result<Option<J>> {
+    let target = i32::try_from(pid).map_err(io::Error::other)?;
+    // SAFETY: getpgid takes a plain integer and touches no memory of ours.
+    let pgid = unsafe { libc::getpgid(target) };
+    if pgid < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let mut unproven = None;
+    for (job, leader) in jobs {
+        if i32::try_from(leader.pid()).ok() != Some(pgid) {
+            continue;
+        }
+        match job_members(leader) {
+            Ok(members) if members.iter().any(|member| member.pid() == target) => {
+                return Ok(Some(job));
+            }
+            Ok(_) => {}
+            Err(error) => unproven = Some(error),
+        }
+    }
+    unproven.map_or(Ok(None), Err)
+}
+
 /// Signal the group `pgid` leads. Only for the leader's parent, while it holds the leader
 /// unreaped -- running, or exited and not yet collected: until the parent reaps it, the leader's
 /// pid, and with it the group's id, names nothing else. A group with nothing left running in it
