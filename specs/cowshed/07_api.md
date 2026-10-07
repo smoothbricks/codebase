@@ -841,7 +841,7 @@ pub enum ProcessCoverageGap {      // the first observation the tree is known to
     UnobservedBirth { pid: u32 },   // a fork, exec or exit named a process whose birth was not observed
     UnobservedExit { pid: u32 },    // a pid was born again while its previous life had no observed exit
     UncountedFork { pid: u32 },     // a member forked without the kernel naming or counting its children
-    UnreadImage { pid: u32 },       // a member exec'd and exited before its new image could be read
+    UnreadImage { pid: u32 },       // a member exec'd and its new image was not read (exited first, or the read failed)
 }
 pub struct CpuTotals { pub user_us: CpuMicros, pub sys_us: CpuMicros }
 pub struct StorageIoTotals { pub read_bytes: StorageIoBytes, pub write_bytes: StorageIoBytes }
@@ -866,11 +866,13 @@ milliseconds once, after aggregation. Storage I/O byte counters follow the kerne
 operation counts into invented byte totals or stand in for volume-allocation deltas. An exit's status and time are one
 `ProcessExit`, present only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal
 result. A gap is absorbing and names the first missed observation. `UncountedFork.pid` is the observed forking member,
-not an invented child PID or a missing-child count; `UnreadImage.pid` is the member whose new image could not be read,
-not an invented program or argv. Both retain their evidence through the generated controller and N-API records. Blocker
-detail fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation error,
-never an assertion that the process is unblocked. A lock observation identifies its path and, when kernel evidence
-resolves it, the holder PID and that holder's job; no program-name guess supplies it.
+not an invented child PID or a missing-child count; `UnreadImage.pid` is the member whose new image was not read,
+whether it exited before the read or the read failed, not an invented program or argv. A failed read is also returned as
+an observation error with its call and errno; the gap keeps the tree from claiming Complete, and does not replace the
+error. Both gaps retain their evidence through the generated controller and N-API records. Blocker detail fields are
+valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never an assertion
+that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder
+PID and that holder's job; no program-name guess supplies it.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one heartbeat per minute for
 each unchanged live process, and each process's final usage on exit. The sampling/subscriber interval `everyMs` does not

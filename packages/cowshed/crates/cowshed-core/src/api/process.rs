@@ -75,6 +75,7 @@ pub enum ProcessCoverageGap {
     /// The kernel reported that a member forked without naming or counting the children
     /// (macOS kqueue `NOTE_FORK`): a child reaped before it was enumerated is unseen.
     UncountedFork { pid: u32 },
-    /// A member exec'd, and exited before its new image could be read.
+    /// A member exec'd and its new image was not read: it exited before the read, or the read
+    /// failed, in which case the observer also returns that failure with its call and errno.
     UnreadImage { pid: u32 },
 }
