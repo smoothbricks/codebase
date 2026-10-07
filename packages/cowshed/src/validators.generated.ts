@@ -169,6 +169,11 @@ export const assertCowshedErrorList = typia.createAssertEquals<readonly Api.Cows
 export const parseCowshedErrorList = (json: string): readonly Api.CowshedError[] =>
   assertCowshedErrorList(JSON.parse(json));
 
+export const assertCpuMicros = typia.createAssertEquals<Api.CpuMicros>();
+export const parseCpuMicros = (json: string): Api.CpuMicros => assertCpuMicros(JSON.parse(json));
+export const assertCpuMicrosList = typia.createAssertEquals<readonly Api.CpuMicros[]>();
+export const parseCpuMicrosList = (json: string): readonly Api.CpuMicros[] => assertCpuMicrosList(JSON.parse(json));
+
 export const assertCreateOptions = typia.createAssertEquals<Api.CreateOptions>();
 export const parseCreateOptions = (json: string): Api.CreateOptions => assertCreateOptions(JSON.parse(json));
 export const assertCreateOptionsList = typia.createAssertEquals<readonly Api.CreateOptions[]>();
@@ -550,6 +555,12 @@ export const parseProcessExit = (json: string): Api.ProcessExit => assertProcess
 export const assertProcessExitList = typia.createAssertEquals<readonly Api.ProcessExit[]>();
 export const parseProcessExitList = (json: string): readonly Api.ProcessExit[] =>
   assertProcessExitList(JSON.parse(json));
+
+export const assertProcessUsage = typia.createAssertEquals<Api.ProcessUsage>();
+export const parseProcessUsage = (json: string): Api.ProcessUsage => assertProcessUsage(JSON.parse(json));
+export const assertProcessUsageList = typia.createAssertEquals<readonly Api.ProcessUsage[]>();
+export const parseProcessUsageList = (json: string): readonly Api.ProcessUsage[] =>
+  assertProcessUsageList(JSON.parse(json));
 
 export const assertProjectGrantDelta = typia.createAssertEquals<Api.ProjectGrantDelta>();
 export const parseProjectGrantDelta = (json: string): Api.ProjectGrantDelta =>

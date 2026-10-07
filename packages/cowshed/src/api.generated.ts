@@ -269,6 +269,12 @@ export type CowshedError = {
   readonly retry?: Retry;
 };
 
+/**
+ * CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
+ * user or system time, or a job's total from its accounting source.
+ */
+export type CpuMicros = number & tags.Type<'uint64'>;
+
 export type CreateOptions = {
   readonly revision?: RevisionTarget;
   readonly fromWorkspace?: WorkspaceName;
@@ -980,6 +986,21 @@ export type ProcessCoverageGap =
 export type ProcessExit = {
   readonly status: ExitStatus;
   readonly exitedAt: UtcTimestamp;
+};
+
+/**
+ * What one process has cost itself, as last read: never the usage of the children it waited
+ * for, which the job's accounting source counts. Absent from a process whose counters were
+ * never read, rather than zero.
+ */
+export type ProcessUsage = {
+  readonly cpuUserUs: CpuMicros;
+  readonly cpuSysUs: CpuMicros;
+  /**
+   * Whether its own CPU over the supervisor's last sample window was at least 1 % of one
+   * core.
+   */
+  readonly busy: boolean;
 };
 
 /**

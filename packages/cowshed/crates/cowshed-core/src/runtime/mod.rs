@@ -6,6 +6,7 @@ pub(crate) mod nx_daemon;
 #[cfg(target_os = "macos")]
 pub mod process_events;
 pub mod process_tree;
+pub mod process_usage;
 pub mod project;
 pub mod shell_host;
 mod shell_job;

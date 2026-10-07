@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
+use super::resources::CpuMicros;
 
 /// Every process a job owned that its observer saw, the exited ones included, and whether the
 /// observer saw all of them.
@@ -46,6 +47,24 @@ pub struct JobProcessSample {
 pub struct ProcessExit {
     pub status: ExitStatus,
     pub exited_at: UtcTimestamp,
+}
+
+/// A process is busy over a sample window in which its own CPU time is at least this share of
+/// the window's wall time, in thousandths of one core: 1 %, the share under which a consumer
+/// counts a tree idle. The one declaration of the threshold; consumers read it from here.
+pub const BUSY_CPU_PERMILLE: u32 = 10;
+
+/// What one process has cost itself, as last read: never the usage of the children it waited
+/// for, which the job's accounting source counts. Absent from a process whose counters were
+/// never read, rather than zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessUsage {
+    pub cpu_user_us: CpuMicros,
+    pub cpu_sys_us: CpuMicros,
+    /// Whether its own CPU over the supervisor's last sample window was at least 1 % of one
+    /// core.
+    pub busy: bool,
 }
 
 /// Whether the tree holds every process the job owned. A gap is absorbing: once an observation
