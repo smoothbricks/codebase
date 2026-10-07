@@ -91,22 +91,23 @@ async function main() {
   const startTime = Date.now();
   await hooks.runPreTasksExecution(run);
   let hashes;
-  let failure;
+  // `{ error }` only on failure: a hasher may throw any value, `undefined` included.
+  let failed = null;
   try {
     hashes = await hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails);
   } catch (error) {
-    failure = error;
+    failed = { error };
   }
   try {
     await hooks.runPostTasksExecution({ ...run, taskResults: {}, startTime, endTime: Date.now() });
   } catch (error) {
     // Both failures are named: the hashing's is the cause, the hook's what it left behind.
-    throw failure === undefined
+    throw failed === null
       ? error
-      : new AggregateError([failure, error], 'hashing failed, and so did postTasksExecution after it');
+      : new AggregateError([failed.error, error], 'hashing failed, and so did postTasksExecution after it');
   }
-  if (failure !== undefined) {
-    throw failure;
+  if (failed !== null) {
+    throw failed.error;
   }
   return hashes;
 }
@@ -155,7 +156,8 @@ async function hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetai
 main().then(
   (hashes) => answer(`${JSON.stringify({ hashes })}\n`),
   (error) => {
-    process.stderr.write(`${error?.stack ?? String(error)}\n`);
+    // Node's own rendering: an AggregateError's `errors` and any `cause` are printed with it.
+    console.error(error);
     process.exitCode = 1;
   },
 );
