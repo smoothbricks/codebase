@@ -421,6 +421,12 @@ impl JobHandle {
         super::download_call::<operations::JobLogs, _>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
+    #[napi(js_name = "tail")]
+    pub fn tail(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::JobTailRead, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Writes to an attached job's stdin.
     #[napi(js_name = "attachWrite")]
     pub fn attach_write(

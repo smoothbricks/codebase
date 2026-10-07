@@ -68,6 +68,7 @@ export interface NativeJobHandleOperations
   extends NativeJobStatus,
     NativeJobSealed,
     NativeJobLogs,
+    NativeJobTail,
     NativeJobAttachWrite,
     NativeJobDetach,
     NativeJobWait,
@@ -639,6 +640,21 @@ export type JobStatusArguments = Readonly<Record<string, never>>;
  */
 export async function jobStatus(handle: NativeJobStatus, args: JobStatusArguments): Promise<Api.JobInfo> {
   return V.parseJobInfo(await handle.status(JSON.stringify(args)));
+}
+
+/** A handle that serves `job.tail`. */
+export interface NativeJobTail {
+  tail(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `job.tail` caller names; its handle binds the rest. */
+export type JobTailArguments = Pick<Api.TailRequest, 'cursor' | 'limits'>;
+
+/**
+ * Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
+ */
+export async function jobTail(handle: NativeJobTail, args: JobTailArguments): Promise<Api.JobTail> {
+  return V.parseJobTail(await handle.tail(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.wait`. */

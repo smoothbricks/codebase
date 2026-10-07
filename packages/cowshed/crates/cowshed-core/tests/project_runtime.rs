@@ -11,21 +11,30 @@ use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
-    JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, Reseed, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, StdinSource,
-    StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
+    LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, Reseed, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState,
+    WorkspaceTarget,
 };
 use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
-use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
+use cowshed_core::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
+use cowshed_core::runtime::job_groups::Birth;
+use cowshed_core::runtime::supervisor::{
+    ArtifactStoreSink, CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal,
+    ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
+    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+};
 use cowshed_core::runtime::{
     JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeLogChunk,
     WorkspaceSnapshot,
 };
+use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::timing::{timed, timed_async};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
@@ -231,6 +240,8 @@ struct FakeHost {
     removal: FakeRemoval,
     recovery_behavior: RecoveryBehavior,
     held_job: Option<Arc<HeldJob>>,
+    /// When set, jobs run in this real workspace supervisor instead of being refused.
+    supervisor: Option<WorkspaceSupervisorHandle>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
     /// Background reclaims `remove` started, for `settle_reclaims`.
@@ -277,6 +288,7 @@ impl FakeHost {
             removal: FakeRemoval::default(),
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
+            supervisor: None,
             create_gate: None,
             reclaims: Vec::new(),
             bundles: Vec::new(),
@@ -1221,6 +1233,9 @@ impl ProjectRuntimeHost for FakeHost {
         request: cowshed_core::api::dto::ExecRequest,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = &self.supervisor {
+            return supervisor.exec(None, None, request).await;
+        }
         let mount = self.snapshot(self.workspace(&workspace)?).info.mount;
         self.events
             .send(Event::Exec {
@@ -1272,9 +1287,12 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
     ) -> Result<JobInfo> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = &self.supervisor {
+            return supervisor.info(job).await;
+        }
         match &self.held_job {
             Some(held) => Ok(held.info()),
             None => Err(Self::worker_unavailable()),
@@ -1295,9 +1313,12 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
     ) -> Result<JobAnswer<JobInfo>> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = self.supervisor.clone() {
+            return Ok(Box::pin(async move { supervisor.wait(job).await }));
+        }
         let Some(held) = self.held_job.clone() else {
             return Err(Self::worker_unavailable());
         };
@@ -1330,12 +1351,24 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
         stream: JobStream,
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>> {
         self.require_incarnation(&workspace, &incarnation)?;
+        if let Some(supervisor) = self.supervisor.clone() {
+            return Ok(Box::pin(async move {
+                let chunk = supervisor
+                    .log_read(job, StreamKind::from(stream), offset, follow)
+                    .await?;
+                Ok(RuntimeLogChunk {
+                    bytes: chunk.bytes,
+                    next_offset: chunk.next_offset,
+                    eof: chunk.eof,
+                })
+            }));
+        }
         let held = self.held_job.clone();
         Ok(Box::pin(async move {
             let Some(held) = held else {
@@ -1359,6 +1392,23 @@ impl ProjectRuntimeHost for FakeHost {
             Ok(held
                 .chunk(stream, offset)
                 .expect("an ended job's streams are at EOF"))
+        }))
+    }
+
+    async fn read_tail(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        cursor: Option<JobJournalCursor>,
+        limits: JobTailLimits,
+    ) -> Result<JobAnswer<JobTail>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let Some(supervisor) = self.supervisor.clone() else {
+            return Err(Self::worker_unavailable());
+        };
+        Ok(Box::pin(async move {
+            supervisor.tail(job, cursor, limits).await
         }))
     }
 }
@@ -1645,6 +1695,352 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
         .expect("the wait answers once the job ends")
         .expect("wait");
     assert_eq!(ended.state, JobState::Exited);
+}
+
+/// A job process the test speaks for: the supervisor hands each spawned job's event sender to
+/// the test, which admits the job's output and ends it through that sender, in the order it
+/// decides.
+struct ScriptedSpawner {
+    spawned: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
+}
+
+#[async_trait]
+impl SpawnSink for ScriptedSpawner {
+    async fn spawn(
+        &mut self,
+        request: ProcessSpawnRequest,
+        events: mpsc::Sender<ProcessEvent>,
+    ) -> Result<Box<dyn RunningProcess>> {
+        self.spawned.send(events).expect("spawn observer");
+        Ok(Box::new(ScriptedProcess {
+            // Not a process: its pid names nothing this test owns, so no group is identified.
+            birth: Birth::Unobserved {
+                pid: 10_000 + u32::try_from(request.job_id.get()).expect("test job id"),
+                reason: "a scripted process leads no group".into(),
+            },
+        }))
+    }
+}
+
+struct ScriptedProcess {
+    birth: Birth,
+}
+
+impl RunningProcess for ScriptedProcess {
+    fn birth(&self) -> Option<&Birth> {
+        Some(&self.birth)
+    }
+
+    fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn close_stdin(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_stdin(&mut self) {}
+
+    fn signal_process_tree(&mut self, _signal: ProcessSignal) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct AcceptedCommitments;
+
+#[async_trait]
+impl CommitmentSink for AcceptedCommitments {
+    async fn record(&mut self, _draft: CommitmentDraft) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A real workspace supervisor over the real artifact store under `root`, whose job processes
+/// are scripted.
+fn scripted_supervisor(
+    root: &Path,
+    spawned: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
+) -> WorkspaceSupervisorHandle {
+    let workspace_root = root.join("workspace");
+    std::fs::create_dir(&workspace_root).expect("workspace root");
+    let authority = WorkspaceAuthoritySnapshot {
+        repo_id: RepoId::parse("acme/widget").expect("fixed repo id"),
+        workspace: WorkspaceName::new("main").expect("main"),
+        workspace_incarnation: incarnation(1),
+        grant_revision: 1,
+        lifecycle_revision: 1,
+    };
+    let config = WorkspaceSupervisorConfig {
+        owned_repo_ids: OwnedRepoIds::sole(authority.repo_id.clone()),
+        authority,
+        workspace_root: workspace_root.clone(),
+        default_cwd: None,
+        sandbox: SandboxConfig {
+            home: root.join("home"),
+            mount_root: root.to_path_buf(),
+            workspace_mount: workspace_root.clone(),
+            exec_temp_dir: root.join("tmp"),
+            port_block: cowshed_core::metadata::PortBlock::new(49_136, 16).expect("port block"),
+            retained_port_blocks: Vec::new(),
+            mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
+            grants: SandboxGrants::default(),
+            allowed_unix_sockets: Vec::new(),
+            additional_denies: Vec::new(),
+            shed_links: Vec::new(),
+            git_worktree_repository: None,
+            build_volume_mount: None,
+            repository_caches: Vec::new(),
+            capabilities: Default::default(),
+        },
+        build_volume_layout: None,
+        artifacts: ArtifactConfig::default(),
+        term_grace: Duration::from_millis(10),
+        actor_capacity: 8,
+        event_capacity: 8,
+        credential_env_names: std::collections::BTreeSet::new(),
+        shell_host: None,
+        shell_pool: Default::default(),
+        group_ledger: None,
+        inherited_groups: Vec::new(),
+        volume_labels: None,
+    };
+    let artifacts = ArtifactStoreSink::open(
+        workspace_root,
+        &config.owned_repo_ids,
+        &config.authority,
+        config.artifacts.clone(),
+    )
+    .expect("open artifact store");
+    WorkspaceSupervisor::start_with_sinks(
+        config,
+        Box::new(ScriptedSpawner { spawned }),
+        Box::new(artifacts),
+        Box::new(AcceptedCommitments),
+    )
+    .expect("start supervisor")
+}
+
+/// Jobs of the main workspace, reached the way an embedder reaches them: the capability client,
+/// its controller connection, the project router and the host, down to a real supervisor.
+struct SupervisedJobs {
+    worker: cowshed_core::api::WorkspaceHandle,
+    spawned: mpsc::UnboundedReceiver<mpsc::Sender<ProcessEvent>>,
+    _runtime: ProjectRuntime,
+}
+
+impl SupervisedJobs {
+    async fn start(root: &TempRoot) -> Self {
+        let (events, _events) = mpsc::unbounded_channel();
+        let (spawner, spawned) = mpsc::unbounded_channel();
+        let mut host = FakeHost::new(root, events, false, false, Vec::new());
+        host.supervisor = Some(scripted_supervisor(root, spawner));
+        let repo = host.descriptor.repo_id.clone();
+        let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+        let router = runtime.router();
+        adopt(&router, &repo).await;
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        tokio::spawn(serve_controller_connection(
+            server.into(),
+            coordinator(repo),
+            router.clone(),
+        ));
+        let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+        let project = cowshed.open(root.join("checkout")).await.expect("open");
+        let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+        let worker = coordinator.worker("main").await.expect("worker");
+        Self {
+            worker,
+            spawned,
+            _runtime: runtime,
+        }
+    }
+
+    /// Admits a job and hands back the sender its scripted process speaks through.
+    async fn exec(&mut self) -> (cowshed_core::api::JobHandle, mpsc::Sender<ProcessEvent>) {
+        let job = self
+            .worker
+            .exec(ExecRequest {
+                command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+                cwd: None,
+                mode: RunSandboxMode::ReadWrite,
+                env: std::collections::HashMap::new(),
+                trace: None,
+                stdin: StdinSource::Empty,
+                stdout_copy: None,
+                stderr_copy: None,
+            })
+            .await
+            .expect("exec");
+        let process = self.spawned.recv().await.expect("the job's process");
+        (job, process)
+    }
+}
+
+/// Admits `bytes` to the job's `stream`, a pipe-read at a time, and returns once all of it is
+/// readable through the controller: a following read of its last byte answers only then.
+async fn admit(
+    job: &cowshed_core::api::JobHandle,
+    process: &mpsc::Sender<ProcessEvent>,
+    stream: JobStream,
+    admitted: u64,
+    bytes: &[u8],
+) {
+    for piece in bytes.chunks(64 * 1024) {
+        process
+            .send(ProcessEvent::Output {
+                job_id: job.id(),
+                stream: StreamKind::from(stream),
+                bytes: Bytes::copy_from_slice(piece),
+            })
+            .await
+            .expect("the job admits output");
+    }
+    let end = admitted + u64::try_from(bytes.len()).expect("test length");
+    let mut last = job
+        .logs(stream, end - 1, true)
+        .await
+        .expect("follow the last byte");
+    let byte = last
+        .next()
+        .await
+        .expect("the last byte arrives")
+        .expect("read the last byte");
+    assert_eq!(&byte[..], &bytes[bytes.len() - 1..]);
+}
+
+/// Ends the job as its process would: an exit, then both streams' EOF.
+async fn end(job: &cowshed_core::api::JobHandle, process: &mpsc::Sender<ProcessEvent>) {
+    process
+        .send(ProcessEvent::Exited {
+            job_id: job.id(),
+            exit: cowshed_core::api::dto::ExitStatus::Exited { code: 0 },
+        })
+        .await
+        .expect("the job exits");
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        process
+            .send(ProcessEvent::OutputEof {
+                job_id: job.id(),
+                stream,
+            })
+            .await
+            .expect("the job's stream ends");
+    }
+    assert_eq!(job.wait().await.expect("wait").state, JobState::Exited);
+}
+
+fn tail_limits(bytes: u32, lines: u32) -> JobTailLimits {
+    JobTailLimits {
+        bytes_per_stream: JobTailBytes::new(bytes).expect("tail bytes"),
+        lines_per_stream: std::num::NonZeroU32::new(lines).expect("tail lines"),
+    }
+}
+
+/// Over the controller, a job's latest bounded tail ends at the end of its journal, a tail after
+/// the cursor it returned holds exactly what was admitted since, and a cursor past the admitted
+/// bytes is a usage error. The 1 MiB journal is far past the store's inline cap, so the sealed
+/// job answers the same tails out of its promoted file.
+#[tokio::test]
+async fn a_tail_ends_at_the_journal_end_and_resumes_at_its_cursor() {
+    const MIB: u64 = 1024 * 1024;
+    let root = test_root();
+    let mut jobs = SupervisedJobs::start(&root).await;
+    let (job, process) = jobs.exec().await;
+    let line = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-\n";
+    let journal: Vec<u8> = line
+        .iter()
+        .copied()
+        .cycle()
+        .take(usize::try_from(MIB).expect("test length"))
+        .collect();
+    admit(&job, &process, JobStream::Stdout, 0, &journal).await;
+
+    let limits = tail_limits(4096, 1024);
+    let latest = job.tail(None, limits).await.expect("latest tail");
+    assert_eq!(
+        latest.next,
+        JobJournalCursor {
+            stdout: MIB,
+            stderr: 0
+        }
+    );
+    assert_eq!(latest.stdout.as_bytes(), &journal[journal.len() - 4096..]);
+    assert!(
+        latest.stdout_truncated,
+        "earlier stdout lies before the tail"
+    );
+    assert!(latest.stderr.as_bytes().is_empty());
+    assert!(!latest.stderr_truncated);
+
+    let more = [b'+'; 100];
+    admit(&job, &process, JobStream::Stdout, MIB, &more).await;
+    let resumed = job
+        .tail(Some(latest.next), limits)
+        .await
+        .expect("tail(next)");
+    assert_eq!(resumed.stdout.as_bytes(), &more[..]);
+    assert_eq!(
+        resumed.next,
+        JobJournalCursor {
+            stdout: MIB + 100,
+            stderr: 0
+        }
+    );
+    assert!(!resumed.stdout_truncated);
+
+    let past = JobJournalCursor {
+        stdout: MIB + 101,
+        stderr: 0,
+    };
+    let error = job
+        .tail(Some(past), limits)
+        .await
+        .expect_err("past the end");
+    assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+
+    end(&job, &process).await;
+    assert_eq!(
+        job.tail(Some(latest.next), limits)
+            .await
+            .expect("sealed tail(next)"),
+        resumed,
+        "the sealed file answers as the live journal did"
+    );
+    let sealed = job.tail(None, limits).await.expect("sealed latest tail");
+    let mut expected = journal[journal.len() - 3996..].to_vec();
+    expected.extend_from_slice(&more);
+    assert_eq!(sealed.stdout.as_bytes(), &expected[..]);
+    assert_eq!(sealed.next, resumed.next);
+    let error = job
+        .tail(Some(past), limits)
+        .await
+        .expect_err("sealed, past the end");
+    assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+
+    // Lines bound a tail as bytes do: the latest two lines are the last full line and the
+    // unterminated one after it; one line after a cursor ends at its newline.
+    let two = job
+        .tail(None, tail_limits(4096, 2))
+        .await
+        .expect("two lines");
+    let mut expected = line.to_vec();
+    expected.extend_from_slice(&more);
+    assert_eq!(two.stdout.as_bytes(), &expected[..]);
+    assert!(two.stdout_truncated);
+    let cursor = JobJournalCursor {
+        stdout: MIB - 128,
+        stderr: 0,
+    };
+    let one = job
+        .tail(Some(cursor), tail_limits(4096, 1))
+        .await
+        .expect("one line");
+    assert_eq!(one.stdout.as_bytes(), &line[..]);
+    assert_eq!(one.next.stdout, MIB - 64);
+    assert!(
+        one.stdout_truncated,
+        "more admitted stdout follows the line"
+    );
 }
 
 /// A create that asks for its steps hears each one as it happens, over the controller connection

@@ -21,16 +21,17 @@ use crate::api::dto::RunSandboxMode;
 use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob,
-    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
+    MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions,
+    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    RemovedWorkspace, SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState,
+    WorkspaceTarget,
 };
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
     LogsChunk, LogsRequest, Operation, OperationRequest, ProjectOpenRequest, ProjectOpened,
-    RepoRequest, Scope, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest,
-    WorkspaceView, encode_result,
+    RepoRequest, Scope, TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest,
+    WorkspaceRequest, WorkspaceView, encode_result,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -315,6 +316,16 @@ pub trait ProjectRuntimeHost: Send + 'static {
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>>;
+    /// A bounded slice of both streams of the job: after `cursor` when it is named, else their
+    /// latest bounded tail.
+    async fn read_tail(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        cursor: Option<JobJournalCursor>,
+        limits: JobTailLimits,
+    ) -> Result<JobAnswer<JobTail>>;
 }
 
 /// An answer a job gives when it reaches a point — its end, its next output — and so may take
@@ -816,6 +827,9 @@ impl ProjectActor {
         let response = match operation {
             Op::JobLogs(params) => {
                 return self.job_logs(&authority, params).await.map(Routed::Later);
+            }
+            Op::JobTailRead(params) => {
+                return self.job_tail(&authority, params).await.map(Routed::Later);
             }
             Op::JobWait(params) => {
                 return self.job_wait(&authority, params).await.map(Routed::Later);
@@ -1393,6 +1407,28 @@ impl ProjectActor {
                 })?,
                 chunk.bytes,
             )
+        }))
+    }
+
+    async fn job_tail(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: TailRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let tail = self
+            .host
+            .read_tail(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+                params.cursor,
+                params.limits,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            respond::<operations::JobTailRead>(&tail.await?)
         }))
     }
 
@@ -10881,6 +10917,22 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 next_offset: chunk.next_offset,
                 eof: chunk.eof,
             })
+        }))
+    }
+
+    async fn read_tail(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        cursor: Option<JobJournalCursor>,
+        limits: JobTailLimits,
+    ) -> Result<JobAnswer<JobTail>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move {
+            supervisor.tail(job, cursor, limits).await
         }))
     }
 }

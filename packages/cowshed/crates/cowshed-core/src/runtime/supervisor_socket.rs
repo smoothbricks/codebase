@@ -30,8 +30,9 @@ use super::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
-    CommandArg, ExecCommand, ExecRequest, JobId, OutputPublication, RunSandboxMode, ScriptCommand,
-    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
+    CommandArg, ExecCommand, ExecRequest, JobId, JobJournalCursor, JobTailLimits,
+    OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest, StdinSource, TraceContext,
+    WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::fork_lock::Fenced;
@@ -298,6 +299,12 @@ enum Call {
         stream: StreamWire,
         offset: u64,
         follow: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    Tail {
+        job_id: JobId,
+        cursor: Option<JobJournalCursor>,
+        limits: JobTailLimits,
     },
     #[serde(rename_all = "camelCase")]
     Checkpoint {
@@ -1113,6 +1120,14 @@ async fn answer(
                 chunk.bytes,
             )
         }
+        Call::Tail {
+            job_id,
+            cursor,
+            limits,
+        } => (
+            to_value(&supervisor.tail(job_id, cursor, limits).await?)?,
+            Bytes::new(),
+        ),
         Call::Checkpoint { checkpoint_id } => {
             let barrier = supervisor.checkpoint_barrier(checkpoint_id).await?;
             (
@@ -1588,6 +1603,27 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 })
             });
             let _ = reply.send(result);
+        }
+        Command::Tail {
+            authority,
+            job_id,
+            cursor,
+            limits,
+            reply,
+        } => {
+            let _ = reply.send(
+                call(
+                    path,
+                    &authority,
+                    Call::Tail {
+                        job_id,
+                        cursor,
+                        limits,
+                    },
+                    Bytes::new(),
+                )
+                .await,
+            );
         }
         Command::Checkpoint {
             authority,

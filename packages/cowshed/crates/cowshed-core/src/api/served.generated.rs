@@ -1028,6 +1028,32 @@ impl Serves<JobLogs> for JobHandle {
     }
 }
 
+impl Serves<JobTailRead> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<TailRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            cursor: Option<JobJournalCursor>,
+            limits: JobTailLimits,
+        }
+        let Caller { cursor, limits } = decode::<JobTailRead, Caller>(arguments)?;
+        Ok(TailRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+            cursor,
+            limits,
+        })
+    }
+}
+
 impl Serves<JobAttachWrite> for JobHandle {
     const BOUND: &'static [&'static str] =
         &["repoId", "workspace", "workspaceIncarnation", "jobId"];
@@ -1177,6 +1203,7 @@ pub(crate) fn each_served(
     check.served::<JobStatus, _>(job_handle, &[]);
     check.served::<JobSealed, _>(job_handle, &[]);
     check.served::<JobLogs, _>(job_handle, &[]);
+    check.served::<JobTailRead, _>(job_handle, &[]);
     check.served::<JobAttachWrite, _>(job_handle, &[]);
     check.served::<JobDetach, _>(job_handle, &[]);
     check.served::<JobWait, _>(job_handle, &[]);

@@ -689,6 +689,15 @@ export type JobInfoRef = {
 );
 
 /**
+ * A position in a job's two output journals: how many admitted bytes of each stream precede it.
+ * A stream's admitted byte count is the cursor just past its end.
+ */
+export type JobJournalCursor = {
+  readonly stdout: number & tags.Type<'uint64'>;
+  readonly stderr: number & tags.Type<'uint64'>;
+};
+
+/**
  * One life of one process: the image it runs now (or ran last), its parent, and how it ended.
  */
 export type JobProcessSample = {
@@ -740,6 +749,33 @@ export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' |
  * Which captured stream a log read walks.
  */
 export type JobStream = 'stdout' | 'stderr';
+
+/**
+ * A bounded raw slice of each stream and the cursor that continues after it. A slice after a
+ * cursor is the start of what follows it; the latest tail is the end of what was admitted.
+ * `*Truncated` says admitted bytes of the window the request named lie outside the slice:
+ * after it when a cursor named the start, before it for the latest tail.
+ */
+export type JobTail = {
+  readonly stdout: BinaryData;
+  readonly stderr: BinaryData;
+  readonly next: JobJournalCursor;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+};
+
+/**
+ * How many bytes a tail returns per stream: at least one, at most 64 KiB.
+ */
+export type JobTailBytes = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65536>;
+
+/**
+ * The bounds of one tail, applied to each stream on its own.
+ */
+export type JobTailLimits = {
+  readonly bytesPerStream: JobTailBytes;
+  readonly linesPerStream: number & tags.Type<'uint32'> & tags.Minimum<1>;
+};
 
 /**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted
@@ -1593,6 +1629,18 @@ export type TaggedBytesEncoding = 'utf8' | 'base64';
 export type TaggedBytesRef = {
   readonly encoding: TaggedBytesEncoding;
   readonly data: string;
+};
+
+/**
+ * A bounded tail of one job: after `cursor` when it is named, else the latest one.
+ */
+export type TailRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly jobId: JobId;
+  readonly cursor: JobJournalCursor | null;
+  readonly limits: JobTailLimits;
 };
 
 export type TerminalCommitment = {

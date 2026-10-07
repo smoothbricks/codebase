@@ -2,11 +2,11 @@ use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo,
-    WorkspaceTarget,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
+    MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions,
+    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ReseedResult, ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -15,7 +15,8 @@ use super::operations::{
     LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation, ProjectGrantRequest,
     ProjectOpenRequest, PushRequest, QuotaRequest, RebaseRequest, RemoveProjectRequest,
     RepoRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
-    SourceDestinationRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
+    SourceDestinationRequest, TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest,
+    WorkspaceAttachRequest,
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
@@ -2022,6 +2023,25 @@ impl JobHandle {
 
     pub async fn status(&self) -> Result<JobInfo> {
         invoke::<operations::JobStatus>(&*self.runtime, &self.authority.job(self.id)).await
+    }
+
+    /// A bounded slice of both streams: after `cursor` when it is named, else their latest
+    /// bounded tail. `next` continues after the slice; a cursor past a stream's admitted bytes is
+    /// a usage error.
+    pub async fn tail(
+        &self,
+        cursor: Option<JobJournalCursor>,
+        limits: JobTailLimits,
+    ) -> Result<JobTail> {
+        let request = TailRequest {
+            repo_id: self.authority.repo_id.clone(),
+            workspace: self.authority.workspace.clone(),
+            workspace_incarnation: self.authority.workspace_incarnation.clone(),
+            job_id: self.id,
+            cursor,
+            limits,
+        };
+        invoke::<operations::JobTailRead>(&*self.runtime, &request).await
     }
 
     /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already

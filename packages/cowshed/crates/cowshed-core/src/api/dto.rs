@@ -27,6 +27,8 @@ pub const MAX_INLINE_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_SUMMARY_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_ARG_BYTES: usize = 128 * 1024;
 pub const MAX_ARGV_BYTES: usize = 1024 * 1024;
+/// The most bytes one tail returns per stream: a tail's slice travels as inline [`BinaryData`].
+pub const MAX_JOB_TAIL_BYTES: usize = MAX_INLINE_OUTPUT_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DtoError {
@@ -60,6 +62,8 @@ pub enum DtoError {
     InvalidCommandArgumentEncoding,
     #[error("command argument cannot be represented exactly on this platform")]
     InvalidPlatformCommandArgument,
+    #[error("a tail's bytes per stream must be in 1..={MAX_JOB_TAIL_BYTES}, got {0}")]
+    InvalidTailBytes(u32),
     #[error("invalid SHA-256 digest {0:?}")]
     InvalidSha256Digest(String),
     #[error("invalid stream projection: {0}")]
@@ -1323,6 +1327,77 @@ pub enum ExitStatus {
 pub struct OutputLimitInfo {
     pub limit_bytes: u64,
     pub crossing_bytes: u64,
+}
+
+/// A position in a job's two output journals: how many admitted bytes of each stream precede it.
+/// A stream's admitted byte count is the cursor just past its end.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobJournalCursor {
+    pub stdout: u64,
+    pub stderr: u64,
+}
+
+/// How many bytes a tail returns per stream: at least one, at most 64 KiB.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65536>")
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobTailBytes(u32);
+
+impl JobTailBytes {
+    pub fn new(value: u32) -> Result<Self, DtoError> {
+        if value != 0 && usize::try_from(value).is_ok_and(|bytes| bytes <= MAX_JOB_TAIL_BYTES) {
+            Ok(Self(value))
+        } else {
+            Err(DtoError::InvalidTailBytes(value))
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Serialize for JobTailBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for JobTailBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The bounds of one tail, applied to each stream on its own.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobTailLimits {
+    pub bytes_per_stream: JobTailBytes,
+    pub lines_per_stream: std::num::NonZeroU32,
+}
+
+/// A bounded raw slice of each stream and the cursor that continues after it. A slice after a
+/// cursor is the start of what follows it; the latest tail is the end of what was admitted.
+/// `*Truncated` says admitted bytes of the window the request named lie outside the slice:
+/// after it when a cursor named the start, before it for the latest tail.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobTail {
+    pub stdout: BinaryData,
+    pub stderr: BinaryData,
+    pub next: JobJournalCursor,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 pub const CONTROLLER_COMMITMENT_VERSION: u16 = 2;
 

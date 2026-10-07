@@ -12,11 +12,11 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, OutputPublication,
-    ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
+    MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions,
+    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob,
+    TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
@@ -324,6 +324,8 @@ operations! {
     worker json "job.sealed" JobSealed(JobRequest) -> SealedJob;
     /// Reads one stream's bytes from an offset.
     worker download(offset) "job.logs" JobLogs(LogsRequest) -> LogsChunk;
+    /// Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
+    worker json "job.tail" JobTailRead(TailRequest) -> JobTail;
     /// Writes to an attached job's stdin.
     worker upload "job.attachWrite" JobAttachWrite(JobRequest) -> EmptyResult;
     /// Detaches from a job.
@@ -668,6 +670,18 @@ pub struct LogsRequest {
 pub struct LogsChunk {
     pub eof: bool,
     pub next_offset: u64,
+}
+
+/// A bounded tail of one job: after `cursor` when it is named, else the latest one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TailRequest {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub cursor: Option<JobJournalCursor>,
+    pub limits: JobTailLimits,
 }
 
 #[cfg(test)]

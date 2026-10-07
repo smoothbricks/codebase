@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
-    ExitStatus, JobFailure, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo,
-    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy,
-    RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WorkspacePath,
+    ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobTailBytes, JobTailLimits,
+    MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo,
+    WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
@@ -2491,6 +2492,48 @@ async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
         remote.session_snapshot(&session).await.unwrap(),
         h.handle.session_snapshot(&session).await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_served_supervisor_answers_a_tail_as_the_in_process_one_does() {
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(
+        &spawned,
+        b"one\ntwo\n",
+        b"err",
+        ExitStatus::Exited { code: 0 },
+    )
+    .await;
+    remote.wait(job).await.unwrap();
+    let limits = JobTailLimits {
+        bytes_per_stream: JobTailBytes::new(64).unwrap(),
+        lines_per_stream: std::num::NonZeroU32::new(1).unwrap(),
+    };
+    let tail = remote.tail(job, None, limits).await.unwrap();
+    assert_eq!(tail, h.handle.tail(job, None, limits).await.unwrap());
+    assert_eq!(
+        (tail.stdout.as_bytes(), tail.stderr.as_bytes()),
+        (&b"two\n"[..], &b"err"[..])
+    );
+    assert_eq!(
+        tail.next,
+        JobJournalCursor {
+            stdout: 8,
+            stderr: 3
+        }
+    );
+    let past = JobJournalCursor {
+        stdout: 9,
+        stderr: 0,
+    };
+    let error = remote.tail(job, Some(past), limits).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
 }
 
 #[tokio::test]
