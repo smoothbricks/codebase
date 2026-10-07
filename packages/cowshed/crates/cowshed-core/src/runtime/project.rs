@@ -12437,21 +12437,23 @@ mod removal_supervisor_tests {
             events: tokio::sync::mpsc::Sender<ProcessEvent>,
         ) -> Result<Box<dyn RunningProcess>> {
             // Not a process: its pid names nothing this test owns, so no group is identified.
-            let birth = super::super::job_groups::Birth::Unobserved {
-                pid: 42,
-                reason: "a test process has no process group".into(),
+            let process = super::super::supervisor::OwnedProcess {
+                birth: super::super::job_groups::Birth::Unobserved {
+                    pid: 42,
+                    reason: "a test process has no process group".into(),
+                },
+                spawned: std::time::Instant::now(),
             };
             events
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
-                    birth: birth.clone(),
-                    at: std::time::Instant::now(),
+                    process: process.clone(),
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;
             Ok(Box::new(TestProcess {
                 job_id: request.job_id,
-                birth,
+                process,
                 events,
                 signals: self.0.clone(),
             }))
@@ -12460,7 +12462,7 @@ mod removal_supervisor_tests {
 
     struct TestProcess {
         job_id: JobId,
-        birth: super::super::job_groups::Birth,
+        process: super::super::supervisor::OwnedProcess,
         events: tokio::sync::mpsc::Sender<ProcessEvent>,
         signals: Arc<Mutex<Vec<ProcessSignal>>>,
     }
@@ -12474,8 +12476,8 @@ mod removal_supervisor_tests {
     }
 
     impl RunningProcess for TestProcess {
-        fn birth(&self) -> Option<&super::super::job_groups::Birth> {
-            Some(&self.birth)
+        fn process(&self) -> Option<&super::super::supervisor::OwnedProcess> {
+            Some(&self.process)
         }
 
         fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> Result<bool> {

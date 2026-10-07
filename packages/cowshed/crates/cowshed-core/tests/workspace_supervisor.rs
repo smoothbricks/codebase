@@ -24,9 +24,9 @@ use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, Labelled, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
-    RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller, VolumeLabels,
-    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    CommitmentDraft, CommitmentSink, Labelled, OwnedProcess, ProcessEvent, ProcessSignal,
+    ProcessSpawnRequest, RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller,
+    VolumeLabels, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
 
@@ -82,9 +82,12 @@ impl SpawnSink for FakeSpawner {
         Ok(Box::new(FakeProcess {
             job_id: request.job_id,
             // Not a process: its pid names nothing this test owns, so no group is identified.
-            birth: Birth::Unobserved {
-                pid,
-                reason: "a fake process leads no group".into(),
+            process: OwnedProcess {
+                birth: Birth::Unobserved {
+                    pid,
+                    reason: "a fake process leads no group".into(),
+                },
+                spawned: Instant::now(),
             },
             observations: self.process_observations.clone(),
             backpressure: self.backpressure,
@@ -95,15 +98,15 @@ impl SpawnSink for FakeSpawner {
 
 struct FakeProcess {
     job_id: JobId,
-    birth: Birth,
+    process: OwnedProcess,
     observations: mpsc::UnboundedSender<ProcessObservation>,
     backpressure: bool,
     writes: usize,
 }
 
 impl RunningProcess for FakeProcess {
-    fn birth(&self) -> Option<&Birth> {
-        Some(&self.birth)
+    fn process(&self) -> Option<&OwnedProcess> {
+        Some(&self.process)
     }
 
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
@@ -1611,7 +1614,10 @@ impl SpawnSink for ReapedGroupSpawner {
         self.births.send(birth.clone()).expect("birth observer");
         Ok(Box::new(FakeProcess {
             job_id: request.job_id,
-            birth,
+            process: OwnedProcess {
+                birth,
+                spawned: Instant::now(),
+            },
             observations: self.process_observations.clone(),
             backpressure: false,
             writes: 0,
@@ -3195,7 +3201,7 @@ struct WarmSpawner {
 struct WarmProcess;
 
 impl RunningProcess for WarmProcess {
-    fn birth(&self) -> Option<&Birth> {
+    fn process(&self) -> Option<&OwnedProcess> {
         None
     }
 
@@ -3262,10 +3268,13 @@ fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
     }
 }
 
-fn unobserved(pid: u32) -> Birth {
-    Birth::Unobserved {
-        pid,
-        reason: "a sampling test names no process".into(),
+fn owned(pid: u32, spawned: Instant) -> OwnedProcess {
+    OwnedProcess {
+        birth: Birth::Unobserved {
+            pid,
+            reason: "a sampling test names no process".into(),
+        },
+        spawned,
     }
 }
 
@@ -3337,8 +3346,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         &job,
         ProcessEvent::Activating {
             job_id,
-            birth: unobserved(100),
-            at: activation,
+            process: owned(100, activation),
         },
         0,
     )
@@ -3364,8 +3372,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         &job,
         ProcessEvent::Started {
             job_id,
-            birth: unobserved(200),
-            at: Instant::now(),
+            process: owned(200, Instant::now()),
         },
         1,
     )

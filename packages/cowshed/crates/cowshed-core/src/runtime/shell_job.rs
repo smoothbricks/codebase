@@ -38,8 +38,8 @@ use super::shell_watch::{
     ActivationEvidence, EvaluationClock, FsInstant, FsSeparation, Snapshot, decode_direnv_watches,
 };
 use super::supervisor::{
-    ChildFence, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
-    process_termination_from_wait, run_system_output, run_system_stdin,
+    ChildFence, OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment,
+    StdinLane, process_termination_from_wait, run_system_output, run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
@@ -356,8 +356,8 @@ struct PooledProcess {
 }
 
 impl RunningProcess for PooledProcess {
-    fn birth(&self) -> Option<&Birth> {
-        // The command's process arrives with `ProcessEvent::Started`.
+    fn process(&self) -> Option<&OwnedProcess> {
+        // The job's processes arrive with `ProcessEvent::Activating` and `ProcessEvent::Started`.
         None
     }
 
@@ -515,8 +515,7 @@ async fn run_pooled(
             let _ = events
                 .send(ProcessEvent::Activating {
                     job_id,
-                    birth: host.fence.birth().clone(),
-                    at: host.spawned,
+                    process: host.fence.process().clone(),
                 })
                 .await;
             signal_failed(
@@ -567,7 +566,9 @@ async fn run_pooled(
     // The descriptors travel to the host and are closed here once sent, so end of output is
     // decided by the command's process tree alone.
     let started = host.run(&command, [stdin, stdout, stderr]).await;
-    let at = Instant::now();
+    // The host forked the command just before it replied: this is the first moment this
+    // process knows of it.
+    let spawned = Instant::now();
     let birth = match started {
         Ok(Started::Running(birth)) => {
             // The command runs and holds the job's streams; nothing here may.
@@ -586,7 +587,10 @@ async fn run_pooled(
     let (signals, mut forwarded) = mpsc::unbounded_channel();
     signal_failed(events, job_id, control.publish(Target::Command(signals))).await;
     let _ = events
-        .send(ProcessEvent::Started { job_id, birth, at })
+        .send(ProcessEvent::Started {
+            job_id,
+            process: OwnedProcess { birth, spawned },
+        })
         .await;
     let exit = match host.exited(&mut forwarded, job_id, events).await {
         Ok(exit) => exit,
@@ -618,8 +622,6 @@ async fn run_pooled(
 pub(super) struct ExecHost {
     /// This process is the host's parent and reaps it only inside this fence.
     fence: Arc<ChildFence>,
-    /// When the host process spawned: a job it activates for owns it from here.
-    spawned: Instant,
     control: tokio::net::UnixStream,
     /// Set once the host closed its end of the control socket, or announced that it exits.
     closed: bool,
@@ -1049,14 +1051,12 @@ impl HostActivator {
             .map_err(classify_spawn_error)
             .map_err(ExecError::from)
             .map_err(super::supervisor::map_exec_error)?;
-        let spawned = Instant::now();
         drop(theirs);
         let fence = Arc::new(ChildFence::new(child.id())?);
         ours.set_nonblocking(true).map_err(pipe_error)?;
         let control = tokio::net::UnixStream::from_std(ours).map_err(pipe_error)?;
         Ok(ExecHost {
             fence,
-            spawned,
             control,
             closed: false,
         })

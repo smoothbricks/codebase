@@ -40,7 +40,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::job_resources::JobSampler;
+use crate::runtime::job_resources::{JobSampler, Sampling};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -411,18 +411,16 @@ pub enum ProcessEvent {
         job_id: JobId,
     },
     /// A cold exec host spawned to activate for a job: the job's first process, which it owns
-    /// from `at` until its command starts.
+    /// until its command starts.
     Activating {
         job_id: JobId,
-        birth: Birth,
-        at: Instant,
+        process: OwnedProcess,
     },
     /// A command that runs in a warm exec host started after its job was admitted. The host is
-    /// the command's parent and observed its group leader before it could reap it, at `at`.
+    /// the command's parent and observed its group leader before it could reap it.
     Started {
         job_id: JobId,
-        birth: Birth,
-        at: Instant,
+        process: OwnedProcess,
     },
     /// A warm-shell job ended before any command started; nothing is left running.
     LaunchFailed {
@@ -440,13 +438,23 @@ pub enum ProcessEvent {
     },
 }
 
+/// A process a job owns, as its parent observed it right after spawning it: the identity of the
+/// group it leads, and when it was spawned.
+#[derive(Clone, Debug)]
+pub struct OwnedProcess {
+    pub birth: Birth,
+    /// When the parent saw the spawn return. A command a warm host forks is stamped when the
+    /// host's report of its start arrives, the first moment this process knows of it.
+    pub spawned: Instant,
+}
+
 /// A job's running process. The leader is held unreaped until the handle is dropped -- once the
 /// job concluded, or when its supervisor goes away -- so the group id names the job's group alone
 /// for as long as signals may be sent, descendants that outlive the leader included.
 pub trait RunningProcess: Send {
     /// The command's process as its parent observed it before anything could reap it. `None`
     /// until the process exists; a warm-shell job reports it with [`ProcessEvent::Started`].
-    fn birth(&self) -> Option<&Birth>;
+    fn process(&self) -> Option<&OwnedProcess>;
     /// `Ok(false)` means the bounded process-input lane is full.
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
     fn close_stdin(&mut self) -> Result<()>;
@@ -1619,7 +1627,7 @@ pub(super) fn process_termination_from_wait(
 /// output open, and a kill must still reach them through the group id the held leader keeps.
 pub(super) struct ChildFence {
     pid: i32,
-    birth: Birth,
+    process: OwnedProcess,
     hold: Mutex<Hold>,
 }
 
@@ -1635,8 +1643,9 @@ enum Hold {
 }
 
 impl ChildFence {
-    /// The fence for `pid`, this process's own child, not yet reaped.
+    /// The fence for `pid`, this process's own child, spawned just now and not yet reaped.
     pub(super) fn new(pid: u32) -> Result<Self> {
+        let spawned = Instant::now();
         let leader = i32::try_from(pid)
             .ok()
             .filter(|pid| *pid > 1)
@@ -1645,13 +1654,20 @@ impl ChildFence {
             })?;
         Ok(Self {
             pid: leader,
-            birth: Birth::of(pid),
+            process: OwnedProcess {
+                birth: Birth::of(pid),
+                spawned,
+            },
             hold: Mutex::new(Hold::Held),
         })
     }
 
     pub(super) fn birth(&self) -> &Birth {
-        &self.birth
+        &self.process.birth
+    }
+
+    pub(super) fn process(&self) -> &OwnedProcess {
+        &self.process
     }
 
     fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
@@ -1671,7 +1687,7 @@ impl ChildFence {
                 format!("inspect them with `ps -g {}`", self.pid),
             ));
         }
-        if let Birth::Unobserved { reason, .. } = &self.birth {
+        if let Birth::Unobserved { reason, .. } = &self.process.birth {
             return Err(CowshedError::environment_missing(
                 format!(
                     "process group {} was never identified ({reason}); it is not signalled",
@@ -1875,8 +1891,8 @@ struct SystemRunningProcess {
 }
 
 impl RunningProcess for SystemRunningProcess {
-    fn birth(&self) -> Option<&Birth> {
-        Some(self.fence.birth())
+    fn process(&self) -> Option<&OwnedProcess> {
+        Some(self.fence.process())
     }
 
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
@@ -2614,9 +2630,9 @@ struct JobStateRecord {
     conclusion: Option<Conclusion>,
     /// The job's process as its parent observed it, once its pid is known. Never observed again.
     birth: Option<Birth>,
-    /// Samples the job from its first owned process until it concludes; `None` before any
-    /// process of the job exists and after its terminal sample.
-    sampler: Option<JobSampler>,
+    /// What the job's resource reads answer: nothing before it owns a process, live samples
+    /// while it does, its terminal sample -- or why that failed -- once it ended.
+    sampling: Sampling,
     output_limit: Option<OutputLimitInfo>,
     kill_reason: Option<KillReason>,
     stdout_copy: Option<OutputPublication>,
@@ -3478,7 +3494,7 @@ impl SupervisorActor {
             wait_failure: None,
             conclusion: None,
             birth: None,
-            sampler: None,
+            sampling: Sampling::Unowned,
             output_limit: None,
             kill_reason: None,
             stdout_copy,
@@ -3495,10 +3511,10 @@ impl SupervisorActor {
         };
         match spawn {
             Ok(process) => {
-                if let Some(birth) = process.birth() {
-                    // The child exists now: a one-shot command is the job's first process.
-                    own_process(&mut job, birth.clone(), Instant::now());
-                    adopt_birth(&mut job, self.group_ledger.is_some(), birth.clone());
+                if let Some(owned) = process.process() {
+                    // A one-shot command is the job's first process.
+                    own_process(&mut job, owned.clone());
+                    adopt_birth(&mut job, self.group_ledger.is_some(), owned.birth.clone());
                 }
                 job.process = Some(process);
                 let started = job.birth.is_some();
@@ -3998,17 +4014,16 @@ impl SupervisorActor {
             ProcessEvent::StdinPumpFailed { job_id, error: _ } => {
                 let _ = self.begin_kill(job_id, KillReason::StdinFailure);
             }
-            ProcessEvent::Activating { job_id, birth, at } => {
-                if let Some(job) = self.jobs.get_mut(&job_id)
-                    && !job.terminal()
-                {
-                    own_process(job, birth, at);
+            ProcessEvent::Activating { job_id, process } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    own_process(job, process);
                 }
             }
-            ProcessEvent::Started { job_id, birth, at } => {
+            ProcessEvent::Started { job_id, process } => {
                 let ledger = self.group_ledger.is_some();
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    own_process(job, birth.clone(), at);
+                    let birth = process.birth.clone();
+                    own_process(job, process);
                     adopt_birth(job, ledger, birth);
                     self.record_groups();
                 }
@@ -4225,11 +4240,9 @@ impl SupervisorActor {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        // The terminal sample, frozen into the job's record. A job that never owned a process
-        // has none.
-        if let Some(sampler) = job.sampler.take() {
-            record_sample(job.info.job_id, &sampler, &mut job.info.resources);
-        }
+        // The terminal sample, frozen into the job's record; none for a job that never owned a
+        // process, or whose last observation failed -- a read says which.
+        job.info.resources = job.sampling.freeze(observe);
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
@@ -4691,34 +4704,24 @@ fn sealed_tail(
     )
 }
 
-/// The job owns `leader`, which spawned at `at`. Its first process starts its sampling; a later
-/// one -- its command, after its activation -- takes the lead and keeps the spawn's baselines.
-fn own_process(job: &mut JobStateRecord, leader: Birth, at: Instant) {
+/// The job owns `process`: its first process starts its sampling, and a later one -- its command,
+/// after its activation -- takes the lead. Either is observed at once as the job's latest sample.
+/// An ended job's sampling stays as it ended, whatever arrives after.
+fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     if job.terminal() {
         return;
     }
-    let sampler = match &mut job.sampler {
-        Some(sampler) => {
-            sampler.lead(leader);
-            sampler
+    let job_id = job.info.job_id;
+    if let Some(sampler) = job.sampling.own(job_id, process) {
+        match observe(sampler) {
+            Ok(sample) => job.info.resources = Some(sample),
+            // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
+            Err(error) => eprintln!(
+                "cowshed: job {} was not sampled: {}",
+                job_id.get(),
+                error.message
+            ),
         }
-        None => job
-            .sampler
-            .insert(JobSampler::spawned(job.info.job_id, leader, at)),
-    };
-    record_sample(job.info.job_id, sampler, &mut job.info.resources);
-}
-
-/// Observe the job now as its latest sample. A failed observation leaves the latest standing and
-/// says why in the daemon log; a resources read answers the failure itself.
-fn record_sample(job_id: JobId, sampler: &JobSampler, latest: &mut Option<JobResourceSample>) {
-    match observe(sampler) {
-        Ok(sample) => *latest = Some(sample),
-        Err(error) => eprintln!(
-            "cowshed: job {} was not sampled: {}",
-            job_id.get(),
-            error.message
-        ),
     }
 }
 
@@ -4726,29 +4729,14 @@ fn observe(sampler: &JobSampler) -> Result<JobResourceSample> {
     sampler.observe(Instant::now(), utc_now()?)
 }
 
-/// A resources read: a running job observed now, an ended job's terminal sample.
+/// A resources read: a running job observed now and kept as its latest sample, an ended job's
+/// terminal sample or why it has none.
 fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
-    if let Some(sampler) = &job.sampler {
-        let sample = observe(sampler)?;
+    let sample = job.sampling.read(job.info.job_id, observe)?;
+    if !job.terminal() {
         job.info.resources = Some(sample.clone());
-        return Ok(sample);
     }
-    job.info.resources.clone().ok_or_else(|| {
-        let job_id = job.info.job_id.get();
-        if job.terminal() {
-            CowshedError::conflict(
-                format!(
-                    "job {job_id} ended before any process of its own existed: nothing was sampled"
-                ),
-                "inspect the job's status for why it never started",
-            )
-        } else {
-            CowshedError::conflict(
-                format!("job {job_id} owns no process yet: there is nothing to sample"),
-                "read its resources once the job has started",
-            )
-        }
-    })
+    Ok(sample)
 }
 
 /// Record the job's process as its parent observed it. A leader no one could identify keeps the
