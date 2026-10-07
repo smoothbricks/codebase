@@ -2,10 +2,10 @@ use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions,
-    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ReseedResult, ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
+    LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
+    RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport,
     WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
@@ -2065,6 +2065,14 @@ impl JobHandle {
             limits,
         };
         invoke::<operations::JobTailRead>(&*self.runtime, &request).await
+    }
+
+    /// The TCP ports the job's process group listens on now, read from the kernel under this
+    /// handle's workspace incarnation: a listening child counts, a port another process holds
+    /// never does, and nothing connects to a port to find out.
+    pub async fn listening_ports(&self) -> Result<JobListeningPorts> {
+        invoke::<operations::JobListeningPortsRead>(&*self.runtime, &self.authority.job(self.id))
+            .await
     }
 
     /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already

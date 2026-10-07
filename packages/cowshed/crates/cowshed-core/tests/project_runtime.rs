@@ -240,8 +240,9 @@ struct FakeHost {
     removal: FakeRemoval,
     recovery_behavior: RecoveryBehavior,
     held_job: Option<Arc<HeldJob>>,
-    /// When set, jobs run in this real workspace supervisor instead of being refused.
-    supervisor: Option<WorkspaceSupervisorHandle>,
+    /// The supervisor serving each workspace whose jobs are real; a workspace without one runs
+    /// none.
+    supervisors: std::collections::BTreeMap<WorkspaceName, WorkspaceSupervisorHandle>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
     /// Background reclaims `remove` started, for `settle_reclaims`.
@@ -288,7 +289,7 @@ impl FakeHost {
             removal: FakeRemoval::default(),
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
-            supervisor: None,
+            supervisors: std::collections::BTreeMap::new(),
             create_gate: None,
             reclaims: Vec::new(),
             bundles: Vec::new(),
@@ -1233,7 +1234,7 @@ impl ProjectRuntimeHost for FakeHost {
         request: cowshed_core::api::dto::ExecRequest,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;
-        if let Some(supervisor) = &self.supervisor {
+        if let Some(supervisor) = self.supervisors.get(&workspace) {
             return supervisor.exec(None, None, request).await;
         }
         let mount = self.snapshot(self.workspace(&workspace)?).info.mount;
@@ -1290,7 +1291,7 @@ impl ProjectRuntimeHost for FakeHost {
         job: JobId,
     ) -> Result<JobInfo> {
         self.require_incarnation(&workspace, &incarnation)?;
-        if let Some(supervisor) = &self.supervisor {
+        if let Some(supervisor) = self.supervisors.get(&workspace) {
             return supervisor.info(job).await;
         }
         match &self.held_job {
@@ -1316,7 +1317,7 @@ impl ProjectRuntimeHost for FakeHost {
         job: JobId,
     ) -> Result<JobAnswer<JobInfo>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        if let Some(supervisor) = self.supervisor.clone() {
+        if let Some(supervisor) = self.supervisors.get(&workspace).cloned() {
             return Ok(Box::pin(async move { supervisor.wait(job).await }));
         }
         let Some(held) = self.held_job.clone() else {
@@ -1357,7 +1358,7 @@ impl ProjectRuntimeHost for FakeHost {
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        if let Some(supervisor) = self.supervisor.clone() {
+        if let Some(supervisor) = self.supervisors.get(&workspace).cloned() {
             return Ok(Box::pin(async move {
                 let chunk = supervisor
                     .log_read(job, StreamKind::from(stream), offset, follow)
@@ -1404,12 +1405,27 @@ impl ProjectRuntimeHost for FakeHost {
         limits: JobTailLimits,
     ) -> Result<JobAnswer<JobTail>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        let Some(supervisor) = self.supervisor.clone() else {
+        let Some(supervisor) = self.supervisors.get(&workspace).cloned() else {
             return Err(Self::worker_unavailable());
         };
         Ok(Box::pin(async move {
             supervisor.tail(job, cursor, limits).await
         }))
+    }
+
+    async fn read_listening_ports(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<cowshed_core::api::dto::JobListeningPorts>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let Some(supervisor) = self.supervisors.get(&workspace).cloned() else {
+            return Err(Self::worker_unavailable());
+        };
+        Ok(Box::pin(
+            async move { supervisor.listening_ports(job).await },
+        ))
     }
 }
 
@@ -1761,12 +1777,25 @@ impl CommitmentSink for AcceptedCommitments {
 
 /// The config of a supervisor of the main workspace at `root/workspace`, mounted under `root`.
 fn supervisor_config(root: &Path) -> WorkspaceSupervisorConfig {
+    supervisor_config_of(
+        root,
+        WorkspaceName::new("main").expect("main"),
+        incarnation(1),
+    )
+}
+
+/// The config of a supervisor of `workspace` at `incarnation`, at `root/workspace`.
+fn supervisor_config_of(
+    root: &Path,
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
+) -> WorkspaceSupervisorConfig {
     let workspace_root = root.join("workspace");
     std::fs::create_dir(&workspace_root).expect("workspace root");
     let authority = WorkspaceAuthoritySnapshot {
         repo_id: RepoId::parse("acme/widget").expect("fixed repo id"),
-        workspace: WorkspaceName::new("main").expect("main"),
-        workspace_incarnation: incarnation(1),
+        workspace,
+        workspace_incarnation,
         grant_revision: 1,
         lifecycle_revision: 1,
     };
@@ -1830,10 +1859,16 @@ fn scripted_supervisor(
     .expect("start supervisor")
 }
 
-/// The production workspace supervisor under `root`: its jobs are real sandboxed children.
+/// The production workspace supervisor of main under `root`: its jobs are real sandboxed
+/// children.
 #[cfg(target_os = "macos")]
 fn system_supervisor(root: &Path) -> WorkspaceSupervisorHandle {
-    let config = supervisor_config(root);
+    system_supervisor_of(supervisor_config(root))
+}
+
+/// The production workspace supervisor `config` describes.
+#[cfg(target_os = "macos")]
+fn system_supervisor_of(config: WorkspaceSupervisorConfig) -> WorkspaceSupervisorHandle {
     std::fs::create_dir_all(&config.sandbox.home).expect("home");
     let token = config
         .workspace_root
@@ -1854,48 +1889,94 @@ fn system_supervisor(root: &Path) -> WorkspaceSupervisorHandle {
 /// its controller connection, the project router and the host, down to a real supervisor.
 struct SupervisedJobs {
     worker: cowshed_core::api::WorkspaceHandle,
+    /// The coordinator the worker was minted through, for another workspace's worker.
+    #[cfg(target_os = "macos")]
+    coordinator: cowshed_core::api::Coordinator,
+    /// What serves another embedder's connection to the same router.
+    #[cfg(target_os = "macos")]
+    controller: Controller,
     _runtime: ProjectRuntime,
 }
 
 impl SupervisedJobs {
     async fn connect(root: &TempRoot, supervisor: WorkspaceSupervisorHandle) -> Self {
+        Self::connect_all(
+            root,
+            [(WorkspaceName::new("main").expect("main"), supervisor)],
+        )
+        .await
+    }
+
+    /// Like [`Self::connect`], with a supervisor for each named workspace of the project.
+    async fn connect_all(
+        root: &TempRoot,
+        supervisors: impl IntoIterator<Item = (WorkspaceName, WorkspaceSupervisorHandle)>,
+    ) -> Self {
         let (events, _events) = mpsc::unbounded_channel();
         let mut host = FakeHost::new(root, events, false, false, Vec::new());
-        host.supervisor = Some(supervisor);
+        host.supervisors.extend(supervisors);
         let repo = host.descriptor.repo_id.clone();
         let runtime = ProjectRuntime::start(host).await.expect("start runtime");
         let router = runtime.router();
         adopt(&router, &repo).await;
-        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        tokio::spawn(serve_controller_connection(
-            server.into(),
-            coordinator(repo),
-            router.clone(),
-        ));
-        let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+        let controller = Controller { repo, router };
+        let (cowshed, token) = Cowshed::connect(controller.endpoint().into())
+            .await
+            .expect("handshake");
         let project = cowshed.open(root.join("checkout")).await.expect("open");
         let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
         let worker = coordinator.worker("main").await.expect("worker");
         Self {
             worker,
+            #[cfg(target_os = "macos")]
+            coordinator,
+            #[cfg(target_os = "macos")]
+            controller,
             _runtime: runtime,
         }
     }
 
     async fn exec(&self, command: ExecCommand) -> cowshed_core::api::JobHandle {
-        self.worker
-            .exec(ExecRequest {
-                command,
-                cwd: None,
-                mode: RunSandboxMode::ReadWrite,
-                env: std::collections::HashMap::new(),
-                trace: None,
-                stdin: StdinSource::Empty,
-                stdout_copy: None,
-                stderr_copy: None,
-            })
-            .await
-            .expect("exec")
+        exec_in(&self.worker, command).await
+    }
+}
+
+/// Admits `command` to `worker`'s workspace, as an embedder would.
+async fn exec_in(
+    worker: &cowshed_core::api::WorkspaceHandle,
+    command: ExecCommand,
+) -> cowshed_core::api::JobHandle {
+    worker
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+        })
+        .await
+        .expect("exec")
+}
+
+/// A project's router, serving coordinator connections the way a controller serves an embedder.
+struct Controller {
+    repo: RepoId,
+    router: RouterHandle,
+}
+
+impl Controller {
+    /// The client end of a new coordinator connection.
+    fn endpoint(&self) -> std::os::unix::net::UnixStream {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        tokio::spawn(serve_controller_connection(
+            server.into(),
+            coordinator(self.repo.clone()),
+            self.router.clone(),
+        ));
+        client
     }
 }
 
@@ -2221,6 +2302,253 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
         .await
         .expect_err("sealed, past the end");
     assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+}
+
+/// What a listening job runs: it listens on an ephemeral IPv4 loopback port, prints the port,
+/// and holds it until the test closes the workspace's `gate` FIFO.
+#[cfg(target_os = "macos")]
+const LISTENER: &str = r#"use strict;
+use IO::Socket::IP;
+my $listener = IO::Socket::IP->new(LocalHost => '127.0.0.1', LocalPort => 0, Listen => 8)
+  or die "listen: $@";
+$| = 1;
+print $listener->sockport, "\n";
+open(my $gate, '<', 'gate') or die "gate: $!";
+my $released = <$gate>;
+"#;
+
+/// A real job of a workspace whose grandchild listens, the port it listens on and the FIFO
+/// that ends it.
+#[cfg(target_os = "macos")]
+struct ListeningJob {
+    job: cowshed_core::api::JobHandle,
+    port: u16,
+    gate: PathBuf,
+}
+
+/// Admits a job to `worker`'s workspace, whose supervisor runs jobs in `workspace`, whose `sh`
+/// runs a child `sh` that runs [`LISTENER`], and returns once the listener has printed its
+/// port: the listening socket exists from then on.
+#[cfg(target_os = "macos")]
+async fn listening_job(
+    workspace: &Path,
+    worker: &cowshed_core::api::WorkspaceHandle,
+) -> ListeningJob {
+    use cowshed_core::fork_lock::Run as _;
+    std::fs::write(workspace.join("listen.pl"), LISTENER).expect("the listener program");
+    let gate = workspace.join("gate");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&gate)
+        .status_locked()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {}", gate.display());
+    let job = exec_in(
+        worker,
+        ExecCommand::Argv(
+            [
+                "/bin/sh",
+                "-c",
+                "/bin/sh -c '/usr/bin/perl listen.pl & wait' & wait",
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect(),
+        ),
+    )
+    .await;
+    let mut stdout = job
+        .logs(JobStream::Stdout, 0, true)
+        .await
+        .expect("follow stdout");
+    let mut line = Vec::new();
+    while !line.contains(&b'\n') {
+        let Some(chunk) = stdout.next().await else {
+            let ended = job.wait().await.expect("the ended job");
+            panic!("the listener never printed its port: {ended:?}");
+        };
+        line.extend_from_slice(&chunk.expect("read stdout"));
+    }
+    let port = std::str::from_utf8(&line)
+        .expect("a UTF-8 line")
+        .trim()
+        .parse()
+        .expect("a port");
+    ListeningJob { job, port, gate }
+}
+
+/// Closes the gate the listener reads, which ends it and then its job.
+#[cfg(target_os = "macos")]
+async fn release(gate: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        // Opening blocks until the listener has the FIFO open to read; closing it is its EOF.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .expect("open the gate");
+    })
+    .await
+    .expect("release task");
+}
+
+/// `job.listeningPorts()` as an embedder's Node process answers it through the built N-API
+/// addon, over its own coordinator connection to the same router.
+#[cfg(target_os = "macos")]
+async fn napi_listening_ports(
+    jobs: &SupervisedJobs,
+    root: &TempRoot,
+    job: JobId,
+) -> cowshed_core::api::dto::JobListeningPorts {
+    use cowshed_core::fork_lock::Spawn as _;
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    let package = Path::new(&manifest).join("../..");
+    let module = Url::from_file_path(package.join("dist/ts/index.js").canonicalize().expect(
+        "the built TypeScript package (nx run cowshed:tsc-js) under packages/cowshed/dist/ts",
+    ))
+    .expect("a module URL");
+    let client = format!(
+        "import {{ connectCoordinator, coordinatorEndpoint }} from {module};\n\
+         const coordinator = await connectCoordinator(coordinatorEndpoint(3), {checkout});\n\
+         const worker = await coordinator.worker('main');\n\
+         const job = await worker.job({job});\n\
+         console.log(JSON.stringify(await job.listeningPorts()));\n\
+         process.exit(0);\n",
+        module = json!(module.as_str()),
+        checkout = json!(root.join("checkout")),
+        job = job.get(),
+    );
+    let node = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("node"))
+                .find(|node| node.is_file())
+        })
+        .expect("node on the test's PATH");
+    let endpoint = std::os::fd::OwnedFd::from(jobs.controller.endpoint());
+    let output = tokio::task::spawn_blocking(move || {
+        // The endpoint arrives as stdin; the shell hands it to Node as descriptor 3, the way a
+        // trusted spawner hands an embedder its controller endpoint.
+        std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"exec "$0" --input-type=module --eval "$1" 3<&0 </dev/null"#,
+            ])
+            .arg(node)
+            .arg(client)
+            .env("NAPI_DEBUG_ADDON", "1")
+            .current_dir(&package)
+            .stdin(std::process::Stdio::from(endpoint))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()?
+            .wait_with_output()
+    })
+    .await
+    .expect("node task")
+    .expect("run node");
+    assert!(
+        output.status.success(),
+        "node: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("node answers the job's listening ports")
+}
+
+/// `listeningPorts()` over real sandboxed jobs, through the controller and through N-API: a job
+/// whose grandchild listens on an ephemeral port names exactly that port in one read, while a
+/// listener this test holds on the host and one in another workspace's job are not named. The
+/// other workspace's job answers its own port alone. Once its listener ended, the job names
+/// none.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_job_s_listening_ports_are_its_own_group_s() {
+    // Bound to the dual-stack wildcard, its port is no job's IPv4 loopback listener's.
+    let host = std::net::TcpListener::bind("[::]:0").expect("host listener");
+    let host_port = host.local_addr().expect("host listener address").port();
+    let root = test_root();
+    // A second workspace of the same project, with its own name and incarnation, served by its
+    // own production supervisor under its own root.
+    let feature = WorkspaceName::new("feature").expect("feature");
+    let feature_root = test_root();
+    let jobs = SupervisedJobs::connect_all(
+        &root,
+        [
+            (
+                WorkspaceName::new("main").expect("main"),
+                system_supervisor(&root),
+            ),
+            (
+                feature.clone(),
+                system_supervisor_of(supervisor_config_of(
+                    &feature_root,
+                    feature.clone(),
+                    incarnation(2),
+                )),
+            ),
+        ],
+    )
+    .await;
+    jobs.coordinator
+        .create(feature.as_str(), CreateOptions::default())
+        .await
+        .expect("create the feature workspace");
+    let feature_worker = jobs
+        .coordinator
+        .worker(feature.as_str())
+        .await
+        .expect("the feature workspace's worker");
+    let (main_info, feature_info) = (jobs.worker.info(), feature_worker.info());
+    assert_ne!(main_info.workspace, feature_info.workspace);
+    assert_ne!(
+        main_info.workspace_incarnation,
+        feature_info.workspace_incarnation
+    );
+    let listening = listening_job(&root.join("workspace"), &jobs.worker).await;
+    let other = listening_job(&feature_root.join("workspace"), &feature_worker).await;
+    assert_ne!(listening.port, other.port);
+
+    let ports = listening
+        .job
+        .listening_ports()
+        .await
+        .expect("the job's listening ports");
+    assert_eq!(ports.job_id, listening.job.id());
+    assert_eq!(ports.ports, vec![listening.port]);
+    assert!(!ports.ports.contains(&host_port));
+    assert!(!ports.ports.contains(&other.port));
+    assert_eq!(
+        other
+            .job
+            .listening_ports()
+            .await
+            .expect("the other workspace's job's listening ports")
+            .ports,
+        vec![other.port]
+    );
+
+    let answered = napi_listening_ports(&jobs, &root, listening.job.id()).await;
+    assert_eq!(answered.job_id, listening.job.id());
+    assert_eq!(answered.ports, vec![listening.port]);
+
+    for ListeningJob { job, gate, .. } in [listening, other] {
+        release(gate).await;
+        let ended = job.wait().await.expect("wait");
+        assert_eq!(
+            ended.exit,
+            Some(cowshed_core::api::dto::ExitStatus::Exited { code: 0 })
+        );
+        assert_eq!(
+            job.listening_ports()
+                .await
+                .expect("an ended job's listening ports")
+                .ports,
+            Vec::<u16>::new()
+        );
+    }
+    drop(host);
 }
 
 /// Every byte `stream` yields until it closes.

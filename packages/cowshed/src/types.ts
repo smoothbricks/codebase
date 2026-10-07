@@ -117,6 +117,11 @@ export interface JobHandle {
    * empty chunk while the job runs.
    */
   logs(args: JobLogsArguments): Promise<JobLogs>;
+  /**
+   * The TCP ports the job's process group listens on now, read from the kernel: a listening
+   * child counts, a port another process holds never does, and nothing connects to a port.
+   */
+  listeningPorts(): Promise<Api.JobListeningPorts>;
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;

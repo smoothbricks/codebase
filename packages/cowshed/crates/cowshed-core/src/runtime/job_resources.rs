@@ -23,9 +23,13 @@ pub(super) enum Sampling {
     Unowned,
     /// The job owns processes: a read observes them now.
     Live(JobSampler),
-    /// The job ended: its terminal sample, or why that last observation failed. A failure is
-    /// kept as it is: an earlier sample would claim the job's end looked like its middle.
-    Frozen(Result<JobResourceSample>),
+    /// The job ended: the process that last led its group, and its terminal sample or why that
+    /// last observation failed. A failure is kept as it is: an earlier sample would claim the
+    /// job's end looked like its middle.
+    Frozen {
+        leader: Birth,
+        outcome: Result<JobResourceSample>,
+    },
 }
 
 impl Sampling {
@@ -38,14 +42,14 @@ impl Sampling {
                 *self = Self::Live(JobSampler::spawned(job_id, process));
                 match self {
                     Self::Live(sampler) => Some(sampler),
-                    Self::Unowned | Self::Frozen(_) => None,
+                    Self::Unowned | Self::Frozen { .. } => None,
                 }
             }
             Self::Live(sampler) => {
                 sampler.lead(process.birth);
                 Some(sampler)
             }
-            Self::Frozen(_) => None,
+            Self::Frozen { .. } => None,
         }
     }
 
@@ -55,12 +59,25 @@ impl Sampling {
         &mut self,
         observe: impl FnOnce(&mut JobSampler) -> Result<JobResourceSample>,
     ) -> Option<JobResourceSample> {
-        if let Self::Live(sampler) = self {
-            *self = Self::Frozen(observe(sampler));
+        if let Self::Live(_) = self
+            && let Self::Live(mut sampler) = std::mem::replace(self, Self::Unowned)
+        {
+            let outcome = observe(&mut sampler);
+            *self = Self::Frozen {
+                leader: sampler.leader,
+                outcome,
+            };
         }
         match self {
-            Self::Frozen(Ok(sample)) => Some(sample.clone()),
-            Self::Unowned | Self::Live(_) | Self::Frozen(Err(_)) => None,
+            Self::Frozen {
+                outcome: Ok(sample),
+                ..
+            } => Some(sample.clone()),
+            Self::Unowned
+            | Self::Live(_)
+            | Self::Frozen {
+                outcome: Err(_), ..
+            } => None,
         }
     }
 
@@ -73,7 +90,7 @@ impl Sampling {
     ) -> Result<JobResourceSample> {
         match self {
             Self::Live(sampler) => observe(sampler),
-            Self::Frozen(outcome) => outcome.clone(),
+            Self::Frozen { outcome, .. } => outcome.clone(),
             Self::Unowned => Err(CowshedError::conflict(
                 format!(
                     "job {} owns no process: it has not started one, or ended before it did",
@@ -89,7 +106,17 @@ impl Sampling {
     pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
         match self {
             Self::Live(sampler) => Some(sampler),
-            Self::Unowned | Self::Frozen(_) => None,
+            Self::Unowned | Self::Frozen { .. } => None,
+        }
+    }
+
+    /// The process that leads the job's group now, or last led it once the job ended; `None`
+    /// while no process of the job's exists, or if none ever did.
+    pub(super) fn leader(&self) -> Option<&Birth> {
+        match self {
+            Self::Live(sampler) => Some(sampler.leader()),
+            Self::Frozen { leader, .. } => Some(leader),
+            Self::Unowned => None,
         }
     }
 }
@@ -305,6 +332,34 @@ mod tests {
     }
 
     const MIB: u64 = 1 << 20;
+
+    /// A job whose only process was its activation -- no command ever started -- still names
+    /// that activation's group once it ended, failed sample or not, so a read of the ended
+    /// job's group never claims the job owned no process.
+    #[test]
+    fn an_ended_job_keeps_the_leader_its_group_last_had() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        assert_eq!(sampling.leader(), None);
+        sampling.own(job(), owned(100, spawn)).expect("live");
+        assert_eq!(sampling.leader().map(Birth::pid), Some(100));
+        let failed = sampling.freeze(|_| {
+            Err(CowshedError::environment_missing(
+                "the activation's last observation failed",
+                "a test",
+            ))
+        });
+        assert_eq!(failed, None);
+        assert_eq!(sampling.leader().map(Birth::pid), Some(100));
+
+        let mut sampling = Sampling::Unowned;
+        sampling.own(job(), owned(100, spawn)).expect("live");
+        sampling
+            .own(job(), owned(200, spawn))
+            .expect("the command leads");
+        sampling.freeze(|sampler| sampler.sample(seen(spawn, &[])));
+        assert_eq!(sampling.leader().map(Birth::pid), Some(200));
+    }
 
     /// The group's peak is the largest simultaneous sum: neither the leader's own memory nor
     /// the sum of every process's separate peak.

@@ -438,6 +438,13 @@ export const assertJobJournalCursorList = typia.createAssertEquals<readonly Api.
 export const parseJobJournalCursorList = (json: string): readonly Api.JobJournalCursor[] =>
   assertJobJournalCursorList(JSON.parse(json));
 
+export const assertJobListeningPorts = typia.createAssertEquals<Api.JobListeningPorts>();
+export const parseJobListeningPorts = (json: string): Api.JobListeningPorts =>
+  assertJobListeningPorts(JSON.parse(json));
+export const assertJobListeningPortsList = typia.createAssertEquals<readonly Api.JobListeningPorts[]>();
+export const parseJobListeningPortsList = (json: string): readonly Api.JobListeningPorts[] =>
+  assertJobListeningPortsList(JSON.parse(json));
+
 export const assertJobProcessDelta = typia.createAssertEquals<Api.JobProcessDelta>();
 export const parseJobProcessDelta = (json: string): Api.JobProcessDelta => assertJobProcessDelta(JSON.parse(json));
 export const assertJobProcessDeltaList = typia.createAssertEquals<readonly Api.JobProcessDelta[]>();

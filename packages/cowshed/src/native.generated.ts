@@ -69,6 +69,7 @@ export interface NativeJobHandleOperations
     NativeJobSealed,
     NativeJobLogs,
     NativeJobTail,
+    NativeJobListeningPorts,
     NativeJobAttachWrite,
     NativeJobDetach,
     NativeJobWait,
@@ -591,6 +592,24 @@ export type JobKillArguments = Readonly<Record<string, never>>;
  */
 export async function jobKill(handle: NativeJobKill, args: JobKillArguments): Promise<Api.EmptyResult> {
   return V.parseEmptyResult(await handle.kill(JSON.stringify(args)));
+}
+
+/** A handle that serves `job.listeningPorts`. */
+export interface NativeJobListeningPorts {
+  listeningPorts(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `job.listeningPorts` caller names; its handle binds the rest. */
+export type JobListeningPortsArguments = Readonly<Record<string, never>>;
+
+/**
+ * Reads the TCP ports the job's process group listens on, from the kernel.
+ */
+export async function jobListeningPorts(
+  handle: NativeJobListeningPorts,
+  args: JobListeningPortsArguments,
+): Promise<Api.JobListeningPorts> {
+  return V.parseJobListeningPorts(await handle.listeningPorts(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.logs`. */

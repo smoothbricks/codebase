@@ -1055,6 +1055,27 @@ impl Serves<JobTailRead> for JobHandle {
     }
 }
 
+impl Serves<JobListeningPortsRead> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<JobRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<JobListeningPortsRead, Caller>(arguments)?;
+        Ok(JobRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+        })
+    }
+}
+
 impl Serves<JobAttachWrite> for JobHandle {
     const BOUND: &'static [&'static str] =
         &["repoId", "workspace", "workspaceIncarnation", "jobId"];
@@ -1205,6 +1226,7 @@ pub(crate) fn each_served(
     check.served::<JobSealed, _>(job_handle, &[]);
     check.served::<JobLogs, _>(job_handle, &[]);
     check.served::<JobTailRead, _>(job_handle, &[]);
+    check.served::<JobListeningPortsRead, _>(job_handle, &[]);
     check.served::<JobAttachWrite, _>(job_handle, &[]);
     check.served::<JobDetach, _>(job_handle, &[]);
     check.served::<JobWait, _>(job_handle, &[]);

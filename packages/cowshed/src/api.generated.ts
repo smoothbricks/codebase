@@ -744,6 +744,17 @@ export type JobJournalCursor = {
 };
 
 /**
+ * The TCP ports on which processes of the job's group listen, read from the kernel at
+ * `sampledAt`: IPv4 and IPv6 alike, ascending, each once. A port another process holds, or a
+ * socket that is only bound or connected, is never one of them; nothing probes a port.
+ */
+export type JobListeningPorts = {
+  readonly jobId: JobId;
+  readonly sampledAt: UtcTimestamp;
+  readonly ports: ReadonlyArray<number & tags.Type<'uint32'> & tags.Maximum<65535>>;
+};
+
+/**
  * The one field of one process that changed; every other field is unchanged. A usage read and
  * a blocker read are separate observations, so a change names exactly one of them, and a
  * change of nothing can be neither built nor decoded.

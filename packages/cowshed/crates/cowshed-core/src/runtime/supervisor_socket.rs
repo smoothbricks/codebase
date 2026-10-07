@@ -289,6 +289,10 @@ enum Call {
         job_id: JobId,
     },
     TraceHealth,
+    #[serde(rename_all = "camelCase")]
+    ListeningPorts {
+        job_id: JobId,
+    },
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
@@ -1107,6 +1111,10 @@ async fn answer(
             Bytes::new(),
         ),
         Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
+        Call::ListeningPorts { job_id } => (
+            to_value(&supervisor.listening_ports(job_id).await?)?,
+            Bytes::new(),
+        ),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
@@ -1577,6 +1585,21 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         }
         Command::TraceHealth { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::TraceHealth, Bytes::new()).await);
+        }
+        Command::ListeningPorts {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(
+                call(
+                    path,
+                    &authority,
+                    Call::ListeningPorts { job_id },
+                    Bytes::new(),
+                )
+                .await,
+            );
         }
         Command::List { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);

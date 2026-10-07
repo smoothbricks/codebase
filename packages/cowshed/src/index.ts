@@ -324,6 +324,10 @@ class JobHandleImpl implements JobHandle {
     return callNativeAsync(() => N.jobLogs(this.#native, args));
   }
 
+  async listeningPorts(): Promise<Api.JobListeningPorts> {
+    return callNativeAsync(() => N.jobListeningPorts(this.#native, {}));
+  }
+
   async detach(): Promise<void> {
     await callNativeAsync(() => N.jobDetach(this.#native, {}));
   }

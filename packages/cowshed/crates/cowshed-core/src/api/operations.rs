@@ -12,11 +12,12 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions,
-    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob,
-    TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
+    LandOptions, LandReport, MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions,
+    PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
+    ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
+    WorkspaceTarget,
 };
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
@@ -326,6 +327,8 @@ operations! {
     worker download(offset) "job.logs" JobLogs(LogsRequest) -> LogsChunk;
     /// Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
     worker json "job.tail" JobTailRead(TailRequest) -> JobTail;
+    /// Reads the TCP ports the job's process group listens on, from the kernel.
+    worker json "job.listeningPorts" JobListeningPortsRead(JobRequest) -> JobListeningPorts;
     /// Writes to an attached job's stdin.
     worker upload "job.attachWrite" JobAttachWrite(JobRequest) -> EmptyResult;
     /// Detaches from a job.

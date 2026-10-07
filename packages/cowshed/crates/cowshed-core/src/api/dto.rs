@@ -1399,6 +1399,18 @@ pub struct JobTail {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
 }
+
+/// The TCP ports on which processes of the job's group listen, read from the kernel at
+/// `sampledAt`: IPv4 and IPv6 alike, ascending, each once. A port another process holds, or a
+/// socket that is only bound or connected, is never one of them; nothing probes a port.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobListeningPorts {
+    pub job_id: JobId,
+    pub sampled_at: UtcTimestamp,
+    pub ports: Vec<u16>,
+}
+
 pub const CONTROLLER_COMMITMENT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
