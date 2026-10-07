@@ -12445,6 +12445,7 @@ mod removal_supervisor_tests {
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
                     birth: birth.clone(),
+                    at: std::time::Instant::now(),
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;

@@ -676,6 +676,7 @@ export type JobInfoRef = {
   readonly cwd: WorkspacePath | null;
   readonly started: UtcTimestamp;
   readonly durationMs?: number & tags.Type<'uint64'>;
+  readonly resources?: JobResourceSample;
   readonly exit?: ExitStatus;
   readonly stdout: StreamInfo;
   readonly stderr: StreamInfo;
@@ -741,6 +742,31 @@ export type JobRequest = {
   readonly workspace: WorkspaceName;
   readonly workspaceIncarnation: WorkspaceIncarnation;
   readonly jobId: JobId;
+};
+
+/**
+ * What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
+ * a process: its shell activation on a cold host, otherwise its command.
+ */
+export type JobResourceSample = {
+  /**
+   * The job sampled, retained so a standalone progress event or receipt keeps its identity.
+   */
+  readonly jobId: JobId;
+  readonly sampledAt: UtcTimestamp;
+  /**
+   * `wall_us` in whole milliseconds.
+   */
+  readonly wallMs: WallMillis;
+  /**
+   * Elapsed since the first owned process spawned.
+   */
+  readonly wallUs: WallMicros;
+  /**
+   * The job's observed leader: the activation's while a cold host activates, then the
+   * command's. Retained after it exits.
+   */
+  readonly leaderPid: number & tags.Type<'uint32'>;
 };
 
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
@@ -1489,6 +1515,11 @@ export type SealedJob = {
   readonly exit: ExitStatus | null;
   readonly failure: JobFailure | null;
   readonly durationMs: (number & tags.Type<'uint64'>) | null;
+  /**
+   * The job's terminal resource sample, exactly as its last [`JobInfo::resources`]; absent
+   * for a job that never owned a process.
+   */
+  readonly resources?: JobResourceSample;
   readonly outputLimit: OutputLimitInfo | null;
   readonly stdout: StreamInfo;
   readonly stderr: StreamInfo;
@@ -1710,6 +1741,16 @@ export type UnattributedRun =
     });
 
 export type UtcTimestamp = string;
+
+/**
+ * Elapsed wall time since the job's first owned process spawned, in microseconds.
+ */
+export type WallMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * Elapsed wall time in whole milliseconds; only [`WallMicros::millis`] makes one.
+ */
+export type WallMillis = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 /**
  * One workspace incarnation: the fence every worker request carries.

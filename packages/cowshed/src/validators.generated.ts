@@ -422,6 +422,13 @@ export const parseJobRequest = (json: string): Api.JobRequest => assertJobReques
 export const assertJobRequestList = typia.createAssertEquals<readonly Api.JobRequest[]>();
 export const parseJobRequestList = (json: string): readonly Api.JobRequest[] => assertJobRequestList(JSON.parse(json));
 
+export const assertJobResourceSample = typia.createAssertEquals<Api.JobResourceSample>();
+export const parseJobResourceSample = (json: string): Api.JobResourceSample =>
+  assertJobResourceSample(JSON.parse(json));
+export const assertJobResourceSampleList = typia.createAssertEquals<readonly Api.JobResourceSample[]>();
+export const parseJobResourceSampleList = (json: string): readonly Api.JobResourceSample[] =>
+  assertJobResourceSampleList(JSON.parse(json));
+
 export const assertJobState = typia.createAssertEquals<Api.JobState>();
 export const parseJobState = (json: string): Api.JobState => assertJobState(JSON.parse(json));
 export const assertJobStateList = typia.createAssertEquals<readonly Api.JobState[]>();
@@ -1039,6 +1046,16 @@ export const parseUtcTimestamp = (json: string): Api.UtcTimestamp => assertUtcTi
 export const assertUtcTimestampList = typia.createAssertEquals<readonly Api.UtcTimestamp[]>();
 export const parseUtcTimestampList = (json: string): readonly Api.UtcTimestamp[] =>
   assertUtcTimestampList(JSON.parse(json));
+
+export const assertWallMicros = typia.createAssertEquals<Api.WallMicros>();
+export const parseWallMicros = (json: string): Api.WallMicros => assertWallMicros(JSON.parse(json));
+export const assertWallMicrosList = typia.createAssertEquals<readonly Api.WallMicros[]>();
+export const parseWallMicrosList = (json: string): readonly Api.WallMicros[] => assertWallMicrosList(JSON.parse(json));
+
+export const assertWallMillis = typia.createAssertEquals<Api.WallMillis>();
+export const parseWallMillis = (json: string): Api.WallMillis => assertWallMillis(JSON.parse(json));
+export const assertWallMillisList = typia.createAssertEquals<readonly Api.WallMillis[]>();
+export const parseWallMillisList = (json: string): readonly Api.WallMillis[] => assertWallMillisList(JSON.parse(json));
 
 export const assertWorkerScope = typia.createAssertEquals<Api.WorkerScope>();
 export const parseWorkerScope = (json: string): Api.WorkerScope => assertWorkerScope(JSON.parse(json));

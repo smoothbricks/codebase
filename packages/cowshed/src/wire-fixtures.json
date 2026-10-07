@@ -532,6 +532,13 @@
         "jobId": 2,
         "pid": 4242,
         "repoId": "smoothbricks/codebase",
+        "resources": {
+          "jobId": 2,
+          "leaderPid": 4242,
+          "sampledAt": "2026-01-02T03:04:05Z",
+          "wallMs": 1250,
+          "wallUs": 1250400
+        },
         "started": "2026-01-02T03:04:05Z",
         "state": "running",
         "stderr": {
@@ -727,6 +734,13 @@
       "jobId": 2,
       "pid": 4242,
       "repoId": "smoothbricks/codebase",
+      "resources": {
+        "jobId": 2,
+        "leaderPid": 4242,
+        "sampledAt": "2026-01-02T03:04:05Z",
+        "wallMs": 1250,
+        "wallUs": 1250400
+      },
       "started": "2026-01-02T03:04:05Z",
       "state": "running",
       "stderr": {

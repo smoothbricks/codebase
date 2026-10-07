@@ -972,3 +972,145 @@ async fn host_controller_a_host_that_breaks_while_activating_fails_the_job_with_
     );
     assert!(ran.stdout.is_empty());
 }
+
+/// A FIFO at `path`: its reader and its writer each wait for the other, so a process blocked on
+/// one is held exactly until the test opens the other end.
+fn fifo(path: &Path) {
+    let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: `raw` is a NUL-terminated path that outlives the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(raw.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// The pid a job's process wrote into the FIFO at `path`, once it wrote it.
+async fn read_pid(path: &Path) -> i32 {
+    let path = path.to_path_buf();
+    let text = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(path)),
+    )
+    .await
+    .expect("the job writes its pid")
+    .expect("reader task")
+    .expect("read the pid");
+    text.trim().parse().expect("a pid")
+}
+
+/// Release the job's process blocked reading the FIFO at `path`.
+async fn release(path: &Path) {
+    let path = path.to_path_buf();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || std::fs::write(path, "go\n")),
+    )
+    .await
+    .expect("the job reads its release")
+    .expect("writer task")
+    .expect("write the release");
+}
+
+/// Wall microseconds from `earlier` to `later`.
+fn micros(earlier: std::time::Instant, later: std::time::Instant) -> u64 {
+    u64::try_from(later.duration_since(earlier).as_micros()).expect("micros")
+}
+
+/// A cold host's activation is its job's first process: the job is sampled while the activation
+/// runs, led by the activation's group, and the command's group takes the lead when it starts.
+/// The activation's spawn stays the wall baseline, and the terminal sample is the sealed one.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts() {
+    let workspace = Workspace::new("shell-pool-resources", 41_360);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in [
+        "activation-pid",
+        "activation-hold",
+        "command-pid",
+        "command-hold",
+    ] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc(
+        "printf '%s\\n' $$ > \"$TMPDIR/activation-pid\"\nread _ < \"$TMPDIR/activation-hold\"\n",
+    );
+    let handle = workspace.supervisor(false);
+    let admitted = std::time::Instant::now();
+    let job = handle
+        .exec(
+            None,
+            None,
+            sh("printf '%s\\n' $$ > \"$TMPDIR/command-pid\"; read _ < \"$TMPDIR/command-hold\""),
+        )
+        .await
+        .expect("admit");
+
+    // The activation runs, held on its FIFO; its group is the host's, which leads the job.
+    let activation_pid = read_pid(&tmp.join("activation-pid")).await;
+    let activation_seen = std::time::Instant::now();
+    // SAFETY: getpgid only reads the process's group.
+    let host = unsafe { libc::getpgid(activation_pid) };
+    assert!(
+        host > 0,
+        "the activation's group: {}",
+        std::io::Error::last_os_error()
+    );
+    let activating = handle
+        .resources(job)
+        .await
+        .expect("an activating job is sampled");
+    let read = std::time::Instant::now();
+    assert_eq!(
+        (activating.job_id, activating.leader_pid),
+        (job, u32::try_from(host).expect("pid"))
+    );
+    assert!(
+        activating.wall_us.get() <= micros(admitted, read),
+        "the job spawned after its admission"
+    );
+    assert_eq!(
+        handle.info(job).await.expect("status").resources,
+        Some(activating.clone()),
+        "status carries the latest sample"
+    );
+
+    release(&tmp.join("activation-hold")).await;
+    let command_pid = read_pid(&tmp.join("command-pid")).await;
+    let before = std::time::Instant::now();
+    let running = handle
+        .resources(job)
+        .await
+        .expect("a running job is sampled");
+    assert_eq!(
+        running.leader_pid,
+        u32::try_from(command_pid).expect("pid"),
+        "the command leads its own group"
+    );
+    assert!(
+        running.wall_us.get() >= micros(activation_seen, before),
+        "the wall still counts from the activation's spawn"
+    );
+    assert!(running.wall_us > activating.wall_us);
+
+    release(&tmp.join("command-hold")).await;
+    let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
+        .await
+        .expect("the job ends")
+        .expect("job outcome");
+    assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+    let terminal = ended.resources.expect("a terminal sample");
+    assert_eq!(
+        terminal.leader_pid, running.leader_pid,
+        "the leader is named after it exits"
+    );
+    assert!(terminal.wall_us >= running.wall_us);
+    assert_eq!(
+        handle.sealed(job).await.expect("sealed").resources,
+        Some(terminal),
+        "the sealed sample is the last one"
+    );
+}

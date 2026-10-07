@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -510,6 +511,14 @@ async fn run_pooled(
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
             };
+            // The host is the job's first process: it activates for this job alone.
+            let _ = events
+                .send(ProcessEvent::Activating {
+                    job_id,
+                    birth: host.fence.birth().clone(),
+                    at: host.spawned,
+                })
+                .await;
             signal_failed(
                 events,
                 job_id,
@@ -558,6 +567,7 @@ async fn run_pooled(
     // The descriptors travel to the host and are closed here once sent, so end of output is
     // decided by the command's process tree alone.
     let started = host.run(&command, [stdin, stdout, stderr]).await;
+    let at = Instant::now();
     let birth = match started {
         Ok(Started::Running(birth)) => {
             // The command runs and holds the job's streams; nothing here may.
@@ -575,7 +585,9 @@ async fn run_pooled(
     // run forwards them until the command is released.
     let (signals, mut forwarded) = mpsc::unbounded_channel();
     signal_failed(events, job_id, control.publish(Target::Command(signals))).await;
-    let _ = events.send(ProcessEvent::Started { job_id, birth }).await;
+    let _ = events
+        .send(ProcessEvent::Started { job_id, birth, at })
+        .await;
     let exit = match host.exited(&mut forwarded, job_id, events).await {
         Ok(exit) => exit,
         Err(error) => {
@@ -606,6 +618,8 @@ async fn run_pooled(
 pub(super) struct ExecHost {
     /// This process is the host's parent and reaps it only inside this fence.
     fence: Arc<ChildFence>,
+    /// When the host process spawned: a job it activates for owns it from here.
+    spawned: Instant,
     control: tokio::net::UnixStream,
     /// Set once the host closed its end of the control socket, or announced that it exits.
     closed: bool,
@@ -1035,12 +1049,14 @@ impl HostActivator {
             .map_err(classify_spawn_error)
             .map_err(ExecError::from)
             .map_err(super::supervisor::map_exec_error)?;
+        let spawned = Instant::now();
         drop(theirs);
         let fence = Arc::new(ChildFence::new(child.id())?);
         ours.set_nonblocking(true).map_err(pipe_error)?;
         let control = tokio::net::UnixStream::from_std(ours).map_err(pipe_error)?;
         Ok(ExecHost {
             fence,
+            spawned,
             control,
             closed: false,
         })

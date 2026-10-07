@@ -23,12 +23,13 @@ use cowshed_core::{
     api::{
         AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
         EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
-        GcReport, GitOid, GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
-        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResizeResult,
-        ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamInfo,
-        TraceContext, TraceId, UtcTimestamp, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding,
-        WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        GcReport, GitOid, GrantSet, JobId, JobInfo, JobResourceSample, JobState, LandReport,
+        LandingCommits, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput,
+        PushReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule,
+        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
+        StreamInfo, TraceContext, TraceId, UtcTimestamp, WallMicros, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -159,6 +160,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: None,
+        resources: None,
         exit: None,
         stdout: inline_stream(""),
         stderr: inline_stream(""),
@@ -168,8 +170,8 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         failure: None,
     };
 
-    // A running job with every optional present, a workspace-file stdin, and both stream storage
-    // variants that name a workspace path.
+    // A running job with every optional present, its latest resource sample among them, a
+    // workspace-file stdin, and both stream storage variants that name a workspace path.
     let running = JobInfo {
         repo_id: repo_id(),
         workspace_incarnation: incarnation(),
@@ -185,6 +187,13 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: Some(workspace_path("packages/cowshed")),
         started: timestamp(),
         duration_ms: None,
+        resources: Some(JobResourceSample {
+            job_id: JobId::new(2).expect("fixture job id"),
+            sampled_at: timestamp(),
+            wall_ms: WallMicros::new(1_250_400).expect("fixture wall").millis(),
+            wall_us: WallMicros::new(1_250_400).expect("fixture wall"),
+            leader_pid: 4242,
+        }),
         exit: None,
         stdout: redirect_stream(2, "out", "build.log", 4096),
         stderr: captured_file_stream(2, "err", 128),
@@ -214,6 +223,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(1_234),
+        resources: None,
         exit: Some(ExitStatus::Exited { code: 0 }),
         stdout: inline_stream("ok\n"),
         stderr: inline_stream(""),
@@ -245,6 +255,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(9),
+        resources: None,
         exit: Some(ExitStatus::Signaled {
             signal: 9,
             core_dumped: true,
@@ -270,6 +281,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(50),
+        resources: None,
         exit: None,
         stdout: captured_file_stream(5, "out", 1_048_576),
         stderr: inline_stream(""),

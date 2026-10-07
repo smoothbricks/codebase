@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -3184,6 +3184,248 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
     assert_eq!(terminal.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(terminal.duration_ms, info.duration_ms);
     assert!(terminal.duration_ms.is_some());
+}
+
+/// A warm-shell job's spawn sink: the job owns no process when it is admitted; its processes
+/// arrive as `Activating`/`Started` events the test sends.
+struct WarmSpawner {
+    spawned: mpsc::UnboundedSender<Spawned>,
+}
+
+struct WarmProcess;
+
+impl RunningProcess for WarmProcess {
+    fn birth(&self) -> Option<&Birth> {
+        None
+    }
+
+    fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn close_stdin(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_stdin(&mut self) {}
+
+    fn signal_process_tree(&mut self, _signal: ProcessSignal) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SpawnSink for WarmSpawner {
+    async fn spawn(
+        &mut self,
+        request: ProcessSpawnRequest,
+        events: mpsc::Sender<ProcessEvent>,
+    ) -> Result<Box<dyn RunningProcess>> {
+        self.spawned
+            .send(Spawned { request, events })
+            .expect("spawn observer");
+        Ok(Box::new(WarmProcess))
+    }
+}
+
+fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
+    let (spawn_tx, spawned) = mpsc::unbounded_channel();
+    let (_process_tx, process) = mpsc::unbounded_channel();
+    let (_artifact_tx, artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, commitments) = mpsc::unbounded_channel();
+    let (order_tx, order) = mpsc::unbounded_channel();
+    let store = ArtifactStoreSink::open(
+        supervisor_config.workspace_root.clone(),
+        &supervisor_config.owned_repo_ids,
+        &supervisor_config.authority,
+        supervisor_config.artifacts.clone(),
+    )
+    .expect("open artifact store");
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(WarmSpawner { spawned: spawn_tx }),
+        Box::new(store),
+        Box::new(FakeCommitments {
+            next_order: 1,
+            observations: commitment_tx,
+            order: order_tx,
+        }),
+    )
+    .unwrap();
+    Harness {
+        handle,
+        spawned,
+        process,
+        artifacts,
+        commitments,
+        order,
+    }
+}
+
+fn unobserved(pid: u32) -> Birth {
+    Birth::Unobserved {
+        pid,
+        reason: "a sampling test names no process".into(),
+    }
+}
+
+/// Deliver `event`, then one stdout byte, and return once the supervisor served that byte at
+/// `offset`: the actor handles a job's events in order, so `event` has been handled too.
+async fn deliver(
+    handle: &WorkspaceSupervisorHandle,
+    spawned: &Spawned,
+    event: ProcessEvent,
+    offset: u64,
+) {
+    let job_id = spawned.request.job_id;
+    spawned.events.send(event).await.unwrap();
+    spawned
+        .events
+        .send(ProcessEvent::Output {
+            job_id,
+            stream: StreamKind::Stdout,
+            bytes: Bytes::from_static(b"."),
+        })
+        .await
+        .unwrap();
+    let chunk = handle
+        .log_read(job_id, StreamKind::Stdout, offset, true)
+        .await
+        .unwrap();
+    assert_eq!(chunk.bytes.as_ref(), b".");
+}
+
+/// A sample's wall time is exactly the time since `spawn` when it was taken: read between
+/// `before` and `after`, it lies between their distances from the spawn.
+fn assert_wall(
+    sample: &cowshed_core::api::JobResourceSample,
+    spawn: Instant,
+    before: Instant,
+    after: Instant,
+) {
+    let low = u64::try_from(before.duration_since(spawn).as_micros()).unwrap();
+    let high = u64::try_from(after.duration_since(spawn).as_micros()).unwrap();
+    assert!(
+        (low..=high).contains(&sample.wall_us.get()),
+        "wallUs {} is not the time since the job's first spawn, between {low} and {high}",
+        sample.wall_us.get()
+    );
+    assert_eq!(sample.wall_ms.get(), sample.wall_us.get() / 1_000);
+}
+
+#[tokio::test]
+async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal() {
+    let (supervisor_config, _root) = isolated_config("resources");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+
+    // Admitted, no process of its own yet: nothing to sample, and the read says so.
+    assert_eq!(handle.info(job_id).await.unwrap().resources, None);
+    let unsampled = handle.resources(job_id).await.unwrap_err();
+    assert_eq!(unsampled.code, ErrorCode::Conflict, "{}", unsampled.message);
+
+    // A cold host spawned for the job five seconds ago is its first process: its leader, its
+    // wall baseline.
+    let activation = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Activating {
+            job_id,
+            birth: unobserved(100),
+            at: activation,
+        },
+        0,
+    )
+    .await;
+    let before = Instant::now();
+    let activating = handle.resources(job_id).await.unwrap();
+    let after = Instant::now();
+    assert_eq!((activating.job_id, activating.leader_pid), (job_id, 100));
+    assert_wall(&activating, activation, before, after);
+    let before = Instant::now();
+    let still_activating = handle.resources(job_id).await.unwrap();
+    let after = Instant::now();
+    assert_wall(&still_activating, activation, before, after);
+    assert_eq!(
+        handle.info(job_id).await.unwrap().resources,
+        Some(still_activating),
+        "status carries the latest sample"
+    );
+
+    // The command starts now: it leads the job, whose wall still counts from the activation.
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            birth: unobserved(200),
+            at: Instant::now(),
+        },
+        1,
+    )
+    .await;
+    let before = Instant::now();
+    let running = handle.resources(job_id).await.unwrap();
+    let after = Instant::now();
+    assert_eq!(running.leader_pid, 200);
+    assert_wall(&running, activation, before, after);
+
+    let before = Instant::now();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = handle.wait(job_id).await.unwrap();
+    let after = Instant::now();
+    let terminal = ended.resources.clone().expect("a terminal sample");
+    assert_eq!(
+        terminal.leader_pid, 200,
+        "the leader is named after it exits"
+    );
+    assert_wall(&terminal, activation, before, after);
+    assert_eq!(
+        handle.resources(job_id).await.unwrap(),
+        terminal,
+        "an ended job's sample is frozen"
+    );
+    assert_eq!(
+        handle.sealed(job_id).await.unwrap().resources,
+        Some(terminal),
+        "the sealed sample is the last one"
+    );
+}
+
+#[tokio::test]
+async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
+    let (supervisor_config, _root) = isolated_config("resources-unspawned");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    job.events
+        .send(ProcessEvent::LaunchFailed {
+            job_id,
+            error: CowshedError::environment_missing("no host could start", "repair the host"),
+        })
+        .await
+        .unwrap();
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        job.events
+            .send(ProcessEvent::OutputEof { job_id, stream })
+            .await
+            .unwrap();
+    }
+    let ended = handle.wait(job_id).await.unwrap();
+    assert_eq!((ended.state, ended.resources), (JobState::Failed, None));
+    assert_eq!(handle.sealed(job_id).await.unwrap().resources, None);
+    let unsampled = handle.resources(job_id).await.unwrap_err();
+    assert_eq!(unsampled.code, ErrorCode::Conflict, "{}", unsampled.message);
 }
 
 /// Workspace `name`'s supervisor config, in an Nx project no daemon serves.

@@ -1743,6 +1743,9 @@ pub struct JobInfo {
     pub cwd: Option<WorkspacePath>,
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
+    /// The latest sample once the job owns a process; frozen at terminal publication. Absent
+    /// before any process of the job exists: a job that never spawned has nothing to sample.
+    pub resources: Option<crate::api::resources::JobResourceSample>,
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
@@ -1772,6 +1775,23 @@ impl JobInfo {
             return Err(DtoError::InvalidJobProjection(
                 "outputLimit must be present exactly for the outputLimit state",
             ));
+        }
+        if let Some(resources) = &self.resources {
+            if self.state == JobState::Queued {
+                return Err(DtoError::InvalidJobProjection(
+                    "a queued job owns no process to sample",
+                ));
+            }
+            if resources.job_id != self.job_id {
+                return Err(DtoError::InvalidJobProjection(
+                    "resources must sample the job that carries them",
+                ));
+            }
+            if !resources.consistent() {
+                return Err(DtoError::InvalidJobProjection(
+                    "resources.wallMs must be resources.wallUs in whole milliseconds",
+                ));
+            }
         }
         match (&self.state, &self.exit) {
             (JobState::Exited, Some(ExitStatus::Exited { .. }))
@@ -1812,6 +1832,8 @@ struct JobInfoRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<&'a crate::api::resources::JobResourceSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     exit: Option<&'a ExitStatus>,
     stdout: &'a StreamInfo,
     stderr: &'a StreamInfo,
@@ -1846,6 +1868,8 @@ struct JobInfoWire {
     cwd: RequiredJobCwd,
     started: UtcTimestamp,
     duration_ms: Option<u64>,
+    #[serde(default)]
+    resources: Option<crate::api::resources::JobResourceSample>,
     exit: Option<ExitStatus>,
     stdout: StreamInfo,
     stderr: StreamInfo,
@@ -1875,6 +1899,7 @@ impl Serialize for JobInfo {
             cwd: &self.cwd,
             started: &self.started,
             duration_ms: self.duration_ms,
+            resources: self.resources.as_ref(),
             exit: self.exit.as_ref(),
             stdout: &self.stdout,
             stderr: &self.stderr,
@@ -1909,6 +1934,7 @@ impl<'de> Deserialize<'de> for JobInfo {
             },
             started: wire.started,
             duration_ms: wire.duration_ms,
+            resources: wire.resources,
             exit: wire.exit,
             stdout: wire.stdout,
             stderr: wire.stderr,
@@ -1934,6 +1960,10 @@ pub struct SealedJob {
     pub exit: Option<ExitStatus>,
     pub failure: Option<JobFailure>,
     pub duration_ms: Option<u64>,
+    /// The job's terminal resource sample, exactly as its last [`JobInfo::resources`]; absent
+    /// for a job that never owned a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::api::resources::JobResourceSample>,
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,

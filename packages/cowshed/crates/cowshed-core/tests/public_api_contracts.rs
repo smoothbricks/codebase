@@ -65,6 +65,12 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
         cwd,
         started: timestamp(),
         duration_ms: Some(1250),
+        resources: Some(JobResourceSample::new(
+            JobId::new(7).unwrap(),
+            timestamp(),
+            WallMicros::new(1_249_731).unwrap(),
+            4242,
+        )),
         exit: Some(ExitStatus::Signaled {
             signal: 15,
             core_dumped: false,
@@ -425,6 +431,7 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "cwd": "packages/app",
             "started": "2026-07-11T12:34:56Z",
             "durationMs": 1250,
+            "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242},
             "exit": {"kind":"signaled","signal":15,"coreDumped":false},
             "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
             "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
@@ -437,6 +444,24 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
     assert!(!encoded.contains("rawBytes"));
     assert!(!encoded.contains("stdoutBytes"));
     assert_eq!(serde_json::from_value::<JobInfo>(value).unwrap(), info);
+
+    let mut queued = info.clone();
+    queued.state = JobState::Queued;
+    queued.duration_ms = None;
+    queued.exit = None;
+    assert!(
+        queued.validate().is_err(),
+        "a queued job owns no process to sample"
+    );
+    let mut foreign = info.clone();
+    foreign.resources.as_mut().unwrap().job_id = JobId::new(8).unwrap();
+    assert!(foreign.validate().is_err(), "a sample of another job");
+    let mut disagreeing = info;
+    disagreeing.resources.as_mut().unwrap().wall_us = WallMicros::new(2_000_000).unwrap();
+    assert!(
+        disagreeing.validate().is_err(),
+        "wallMs must project wallUs"
+    );
 }
 
 #[test]
@@ -456,6 +481,7 @@ fn root_job_info_requires_explicit_null_cwd() {
         "cwd": null,
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 1250,
+        "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242},
         "exit": {"kind":"signaled","signal":15,"coreDumped":false},
         "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
         "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},

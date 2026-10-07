@@ -5,10 +5,11 @@
 //! as its Rust constructor, so no projection admits a value another projection refuses.
 
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::dto::MAX_JOB_ID;
+use super::dto::{JobId, MAX_JOB_ID, UtcTimestamp};
 
 /// The largest integer Rust, JSON and a JavaScript `number` all hold exactly.
 pub const MAX_EXACT_INTEGER: u64 = MAX_JOB_ID;
@@ -120,7 +121,6 @@ impl StorageIoBytes {
     pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
         exact("ioBytes", u128::from(value)).map(Self)
     }
-
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -140,6 +140,77 @@ impl From<StorageIoBytes> for u64 {
     }
 }
 
+/// Elapsed wall time since the job's first owned process spawned, in microseconds.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+pub struct WallMicros(u64);
+
+impl WallMicros {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("wallUs", u128::from(value)).map(Self)
+    }
+
+    pub fn of(elapsed: Duration) -> Result<Self, ResourceUnitError> {
+        exact("wallUs", elapsed.as_micros()).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The whole milliseconds this duration holds: its display projection.
+    pub const fn millis(self) -> WallMillis {
+        WallMillis(self.0 / 1_000)
+    }
+}
+
+impl TryFrom<u64> for WallMicros {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<WallMicros> for u64 {
+    fn from(value: WallMicros) -> Self {
+        value.0
+    }
+}
+
+/// Elapsed wall time in whole milliseconds; only [`WallMicros::millis`] makes one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+pub struct WallMillis(u64);
+
+impl WallMillis {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for WallMillis {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        exact("wallMs", u128::from(value)).map(Self)
+    }
+}
+
+impl From<WallMillis> for u64 {
+    fn from(value: WallMillis) -> Self {
+        value.0
+    }
+}
+
 fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
     u64::try_from(value)
         .ok()
@@ -147,11 +218,45 @@ fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
         .ok_or(ResourceUnitError::Inexact { unit, value })
 }
 
+/// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
+/// a process: its shell activation on a cold host, otherwise its command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobResourceSample {
+    /// The job sampled, retained so a standalone progress event or receipt keeps its identity.
+    pub job_id: JobId,
+    pub sampled_at: UtcTimestamp,
+    /// `wall_us` in whole milliseconds.
+    pub wall_ms: WallMillis,
+    /// Elapsed since the first owned process spawned.
+    pub wall_us: WallMicros,
+    /// The job's observed leader: the activation's while a cold host activates, then the
+    /// command's. Retained after it exits.
+    pub leader_pid: u32,
+}
+
+impl JobResourceSample {
+    pub fn new(job_id: JobId, sampled_at: UtcTimestamp, wall: WallMicros, leader_pid: u32) -> Self {
+        Self {
+            job_id,
+            sampled_at,
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid,
+        }
+    }
+
+    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`.
+    pub fn consistent(&self) -> bool {
+        self.wall_ms == self.wall_us.millis()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{CpuMicros, MAX_EXACT_INTEGER, ResidentBytes, StorageIoBytes};
+    use super::*;
 
     fn length(denominator: u32) -> NonZeroU32 {
         NonZeroU32::new(denominator).expect("a tick length's denominator")
@@ -192,5 +297,62 @@ mod tests {
             assert!(serde_json::from_str::<ResidentBytes>(&json).is_err());
             assert!(serde_json::from_str::<StorageIoBytes>(&json).is_err());
         }
+    }
+
+    fn timestamp() -> UtcTimestamp {
+        UtcTimestamp::new("2026-10-07T12:00:00Z").expect("timestamp")
+    }
+
+    #[test]
+    fn wall_milliseconds_project_the_microseconds() {
+        let wall = WallMicros::of(Duration::from_micros(12_345_999)).expect("exact");
+        let sample = JobResourceSample::new(JobId::new(7).expect("job"), timestamp(), wall, 41);
+        assert_eq!(
+            (sample.wall_us.get(), sample.wall_ms.get()),
+            (12_345_999, 12_345)
+        );
+        assert!(sample.consistent());
+    }
+
+    #[test]
+    fn a_duration_no_projection_holds_exactly_is_an_error() {
+        let past = Duration::from_micros(MAX_EXACT_INTEGER) + Duration::from_micros(1);
+        assert_eq!(
+            WallMicros::of(past),
+            Err(ResourceUnitError::Inexact {
+                unit: "wallUs",
+                value: u128::from(MAX_EXACT_INTEGER) + 1,
+            })
+        );
+        assert!(WallMicros::of(Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn the_wire_is_camel_case_numbers_and_refuses_an_inexact_unit() {
+        let wall = WallMicros::new(1_500).expect("exact");
+        let sample = JobResourceSample::new(JobId::new(3).expect("job"), timestamp(), wall, 99);
+        let json = serde_json::to_value(&sample).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "jobId": 3,
+                "sampledAt": "2026-10-07T12:00:00Z",
+                "wallMs": 1,
+                "wallUs": 1_500,
+                "leaderPid": 99,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<JobResourceSample>(json).expect("round trip"),
+            sample
+        );
+        let inexact = serde_json::json!({
+            "jobId": 3,
+            "sampledAt": "2026-10-07T12:00:00Z",
+            "wallMs": 1,
+            "wallUs": MAX_EXACT_INTEGER + 1,
+            "leaderPid": 99,
+        });
+        assert!(serde_json::from_value::<JobResourceSample>(inexact).is_err());
     }
 }

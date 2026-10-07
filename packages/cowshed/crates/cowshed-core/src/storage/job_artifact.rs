@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray,
-    StructArray, UInt64Array, new_null_array,
+    StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
@@ -25,9 +25,11 @@ use crate::api::dto::{
     DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId, JobState,
     LandAdoptionCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES,
     OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
-    RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIntroducedCommitment,
-    WorkspacePath, WorkspaceRetiredCommitment, validate_command_argv,
+    RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment, UtcTimestamp,
+    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    validate_command_argv,
 };
+use crate::api::resources::{JobResourceSample, WallMicros};
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -78,14 +80,24 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// The one layout records are written and read in. A store holding a record in an earlier layout
-/// is set aside whole ([`SetAsideStore`]), never read.
-const RECORD_SCHEMA_VERSION: u64 = 5;
+/// The one layout records are written and read in: version 6 carries a terminal job's resource
+/// sample in [`RESOURCE_COLUMNS`]. A store holding a record in an earlier layout is set aside
+/// whole ([`SetAsideStore`]), never read.
+const RECORD_SCHEMA_VERSION: u64 = 6;
 /// Where a store in an earlier record layout is moved, beside the records it no longer is.
 const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
+/// The terminal resource sample's columns, in order: its time, wall duration and leader. All
+/// null for a record without a sample.
+const RESOURCE_COLUMNS: [&str; 3] = [
+    "resources_sampled_at",
+    "resources_wall_us",
+    "resources_leader_pid",
+];
+/// The first of [`RESOURCE_COLUMNS`].
+const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -307,6 +319,9 @@ pub struct JobArtifactRecord {
     pub exit: Option<ExitStatus>,
     /// How long a terminal job ran; absent while it runs and for a job whose end nothing observed.
     pub duration_ms: Option<u64>,
+    /// A terminal job's last resource sample; absent while it runs and for a job that never owned
+    /// a process.
+    pub resources: Option<JobResourceSample>,
 }
 
 impl JobArtifactRecord {
@@ -316,11 +331,20 @@ impl JobArtifactRecord {
             return Err(integrity(0, "only a failed job record names a failure"));
         }
         if matches!(self.state, JobState::Queued | JobState::Running)
-            && (self.exit.is_some() || self.duration_ms.is_some())
+            && (self.exit.is_some() || self.duration_ms.is_some() || self.resources.is_some())
         {
             return Err(integrity(
                 0,
-                "only a terminal job record names an exit status or a duration",
+                "only a terminal job record names an exit status, a duration or a terminal \
+                 resource sample",
+            ));
+        }
+        if let Some(resources) = &self.resources
+            && (resources.job_id != self.job_id || !resources.consistent())
+        {
+            return Err(integrity(
+                0,
+                "a record's resource sample must be its own job's, its wallMs its wallUs",
             ));
         }
         if self.sequence == 0 {
@@ -359,6 +383,8 @@ pub struct JobEnding {
     pub state: JobState,
     pub exit: Option<ExitStatus>,
     pub duration_ms: Option<u64>,
+    /// The job's terminal resource sample; `None` when no process of the job ever existed.
+    pub resources: Option<JobResourceSample>,
 }
 
 /// An ending of which nothing is known beyond its state: a job refused before its command ran.
@@ -368,6 +394,7 @@ impl From<JobState> for JobEnding {
             state,
             exit: None,
             duration_ms: None,
+            resources: None,
         }
     }
 }
@@ -847,6 +874,7 @@ impl ArtifactStore {
             failure: None,
             exit: None,
             duration_ms: None,
+            resources: None,
         };
         self.append_record(admission)?;
         let replaced = self.live_jobs.insert(
@@ -1411,6 +1439,7 @@ impl ArtifactStore {
             state,
             exit,
             duration_ms,
+            resources,
         } = ending.into();
         self.validate_token(&token)?;
         let mut live =
@@ -1458,6 +1487,7 @@ impl ArtifactStore {
                 failure: None,
                 exit,
                 duration_ms,
+                resources,
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -3469,6 +3499,9 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field("exit_signal", DataType::Int32, true),
         field("exit_core_dumped", DataType::Boolean, true),
         field("duration_ms", DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[0], DataType::Utf8, true),
+        field(RESOURCE_COLUMNS[1], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[2], DataType::UInt32, true),
     ]))
 }
 
@@ -3659,6 +3692,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
     let stdout = flatten_storage(&record.stdout.storage);
     let stderr = flatten_storage(&record.stderr.storage);
     let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
+    let resources = record.resources.as_ref();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
@@ -3723,6 +3757,15 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(Int32Array::from(vec![exit_signal])),
         Arc::new(BooleanArray::from(vec![exit_core_dumped])),
         Arc::new(UInt64Array::from(vec![record.duration_ms])),
+        Arc::new(StringArray::from(vec![
+            resources.map(|sample| sample.sampled_at.as_str()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.wall_us.get()),
+        ])),
+        Arc::new(UInt32Array::from(vec![
+            resources.map(|sample| sample.leader_pid),
+        ])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3811,6 +3854,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         .then(|| uint64(batch, duration_column).map(|column| column.value(0)))
         .transpose()?;
     let exit = decode_exit(batch, EXIT_COLUMN)?;
+    let resources = decode_resources(batch, job_id)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -3825,7 +3869,36 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         failure,
         exit,
         duration_ms,
+        resources,
     })
+}
+
+/// The terminal resource sample of a version-6 job batch: absent when every one of
+/// [`RESOURCE_COLUMNS`] is null; a partly null sample is damage.
+fn decode_resources(
+    batch: &RecordBatch,
+    job_id: JobId,
+) -> Result<Option<JobResourceSample>, ArtifactError> {
+    let columns = RESOURCE_COLUMN..RESOURCE_COLUMN + RESOURCE_COLUMNS.len();
+    let nulls = columns
+        .clone()
+        .filter(|&column| batch.column(column).is_null(0))
+        .count();
+    if nulls == RESOURCE_COLUMNS.len() {
+        return Ok(None);
+    }
+    if nulls != 0 {
+        return Err(ArtifactError::Arrow(
+            "resource columns must all be null or all present".into(),
+        ));
+    }
+    let sampled_at = UtcTimestamp::new(string(batch, RESOURCE_COLUMN)?.value(0))?;
+    let wall = WallMicros::new(uint64(batch, RESOURCE_COLUMN + 1)?.value(0))
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    let leader_pid = uint32(batch, RESOURCE_COLUMN + 2)?.value(0);
+    Ok(Some(JobResourceSample::new(
+        job_id, sampled_at, wall, leader_pid,
+    )))
 }
 
 fn visible_storage_name(kind: VisibleStorageKind) -> &'static str {
@@ -4172,6 +4245,13 @@ fn downcast<'a, T: 'static>(array: &'a dyn Array, name: &str) -> Result<&'a T, A
 }
 
 fn uint64(batch: &RecordBatch, index: usize) -> Result<&UInt64Array, ArtifactError> {
+    downcast(
+        batch.column(index).as_ref(),
+        batch.schema().field(index).name(),
+    )
+}
+
+fn uint32(batch: &RecordBatch, index: usize) -> Result<&UInt32Array, ArtifactError> {
     downcast(
         batch.column(index).as_ref(),
         batch.schema().field(index).name(),
@@ -5181,6 +5261,56 @@ mod tests {
         );
     }
 
+    fn sample(job_id: u64, wall_us: u64, leader_pid: u32) -> JobResourceSample {
+        JobResourceSample::new(
+            JobId::new(job_id).unwrap(),
+            UtcTimestamp::new("2026-10-07T12:00:00Z").unwrap(),
+            WallMicros::new(wall_us).unwrap(),
+            leader_pid,
+        )
+    }
+
+    #[test]
+    fn the_current_layout_keeps_a_terminal_resource_sample() {
+        let sampled = JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            resources: Some(sample(9, 1_234_567, 4242)),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&sampled).unwrap();
+        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
+            panic!("a job record");
+        };
+        assert_eq!(read, sampled);
+
+        // A sample missing one of its columns is damage, not a job without a sample.
+        let mut columns = batch.columns().to_vec();
+        columns[RESOURCE_COLUMN + 2] = Arc::new(UInt32Array::from(vec![Option::<u32>::None]));
+        let partial = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert!(batch_to_protected_record(&partial).is_err());
+
+        for (record, why) in [
+            (
+                JobArtifactRecord {
+                    resources: Some(sample(10, 1, 1)),
+                    ..valid_job_record(9)
+                },
+                "a record carries its own job's sample",
+            ),
+            (
+                JobArtifactRecord {
+                    state: JobState::Running,
+                    resources: Some(sample(9, 1, 1)),
+                    ..valid_job_record(9)
+                },
+                "a running job's record has no terminal sample",
+            ),
+        ] {
+            assert!(record.validate().is_err(), "{why}");
+        }
+    }
+
     fn valid_job_record(job_id: u64) -> JobArtifactRecord {
         JobArtifactRecord {
             repo_id: repo(),
@@ -5196,6 +5326,7 @@ mod tests {
             failure: None,
             exit: None,
             duration_ms: None,
+            resources: None,
         }
     }
 
