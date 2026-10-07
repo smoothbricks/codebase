@@ -373,6 +373,22 @@ export const parseGrantSet = (json: string): Api.GrantSet => assertGrantSet(JSON
 export const assertGrantSetList = typia.createAssertEquals<readonly Api.GrantSet[]>();
 export const parseGrantSetList = (json: string): readonly Api.GrantSet[] => assertGrantSetList(JSON.parse(json));
 
+export const assertHostCores = typia.createAssertEquals<Api.HostCores>();
+export const parseHostCores = (json: string): Api.HostCores => assertHostCores(JSON.parse(json));
+export const assertHostCoresList = typia.createAssertEquals<readonly Api.HostCores[]>();
+export const parseHostCoresList = (json: string): readonly Api.HostCores[] => assertHostCoresList(JSON.parse(json));
+
+export const assertHostLoad1 = typia.createAssertEquals<Api.HostLoad1>();
+export const parseHostLoad1 = (json: string): Api.HostLoad1 => assertHostLoad1(JSON.parse(json));
+export const assertHostLoad1List = typia.createAssertEquals<readonly Api.HostLoad1[]>();
+export const parseHostLoad1List = (json: string): readonly Api.HostLoad1[] => assertHostLoad1List(JSON.parse(json));
+
+export const assertHostLoadSample = typia.createAssertEquals<Api.HostLoadSample>();
+export const parseHostLoadSample = (json: string): Api.HostLoadSample => assertHostLoadSample(JSON.parse(json));
+export const assertHostLoadSampleList = typia.createAssertEquals<readonly Api.HostLoadSample[]>();
+export const parseHostLoadSampleList = (json: string): readonly Api.HostLoadSample[] =>
+  assertHostLoadSampleList(JSON.parse(json));
+
 export const assertIdentityReport = typia.createAssertEquals<Api.IdentityReport>();
 export const parseIdentityReport = (json: string): Api.IdentityReport => assertIdentityReport(JSON.parse(json));
 export const assertIdentityReportList = typia.createAssertEquals<readonly Api.IdentityReport[]>();

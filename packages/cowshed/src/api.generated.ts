@@ -646,6 +646,21 @@ export type GrantSet = {
 };
 
 /**
+ * Online host cores, independent of the current process's affinity mask.
+ */
+export type HostCores = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65535>;
+
+/**
+ * The host's one-minute run-queue load, never a missing observation filled with zero.
+ */
+export type HostLoad1 = number & tags.Minimum<0>;
+
+export type HostLoadSample = {
+  readonly load1: HostLoad1;
+  readonly cores: HostCores;
+};
+
+/**
  * A project's repository identities after `cowshed identity add`: the project, whether the named
  * remote was newly bound, the identity it names, and every identity the binding now holds — each
  * one a URL workspaces fetch from the local clone.

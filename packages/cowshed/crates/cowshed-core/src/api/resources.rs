@@ -4,7 +4,7 @@
 //! number. Its scalar declaration gives generated validators the same safe-integer boundary
 //! as its Rust constructor, so no projection admits a value another projection refuses.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -14,12 +14,16 @@ use super::dto::{JobId, MAX_JOB_ID, UtcTimestamp};
 /// The largest integer Rust, JSON and a JavaScript `number` all hold exactly.
 pub const MAX_EXACT_INTEGER: u64 = MAX_JOB_ID;
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ResourceUnitError {
     #[error(
         "{unit} {value} exceeds {MAX_EXACT_INTEGER}, the largest value every projection holds exactly"
     )]
     Inexact { unit: &'static str, value: u128 },
+    #[error("host load1 must be finite and non-negative, got {value}")]
+    InvalidHostLoad { value: f64 },
+    #[error("host core count must be positive")]
+    ZeroHostCores,
 }
 
 /// CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
@@ -218,6 +222,80 @@ fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
         .ok_or(ResourceUnitError::Inexact { unit, value })
 }
 
+/// The host's one-minute run-queue load, never a missing observation filled with zero.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+#[cfg_attr(any(), cowshed_api(scalar = "number & tags.Minimum<0>"))]
+pub struct HostLoad1(f64);
+
+impl HostLoad1 {
+    pub fn new(value: f64) -> Result<Self, ResourceUnitError> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ResourceUnitError::InvalidHostLoad { value })
+        }
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+// NaN is the only non-reflexive f64 value; the constructor and decoder both refuse it.
+impl Eq for HostLoad1 {}
+
+impl TryFrom<f64> for HostLoad1 {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<HostLoad1> for f64 {
+    fn from(value: HostLoad1) -> Self {
+        value.get()
+    }
+}
+
+/// Online host cores, independent of the current process's affinity mask.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<\"uint32\"> & tags.Minimum<1> & tags.Maximum<65535>")
+)]
+pub struct HostCores(NonZeroU16);
+
+impl HostCores {
+    pub fn new(value: u16) -> Result<Self, ResourceUnitError> {
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(ResourceUnitError::ZeroHostCores)
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostLoadSample {
+    pub load1: HostLoad1,
+    pub cores: HostCores,
+}
+
+impl HostLoadSample {
+    pub fn new(load1: f64, cores: u16) -> Result<Self, ResourceUnitError> {
+        Ok(Self {
+            load1: HostLoad1::new(load1)?,
+            cores: HostCores::new(cores)?,
+        })
+    }
+}
+
 /// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
 /// a process: its shell activation on a cold host, otherwise its command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -373,5 +451,39 @@ mod tests {
             "members": [99, 100],
         });
         assert!(serde_json::from_value::<JobResourceSample>(inexact).is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn host_sample_wire_is_checked_numbers() {
+        let sample = HostLoadSample::new(12.5, 8).expect("host snapshot");
+        let json = serde_json::json!({ "load1": 12.5, "cores": 8 });
+        assert_eq!(serde_json::to_value(sample).expect("serialize"), json);
+        assert_eq!(
+            serde_json::from_value::<HostLoadSample>(json).expect("decode"),
+            sample
+        );
+        for invalid in [
+            serde_json::json!({ "load1": -0.1, "cores": 8 }),
+            serde_json::json!({ "load1": 1.0, "cores": 0 }),
+            serde_json::json!({ "load1": 1.0, "cores": 65_536 }),
+            serde_json::json!({ "load1": 1.0, "cores": 1.5 }),
+        ] {
+            assert!(serde_json::from_value::<HostLoadSample>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn host_load_refuses_nonfinite_and_negative_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert!(HostLoad1::new(value).is_err());
+        }
+        assert_eq!(HostLoad1::new(0.0).expect("idle").get(), 0.0);
+        assert_eq!(HostCores::new(u16::MAX).expect("maximum").get(), u16::MAX);
+        assert!(HostCores::new(0).is_err());
     }
 }
