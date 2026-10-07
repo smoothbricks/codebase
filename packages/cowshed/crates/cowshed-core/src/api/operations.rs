@@ -26,6 +26,7 @@ use crate::repository::{RepoId, RepositoryBinding};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -64,9 +65,17 @@ pub fn operation(method: &str) -> Option<&'static OperationInfo> {
     OPERATIONS.iter().find(|info| info.method == method)
 }
 
-/// Encodes a request as the JSON params of its call.
-pub fn encode_request<O: Operation>(request: &O::Request) -> Result<Value> {
-    encode_params(O::METHOD, request)
+/// Encodes a request as the JSON params of its call, serialized once and framed verbatim.
+pub fn encode_request<O: Operation>(request: &O::Request) -> Result<Box<RawValue>> {
+    serde_json::value::to_raw_value(request).map_err(|error| {
+        CowshedError::usage(
+            format!(
+                "{} parameters are not representable as JSON: {error}",
+                O::METHOD
+            ),
+            "use UTF-8 paths and validated cowshed option values",
+        )
+    })
 }
 
 /// Decodes a call's JSON result as the operation's declared result.

@@ -29,6 +29,7 @@ use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::fmt;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -89,22 +90,25 @@ impl WorkspaceAuthority {
     }
 }
 
+/// A call's params as its declared operation serialized them, framed verbatim.
+pub(crate) type Params = Box<RawValue>;
+
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
-    async fn call(&self, method: &'static str, params: Value) -> Result<Value>;
+    async fn call(&self, method: &'static str, params: Params) -> Result<Value>;
     /// A call whose lifecycle steps are sent to `steps` as the controller reports them, all of
     /// them before the call returns.
     async fn call_reporting(
         &self,
         method: &'static str,
-        params: Value,
+        params: Params,
         steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
     ) -> Result<Value>;
-    async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value>;
+    async fn upload(&self, method: &'static str, params: Params, bytes: Bytes) -> Result<Value>;
     async fn download(
         &self,
         method: &'static str,
-        params: Value,
+        params: Params,
         expected_offset: u64,
     ) -> Result<BinaryDownload>;
     async fn exec(
@@ -129,20 +133,20 @@ pub(crate) trait ControllerRuntime: Send + Sync {
 enum ActorMessage {
     Json {
         method: &'static str,
-        params: Value,
+        params: Params,
         /// Where the call's step frames go; `None` asks for none.
         steps: Option<mpsc::UnboundedSender<StepReport>>,
         reply: oneshot::Sender<Result<ActorResponse>>,
     },
     Upload {
         method: &'static str,
-        params: Value,
+        params: Params,
         bytes: Bytes,
         reply: oneshot::Sender<Result<ActorResponse>>,
     },
     Download {
         method: &'static str,
-        params: Value,
+        params: Params,
         expected_offset: u64,
         reply: oneshot::Sender<Result<ActorResponse>>,
     },
@@ -172,7 +176,7 @@ impl ActorRuntime {
     async fn json(
         &self,
         method: &'static str,
-        params: Value,
+        params: Params,
         steps: Option<mpsc::UnboundedSender<StepReport>>,
     ) -> Result<Value> {
         let (reply, response) = oneshot::channel();
@@ -197,20 +201,20 @@ impl ActorRuntime {
 #[cfg(unix)]
 #[async_trait]
 impl ControllerRuntime for ActorRuntime {
-    async fn call(&self, method: &'static str, params: Value) -> Result<Value> {
+    async fn call(&self, method: &'static str, params: Params) -> Result<Value> {
         self.json(method, params, None).await
     }
 
     async fn call_reporting(
         &self,
         method: &'static str,
-        params: Value,
+        params: Params,
         steps: mpsc::UnboundedSender<StepReport>,
     ) -> Result<Value> {
         self.json(method, params, Some(steps)).await
     }
 
-    async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value> {
+    async fn upload(&self, method: &'static str, params: Params, bytes: Bytes) -> Result<Value> {
         if bytes.len() > MAX_BINARY_FRAME_BYTES {
             return Err(CowshedError::internal(
                 "controller RPC binary request exceeds the 64 KiB frame limit",
@@ -237,7 +241,7 @@ impl ControllerRuntime for ActorRuntime {
     async fn download(
         &self,
         method: &'static str,
-        params: Value,
+        params: Params,
         expected_offset: u64,
     ) -> Result<BinaryDownload> {
         let (reply, response) = oneshot::channel();
@@ -1335,7 +1339,7 @@ async fn send_call(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     id: u64,
     method: &str,
-    params: &Value,
+    params: &RawValue,
     lane: &ActorLane,
     steps: bool,
 ) -> Result<()> {
@@ -2021,6 +2025,10 @@ mod tests {
     use std::future;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+    fn empty_params() -> Params {
+        serde_json::value::to_raw_value(&json!({})).expect("raw params")
+    }
+
     #[derive(Default)]
     struct TestRuntime {
         mode: AtomicU8,
@@ -2041,7 +2049,7 @@ mod tests {
 
     #[async_trait]
     impl ControllerRuntime for TestRuntime {
-        async fn call(&self, method: &'static str, _params: Value) -> Result<Value> {
+        async fn call(&self, method: &'static str, _params: Params) -> Result<Value> {
             self.rpc_calls.fetch_add(1, Ordering::SeqCst);
             match method {
                 "job.status" => {
@@ -2059,7 +2067,7 @@ mod tests {
         async fn call_reporting(
             &self,
             method: &'static str,
-            _params: Value,
+            _params: Params,
             _steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
         ) -> Result<Value> {
             unreachable!("the job-stream tests make no reported call, and {method} is one")
@@ -2068,7 +2076,7 @@ mod tests {
         async fn upload(
             &self,
             method: &'static str,
-            _params: Value,
+            _params: Params,
             _bytes: Bytes,
         ) -> Result<Value> {
             if method == "job.attachWrite" {
@@ -2080,7 +2088,7 @@ mod tests {
         async fn download(
             &self,
             method: &'static str,
-            _params: Value,
+            _params: Params,
             _expected_offset: u64,
         ) -> Result<BinaryDownload> {
             assert_eq!(method, "job.logs");
@@ -3039,7 +3047,10 @@ mod tests {
             write_rpc_frame(&mut server, &response).await.unwrap();
         });
 
-        let error = runtime.call("project.list", json!({})).await.unwrap_err();
+        let error = runtime
+            .call("project.list", empty_params())
+            .await
+            .unwrap_err();
         assert!(error.message.contains("response decoding failed"));
         assert!(error.message.contains("unknown field"));
         server_task.await.unwrap();
@@ -3060,7 +3071,10 @@ mod tests {
                 )
                 .await;
             });
-            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            let error = runtime
+                .call("project.list", empty_params())
+                .await
+                .unwrap_err();
             assert!(error.message.contains("id did not match"));
             server_task.await.unwrap();
         }
@@ -3076,7 +3090,10 @@ mod tests {
                 )
                 .await;
             });
-            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            let error = runtime
+                .call("project.list", empty_params())
+                .await
+                .unwrap_err();
             assert!(error.message.contains("unsolicited binary"));
             server_task.await.unwrap();
         }
@@ -3093,7 +3110,7 @@ mod tests {
                 .await;
             });
             let error = runtime
-                .download("job.logs", json!({}), 0)
+                .download("job.logs", empty_params(), 0)
                 .await
                 .err()
                 .unwrap();
@@ -3113,7 +3130,7 @@ mod tests {
                 .await;
             });
             let error = runtime
-                .download("job.logs", json!({}), 0)
+                .download("job.logs", empty_params(), 0)
                 .await
                 .err()
                 .unwrap();
@@ -3133,7 +3150,7 @@ mod tests {
                 .await;
             });
             let error = runtime
-                .download("job.logs", json!({}), 0)
+                .download("job.logs", empty_params(), 0)
                 .await
                 .err()
                 .unwrap();
@@ -3154,7 +3171,7 @@ mod tests {
                 write_raw_frame(&mut server, b"ab").await;
             });
             let error = runtime
-                .download("job.logs", json!({}), 0)
+                .download("job.logs", empty_params(), 0)
                 .await
                 .err()
                 .unwrap();
@@ -3174,7 +3191,7 @@ mod tests {
                 .await;
             });
             let error = runtime
-                .download("job.logs", json!({}), 0)
+                .download("job.logs", empty_params(), 0)
                 .await
                 .err()
                 .unwrap();
@@ -3195,7 +3212,10 @@ mod tests {
                 .unwrap();
                 write_rpc_frame(&mut server, &response).await.unwrap();
             });
-            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            let error = runtime
+                .call("project.list", empty_params())
+                .await
+                .unwrap_err();
             assert!(error.message.contains("invalid envelope"));
             server_task.await.unwrap();
         }
@@ -3216,14 +3236,14 @@ mod tests {
         let error = runtime
             .upload(
                 "job.attachWrite",
-                json!({}),
+                empty_params(),
                 Bytes::from(vec![0; MAX_BINARY_FRAME_BYTES + 1]),
             )
             .await
             .unwrap_err();
         assert!(error.message.contains("64 KiB"));
         assert_eq!(
-            runtime.call("project.list", json!({})).await.unwrap(),
+            runtime.call("project.list", empty_params()).await.unwrap(),
             json!([])
         );
         server_task.await.unwrap();

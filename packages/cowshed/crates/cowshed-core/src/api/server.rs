@@ -29,6 +29,7 @@ pub(crate) mod codec {
     use crate::api::dto::StepReport;
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
+    use serde_json::value::RawValue;
     use std::borrow::Cow;
     use std::fmt;
     use std::io;
@@ -48,12 +49,14 @@ pub(crate) mod codec {
         repo_id: Cow<'a, RepoId>,
     }
 
+    /// One schema for both directions: a client frames its operation's pre-serialized params
+    /// verbatim (`P = &RawValue`), and the controller decodes them as JSON (`P = Value`).
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct RpcRequestFields<'a> {
+    struct RpcRequestFields<'a, P> {
         id: u64,
         method: Cow<'a, str>,
-        params: Cow<'a, Value>,
+        params: P,
         #[serde(skip_serializing_if = "Option::is_none")]
         binary_length: Option<u32>,
         /// The caller asks to hear the call's lifecycle steps as step frames ahead of its answer.
@@ -196,7 +199,7 @@ pub(crate) mod codec {
     }
 
     #[derive(Debug)]
-    pub(crate) struct DecodedRpcRequest(RpcRequestFields<'static>);
+    pub(crate) struct DecodedRpcRequest(RpcRequestFields<'static, Value>);
 
     impl DecodedRpcRequest {
         pub(crate) const fn id(&self) -> u64 {
@@ -278,10 +281,11 @@ pub(crate) mod codec {
         decode::<ServerHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedServerHello)
     }
 
+    /// `params` is the request already serialized by its declared operation, framed verbatim.
     pub(crate) fn encode_rpc_request(
         id: u64,
         method: &str,
-        params: &Value,
+        params: &RawValue,
         binary_length: Option<u32>,
         steps: bool,
     ) -> Result<Vec<u8>, WireCodecError> {
@@ -289,7 +293,7 @@ pub(crate) mod codec {
             &RpcRequestFields {
                 id,
                 method: Cow::Borrowed(method),
-                params: Cow::Borrowed(params),
+                params,
                 binary_length,
                 steps,
             },
@@ -298,7 +302,8 @@ pub(crate) mod codec {
     }
 
     pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<DecodedRpcRequest, WireCodecError> {
-        decode::<RpcRequestFields<'static>>(bytes, MAX_JSON_FRAME_BYTES).map(DecodedRpcRequest)
+        decode::<RpcRequestFields<'static, Value>>(bytes, MAX_JSON_FRAME_BYTES)
+            .map(DecodedRpcRequest)
     }
 
     pub(crate) fn encode_rpc_step(id: u64, report: &StepReport) -> Result<Vec<u8>, WireCodecError> {
@@ -400,8 +405,9 @@ pub(crate) mod codec {
         #[test]
         fn directional_rpc_codecs_share_one_strict_schema() {
             let params = json!({"repoId": "acme/widget"});
-            let request = encode_rpc_request(7, "project.list", &params, None, false)
-                .expect("encode request");
+            let raw = serde_json::value::to_raw_value(&params).expect("raw params");
+            let request =
+                encode_rpc_request(7, "project.list", &raw, None, false).expect("encode request");
             let request_value: Value = serde_json::from_slice(&request).expect("request JSON");
             assert!(request_value.get("binaryLength").is_none());
             assert!(
@@ -431,7 +437,8 @@ pub(crate) mod codec {
 
         #[test]
         fn a_call_that_asks_for_its_steps_reads_them_as_step_frames() {
-            let request = encode_rpc_request(9, "coordinator.create", &json!({}), None, true)
+            let raw = serde_json::value::to_raw_value(&json!({})).expect("raw params");
+            let request = encode_rpc_request(9, "coordinator.create", &raw, None, true)
                 .expect("encode request");
             assert!(
                 decode_rpc_request(&request)
