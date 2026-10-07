@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { includeGlobsFor, type TestProgram, testProgramFault } from './test-program.js';
+import {
+  includeGlobsFor,
+  listTypeScriptSources,
+  type ProjectTree,
+  type TestProgram,
+  testProgramFault,
+} from './test-program.js';
 
 type Configs = Record<string, Record<string, unknown>>;
 
@@ -214,5 +220,84 @@ describe('where a test program looks for tests', () => {
 
     expect(includeGlobsFor(program(files), { include: ['direnv/**/*'] }, false)).toEqual([]);
     expect(includeGlobsFor(program(files), { include: ['lib/**/*'] }, false)).toContain('direnv/**/*.test.ts');
+  });
+});
+
+/** An in-memory project listing: what `listTypeScriptSources` walks, built from the file paths it should contain. */
+function listing(files: string[]): ProjectTree {
+  const paths = new Set(files);
+  const children = new Map<string, Set<string>>();
+  for (const file of files) {
+    const parts = file.split('/');
+    for (let depth = 1; depth <= parts.length; depth++) {
+      const parent = parts.slice(0, depth - 1).join('/');
+      children.set(parent, (children.get(parent) ?? new Set()).add(parts[depth - 1] ?? ''));
+    }
+  }
+  return { children: (directory) => [...(children.get(directory) ?? [])], isFile: (path) => paths.has(path) };
+}
+
+describe('which sources belong to a project', () => {
+  const sources = (files: string[]) => listTypeScriptSources(listing(files), 'packages/app');
+
+  it('lists the TypeScript the project holds, project-relative and sorted', () => {
+    expect(
+      sources([
+        'packages/app/src/b.test.ts',
+        'packages/app/src/a.ts',
+        'packages/app/README.md',
+        'packages/app/src/view.tsx',
+      ]),
+    ).toEqual(['src/a.ts', 'src/b.test.ts', 'src/view.tsx']);
+  });
+
+  it('leaves out a nested project: its files are its own, and its own policy pass covers them', () => {
+    expect(
+      sources([
+        'packages/app/src/a.test.ts',
+        'packages/app/oracle-gates/project.json',
+        'packages/app/oracle-gates/src/gate.test.ts',
+        'packages/app/vendored/package.json',
+        'packages/app/vendored/x.test.ts',
+      ]),
+    ).toEqual(['src/a.test.ts']);
+  });
+
+  it('keeps a directory whose only config is a tsconfig: that is a routing file, not a program anyone runs', () => {
+    // In a consumer monorepo, a package's tests/, fleet-it/ and nx-it/ each carry a tsconfig.json that extends ../tsconfig.test.json
+    // so ttsc routes their files; nothing typechecks them but the parent's tsconfig.test.json.
+    expect(
+      sources([
+        'packages/app/src/tsconfig.lib.json',
+        'packages/app/src/a.test.ts',
+        'packages/app/fleet-it/tsconfig.json',
+        'packages/app/fleet-it/plan.test.ts',
+        'packages/app/tests/tsconfig.test.json',
+        'packages/app/tests/b.test.ts',
+        'packages/app/deep/inner/tsconfig.lib.json',
+        'packages/app/deep/inner/x.test.ts',
+      ]),
+    ).toEqual(['deep/inner/x.test.ts', 'fleet-it/plan.test.ts', 'src/a.test.ts', 'tests/b.test.ts']);
+  });
+
+  it('counts the tests under a routing tsconfig, so a program that selects none of them is a fault', () => {
+    const files = sources(['packages/app/tests/tsconfig.json', 'packages/app/tests/a.test.ts']);
+    const app = { projectRoot: 'packages/app', files, readConfig: () => null };
+
+    expect(testProgramFault(app, { include: ['tests/**/*.ts'] })).toBeNull();
+    expect(testProgramFault(app, { include: ['src/**/*.ts'] })).toEqual({
+      kind: 'tests-unselected',
+      tests: ['tests/a.test.ts'],
+    });
+  });
+
+  it('keeps a nested directory of src that only the tests share', () => {
+    expect(sources(['packages/app/src/lib/b.test.ts'])).toEqual(['src/lib/b.test.ts']);
+  });
+
+  it('still reads the project root itself, though it has the manifest and the configs', () => {
+    expect(
+      sources(['packages/app/package.json', 'packages/app/tsconfig.json', 'packages/app/scripts/a.test.ts']),
+    ).toEqual(['scripts/a.test.ts']);
   });
 });

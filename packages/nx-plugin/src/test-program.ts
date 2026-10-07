@@ -38,6 +38,8 @@ const NON_TYPESCRIPT_PATTERN = /\.(?:[cm]?jsx?|json)$/;
 const CONFIG_DIR = /^\$\{configDir\}/;
 /** Matches no path: what an include ending in a bare `**` selects. */
 const NEVER = /(?!)/;
+/** What makes a directory a project of its own: a manifest or an Nx project file. */
+const PROJECT_FILE = /^(?:package|project)\.json$/;
 /**
  * Top-level directories whose `*.test.ts` files are data a harness compiles,
  * not suites. The stray-test policy skips the same one.
@@ -46,7 +48,15 @@ const FIXTURE_DIRECTORY = 'fixtures';
 const PACKAGE_CONVENTION_ROOT = 'src';
 const TESTS_DIRECTORY = '__tests__';
 
-/** The TypeScript sources of a project, project-relative and sorted. */
+/**
+ * The TypeScript sources of a project, project-relative and sorted.
+ *
+ * A directory below the project that is a project of its own (its own manifest or Nx project file) is not part of
+ * this one: its files are its own tests, found by its own policy pass, and folding them in would count them twice.
+ * A directory that merely carries a tsconfig is not that: in a monorepo of Bun programs such a file routes the
+ * directory's files to the parent's program (a `tests/tsconfig.json` extending `../tsconfig.test.json`), and
+ * nothing typechecks the directory but that program.
+ */
 export function listTypeScriptSources(tree: ProjectTree, projectRoot: string): string[] {
   const files: string[] = [];
   const walk = (directory: string): void => {
@@ -54,13 +64,20 @@ export function listTypeScriptSources(tree: ProjectTree, projectRoot: string): s
       const path = posix.join(directory, name);
       if (tree.isFile(path)) {
         if (TYPESCRIPT_SOURCE.test(name)) files.push(posix.relative(projectRoot, path));
-      } else if (!isNonSourceDirectory(name)) {
+      } else if (!isNonSourceDirectory(name) && !isNestedProject(tree, path)) {
         walk(path);
       }
     }
   };
   walk(projectRoot);
   return files.sort();
+}
+
+/** A directory with its own manifest or Nx project file is a project, and its files are that project's. */
+function isNestedProject(tree: ProjectTree, directory: string): boolean {
+  return childrenOf(tree, directory).some(
+    (name) => PROJECT_FILE.test(name) && tree.isFile(posix.join(directory, name)),
+  );
 }
 
 /** A dangling link (a collected build out-link) is neither a file nor a directory; anything else is a real fault. */
