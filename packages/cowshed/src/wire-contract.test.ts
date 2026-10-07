@@ -186,6 +186,29 @@ describe('napi wire contract', () => {
   });
 });
 
+const resourceUnitSeams = {
+  CpuMicros: { assertOne: validators.assertCpuMicros, parseOne: validators.parseCpuMicros },
+  ResidentBytes: { assertOne: validators.assertResidentBytes, parseOne: validators.parseResidentBytes },
+  StorageIoBytes: { assertOne: validators.assertStorageIoBytes, parseOne: validators.parseStorageIoBytes },
+} satisfies Record<string, SeamType<number>>;
+
+describe('checked resource units', () => {
+  for (const [name, seam] of Object.entries<SeamType<number>>(resourceUnitSeams)) {
+    it(`${name} shares Rust's safe-integer boundary`, () => {
+      for (const value of [0, Number.MAX_SAFE_INTEGER]) {
+        expect(seam.assertOne(value)).toBe(value);
+        expect(seam.parseOne(JSON.stringify(value))).toBe(value);
+      }
+      for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => seam.assertOne(value)).toThrow();
+        expect(() => seam.parseOne(JSON.stringify(value))).toThrow();
+      }
+      expect(() => seam.assertOne(Number.POSITIVE_INFINITY)).toThrow();
+      expect(() => seam.assertOne(Number.NaN)).toThrow();
+    });
+  }
+});
+
 const assertGeneratedModule = typia.createAssert<{
   readonly assertWorkspaceInfo: (value: unknown) => unknown;
   readonly parseWorkspaceInfo: (json: string) => unknown;

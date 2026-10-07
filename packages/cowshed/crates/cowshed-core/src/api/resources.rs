@@ -1,8 +1,8 @@
-//! A job's resource sample (07_api.md "Job monitoring") and its named units: the one record a
-//! resource read, a progress event and a terminal result all carry.
+//! The named units of job and per-process resource readings (07_api.md "Job monitoring").
 //!
 //! Each unit has a private field and a checked constructor; its wire projection is the bare
-//! number. A value no projection holds exactly is a typed error, never a truncation.
+//! number. Its scalar declaration gives generated validators the same safe-integer boundary
+//! as its Rust constructor, so no projection admits a value another projection refuses.
 
 use std::num::NonZeroU32;
 
@@ -23,6 +23,10 @@ pub enum ResourceUnitError {
 
 /// CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
 /// user or system time, or a job's total from its accounting source.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 pub struct CpuMicros(u64);
@@ -68,6 +72,10 @@ impl From<CpuMicros> for u64 {
 
 /// Bytes of memory resident in RAM: what processes hold now, never memory charged to them
 /// elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 pub struct ResidentBytes(u64);
@@ -100,6 +108,10 @@ impl From<ResidentBytes> for u64 {
 
 /// Bytes a kernel counted as moved to or from storage: never logical reads its cache served,
 /// volume-allocation deltas, or operation counts converted into bytes.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 pub struct StorageIoBytes(u64);
@@ -139,7 +151,7 @@ fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{CpuMicros, MAX_EXACT_INTEGER};
+    use super::{CpuMicros, MAX_EXACT_INTEGER, ResidentBytes, StorageIoBytes};
 
     fn length(denominator: u32) -> NonZeroU32 {
         NonZeroU32::new(denominator).expect("a tick length's denominator")
@@ -159,5 +171,26 @@ mod tests {
         );
         assert!(CpuMicros::of_ticks(u64::MAX, u32::MAX, length(1)).is_err());
         assert!(CpuMicros::new(MAX_EXACT_INTEGER + 1).is_err());
+    }
+
+    #[test]
+    fn resource_units_share_the_safe_integer_boundary() {
+        for value in [0, MAX_EXACT_INTEGER] {
+            assert_eq!(CpuMicros::new(value).map(CpuMicros::get), Ok(value));
+            assert_eq!(ResidentBytes::new(value).map(ResidentBytes::get), Ok(value));
+            assert_eq!(
+                StorageIoBytes::new(value).map(StorageIoBytes::get),
+                Ok(value)
+            );
+        }
+        for value in [MAX_EXACT_INTEGER + 1, u64::MAX] {
+            assert!(CpuMicros::new(value).is_err());
+            assert!(ResidentBytes::new(value).is_err());
+            assert!(StorageIoBytes::new(value).is_err());
+            let json = value.to_string();
+            assert!(serde_json::from_str::<CpuMicros>(&json).is_err());
+            assert!(serde_json::from_str::<ResidentBytes>(&json).is_err());
+            assert!(serde_json::from_str::<StorageIoBytes>(&json).is_err());
+        }
     }
 }

@@ -273,7 +273,7 @@ export type CowshedError = {
  * CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
  * user or system time, or a job's total from its accounting source.
  */
-export type CpuMicros = number & tags.Type<'uint64'>;
+export type CpuMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 export type CreateOptions = {
   readonly revision?: RevisionTarget;
@@ -1330,7 +1330,7 @@ export type ReseedSkip =
  * Bytes of memory resident in RAM: what processes hold now, never memory charged to them
  * elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
  */
-export type ResidentBytes = number & tags.Type<'uint64'>;
+export type ResidentBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 export type ResizeRequest = {
   readonly repoId: RepoId;
@@ -1568,7 +1568,7 @@ export type StepReport =
  * Bytes a kernel counted as moved to or from storage: never logical reads its cache served,
  * volume-allocation deltas, or operation counts converted into bytes.
  */
-export type StorageIoBytes = number & tags.Type<'uint64'>;
+export type StorageIoBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 export type StreamInfo = StreamInfoRef;
 
