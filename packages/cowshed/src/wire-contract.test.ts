@@ -184,6 +184,21 @@ describe('napi wire contract', () => {
     expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlock: retainedPortBlocks?.[0] })).toThrow();
     expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlocks: retainedPortBlocks?.[0] })).toThrow();
   });
+
+  it('refuses a host load no finite f64 holds, as the Rust constructor does', () => {
+    // JSON has no infinity literal, but an overflowing one parses to it: `1e400` is Infinity.
+    for (const load1 of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN, -1]) {
+      expect(() => validators.assertHostLoad1(load1)).toThrow();
+      expect(() => validators.assertHostLoadSample({ load1, cores: 1 })).toThrow();
+    }
+    expect(() => validators.parseHostLoad1('1e400')).toThrow();
+    expect(() => validators.parseHostLoadSample('{"load1":1e400,"cores":1}')).toThrow();
+    for (const load1 of [0, 12.5, Number.MAX_VALUE]) {
+      expect(validators.assertHostLoad1(load1)).toBe(load1);
+      expect(validators.assertHostLoadSample({ load1, cores: 1 })).toEqual({ load1, cores: 1 });
+    }
+    expect(validators.parseHostLoad1('1.7976931348623157e308')).toBe(Number.MAX_VALUE);
+  });
 });
 
 const resourceUnitSeams = {

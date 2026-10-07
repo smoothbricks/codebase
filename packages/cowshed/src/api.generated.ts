@@ -651,9 +651,11 @@ export type GrantSet = {
 export type HostCores = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65535>;
 
 /**
- * The host's one-minute run-queue load, never a missing observation filled with zero.
+ * The host's one-minute run-queue load, never a missing observation filled with zero. Finite:
+ * the wire bound is the largest finite f64, so a projection refuses infinity as the constructor
+ * does, and NaN fails the lower bound.
  */
-export type HostLoad1 = number & tags.Minimum<0>;
+export type HostLoad1 = number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>;
 
 export type HostLoadSample = {
   readonly load1: HostLoad1;

@@ -130,6 +130,7 @@ impl StorageIoBytes {
     pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
         exact("ioBytes", u128::from(value)).map(Self)
     }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -227,10 +228,15 @@ fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
         .ok_or(ResourceUnitError::Inexact { unit, value })
 }
 
-/// The host's one-minute run-queue load, never a missing observation filled with zero.
+/// The host's one-minute run-queue load, never a missing observation filled with zero. Finite:
+/// the wire bound is the largest finite f64, so a projection refuses infinity as the constructor
+/// does, and NaN fails the lower bound.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
-#[cfg_attr(any(), cowshed_api(scalar = "number & tags.Minimum<0>"))]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>")
+)]
 pub struct HostLoad1(f64);
 
 impl HostLoad1 {
