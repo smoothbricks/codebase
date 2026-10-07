@@ -687,15 +687,26 @@ fn typescript(
     served: &BTreeMap<&str, Signature<'_>>,
     api: &Api,
 ) -> Result<String, String> {
+    // A stream operation's wrapper is the addon's iterator, which `native.ts` writes once.
+    let iterates = served
+        .values()
+        .any(|method| method.answer == Answer::Stream);
+    let native_imports = if iterates {
+        "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  \
+         type NativeWorkspaceRefHandle,\n} from './native.js';\n"
+    } else {
+        "import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n"
+    };
     let mut output = format!(
         "{HEADER}/// <reference types=\"node\" />\n\n\
          import type * as Api from './api.generated.js';\n\
-         import type {{ NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle }} from './native.js';\n\
+         {native_imports}\
          import * as V from './validators.generated.js';\n\n\
          /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */\n\
          export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n\n\
          /**\n * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,\n\
-         \x20* as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes.\n */\n\
+         \x20* as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even\n\
+         \x20* while a `next` waits, which then resolves to `null`.\n */\n\
          export interface NativeEvents {{\n  next(): Promise<string | null>;\n  close(): Promise<void>;\n}}\n"
     );
     for (class, methods) in classes.iter().filter(|(_, methods)| !methods.is_empty()) {
@@ -779,7 +790,7 @@ fn typescript(
             Answer::Json => {
                 let (ty, validator) = result_type(&operation.result, &record_name)?;
                 (
-                    "function",
+                    "async function",
                     format!("Promise<{ty}>"),
                     format!("return V.{validator}(await {call});"),
                 )
@@ -787,7 +798,7 @@ fn typescript(
             Answer::Download => {
                 let (ty, validator) = result_type(&operation.result, &record_name)?;
                 (
-                    "function",
+                    "async function",
                     format!("Promise<{ty} & {{ readonly bytes: Uint8Array }}>"),
                     format!(
                         "const answer = await {call};\n  return {{ ...V.{validator}(answer.json), bytes: answer.bytes }};"
@@ -795,7 +806,7 @@ fn typescript(
                 )
             }
             Answer::Workspace | Answer::Worker | Answer::Job => (
-                "function",
+                "async function",
                 format!("Promise<{}>", method.answer.native()),
                 format!("return {call};"),
             ),
@@ -803,19 +814,15 @@ fn typescript(
             Answer::Stream => {
                 let (ty, validator) = result_type(&operation.result, &record_name)?;
                 (
-                    "function*",
-                    format!("AsyncGenerator<{ty}, void, undefined>"),
-                    format!(
-                        "const events = await {call};\n  try {{\n    \
-                         for (let event = await events.next(); event !== null; event = await events.next()) {{\n      \
-                         yield V.{validator}(event);\n    }}\n  }} finally {{\n    await events.close();\n  }}"
-                    ),
+                    "function",
+                    format!("EventIterator<{ty}>"),
+                    format!("return eventIterator(() => {call}, V.{validator});"),
                 )
             }
         };
         writeln!(
             output,
-            "export async {keyword} {function}(handle: {interface}, args: {arguments}{bytes_parameter}): {returns} {{\n  {body}\n}}"
+            "export {keyword} {function}(handle: {interface}, args: {arguments}{bytes_parameter}): {returns} {{\n  {body}\n}}"
         )
         .unwrap();
     }
@@ -988,9 +995,9 @@ mod tests {
     }
 
     /// A stream-lane operation is served by its handle, and its adapter answers the call's events:
-    /// a generator whose every step is one demand, closing the call when it is left early.
+    /// an iterator whose every step is one demand and whose `return` closes the call at once.
     #[test]
-    fn a_stream_operation_projects_to_a_generator_of_its_events() {
+    fn a_stream_operation_projects_to_an_iterator_of_its_events() {
         let output = output(
             r#"operations! {
                 /// Reads one stream's bytes from an offset.
@@ -1023,17 +1030,17 @@ mod tests {
         );
         assert!(
             output.typescript.contains(concat!(
-                "export async function* jobChunks(handle: NativeJobChunks, args: JobChunksArguments): AsyncGenerator<Api.LogsChunk, void, undefined> {\n",
-                "  const events = await handle.chunks(JSON.stringify(args));\n",
-                "  try {\n",
-                "    for (let event = await events.next(); event !== null; event = await events.next()) {\n",
-                "      yield V.parseLogsChunk(event);\n",
-                "    }\n",
-                "  } finally {\n",
-                "    await events.close();\n",
-                "  }\n",
+                "export function jobChunks(handle: NativeJobChunks, args: JobChunksArguments): EventIterator<Api.LogsChunk> {\n",
+                "  return eventIterator(() => handle.chunks(JSON.stringify(args)), V.parseLogsChunk);\n",
                 "}",
             )),
+            "{}",
+            output.typescript
+        );
+        assert!(
+            output
+                .typescript
+                .contains("  type EventIterator,\n  eventIterator,\n"),
             "{}",
             output.typescript
         );
