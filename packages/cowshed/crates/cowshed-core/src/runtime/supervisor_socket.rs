@@ -288,6 +288,7 @@ enum Call {
     Resources {
         job_id: JobId,
     },
+    TraceHealth,
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
@@ -1105,6 +1106,7 @@ async fn answer(
             to_value(&supervisor.resources(job_id).await?)?,
             Bytes::new(),
         ),
+        Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
@@ -1572,6 +1574,9 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         } => {
             let _ =
                 reply.send(call(path, &authority, Call::Resources { job_id }, Bytes::new()).await);
+        }
+        Command::TraceHealth { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::TraceHealth, Bytes::new()).await);
         }
         Command::List { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);

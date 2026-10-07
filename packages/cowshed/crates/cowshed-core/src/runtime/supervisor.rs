@@ -2004,9 +2004,6 @@ pub(super) async fn run_system_output<R>(
 pub struct WorkspaceSupervisorHandle {
     authority: WorkspaceAuthoritySnapshot,
     commands: mpsc::Sender<Command>,
-    /// The job-span writer of a supervisor this process runs; `None` for one it writes none
-    /// for, or one another process serves.
-    job_spans: Option<JobSpanPublisher>,
 }
 
 impl std::fmt::Debug for WorkspaceSupervisorHandle {
@@ -2026,7 +2023,6 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands,
-            job_spans: None,
         }
     }
 
@@ -2035,7 +2031,6 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands: self.commands.clone(),
-            job_spans: self.job_spans.clone(),
         }
     }
 
@@ -2044,16 +2039,13 @@ impl WorkspaceSupervisorHandle {
     }
 
     /// How this supervisor's job-span writer has fared, once every span row queued before the
-    /// call is sealed or refused. Refused where the handle reaches no writer.
+    /// call is sealed or refused. Refused by a supervisor that writes no job spans.
     pub async fn trace_health(&self) -> Result<TraceHealth> {
-        match &self.job_spans {
-            Some(job_spans) => job_spans.health().await,
-            None => Err(CowshedError::environment_missing(
-                "this supervisor handle reaches no job-span writer: the supervisor writes no job \
-                 spans, or another process serves it",
-                "ask the process that serves the workspace's supervisor",
-            )),
-        }
+        self.call(|reply| Command::TraceHealth {
+            authority: self.authority.clone(),
+            reply,
+        })
+        .await
     }
 
     pub async fn advance_authority(
@@ -2079,7 +2071,6 @@ impl WorkspaceSupervisorHandle {
         Ok(Self {
             authority,
             commands: self.commands.clone(),
-            job_spans: self.job_spans.clone(),
         })
     }
 
@@ -2425,7 +2416,6 @@ impl WorkspaceSupervisor {
         let handle = WorkspaceSupervisorHandle {
             authority: config.authority.clone(),
             commands,
-            job_spans: job_spans.clone(),
         };
         let nx_daemon =
             NxDaemonKeeper::for_role(WorkspaceRole::for_name(&config.authority.workspace));
@@ -2523,6 +2513,10 @@ pub(super) enum Command {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
         reply: oneshot::Sender<Result<JobResourceSample>>,
+    },
+    TraceHealth {
+        authority: WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<TraceHealth>>,
     },
     List {
         authority: WorkspaceAuthoritySnapshot,
@@ -2944,6 +2938,28 @@ impl SupervisorActor {
                     .and_then(|()| self.job_mut(job_id))
                     .and_then(sample_job);
                 let _ = reply.send(result);
+            }
+            Command::TraceHealth { authority, reply } => {
+                let writer = self.validate_authority(&authority).and_then(|()| {
+                    self.job_spans.clone().ok_or_else(|| {
+                        CowshedError::environment_missing(
+                            "this workspace's supervisor writes no job spans",
+                            "start the supervisor with a telemetry root",
+                        )
+                    })
+                });
+                match writer {
+                    // The writer answers once every earlier row is sealed; the actor does not
+                    // wait for that.
+                    Ok(writer) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(writer.health().await);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             Command::List { authority, reply } => {
                 // A job the store refused to seal makes the list fail with that refusal rather

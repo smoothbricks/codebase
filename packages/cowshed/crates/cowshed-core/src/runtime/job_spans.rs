@@ -4,8 +4,8 @@
 //! (`JobInfo.trace`): a `span-start` row at admission and a `span-ok`/`span-err` row at its
 //! terminal state, each sealed as its own segment `job-<order:020>-<writer>.arrow` under
 //! `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`]. The span's lmao address
-//! is thread `job_id`, span 1; the W3C span id rides beside it as `w3c_span_id`. `env_hash` is not
-//! computed by the supervisor yet, so no row carries it.
+//! is thread [`job_span_thread`] of the job's durable key, span 1; the W3C span id rides beside it
+//! as `w3c_span_id`. `env_hash` is not computed by the supervisor yet, so no row carries it.
 //!
 //! Telemetry never gates a job. The actor hands a row to [`JobSpanPublisher::record`], which
 //! queues it without waiting; one writer task seals rows in order, off the actor and off the
@@ -34,15 +34,38 @@ use crate::storage::trace_segment::{
 
 /// The span name both rows of a job span carry.
 pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";
-/// A job span is the only span its lmao thread (the job) writes.
+/// A job span is the first span of its job's lmao thread ([`job_span_thread`]).
 pub const JOB_SPAN_ID: u32 = 1;
 /// Rows waiting for the writer: two per job, so this covers a burst of concurrent admissions and
 /// terminals far beyond what a workspace's actor queue admits at once. A full queue refuses rows
 /// rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
 
+/// The lmao thread a job's spans are written on: the first eight bytes of a domain-separated
+/// BLAKE3 of the job's durable key `(repo_id, workspace_incarnation, job_id)` (13_telemetry.md,
+/// "Trace context propagation"). A workspace-local `job_id` alone repeats across workspaces, and an
+/// adopted trace context is shared across them, so jobs that agree on both still get distinct
+/// addresses; a writer derives the same thread from the key alone, with nothing to keep.
+pub fn job_span_thread(
+    repo_id: &RepoId,
+    workspace_incarnation: &WorkspaceIncarnation,
+    job_id: JobId,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new_derive_key("cowshed job span thread v1");
+    for part in [repo_id.as_str(), workspace_incarnation.as_str()] {
+        let length = u64::try_from(part.len()).expect("a key part fits in u64");
+        hasher.update(&length.to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(&job_id.get().to_le_bytes());
+    let mut thread = [0; 8];
+    hasher.finalize_xof().fill(&mut thread);
+    u64::from_le_bytes(thread)
+}
+
 /// What a supervisor's job-span writer did: rows sealed, rows refused, and the last refusal.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TraceHealth {
     pub recorded: u64,
     pub failed: u64,
@@ -154,9 +177,20 @@ impl JobSpanPublisher {
     }
 
     /// Queue the row for `info` crossing `edge` now, without waiting. A queue that is full or a
-    /// writer that stopped refuses it, and the refusal is counted.
+    /// writer that stopped refuses it, and the refusal is counted; a refused row is never built.
     pub fn record(&self, info: &JobInfo, edge: JobSpanEdge) {
-        let row = JobSpanRow {
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                let reason = match error {
+                    mpsc::error::TrySendError::Full(()) => "the job span queue is full",
+                    mpsc::error::TrySendError::Closed(()) => "the job span writer stopped",
+                };
+                refuse(&self.health, reason.to_owned());
+                return;
+            }
+        };
+        permit.send(Request::Row(Box::new(JobSpanRow {
             at: SystemTime::now(),
             trace: info.trace.clone(),
             repo_id: info.repo_id.clone(),
@@ -164,14 +198,7 @@ impl JobSpanPublisher {
             job_id: info.job_id,
             grant_revision: info.grant_revision,
             edge,
-        };
-        if let Err(error) = self.sender.try_send(Request::Row(Box::new(row))) {
-            let reason = match error {
-                mpsc::error::TrySendError::Full(_) => "the job span queue is full",
-                mpsc::error::TrySendError::Closed(_) => "the job span writer stopped",
-            };
-            refuse(&self.health, reason.to_owned());
-        }
+        })));
     }
 
     /// The writer's health once every row queued before this call is sealed or refused.
@@ -258,7 +285,7 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Tr
         timestamp_ns,
         trace_id: row.trace.trace_id.as_str(),
         span: SpanAddress {
-            thread_id: row.job_id.get(),
+            thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),
             span_id: JOB_SPAN_ID,
         },
         parent: None,
@@ -327,5 +354,32 @@ mod tests {
         }
         assert_eq!(JobSpanEdge::Start.entry_type(), EntryType::SpanStart);
         assert_eq!(JobSpanEdge::Start.state(), None);
+    }
+
+    /// Jobs that share an adopted trace and a workspace-local id are still distinct spans: the
+    /// thread follows the whole durable key, and only it.
+    #[test]
+    fn a_job_s_span_thread_is_its_durable_key_s() {
+        let repo = RepoId::parse("acme/widget").unwrap();
+        let other_repo = RepoId::parse("acme/gadget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let other_incarnation =
+            WorkspaceIncarnation::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let one = JobId::new(1).unwrap();
+        let two = JobId::new(2).unwrap();
+        let thread = job_span_thread(&repo, &incarnation, one);
+        assert_eq!(thread, job_span_thread(&repo, &incarnation, one));
+        for (repo, incarnation, job) in [
+            (&repo, &other_incarnation, one),
+            (&other_repo, &incarnation, one),
+            (&repo, &incarnation, two),
+        ] {
+            assert_ne!(
+                thread,
+                job_span_thread(repo, incarnation, job),
+                "{repo:?} {incarnation:?} {job:?}"
+            );
+        }
+        assert_ne!(thread, one.get(), "not the workspace-local job id");
     }
 }

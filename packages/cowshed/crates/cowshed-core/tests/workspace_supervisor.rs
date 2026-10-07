@@ -4293,7 +4293,11 @@ fn expected_span(
 ) -> [JobSpanRow; 2] {
     let row = |entry_type: &str, job_state: Option<&str>| JobSpanRow {
         trace_id: job.trace.trace_id.as_str().to_owned(),
-        thread_id: job.job_id.get(),
+        thread_id: cowshed_core::runtime::job_spans::job_span_thread(
+            &job.repo_id,
+            &job.workspace_incarnation,
+            job.job_id,
+        ),
         span_id: 1,
         parent_span_id: None,
         entry_type: entry_type.to_owned(),
@@ -4423,6 +4427,125 @@ async fn a_refused_job_span_is_counted_and_never_fails_its_job() {
             .as_deref()
             .is_some_and(|failure| failure.contains("creating telemetry partition")),
         "{health:?}"
+    );
+}
+
+/// Two workspaces' first jobs under one adopted trace context share the trace id and the
+/// workspace-local job id, yet seal distinct lmao spans: the thread follows the durable key
+/// `(repo_id, workspace_incarnation, job_id)`, never `job_id` alone.
+#[tokio::test]
+async fn jobs_sharing_an_adopted_trace_and_a_job_id_across_workspaces_are_distinct_spans() {
+    let root = workspace_root("job-span-two-workspaces");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    let second = WorkspaceAuthoritySnapshot {
+        workspace_incarnation: WorkspaceIncarnation::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap(),
+        ..authority()
+    };
+    let mut ended = Vec::new();
+    for (name, authority) in [("first", authority()), ("second", second)] {
+        let workspace = workspace_root(&format!("job-span-workspace-{name}"));
+        let mut h = harness_with_config(
+            WorkspaceSupervisorConfig {
+                owned_repo_ids: OwnedRepoIds::sole(authority.repo_id.clone()),
+                authority,
+                telemetry_root: Some(telemetry.clone()),
+                ..config(&workspace)
+            },
+            1,
+            1024,
+            false,
+            false,
+        );
+        let mut adopted = request(StdinSource::Empty);
+        adopted.trace = Some(adopted_trace());
+        let job = h.handle.exec(None, None, adopted).await.unwrap();
+        let spawned = h.spawned.recv().await.unwrap();
+        complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+        ended.push(h.handle.wait(job).await.unwrap());
+        let health = h.handle.trace_health().await.unwrap();
+        assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    }
+    assert_eq!(
+        ended[0].job_id, ended[1].job_id,
+        "both are their workspace's first job"
+    );
+    assert_eq!(
+        ended[0].trace, ended[1].trace,
+        "both adopted one trace context"
+    );
+    let addresses = job_spans(&telemetry)
+        .into_iter()
+        .map(|(_, row)| {
+            (
+                row.workspace_incarnation,
+                (row.trace_id, row.thread_id, row.span_id),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        addresses.len(),
+        2,
+        "one address per job, both rows of a job on it: {addresses:?}"
+    );
+    let distinct = addresses
+        .iter()
+        .map(|(_, address)| address)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "the two jobs' spans collide: {addresses:?}"
+    );
+    let sealed = job_spans(&telemetry);
+    for job in &ended {
+        let rows = sealed
+            .iter()
+            .filter(|(_, row)| row.workspace_incarnation == job.workspace_incarnation.as_str())
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        let expected = expected_span(job, "span-ok", "exited");
+        assert_eq!(rows, expected.iter().collect::<Vec<_>>());
+    }
+}
+
+/// A handle that reaches the supervisor only through its socket reads the same trace health.
+#[tokio::test]
+async fn a_served_supervisor_answers_its_trace_health() {
+    let root = workspace_root("job-span-served");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            telemetry_root: Some(telemetry.clone()),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(job).await.unwrap();
+    let health = remote.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_eq!(health, h.handle.trace_health().await.unwrap());
+
+    let (silent, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&silent.handle).await;
+    let refused = remote.trace_health().await.unwrap_err();
+    assert_eq!(
+        refused.code,
+        ErrorCode::EnvironmentMissing,
+        "{}",
+        refused.message
     );
 }
 

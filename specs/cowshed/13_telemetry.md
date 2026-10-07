@@ -25,7 +25,10 @@ adopted for it (`JobInfo.trace`): a `span-start` row at admission and a `span-ok
 each as its own sealed segment `job-<order:020>-<writer>.arrow` under `<host-telemetry-root>/<yyyy-mm-dd>/`, sealed like
 the gateway's (create-new `0600` temporary, fsync, rename, directory fsync). The rows carry `repo_id`,
 `workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its state. The
-writes run off the supervisor's actor; a refused write is counted in the supervisor's trace health and never fails or
+span's lmao address is span 1 of the thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the
+first eight bytes of a domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under
+one adopted trace context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in
+the supervisor's trace health, which every supervisor handle reads, in process or over its socket, and never fails or
 delays the job. This job span is the anchor `process.run` spans parent from. `env_hash` is not yet computed by the
 supervisor, so job spans do not carry it.
 
