@@ -238,7 +238,9 @@ reports runtime creation and protocol connection/open separately. Checked land r
 inspection, dirty checks, supervisor readiness, check dispatch/completion, and Git delivery. `gc` reports its build
 volume collection, its discard deletes and its substrate pass (`gc build-volumes`, `gc discard`, `gc substrate`). The
 real fixture also reports Git verb durations and elapsed phase boundaries, and each scratch root its teardown and a
-run's sweep of dead runs; these diagnostics do not expose command payloads.
+run's sweep of dead runs; these diagnostics do not expose command payloads. Build-state Git failures name the exit
+status or terminating signal alongside stderr, including when the command wrote nothing, so an interrupted query does
+not leave an unexplained empty error.
 
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a

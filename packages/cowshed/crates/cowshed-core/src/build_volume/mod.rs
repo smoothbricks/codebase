@@ -428,7 +428,7 @@ pub(crate) fn tracked_source(
         return Err(crate::CowshedError::environment_missing(
             format!(
                 "cannot prove build-state paths contain no tracked source: {}",
-                String::from_utf8_lossy(&output.stderr).trim_end()
+                crate::git::git_ended(&output)
             ),
             "repair the checkout's Git index and retry; nothing has been deleted",
         ));

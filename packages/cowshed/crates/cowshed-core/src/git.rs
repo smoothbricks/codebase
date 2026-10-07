@@ -2560,6 +2560,16 @@ pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
     )
 }
 
+/// How a failed Git command ended, followed by anything it wrote to stderr.
+/// A signal-killed command can leave stderr empty, so its status must still be reported.
+pub(crate) fn git_ended(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match stderr.trim_end() {
+        "" => format!("git {}", output.status),
+        said => format!("git {}: {said}", output.status),
+    }
+}
+
 async fn run_git_at_with_objects<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
@@ -2894,7 +2904,7 @@ mod tests {
     use super::{
         BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
         GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, ensure_git_success,
-        git_message, held_by_repository_blocking, ignored_by, ignored_by_blocking,
+        git_ended, git_message, held_by_repository_blocking, ignored_by, ignored_by_blocking,
         is_git_repository, parse_lines, workspace_remote_name,
     };
 
@@ -3392,6 +3402,25 @@ mod tests {
         assert_eq!(
             git_message("read object", &output),
             "failed to read object (git status exit status: 9)"
+        );
+    }
+
+    #[test]
+    fn a_failed_git_is_named_by_how_it_ended() {
+        let signalled = Output {
+            status: ExitStatus::from_raw(libc::SIGTERM),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(git_ended(&signalled), "git signal: 15 (SIGTERM)");
+        assert_eq!(git_ended(&command_output(9, b"")), "git exit status: 9");
+        assert_eq!(
+            git_ended(&command_output(9, b" \n\t")),
+            "git exit status: 9"
+        );
+        assert_eq!(
+            git_ended(&command_output(128, b"fatal: index file corrupt\n")),
+            "git exit status: 128: fatal: index file corrupt"
         );
     }
 

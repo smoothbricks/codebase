@@ -243,7 +243,7 @@ pub(crate) fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result
             format!(
                 "cannot locate {}'s Git exclude file: {}",
                 checkout.display(),
-                String::from_utf8_lossy(&output.stderr).trim_end()
+                crate::git::git_ended(&output)
             ),
             "repair the checkout's Git metadata and retry",
         ));

@@ -493,7 +493,7 @@ pub(super) fn expand_declared(
                 format!(
                     "cannot expand [build] state {}: {}",
                     entry.spelling().display(),
-                    String::from_utf8_lossy(&output.stderr).trim_end()
+                    crate::git::git_ended(&output)
                 ),
                 "repair the checkout's Git index and retry",
             ));
@@ -915,7 +915,7 @@ fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
         return Err(CowshedError::environment_missing(
             format!(
                 "cannot enumerate tracked tool manifests: {}",
-                String::from_utf8_lossy(&output.stderr).trim_end()
+                crate::git::git_ended(&output)
             ),
             "repair the checkout's Git index and retry",
         ));
