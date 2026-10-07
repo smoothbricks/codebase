@@ -54,6 +54,8 @@ impl ErrorCode {
 }
 
 /// An operational error with a concrete recovery command.
+// The generated public error describes what this build emits, not its cross-build input decoder.
+#[cfg_attr(any(), cowshed_api(output_only = "true"))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CowshedError {
     pub code: ErrorCode,

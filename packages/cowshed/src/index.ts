@@ -45,66 +45,24 @@ import {
   type WorkspaceInfo,
   type WorkspaceRef,
 } from './types.js';
+import {
+  assertAttachOptions,
+  parseDoctorReport,
+  parseGcReport,
+  parseGrantSet,
+  parseJobInfo,
+  parseJobInfoList as parseJobInfos,
+  parseLandReport,
+  parsePushReport,
+  parseRebaseReport,
+  parseRemoveReport,
+  parseResizeResult,
+  parseWorkspaceInfo,
+  parseWorkspaceInfoList as parseWorkspaceInfos,
+} from './validators.generated.js';
 
-export {
-  type AbandonedWork,
-  type AdoptOptions,
-  type AttachOptions,
-  type CheckpointInfo,
-  type CheckpointOptions,
-  type Coordinator,
-  type CoordinatorEndpoint,
-  CowshedError,
-  type DoctorReport,
-  type EgressMode,
-  type EgressRule,
-  type ErrorCode,
-  type ExecCommand,
-  type ExecOptions,
-  type ExecRequest,
-  type ExpectedRefHead,
-  type Finding,
-  type FindingSeverity,
-  type GcCandidate,
-  type GcDeferred,
-  type GcOptions,
-  type GcReport,
-  type GrantDelta,
-  type GrantSet,
-  type JobAttachment,
-  type JobCommand,
-  type JobFailure,
-  type JobHandle,
-  type JobInfo,
-  type JobInfoFields,
-  type JobState,
-  type JobStream,
-  type LandOptions,
-  type LandReport,
-  type OutputPublication,
-  type PathOptions,
-  type PortBlock,
-  type Project,
-  type PushOptions,
-  type PushReport,
-  type RebaseOptions,
-  type RebaseReport,
-  type RemoveOptions,
-  type RemoveReport,
-  type ResizeResult,
-  type ResizeVolume,
-  type RevisionTarget,
-  type RunSandboxMode,
-  type ScriptCommand,
-  type ScriptValue,
-  type Session,
-  type SimVerb,
-  type WorkspaceHandle,
-  type WorkspaceInfo,
-  type WorkspaceRef,
-  type WorkspaceRole,
-  type WorkspaceState,
-} from './types.js';
+export type * from './types.js';
+export { CowshedError } from './types.js';
 
 /**
  * The napi rejection shape. `hint` is a real property on the JS `Error`, set by `to_napi_error`
@@ -120,19 +78,6 @@ interface NativeError {
 
 const native = loadNativeModule();
 const isNativeError = typia.createIs<NativeError>();
-const parseWorkspaceInfo = typia.json.createAssertParse<WorkspaceInfo>();
-const parseWorkspaceInfos = typia.json.createAssertParse<WorkspaceInfo[]>();
-const parseGrantSet = typia.json.createAssertParse<GrantSet>();
-const parseLandReport = typia.json.createAssertParse<LandReport>();
-const parseRebaseReport = typia.json.createAssertParse<RebaseReport>();
-const parseGcReport = typia.json.createAssertParse<GcReport>();
-const parsePushReport = typia.json.createAssertParse<PushReport>();
-const parseJobInfo = typia.json.createAssertParse<JobInfo>();
-const parseJobInfos = typia.json.createAssertParse<JobInfo[]>();
-const parseResizeResult = typia.json.createAssertParse<ResizeResult>();
-const parseDoctorReport = typia.json.createAssertParse<DoctorReport>();
-const parseRemoveReport = typia.json.createAssertParse<RemoveReport>();
-const assertAttachOptions = typia.createAssertEquals<AttachOptions>();
 
 function normalizeNativeError(error: unknown): unknown {
   if (!isNativeError(error)) {

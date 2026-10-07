@@ -5,8 +5,14 @@ pub fn parse(source: &str, api: &mut Api) -> syn::Result<()> {
     parse_items(syn::parse_file(source)?.items, api, true)
 }
 
+/// API declarations have lexical priority over equally named implementation/support records.
 pub fn parse_support(source: &str, api: &mut Api) -> syn::Result<()> {
-    parse_items(syn::parse_file(source)?.items, api, false)
+    let mut support = Api::default();
+    parse_items(syn::parse_file(source)?.items, &mut support, false)?;
+    for (name, record) in support.records {
+        api.records.entry(name).or_insert(record);
+    }
+    Ok(())
 }
 
 fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<()> {
@@ -33,20 +39,26 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
         .collect();
     for item in items {
         let record = match item {
-            Item::Struct(item) => Some(Record {
-                exported: exported
-                    && is_public(&item.vis)
-                    && (is_serialized(&item.attrs)
-                        || custom_serializers.contains(&item.ident.to_string())),
-                name: item.ident.to_string(),
-                docs: docs(&item.attrs),
-                serde: serde(&item.attrs)?,
-                projection: projection(&item.attrs)?,
-                shape: Shape::Struct(fields(item.fields)?),
-            }),
+            Item::Struct(item) => {
+                let projection = projection(&item.attrs)?;
+                let shape = Shape::Struct(fields(item.fields, projection.output_only)?);
+                Some(Record {
+                    exported: exported
+                        && is_public(&item.vis)
+                        && item.generics.type_params().next().is_none()
+                        && (is_serialized(&item.attrs)
+                            || custom_serializers.contains(&item.ident.to_string())),
+                    name: item.ident.to_string(),
+                    docs: docs(&item.attrs),
+                    serde: serde(&item.attrs)?,
+                    projection,
+                    shape,
+                })
+            }
             Item::Enum(item) => Some(Record {
                 exported: exported
                     && is_public(&item.vis)
+                    && item.generics.type_params().next().is_none()
                     && (is_serialized(&item.attrs)
                         || custom_serializers.contains(&item.ident.to_string())),
                 name: item.ident.to_string(),
@@ -61,7 +73,7 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                                 name: variant.ident.to_string(),
                                 docs: docs(&variant.attrs),
                                 serde: serde(&variant.attrs)?,
-                                fields: fields(variant.fields)?,
+                                fields: fields(variant.fields, false)?,
                             })
                         })
                         .collect::<syn::Result<_>>()?,
@@ -75,7 +87,29 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                 projection: projection(&item.attrs)?,
                 shape: Shape::Alias(*item.ty),
             }),
-            Item::Mod(item) if item.ident != "tests" => {
+            Item::Macro(item) if item.mac.path.is_ident("hex_identifier") => {
+                let identifier = syn::parse2::<HexIdentifier>(item.mac.tokens)?;
+                let digits = identifier.bytes.checked_mul(2).ok_or_else(|| {
+                    syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "hex identifier width overflow",
+                    )
+                })?;
+                Some(Record {
+                    name: identifier.name.to_string(),
+                    docs: docs(&item.attrs),
+                    serde: Serde::default(),
+                    projection: Projection {
+                        scalar: Some(format!(
+                            "string & tags.Pattern<'^(?!0{{{digits}}}$)[0-9a-f]{{{digits}}}$'>"
+                        )),
+                        ..Projection::default()
+                    },
+                    shape: Shape::Alias(syn::parse_quote!(String)),
+                    exported,
+                })
+            }
+            Item::Mod(item) if !is_test_only(&item.attrs)? => {
                 if let Some((_, items)) = item.content {
                     parse_items(items, api, exported)?;
                 }
@@ -97,12 +131,28 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
     Ok(())
 }
 
+struct HexIdentifier {
+    name: syn::Ident,
+    bytes: usize,
+}
+
+impl syn::parse::Parse for HexIdentifier {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let name = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let bytes = input.parse::<syn::LitInt>()?.base10_parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let _: syn::Ident = input.parse()?;
+        Ok(Self { name, bytes })
+    }
+}
+
 fn is_public(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public(_))
 }
 
 fn is_public_projection(projection: &Projection) -> bool {
-    projection.wire.is_some() || projection.scalar.is_some()
+    projection.wire.is_some() || projection.scalar.is_some() || projection.name.is_some()
 }
 
 fn is_serialized(attrs: &[Attribute]) -> bool {
@@ -123,13 +173,13 @@ fn is_serialized(attrs: &[Attribute]) -> bool {
     })
 }
 
-fn fields(fields: syn::Fields) -> syn::Result<Fields> {
+fn fields(fields: syn::Fields, output_only: bool) -> syn::Result<Fields> {
     let parse_field = |field: syn::Field| {
         Ok(Field {
             name: field.ident.map(|ident| ident.to_string()),
             ty: field.ty,
             docs: docs(&field.attrs),
-            serde: serde(&field.attrs)?,
+            serde: serde_for(&field.attrs, output_only)?,
         })
     };
     match fields {
@@ -168,6 +218,10 @@ fn docs(attrs: &[Attribute]) -> Vec<String> {
 }
 
 pub fn serde(attrs: &[Attribute]) -> syn::Result<Serde> {
+    serde_for(attrs, false)
+}
+
+fn serde_for(attrs: &[Attribute], output_only: bool) -> syn::Result<Serde> {
     let mut result = Serde::default();
     for attr in attrs {
         let mut apply = |meta: syn::meta::ParseNestedMeta<'_>| {
@@ -200,8 +254,21 @@ pub fn serde(attrs: &[Attribute]) -> syn::Result<Serde> {
                 result.deny_unknown_fields = true;
             } else if meta.path.is_ident("skip") || meta.path.is_ident("skip_serializing") {
                 result.skip = true;
-            } else {
+            } else if meta.path.is_ident("bound")
+                || meta.path.is_ident("borrow")
+                || meta.path.is_ident("expecting")
+                || meta.path.is_ident("crate")
+            {
                 consume_value(&meta)?;
+            } else if meta.path.is_ident("deserialize_with") && output_only {
+                result.deserialize_with = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else {
+                let name = meta
+                    .path
+                    .get_ident()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "qualified attribute".to_owned());
+                return Err(meta.error(format!("unsupported serde attribute {name}")));
             }
             Ok(())
         };
@@ -251,6 +318,10 @@ fn projection(attrs: &[Attribute]) -> syn::Result<Projection> {
                         result.name = Some(value);
                     } else if meta.path.is_ident("unit_value") {
                         result.unit_value = Some(value);
+                    } else if meta.path.is_ident("output_only") {
+                        result.output_only = value
+                            .parse()
+                            .map_err(|_| meta.error("output_only must be true or false"))?;
                     } else {
                         return Err(meta.error("unknown cowshed_api projection attribute"));
                     }
@@ -263,4 +334,108 @@ fn projection(attrs: &[Attribute]) -> syn::Result<Projection> {
         })?;
     }
     Ok(result)
+}
+
+fn is_test_only(attrs: &[Attribute]) -> syn::Result<bool> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("cfg")) {
+        if requires_test(&attr.parse_args::<Meta>()?)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn requires_test(predicate: &Meta) -> syn::Result<bool> {
+    match predicate {
+        Meta::Path(path) => Ok(path.is_ident("test")),
+        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let predicates = list.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            )?;
+            let all = list.path.is_ident("all");
+            let mut required = !all && !predicates.is_empty();
+            for predicate in predicates {
+                let test_only = requires_test(&predicate)?;
+                required = if all {
+                    required || test_only
+                } else {
+                    required && test_only
+                };
+            }
+            Ok(required)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_serde_shapes_are_refused_by_attribute_name() {
+        for attribute in [
+            "with = \"custom\"",
+            "serialize_with = \"custom\"",
+            "deserialize_with = \"custom\"",
+            "getter = \"custom\"",
+            "remote = \"Other\"",
+            "alias = \"old\"",
+            "other",
+            "variant_identifier",
+            "field_identifier",
+            "skip_deserializing",
+        ] {
+            let source = format!(
+                "#[derive(Serialize)] #[serde({attribute})] pub struct Record {{ pub value: String }}"
+            );
+            let error =
+                parse(&source, &mut Api::default()).expect_err("unsupported shape must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(attribute.split([' ', '=']).next().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_modules_are_excluded_by_predicate_not_spelling() {
+        let source = r#"
+            #[cfg(all(test, unix))] mod oracle { #[derive(Serialize)] pub struct Fixture { pub value: String } }
+            mod tests { #[derive(Serialize)] pub struct Production { pub value: String } }
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).unwrap();
+        assert!(!api.records.contains_key("Fixture"));
+        assert!(api.records["Production"].exported);
+    }
+
+    #[test]
+    fn explicit_output_projection_does_not_weaken_input_attribute_checks() {
+        let source = r#"
+            #[derive(Serialize, Deserialize)]
+            #[cfg_attr(any(), cowshed_api(output_only = "true"))]
+            pub struct ErrorReceipt {
+                #[serde(default, deserialize_with = "custom_input", skip_serializing_if = "Option::is_none")]
+                pub reason: Option<String>,
+            }
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).unwrap();
+        let Shape::Struct(Fields::Named(fields)) = &api.records["ErrorReceipt"].shape else {
+            panic!("receipt has named fields");
+        };
+        assert_eq!(
+            fields[0].serde.deserialize_with.as_deref(),
+            Some("custom_input")
+        );
+        assert!(
+            parse(
+                &source.replace("deserialize_with", "serialize_with"),
+                &mut Api::default()
+            )
+            .is_err()
+        );
+    }
 }

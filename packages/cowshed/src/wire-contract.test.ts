@@ -2,40 +2,20 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import typia from 'typia';
-import type {
-  DoctorReport,
-  GcReport,
-  GrantDelta,
-  GrantSet,
-  JobInfo,
-  LandReport,
-  PushReport,
-  RebaseReport,
-  RemoveReport,
-  ResizeResult,
-  WorkspaceInfo,
-} from './types.js';
+import type { GrantDelta } from './types.js';
+import * as validators from './validators.generated.js';
 
 /**
- * The consumer half of the napi wire contract.
- *
- * `wire-fixtures.json` is real `serde_json` output for every DTO the napi exports hand back, kept
- * current by `the_committed_wire_corpus_is_what_core_serializes` in
- * `crates/cowshed-napi/src/wire_contract.rs`. Here those same documents go through the typia
- * types `index.ts` validates with, so a Rust DTO that grows, loses, or renames a field is red on
- * this side until `types.ts` moves with it.
- *
- * Both directions of drift fail:
- * - a field the wire carries that `types.ts` does not name is an unexpected property — this is
- *   what caught `JobInfo.argv` typed `string[]` against the tagged `CommandArg` objects the
- *   controller actually emits;
- * - a field `types.ts` requires that the wire omits is a missing property.
- *
- * `assertEquals` rather than `assert` is the entire point. `assert` ignores excess properties and
- * would have stayed green through every drift this file exists to catch. `assertParse` runs beside
- * it because that is literally the validator `index.ts` applies to the napi JSON string.
+ * The consumer half of the N-API wire contract. The corpus is real core serde output;
+ * these are the exact generated validators the public facade consumes. A source DTO
+ * change regenerates both the types and their validators, while the corpus witnesses
+ * the serializer's actual shape. Exact assertions reject extra fields as well as missing
+ * ones; JSON parsing uses those same assertions rather than silently retaining extras.
  */
 
 /** One document, or a list of them where the export returns an array. */
@@ -52,49 +32,25 @@ const LIST_CASE = 'list';
 
 const seamTypes = {
   JobInfo: {
-    assertOne: typia.createAssertEquals<JobInfo>(),
-    parseOne: typia.json.createAssertParse<JobInfo>(),
-    assertMany: typia.createAssertEquals<JobInfo[]>(),
-    parseMany: typia.json.createAssertParse<JobInfo[]>(),
+    assertOne: validators.assertJobInfo,
+    parseOne: validators.parseJobInfo,
+    assertMany: validators.assertJobInfoList,
+    parseMany: validators.parseJobInfoList,
   },
   WorkspaceInfo: {
-    assertOne: typia.createAssertEquals<WorkspaceInfo>(),
-    parseOne: typia.json.createAssertParse<WorkspaceInfo>(),
-    assertMany: typia.createAssertEquals<WorkspaceInfo[]>(),
-    parseMany: typia.json.createAssertParse<WorkspaceInfo[]>(),
+    assertOne: validators.assertWorkspaceInfo,
+    parseOne: validators.parseWorkspaceInfo,
+    assertMany: validators.assertWorkspaceInfoList,
+    parseMany: validators.parseWorkspaceInfoList,
   },
-  GrantSet: {
-    assertOne: typia.createAssertEquals<GrantSet>(),
-    parseOne: typia.json.createAssertParse<GrantSet>(),
-  },
-  LandReport: {
-    assertOne: typia.createAssertEquals<LandReport>(),
-    parseOne: typia.json.createAssertParse<LandReport>(),
-  },
-  RebaseReport: {
-    assertOne: typia.createAssertEquals<RebaseReport>(),
-    parseOne: typia.json.createAssertParse<RebaseReport>(),
-  },
-  PushReport: {
-    assertOne: typia.createAssertEquals<PushReport>(),
-    parseOne: typia.json.createAssertParse<PushReport>(),
-  },
-  GcReport: {
-    assertOne: typia.createAssertEquals<GcReport>(),
-    parseOne: typia.json.createAssertParse<GcReport>(),
-  },
-  DoctorReport: {
-    assertOne: typia.createAssertEquals<DoctorReport>(),
-    parseOne: typia.json.createAssertParse<DoctorReport>(),
-  },
-  RemoveReport: {
-    assertOne: typia.createAssertEquals<RemoveReport>(),
-    parseOne: typia.json.createAssertParse<RemoveReport>(),
-  },
-  ResizeResult: {
-    assertOne: typia.createAssertEquals<ResizeResult>(),
-    parseOne: typia.json.createAssertParse<ResizeResult>(),
-  },
+  GrantSet: { assertOne: validators.assertGrantSet, parseOne: validators.parseGrantSet },
+  LandReport: { assertOne: validators.assertLandReport, parseOne: validators.parseLandReport },
+  RebaseReport: { assertOne: validators.assertRebaseReport, parseOne: validators.parseRebaseReport },
+  PushReport: { assertOne: validators.assertPushReport, parseOne: validators.parsePushReport },
+  GcReport: { assertOne: validators.assertGcReport, parseOne: validators.parseGcReport },
+  DoctorReport: { assertOne: validators.assertDoctorReport, parseOne: validators.parseDoctorReport },
+  RemoveReport: { assertOne: validators.assertRemoveReport, parseOne: validators.parseRemoveReport },
+  ResizeResult: { assertOne: validators.assertResizeResult, parseOne: validators.parseResizeResult },
 } satisfies Record<string, SeamType<unknown>>;
 
 /**
@@ -215,5 +171,66 @@ describe('napi wire contract', () => {
     const { retainedPortBlocks, ...current } = grants;
     expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlock: retainedPortBlocks?.[0] })).toThrow();
     expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlocks: retainedPortBlocks?.[0] })).toThrow();
+  });
+});
+
+const assertGeneratedModule = typia.createAssert<{
+  readonly assertWorkspaceInfo: (value: unknown) => unknown;
+  readonly parseWorkspaceInfo: (json: string) => unknown;
+}>();
+
+describe('canonical DTO generation', () => {
+  it('a declared field changes the generated type and the executed validator', async () => {
+    const sourceDirectory = dirname(fileURLToPath(import.meta.url));
+    const project = fileURLToPath(new URL('..', import.meta.url));
+    const scratch = mkdtempSync(join(sourceDirectory, '.api-generation-'));
+    try {
+      const core = join(scratch, 'crates/cowshed-core/src');
+      const gateway = join(scratch, 'crates/cowshed-gateway-types/src');
+      cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
+      mkdirSync(gateway, { recursive: true });
+      cpSync(join(project, 'crates/cowshed-gateway-types/src/status.rs'), join(gateway, 'status.rs'));
+      mkdirSync(join(scratch, 'src'));
+      // A separate project snapshots the mutant after it exists; the running test's program
+      // was already snapshotted before the scratch files were created.
+      writeFileSync(
+        join(scratch, 'src/tsconfig.test.json'),
+        JSON.stringify({
+          extends: join(sourceDirectory, 'tsconfig.test.json'),
+          compilerOptions: { rootDir: '.', composite: false, noEmit: true },
+          include: ['./*.ts'],
+        }),
+      );
+      const declaration = join(core, 'api/dto.rs');
+      const original = readFileSync(declaration, 'utf8');
+      const changed = original.replace(
+        'pub struct WorkspaceInfo {',
+        'pub struct WorkspaceInfo {\n    pub generation_probe: bool,',
+      );
+      expect(changed).not.toBe(original);
+      writeFileSync(declaration, changed);
+
+      const generator = fileURLToPath(new URL('../../../target/debug/cowshed-api-gen', import.meta.url));
+      const generated = spawnSync(generator, ['write', scratch], { encoding: 'utf8' });
+      if (generated.status !== 0) {
+        throw new Error(`API generator failed (${generated.status}): ${generated.stderr}`, { cause: generated.error });
+      }
+      expect(readFileSync(join(scratch, 'src/api.generated.ts'), 'utf8')).toMatch(
+        /readonly ['"]?generationProbe['"]?: boolean/,
+      );
+      const module: unknown = await import(pathToFileURL(join(scratch, 'src/validators.generated.ts')).href);
+      const changedValidators = assertGeneratedModule(module);
+      const baseline = seamTypes.WorkspaceInfo.assertOne(
+        Object.values(corpus.WorkspaceInfo ?? {}).find((value) => !Array.isArray(value)),
+      );
+      expect(() => changedValidators.assertWorkspaceInfo(baseline)).toThrow();
+      expect(() => changedValidators.parseWorkspaceInfo(JSON.stringify(baseline))).toThrow();
+      const withField = { ...baseline, generationProbe: true };
+      expect(changedValidators.assertWorkspaceInfo(withField)).toEqual(withField);
+      expect(changedValidators.parseWorkspaceInfo(JSON.stringify(withField))).toEqual(withField);
+      expect(() => validators.assertWorkspaceInfo(withField)).toThrow();
+    } finally {
+      rmSync(scratch, { recursive: true });
+    }
   });
 });

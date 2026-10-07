@@ -57,6 +57,7 @@ pub struct Serde {
     pub deny_unknown_fields: bool,
     pub into: Option<String>,
     pub from: Option<String>,
+    pub deserialize_with: Option<String>,
 }
 
 /// Metadata for custom serializers. Kept on the canonical Rust declaration, never in an adapter.
@@ -67,4 +68,5 @@ pub struct Projection {
     pub exclusive: Vec<String>,
     pub name: Option<String>,
     pub unit_value: Option<String>,
+    pub output_only: bool,
 }

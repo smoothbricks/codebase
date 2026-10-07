@@ -1209,7 +1209,7 @@ mod host_stable_path_tests {
 mod error_code_ssot {
     use cowshed_core::ErrorCode;
 
-    const TYPES_TS: &str = include_str!("../../../src/types.ts");
+    const TYPES_TS: &str = include_str!("../../../src/api.generated.ts");
 
     /// Core's kebab-case spellings, in enum-declaration order. Adding a variant breaks
     /// `ErrorCode::as_str`; adding it there without this list leaves the TypeScript union
@@ -1232,24 +1232,27 @@ mod error_code_ssot {
     fn ts_spellings() -> Vec<&'static str> {
         let start = TYPES_TS
             .find("export type ErrorCode =")
-            .expect("types.ts exports ErrorCode");
+            .expect("api.generated.ts exports ErrorCode");
         let end = start
             + TYPES_TS[start..]
                 .find(';')
                 .expect("ErrorCode union is semicolon-terminated");
         TYPES_TS[start..end]
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim().trim_start_matches('|').trim();
-                trimmed
+            .strip_prefix("export type ErrorCode =")
+            .expect("the generated taxonomy declaration")
+            .split('|')
+            .map(|member| {
+                member
+                    .trim()
                     .strip_prefix('\'')
                     .and_then(|value| value.strip_suffix('\''))
+                    .expect("each generated taxonomy member is a quoted string")
             })
             .collect()
     }
 
     /// The JSON wire corpus covers DTOs; ErrorCode rides on the napi Error object instead, so
-    /// this is the check that `types.ts` still names every `as_str` spelling and nothing else.
+    /// this checks the generated union names every `as_str` spelling and nothing else.
     #[test]
     fn types_ts_error_code_union_matches_core_taxonomy() {
         assert_eq!(ts_spellings(), rust_spellings());

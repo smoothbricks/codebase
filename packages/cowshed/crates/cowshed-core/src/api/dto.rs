@@ -80,6 +80,12 @@ pub enum DtoError {
     CommandShape,
 }
 
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>"
+    )
+)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct JobId(u64);
 
@@ -123,6 +129,10 @@ impl<'de> Deserialize<'de> for JobId {
     }
 }
 
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "string & tags.Pattern<'^([0-9a-f]{40}|[0-9a-f]{64})$'>")
+)]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GitOid(String);
 
@@ -311,6 +321,7 @@ fn is_published_leap_second(
     })
 }
 
+#[cfg_attr(any(), cowshed_api(scalar = "string"))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UtcTimestamp(String);
 
@@ -348,6 +359,7 @@ impl<'de> Deserialize<'de> for UtcTimestamp {
     }
 }
 
+#[cfg_attr(any(), cowshed_api(scalar = "string"))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspacePath(PathBuf);
 
@@ -787,6 +799,7 @@ pub struct OutputSummary {
 ///
 /// On Unix, serde preserves the bytes returned by `OsStrExt::as_bytes`: valid UTF-8 uses the
 /// `utf8` tag and every other sequence uses canonical standard base64. No conversion is lossy.
+#[cfg_attr(any(), cowshed_api(wire = "TaggedBytesRef"))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CommandArg(OsString);
 
@@ -1022,6 +1035,7 @@ fn command_arg_from_decoded_bytes(bytes: Vec<u8>) -> Result<CommandArg, DtoError
 /// Valid UTF-8 is emitted as tagged UTF-8. Every other byte sequence is emitted as tagged
 /// base64. The tag makes the wire representation unambiguous and deserialization never performs
 /// lossy conversion.
+#[cfg_attr(any(), cowshed_api(wire = "TaggedBytesRef"))]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BinaryData(Vec<u8>);
 
@@ -1072,6 +1086,7 @@ impl<'de> Deserialize<'de> for BinaryData {
 }
 
 /// A fixed-width SHA-256 digest, serialized as 64 lowercase hexadecimal characters.
+#[cfg_attr(any(), cowshed_api(scalar = "string & tags.Pattern<'^[0-9a-f]{64}$'>"))]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Sha256Digest([u8; 32]);
 
@@ -1191,6 +1206,7 @@ impl OutputStorage {
     }
 }
 
+#[cfg_attr(any(), cowshed_api(wire = "StreamInfoRef"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamInfo {
     pub storage: OutputStorage,
@@ -1417,6 +1433,7 @@ pub struct LandAdoptionCommitment {
 /// Versioned controller-owned existence, lifecycle, order, and lineage evidence.
 ///
 /// Protected payload bytes and artifact paths deliberately do not appear in any variant.
+#[cfg_attr(any(), cowshed_api(wire = "ControllerCommitmentRef"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControllerCommitment {
     WorkspaceIntroduced(WorkspaceIntroducedCommitment),
@@ -1638,6 +1655,7 @@ pub struct StdinInfo {
     pub complete: bool,
 }
 
+#[cfg_attr(any(), cowshed_api(wire = "JobInfoRef"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobInfo {
     pub repo_id: RepoId,
@@ -1699,6 +1717,7 @@ impl JobInfo {
     }
 }
 
+#[cfg_attr(any(), cowshed_api(exclusive = "argv,script"))]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobInfoRef<'a> {
@@ -1845,6 +1864,7 @@ pub struct SealedJob {
     pub stderr: StreamInfo,
 }
 
+#[cfg_attr(any(), cowshed_api(wire = "ExecRecordRef"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecRecord {
     pub repo_id: RepoId,
@@ -2050,6 +2070,8 @@ pub struct OutputPublication {
     pub policy: PublicationPolicy,
 }
 /// What a job runs.
+#[cfg_attr(any(), serde(rename_all = "camelCase"))]
+#[cfg_attr(any(), cowshed_api(name = "ExecCommand"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecCommand {
     /// A byte-exact argv, executed directly.
@@ -2279,6 +2301,7 @@ macro_rules! string_domain_serde {
 string_domain_serde!(BranchName);
 string_domain_serde!(GitRef);
 
+#[cfg_attr(any(), serde(rename_all = "camelCase"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevisionTarget {
     Branch(BranchName),
@@ -2349,6 +2372,8 @@ impl<'de> Deserialize<'de> for RevisionTarget {
     }
 }
 
+#[cfg_attr(any(), serde(rename_all = "camelCase"))]
+#[cfg_attr(any(), cowshed_api(unit_value = "true"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpectedRefHead {
     Missing,

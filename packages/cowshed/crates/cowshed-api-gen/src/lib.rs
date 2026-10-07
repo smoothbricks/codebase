@@ -25,17 +25,24 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         records::parse(&source, &mut api)
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
+    let error_path = core.join("error.rs");
+    records::parse(&read_source(&error_path)?, &mut api)
+        .map_err(|error| format!("{}: {error}", error_path.display()))?;
     for name in [
         "metadata.rs",
         "repository.rs",
         "project_policy.rs",
-        "error.rs",
+        "build_volume/mod.rs",
+        "runtime/supervisor_socket.rs",
     ] {
         let path = core.join(name);
         let source = read_source(&path)?;
         records::parse_support(&source, &mut api)
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
+    let gateway_status = project.join("crates/cowshed-gateway-types/src/status.rs");
+    records::parse_support(&read_source(&gateway_status)?, &mut api)
+        .map_err(|error| format!("{}: {error}", gateway_status.display()))?;
     let output = typescript::emit(&api)?;
     Ok(vec![
         GeneratedFile {

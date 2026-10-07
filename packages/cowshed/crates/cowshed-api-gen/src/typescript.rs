@@ -32,17 +32,13 @@ pub fn emit(api: &Api) -> Result<Output, String> {
             "export const assert{name} = typia.createAssertEquals<Api.{name}>();"
         )
         .unwrap();
-        writeln!(
-            validators,
-            "export const parse{name} = typia.json.createAssertParse<Api.{name}>();"
-        )
-        .unwrap();
+        writeln!(validators, "export const parse{name} = (json: string): Api.{name} => assert{name}(JSON.parse(json));").unwrap();
         writeln!(
             validators,
             "export const assert{name}List = typia.createAssertEquals<readonly Api.{name}[]>();"
         )
         .unwrap();
-        writeln!(validators, "export const parse{name}List = typia.json.createAssertParse<readonly Api.{name}[]>();\n").unwrap();
+        writeln!(validators, "export const parse{name}List = (json: string): readonly Api.{name}[] => assert{name}List(JSON.parse(json));\n").unwrap();
     }
     Ok(Output { types, validators })
 }
@@ -95,6 +91,25 @@ impl Emitter<'_> {
     fn shape(&mut self, record: &Record) -> Result<String, String> {
         match &record.shape {
             Shape::Alias(ty) => self.ty(ty),
+            Shape::Struct(fields) if record.serde.transparent => {
+                let fields = match fields {
+                    Fields::Named(fields) | Fields::Tuple(fields) => fields,
+                    Fields::Unit => {
+                        return Err(format!("{}: transparent record has no field", record.name));
+                    }
+                };
+                let mut projected = fields.iter().filter(|field| !field.serde.skip);
+                let field = projected.next().ok_or_else(|| {
+                    format!("{}: transparent record has no projected field", record.name)
+                })?;
+                if projected.next().is_some() {
+                    return Err(format!(
+                        "{}: transparent record requires one projected field",
+                        record.name
+                    ));
+                }
+                self.ty(&field.ty)
+            }
             Shape::Struct(fields) => self.fields(
                 fields,
                 record.serde.rename_all.as_deref(),
@@ -125,7 +140,11 @@ impl Emitter<'_> {
         )?;
         let fields = self.fields(
             &variant.fields,
-            record.serde.rename_all_fields.as_deref(),
+            variant
+                .serde
+                .rename_all
+                .as_deref()
+                .or(record.serde.rename_all_fields.as_deref()),
             false,
             &[],
         )?;
@@ -151,7 +170,13 @@ impl Emitter<'_> {
             };
         }
         if matches!(variant.fields, Fields::Unit) {
-            Ok(quoted(&name))
+            match record.projection.unit_value.as_deref() {
+                Some(value @ ("true" | "false")) => {
+                    Ok(format!("{{ readonly {}: {value} }}", quoted(&name)))
+                }
+                Some(value) => Err(format!("unsupported unit projection literal {value}")),
+                None => Ok(quoted(&name)),
+            }
         } else {
             Ok(format!("{{ readonly {}: {fields} }}", quoted(&name)))
         }
@@ -181,6 +206,7 @@ impl Emitter<'_> {
                 let mut object = String::from("{\n");
                 let mut flattened = Vec::new();
                 let mut alternatives = Vec::new();
+                let mut has_fields = false;
                 for field in fields.iter().filter(|field| !field.serde.skip) {
                     if field.serde.flatten {
                         flattened.push(self.ty(&field.ty)?);
@@ -193,6 +219,7 @@ impl Emitter<'_> {
                             .push((name, self.ty(option_inner(&field.ty).unwrap_or(&field.ty))?));
                         continue;
                     }
+                    has_fields = true;
                     documentation(&mut object, &field.docs, "  ");
                     let (optional, ty) = self.field(field, default)?;
                     writeln!(
@@ -204,7 +231,9 @@ impl Emitter<'_> {
                     .unwrap();
                 }
                 object.push('}');
-                flattened.insert(0, object);
+                if has_fields {
+                    flattened.insert(0, object);
+                }
                 if !exclusive.is_empty() {
                     if alternatives.len() != exclusive.len() || alternatives.len() < 2 {
                         return Err(
@@ -225,7 +254,11 @@ impl Emitter<'_> {
                     }
                     flattened.push(format!("({})", branches.join(" | ")));
                 }
-                Ok(flattened.join(" & "))
+                if flattened.is_empty() {
+                    Ok("Readonly<Record<string, never>>".to_owned())
+                } else {
+                    Ok(flattened.join(" & "))
+                }
             }
         }
     }
@@ -295,6 +328,12 @@ impl Emitter<'_> {
                     "u64" | "usize" => Ok("number & tags.Type<'uint64'>".to_owned()),
                     "i64" | "isize" => Ok("number & tags.Type<'int64'>".to_owned()),
                     "f32" | "f64" => Ok("number".to_owned()),
+                    "NonZeroU8" | "NonZeroU16" | "NonZeroU32" | "NonZeroU64" | "NonZeroUsize" => {
+                        let primitive = name.trim_start_matches("NonZero").to_ascii_lowercase();
+                        let ty = syn::parse_str::<Type>(&primitive)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("{} & tags.Minimum<1>", self.ty(&ty)?))
+                    }
                     "Vec" | "VecDeque" => match arguments.as_slice() {
                         [inner] => Ok(format!("ReadonlyArray<{}>", self.ty(inner)?)),
                         _ => Err(format!("{name} requires one type argument")),
@@ -513,6 +552,40 @@ mod tests {
         assert!(output.types.contains("export type Id = string;"));
         assert!(output.types.contains("readonly 'kind': 'started'"));
         assert!(output.types.contains("readonly 'value': Id"));
-        assert!(output.types.contains("export type Wrapped = {\n} & Event;"));
+        assert!(output.types.contains("export type Wrapped = Event;"));
+    }
+
+    #[test]
+    fn variant_payload_rename_and_try_from_proxy_are_not_guessed() {
+        let output = render(
+            r#"
+            #[derive(Serialize)] #[serde(tag = "state", rename_all = "camelCase")]
+            pub enum Measurement {
+                #[serde(rename_all = "camelCase")]
+                Measured { target_branch: String }
+            }
+            #[derive(Serialize, Deserialize)] #[serde(try_from = "Wire")]
+            pub struct Checked { private_state: bool }
+            #[derive(Deserialize)] struct Wire { observed_value: String }
+            #[derive(Serialize)] #[serde(transparent)]
+            pub struct NamedId { value: String }
+        "#,
+        );
+        assert!(output.types.contains("readonly 'targetBranch': string"));
+        assert!(!output.types.contains("target_branch"));
+        assert!(output.types.contains("export type Checked = Wire;"));
+        assert!(output.types.contains("readonly 'observed_value': string"));
+        assert!(!output.types.contains("private_state"));
+        assert!(output.types.contains("export type NamedId = string;"));
+    }
+
+    #[test]
+    fn empty_record_is_not_the_non_null_any_type() {
+        let output = render("#[derive(Serialize)] pub struct Empty {}");
+        assert!(
+            output
+                .types
+                .contains("export type Empty = Readonly<Record<string, never>>;")
+        );
     }
 }
