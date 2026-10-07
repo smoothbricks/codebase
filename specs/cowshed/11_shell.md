@@ -12,6 +12,8 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > are also unbuilt; Rust attachment writes exist, while N-API exposes no attachment stdio. The process-group ownership
 > ledger is implemented; it is not a resource-sampling API. Fork/exec tree observation, per-process usage and blocker
 > samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
+> Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead measurement and
+> unattributed-usage reconciliation are unbuilt too.
 
 ## Shell activation and process reuse
 
@@ -404,11 +406,11 @@ command, never idle time inherited from a reused warm host.
 
 ### Complete process tree, compact observations
 
-The supervisor observes each fork and exec in the job's owned process tree and samples its members at the poll cadence:
-kqueue `NOTE_FORK`/`NOTE_EXEC` on macOS, pidfd-backed process identities and proc children on Linux. Identity-fenced
-records retain exited descendants and their final usage, so a compiler that starts and exits between coarse progress
-ticks remains part of the job's cost and leaf-work identity. Missing observations are errors, not a shortened tree
-presented as complete.
+The supervisor observes fork, exec and exit, not just membership at a poll. macOS uses kqueue
+`NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`. Linux combines pidfd identity and proc metrics with an event-capable source, chosen
+by measuring proc connector `CN_PROC` through the privileged helper against ptrace fork/exec/exit tracing on the same
+fork-heavy workload. Polling alone cannot claim complete short-lived descendants. Missing events are explicit coverage
+gaps, never a shortened tree presented as complete.
 
 `JobHandle.processes` and `process_events` expose the canonical records in 07_api.md through both controller and N-API,
 generated from the same declaration. The records carry per-process CPU user/sys microseconds, current/peak RSS,
@@ -420,6 +422,13 @@ The supervisor emits one `process.run` span per process under the job's trace, w
 and birth/exit as its boundaries. Changed-state rows and coarse heartbeat rows use the fixed shared columns in
 13_telemetry.md; job-level host load and volume deltas stay on the job span. There is no per-process, per-metric, or
 per-sample column proliferation, and no JSON string payload.
+
+Linux job totals come from the job's cgroup v2: CPU `cpu.stat`, charged memory `memory.current`/`memory.peak`, and
+storage I/O `io.stat`; those totals include short-lived descendants the process observer missed. Charged memory includes
+cache/kernel charges and remains distinct from RSS. macOS reconciles against the leader's own/children rusage totals.
+Per-process rows and independent totals are compared in named units; differences produce explicit unattributed CPU/I/O
+rows on the job span. A coverage gap does not turn totals into a guessed live-process sum. An unknown or gap leaf
+remains absent and cannot seed a leaf-keyed baseline.
 
 Workspace and build-volume used-byte deltas are separate volume statistics, never a tree scan or a claim about
 per-process write syscalls. They compare usage at spawn with usage at the sample or terminal boundary and may be

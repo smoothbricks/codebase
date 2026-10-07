@@ -249,7 +249,9 @@ stdio/EOF, identity-fenced group-listener queries, and `AbortSignal` plumbing ar
 supports offset-addressed raw log reads, numeric-job reattachment, and attachment stdin writes; its `JobStdin` has no
 explicit close operation. The addon does not yet expose that full surface. One-use worker descriptor connection is also
 unbuilt. Fork/exec tree observations, per-process CPU/RSS/I/O and blocker facts, typed process event streams,
-CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt.
+CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt. Complete cgroup job totals, separate
+charged-memory counters, measured fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt
+as well.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
@@ -268,6 +270,11 @@ command.
 the controller. Low CPU never supplies a guessed blocker; `none` means observed unblocked state, and missing evidence
 remains explicit. The span projection uses the compact fixed column set in the telemetry specification, not JSON
 payloads or one column per process. No command flavor or argv-derived expectation is required.
+
+Process snapshots carry honest coverage alongside the retained rows. Resource receipts carry independent job-accounting
+sources and named checked units, with separate charged memory rather than an RSS substitution. Short-lived descendants
+are accounted even if an observer missed their spans; the missing attribution is an explicit row/gap, and an unknown
+leaf stays absent instead of polluting a baseline. The same generated records reach the controller and N-API.
 
 The CLI remains the integration point for shell-only consumers. Rust, N-API, CLI, and MCP frontends must agree on
 lifecycle, grant propagation, numeric jobs, tiered artifact storage, bounded summaries and control responses, raw

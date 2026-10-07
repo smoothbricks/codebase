@@ -6,7 +6,8 @@ they flush as Arrow segments under `/private/cowshed/store/telemetry/`. There is
 schema), no NDJSON files on disk, and no telemetry daemon. (Spec: `specs/cowshed/13_telemetry.md`.)
 
 > **Implementation status — process monitoring:** per-process tree observation, resource/blocker events, and the compact
-> process/job spans described below are unbuilt. Existing gateway and continuity segments are not that tree.
+> process/job spans described below are unbuilt. Existing gateway and continuity segments are not that tree. Complete
+> cgroup job accounting, charged-memory counters, event-source measurement and reconciliation rows are also unbuilt.
 
 ## Why not a logfile
 
@@ -27,6 +28,16 @@ Rows record state/blocker changes, RSS 2× steps, and busy/idle transitions, plu
 Only changed columns are set; the terminal row carries final usage. Host start/end load and cores and the signed
 workspace/build-volume deltas stay on the job span. There are no JSON string columns or new columns per process, metric,
 or sample. Missing blocker evidence is not a claim that a process is unblocked.
+
+Job totals have an independent source: Linux uses each job's cgroup v2 CPU, charged-memory and storage-I/O counters;
+macOS uses the leader's own/children rusage reconciliation. Charged memory is not RSS. Missed process events do not
+erase those totals: an explicit unattributed CPU/I/O row and typed coverage gap say what remains unattributed. An
+unknown leaf is never guessed for a command baseline.
+
+Linux pidfd/proc polling does not capture every short-lived fork/exec. A measured implementation compares proc connector
+through the privileged helper and ptrace event tracing on the same fork-heavy workload before selecting the event
+source; macOS uses fork/exec/exit kqueue events. The burst-between-polls case is the coverage oracle, not just a
+long-lived process census.
 
 ## Reading it
 

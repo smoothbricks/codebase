@@ -21,7 +21,8 @@ exists.
 
 > **Implementation status — process monitoring:** fork/exec tree observation, per-process resource/blocker events,
 > `process.run` spans, their on-change/heartbeat rows, and job-span host/volume columns below are unbuilt. Existing
-> gateway trace segments and controller commitments do not implement that process tree.
+> gateway trace segments and controller commitments do not implement that process tree. Cgroup job-total and
+> charged-memory columns and unattributed-usage reconciliation rows are unbuilt as well.
 
 ## Trace context propagation
 
@@ -113,6 +114,23 @@ The job span, not each process span, carries signed `disk_ws_delta_bytes` and op
 milliload with the declared checked conversion; non-finite, negative, or overflowing load and an overflowing core count
 are typed errors, never truncation. A missing build volume leaves its delta null. Process I/O and volume allocation
 remain different facts.
+
+Linux job accounting retains the complete cgroup-v2 CPU and storage-I/O counters and separate charged-memory
+current/peak; charged memory includes cache/kernel charges and is never written into an RSS column. macOS retains the
+leader's own/children rusage reconciliation source. The declared source and named checked unit types are part of the
+typed accounting record (07_api.md), not a JSON string.
+
+A discrepancy between attributed process rows and the independent job total emits one `job.unattributed` row with
+`unattributed_cpu_us`, optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units;
+source/coverage is a fixed row kind or enum, not a dynamically named column. Event loss, unavailable evidence and
+counter-window/precision disagreement are explicit. Charged-memory fields
+`charged_memory_current_bytes`/`charged_memory_peak_bytes` stay on the job span. None of these fields grows the
+fourteen-column process schema or duplicates process-tree JSON.
+
+The process event-source RED compares expected birth/exec/exit records for bursts of short-lived grandchildren entirely
+between coarse polls. Linux compares `CN_PROC` through the owning privileged helper and ptrace
+`TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` for coverage and fork-heavy overhead before selecting one; pidfds alone supply
+identity and exit observation, not fork events. macOS includes `NOTE_EXIT` beside `NOTE_FORK`/`NOTE_EXEC`.
 
 One generated column declaration owns these names, types, enum values, and event-to-row projections. No writer
 hand-copies the schema. The tree is span parentage, never JSON; no process name, metric name, or sample number creates a

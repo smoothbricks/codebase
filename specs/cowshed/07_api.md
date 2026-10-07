@@ -14,7 +14,9 @@ with identical semantics and error taxonomy.
 > hand-maintained; the shared wire corpus checks agreement, not generated parity. Complete fork/exec process-tree
 > observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work identity, and the compact
 > process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies groups for safe termination; it
-> does not yet provide these observations.
+> does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux fork/exec event-source
+> selection, macOS exit observation and rusage reconciliation, charged-memory counters, and explicit unattributed-usage
+> rows are also unbuilt.
 
 ## Authority model (frozen)
 
@@ -666,21 +668,39 @@ closing. The interval is positive and uses the declaration's bounded duration co
 intermediate samples; terminal evidence and journal bytes are never lost.
 
 ```rust
-pub struct HostLoadSample { pub load1: f64, pub cores: u32 }
-pub struct JobVolumeUsage { pub workspace_delta_bytes: i64, pub build_delta_bytes: Option<i64> }
+pub struct WallMillis(u64);
+pub struct WallMicros(u64);
+pub struct CpuMillis(u64);
+pub struct CpuMicros(u64);
+pub struct CpuMicrosDelta(i64);
+pub struct ResidentBytes(u64);
+pub struct ChargedMemoryBytes(u64);
+pub struct StorageIoBytes(u64);
+pub struct StorageIoBytesDelta(i64);
+pub struct VolumeUsedBytesDelta(i64);
+pub struct HostLoad1(f64);
+pub struct OneCoreCpuPercent(f64);
+pub struct HostCores(u16);
+pub struct HostLoadSample { pub load1: HostLoad1, pub cores: HostCores }
+pub struct JobVolumeUsage {
+    pub workspace_delta_bytes: VolumeUsedBytesDelta,
+    pub build_delta_bytes: Option<VolumeUsedBytesDelta>,
+}
 pub struct JobStreamWatermark { pub bytes: u64, pub lines: u64 }
 pub struct JobResourceSample {
     pub job_id: JobId,                // retained in standalone progress and terminal resource receipts
     pub sampled_at: UtcTimestamp,
-    pub wall_ms: u64,
+    pub wall_ms: WallMillis,
+    pub wall_us: WallMicros,          // retained precise duration; wallMs is its display projection
     pub leader_pid: u32,              // observed leader; this sample exists only after spawn
     pub members: Vec<u32>,            // complete current membership of the owned job process group
-    pub leaf: JobProcessLeaf,          // retained CPU-winning leaf identity, including exited work
-    pub cpu_user_ms: u64,
-    pub cpu_sys_ms: u64,
-    pub cpu_pct: f64,
-    pub rss_bytes: u64,
-    pub rss_peak_bytes: u64,
+    pub leaf: Option<JobProcessLeaf>, // absent when observation gaps make the CPU-winning leaf unknown
+    pub cpu_user_ms: CpuMillis,       // derived once from the accounting source's microseconds
+    pub cpu_sys_ms: CpuMillis,
+    pub cpu_pct: OneCoreCpuPercent,
+    pub rss_bytes: ResidentBytes,
+    pub rss_peak_bytes: ResidentBytes,
+    pub accounting: JobAccounting,
     pub host_start: HostLoadSample,
     pub host: HostLoadSample,          // current sample; end host facts in the terminal sample
     pub volumes: JobVolumeUsage,
@@ -757,12 +777,11 @@ EOF and job cancellation remain different operations.
 
 ### Process-tree observations
 
-`processes()` returns `JobProcessTree { jobId, sampledAt, processes }`, retaining the final record of exited descendants
-as well as current members. The supervisor owns the observation of every fork/exec in its job's tree: macOS uses kqueue
-`NOTE_FORK`/`NOTE_EXEC` on members, Linux uses pidfd-backed identities and proc children, and both sample members at the
-supervisor's poll cadence. This is one generated controller and N-API declaration, not an adapter's `ps` scan. A lost
-observation or failed identity read is a typed error, never a silently incomplete tree or a PID reused as if it were the
-original process.
+`processes()` returns `JobProcessTree { jobId, sampledAt, processes, coverage }`, retaining final records of observed
+exited descendants as well as current members. The supervisor observes fork, exec and exit events: macOS uses kqueue
+`NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`; Linux requires an event source beside pidfd identity and proc metrics. Periodic
+proc children polling alone is not a complete tree. A missed observation records a typed coverage gap and an
+unattributed-usage row; it never silently claims completeness or trusts a reused PID.
 
 The canonical records are:
 
@@ -771,6 +790,7 @@ pub struct JobProcessTree {
     pub job_id: JobId,
     pub sampled_at: UtcTimestamp,
     pub processes: Vec<JobProcessSample>,
+    pub coverage: ProcessCoverage,
 }
 pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<CommandArg> }
 pub enum ProcessBlockedOn { None, Lock, Socket, Pipe, Child, Stdin, Disk }
@@ -780,12 +800,12 @@ pub struct JobProcessSample {
     pub program: String,
     pub argv: Vec<CommandArg>,
     pub born_at: UtcTimestamp,
-    pub cpu_user_us: u64,
-    pub cpu_sys_us: u64,
-    pub rss_bytes: u64,
-    pub rss_peak_bytes: u64,
-    pub io_read_bytes: u64,
-    pub io_write_bytes: u64,
+    pub cpu_user_us: CpuMicros,
+    pub cpu_sys_us: CpuMicros,
+    pub rss_bytes: ResidentBytes,
+    pub rss_peak_bytes: ResidentBytes,
+    pub io_read_bytes: StorageIoBytes,
+    pub io_write_bytes: StorageIoBytes,
     pub busy: bool,
     pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
     pub blocked_path: Option<String>,
@@ -802,16 +822,32 @@ pub enum JobProcessEvent {
     Exited(JobProcessSample),          // final own-process usage, exit and exitedAt
 }
 pub struct JobProcessStream { /* bounded stream of Result<JobProcessEvent, CowshedError> */ }
+pub enum ProcessCoverage { Complete, Gap { reason: CowshedError } }
+pub struct CpuTotals { pub user_us: CpuMicros, pub sys_us: CpuMicros }
+pub struct StorageIoTotals { pub read_bytes: StorageIoBytes, pub write_bytes: StorageIoBytes }
+pub struct ChargedMemoryUsage { pub current_bytes: ChargedMemoryBytes, pub peak_bytes: ChargedMemoryBytes }
+pub struct UsageReconciliation {
+    pub cpu_us: CpuMicrosDelta,
+    pub io_read_bytes: Option<StorageIoBytesDelta>,
+    pub io_write_bytes: Option<StorageIoBytesDelta>,
+    pub coverage: ProcessCoverage,
+}
+pub enum JobAccounting {
+    LinuxCgroupV2 { cpu: CpuTotals, io: StorageIoTotals, charged_memory: ChargedMemoryUsage,
+                    reconciliation: UsageReconciliation },
+    MacOsRusageChildren { cpu: CpuTotals, io: Option<StorageIoTotals>, reconciliation: UsageReconciliation },
+}
 ```
 
 Birth and parent identity are kernel observations retained internally, not fresh trust in numeric PID values.
-Per-process CPU counters are that process's own usage; group totals accumulate each member once, including exited
-members. Microsecond process counters convert to the job's millisecond counters through one named conversion after
-aggregation. I/O counters distinguish process reads/writes from volume-wide used-byte deltas. Exit and `exitedAt` are
-present together only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal result.
-Blocker detail fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation
-error, never an assertion that the process is unblocked. A lock observation identifies its path and, when kernel
-evidence resolves it, the holder PID and that holder's job; no program-name guess supplies it.
+Per-process CPU counters are that process's own usage. Complete job counters have an independent, declared source and
+reconcile against the retained process counters; they are not a live-members-only sum. Microseconds convert to
+milliseconds once, after aggregation. Storage I/O byte counters follow the kernel source's semantics and never convert
+operation counts into invented byte totals or stand in for volume-allocation deltas. Exit and `exitedAt` are present
+together only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal result. Blocker
+detail fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation error,
+never an assertion that the process is unblocked. A lock observation identifies its path and, when kernel evidence
+resolves it, the holder PID and that holder's job; no program-name guess supplies it.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one coarse heartbeat per
 progress tick, and each process's final usage on exit. State or blocker transitions, an RSS crossing of a 2× step, and a
@@ -820,7 +856,44 @@ process. The `leaf` in `JobResourceSample` selects the deepest CPU-winning proce
 members; CPU usage, depth, then birth identity/PID provide deterministic tie-breaking. Consumers use these observed
 facts without declaring or deriving an expectation from a command's argv. The generated sparse delta distinguishes
 unchanged, SET, and CLEAR; clearing a blocker path or holder never leaves the preceding lock's detail in the current
-snapshot. Its constructor rejects an empty change event.
+snapshot. Its constructor rejects an empty change event. An unknown leaf or a coverage-gap leaf remains absent. A
+consumer must skip a leaf-keyed baseline update for that terminal and record why; it never picks a guessed observed
+process to stand in for work the tree missed.
+
+### Complete job accounting and observation reconciliation
+
+On Linux, the job owns a cgroup v2 from its first owned process through terminal accounting. `cpu.stat` accounts CPU
+usage for the job and its descendants, `memory.current`/`memory.peak` retain charged memory, and `io.stat` accounts
+storage I/O. Descendants born and reaped between polls still contribute. Cgroup placement precedes their execution;
+migrating a process after it ran is not complete accounting. These totals reach the controller and N-API through the
+same declaration as process events.
+
+Charged-memory current/peak is separate from `rssBytes`/`rssPeakBytes`: cgroup memory includes anonymous memory,
+file/page cache and kernel charges. It is never relabeled as RSS. Named resource types above have private fields,
+checked constructors and checked unit conversions, while their generated wire projection preserves the numeric
+representation. Non-finite load/share, invalid core counts and numeric overflow are typed errors, never casts or
+truncation. The accounting union identifies each total's source; a source that cannot report storage bytes leaves that
+optional observation unavailable, never converts block-operation counts or inserts zero. Lifetime CPU share uses the
+accounting source's cumulative user+system microseconds divided by `wallUs`; `cpuPct` remains the latest sampler-window
+share and is not that lifetime statistic. A zero-duration observation does not manufacture a ratio or enter a usage
+baseline. The cgroup's peak counter is read without resetting it, and missing controllers/counters are typed operational
+errors, not zero totals.
+
+The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
+through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
+fork-heavy workload, measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither
+backend is selected by familiarity or assumed overhead. pidfd identity and proc sampling complement the chosen event
+source, not replace it. macOS observes all three kqueue event kinds and reconciles CPU against the leader's own and
+children rusage totals, including the activation interval.
+
+Reconciliation retains the difference between independent job totals and attributed process rows in named units.
+Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,
+counter precision and sampling-window disagreement remain stated, not clamped away. A gap does not erase the independent
+job totals. Coverage and leaf identity remain honest so a partial tree cannot contaminate a baseline. The RED includes
+bursts of short-lived grandchildren that fork, exec and exit entirely between coarse polls.
+
+Counter semantics: [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html);
+[pidfd events](https://man7.org/linux/man-pages/man2/pidfd_open.2.html) report exit/reap, not fork/exec.
 
 The corresponding span layout and event-to-row projection are defined once in 13_telemetry.md, "Process-tree spans". API
 records remain typed; no JSON string column carries a process tree or metric payload.
