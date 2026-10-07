@@ -391,7 +391,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const held = '/v/9-abcdef is kept: /v/9-abcdef/x.asif (/dev/disk9) still attached from below it';
-    const volume = scriptedVolume({ ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [held] } });
+    const volume = scriptedVolume({
+      ok: true,
+      value: { kind: 'leased', lease: leaseAt(directory), held: [held], reaped: [] },
+    });
 
     const result = await runBoundedExec(
       { command: 'node -e "console.log(process.env.TMPDIR)"', timeoutMs: 5_000 },
@@ -405,6 +408,37 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(directory);
     expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${held}\n`);
     expect(volume.released).toEqual([directory]);
+  });
+
+  it('stops what the command left working in its lease before the lease ends, and says so', async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const volume = scriptedVolume(
+      {
+        ok: true,
+        value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: ['4242 (nx daemon of a dead task)'] },
+      },
+      null,
+      ['31337 (bun nx daemon --start)'],
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node -e "0"', timeoutMs: 5_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+      null,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain(
+      'RAM temp volume: stopped 31337 (bun nx daemon --start), which the command left working in its lease\n',
+    );
+    expect(result.terminalOutput).toContain(
+      'RAM temp volume: stopped 4242 (nx daemon of a dead task), which a dead task left working in its lease\n',
+    );
+    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory}`]);
   });
 
   it('keeps the inherited TMPDIR inside a sandbox and says so once', async () => {
@@ -451,7 +485,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const volume = scriptedVolume(
-      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [] } },
+      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [] } },
       { kind: 'volume-full', mountpoint: workspace.root, capacityBytes: 1024 * 1024 * 1024, freeBytes: 1024 * 1024 },
     );
 
@@ -572,17 +606,25 @@ function leaseAt(directory: string): RamTempLease {
   return { directory, mountpoint: dirname(directory), capacityBytes: 1024 * 1024 * 1024 };
 }
 
-/** A temp volume whose answers are fixed, recording which leases were released. */
+/** A temp volume whose answers are fixed, recording which leases were reaped and released, in order. */
 function scriptedVolume(
   acquisition: Result<RamTempAcquisition, RamTempError>,
   full: RamTempError | null = null,
-): TempVolume & { released: string[] } {
+  leftovers: string[] = [],
+): TempVolume & { released: string[]; order: string[] } {
   const released: string[] = [];
+  const order: string[] = [];
   return {
     released,
+    order,
     acquire: () => Promise.resolve(acquisition),
+    reap(lease) {
+      order.push(`reap ${lease.directory}`);
+      return Promise.resolve({ ok: true, value: leftovers });
+    },
     release(lease) {
       released.push(lease.directory);
+      order.push(`release ${lease.directory}`);
       return Promise.resolve({ ok: true, value: undefined });
     },
     fullness: () => Promise.resolve(full),

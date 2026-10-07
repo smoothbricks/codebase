@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { awaitExit, pidsWorkingIn, processTable, terminate, withDescendants } from '../../testing.js';
 import { diskClassOf, takeDiskLease } from './disk-lease.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 
@@ -98,6 +99,58 @@ export interface HostCommands {
   run(file: string, args: readonly string[]): Promise<CommandOutput>;
 }
 
+/**
+ * How long a process a task left in its lease gets to exit on SIGTERM before it gets SIGKILL: the
+ * time a daemon takes to stop its watcher and its plugin workers, and well under the grace a
+ * bounded leg gives its own command.
+ */
+const LEFTOVER_GRACE_MS = 5_000;
+
+/**
+ * The processes still working in a lease directory once its task is over, and how they end. A
+ * seam so the volume's state machine is testable without any.
+ */
+export interface LeaseProcesses {
+  /**
+   * End every process whose working directory is in `directory`, and everything those started,
+   * and answer each as `<pid> (<command>)`. Every one has exited when this settles; one that
+   * would not rejects with its name.
+   */
+  stopWorkingIn(directory: string): Promise<string[]>;
+}
+
+/**
+ * The host's processes. A lease belongs to one task and its command is gone by the time the
+ * lease ends, so what still works in it is what the command left behind. A fixture's Nx daemon is
+ * the usual one: Nx detaches it into a session of its own, so the process-group kill that ends a
+ * timed-out command never reaches it, and a test process that is killed runs no teardown of its
+ * own. Deleting the lease asks such a daemon to leave only by deleting its record, which it
+ * notices within a second when it is idle and not at all while it is wedged; a signal does not
+ * depend on the daemon noticing, and a process left on the volume is what keeps it from
+ * detaching.
+ */
+export const hostLeaseProcesses: LeaseProcesses = {
+  async stopWorkingIn(directory) {
+    const working = (await pidsWorkingIn(directory)).filter((pid) => pid !== process.pid);
+    if (working.length === 0) {
+      return [];
+    }
+    const leftovers = withDescendants(await processTable(), working).filter((entry) => entry.pid !== process.pid);
+    for (const entry of leftovers) {
+      terminate(entry.pid);
+    }
+    try {
+      await awaitExit(leftovers, `processes working in ${directory}`, LEFTOVER_GRACE_MS);
+    } catch {
+      for (const entry of leftovers) {
+        terminate(entry.pid, 'SIGKILL');
+      }
+      await awaitExit(leftovers, `processes working in ${directory} after SIGKILL`, LEFTOVER_GRACE_MS);
+    }
+    return leftovers.map((entry) => `${entry.pid} (${entry.command.slice(0, 160)})`);
+  },
+};
+
 export interface RamTempPaths {
   /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */
   mountpoint: string;
@@ -140,8 +193,11 @@ export interface RamTempLease {
 }
 
 export type RamTempAcquisition =
-  /** `held`: dead leases that could not be reclaimed, each with what still holds it. */
-  | { kind: 'leased'; lease: RamTempLease; held: string[] }
+  /**
+   * `held`: dead leases that could not be reclaimed, each with what still holds it. `reaped`: the
+   * processes of dead leases that were still working there and were stopped before the lease went.
+   */
+  | { kind: 'leased'; lease: RamTempLease; held: string[]; reaped: string[] }
   /** Inside a cowshed sandbox: /private/tmp is not writable and no image can attach. */
   | { kind: 'sandboxed'; detail: string };
 
@@ -153,6 +209,8 @@ interface Survivors {
   live: number;
   /** Dead leases kept because something attached below them; described for the task's output. */
   held: string[];
+  /** Processes stopped in dead leases, described for the task's output. */
+  reaped: string[];
 }
 
 /** A host command or filesystem step failed while the volume was being created, mounted or detached. */
@@ -184,6 +242,7 @@ export class RamTempVolume {
     private readonly commands: HostCommands,
     private readonly pid: number = process.pid,
     private readonly isAlive: (pid: number) => boolean = processIsAlive,
+    private readonly processes: LeaseProcesses = hostLeaseProcesses,
   ) {
     this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
   }
@@ -199,6 +258,7 @@ export class RamTempVolume {
     try {
       const mounted = await this.mountedCapacity();
       let held: string[] = [];
+      let reaped: string[] = [];
       if (mounted === null) {
         const created = await this.create();
         if (!created.ok) {
@@ -210,6 +270,7 @@ export class RamTempVolume {
           return survivors;
         }
         held = survivors.value.held;
+        reaped = survivors.value.reaped;
       }
       const directory = await mkdtemp(join(this.paths.mountpoint, `${this.pid}-`));
       return {
@@ -218,12 +279,33 @@ export class RamTempVolume {
           kind: 'leased',
           lease: { directory, mountpoint: this.paths.mountpoint, capacityBytes: mounted ?? this.capacityBytes },
           held,
+          reaped,
         },
       };
     } catch (error) {
       return failed('lease', errorText(error));
     } finally {
       await lock.value.close();
+    }
+  }
+
+  /**
+   * Stop what the task left working in its lease, before the lease ends: the processes whose
+   * working directory is in it and everything they started, answered as `<pid> (<command>)`.
+   * Runs outside the volume's lock, which one lease's leftovers must not hold up the others
+   * behind, and costs a scan of every process only when the lease still holds anything.
+   */
+  async reap(lease: RamTempLease): Promise<Result<string[], RamTempError>> {
+    try {
+      if ((await readdir(lease.directory)).length === 0) {
+        return { ok: true, value: [] };
+      }
+      return { ok: true, value: await this.processes.stopWorkingIn(lease.directory) };
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') {
+        return { ok: true, value: [] };
+      }
+      return failed('reap', errorText(error));
     }
   }
 
@@ -301,7 +383,7 @@ export class RamTempVolume {
 
   /** Remove leases whose task is gone; what remains on the volume. */
   private async reclaimDeadLeases(): Promise<Result<Survivors, RamTempError>> {
-    const survivors: Survivors = { live: 0, held: [] };
+    const survivors: Survivors = { live: 0, held: [], reaped: [] };
     for (const name of await readdir(this.paths.mountpoint)) {
       const match = LEASE_NAME.exec(name);
       if (!match) {
@@ -312,6 +394,11 @@ export class RamTempVolume {
         continue;
       }
       const directory = join(this.paths.mountpoint, name);
+      // Its task is gone, so what works in it is what that task left: stopped before the lease
+      // is removed, even where the removal is refused below.
+      if ((await readdir(directory)).length > 0) {
+        survivors.reaped.push(...(await this.processes.stopWorkingIn(directory)));
+      }
       const removed = await this.removeLease(directory);
       if (!removed.ok) {
         return removed;

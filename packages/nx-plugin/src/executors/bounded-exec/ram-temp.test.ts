@@ -1,13 +1,24 @@
 import { describe, expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
-import { userInfo } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-
+import { isRunning } from '../../testing.js';
 import {
   createHostCommands,
   type HostCommands,
+  hostLeaseProcesses,
   imagesBackedUnder,
   mountsBelow,
   operationDisk,
@@ -343,3 +354,40 @@ function registryDevice(url: string, disk: string): string[] {
     `          |   "BSD Name" = "${disk}s1"`,
   ];
 }
+
+describe('processes a task left working in its RAM lease', () => {
+  const scratch = (): string => mkdtempSync(join(realpathSync(tmpdir()), 'lease-leftovers-'));
+
+  it('stops a detached process working in the lease and what it started, and names them', async () => {
+    const lease = scratch();
+    // A fixture's Nx daemon, as Nx leaves it: its own session, working in the fixture, with a
+    // child of its own (a plugin worker), so the command's process-group kill never reaches it.
+    const daemon = spawn('sh', ['-c', 'sleep 600 & wait'], { cwd: lease, detached: true, stdio: 'ignore' });
+    const daemonPid = daemon.pid;
+    expect(daemonPid).toBeDefined();
+    try {
+      const stopped = await hostLeaseProcesses.stopWorkingIn(lease);
+
+      expect(stopped.some((entry) => entry.startsWith(`${daemonPid} (`))).toBe(true);
+      expect(stopped.length).toBeGreaterThanOrEqual(2);
+      expect(isRunning(daemonPid ?? 0) && daemon.exitCode === null && daemon.signalCode === null).toBe(false);
+    } finally {
+      daemon.kill('SIGKILL');
+      rmSync(lease, { recursive: true, force: true });
+    }
+  });
+
+  it('stops nothing in a lease no process works in, and nothing that works elsewhere', async () => {
+    const lease = scratch();
+    const elsewhere = scratch();
+    const bystander = spawn('sleep', ['600'], { cwd: elsewhere, detached: true, stdio: 'ignore' });
+    try {
+      expect(await hostLeaseProcesses.stopWorkingIn(lease)).toEqual([]);
+      expect(bystander.exitCode === null && bystander.signalCode === null).toBe(true);
+    } finally {
+      bystander.kill('SIGKILL');
+      rmSync(lease, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+});

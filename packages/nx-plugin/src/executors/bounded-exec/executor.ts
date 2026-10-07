@@ -78,7 +78,7 @@ export interface ProcessTreeKiller {
 }
 
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
-export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness'>;
+export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'reap'>;
 
 export default function boundedExecExecutor(
   options: BoundedExecOptions,
@@ -163,6 +163,9 @@ export async function runBoundedExec(
       for (const held of acquired.value.held) {
         appendStderr(`RAM temp volume: dead lease ${held}\n`);
       }
+      for (const reaped of acquired.value.reaped) {
+        appendStderr(`RAM temp volume: stopped ${reaped}, which a dead task left working in its lease\n`);
+      }
     } else {
       appendStderr(
         `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
@@ -175,6 +178,16 @@ export async function runBoundedExec(
     }
     const held = lease;
     lease = null;
+    // What the command left working in its lease is a leak, whichever way the command ended; it
+    // is stopped before the lease goes, so the volume can detach, and said, so its owner fixes it.
+    const reaped = await tempVolume?.reap(held);
+    if (reaped?.ok) {
+      for (const leftover of reaped.value) {
+        appendStderr(`RAM temp volume: stopped ${leftover}, which the command left working in its lease\n`);
+      }
+    } else if (reaped) {
+      appendStderr(`${describeRamTempError(reaped.error)}\n`);
+    }
     const released = await tempVolume?.release(held);
     if (released && !released.ok) {
       appendStderr(`${describeRamTempError(released.error)}\n`);

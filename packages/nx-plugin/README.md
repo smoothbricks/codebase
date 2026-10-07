@@ -659,6 +659,15 @@ those belong to whoever attached them, so the lease and the volume are kept and 
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
 
+Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
+fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
+never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
+deleting its record, which an idle daemon notices within a second and a wedged one never does, and a process left on the
+volume keeps it from detaching. So the task's own release, and the next task's reclaim of a dead lease, send SIGTERM to
+every process whose working directory is in the lease and to what those started, SIGKILL to what has not exited five
+seconds later, and name each on stderr (`stopped <pid> (<command>), which the command left working in its lease`). A
+lease with nothing in it costs no scan. The line is the leak check: a suite that prints it has a fixture to fix.
+
 The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: asking for any other mountpoint escalates
 to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
 plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
