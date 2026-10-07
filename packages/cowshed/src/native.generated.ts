@@ -621,7 +621,8 @@ export interface NativeJobLogs {
 export type JobLogsArguments = Pick<Api.LogsRequest, 'stream' | 'follow' | 'offset'>;
 
 /**
- * Reads one stream's bytes from an offset.
+ * Reads one bounded raw chunk from an offset. Without follow, an empty chunk is the current
+ * written end even when eof is false; follow waits on supervisor output notifications.
  */
 export async function jobLogs(
   handle: NativeJobLogs,

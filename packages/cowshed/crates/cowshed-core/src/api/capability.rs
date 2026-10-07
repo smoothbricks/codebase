@@ -447,8 +447,8 @@ fn actor_reply_error() -> CowshedError {
     )
 }
 
-/// The bytes of one stream from `offset` on, page by page; following asks again past end of file
-/// until the job is terminal.
+/// The bytes of one stream from `offset` on, page by page, ending at the current written end.
+/// Following waits on supervisor output notifications past that end until the job is terminal.
 fn poll_job_stream(
     runtime: Arc<dyn ControllerRuntime>,
     authority: Arc<WorkspaceAuthority>,
@@ -495,10 +495,10 @@ fn poll_job_stream(
                     break;
                 }
             }
+            if !follow && (!had_bytes || eof) {
+                break;
+            }
             if eof {
-                if !follow {
-                    break;
-                }
                 let job = authority.job(id);
                 let status = tokio::select! {
                     _ = sender.closed() => break,
@@ -514,12 +514,6 @@ fn poll_job_stream(
                         }
                         break;
                     }
-                }
-            }
-            if !had_bytes || eof {
-                tokio::select! {
-                    _ = sender.closed() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 }
             }
         }
@@ -2076,7 +2070,8 @@ impl JobHandle {
     }
 
     /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already
-    /// continues from there. `follow` keeps reading past end of file until the job is terminal.
+    /// continues from there. Without `follow`, ends at the current written end even while the
+    /// job runs; `follow` waits on output notifications past that end until the job is terminal.
     pub async fn logs(
         &self,
         stream: JobStream,
@@ -2272,6 +2267,14 @@ mod tests {
                 4 => Ok(BinaryDownload {
                     bytes: b"after-eof".to_vec(),
                     eof: true,
+                }),
+                5 if call < 2 => Ok(BinaryDownload {
+                    bytes: if call == 0 { b"abc" } else { b"def" }.to_vec(),
+                    eof: false,
+                }),
+                5 | 6 => Ok(BinaryDownload {
+                    bytes: Vec::new(),
+                    eof: false,
                 }),
                 _ => Ok(BinaryDownload {
                     bytes: Vec::new(),
@@ -3761,6 +3764,31 @@ mod tests {
         assert_eq!(bytes, b"abcdefghi");
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 3);
         assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_follow_stream_stops_at_the_current_end_of_an_open_stream() {
+        for (mode, expected, calls) in [(5, &b"abcdef"[..], 3), (6, &b""[..], 1)] {
+            let runtime = Arc::new(TestRuntime::default());
+            runtime.mode.store(mode, Ordering::SeqCst);
+            let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+            let mut stream = poll_job_stream(
+                runtime_trait,
+                test_authority(),
+                JobId::new(7).unwrap(),
+                JobStream::Stdout,
+                0,
+                false,
+            );
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+
+            assert_eq!(bytes, expected);
+            assert_eq!(runtime.log_calls.load(Ordering::SeqCst), calls);
+            assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

@@ -2226,6 +2226,38 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
     let journal = until_admitted(&job, JobStream::Stdout, 0, MIB).await;
     assert!(journal.iter().all(|byte| *byte == b'a'));
 
+    // A non-follow reader drains the admitted prefix, not the lifetime of the child blocked
+    // on the FIFO. Resuming and reading at the current end must also finish without a timer.
+    for offset in [0, MIB - 7, MIB] {
+        let mut logs = job
+            .logs(JobStream::Stdout, offset, false)
+            .await
+            .expect("read current stdout");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = logs.next().await {
+            bytes.extend_from_slice(&chunk.expect("stdout chunk"));
+        }
+        assert_eq!(bytes, journal[usize::try_from(offset).expect("offset")..]);
+        assert_eq!(
+            job.status().await.expect("held job").state,
+            JobState::Running
+        );
+    }
+    let mut stderr = job
+        .logs(JobStream::Stderr, 0, false)
+        .await
+        .expect("read current stderr");
+    assert!(stderr.next().await.is_none());
+    assert_eq!(
+        job.status().await.expect("held job").state,
+        JobState::Running
+    );
+
+    let mut followed = job
+        .logs(JobStream::Stdout, MIB, true)
+        .await
+        .expect("follow past the current end");
+
     let limits = tail_limits(4096, 1024);
     let latest = job.tail(None, limits).await.expect("latest tail");
     assert!(
@@ -2245,13 +2277,15 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
 
     let more = [b'+'; 100];
     let released = gate.clone();
-    tokio::task::spawn_blocking(move || {
-        // Opening blocks until the child opens the FIFO to read; closing it ends the child.
+    let gate_writer = tokio::task::spawn_blocking(move || {
+        // Opening blocks until the child opens the FIFO to read; keep it open until the
+        // followed reader has received these bytes while the child still lives.
         let mut gate = std::fs::OpenOptions::new()
             .write(true)
             .open(released)
             .expect("open the gate");
         gate.write_all(&more).expect("release 100 bytes");
+        gate
     })
     .await
     .expect("release task");
@@ -2259,6 +2293,23 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
         until_admitted(&job, JobStream::Stdout, MIB, MIB + 100).await,
         more
     );
+    let mut followed_bytes = Vec::new();
+    while followed_bytes.len() < more.len() {
+        followed_bytes.extend_from_slice(
+            &followed
+                .next()
+                .await
+                .expect("followed bytes")
+                .expect("chunk"),
+        );
+    }
+    assert_eq!(followed_bytes, more);
+    assert_eq!(
+        job.status().await.expect("held job").state,
+        JobState::Running
+    );
+    drop(gate_writer);
+    assert!(followed.next().await.is_none());
     let resumed = job
         .tail(Some(latest.next), limits)
         .await

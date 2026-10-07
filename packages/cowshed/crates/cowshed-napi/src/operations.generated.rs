@@ -415,7 +415,8 @@ impl JobHandle {
         super::json_call::<operations::JobSealed, _>(env, Arc::clone(&self.inner), arguments)
     }
 
-    /// Reads one stream's bytes from an offset.
+    /// Reads one bounded raw chunk from an offset. Without follow, an empty chunk is the current
+    /// written end even when eof is false; follow waits on supervisor output notifications.
     #[napi(js_name = "logs")]
     pub fn logs(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::download_call::<operations::JobLogs, _>(env, Arc::clone(&self.inner), arguments)

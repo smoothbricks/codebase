@@ -1082,6 +1082,9 @@ export type LockHolder = {
  * The JSON half of a `job.logs` answer; the bytes follow as its raw-byte frame.
  */
 export type LogsChunk = {
+  /**
+   * The stream has closed, not merely reached its current written end.
+   */
   readonly eof: boolean;
   readonly nextOffset: number & tags.Type<'uint64'>;
 };

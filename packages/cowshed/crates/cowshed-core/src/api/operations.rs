@@ -323,7 +323,8 @@ operations! {
     worker json "job.status" JobStatus(JobRequest) -> JobInfo;
     /// Reads one ended job's sealed record.
     worker json "job.sealed" JobSealed(JobRequest) -> SealedJob;
-    /// Reads one stream's bytes from an offset.
+    /// Reads one bounded raw chunk from an offset. Without follow, an empty chunk is the current
+    /// written end even when eof is false; follow waits on supervisor output notifications.
     worker download(offset) "job.logs" JobLogs(LogsRequest) -> LogsChunk;
     /// Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
     worker json "job.tail" JobTailRead(TailRequest) -> JobTail;
@@ -671,6 +672,7 @@ pub struct LogsRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LogsChunk {
+    /// The stream has closed, not merely reached its current written end.
     pub eof: bool,
     pub next_offset: u64,
 }

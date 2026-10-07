@@ -104,10 +104,11 @@ describe('Cowshed Node-API bindings', () => {
    *
    * A Node controller serves the wire on one end of a socket pair and hands the other end to a
    * Node client as fd 3, the way a trusted spawner hands an endpoint over. The controller keeps
-   * the wait open until it has answered the job's status: a client that holds its other calls
-   * behind the wait deadlocks with it, and the spawn's deadline ends the pair.
+   * the wait open until it has answered non-follow logs and the job's status. Logs reach an empty
+   * current-end chunk with eof=false; this is not the end of the running job. A client that holds
+   * these other calls behind the wait deadlocks with it, and the spawn's deadline ends the pair.
    */
-  it('answers a second call on one connection while job.wait() is pending', async () => {
+  it('reads current raw logs and status while job.wait() is pending on one connection', async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
     const client = `
       import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
@@ -115,8 +116,18 @@ describe('Cowshed Node-API bindings', () => {
       const worker = await coordinator.worker('main');
       const job = await worker.exec({ argv: ['build'] });
       const ended = job.wait();
+      const bytes = [];
+      let offset = 0;
+      let chunk;
+      do {
+        chunk = await job.logs({ stream: 'stdout', offset, follow: false });
+        bytes.push(...chunk.bytes);
+        offset = chunk.nextOffset;
+      } while (chunk.bytes.length !== 0 && !chunk.eof);
       const status = await job.status();
-      console.log(JSON.stringify({ status: status.state, ended: (await ended).state }));
+      console.log(JSON.stringify({
+        bytes, offset, eof: chunk.eof, status: status.state, ended: (await ended).state,
+      }));
       process.exit(0);
     `;
     const controller = `
@@ -181,6 +192,7 @@ describe('Cowshed Node-API bindings', () => {
       const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
       let greeted = false;
       let statusAnswered = false;
+      let logsAnswered = false;
       const waits = [];
       const handle = (message) => {
         if (!greeted) {
@@ -188,7 +200,22 @@ describe('Cowshed Node-API bindings', () => {
           send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
         } else if (message.method in results) {
           answer(message.id, results[message.method]);
+        } else if (message.method === 'job.logs') {
+          const { stream, offset, follow } = message.params;
+          if (stream !== 'stdout' || follow !== false || ![0, 4].includes(offset)) {
+            throw new Error('unexpected logs request ' + JSON.stringify(message.params));
+          }
+          const bytes = offset === 0 ? Buffer.from([0, 255, 128, 10]) : Buffer.alloc(0);
+          logsAnswered = offset === 4;
+          send({
+            id: message.id, ok: true, result: { eof: false, nextOffset: offset + bytes.length },
+            error: null, binaryLength: bytes.length,
+          });
+          const head = Buffer.alloc(4);
+          head.writeUInt32BE(bytes.length);
+          socket.write(Buffer.concat([head, bytes]));
         } else if (message.method === 'job.status') {
+          if (!logsAnswered) throw new Error('status arrived before the current-end log chunk');
           statusAnswered = true;
           answer(message.id, job(false));
           for (const id of waits.splice(0)) answer(id, job(true));
@@ -232,7 +259,7 @@ describe('Cowshed Node-API bindings', () => {
 
     expect({ exitCode, stdout: stdout.trim(), stderr }).toEqual({
       exitCode: 0,
-      stdout: JSON.stringify({ status: 'running', ended: 'exited' }),
+      stdout: JSON.stringify({ bytes: [0, 255, 128, 10], offset: 4, eof: false, status: 'running', ended: 'exited' }),
       stderr: '',
     });
   }, 30_000);

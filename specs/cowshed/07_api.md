@@ -346,6 +346,8 @@ impl JobHandle {
     pub async fn tail(&self, cursor: Option<JobJournalCursor>, limits: JobTailLimits)
         -> Result<JobTail, CowshedError>;
     // From `offset` on: a reader holding the first `offset` bytes continues where it stopped.
+    // Without follow, drain the currently written bytes and end even while the job lives.
+    // Follow waits on supervisor output notifications past that end, until the job is terminal.
     pub async fn logs(&self, stream: JobStream, offset: u64, follow: bool)
         -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
     pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment, CowshedError>;
@@ -1327,6 +1329,10 @@ export type JobInfo = JobCommand & {
   outputLimit?: { limitBytes: number; crossingBytes: number };
 };
 
+// The N-API boundary returns one bounded raw chunk, not the Rust stream adapter.
+// Empty bytes mark the current end; eof means the stream has closed, not merely caught up.
+export type JobLogs = { readonly bytes: Uint8Array; readonly nextOffset: number; readonly eof: boolean };
+
 export interface JobHandle {
   readonly id: JobId;
   status(): Promise<JobInfo>;
@@ -1336,10 +1342,9 @@ export interface JobHandle {
   processEvents(everyMs: number): AsyncIterable<JobProcessEvent>;
   progress(everyMs: number): AsyncIterable<JobResourceSample>;
   tail(cursor: JobJournalCursor | undefined, limits: JobTailLimits): Promise<JobTail>;
-  logs(
-    stream: JobStream,
-    opts?: { offset?: number; follow?: boolean; signal?: AbortSignal }
-  ): AsyncIterable<Uint8Array>;
+  // Without follow, continue at nextOffset until bytes is empty or eof is true.
+  // Follow waits for output notifications at the current end while the job is running.
+  logs(args: { stream: JobStream; offset: number; follow: boolean }): Promise<JobLogs>;
   attach(opts?: { cursor?: JobJournalCursor; signal?: AbortSignal }): Promise<JobAttachment>;
   detach(): Promise<void>;
   kill(): Promise<void>;

@@ -105,7 +105,7 @@ export interface Session {
   exec(request: ExecRequest): Promise<JobHandle>;
 }
 
-/** One `job.logs` chunk: where it ends, whether the stream had ended, and its bytes. */
+/** One `job.logs` chunk: where it ends, whether the stream has closed, and its bytes. */
 export type JobLogs = Api.LogsChunk & { readonly bytes: Uint8Array };
 
 export interface JobHandle {
@@ -113,8 +113,9 @@ export interface JobHandle {
   status(): Promise<Api.JobInfo>;
   /**
    * One stream's bytes from `offset`, at most one chunk. Reading again from `nextOffset` continues
-   * where this chunk ended; `follow` waits for bytes or the stream's end instead of answering an
-   * empty chunk while the job runs.
+   * where this chunk ended. Without `follow`, stop at an empty chunk or `eof`: an empty chunk is
+   * the current end even when the stream is still open (`eof: false`). With `follow`, the supervisor
+   * waits for written bytes or the job's end instead of answering an empty chunk while the job runs.
    */
   logs(args: JobLogsArguments): Promise<JobLogs>;
   /**
