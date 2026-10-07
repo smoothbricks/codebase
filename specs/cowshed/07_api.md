@@ -894,6 +894,19 @@ valid only for their observed blocker kind; an unobserved blocker is absence or 
 that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder
 PID and that holder's job; no program-name guess supplies it.
 
+`blockedOn` is read from each process's threads at one moment and fenced to its retained life as its usage is. A
+running or runnable thread makes it `none`. Otherwise it is the one class every kernel-evidenced wait of its threads
+agrees on. Waits no class names (a futex, a poll over many descriptors, a timer) and waits that disagree leave it absent.
+On Linux, a thread in `D` (disk sleep) is `disk`. A sleeping thread is classed by the system call
+`/proc/<pid>/task/<tid>/syscall` names. A read of descriptor 0 is `stdin`. A read or write of a FIFO or socket
+descriptor is `pipe` or `socket`, and socket calls are `socket`. `wait4`/`waitid` is `child`. `flock` or
+`F_SETLKW`/`F_OFD_SETLKW` is `lock` on the descriptor's path, and its holder is the lock `/proc/locks` lists the request
+under. On macOS, an uninterruptible thread is `disk`, and `pipe`/`stdin` are read from `PIPE_WANTR`: a reader sleeping on
+a pipe end only this process references (descriptor 0 for `stdin`). Socket, child and lock waits have no unprivileged
+kernel evidence on macOS (a thread's wait channel reads zero, and none of those waits leaves state on a descriptor), so
+there they read as no evidence: `blockedOn` is absent, not `none`. A lock holder's job is the supervisor's: the job
+whose process group holds the holder's PID.
+
 `usage` is a process's own counters as last read. It is absent, never zero, for a process whose counters were never
 read: one reaped before the sampler reached it, or on macOS one that exited before its first read could be proven its
 own. Usage is final only when it was read after the process exited. An exit with no such read is the coverage gap
