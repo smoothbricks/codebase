@@ -136,13 +136,15 @@ macro_rules! operations {
         $scope:ident $lane:ident $(($offset:ident))? $method:literal
             $marker:ident($request:ty) -> $result:ty;
     )+) => {
-        /// One declared controller operation.
-        pub trait Operation {
+        /// One declared controller operation. Sealed: the table below is every operation there
+        /// is, so no crate can mint a marker that names another operation's method.
+        pub trait Operation: sealed::Sealed + Send + Sync + 'static {
             const METHOD: &'static str;
             const SCOPE: Scope;
             const LANE: Lane;
-            type Request: Serialize + DeserializeOwned;
-            type Result: Serialize + DeserializeOwned;
+            /// Plain data, so any task may carry a call across its awaits.
+            type Request: Serialize + DeserializeOwned + Send + Sync + 'static;
+            type Result: Serialize + DeserializeOwned + Send + Sync + 'static;
 
             /// The decoded form the controller routes.
             fn request(request: Self::Request) -> OperationRequest;
@@ -152,6 +154,8 @@ macro_rules! operations {
             $(#[doc = $doc])+
             #[derive(Debug)]
             pub enum $marker {}
+
+            impl sealed::Sealed for $marker {}
 
             impl Operation for $marker {
                 const METHOD: &'static str = $method;
@@ -215,6 +219,15 @@ macro_rules! operations {
         }
     };
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Which handle serves which operation, and how it builds the request. Generated beside the table
+/// it is generated from, so it names the request records and their field types as the table does.
+#[path = "served.generated.rs"]
+pub(super) mod served;
 
 operations! {
     /// Resolves a path to the project this controller is bound to.
@@ -284,7 +297,7 @@ operations! {
     /// Reports the project's health findings.
     coordinator json "coordinator.doctor" CoordinatorDoctor(RepoRequest) -> DoctorReport;
     /// Mints a worker capability for one workspace.
-    coordinator json "coordinator.worker" CoordinatorWorker(WorkspaceRequest) -> WorkspaceView;
+    coordinator json "coordinator.worker" CoordinatorWorker(WorkspaceRequest) -> WorkerView;
     /// Starts serving a workspace's supervisor.
     internal json "coordinator.serveSupervisor" CoordinatorServeSupervisor(WorkspaceRequest) -> EmptyResult;
     /// Refreshes a mounted workspace's build state.
@@ -379,6 +392,12 @@ pub struct WorkspaceView {
     pub info: WorkspaceInfo,
     pub grants: GrantSet,
 }
+
+/// The workspace a worker capability was minted for. The wire form is the [`WorkspaceView`]; the
+/// type is what lets only the call that mints a worker capability yield one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct WorkerView(pub WorkspaceView);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

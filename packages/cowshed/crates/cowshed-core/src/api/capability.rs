@@ -1,3 +1,4 @@
+use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
@@ -14,7 +15,7 @@ use super::operations::{
     LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation, ProjectGrantRequest,
     ProjectOpenRequest, PushRequest, QuotaRequest, RebaseRequest, RemoveProjectRequest,
     RepoRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
-    SourceDestinationRequest, WorkerScope, WorkspaceAtRequest, WorkspaceAttachRequest,
+    SourceDestinationRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
@@ -60,6 +61,25 @@ impl WorkspaceAuthority {
             repo_id: info.repo_id.clone(),
             workspace: info.workspace.clone(),
             workspace_incarnation: info.workspace_incarnation.clone(),
+        }
+    }
+
+    /// This workspace incarnation, as the request fields a worker binds.
+    fn fields(&self) -> WorkspaceFields<'_> {
+        WorkspaceFields {
+            repo_id: &self.repo_id,
+            workspace: &self.workspace,
+            workspace_incarnation: &self.workspace_incarnation,
+        }
+    }
+
+    /// This workspace incarnation and `job`, as the request fields a job handle binds.
+    fn job_fields<'a>(&'a self, job: &'a JobId) -> JobFields<'a> {
+        JobFields {
+            repo_id: &self.repo_id,
+            workspace: &self.workspace,
+            workspace_incarnation: &self.workspace_incarnation,
+            job_id: job,
         }
     }
 
@@ -427,9 +447,9 @@ fn poll_job_stream(
             };
             let chunk = tokio::select! {
                 _ = sender.closed() => break,
-                value = invoke_download::<operations::JobLogs>(&*runtime, &request, offset) => value,
+                value = invoke_download::<operations::JobLogs>(&*runtime, request) => value,
             };
-            let chunk = match chunk {
+            let (chunk, bytes) = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     tokio::select! {
@@ -439,21 +459,10 @@ fn poll_job_stream(
                     break;
                 }
             };
-            let had_bytes = !chunk.bytes.is_empty();
+            let had_bytes = !bytes.is_empty();
             let eof = chunk.eof;
+            offset = chunk.next_offset;
             if had_bytes {
-                offset = match offset.checked_add(chunk.bytes.len() as u64) {
-                    Some(next_offset) => next_offset,
-                    None => {
-                        let error = CowshedError::internal("job.logs response offset overflowed");
-                        tokio::select! {
-                            _ = sender.closed() => {}
-                            _ = sender.send(Err(error)) => {}
-                        }
-                        break;
-                    }
-                };
-                let bytes = Bytes::from(chunk.bytes);
                 let sent = tokio::select! {
                     _ = sender.closed() => false,
                     result = sender.send(Ok(bytes)) => result.is_ok(),
@@ -495,7 +504,7 @@ fn poll_job_stream(
 }
 
 /// Calls a declared operation and decodes its declared result.
-async fn invoke<O: Operation>(
+pub(super) async fn invoke<O: Operation>(
     runtime: &(impl ControllerRuntime + ?Sized),
     request: &O::Request,
 ) -> Result<O::Result> {
@@ -514,7 +523,7 @@ async fn invoke_reporting<O: Operation>(
 }
 
 /// [`invoke`] for an upload operation, with `bytes` as its raw-byte frame.
-async fn invoke_upload<O: Operation>(
+pub(super) async fn invoke_upload<O: Operation>(
     runtime: &(impl ControllerRuntime + ?Sized),
     request: &O::Request,
     bytes: Bytes,
@@ -523,14 +532,28 @@ async fn invoke_upload<O: Operation>(
     decode_result::<O>(runtime.upload(O::METHOD, params, bytes).await?)
 }
 
-/// Calls a download operation whose raw-byte frame starts at `offset`.
-async fn invoke_download<O: Operation>(
+/// Calls a download operation: the chunk's metadata and its bytes, which start at the offset the
+/// request declares. The connection has already proved the chunk ends exactly at `nextOffset`.
+pub(super) async fn invoke_download<O: Operation<Result = LogsChunk>>(
     runtime: &(impl ControllerRuntime + ?Sized),
-    request: &O::Request,
-    offset: u64,
-) -> Result<BinaryDownload> {
-    let params = encode_request::<O>(request)?;
-    runtime.download(O::METHOD, params, offset).await
+    request: O::Request,
+) -> Result<(LogsChunk, Bytes)> {
+    let params = encode_request::<O>(&request)?;
+    let offset = O::request(request).download_offset().ok_or_else(|| {
+        CowshedError::internal(format!("{} declares no download offset", O::METHOD))
+    })?;
+    let download = runtime.download(O::METHOD, params, offset).await?;
+    let next_offset = u64::try_from(download.bytes.len())
+        .ok()
+        .and_then(|length| offset.checked_add(length))
+        .ok_or_else(|| CowshedError::internal(format!("{} offset overflowed", O::METHOD)))?;
+    Ok((
+        LogsChunk {
+            eof: download.eof,
+            next_offset,
+        },
+        Bytes::from(download.bytes),
+    ))
 }
 
 pub struct RawByteStream {
@@ -767,7 +790,7 @@ pub struct WorkspaceRef {
 }
 
 impl WorkspaceRef {
-    fn from_view(view: WorkspaceView, runtime: Arc<dyn ControllerRuntime>) -> Self {
+    pub(super) fn from_view(view: WorkspaceView, runtime: Arc<dyn ControllerRuntime>) -> Self {
         Self {
             info: view.info,
             grants: view.grants,
@@ -1755,11 +1778,77 @@ impl Coordinator {
 
     pub async fn worker(&self, workspace: &str) -> Result<WorkspaceHandle> {
         let request = self.workspace_request(workspace)?;
-        let view = invoke::<operations::CoordinatorWorker>(&*self.runtime, &request).await?;
-        Ok(WorkspaceHandle::new(
-            self.workspace_ref(view),
-            Arc::clone(&self.runtime),
-        ))
+        let WorkerView(view) =
+            invoke::<operations::CoordinatorWorker>(&*self.runtime, &request).await?;
+        Ok(self.worker_handle(view))
+    }
+
+    /// The worker capability the controller minted as `view`.
+    pub(super) fn worker_handle(&self, view: WorkspaceView) -> WorkspaceHandle {
+        WorkspaceHandle::new(self.workspace_ref(view), Arc::clone(&self.runtime))
+    }
+}
+
+impl Binder for Project {
+    type Fields<'a> = RepoFields<'a>;
+
+    fn binding(&self) -> Binding<'_, RepoFields<'_>> {
+        Binding {
+            runtime: &self.runtime,
+            authority: RepoFields {
+                repo_id: &self.repo_id,
+            },
+        }
+    }
+}
+
+impl Binder for WorkspaceRef {
+    type Fields<'a> = WorkspaceFields<'a>;
+
+    fn binding(&self) -> Binding<'_, WorkspaceFields<'_>> {
+        Binding {
+            runtime: &self.runtime,
+            authority: WorkspaceFields {
+                repo_id: &self.info.repo_id,
+                workspace: &self.info.workspace,
+                workspace_incarnation: &self.info.workspace_incarnation,
+            },
+        }
+    }
+}
+
+impl Binder for Coordinator {
+    type Fields<'a> = RepoFields<'a>;
+
+    fn binding(&self) -> Binding<'_, RepoFields<'_>> {
+        Binding {
+            runtime: &self.runtime,
+            authority: RepoFields {
+                repo_id: &self.project.repo_id,
+            },
+        }
+    }
+}
+
+impl Binder for WorkspaceHandle {
+    type Fields<'a> = WorkspaceFields<'a>;
+
+    fn binding(&self) -> Binding<'_, WorkspaceFields<'_>> {
+        Binding {
+            runtime: &self.runtime,
+            authority: self.authority.fields(),
+        }
+    }
+}
+
+impl Binder for JobHandle {
+    type Fields<'a> = JobFields<'a>;
+
+    fn binding(&self) -> Binding<'_, JobFields<'_>> {
+        Binding {
+            runtime: &self.runtime,
+            authority: self.authority.job_fields(&self.id),
+        }
     }
 }
 
@@ -1842,7 +1931,7 @@ impl WorkspaceHandle {
         Ok((sealed, self.job_handle(id)))
     }
 
-    fn job_handle(&self, id: JobId) -> JobHandle {
+    pub(super) fn job_handle(&self, id: JobId) -> JobHandle {
         JobHandle {
             authority: Arc::clone(&self.authority),
             id,
@@ -2020,7 +2109,9 @@ impl fmt::Debug for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::call::{Arguments, Serves, call};
     use crate::api::dto::RunSandboxMode;
+    use crate::api::operations::{self, OPERATIONS, Scope};
     use serde_json::json;
     use std::future;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -2892,6 +2983,307 @@ mod tests {
             JobId::new(7).unwrap()
         );
         server_task.await.unwrap();
+    }
+
+    fn arguments(value: Value) -> Arguments {
+        let Value::Object(arguments) = value else {
+            panic!("arguments are a JSON object: {value}");
+        };
+        arguments
+    }
+
+    #[track_caller]
+    fn refused_as_bound<T>(result: Result<T>, field: &str) {
+        let Err(error) = result else {
+            panic!("a caller's {field} reached the controller");
+        };
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(
+            error.message.contains(&format!(
+                "arguments name {field}, which the handle supplies"
+            )),
+            "{}",
+            error.message
+        );
+    }
+
+    /// A caller can never name what its handle binds: a coordinator cannot be pointed at another
+    /// repository, a workspace reference or worker at another workspace or incarnation, a job
+    /// handle at another job. Each is refused before anything reaches the controller.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_caller_field_the_handle_binds_is_refused_before_the_wire() {
+        let runtime = Arc::new(TestRuntime::default());
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let coordinator = coordinator(Arc::clone(&runtime_trait));
+        let workspace = workspace_ref(Arc::clone(&runtime_trait));
+        let worker = workspace_handle(Arc::clone(&runtime_trait));
+        let job = JobHandle {
+            authority: test_authority(),
+            id: JobId::new(7).unwrap(),
+            runtime: runtime_trait,
+        };
+
+        refused_as_bound(
+            call::<operations::ProjectList, _>(
+                coordinator.project(),
+                arguments(json!({ "repoId": "acme/other" })),
+            )
+            .await,
+            "repoId",
+        );
+        refused_as_bound(
+            call::<operations::CoordinatorDestroy, _>(
+                &coordinator,
+                arguments(json!({
+                    "repoId": "acme/other",
+                    "workspace": "raven",
+                    "options": { "force": true },
+                })),
+            )
+            .await,
+            "repoId",
+        );
+        refused_as_bound(
+            call::<operations::WorkspaceAttach, _>(
+                &workspace,
+                arguments(json!({ "workspace": "crow" })),
+            )
+            .await,
+            "workspace",
+        );
+        for (field, value) in [
+            ("repoId", json!("acme/other")),
+            ("workspace", json!("crow")),
+            (
+                "workspaceIncarnation",
+                json!("1198f2c0b7e34dc795f17b238b331c80"),
+            ),
+        ] {
+            refused_as_bound(
+                call::<operations::WorkerListJobs, _>(&worker, arguments(json!({ field: value })))
+                    .await,
+                field,
+            );
+        }
+        refused_as_bound(
+            call::<operations::JobKill, _>(&job, arguments(json!({ "jobId": 8 }))).await,
+            "jobId",
+        );
+        assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// What reaches the controller is the handle's authority merged with the caller's fields, so a
+    /// coordinator's call names its own repository and a worker's its own workspace incarnation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_carries_the_handles_authority_beside_the_callers_fields() {
+        let (runtime, mut server) = actor_pair();
+        let coordinator = coordinator(Arc::clone(&runtime));
+        let worker = workspace_handle(runtime);
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "coordinator.destroy");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "crow",
+                    "options": { "force": true, "restore": false, "abandon": false },
+                })
+            );
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({}),
+                None,
+            )
+            .await;
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "worker.listJobs");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                })
+            );
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!([]),
+                None,
+            )
+            .await;
+        });
+
+        call::<operations::CoordinatorDestroy, _>(
+            &coordinator,
+            arguments(json!({ "workspace": "crow", "options": { "force": true } })),
+        )
+        .await
+        .expect("destroy through the coordinator");
+        let jobs = call::<operations::WorkerListJobs, _>(&worker, Arguments::new())
+            .await
+            .expect("list jobs through the worker");
+        assert!(jobs.is_empty());
+        server_task.await.unwrap();
+    }
+
+    /// A workspace reference fences its repository and workspace, not the incarnation it was
+    /// resolved at: its grants read names none, exactly as [`WorkspaceRef::refresh_grants`] does,
+    /// so a reference resolved before its name was recreated still reads by name. A worker is
+    /// fenced on its whole incarnation, so the same stale incarnation is refused. The server here
+    /// answers by the controller's rule, which
+    /// `a_grants_read_that_holds_an_incarnation_is_fenced_on_a_coordinator_connection` proves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_reference_reads_grants_by_name_while_a_stale_worker_is_refused() {
+        let (runtime, mut server) = actor_pair();
+        // Both handles hold incarnation …80; the workspace has since been recreated as …81.
+        let reference = workspace_ref(Arc::clone(&runtime));
+        let worker = workspace_handle(runtime);
+        let stale = reference.info().workspace_incarnation.clone();
+        let live = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut sent = Vec::new();
+            for _ in 0..3 {
+                let (_, request) = read_rpc_request(&mut server).await;
+                assert_eq!(request["method"], "workspace.grants");
+                let id = request["id"].as_u64().unwrap();
+                let params: WorkspaceGrantsRequest =
+                    serde_json::from_value(request["params"].clone()).unwrap();
+                match params.workspace_incarnation {
+                    Some(held) if held != live => {
+                        let error = CowshedError::fence_refusal(
+                            crate::error::FenceRefusal::IncarnationMoved {
+                                workspace: params.workspace,
+                                observed: live.clone(),
+                            },
+                            "workspace incarnation is stale",
+                            "resolve the workspace again and retry",
+                        );
+                        let response = codec::encode_rpc_error(id, &error).unwrap();
+                        write_rpc_frame(&mut server, &response).await.unwrap();
+                    }
+                    _ => write_rpc_success(&mut server, id, json!(GrantSet::default()), None).await,
+                }
+                sent.push(request["params"].clone());
+            }
+            sent
+        });
+
+        let read = reference
+            .refresh_grants()
+            .await
+            .expect("a stale reference reads its grants by name");
+        let called = call::<operations::WorkspaceGrants, _>(&reference, Arguments::new())
+            .await
+            .expect("a stale reference's generated call reads by name too");
+        assert_eq!(called, read);
+        let refused = call::<operations::WorkspaceGrants, _>(&worker, Arguments::new())
+            .await
+            .expect_err("a stale worker is refused");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert!(refused.fence_source().is_some(), "{refused:?}");
+
+        let by_name = json!({ "repoId": "acme/widget", "workspace": "raven" });
+        let mut fenced = by_name.clone();
+        fenced["workspaceIncarnation"] = json!(stale);
+        assert_eq!(
+            server_task.await.unwrap(),
+            [by_name.clone(), by_name, fenced]
+        );
+    }
+
+    /// Every operation a handle serves builds, from the handle's fields and the caller's, exactly
+    /// the request the controller decodes from the same whole object: the generated construction
+    /// and the declaration agree on every field, spelling and default of the one request corpus.
+    /// A bound field the handle supplies as `None` is absent from that object.
+    #[cfg(unix)]
+    #[test]
+    fn every_served_request_is_the_declared_decoding_of_the_same_fields() {
+        struct Agrees {
+            corpus: std::collections::BTreeMap<String, Value>,
+            checked: std::collections::BTreeSet<&'static str>,
+        }
+
+        impl operations::served::EachServed for Agrees {
+            fn served<O: Operation, H: Serves<O>>(&mut self, handle: &H, absent: &[&str])
+            where
+                O::Request: PartialEq + fmt::Debug,
+            {
+                let Some(Value::Object(corpus)) = self.corpus.get(O::METHOD) else {
+                    panic!("{} has a corpus request object", O::METHOD);
+                };
+                let mut whole = corpus.clone();
+                // A field the handle supplies as `None` is still bound, so no caller names it; the
+                // declaration decodes it as absent.
+                for field in absent {
+                    assert!(
+                        H::BOUND.contains(field),
+                        "{}: {field} is supplied as absent, so it must be bound",
+                        O::METHOD
+                    );
+                    whole.remove(*field);
+                }
+                for (field, value) in [
+                    ("repoId", json!("acme/widget")),
+                    ("workspace", json!("raven")),
+                    (
+                        "workspaceIncarnation",
+                        json!("0198f2c0b7e34dc795f17b238b331c80"),
+                    ),
+                    ("jobId", json!(7)),
+                ] {
+                    if H::BOUND.contains(&field) && !absent.contains(&field) {
+                        whole.insert(field.to_owned(), value);
+                    }
+                }
+                let caller: Arguments = whole
+                    .iter()
+                    .filter(|(field, _)| !H::BOUND.contains(&field.as_str()))
+                    .map(|(field, value)| (field.clone(), value.clone()))
+                    .collect();
+                let declared: O::Request = serde_json::from_value(Value::Object(whole))
+                    .unwrap_or_else(|error| panic!("{} corpus request: {error}", O::METHOD));
+                let built = H::request(&handle.binding().authority, caller)
+                    .unwrap_or_else(|error| panic!("{} built request: {error:?}", O::METHOD));
+                assert_eq!(built, declared, "{}", O::METHOD);
+                self.checked.insert(O::METHOD);
+            }
+        }
+
+        let runtime: Arc<dyn ControllerRuntime> = Arc::new(TestRuntime::default());
+        let coordinator = coordinator(Arc::clone(&runtime));
+        let job = JobHandle {
+            authority: test_authority(),
+            id: JobId::new(7).unwrap(),
+            runtime: Arc::clone(&runtime),
+        };
+        let mut agrees = Agrees {
+            corpus: serde_json::from_str(include_str!("operations.corpus.json"))
+                .expect("the corpus is a JSON object of requests"),
+            checked: std::collections::BTreeSet::new(),
+        };
+        operations::served::each_served(
+            &mut agrees,
+            coordinator.project(),
+            &workspace_ref(Arc::clone(&runtime)),
+            &coordinator,
+            &workspace_handle(runtime),
+            &job,
+        );
+        // `project.open` is how a project is reached, not a method of a handle; every other
+        // operation a caller may reach is served by some handle and was checked.
+        let reachable: std::collections::BTreeSet<&str> = OPERATIONS
+            .iter()
+            .filter(|operation| operation.scope != Scope::Internal)
+            .map(|operation| operation.method)
+            .filter(|method| *method != "project.open")
+            .collect();
+        assert_eq!(agrees.checked, reachable);
     }
 
     #[cfg(unix)]

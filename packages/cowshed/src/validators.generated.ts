@@ -975,6 +975,11 @@ export const assertWorkerScopeList = typia.createAssertEquals<readonly Api.Worke
 export const parseWorkerScopeList = (json: string): readonly Api.WorkerScope[] =>
   assertWorkerScopeList(JSON.parse(json));
 
+export const assertWorkerView = typia.createAssertEquals<Api.WorkerView>();
+export const parseWorkerView = (json: string): Api.WorkerView => assertWorkerView(JSON.parse(json));
+export const assertWorkerViewList = typia.createAssertEquals<readonly Api.WorkerView[]>();
+export const parseWorkerViewList = (json: string): readonly Api.WorkerView[] => assertWorkerViewList(JSON.parse(json));
+
 export const assertWorkspaceAtRequest = typia.createAssertEquals<Api.WorkspaceAtRequest>();
 export const parseWorkspaceAtRequest = (json: string): Api.WorkspaceAtRequest =>
   assertWorkspaceAtRequest(JSON.parse(json));

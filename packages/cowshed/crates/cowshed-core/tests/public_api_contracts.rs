@@ -1000,7 +1000,7 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
 
 /// Each capability probe case: a crate name, a snippet that must not compile, and what its errors
 /// must name.
-const CAPABILITY_CASES: [(&str, &str, &[&str]); 6] = [
+const CAPABILITY_CASES: [(&str, &str, &[&str]); 9] = [
     (
         "project_authority",
         "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\n",
@@ -1047,6 +1047,26 @@ const CAPABILITY_CASES: [(&str, &str, &[&str]); 6] = [
         "null_success",
         "use cowshed_core::api::JsonEnvelope;\nfn deny() { let _ = JsonEnvelope::success(()); }\n",
         &["success", "Sealed"],
+    ),
+    (
+        "worker_operation_authority",
+        "use cowshed_core::WorkspaceHandle;\nuse cowshed_core::api::call::{Arguments, call};\nuse cowshed_core::api::operations::{CoordinatorDestroy, WorkspaceAttach};\npub async fn deny(value: &WorkspaceHandle) { let _ = call::<CoordinatorDestroy, _>(value, Arguments::new()).await; let _ = call::<WorkspaceAttach, _>(value, Arguments::new()).await; }\n",
+        &[
+            "Serves<cowshed_core::api::operations::CoordinatorDestroy>` is not implemented for `WorkspaceHandle`",
+            "Serves<cowshed_core::api::operations::WorkspaceAttach>` is not implemented for `WorkspaceHandle`",
+        ],
+    ),
+    (
+        "workspace_ref_operation_authority",
+        "use cowshed_core::WorkspaceRef;\nuse cowshed_core::api::call::{Arguments, call_upload};\nuse cowshed_core::api::operations::WorkerExec;\npub async fn deny(value: &WorkspaceRef) { let _ = call_upload::<WorkerExec, _>(value, Arguments::new(), None).await; }\n",
+        &[
+            "Serves<cowshed_core::api::operations::WorkerExec>` is not implemented for `WorkspaceRef`",
+        ],
+    ),
+    (
+        "forged_operation",
+        "use cowshed_core::JobHandle;\nuse cowshed_core::api::call::Serves;\nuse cowshed_core::api::operations::{JobRequest, Lane, Operation, OperationRequest, Scope};\npub enum Forged {}\nimpl Operation for Forged { const METHOD: &'static str = \"coordinator.destroy\"; const SCOPE: Scope = Scope::Worker; const LANE: Lane = Lane::Json; type Request = JobRequest; type Result = (); fn request(request: JobRequest) -> OperationRequest { OperationRequest::JobKill(request) } }\nimpl Serves<Forged> for JobHandle { const BOUND: &'static [&'static str] = &[]; }\n",
+        &["`Forged: operations::sealed::Sealed` is not satisfied"],
     ),
 ];
 
@@ -1169,7 +1189,7 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
 /// takes longer than the bounded window of the test below (measured over 100s on a hosted arm64
 /// macOS runner, where it timed the release candidate out), and none of it is under test. So
 /// `cowshed:capability-probe-warmup` runs this ahead of the cowshed-core exceptional shards, in
-/// a build budget, and the test's window covers the six case crates alone. Ignored, because it
+/// a build budget, and the test's window covers the case crates alone. Ignored, because it
 /// proves nothing a test should: every crate is empty and must check.
 #[test]
 #[ignore = "build step for the capability probe; cowshed:capability-probe-warmup runs it"]

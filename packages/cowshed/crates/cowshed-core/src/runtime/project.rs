@@ -1001,7 +1001,9 @@ impl ProjectActor {
             Op::CoordinatorWorker(params) => {
                 self.require_repo(&params.repo_id)?;
                 let snapshot = self.host.open_worker(params.workspace).await?;
-                respond::<operations::CoordinatorWorker>(&workspace_view(snapshot))
+                respond::<operations::CoordinatorWorker>(&operations::WorkerView(workspace_view(
+                    snapshot,
+                )))
             }
             Op::WorkerExec(params) => respond::<operations::WorkerExec>(
                 &self.worker_exec(&authority, params, upload).await?,

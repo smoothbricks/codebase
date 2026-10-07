@@ -1571,6 +1571,12 @@ export type WorkerScope = {
   readonly workspaceIncarnation: WorkspaceIncarnation;
 };
 
+/**
+ * The workspace a worker capability was minted for. The wire form is the [`WorkspaceView`]; the
+ * type is what lets only the call that mints a worker capability yield one.
+ */
+export type WorkerView = WorkspaceView;
+
 export type WorkspaceAtRequest = {
   readonly repoId: RepoId;
   readonly path: string;
