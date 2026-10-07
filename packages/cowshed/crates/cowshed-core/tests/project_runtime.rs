@@ -1755,12 +1755,8 @@ impl CommitmentSink for AcceptedCommitments {
     }
 }
 
-/// A real workspace supervisor over the real artifact store under `root`, whose job processes
-/// are scripted.
-fn scripted_supervisor(
-    root: &Path,
-    spawned: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
-) -> WorkspaceSupervisorHandle {
+/// The config of a supervisor of the main workspace at `root/workspace`, mounted under `root`.
+fn supervisor_config(root: &Path) -> WorkspaceSupervisorConfig {
     let workspace_root = root.join("workspace");
     std::fs::create_dir(&workspace_root).expect("workspace root");
     let authority = WorkspaceAuthoritySnapshot {
@@ -1770,7 +1766,7 @@ fn scripted_supervisor(
         grant_revision: 1,
         lifecycle_revision: 1,
     };
-    let config = WorkspaceSupervisorConfig {
+    WorkspaceSupervisorConfig {
         owned_repo_ids: OwnedRepoIds::sole(authority.repo_id.clone()),
         authority,
         workspace_root: workspace_root.clone(),
@@ -1803,9 +1799,18 @@ fn scripted_supervisor(
         group_ledger: None,
         inherited_groups: Vec::new(),
         volume_labels: None,
-    };
+    }
+}
+
+/// A real workspace supervisor over the real artifact store under `root`, whose job processes
+/// are scripted.
+fn scripted_supervisor(
+    root: &Path,
+    spawned: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
+) -> WorkspaceSupervisorHandle {
+    let config = supervisor_config(root);
     let artifacts = ArtifactStoreSink::open(
-        workspace_root,
+        config.workspace_root.clone(),
         &config.owned_repo_ids,
         &config.authority,
         config.artifacts.clone(),
@@ -1820,20 +1825,38 @@ fn scripted_supervisor(
     .expect("start supervisor")
 }
 
+/// The production workspace supervisor under `root`: its jobs are real sandboxed children.
+#[cfg(target_os = "macos")]
+fn system_supervisor(root: &Path) -> WorkspaceSupervisorHandle {
+    let config = supervisor_config(root);
+    std::fs::create_dir_all(&config.sandbox.home).expect("home");
+    let token = config
+        .workspace_root
+        .join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH);
+    std::fs::create_dir_all(token.parent().expect("token directory")).expect("token directory");
+    std::fs::write(
+        &token,
+        cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32]).encode(),
+    )
+    .expect("workspace token");
+    // A credential asset is private to its owner, or the supervisor refuses it.
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("workspace token mode");
+    WorkspaceSupervisor::start(config, AcceptedCommitments).expect("start supervisor")
+}
+
 /// Jobs of the main workspace, reached the way an embedder reaches them: the capability client,
 /// its controller connection, the project router and the host, down to a real supervisor.
 struct SupervisedJobs {
     worker: cowshed_core::api::WorkspaceHandle,
-    spawned: mpsc::UnboundedReceiver<mpsc::Sender<ProcessEvent>>,
     _runtime: ProjectRuntime,
 }
 
 impl SupervisedJobs {
-    async fn start(root: &TempRoot) -> Self {
+    async fn connect(root: &TempRoot, supervisor: WorkspaceSupervisorHandle) -> Self {
         let (events, _events) = mpsc::unbounded_channel();
-        let (spawner, spawned) = mpsc::unbounded_channel();
         let mut host = FakeHost::new(root, events, false, false, Vec::new());
-        host.supervisor = Some(scripted_supervisor(root, spawner));
+        host.supervisor = Some(supervisor);
         let repo = host.descriptor.repo_id.clone();
         let runtime = ProjectRuntime::start(host).await.expect("start runtime");
         let router = runtime.router();
@@ -1850,17 +1873,14 @@ impl SupervisedJobs {
         let worker = coordinator.worker("main").await.expect("worker");
         Self {
             worker,
-            spawned,
             _runtime: runtime,
         }
     }
 
-    /// Admits a job and hands back the sender its scripted process speaks through.
-    async fn exec(&mut self) -> (cowshed_core::api::JobHandle, mpsc::Sender<ProcessEvent>) {
-        let job = self
-            .worker
+    async fn exec(&self, command: ExecCommand) -> cowshed_core::api::JobHandle {
+        self.worker
             .exec(ExecRequest {
-                command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+                command,
                 cwd: None,
                 mode: RunSandboxMode::ReadWrite,
                 env: std::collections::HashMap::new(),
@@ -1870,14 +1890,64 @@ impl SupervisedJobs {
                 stderr_copy: None,
             })
             .await
-            .expect("exec");
+            .expect("exec")
+    }
+}
+
+/// [`SupervisedJobs`] whose processes the test speaks for ([`ScriptedSpawner`]).
+struct ScriptedJobs {
+    jobs: SupervisedJobs,
+    spawned: mpsc::UnboundedReceiver<mpsc::Sender<ProcessEvent>>,
+}
+
+impl ScriptedJobs {
+    async fn start(root: &TempRoot) -> Self {
+        let (spawner, spawned) = mpsc::unbounded_channel();
+        let jobs = SupervisedJobs::connect(root, scripted_supervisor(root, spawner)).await;
+        Self { jobs, spawned }
+    }
+
+    /// Admits a job and hands back the sender its scripted process speaks through.
+    async fn exec(&mut self) -> (cowshed_core::api::JobHandle, mpsc::Sender<ProcessEvent>) {
+        let job = self
+            .jobs
+            .exec(ExecCommand::Argv(vec![CommandArg::from("build")]))
+            .await;
         let process = self.spawned.recv().await.expect("the job's process");
         (job, process)
     }
 }
 
+/// Returns once the job's `stream` holds `end` admitted bytes readable through the controller,
+/// answering those after `from`, which must already be admitted. A followed read from an
+/// admitted offset waits for the next bytes, so this is a barrier, never a poll; a read past
+/// the admitted end would instead be refused.
+async fn until_admitted(
+    job: &cowshed_core::api::JobHandle,
+    stream: JobStream,
+    from: u64,
+    end: u64,
+) -> Vec<u8> {
+    let want = usize::try_from(end - from).expect("test length");
+    let mut follow = job
+        .logs(stream, from, true)
+        .await
+        .expect("follow the stream");
+    let mut bytes = Vec::with_capacity(want);
+    while bytes.len() < want {
+        let chunk = follow
+            .next()
+            .await
+            .expect("the stream reaches the end before it closes")
+            .expect("read the stream");
+        bytes.extend_from_slice(&chunk);
+    }
+    assert_eq!(bytes.len(), want, "no byte past the end is admitted yet");
+    bytes
+}
+
 /// Admits `bytes` to the job's `stream`, a pipe-read at a time, and returns once all of it is
-/// readable through the controller: a following read of its last byte answers only then.
+/// readable through the controller.
 async fn admit(
     job: &cowshed_core::api::JobHandle,
     process: &mpsc::Sender<ProcessEvent>,
@@ -1896,16 +1966,7 @@ async fn admit(
             .expect("the job admits output");
     }
     let end = admitted + u64::try_from(bytes.len()).expect("test length");
-    let mut last = job
-        .logs(stream, end - 1, true)
-        .await
-        .expect("follow the last byte");
-    let byte = last
-        .next()
-        .await
-        .expect("the last byte arrives")
-        .expect("read the last byte");
-    assert_eq!(&byte[..], &bytes[bytes.len() - 1..]);
+    assert_eq!(until_admitted(job, stream, admitted, end).await, bytes);
 }
 
 /// Ends the job as its process would: an exit, then both streams' EOF.
@@ -1944,7 +2005,7 @@ fn tail_limits(bytes: u32, lines: u32) -> JobTailLimits {
 async fn a_tail_ends_at_the_journal_end_and_resumes_at_its_cursor() {
     const MIB: u64 = 1024 * 1024;
     let root = test_root();
-    let mut jobs = SupervisedJobs::start(&root).await;
+    let mut jobs = ScriptedJobs::start(&root).await;
     let (job, process) = jobs.exec().await;
     let line = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-\n";
     let journal: Vec<u8> = line
@@ -2043,6 +2104,120 @@ async fn a_tail_ends_at_the_journal_end_and_resumes_at_its_cursor() {
     );
 }
 
+/// The same tail contract over a real sandboxed child, through the controller: the child writes
+/// 1 MiB, then blocks reading a FIFO the test holds and copies what the test writes into it to
+/// stdout. The latest 4 KiB tail ends at the admitted end; once the test releases 100 bytes,
+/// `tail(next)` returns exactly them; a cursor past the end is a usage error; and the sealed job,
+/// its stdout promoted to a file, answers the same tails.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes_at_its_cursor() {
+    use std::io::Write as _;
+    const MIB: u64 = 1024 * 1024;
+    let root = test_root();
+    let jobs = SupervisedJobs::connect(&root, system_supervisor(&root)).await;
+    let gate = root.join("workspace").join("gate");
+    use cowshed_core::fork_lock::Run as _;
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&gate)
+        .status_locked()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {}", gate.display());
+    let job = jobs
+        .exec(ExecCommand::Argv(
+            [
+                "/bin/sh",
+                "-c",
+                "/usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\000' a && /bin/cat gate",
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect(),
+        ))
+        .await;
+    let journal = until_admitted(&job, JobStream::Stdout, 0, MIB).await;
+    assert!(journal.iter().all(|byte| *byte == b'a'));
+
+    let limits = tail_limits(4096, 1024);
+    let latest = job.tail(None, limits).await.expect("latest tail");
+    assert!(
+        latest.stderr.as_bytes().is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(latest.stderr.as_bytes())
+    );
+    assert_eq!(
+        latest.next,
+        JobJournalCursor {
+            stdout: MIB,
+            stderr: 0
+        }
+    );
+    assert_eq!(latest.stdout.as_bytes(), &[b'a'; 4096][..]);
+    assert!(latest.stdout_truncated);
+
+    let more = [b'+'; 100];
+    let released = gate.clone();
+    tokio::task::spawn_blocking(move || {
+        // Opening blocks until the child opens the FIFO to read; closing it ends the child.
+        let mut gate = std::fs::OpenOptions::new()
+            .write(true)
+            .open(released)
+            .expect("open the gate");
+        gate.write_all(&more).expect("release 100 bytes");
+    })
+    .await
+    .expect("release task");
+    assert_eq!(
+        until_admitted(&job, JobStream::Stdout, MIB, MIB + 100).await,
+        more
+    );
+    let resumed = job
+        .tail(Some(latest.next), limits)
+        .await
+        .expect("tail(next)");
+    assert_eq!(resumed.stdout.as_bytes(), &more[..]);
+    assert_eq!(
+        resumed.next,
+        JobJournalCursor {
+            stdout: MIB + 100,
+            stderr: 0
+        }
+    );
+    assert!(!resumed.stdout_truncated);
+    let past = JobJournalCursor {
+        stdout: MIB + 101,
+        stderr: 0,
+    };
+    let error = job
+        .tail(Some(past), limits)
+        .await
+        .expect_err("past the end");
+    assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+
+    let ended = job.wait().await.expect("wait");
+    assert_eq!(
+        ended.exit,
+        Some(cowshed_core::api::dto::ExitStatus::Exited { code: 0 })
+    );
+    assert_eq!(ended.stdout.bytes, MIB + 100);
+    assert_eq!(
+        job.tail(Some(latest.next), limits)
+            .await
+            .expect("sealed tail(next)"),
+        resumed
+    );
+    let sealed = job.tail(None, limits).await.expect("sealed latest tail");
+    let mut expected = vec![b'a'; 3996];
+    expected.extend_from_slice(&more);
+    assert_eq!(sealed.stdout.as_bytes(), &expected[..]);
+    let error = job
+        .tail(Some(past), limits)
+        .await
+        .expect_err("sealed, past the end");
+    assert_eq!(error.code, ErrorCode::Usage, "{error:?}");
+}
+
 /// Every byte `stream` yields until it closes.
 async fn drain(mut stream: cowshed_core::RawByteStream) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -2058,7 +2233,7 @@ async fn drain(mut stream: cowshed_core::RawByteStream) -> Vec<u8> {
 #[tokio::test]
 async fn an_attachment_resumes_each_stream_at_its_cursor() {
     let root = test_root();
-    let mut jobs = SupervisedJobs::start(&root).await;
+    let mut jobs = ScriptedJobs::start(&root).await;
     let (job, process) = jobs.exec().await;
     let seen = b"already seen\n";
     let n = u64::try_from(seen.len()).expect("test length");
