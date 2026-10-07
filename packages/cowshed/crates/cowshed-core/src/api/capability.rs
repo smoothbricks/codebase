@@ -16,8 +16,8 @@ use super::operations::{
     ProjectOpenRequest, PushRequest, QuotaRequest, RebaseRequest, RemoveProjectRequest,
     RepoRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
     SourceDestinationRequest, TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest,
-    WorkspaceAttachRequest,
-    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
+    WorkspaceAttachRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result,
+    encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::server::MAX_BINARY_FRAME_BYTES;
