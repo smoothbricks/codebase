@@ -667,7 +667,7 @@ impl BuildVolumes {
     /// Land step 6: when nothing opened the closed target's task database since
     /// [`Self::close_target`], give the landing volume the target's daemon records in place of
     /// its own and rename the target's build link onto it. The target's previous volume is
-    /// unlinked and released when idle. Answers how long the move took.
+    /// unlinked and released at once unless a running job holds it. Answers how long the move took.
     ///
     /// The look and the rename happen under Nx's own open locks on the target's databases
     /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:

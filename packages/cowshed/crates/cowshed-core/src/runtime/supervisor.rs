@@ -2370,6 +2370,7 @@ impl WorkspaceSupervisor {
             command_lane_closed: false,
             nx_daemon,
             labelled_build: None,
+            labelling: tokio::task::JoinSet::new(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -2659,6 +2660,8 @@ struct SupervisorActor {
     nx_daemon: Option<NxDaemonKeeper>,
     /// The build volume this supervisor last asked to be named for its checkout.
     labelled_build: Option<PathBuf>,
+    /// Background renames must finish before quiescence hands this checkout's volume away.
+    labelling: tokio::task::JoinSet<()>,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -2725,6 +2728,11 @@ impl SupervisorActor {
                         None => break,
                     }
                 }
+                labelled = self.labelling.join_next(), if !self.labelling.is_empty() => {
+                    if let Some(Err(error)) = labelled {
+                        eprintln!("cowshed: volume label task failed: {error}");
+                    }
+                }
                 () = super::nx_daemon::next_probe(&mut self.nx_daemon),
                     if self.nx_daemon.is_some()
                         && self.lifecycle == ActorLifecycle::Running
@@ -2734,8 +2742,9 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
-            self.finish_lifecycle_waiters();
+            self.finish_lifecycle_waiters().await;
         }
+        self.drain_labels().await;
     }
 
     async fn handle_command(&mut self, command: Command) {
@@ -3131,7 +3140,7 @@ impl SupervisorActor {
         let labeller = Arc::clone(&labels.labeller);
         let name = self.authority.workspace.clone();
         let checkout = self.workspace_root.clone();
-        drop(tokio::task::spawn_blocking(move || {
+        self.labelling.spawn_blocking(move || {
             for (what, mount, label) in volumes {
                 // A land may have moved the link off this build volume since the rename was
                 // asked for; the volume is then another checkout's to name, never this one's.
@@ -3154,7 +3163,7 @@ impl SupervisorActor {
                     ),
                 }
             }
-        }));
+        });
     }
 
     /// Admit and spawn one job, granted `build_volume`.
@@ -4143,9 +4152,12 @@ impl SupervisorActor {
         }
     }
 
-    fn finish_lifecycle_waiters(&mut self) {
+    async fn finish_lifecycle_waiters(&mut self) {
         if self.has_running_jobs() {
             return;
+        }
+        if !self.quiesce_waiters.is_empty() || !self.retire_waiters.is_empty() {
+            self.drain_labels().await;
         }
         for waiter in self.quiesce_waiters.drain(..) {
             let _ = waiter.send(Ok(()));
@@ -4156,6 +4168,14 @@ impl SupervisorActor {
         if self.lifecycle == ActorLifecycle::Retired {
             for waiter in self.retire_waiters.drain(..) {
                 let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    async fn drain_labels(&mut self) {
+        while let Some(labelled) = self.labelling.join_next().await {
+            if let Err(error) = labelled {
+                eprintln!("cowshed: volume label task failed: {error}");
             }
         }
     }

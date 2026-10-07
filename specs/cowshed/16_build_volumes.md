@@ -71,12 +71,14 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.asif` with its sidecar
   `<id>.asif.json`. It is attached `nobrowse` at a store-side mountpoint, `<mount-root>/.build/<owner>/<repo>/<id>`,
   never inside another volume.
-- **Names**: every attached build volume is named `[cowshed] <project> — build <checkout>` (the project is displayed as
-  `<owner> · <repo>`); main uses `build main`, and a session uses `build <ws>`. A volume is never left named only
-  `[cowshed]`. Its supervisor queues the APFS rename off the provisioning path, checks the name again on controller
-  start, and queues a new name whenever land or adopt changes the checkout that owns it. A seed is named
-  `[cowshed] <project> — seed <target>` whenever cowshed attaches it; freezing or superseding a detached seed does not
-  attach it merely to rename it.
+- **Names**: every mounted live build volume is named `[cowshed] <project> — build <checkout>` (the project is displayed
+  as `<owner> · <repo>`); main uses `build main`, and a session uses `build <ws>`. A mounted live volume is never left
+  named only `[cowshed]`. Its supervisor queues the APFS rename off the provisioning path, checks the name again on
+  supervisor start, and queues a new name whenever land or adopt changes the checkout that owns it. Seeds are never
+  mounted and are never named: mounting one merely to rename it would write its image and advance the seed-freshness
+  clock (Targets and seeds). Resize may attach a seed without mounting it; no label operation accompanies that attach.
+  Quiescence drains the checkout's queued renames before its volume changes owner, so an old background rename cannot
+  overwrite the adopted volume's new name. Provisioning does not wait for those renames.
 - **Capacity**: 100 GiB by default for a build volume created from nothing; `.cowshed.toml`
   `[build] capacity = "<size>"` overrides it per project. A sparse image costs only its written blocks, so the capacity
   is not an allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with
@@ -362,8 +364,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
       go of the locks;
    5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
-      `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless an
-      operation lock or a running job's hold still owns it. This applies with `--no-retire` too.
+      `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless a
+      running job's hold still owns it. This applies with `--no-retire` too.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -479,14 +481,15 @@ again at any level above it.
 - The last checkout link is the reclaim moment. Removing or retiring a checkout, adopting a replacement, failing a fork,
   or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
-- Ownership is an operation lock or a job hold, not the kernel's refusal to unmount. Every admitted cowshed job holds a
-  shared flock on the build volume's `<id>.asif.hold` for its lifetime; release must claim it exclusively. A running job
-  therefore keeps main's previous volume across a swap. A held lifecycle/image lock likewise defers release.
+- Ownership is a job hold or an unfinished create/fork in the lifecycle intent journal, not the kernel's refusal to
+  unmount. Every admitted cowshed job holds a shared flock on the build volume's `<id>.asif.hold` for its lifetime;
+  release must claim it exclusively. A running job therefore keeps main's previous volume across a swap.
 - Once no owner remains, release first requests a non-forced unmount and allows a bounded grace for holders to release
   it. If the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold
-  file and mountpoint. Before forcing, it records the remaining holders and names each pid and command in the release
-  span and on stderr. Editors or indexers holding files or a working directory without a cowshed job hold cannot keep an
-  unlinked volume attached indefinitely. Force here revokes their access to the volume; it does not kill them.
+  file and mountpoint. At the initial unforced refusal, it records the holders and names each pid and command on stderr,
+  distinguishing release within the grace from a forced unmount. Editors or indexers holding files or a working
+  directory without a cowshed job hold cannot keep an unlinked volume attached indefinitely. Force revokes their access
+  to the volume; it does not kill them.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
   when the target retires. Detached seeds do not need an attach or a rename to be deleted.
 - A fork's volume and seed exist before its workspace does: `cowshed new` and `cowshed fork` clone them into the staged
@@ -495,9 +498,10 @@ again at any level above it.
   as that workspace's or as its seed, and every image without a record, naming the workspace. Without this, an `rm` in
   one process deleted the volume and seed of a `new` running in another, and the new workspace's mount refused its link
   to a volume nobody owned.
-- Collection says why it skips: current checkout links and latest seeds are counted as retained; a job hold, lifecycle
-  lock, image lock, unfinished operation or failed release names the volume and reason. One volume's release failure
-  does not hide later candidates. `--dry-run` changes nothing and reports the same ownership reasons.
+- Collection says why it skips: a job hold, an unfinished create/fork, an unreadable detached checkout or record, or a
+  failed release names the volume and reason. Opportunistic collection counts routine detached/still-forming deferrals
+  on one line. One volume's release failure does not hide later candidates. `--dry-run` changes nothing and reports the
+  same ownership reasons.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
   database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in
@@ -742,9 +746,10 @@ The decisions this spec records, in the order they were taken. It is kept so the
   carry commits with foreign keys enforced, so an index Nx could not have written fails the carry instead.
 - 2026-10-07: cloning the formatted blank template had left build volumes named only `[cowshed]`, and treating a
   kernel-busy unmount as ownership stranded unlinked images behind editors and indexers. Names now identify project,
-  checkout and build/seed role off the provisioning path, and follow land/adopt ownership changes. An operation lock or
-  running job's flock is the ownership proof; otherwise the last checkout link triggers release with grace then force,
-  naming every evicted holder and every collection deferral. Detached seeds are labelled lazily when attached.
+  checkout and build role off the provisioning path, and follow land/adopt ownership changes. A running job's flock or
+  an unfinished create/fork is the ownership proof; otherwise the last checkout link triggers release with grace then
+  force, naming the initial holders and every collection deferral. Seeds are never mounted or named: their image mtime
+  is the seed-freshness clock.
 
 ## Open questions
 

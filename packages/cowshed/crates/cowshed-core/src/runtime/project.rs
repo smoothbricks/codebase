@@ -3785,7 +3785,7 @@ impl NativeProjectRuntimeHost {
     /// fingerprint moved off the one the volume's state records; otherwise only displaced links
     /// are restored.
     async fn refresh_build_state_for(
-        &self,
+        &mut self,
         current: &NativeWorkspace,
         mount: &Path,
     ) -> Result<crate::build_volume::BuildStateRefresh> {
@@ -3863,6 +3863,15 @@ impl NativeProjectRuntimeHost {
                 )
             })?;
         refresh.findings = findings;
+        if refresh.created {
+            // First touch can happen after the supervisor started with no build volume.
+            // Name the new volume now, even when refresh admitted no job on it.
+            let build = volumes.layout.grant(&name, mount)?;
+            self.ensure_supervisor(&name)
+                .await?
+                .name_build_volume(build)
+                .await?;
+        }
         for displaced in &refresh.displaced {
             eprintln!("cowshed: {name}: {displaced}");
         }

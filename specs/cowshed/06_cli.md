@@ -255,22 +255,23 @@ target; successful mount changes still reconcile with the gateway.
 
 ### Build-volume names and reclamation
 
-Every attached build volume is named `[cowshed] <project> — build <checkout>` (`<project>` is `<owner> · <repo>`), never
-only `[cowshed]`. The supervisor names new volumes off the provisioning path, reconciles existing names when the
-controller starts, and renames a volume when land or adopt moves it to another checkout. A detached seed is not attached
-just to name it; if attached, it is named `[cowshed] <project> — seed <target>` (16, "Substrate").
+Every mounted live build volume is named `[cowshed] <project> — build <checkout>` (`<project>` is `<owner> · <repo>`),
+never only `[cowshed]`. The supervisor names new volumes off the provisioning path, reconciles existing names when the
+supervisor starts, and renames a volume when land or adopt moves it to another checkout. Seeds are never mounted and are
+never named: a mount just to rename one would advance its image mtime, the seed-freshness clock (16, "Substrate").
 
 `rm` and `land`, including `land --no-retire`, collect build volumes synchronously: the moment no checkout links a
-volume and it is no target's latest seed, it is detached and reclaimed unless a lifecycle/image lock or a running
-cowshed job's shared hold proves an owner. A non-forced unmount gets a bounded grace; if it still refuses and no owner
-remains, release forces the unmount and names every evicted holder's pid and command on stderr. Force revokes those
-processes' volume access rather than killing them. A job admitted before an adoption retains its old volume until its
-hold is dropped. Failed forks and superseded seeds use the same reclaim rule (16, "Garbage collection").
+volume and it is no target's latest seed, it is detached and reclaimed unless a running cowshed job's shared hold or an
+unfinished create/fork in the lifecycle intent journal proves an owner. A non-forced unmount gets a bounded grace; if it
+still refuses and no owner remains, release forces the unmount. It names each initial holder's pid and command on stderr
+and says whether the volume was released within the grace or forced afterwards. Force revokes those processes' volume
+access rather than killing them. A job admitted before an adoption retains its old volume until its hold is dropped.
+Failed forks and superseded seeds use the same reclaim rule (16, "Garbage collection").
 
-Both explicit `gc` and opportunistic collection explain deferrals: checkout links and latest seeds are counted, and job
-holds, operation locks, unfinished lifecycle work and release failures name the volume and reason. A refusal on one
-volume does not hide later candidates. `gc --dry-run` reports candidates and reasons without changing mounts, labels or
-images.
+Both explicit `gc` and opportunistic collection explain deferrals: job holds, unfinished create/fork work, unreadable
+detached checkouts or records, and release failures name the volume and reason; opportunistic collection counts routine
+detached/still-forming deferrals on one line. A refusal on one volume does not hide later candidates. `gc --dry-run`
+reports candidates and reasons without changing mounts, labels or images.
 
 ### `cowshed ls` detached rows
 

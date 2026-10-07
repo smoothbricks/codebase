@@ -2460,6 +2460,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         "land reclaims the previous record"
     );
     assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_build_label(&layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
 
     succeed(&mut service, ["rm", "topic"]).await;
@@ -2467,6 +2468,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         layout.image(&landing).exists(),
         "rm preserves main's adopted volume"
     );
+    assert_build_label(&layout, &fixture.checkout, "main").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;

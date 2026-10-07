@@ -23,9 +23,10 @@ use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
-    RunningProcess, SessionToken, SpawnCommand, SpawnSink, WorkspaceAuthoritySnapshot,
-    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    CommitmentDraft, CommitmentSink, Labelled, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
+    RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller, VolumeLabels,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    WorkspaceSupervisorHandle,
 };
 
 #[path = "support/temp_root.rs"]
@@ -2039,6 +2040,51 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
         .unwrap();
     assert!(eof.bytes.is_empty());
     assert!(eof.eof);
+}
+
+#[tokio::test]
+async fn quiesce_drains_background_volume_labels_before_handing_ownership_away() {
+    struct BlockedLabeller {
+        entered: mpsc::UnboundedSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl VolumeLabeller for BlockedLabeller {
+        fn ensure_label(&self, _mount: &Path, _label: &str) -> std::io::Result<Labelled> {
+            self.entered.send(()).map_err(std::io::Error::other)?;
+            self.release
+                .lock()
+                .expect("unpoisoned labeller gate")
+                .recv()
+                .map_err(std::io::Error::other)?;
+            Ok(Labelled::Renamed)
+        }
+    }
+    let root = workspace_root("volume-label-quiesce");
+    let (entered, mut renaming) = mpsc::unbounded_channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let mut supervisor = config(&root);
+    supervisor.volume_labels = Some(VolumeLabels {
+        workspace: "[cowshed] acme · widget — main".into(),
+        build: "[cowshed] acme · widget — build main".into(),
+        labeller: std::sync::Arc::new(BlockedLabeller {
+            entered,
+            release: std::sync::Mutex::new(gate),
+        }),
+    });
+    let h = harness_with_config(supervisor, 1, 1024, false, false);
+    renaming
+        .recv()
+        .await
+        .expect("the background rename entered its gate");
+    let handle = h.handle.clone();
+    let quiesce = tokio::spawn(async move { handle.quiesce().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !quiesce.is_finished(),
+        "ownership cannot move past a queued rename"
+    );
+    release.send(()).expect("release the rename");
+    quiesce.await.unwrap().unwrap();
 }
 
 #[tokio::test]
