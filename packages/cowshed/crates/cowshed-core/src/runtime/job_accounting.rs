@@ -488,9 +488,9 @@ mod tests {
     }
 
     /// Every part of a reading is converted from Mach ticks through the timebase's rational, once.
-    /// On Apple silicon's 125/3 ns tick, reading the ticks as nanoseconds is 24x short of the
-    /// CPU they count, and the conversion is refused unless it uses the rational. On Intel's
-    /// 1/1 tick the two agree, so a native raw-unit control proves nothing there.
+    /// On Apple silicon's 125/3 ns tick, reading the ticks as nanoseconds understates the CPU
+    /// they count about 41.67-fold, and the conversion is refused unless it uses the rational.
+    /// On Intel's 1/1 tick the two agree, so a native raw-unit control proves nothing there.
     #[test]
     fn mach_ticks_convert_through_the_injected_timebase_never_as_nanoseconds() {
         let ticks = RusageTicks {
