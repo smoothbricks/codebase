@@ -76,7 +76,8 @@
     "trace": null,
     "stdin": { "kind": "inline" },
     "stdoutCopy": null,
-    "stderrCopy": null
+    "stderrCopy": null,
+    "admissionKey": "operation-7"
   },
   "worker.stdinChunk": {
     "repoId": "acme/widget",
@@ -106,6 +107,12 @@
     "workspace": "feature",
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
     "jobId": 7
+  },
+  "worker.jobByKey": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "admissionKey": "operation-7"
   },
   "worker.checkpoint": {
     "repoId": "acme/widget",

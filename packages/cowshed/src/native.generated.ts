@@ -59,6 +59,7 @@ export interface NativeWorkspaceHandleOperations
     NativeWorkerShell,
     NativeWorkerListJobs,
     NativeWorkerJob,
+    NativeWorkerJobByKey,
     NativeWorkerCheckpoint,
     NativeWorkerPush,
     NativeSessionClose {}
@@ -787,7 +788,17 @@ export interface NativeWorkerExec {
 /** The request fields a `worker.exec` caller names; its handle binds the rest. */
 export type WorkerExecArguments = Pick<
   Api.ExecParams,
-  'session' | 'argv' | 'script' | 'cwd' | 'mode' | 'env' | 'trace' | 'stdin' | 'stdoutCopy' | 'stderrCopy'
+  | 'session'
+  | 'argv'
+  | 'script'
+  | 'cwd'
+  | 'mode'
+  | 'env'
+  | 'trace'
+  | 'stdin'
+  | 'stdoutCopy'
+  | 'stderrCopy'
+  | 'admissionKey'
 >;
 
 /**
@@ -817,6 +828,25 @@ export type WorkerJobArguments = Pick<Api.JobRequest, 'jobId'>;
  */
 export async function workerJob(handle: NativeWorkerJob, args: WorkerJobArguments): Promise<NativeJobHandle> {
   return handle.job(JSON.stringify(args));
+}
+
+/** A handle that serves `worker.jobByKey`. */
+export interface NativeWorkerJobByKey {
+  jobByKey(argumentsJson: string): Promise<NativeJobHandle>;
+}
+
+/** The request fields a `worker.jobByKey` caller names; its handle binds the rest. */
+export type WorkerJobByKeyArguments = Pick<Api.AdmissionKeyRequest, 'admissionKey'>;
+
+/**
+ * Names the job an admission key admitted in the workspace incarnation: the job whose exec
+ * reply was lost.
+ */
+export async function workerJobByKey(
+  handle: NativeWorkerJobByKey,
+  args: WorkerJobByKeyArguments,
+): Promise<NativeJobHandle> {
+  return handle.jobByKey(JSON.stringify(args));
 }
 
 /** A handle that serves `worker.listJobs`. */

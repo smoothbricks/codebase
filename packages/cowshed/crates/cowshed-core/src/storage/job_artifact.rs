@@ -21,19 +21,20 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::api::dto::{
-    AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
-    DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId, JobState,
-    LandAdoptionCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES,
-    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
-    RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment, UtcTimestamp,
-    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
-    validate_command_argv,
+    AdmissionCommitment, AdmissionKey, BinaryData, CheckpointCommitment, CommandArg,
+    ControllerCommitment, DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId,
+    JobState, LandAdoptionCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
+    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, PublicationPolicy, RestoreCommitment, RunSandboxMode, Sha256Digest,
+    StreamInfo, TerminalCommitment, UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath,
+    WorkspaceRetiredCommitment, validate_command_argv,
 };
 use crate::api::resources::{
     CpuMicros, CpuTotals, HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark,
     JobVolumeUsage, ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes,
     StreamLines, VolumeUsage, WallMicros,
 };
+use crate::error::AdmissionField;
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -84,14 +85,19 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// The one layout records are written and read in: version 7 carries a terminal job's resource
-/// sample in [`RESOURCE_COLUMNS`], its accounting in [`ACCOUNTING_COLUMNS`], then each of its
-/// volumes' usage in [`VOLUME_COLUMNS`], appended after every column of version 6 (11_shell.md:
-/// layouts grow only by trailing columns). A store holding a record in an earlier layout is set
-/// aside whole ([`SetAsideStore`]), never read.
-const RECORD_SCHEMA_VERSION: u64 = 7;
+/// Layout 8 keeps every resource, accounting and volume column of layout 7, then appends the
+/// keyed admission. A store holding a record in an earlier layout is set aside whole
+/// ([`SetAsideStore`]), never read.
+const RECORD_SCHEMA_VERSION: u64 = 8;
+/// The first layout whose job records carry admission keys. A store in it or a later layout set
+/// aside while serving an incarnation took that incarnation's keyed admissions along, so the
+/// keys it named can no longer be proven absent ([`AdmissionLookup::Unprovable`]).
+pub const FIRST_KEYED_LAYOUT: u64 = 8;
 /// Where a store in an earlier record layout is moved, beside the records it no longer is.
 const SET_ASIDE_DIRECTORY: &str = "set-aside";
+/// The file in a set-aside store's directory naming the incarnation the store served when it
+/// was set aside.
+const SET_ASIDE_INCARNATION_FILE: &str = "incarnation";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
@@ -136,6 +142,8 @@ const RUSAGE_CHILDREN_SOURCE: &str = "macOsRusageChildren";
 const VOLUME_COLUMNS: [&str; 2] = ["resources_volume_workspace", "resources_volume_build"];
 /// Where [`VOLUME_COLUMNS`]' workspace volume is; the build volume's follows it.
 const VOLUME_COLUMN: usize = ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len();
+/// The first keyed admission column, after every volume column of layout 7.
+const ADMISSION_COLUMN: usize = VOLUME_COLUMN + VOLUME_COLUMNS.len();
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -197,6 +205,12 @@ pub enum ArtifactError {
         job_id: JobId,
         message: &'static str,
     },
+    /// The record would bind an admission key this incarnation already bound to another job.
+    #[error("admission key already admitted job {admitted:?}, not job {job_id:?}")]
+    AdmissionKeyTaken { job_id: JobId, admitted: JobId },
+    /// The record would bind an admission key a set-aside store may already bind.
+    #[error("admission key may be bound in the job store set aside at {}", set_aside.display())]
+    AdmissionKeyUnprovable { set_aside: PathBuf },
     #[error("failed to secure redirect descriptor for {path}: {message}")]
     RedirectDescriptor { path: PathBuf, message: String },
     #[error(
@@ -360,6 +374,263 @@ pub struct JobArtifactRecord {
     /// A terminal job's last resource sample; absent while it runs and for a job that never owned
     /// a process.
     pub resources: Option<JobResourceSample>,
+    /// The key a keyed exec admitted this job under, with the rest of the request it was
+    /// admitted for; every record of the job carries it.
+    pub admission: Option<JobAdmission>,
+}
+
+/// A keyed exec's admission: its key and every part of its request a repeat under the key must
+/// carry unchanged, as the caller sent it, but the command, which is the record's own. The trace
+/// is telemetry, and a stream's content is no part of the request: only that stdin is a stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobAdmission {
+    pub key: AdmissionKey,
+    pub cwd: Option<WorkspacePath>,
+    pub mode: RunSandboxMode,
+    /// Sorted by name, so equal environments compare equal.
+    pub env: BTreeMap<String, String>,
+    pub stdin: AdmittedStdin,
+    pub session: AdmittedSession,
+    pub stdout_copy: Option<OutputPublication>,
+    pub stderr_copy: Option<OutputPublication>,
+}
+
+impl JobAdmission {
+    /// The fields in which `other`, for `other_command`, asks for something else than this
+    /// admission did for `command`; empty when it repeats it.
+    pub fn differences(
+        &self,
+        command: &ExecCommand,
+        other: &Self,
+        other_command: &ExecCommand,
+    ) -> Vec<AdmissionField> {
+        [
+            (AdmissionField::Command, command != other_command),
+            (AdmissionField::Cwd, self.cwd != other.cwd),
+            (AdmissionField::Mode, self.mode != other.mode),
+            (AdmissionField::Env, self.env != other.env),
+            (AdmissionField::Stdin, self.stdin != other.stdin),
+            (AdmissionField::Session, self.session != other.session),
+            (
+                AdmissionField::StdoutCopy,
+                self.stdout_copy != other.stdout_copy,
+            ),
+            (
+                AdmissionField::StderrCopy,
+                self.stderr_copy != other.stderr_copy,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
+    }
+}
+
+/// Where a keyed exec's stdin came from. Inline bytes are part of the request, so they are
+/// identified by their digest and length; a stream's bytes are not, and a workspace file is named.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmittedStdin {
+    Empty,
+    Inline { sha256: Sha256Digest, bytes: u64 },
+    Stream,
+    WorkspaceFile(WorkspacePath),
+}
+
+/// The session a keyed exec ran in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmittedSession {
+    None,
+    Unnamed,
+    Named(String),
+}
+
+/// One job a key admitted, with what it was admitted for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Admitted {
+    job_id: JobId,
+    command: ExecCommand,
+    admission: JobAdmission,
+}
+
+/// Every admission key the store's incarnation admitted a job under.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdmissionIndex {
+    keys: BTreeMap<AdmissionKey, Admitted>,
+    /// A store set aside while serving this incarnation in a keyed layout: the keys it holds
+    /// are unreadable, so a key not in `keys` may still have admitted a job.
+    set_aside: Option<PathBuf>,
+}
+
+/// What an incarnation's admissions say of one key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionLookup<'a> {
+    Admitted {
+        job_id: JobId,
+        command: &'a ExecCommand,
+        admission: &'a JobAdmission,
+    },
+    /// The key admitted nothing in this incarnation.
+    Absent,
+    /// The key is not among the readable admissions, and the store set aside in `set_aside`
+    /// may hold it: whether it admitted a job cannot be told.
+    Unprovable { set_aside: &'a Path },
+}
+
+impl AdmissionIndex {
+    /// The keyed admissions of `incarnation` among the recovered records, and whether a store
+    /// set aside under `job_root` may hold more.
+    fn recover(
+        recovery: &RecoveryReport,
+        incarnation: &WorkspaceIncarnation,
+        job_root: &Path,
+    ) -> Result<Self, ArtifactError> {
+        let mut keys = BTreeMap::<AdmissionKey, Admitted>::new();
+        for frame in &recovery.frames {
+            let ProtectedRecord::Job(record) = &frame.record else {
+                continue;
+            };
+            let Some(admission) = &record.admission else {
+                continue;
+            };
+            if &record.workspace_incarnation != incarnation {
+                continue;
+            }
+            match keys.get(&admission.key) {
+                Some(known)
+                    if known.job_id == record.job_id
+                        && known.command == record.command
+                        && &known.admission == admission => {}
+                Some(known) => {
+                    return Err(integrity(
+                        0,
+                        &format!(
+                            "admission key {:?} is recorded for job {} and for job {}",
+                            admission.key.as_str(),
+                            known.job_id.get(),
+                            record.job_id.get()
+                        ),
+                    ));
+                }
+                None => {
+                    keys.insert(
+                        admission.key.clone(),
+                        Admitted {
+                            job_id: record.job_id,
+                            command: record.command.clone(),
+                            admission: admission.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            keys,
+            set_aside: keyed_history_set_aside(job_root, incarnation)?,
+        })
+    }
+
+    fn lookup(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
+        match (self.keys.get(key), &self.set_aside) {
+            (Some(known), _) => AdmissionLookup::Admitted {
+                job_id: known.job_id,
+                command: &known.command,
+                admission: &known.admission,
+            },
+            (None, None) => AdmissionLookup::Absent,
+            (None, Some(set_aside)) => AdmissionLookup::Unprovable { set_aside },
+        }
+    }
+
+    /// Refuse a record of `job_id` that binds `admission`'s key unless the key is provably
+    /// free or already `job_id`'s.
+    fn check(&self, job_id: JobId, admission: &JobAdmission) -> Result<(), ArtifactError> {
+        match self.lookup(&admission.key) {
+            AdmissionLookup::Absent => Ok(()),
+            AdmissionLookup::Admitted {
+                job_id: admitted, ..
+            } if admitted == job_id => Ok(()),
+            AdmissionLookup::Admitted {
+                job_id: admitted, ..
+            } => Err(ArtifactError::AdmissionKeyTaken { job_id, admitted }),
+            AdmissionLookup::Unprovable { set_aside } => {
+                Err(ArtifactError::AdmissionKeyUnprovable {
+                    set_aside: set_aside.to_path_buf(),
+                })
+            }
+        }
+    }
+
+    /// Bind `admission`'s key to `job_id`, a record [`Self::check`] allowed now being durable.
+    fn admit(&mut self, job_id: JobId, command: &ExecCommand, admission: &JobAdmission) {
+        self.keys
+            .entry(admission.key.clone())
+            .or_insert_with(|| Admitted {
+                job_id,
+                command: command.clone(),
+                admission: admission.clone(),
+            });
+    }
+}
+
+/// Name, in the directory of a store just set aside in a keyed layout, the incarnation it
+/// served. Until the name is durable a later open reads the store as anyone's
+/// ([`keyed_history_set_aside`]).
+fn record_set_aside_incarnation(
+    set_aside: &SetAsideStore,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<(), ArtifactError> {
+    crate::fsio::publish_private_file(&set_aside.path.join(SET_ASIDE_INCARNATION_FILE), |writer| {
+        writer.write_all(incarnation.as_str().as_bytes())
+    })
+    .map_err(|error| match error {
+        crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
+        crate::fsio::PublishError::Write(source) => io_error(&set_aside.path, source),
+    })
+}
+
+/// The first store set aside under `job_root` in a keyed layout that may have served
+/// `incarnation`: one whose directory names it, or names no incarnation at all.
+fn keyed_history_set_aside(
+    job_root: &Path,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<Option<PathBuf>, ArtifactError> {
+    let parent = job_root.join(SET_ASIDE_DIRECTORY);
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&parent, error)),
+    };
+    let mut keyed = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error(&parent, error))?;
+        let name = entry.file_name();
+        let layout = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("layout-"))
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|layout| layout.parse::<u64>().ok())
+            .ok_or_else(|| {
+                integrity(
+                    0,
+                    &format!("set-aside entry {name:?} names no record layout"),
+                )
+            })?;
+        if layout < FIRST_KEYED_LAYOUT {
+            continue;
+        }
+        let path = entry.path();
+        let served = path.join(SET_ASIDE_INCARNATION_FILE);
+        let may_hold = match fs::read(&served) {
+            Ok(bytes) => bytes == incarnation.as_str().as_bytes(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => return Err(io_error(&served, error)),
+        };
+        if may_hold {
+            keyed.push(path);
+        }
+    }
+    keyed.sort();
+    Ok(keyed.into_iter().next())
 }
 
 impl JobArtifactRecord {
@@ -688,6 +959,7 @@ pub struct ArtifactStore {
     next_job_id: u64,
     live_jobs: BTreeMap<JobId, LiveJobState>,
     committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
+    admissions: AdmissionIndex,
     recovery: RecoveryReport,
     /// The records file as this store last recovered or appended to it. An append that finds it
     /// unchanged — same inode, same length — knows every frame already, so it skips re-reading
@@ -835,6 +1107,17 @@ impl ArtifactStore {
         }
         ensure_record_sequence_counter(&lock, &recovery)?;
         ensure_checkpoint_barrier_counter(&lock, &recovery, &workspace_incarnation)?;
+        let job_root = lock
+            .records
+            .parent()
+            .ok_or_else(|| integrity(0, "records path has no job parent"))?
+            .to_path_buf();
+        if let Some(set_aside) = &recovery.set_aside
+            && set_aside.layout >= FIRST_KEYED_LAYOUT
+        {
+            record_set_aside_incarnation(set_aside, &workspace_incarnation)?;
+        }
+        let admissions = AdmissionIndex::recover(&recovery, &workspace_incarnation, &job_root)?;
         let records_seen = RecordsIdentity::of(&records_path)?;
         drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
@@ -850,6 +1133,7 @@ impl ArtifactStore {
             next_job_id,
             live_jobs: BTreeMap::new(),
             committed_jobs,
+            admissions,
             recovery,
             config,
             records_seen,
@@ -879,6 +1163,7 @@ impl ArtifactStore {
         job_id: JobId,
         grant_revision: u64,
         command: &ExecCommand,
+        admission: Option<JobAdmission>,
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
@@ -900,7 +1185,7 @@ impl ArtifactStore {
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         secure_redirect_target(&self.workspace_root, &mut targets.stdout)?;
         secure_redirect_target(&self.workspace_root, &mut targets.stderr)?;
-        let admission = JobArtifactRecord {
+        let record = JobArtifactRecord {
             repo_id: self.owned_repo_ids.current().clone(),
             workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
@@ -915,13 +1200,15 @@ impl ArtifactStore {
             exit: None,
             duration_ms: None,
             resources: None,
+            admission: admission.clone(),
         };
-        self.append_record(admission)?;
+        self.append_record(record)?;
         let replaced = self.live_jobs.insert(
             job_id,
             LiveJobState {
                 grant_revision,
                 command: command.clone(),
+                admission,
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -938,6 +1225,11 @@ impl ArtifactStore {
             job_id,
             namespace: self.token_namespace,
         })
+    }
+
+    /// What this incarnation's admissions say of `key`.
+    pub fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
+        self.admissions.lookup(key)
     }
 
     /// Seal every job this incarnation admitted and never sealed: the jobs a supervisor ran when
@@ -1022,6 +1314,12 @@ impl ArtifactStore {
                 &lock,
                 self.config.retained_recovery_budget_bytes,
             )?;
+            // Another writer appended: the keys it bound are this store's to honour too.
+            let job_root = path
+                .parent()
+                .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+            self.admissions =
+                AdmissionIndex::recover(&recovery, &self.workspace_incarnation, job_root)?;
             terminal
                 && recovery.frames.iter().any(|frame| {
                     matches!(
@@ -1039,6 +1337,11 @@ impl ArtifactStore {
                 "duplicate terminal artifact record for job id",
             ));
         }
+        // The key binds under the lock that orders every record: no other job can take it
+        // between this check and the append.
+        if let Some(admission) = &record.admission {
+            self.admissions.check(record.job_id, admission)?;
+        }
         let sequence = allocate_record_sequence(&lock)?;
         let mut record = record;
         record.sequence = sequence;
@@ -1048,6 +1351,10 @@ impl ArtifactStore {
         let digest = Sha256Digest::compute(&payload);
         append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
         self.records_seen = RecordsIdentity::of(&path)?;
+        if let Some(admission) = &record.admission {
+            self.admissions
+                .admit(record.job_id, &record.command, admission);
+        }
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
@@ -1297,6 +1604,7 @@ struct QuotaAdmission {
 struct LiveJobState {
     grant_revision: u64,
     command: ExecCommand,
+    admission: Option<JobAdmission>,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1528,6 +1836,7 @@ impl ArtifactStore {
                 exit,
                 duration_ms,
                 resources,
+                admission: live.admission.clone(),
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -3560,6 +3869,20 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(ACCOUNTING_COLUMNS[4], DataType::UInt64, true),
         field(VOLUME_COLUMNS[0], DataType::Utf8, true),
         field(VOLUME_COLUMNS[1], DataType::Utf8, true),
+        field("admission_key", DataType::Utf8, true),
+        field("admission_cwd", DataType::Utf8, true),
+        field("admission_mode", DataType::Utf8, true),
+        field("admission_env", admission_env_type(), true),
+        field("admission_stdin", DataType::Utf8, true),
+        field("admission_stdin_path", DataType::Utf8, true),
+        field("admission_stdin_sha256", DataType::Binary, true),
+        field("admission_stdin_bytes", DataType::UInt64, true),
+        field("admission_session", DataType::Utf8, true),
+        field("admission_session_name", DataType::Utf8, true),
+        field("admission_stdout_copy_path", DataType::Utf8, true),
+        field("admission_stdout_copy_policy", DataType::Utf8, true),
+        field("admission_stderr_copy_path", DataType::Utf8, true),
+        field("admission_stderr_copy_policy", DataType::Utf8, true),
     ]))
 }
 
@@ -3784,7 +4107,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         .and_then(|sample| sample.volumes.build.as_ref())
         .map(volume)
         .transpose()?;
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
         Arc::new(StringArray::from(vec![record.repo_id.as_str()])),
@@ -3896,6 +4219,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(StringArray::from(vec![workspace_volume])),
         Arc::new(StringArray::from(vec![build_volume])),
     ];
+    columns.extend(admission_columns(record.admission.as_ref())?);
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
@@ -3984,6 +4308,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         .transpose()?;
     let exit = decode_exit(batch, EXIT_COLUMN)?;
     let resources = decode_resources(batch, job_id)?;
+    let admission = decode_admission(batch, ADMISSION_COLUMN)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -3999,6 +4324,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         exit,
         duration_ms,
         resources,
+        admission,
     })
 }
 
@@ -4138,6 +4464,236 @@ fn decode_accounting(batch: &RecordBatch) -> Result<Option<JobAccounting>, Artif
         (true, false) | (false, true) => return damaged("read bytes without write bytes"),
     };
     Ok(Some(JobAccounting::MacOsRusageChildren { cpu, io }))
+}
+
+fn admission_env_type() -> DataType {
+    DataType::List(Arc::new(field(
+        "item",
+        DataType::Struct(admission_env_fields()),
+        false,
+    )))
+}
+
+fn admission_env_fields() -> Fields {
+    Fields::from(vec![
+        field("name", DataType::Utf8, false),
+        field("value", DataType::Utf8, false),
+    ])
+}
+
+fn mode_name(mode: RunSandboxMode) -> &'static str {
+    match mode {
+        RunSandboxMode::ReadWrite => "readWrite",
+        RunSandboxMode::ReadOnly => "readOnly",
+    }
+}
+
+fn parse_mode(name: &str) -> Result<RunSandboxMode, ArtifactError> {
+    match name {
+        "readWrite" => Ok(RunSandboxMode::ReadWrite),
+        "readOnly" => Ok(RunSandboxMode::ReadOnly),
+        other => Err(ArtifactError::Arrow(format!(
+            "unknown sandbox mode {other:?}"
+        ))),
+    }
+}
+
+fn policy_name(policy: PublicationPolicy) -> &'static str {
+    match policy {
+        PublicationPolicy::CreateNew => "createNew",
+        PublicationPolicy::Replace => "replace",
+    }
+}
+
+fn parse_policy(name: &str) -> Result<PublicationPolicy, ArtifactError> {
+    match name {
+        "createNew" => Ok(PublicationPolicy::CreateNew),
+        "replace" => Ok(PublicationPolicy::Replace),
+        other => Err(ArtifactError::Arrow(format!(
+            "unknown publication policy {other:?}"
+        ))),
+    }
+}
+
+fn workspace_path_str(path: &WorkspacePath) -> &str {
+    path.as_path()
+        .to_str()
+        .expect("WorkspacePath is always UTF-8")
+}
+
+/// The fourteen admission columns of one job record: all null for an unkeyed job.
+fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, ArtifactError> {
+    let Some(admission) = admission else {
+        let schema = protected_record_schema();
+        return Ok((ADMISSION_COLUMN..schema.fields().len())
+            .map(|index| new_null_array(schema.field(index).data_type(), 1))
+            .collect());
+    };
+    let (stdin, stdin_path, stdin_sha256, stdin_bytes) = match &admission.stdin {
+        AdmittedStdin::Empty => ("empty", None, None, None),
+        AdmittedStdin::Inline { sha256, bytes } => (
+            "inline",
+            None,
+            Some(sha256.as_bytes().as_slice()),
+            Some(*bytes),
+        ),
+        AdmittedStdin::Stream => ("stream", None, None, None),
+        AdmittedStdin::WorkspaceFile(path) => {
+            ("workspaceFile", Some(workspace_path_str(path)), None, None)
+        }
+    };
+    let (session, session_name) = match &admission.session {
+        AdmittedSession::None => ("none", None),
+        AdmittedSession::Unnamed => ("unnamed", None),
+        AdmittedSession::Named(name) => ("named", Some(name.as_str())),
+    };
+    fn publication(copy: Option<&OutputPublication>) -> (Option<&str>, Option<&'static str>) {
+        (
+            copy.map(|copy| workspace_path_str(&copy.path)),
+            copy.map(|copy| policy_name(copy.policy)),
+        )
+    }
+    let (stdout_path, stdout_policy) = publication(admission.stdout_copy.as_ref());
+    let (stderr_path, stderr_policy) = publication(admission.stderr_copy.as_ref());
+    let names = StringArray::from_iter_values(admission.env.keys());
+    let values = StringArray::from_iter_values(admission.env.values());
+    let count = i32::try_from(admission.env.len())
+        .map_err(|_| ArtifactError::Arrow("too many environment entries".into()))?;
+    let env = ListArray::new(
+        Arc::new(field(
+            "item",
+            DataType::Struct(admission_env_fields()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, count])),
+        Arc::new(StructArray::new(
+            admission_env_fields(),
+            vec![Arc::new(names), Arc::new(values)],
+            None,
+        )),
+        None,
+    );
+    Ok(vec![
+        Arc::new(StringArray::from(vec![Some(admission.key.as_str())])),
+        Arc::new(StringArray::from(vec![
+            admission.cwd.as_ref().map(workspace_path_str),
+        ])),
+        Arc::new(StringArray::from(vec![Some(mode_name(admission.mode))])),
+        Arc::new(env),
+        Arc::new(StringArray::from(vec![Some(stdin)])),
+        Arc::new(StringArray::from(vec![stdin_path])),
+        Arc::new(BinaryArray::from(vec![stdin_sha256])),
+        Arc::new(UInt64Array::from(vec![stdin_bytes])),
+        Arc::new(StringArray::from(vec![Some(session)])),
+        Arc::new(StringArray::from(vec![session_name])),
+        Arc::new(StringArray::from(vec![stdout_path])),
+        Arc::new(StringArray::from(vec![stdout_policy])),
+        Arc::new(StringArray::from(vec![stderr_path])),
+        Arc::new(StringArray::from(vec![stderr_policy])),
+    ])
+}
+
+/// The admission a job record's columns from `first` on carry: none when its key is null, and
+/// then every other admission column must be null too.
+fn decode_admission(
+    batch: &RecordBatch,
+    first: usize,
+) -> Result<Option<JobAdmission>, ArtifactError> {
+    let present = |offset: usize| !batch.column(first + offset).is_null(0);
+    let text = |offset: usize| -> Result<Option<&str>, ArtifactError> {
+        present(offset)
+            .then(|| string(batch, first + offset).map(|column| column.value(0)))
+            .transpose()
+    };
+    let required = |offset: usize, what: &str| -> Result<&str, ArtifactError> {
+        text(offset)?
+            .ok_or_else(|| ArtifactError::Arrow(format!("a keyed admission record has no {what}")))
+    };
+    let path = |value: &str| {
+        WorkspacePath::new(value).map_err(|error| ArtifactError::Arrow(error.to_string()))
+    };
+    let Some(key) = text(0)? else {
+        return if (1..14).any(present) {
+            Err(ArtifactError::Arrow(
+                "an unkeyed job record carries admission columns".into(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let key = AdmissionKey::new(key)?;
+    let cwd = text(1)?.map(path).transpose()?;
+    let mode = parse_mode(required(2, "sandbox mode")?)?;
+    if !present(3) {
+        return Err(ArtifactError::Arrow(
+            "a keyed admission record has no environment".into(),
+        ));
+    }
+    let entries = list(batch, first + 3)?.value(0);
+    let entries = downcast::<StructArray>(entries.as_ref(), "admission_env.values")?;
+    let names = struct_string(entries, "name")?;
+    let values = struct_string(entries, "value")?;
+    let mut env = BTreeMap::new();
+    for row in 0..entries.len() {
+        if env
+            .insert(names.value(row).to_owned(), values.value(row).to_owned())
+            .is_some()
+        {
+            return Err(ArtifactError::Arrow(format!(
+                "a keyed admission names environment variable {:?} twice",
+                names.value(row)
+            )));
+        }
+    }
+    let stdin = match (required(4, "stdin")?, text(5)?, present(6), present(7)) {
+        ("empty", None, false, false) => AdmittedStdin::Empty,
+        ("inline", None, true, true) => AdmittedStdin::Inline {
+            sha256: required_digest(batch, first + 6, 0)?,
+            bytes: required_u64(batch, first + 7, 0)?,
+        },
+        ("stream", None, false, false) => AdmittedStdin::Stream,
+        ("workspaceFile", Some(stdin_path), false, false) => {
+            AdmittedStdin::WorkspaceFile(path(stdin_path)?)
+        }
+        (kind, stdin_path, digest, bytes) => {
+            return Err(ArtifactError::Arrow(format!(
+                "admitted stdin {kind:?} with path {stdin_path:?}, digest present {digest} and \
+                 length present {bytes} is no stdin source"
+            )));
+        }
+    };
+    let session = match (required(8, "session")?, text(9)?) {
+        ("none", None) => AdmittedSession::None,
+        ("unnamed", None) => AdmittedSession::Unnamed,
+        ("named", Some(name)) => AdmittedSession::Named(name.to_owned()),
+        (kind, name) => {
+            return Err(ArtifactError::Arrow(format!(
+                "admitted session {kind:?} named {name:?} is no session"
+            )));
+        }
+    };
+    let publication = |offset: usize| -> Result<Option<OutputPublication>, ArtifactError> {
+        match (text(offset)?, text(offset + 1)?) {
+            (None, None) => Ok(None),
+            (Some(copy), Some(policy)) => Ok(Some(OutputPublication {
+                path: path(copy)?,
+                policy: parse_policy(policy)?,
+            })),
+            _ => Err(ArtifactError::Arrow(
+                "an admitted output copy needs both its path and its policy".into(),
+            )),
+        }
+    };
+    Ok(Some(JobAdmission {
+        key,
+        cwd,
+        mode,
+        env,
+        stdin,
+        session,
+        stdout_copy: publication(10)?,
+        stderr_copy: publication(12)?,
+    }))
 }
 
 fn visible_storage_name(kind: VisibleStorageKind) -> &'static str {
@@ -5820,6 +6376,7 @@ mod tests {
             exit: None,
             duration_ms: None,
             resources: None,
+            admission: None,
         }
     }
 
@@ -6082,6 +6639,187 @@ mod tests {
         }
     }
 
+    fn keyed(key: &str, stdin: AdmittedStdin) -> JobAdmission {
+        JobAdmission {
+            key: AdmissionKey::new(key).unwrap(),
+            cwd: Some(WorkspacePath::new("packages/app").unwrap()),
+            mode: RunSandboxMode::ReadOnly,
+            env: BTreeMap::from([("LANG".to_owned(), "C".to_owned())]),
+            stdin,
+            session: AdmittedSession::Named("build".into()),
+            stdout_copy: Some(OutputPublication {
+                path: WorkspacePath::new("out/log").unwrap(),
+                policy: PublicationPolicy::Replace,
+            }),
+            stderr_copy: None,
+        }
+    }
+
+    fn argv_true() -> ExecCommand {
+        ExecCommand::Argv(vec!["true".into()])
+    }
+
+    /// A key, its request and its job commit in the job's first record, and every later record
+    /// carries them: a store opened afresh answers the key from what it reads back, inline stdin
+    /// by digest and length.
+    #[test]
+    fn an_admission_survives_its_records_and_binds_its_key_to_one_job() {
+        let root = temp_root("admission-round-trip");
+        let inline = keyed(
+            "op-1",
+            AdmittedStdin::Inline {
+                sha256: Sha256Digest::compute(b"payload"),
+                bytes: 7,
+            },
+        );
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let job_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                Some(inline.clone()),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        let sealed = store.finish(token, JobState::Exited).unwrap();
+        assert_eq!(sealed.record.admission.as_ref(), Some(&inline));
+        let next = store.next_job_id().unwrap();
+        assert!(matches!(
+            store.begin_job(next, 1, &argv_true(), Some(inline.clone()), OutputTargets::default()),
+            Err(ArtifactError::AdmissionKeyTaken { admitted, .. }) if admitted == job_id
+        ));
+        drop(store);
+
+        let reopened = store_at(&root, ArtifactConfig::default());
+        match reopened.admitted(&inline.key) {
+            AdmissionLookup::Admitted {
+                job_id: admitted,
+                command,
+                admission,
+            } => assert_eq!(
+                (admitted, command, admission),
+                (job_id, &argv_true(), &inline)
+            ),
+            other => panic!("the key reads back as {other:?}"),
+        }
+        assert_eq!(
+            reopened.admitted(&AdmissionKey::new("op-2").unwrap()),
+            AdmissionLookup::Absent
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two stores over one log stand for two writers: the second learns the key the first
+    /// bound when its own append re-reads the log, under the lock, and binds nothing.
+    #[test]
+    fn a_key_another_writer_bound_first_is_refused_under_the_records_lock() {
+        let root = temp_root("admission-two-writers");
+        let mut first = store_at(&root, ArtifactConfig::default());
+        let mut second = store_at(&root, ArtifactConfig::default());
+        let admission = keyed("op-1", AdmittedStdin::Stream);
+        let unkeyed = first.next_job_id().unwrap();
+        let token = first
+            .begin_job(unkeyed, 1, &argv_true(), None, OutputTargets::default())
+            .unwrap();
+        first.finish(token, JobState::Exited).unwrap();
+        let bound = first.next_job_id().unwrap();
+        first
+            .begin_job(
+                bound,
+                1,
+                &argv_true(),
+                Some(admission.clone()),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        let stale = second.next_job_id().unwrap();
+        assert_eq!(
+            stale, unkeyed,
+            "the second writer read the log before either job"
+        );
+        let records = fs::read(records_path(&root)).unwrap();
+        assert!(matches!(
+            second.begin_job(stale, 1, &argv_true(), Some(admission), OutputTargets::default()),
+            Err(ArtifactError::AdmissionKeyTaken { job_id: refused, admitted })
+                if refused == stale && admitted == bound
+        ));
+        assert_eq!(fs::read(records_path(&root)).unwrap(), records);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A store set aside in a keyed layout took its keys along unread. While it may have served
+    /// this incarnation -- its directory names this incarnation, or names none -- no key absent
+    /// from the readable records is free; a store of an earlier, keyless layout or of another
+    /// incarnation proves nothing missing.
+    #[test]
+    fn a_keyed_store_set_aside_for_this_incarnation_makes_absence_unprovable() {
+        let key = AdmissionKey::new("op-1").unwrap();
+        let cases = [
+            ("keyed-unnamed", FIRST_KEYED_LAYOUT, None, true),
+            (
+                "keyed-this",
+                FIRST_KEYED_LAYOUT,
+                Some(incarnation().as_str().to_owned()),
+                true,
+            ),
+            (
+                "keyed-other",
+                FIRST_KEYED_LAYOUT,
+                Some("0198f2c0b7e34dc795f17b238b331c81".to_owned()),
+                false,
+            ),
+            ("keyless", FIRST_KEYED_LAYOUT - 1, None, false),
+        ];
+        for (label, layout, served, unprovable) in cases {
+            let root = temp_root(&format!("admission-set-aside-{label}"));
+            let job_root = ensure_private_job_root(&root).unwrap();
+            let set_aside = job_root
+                .join(SET_ASIDE_DIRECTORY)
+                .join(format!("layout-{layout}"));
+            fs::create_dir_all(&set_aside).unwrap();
+            if let Some(served) = served {
+                fs::write(set_aside.join(SET_ASIDE_INCARNATION_FILE), served).unwrap();
+            }
+            let mut store = store_at(&root, ArtifactConfig::default());
+            let job_id = store.next_job_id().unwrap();
+            let before = fs::read(records_path(&root)).ok();
+            let begun = store.begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                Some(keyed(key.as_str(), AdmittedStdin::Empty)),
+                OutputTargets::default(),
+            );
+            if unprovable {
+                assert_eq!(
+                    store.admitted(&key),
+                    AdmissionLookup::Unprovable {
+                        set_aside: &set_aside
+                    },
+                    "{label}"
+                );
+                assert!(
+                    matches!(
+                        begun,
+                        Err(ArtifactError::AdmissionKeyUnprovable { set_aside: ref path })
+                            if path == &set_aside
+                    ),
+                    "{label}: {begun:?}"
+                );
+                assert_eq!(
+                    fs::read(records_path(&root)).ok(),
+                    before,
+                    "{label}: nothing was recorded"
+                );
+            } else {
+                assert!(begun.is_ok(), "{label}: {begun:?}");
+            }
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     #[test]
     fn terminal_records_and_tokens_reject_duplicate_stale_and_foreign_use() {
         let root = temp_root("append-guards");
@@ -6092,6 +6830,7 @@ mod tests {
                 job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6121,6 +6860,7 @@ mod tests {
                 foreign_job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6265,6 +7005,7 @@ mod tests {
                     next,
                     1,
                     &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                    None,
                     OutputTargets::default(),
                 )
                 .unwrap();
@@ -6528,6 +7269,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6592,6 +7334,7 @@ mod tests {
                 job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6634,6 +7377,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6669,6 +7413,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6703,6 +7448,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6801,6 +7547,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

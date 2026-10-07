@@ -75,7 +75,6 @@ describe('Cowshed Node-API bindings', () => {
   });
 
   it('loads the built addon and preserves its error contract under Node', async () => {
-    const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
     const script = `
       import { coordinatorEndpoint, CowshedError } from ${JSON.stringify(moduleUrl)};
       try {
@@ -109,7 +108,6 @@ describe('Cowshed Node-API bindings', () => {
    * these other calls behind the wait deadlocks with it, and the spawn's deadline ends the pair.
    */
   it('reads current raw logs and status while job.wait() is pending on one connection', async () => {
-    const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
     const client = `
       import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
       const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
@@ -130,9 +128,7 @@ describe('Cowshed Node-API bindings', () => {
       }));
       process.exit(0);
     `;
-    const controller = `
-      import { spawn } from 'node:child_process';
-      const incarnation = '0198f2c0b7e34dc795f17b238b331c80';
+    const calls = `
       const emptyStream = {
         storage: { kind: 'captured', artifact: { kind: 'inline', data: { encoding: 'utf8', data: '' } } },
         bytes: 0,
@@ -154,52 +150,12 @@ describe('Cowshed Node-API bindings', () => {
         trace: { traceId: '4bf92f3577b34da6a3ce929d0e0e4736', spanId: '00f067aa0ba902b7' },
         stdin: { kind: 'empty', bytes: 0, complete: true },
       });
-      const results = {
-        'project.open': {
-          repoId: 'acme/widget',
-          binding: {
-            version: 1,
-            identities: [{ repoId: 'acme/widget', remoteName: null, remoteUrl: null, primary: true }],
-          },
-          gitRoot: '/w/widget',
-          storeRoot: '/w/store',
-        },
-        'coordinator.worker': {
-          info: {
-            repoId: 'acme/widget',
-            workspace: 'main',
-            workspaceIncarnation: incarnation,
-            role: 'main',
-            mount: '/w/widget',
-            state: 'attached',
-            checkpoints: [],
-            snapshotStale: false,
-          },
-          grants: { egress: [], read: [], revision: 0, sim: [], write: [] },
-        },
-        'worker.exec': 1,
-      };
-      const node = spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(client)}], {
-        stdio: ['ignore', 'inherit', 'inherit', 'pipe'],
-      });
-      const socket = node.stdio[3];
-      const send = (value) => {
-        const body = Buffer.from(JSON.stringify(value));
-        const head = Buffer.alloc(4);
-        head.writeUInt32BE(body.length);
-        socket.write(Buffer.concat([head, body]));
-      };
-      const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
-      let greeted = false;
       let statusAnswered = false;
       let logsAnswered = false;
       const waits = [];
-      const handle = (message) => {
-        if (!greeted) {
-          greeted = true;
-          send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
-        } else if (message.method in results) {
-          answer(message.id, results[message.method]);
+      const call = (message) => {
+        if (message.method === 'worker.exec') {
+          answer(message.id, 1);
         } else if (message.method === 'job.logs') {
           const { stream, offset, follow } = message.params;
           if (stream !== 'stdout' || follow !== false || ![0, 4].includes(offset)) {
@@ -224,43 +180,189 @@ describe('Cowshed Node-API bindings', () => {
         } else if (message.method === 'job.wait') {
           answer(message.id, job(true));
         } else {
-          const error = { code: 'internal', message: 'unscripted ' + message.method, hint: 'script it' };
-          send({ id: message.id, ok: false, result: null, error, binaryLength: null });
+          return false;
         }
+        return true;
       };
-      let buffered = Buffer.alloc(0);
-      socket.on('data', (chunk) => {
-        buffered = Buffer.concat([buffered, chunk]);
-        while (buffered.length >= 4 && buffered.length >= 4 + buffered.readUInt32BE(0)) {
-          const length = buffered.readUInt32BE(0);
-          handle(JSON.parse(buffered.subarray(4, 4 + length).toString()));
-          buffered = buffered.subarray(4 + length);
-        }
-      });
-      node.on('exit', (code) => {
-        process.exitCode = code ?? 1;
-        socket.destroy();
-      });
     `;
-    const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
-      cwd: join(import.meta.dir, '..'),
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      // Bounds only a deadlocked pair; a working client ends in milliseconds. Killing the
-      // controller closes the client's endpoint, which ends the client too.
-      timeout: 20_000,
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      node.exited,
-      new Response(node.stdout).text(),
-      new Response(node.stderr).text(),
-    ]);
-
-    expect({ exitCode, stdout: stdout.trim(), stderr }).toEqual({
+    expect(await scriptedPair(client, calls)).toEqual({
       exitCode: 0,
       stdout: JSON.stringify({ bytes: [0, 255, 128, 10], offset: 4, eof: false, status: 'running', ended: 'exited' }),
       stderr: '',
     });
   }, 30_000);
+
+  /**
+   * 07_api "Keyed admission": the addon carries an exec's admission key onto the controller wire
+   * as given, and a keyed refusal reaches JavaScript as a `CowshedError` whose `admission` is the
+   * controller's typed refusal, field for field: the conversion keeps the cause, not only the
+   * code, message and hint.
+   */
+  it('carries an admission key to exec and its typed refusal back', async () => {
+    const client = `
+      import { connectCoordinator, coordinatorEndpoint, CowshedError } from ${JSON.stringify(moduleUrl)};
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker('main');
+      const refusal = async (request) => {
+        try {
+          await worker.exec(request);
+          return 'resolved';
+        } catch (error) {
+          return { ours: error instanceof CowshedError, code: error.code, admission: error.admission ?? null };
+        }
+      };
+      const job = await worker.exec({ argv: ['build'], admissionKey: 'op-1' });
+      const changed = await refusal({ argv: ['test'], admissionKey: 'op-1' });
+      const unprovable = await refusal({ argv: ['build'], admissionKey: 'op-2' });
+      console.log(JSON.stringify({ job: job.id, changed, unprovable }));
+      process.exit(0);
+    `;
+    const calls = `
+      const seen = [];
+      process.on('exit', () => console.log(JSON.stringify(seen)));
+      const refuse = (id, admission) =>
+        send({
+          id,
+          ok: false,
+          result: null,
+          error: { code: 'conflict', message: 'refused', hint: 'reach the keyed job', admission },
+          binaryLength: null,
+        });
+      const call = (message) => {
+        if (message.method !== 'worker.exec') {
+          return false;
+        }
+        const { admissionKey } = message.params;
+        const argv = message.params.argv.map((arg) => arg.data);
+        seen.push([admissionKey, argv]);
+        if (admissionKey === 'op-2') {
+          refuse(message.id, { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-6' });
+        } else if (argv[0] === 'test') {
+          refuse(message.id, { reason: 'keyConflict', jobId: 7, fields: ['command'] });
+        } else {
+          answer(message.id, 7);
+        }
+        return true;
+      };
+    `;
+    const { exitCode, stdout, stderr } = await scriptedPair(client, calls);
+    expect({ exitCode, stdout: stdout.split('\n'), stderr }).toEqual({
+      exitCode: 0,
+      stdout: [
+        JSON.stringify({
+          job: 7,
+          changed: {
+            ours: true,
+            code: 'conflict',
+            admission: { reason: 'keyConflict', jobId: 7, fields: ['command'] },
+          },
+          unprovable: {
+            ours: true,
+            code: 'conflict',
+            admission: { reason: 'unprovable', setAside: '/w/widget/.cowshed/job/set-aside/layout-6' },
+          },
+        }),
+        JSON.stringify([
+          ['op-1', ['build']],
+          ['op-1', ['test']],
+          ['op-2', ['build']],
+        ]),
+      ],
+      stderr: '',
+    });
+  }, 30_000);
 });
+
+const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
+
+/**
+ * A Node controller serves the wire on one end of a socket pair and hands the other end to a Node
+ * `client` as fd 3, the way a trusted spawner hands an endpoint over. It greets, opens the project
+ * and the worker; `calls` defines `call(message)`, which answers the rest and returns false for a
+ * call it does not script. The spawn's deadline ends a deadlocked pair.
+ */
+async function scriptedPair(
+  client: string,
+  calls: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const controller = `
+    import { spawn } from 'node:child_process';
+    const incarnation = '0198f2c0b7e34dc795f17b238b331c80';
+    const opened = {
+      'project.open': {
+        repoId: 'acme/widget',
+        binding: {
+          version: 1,
+          identities: [{ repoId: 'acme/widget', remoteName: null, remoteUrl: null, primary: true }],
+        },
+        gitRoot: '/w/widget',
+        storeRoot: '/w/store',
+      },
+      'coordinator.worker': {
+        info: {
+          repoId: 'acme/widget',
+          workspace: 'main',
+          workspaceIncarnation: incarnation,
+          role: 'main',
+          mount: '/w/widget',
+          state: 'attached',
+          checkpoints: [],
+          snapshotStale: false,
+        },
+        grants: { egress: [], read: [], revision: 0, sim: [], write: [] },
+      },
+    };
+    const node = spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(client)}], {
+      stdio: ['ignore', 'inherit', 'inherit', 'pipe'],
+    });
+    const socket = node.stdio[3];
+    const send = (value) => {
+      const body = Buffer.from(JSON.stringify(value));
+      const head = Buffer.alloc(4);
+      head.writeUInt32BE(body.length);
+      socket.write(Buffer.concat([head, body]));
+    };
+    const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
+    ${calls}
+    let greeted = false;
+    const handle = (message) => {
+      if (!greeted) {
+        greeted = true;
+        send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
+      } else if (message.method in opened) {
+        answer(message.id, opened[message.method]);
+      } else if (!call(message)) {
+        const error = { code: 'internal', message: 'unscripted ' + message.method, hint: 'script it' };
+        send({ id: message.id, ok: false, result: null, error, binaryLength: null });
+      }
+    };
+    let buffered = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      while (buffered.length >= 4 && buffered.length >= 4 + buffered.readUInt32BE(0)) {
+        const length = buffered.readUInt32BE(0);
+        handle(JSON.parse(buffered.subarray(4, 4 + length).toString()));
+        buffered = buffered.subarray(4 + length);
+      }
+    });
+    node.on('exit', (code) => {
+      process.exitCode = code ?? 1;
+      socket.destroy();
+    });
+  `;
+  const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
+    cwd: join(import.meta.dir, '..'),
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    // Bounds only a deadlocked pair; a working client ends in milliseconds. Killing the
+    // controller closes the client's endpoint, which ends the client too.
+    timeout: 20_000,
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    node.exited,
+    new Response(node.stdout).text(),
+    new Response(node.stderr).text(),
+  ]);
+  return { exitCode, stdout: stdout.trim(), stderr };
+}

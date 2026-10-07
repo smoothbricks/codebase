@@ -70,7 +70,9 @@ enum Event {
         workspace: WorkspaceName,
         mount: PathBuf,
         argv: Vec<Vec<u8>>,
+        admission_key: Option<cowshed_core::api::AdmissionKey>,
     },
+    JobByKey(WorkspaceName, cowshed_core::api::AdmissionKey),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1249,6 +1251,7 @@ impl ProjectRuntimeHost for FakeHost {
                     .iter()
                     .map(|argument| argument.as_os_str().as_bytes().to_vec())
                     .collect(),
+                admission_key: request.admission_key,
             })
             .ok();
         JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
@@ -1308,6 +1311,17 @@ impl ProjectRuntimeHost for FakeHost {
     ) -> Result<cowshed_core::api::SealedJob> {
         self.require_incarnation(&workspace, &incarnation)?;
         Err(Self::worker_unavailable())
+    }
+
+    async fn job_by_key(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        key: cowshed_core::api::AdmissionKey,
+    ) -> Result<JobId> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        self.events.send(Event::JobByKey(workspace, key)).ok();
+        JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
     }
 
     async fn wait_job(
@@ -1583,6 +1597,7 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         workspace,
         mount,
         argv: decoded,
+        admission_key: None,
     }) = events.recv().await
     else {
         panic!("missing exec event");
@@ -1603,6 +1618,79 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(events.try_recv().is_err(), "invalid argv reached the host");
     }
+}
+
+/// The controller carries an exec's admission key to the host exactly as the caller named it,
+/// and routes `worker.jobByKey` to the host under the caller's incarnation fence; a malformed key
+/// reaches no host.
+#[tokio::test]
+async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    let key = cowshed_core::api::AdmissionKey::new("op-1").expect("key");
+    let exec = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "argv": serde_json::to_value(vec![CommandArg::from("build")]).unwrap(),
+        "mode": "readWrite",
+        "env": {},
+        "stdin": {"kind":"empty"},
+        "stdoutCopy": null,
+        "stderrCopy": null,
+        "admissionKey": "op-1"
+    });
+    assert_eq!(
+        route(&router, coordinator(repo.clone()), "worker.exec", exec)
+            .await
+            .unwrap(),
+        json!(1)
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    let Some(Event::Exec { admission_key, .. }) = events.recv().await else {
+        panic!("missing exec event");
+    };
+    assert_eq!(admission_key, Some(key.clone()));
+
+    let by_key = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "admissionKey": "op-1"
+    });
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.jobByKey",
+            by_key.clone()
+        )
+        .await
+        .unwrap(),
+        json!(1)
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::JobByKey(
+            WorkspaceName::new("main").expect("main"),
+            key
+        ))
+    );
+
+    let mut empty = by_key;
+    empty["admissionKey"] = json!("");
+    let error = route(&router, coordinator(repo.clone()), "worker.jobByKey", empty)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(
+        events.try_recv().is_err(),
+        "a malformed key reached the host"
+    );
 }
 
 #[tokio::test]
@@ -1678,6 +1766,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
             stdin: StdinSource::Empty,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         })
         .await
         .expect("exec");

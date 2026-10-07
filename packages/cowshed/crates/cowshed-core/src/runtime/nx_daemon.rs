@@ -209,6 +209,7 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
         stdin: StdinSource::Empty,
         stdout_copy: None,
         stderr_copy: None,
+        admission_key: None,
     })
 }
 

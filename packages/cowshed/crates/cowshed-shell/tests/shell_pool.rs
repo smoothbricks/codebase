@@ -222,6 +222,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         stdin: StdinSource::Empty,
         stdout_copy: None,
         stderr_copy: None,
+        admission_key: None,
     }
 }
 

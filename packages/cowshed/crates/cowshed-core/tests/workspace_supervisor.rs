@@ -7,19 +7,23 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
+    AdmissionKey,
     CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
     ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark, JobTailBytes,
     JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
     OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinSource,
     StreamInfo, WorkspacePath,
 };
-use cowshed_core::error::{CowshedError, ErrorCode, Result};
+use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
-use cowshed_core::storage::job_artifact::{ArtifactConfig, ArtifactStore, JobEnding, StreamKind};
+use cowshed_core::storage::job_artifact::{
+    AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
+    StreamKind,
+};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -179,8 +183,10 @@ impl ArtifactSink for FakeArtifactSink {
         expected_job_id: JobId,
         _grant_revision: u64,
         command: &cowshed_core::api::ExecCommand,
+        admission: Option<JobAdmission>,
     ) -> Result<()> {
         assert!(command.validate().is_ok());
+        assert_eq!(admission, None, "this sink keeps no admission keys");
         assert_eq!(expected_job_id, self.next);
         self.observations
             .send(ArtifactObservation::Admit(expected_job_id))
@@ -205,6 +211,11 @@ impl ArtifactSink for FakeArtifactSink {
         );
         assert!(replaced.is_none());
         Ok(())
+    }
+
+    /// Keyed admission is the production store's ([`real_store_harness`]).
+    fn admitted(&self, _key: &AdmissionKey) -> AdmissionLookup<'_> {
+        AdmissionLookup::Absent
     }
 
     fn prepare_background(&mut self, job_id: JobId) -> Result<()> {
@@ -554,6 +565,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stdin,
         stdout_copy: None,
         stderr_copy: None,
+        admission_key: None,
     }
 }
 
@@ -2579,6 +2591,236 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     assert_eq!(received, sent);
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
+}
+
+fn keyed(key: &str, stdin: StdinSource) -> ExecRequest {
+    ExecRequest {
+        admission_key: Some(AdmissionKey::new(key).unwrap()),
+        ..request(stdin)
+    }
+}
+
+/// 07_api "Keyed admission": a key's first exec binds its stdin stream to the job it admits. A
+/// repeat under the key -- the caller lost the reply and exec'd again -- is answered with that job
+/// by number in a usage refusal, and its own stream reaches nothing: the job reads the first
+/// stream's bytes exactly once, and nothing runs a second time.
+#[tokio::test]
+async fn a_keyed_stream_repeat_names_its_job_and_binds_no_second_stream() {
+    use tokio::io::AsyncWriteExt as _;
+    let (supervisor_config, _root) = isolated_config("keyed-stream");
+    let mut h = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&h.handle).await;
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let job = remote
+        .exec(
+            None,
+            None,
+            keyed("op-1", StdinSource::Stream(Box::pin(reader))),
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+
+    let refused = remote
+        .exec(
+            None,
+            None,
+            keyed(
+                "op-1",
+                StdinSource::Stream(Box::pin(std::io::Cursor::new(b"second".to_vec()))),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Usage);
+    assert_eq!(
+        refused.message,
+        format!("stdin already bound to job {}; attach to write", job.get())
+    );
+    assert_eq!(
+        refused.admission_source(),
+        Some(&AdmissionRefusal::StdinBound { job_id: job })
+    );
+
+    writer.write_all(b"first").await.unwrap();
+    drop(writer);
+    let mut received = Vec::new();
+    loop {
+        match h.process.recv().await.unwrap() {
+            ProcessObservation::Stdin(id, bytes) => {
+                assert_eq!(id, job);
+                received.extend_from_slice(&bytes);
+            }
+            ProcessObservation::StdinClosed(id) => {
+                assert_eq!(id, job);
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(received, b"first");
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
+    assert!(h.spawned.try_recv().is_err(), "the repeat spawned nothing");
+    assert!(
+        h.process.try_recv().is_err(),
+        "no byte of the second stream reached the job"
+    );
+}
+
+/// The reply is the killpoint: a caller sends a keyed exec over the supervisor socket and hangs up
+/// without reading a byte back, so the job's number reaches no one, and the supervisor that ran
+/// the job is gone before anyone asks again. The next supervisor answers the key from the records
+/// alone -- the same request gets the same job, `jobByKey` reaches it, and the spawn sink saw one
+/// run -- while a changed request under the key is a conflict naming what changed.
+#[tokio::test]
+async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_supervisor() {
+    use tokio::io::AsyncWriteExt as _;
+    let (supervisor_config, _root) = isolated_config("keyed-lost-reply");
+    let payload = || StdinSource::Inline(Bytes::from_static(b"payload"));
+    let mut first = real_store_harness(supervisor_config.clone());
+    let (_remote, path) = served(&first.handle).await;
+    let authority = first.handle.current_authority().await.unwrap();
+    let sent = request(StdinSource::Empty);
+    let ExecCommand::Argv(argv) = &sent.command else {
+        unreachable!("request() runs an argv")
+    };
+    let call = serde_json::to_vec(&serde_json::json!({
+        "call": {
+            "authority": {
+                "repoId": authority.repo_id,
+                "workspace": authority.workspace,
+                "workspaceIncarnation": authority.workspace_incarnation,
+                "grantRevision": authority.grant_revision,
+                "lifecycleRevision": authority.lifecycle_revision,
+            },
+            "call": {
+                "call": "exec",
+                "session": null,
+                "buildVolume": null,
+                "background": false,
+                "request": {
+                    "argv": argv,
+                    "script": null,
+                    "cwd": sent.cwd,
+                    "mode": sent.mode,
+                    "env": sent.env,
+                    "trace": null,
+                    "stdin": { "kind": "inline" },
+                    "stdoutCopy": null,
+                    "stderrCopy": null,
+                    "admissionKey": "op-1",
+                },
+            },
+            "bytes": b"payload".len(),
+        }
+    }))
+    .unwrap();
+    let mut caller = tokio::net::UnixStream::connect(&path).await.unwrap();
+    for frame in [&call[..], &b"payload"[..]] {
+        caller
+            .write_all(&u32::try_from(frame.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        caller.write_all(frame).await.unwrap();
+    }
+    let spawned = first.spawned.recv().await.unwrap();
+    // Nothing was read: whatever the supervisor answered dies with the caller's socket.
+    drop(caller);
+    let job = spawned.request.job_id;
+    complete(&spawned, b"ran\n", b"", ExitStatus::Exited { code: 0 }).await;
+    first.handle.wait(job).await.unwrap();
+    first.handle.quiesce().await.unwrap();
+    first.handle.retire().await.unwrap();
+    drop(first);
+
+    let mut second = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&second.handle).await;
+    let key = AdmissionKey::new("op-1").unwrap();
+    assert_eq!(remote.job_by_key(key.clone()).await.unwrap(), job);
+    assert_eq!(
+        remote
+            .exec(None, None, keyed("op-1", payload()))
+            .await
+            .unwrap(),
+        job
+    );
+
+    let changed_argv = ExecRequest {
+        command: ExecCommand::Argv(vec!["printf".into(), "other".into()]),
+        ..keyed("op-1", payload())
+    };
+    let conflict = remote.exec(None, None, changed_argv).await.unwrap_err();
+    assert_eq!(conflict.code, ErrorCode::Conflict);
+    assert_eq!(
+        conflict.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Command],
+        })
+    );
+    let changed_bytes = remote
+        .exec(
+            None,
+            None,
+            keyed("op-1", StdinSource::Inline(Bytes::from_static(b"payloaD"))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        changed_bytes.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Stdin],
+        })
+    );
+    assert_eq!(
+        remote
+            .job_by_key(AdmissionKey::new("op-2").unwrap())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert!(
+        second.spawned.try_recv().is_err(),
+        "the job ran once: nothing spawned again"
+    );
+}
+
+/// A job store set aside in a keyed layout for this incarnation may hold any key: a keyed exec
+/// is refused with that reason, never spawned, and `jobByKey` says the same, never `NotFound`.
+#[tokio::test]
+async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let (supervisor_config, _root) = isolated_config("keyed-unprovable");
+    let set_aside = supervisor_config
+        .workspace_root
+        .join(".cowshed/job/set-aside")
+        .join(format!("layout-{FIRST_KEYED_LAYOUT}"));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&set_aside)
+        .unwrap();
+    let mut h = real_store_harness(supervisor_config);
+    let unprovable = AdmissionRefusal::Unprovable {
+        set_aside: set_aside.clone(),
+    };
+    let refused = h
+        .handle
+        .exec(None, None, keyed("op-1", StdinSource::Empty))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(refused.admission_source(), Some(&unprovable));
+    let lookup = h
+        .handle
+        .job_by_key(AdmissionKey::new("op-1").unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(lookup.admission_source(), Some(&unprovable));
+    assert!(h.spawned.try_recv().is_err(), "nothing ran under the key");
 }
 
 #[tokio::test]

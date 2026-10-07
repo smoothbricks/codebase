@@ -30,6 +30,7 @@ use super::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
+    AdmissionKey,
     CommandArg, ExecCommand, ExecRequest, JobId, JobJournalCursor, JobTailLimits,
     OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest, StdinSource, TraceContext,
     WorkspacePath,
@@ -293,6 +294,10 @@ enum Call {
     ListeningPorts {
         job_id: JobId,
     },
+    #[serde(rename_all = "camelCase")]
+    JobByKey {
+        key: AdmissionKey,
+    },
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
@@ -384,6 +389,7 @@ struct ExecWire {
     stdin: StdinWire,
     stdout_copy: Option<OutputPublication>,
     stderr_copy: Option<OutputPublication>,
+    admission_key: Option<AdmissionKey>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1055,6 +1061,7 @@ async fn answer(
                 stdin,
                 stdout_copy: request.stdout_copy,
                 stderr_copy: request.stderr_copy,
+                admission_key: request.admission_key,
             };
             let session = wire.map(session);
             let job_id = if background {
@@ -1115,6 +1122,7 @@ async fn answer(
             to_value(&supervisor.listening_ports(job_id).await?)?,
             Bytes::new(),
         ),
+        Call::JobByKey { key } => (to_value(&supervisor.job_by_key(key).await?)?, Bytes::new()),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
@@ -1601,6 +1609,13 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 .await,
             );
         }
+        Command::JobByKey {
+            authority,
+            key,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::JobByKey { key }, Bytes::new()).await);
+        }
         Command::List { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);
         }
@@ -1771,6 +1786,7 @@ async fn forward_exec(
             stdin,
             stdout_copy: request.stdout_copy,
             stderr_copy: request.stderr_copy,
+            admission_key: request.admission_key,
         }),
     };
     let admitted = call::<JobId>(path, &authority, call_request, payload).await;

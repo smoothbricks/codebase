@@ -7,12 +7,22 @@ export type { JobLogsArguments } from './native.generated.js';
 export class CowshedError extends Error {
   readonly code: Api.ErrorCode;
   readonly hint: string;
+  /** Present only on a keyed exec that spawned nothing, naming why and the job its key admitted. */
+  readonly admission?: Api.AdmissionRefusal;
 
-  constructor(code: Api.ErrorCode, message: string, hint: string, options?: ErrorOptions) {
+  constructor(
+    code: Api.ErrorCode,
+    message: string,
+    hint: string,
+    options?: ErrorOptions & { readonly admission?: Api.AdmissionRefusal },
+  ) {
     super(message, options);
     this.name = 'CowshedError';
     this.code = code;
     this.hint = hint;
+    if (options?.admission !== undefined) {
+      this.admission = options.admission;
+    }
   }
 }
 

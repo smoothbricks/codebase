@@ -25,6 +25,52 @@ export type AdmissionCommitment = {
   readonly grantRevision: number & tags.Type<'uint64'>;
 };
 
+/**
+ * A part of an exec request a repeat under its admission key must carry unchanged, by its
+ * request name.
+ */
+export type AdmissionField = 'command' | 'cwd' | 'mode' | 'env' | 'stdin' | 'session' | 'stdoutCopy' | 'stderrCopy';
+
+/**
+ * The caller's name for one idempotent exec within a workspace incarnation (07_api "Keyed
+ * admission"): 1 to [`MAX_ADMISSION_KEY_BYTES`] bytes of UTF-8, compared byte for byte. It grants
+ * no authority and means nothing in another incarnation.
+ */
+export type AdmissionKey = string &
+  tags.MinLength<1> &
+  tags.TagBase<{
+    kind: 'utf8Bytes';
+    target: 'string';
+    value: 4096;
+    validate: 'new TextEncoder().encode($input).byteLength <= 4096';
+  }>;
+
+export type AdmissionKeyRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly admissionKey: AdmissionKey;
+};
+
+/**
+ * Why a keyed exec spawned nothing. Each refusal names the job the key admitted, when the
+ * store can name it, so the caller reaches that job instead of exec'ing again.
+ *
+ * Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+ * refusal (`CowshedError::admission_source` answers `None`) rather than losing the whole error.
+ */
+export type AdmissionRefusal =
+  | ({ readonly reason: 'keyConflict' } & {
+      readonly jobId: JobId;
+      readonly fields: ReadonlyArray<AdmissionField>;
+    })
+  | ({ readonly reason: 'stdinBound' } & {
+      readonly jobId: JobId;
+    })
+  | ({ readonly reason: 'unprovable' } & {
+      readonly setAside: string;
+    });
+
 export type AdoptOptions = {
   readonly path?: string;
   readonly repoId?: RepoId;
@@ -272,6 +318,12 @@ export type CowshedError = {
    * wire otherwise, like `otherBuild`.
    */
   readonly retry?: Retry;
+  /**
+   * Present only on a keyed exec that spawned nothing (07_api "Keyed admission and restart
+   * attachment"), naming why and the job the key admitted. Absent from the wire otherwise,
+   * like `fence`.
+   */
+  readonly admission?: AdmissionRefusal;
 };
 
 /**
@@ -404,6 +456,7 @@ export type ExecParams = {
   readonly stdin: ExecStdin;
   readonly stdoutCopy: OutputPublication | null;
   readonly stderrCopy: OutputPublication | null;
+  readonly admissionKey?: AdmissionKey;
 };
 
 export type ExecRecord = ExecRecordRef;

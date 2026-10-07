@@ -82,6 +82,8 @@ pub enum DtoError {
     ScriptTooLarge,
     #[error("a command is exactly one of argv and script")]
     CommandShape,
+    #[error("an admission key is 1 to {MAX_ADMISSION_KEY_BYTES} UTF-8 bytes, got {0}")]
+    InvalidAdmissionKey(usize),
 }
 
 #[cfg_attr(
@@ -177,6 +179,60 @@ impl Serialize for GitOid {
 }
 
 impl<'de> Deserialize<'de> for GitOid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Longest admission key, in UTF-8 bytes: room for an executor's own operation identity.
+pub const MAX_ADMISSION_KEY_BYTES: usize = 4096;
+
+/// The caller's name for one idempotent exec within a workspace incarnation (07_api "Keyed
+/// admission"): 1 to [`MAX_ADMISSION_KEY_BYTES`] bytes of UTF-8, compared byte for byte. It grants
+/// no authority and means nothing in another incarnation.
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "string & tags.MinLength<1> & tags.TagBase<{ kind: 'utf8Bytes'; target: 'string'; value: 4096; validate: 'new TextEncoder().encode($input).byteLength <= 4096' }>"
+    )
+)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AdmissionKey(String);
+
+impl AdmissionKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
+        let value = value.into();
+        if (1..=MAX_ADMISSION_KEY_BYTES).contains(&value.len()) {
+            Ok(Self(value))
+        } else {
+            Err(DtoError::InvalidAdmissionKey(value.len()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AdmissionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for AdmissionKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AdmissionKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -2336,6 +2392,9 @@ pub struct ExecRequest {
     pub stdin: StdinSource,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
+    /// Names this exec for idempotent admission: a repeat with the same key and request answers
+    /// the job the first admitted, and never spawns again.
+    pub admission_key: Option<AdmissionKey>,
 }
 
 fn valid_ref_name(value: &str) -> bool {

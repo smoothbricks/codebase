@@ -19,6 +19,7 @@ use crate::api::dto::LandingCommits;
 #[cfg(target_os = "macos")]
 use crate::api::dto::RunSandboxMode;
 use crate::api::dto::{
+    AdmissionKey,
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
     GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
@@ -285,6 +286,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<SealedJob>;
+    /// The job `key` admitted in the workspace incarnation, from its durable records.
+    async fn job_by_key(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        key: AdmissionKey,
+    ) -> Result<JobId>;
     /// The job's terminal record, once it has one.
     async fn wait_job(
         &mut self,
@@ -1080,6 +1088,20 @@ impl ProjectActor {
             Op::WorkerJob(params) => {
                 respond::<operations::WorkerJob>(&self.job_info(&authority, params).await?)
             }
+            Op::WorkerJobByKey(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                respond::<operations::WorkerJobByKey>(
+                    &self
+                        .host
+                        .job_by_key(
+                            params.workspace,
+                            params.workspace_incarnation,
+                            params.admission_key,
+                        )
+                        .await?,
+                )
+            }
             Op::JobStatus(params) => {
                 respond::<operations::JobStatus>(&self.job_info(&authority, params).await?)
             }
@@ -1755,6 +1777,7 @@ fn exec_request(
             stdin,
             stdout_copy: params.stdout_copy,
             stderr_copy: params.stderr_copy,
+            admission_key: params.admission_key,
         },
     ))
 }
@@ -10927,6 +10950,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.ensure_supervisor(&workspace).await?.sealed(job).await
     }
 
+    async fn job_by_key(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        key: AdmissionKey,
+    ) -> Result<JobId> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        self.ensure_supervisor(&workspace)
+            .await?
+            .job_by_key(key)
+            .await
+    }
+
     async fn wait_job(
         &mut self,
         workspace: WorkspaceName,
@@ -12429,8 +12466,21 @@ mod removal_supervisor_tests {
             _job_id: JobId,
             _grant_revision: u64,
             _command: &ExecCommand,
+            admission: Option<crate::storage::job_artifact::JobAdmission>,
         ) -> Result<()> {
-            Ok(())
+            match admission {
+                None => Ok(()),
+                Some(_) => Err(CowshedError::internal(
+                    "this test sink keeps no admission keys",
+                )),
+            }
+        }
+
+        fn admitted(
+            &self,
+            _key: &crate::api::dto::AdmissionKey,
+        ) -> crate::storage::job_artifact::AdmissionLookup<'_> {
+            crate::storage::job_artifact::AdmissionLookup::Absent
         }
 
         fn prepare_background(&mut self, _job_id: JobId) -> Result<()> {
@@ -12616,6 +12666,7 @@ mod removal_supervisor_tests {
                     stdin: StdinSource::Empty,
                     stdout_copy: None,
                     stderr_copy: None,
+                    admission_key: None,
                 },
             )
             .await
@@ -13294,6 +13345,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         stdin: StdinSource::Empty,
         stdout_copy: None,
         stderr_copy: None,
+        admission_key: None,
     }
 }
 

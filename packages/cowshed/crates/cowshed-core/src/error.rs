@@ -95,6 +95,15 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     retry: Option<Retry>,
+    /// Present only on a keyed exec that spawned nothing (07_api "Keyed admission and restart
+    /// attachment"), naming why and the job the key admitted. Absent from the wire otherwise,
+    /// like `fence`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_to_this_build"
+    )]
+    admission: Option<Box<AdmissionRefusal>>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
@@ -136,6 +145,64 @@ pub enum Retry {
     /// Garbage collection found the store changed between its plan and its execution (another
     /// process reclaiming or retiring an image) and collected nothing.
     GcPlanStale,
+}
+
+/// A part of an exec request a repeat under its admission key must carry unchanged, by its
+/// request name.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdmissionField {
+    Command,
+    Cwd,
+    Mode,
+    Env,
+    Stdin,
+    Session,
+    StdoutCopy,
+    StderrCopy,
+}
+
+impl AdmissionField {
+    /// The name the wire spells this field with, for sentences.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Cwd => "cwd",
+            Self::Mode => "mode",
+            Self::Env => "env",
+            Self::Stdin => "stdin",
+            Self::Session => "session",
+            Self::StdoutCopy => "stdoutCopy",
+            Self::StderrCopy => "stderrCopy",
+        }
+    }
+}
+
+/// Why a keyed exec spawned nothing. Each refusal names the job the key admitted, when the
+/// store can name it, so the caller reaches that job instead of exec'ing again.
+///
+/// Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+/// refusal (`CowshedError::admission_source` answers `None`) rather than losing the whole error.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AdmissionRefusal {
+    /// The key admitted `job_id` for another request; `fields` names what this one changed. A
+    /// `Conflict`.
+    KeyConflict {
+        job_id: crate::api::dto::JobId,
+        fields: Vec<AdmissionField>,
+    },
+    /// The key admitted `job_id` with a live stdin stream, bound to that job once. The repeat
+    /// answers the job and cannot bind a second stream: its bytes go through an attachment. A
+    /// `Usage` error.
+    StdinBound { job_id: crate::api::dto::JobId },
+    /// A job store set aside in this workspace incarnation, at `set_aside`, may hold the key:
+    /// whether it admitted a job cannot be told, so nothing is spawned under it. A `Conflict`.
+    Unprovable { set_aside: std::path::PathBuf },
 }
 
 /// The most paths a [`FenceRefusal`] names; `total` still counts every one.
@@ -223,6 +290,7 @@ impl CowshedError {
             healing: None,
             fence: None,
             retry: None,
+            admission: None,
             lifecycle_conflict: None,
         }
     }
@@ -250,6 +318,7 @@ impl CowshedError {
             healing: None,
             fence: None,
             retry: None,
+            admission: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -274,6 +343,7 @@ impl CowshedError {
             healing: None,
             fence: None,
             retry: None,
+            admission: None,
             lifecycle_conflict: None,
         }
     }
@@ -300,6 +370,7 @@ impl CowshedError {
             healing: None,
             fence: None,
             retry: None,
+            admission: None,
             lifecycle_conflict: None,
         }
     }
@@ -321,6 +392,7 @@ impl CowshedError {
             healing: Some(heal),
             fence: None,
             retry: None,
+            admission: None,
             lifecycle_conflict: None,
         }
     }
@@ -343,6 +415,51 @@ impl CowshedError {
         Self {
             retry: Some(retry),
             ..Self::conflict(message, hint)
+        }
+    }
+
+    /// A keyed exec that spawned nothing: a `Usage` error for a second stream bound to the
+    /// key's job, else a `Conflict`, carrying the reason as [`AdmissionRefusal`].
+    pub fn admission_refusal(refusal: AdmissionRefusal) -> Self {
+        let error = match &refusal {
+            AdmissionRefusal::KeyConflict { job_id, fields } => Self::conflict(
+                format!(
+                    "the admission key already admitted job {} for another request: this one \
+                     changes its {}",
+                    job_id.get(),
+                    fields
+                        .iter()
+                        .map(|field| field.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!(
+                    "reach job {} with jobByKey, or exec the changed request under a new key",
+                    job_id.get()
+                ),
+            ),
+            AdmissionRefusal::StdinBound { job_id } => Self::usage(
+                format!(
+                    "stdin already bound to job {}; attach to write",
+                    job_id.get()
+                ),
+                format!(
+                    "attach to job {} and write its stdin through the attachment",
+                    job_id.get()
+                ),
+            ),
+            AdmissionRefusal::Unprovable { set_aside } => Self::conflict(
+                format!(
+                    "the admission key may have admitted a job recorded in the job store set \
+                     aside at {}, which this cowshed cannot read",
+                    set_aside.display()
+                ),
+                "exec under the key in a new workspace incarnation, or without a key",
+            ),
+        };
+        Self {
+            admission: Some(Box::new(refusal)),
+            ..error
         }
     }
 
@@ -469,6 +586,11 @@ impl CowshedError {
         self.retry
     }
 
+    /// Why a keyed exec spawned nothing, when this is that refusal.
+    pub fn admission_source(&self) -> Option<&AdmissionRefusal> {
+        self.admission.as_deref()
+    }
+
     pub const fn exit_code(&self) -> u8 {
         self.code.exit_code()
     }
@@ -514,6 +636,63 @@ mod tests {
         assert_eq!(
             CODES.map(ErrorCode::exec_wrapper_exit_code),
             [100, 101, 102, 103, 104, 105, 106]
+        );
+    }
+
+    /// The refusal crosses the controller socket as data: a caller reads the key's job from the
+    /// decoded error and attaches to it, never exec'ing again.
+    #[test]
+    fn a_bound_stdin_refusal_is_a_usage_error_naming_the_job_on_the_wire() {
+        use super::AdmissionRefusal;
+        let job_id = crate::api::dto::JobId::new(7).unwrap();
+        let error = CowshedError::admission_refusal(AdmissionRefusal::StdinBound { job_id });
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert_eq!(
+            error.message,
+            "stdin already bound to job 7; attach to write"
+        );
+        let value = serde_json::to_value(&error).expect("error serializes");
+        assert_eq!(
+            value["admission"],
+            serde_json::json!({ "reason": "stdinBound", "jobId": 7 })
+        );
+        let decoded: CowshedError = serde_json::from_value(value).expect("error decodes");
+        assert_eq!(
+            decoded.admission_source(),
+            Some(&AdmissionRefusal::StdinBound { job_id })
+        );
+        let plain = serde_json::to_value(CowshedError::conflict("stale", "retry")).unwrap();
+        assert!(plain.get("admission").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn a_key_conflict_names_each_changed_field_as_the_wire_spells_it() {
+        use super::{AdmissionField, AdmissionRefusal};
+        let fields = [
+            AdmissionField::Command,
+            AdmissionField::Cwd,
+            AdmissionField::Mode,
+            AdmissionField::Env,
+            AdmissionField::Stdin,
+            AdmissionField::Session,
+            AdmissionField::StdoutCopy,
+            AdmissionField::StderrCopy,
+        ];
+        for field in fields {
+            assert_eq!(
+                serde_json::to_value(field).unwrap(),
+                serde_json::json!(field.as_str())
+            );
+        }
+        let error = CowshedError::admission_refusal(AdmissionRefusal::KeyConflict {
+            job_id: crate::api::dto::JobId::new(3).unwrap(),
+            fields: vec![AdmissionField::Command, AdmissionField::StdoutCopy],
+        });
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(
+            error.message.ends_with("changes its command, stdoutCopy"),
+            "{}",
+            error.message
         );
     }
 

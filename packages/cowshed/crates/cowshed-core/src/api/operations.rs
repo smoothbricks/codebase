@@ -10,6 +10,7 @@
 //! table changes every projection together; no adapter restates a field list.
 
 use super::dto::{
+    AdmissionKey,
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, GcOptions, GcReport, GrantDelta,
     GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
@@ -315,6 +316,9 @@ operations! {
     worker json "worker.listJobs" WorkerListJobs(WorkerScope) -> Vec<JobInfo>;
     /// Resolves one job.
     worker json "worker.job" WorkerJob(JobRequest) -> JobInfo;
+    /// Names the job an admission key admitted in the workspace incarnation: the job whose exec
+    /// reply was lost.
+    worker json "worker.jobByKey" WorkerJobByKey(AdmissionKeyRequest) -> JobId;
     /// Takes a checkpoint.
     worker json "worker.checkpoint" WorkerCheckpoint(CheckpointRequest) -> CheckpointResult;
     /// Pushes the workspace's branch.
@@ -601,6 +605,17 @@ pub struct ExecParams {
     pub stdin: ExecStdin,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_key: Option<AdmissionKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionKeyRequest {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub admission_key: AdmissionKey,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

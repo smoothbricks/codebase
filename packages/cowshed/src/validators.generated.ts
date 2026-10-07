@@ -15,6 +15,31 @@ export const assertAdmissionCommitmentList = typia.createAssertEquals<readonly A
 export const parseAdmissionCommitmentList = (json: string): readonly Api.AdmissionCommitment[] =>
   assertAdmissionCommitmentList(JSON.parse(json));
 
+export const assertAdmissionField = typia.createAssertEquals<Api.AdmissionField>();
+export const parseAdmissionField = (json: string): Api.AdmissionField => assertAdmissionField(JSON.parse(json));
+export const assertAdmissionFieldList = typia.createAssertEquals<readonly Api.AdmissionField[]>();
+export const parseAdmissionFieldList = (json: string): readonly Api.AdmissionField[] =>
+  assertAdmissionFieldList(JSON.parse(json));
+
+export const assertAdmissionKey = typia.createAssertEquals<Api.AdmissionKey>();
+export const parseAdmissionKey = (json: string): Api.AdmissionKey => assertAdmissionKey(JSON.parse(json));
+export const assertAdmissionKeyList = typia.createAssertEquals<readonly Api.AdmissionKey[]>();
+export const parseAdmissionKeyList = (json: string): readonly Api.AdmissionKey[] =>
+  assertAdmissionKeyList(JSON.parse(json));
+
+export const assertAdmissionKeyRequest = typia.createAssertEquals<Api.AdmissionKeyRequest>();
+export const parseAdmissionKeyRequest = (json: string): Api.AdmissionKeyRequest =>
+  assertAdmissionKeyRequest(JSON.parse(json));
+export const assertAdmissionKeyRequestList = typia.createAssertEquals<readonly Api.AdmissionKeyRequest[]>();
+export const parseAdmissionKeyRequestList = (json: string): readonly Api.AdmissionKeyRequest[] =>
+  assertAdmissionKeyRequestList(JSON.parse(json));
+
+export const assertAdmissionRefusal = typia.createAssertEquals<Api.AdmissionRefusal>();
+export const parseAdmissionRefusal = (json: string): Api.AdmissionRefusal => assertAdmissionRefusal(JSON.parse(json));
+export const assertAdmissionRefusalList = typia.createAssertEquals<readonly Api.AdmissionRefusal[]>();
+export const parseAdmissionRefusalList = (json: string): readonly Api.AdmissionRefusal[] =>
+  assertAdmissionRefusalList(JSON.parse(json));
+
 export const assertAdoptOptions = typia.createAssertEquals<Api.AdoptOptions>();
 export const parseAdoptOptions = (json: string): Api.AdoptOptions => assertAdoptOptions(JSON.parse(json));
 export const assertAdoptOptionsList = typia.createAssertEquals<readonly Api.AdoptOptions[]>();

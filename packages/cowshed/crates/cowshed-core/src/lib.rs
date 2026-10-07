@@ -66,7 +66,8 @@ mod scratch_apfs;
 mod temp_root;
 
 pub use error::{
-    CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result, Retry,
+    AdmissionRefusal, CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result,
+    Retry,
 };
 pub use gateway_inventory::{
     AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,

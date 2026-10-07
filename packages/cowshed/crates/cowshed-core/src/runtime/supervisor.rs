@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{
+    AdmissionKey,
     BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
     JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits, OutputLimitInfo,
     OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest,
@@ -23,7 +24,7 @@ use crate::api::dto::{
     WorkspacePath,
 };
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
-use crate::error::{CowshedError, Result};
+use crate::error::{AdmissionRefusal, CowshedError, Result};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
@@ -46,8 +47,9 @@ use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
-    ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
-    SealedCheckpointManifest, StreamKind,
+    AdmissionLookup, AdmittedSession, AdmittedStdin, ArtifactConfig, ArtifactError, ArtifactStore,
+    CompletedJobArtifacts, JobAdmission, JobEnding, OutputTargets, SealedCheckpointManifest,
+    StreamKind,
 };
 
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
@@ -531,7 +533,16 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()>;
+    /// Durably admit `job_id`, under `admission`'s key when it has one, before it spawns.
+    fn admit(
+        &mut self,
+        job_id: JobId,
+        grant_revision: u64,
+        command: &ExecCommand,
+        admission: Option<JobAdmission>,
+    ) -> Result<()>;
+    /// What this workspace incarnation's admissions say of `key`.
+    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
     fn seal(
@@ -605,10 +616,22 @@ impl ArtifactSink for ArtifactStoreSink {
         })
     }
 
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()> {
+    fn admit(
+        &mut self,
+        job_id: JobId,
+        grant_revision: u64,
+        command: &ExecCommand,
+        admission: Option<JobAdmission>,
+    ) -> Result<()> {
         let token = self
             .store
-            .begin_job(job_id, grant_revision, command, OutputTargets::default())
+            .begin_job(
+                job_id,
+                grant_revision,
+                command,
+                admission,
+                OutputTargets::default(),
+            )
             .map_err(map_artifact_error)?;
         if token.job_id() != job_id || self.tokens.insert(job_id, token).is_some() {
             return Err(CowshedError::integrity(
@@ -617,6 +640,10 @@ impl ArtifactSink for ArtifactStoreSink {
             ));
         }
         Ok(())
+    }
+
+    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
+        self.store.admitted(key)
     }
 
     fn prepare_background(&mut self, job_id: JobId) -> Result<()> {
@@ -2230,6 +2257,17 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// The job `key` admitted in this workspace incarnation, from its durable records: answered
+    /// after the exec's reply was lost, and by a supervisor that did not run the job.
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobId> {
+        self.call(|reply| Command::JobByKey {
+            authority: self.authority.clone(),
+            key,
+            reply,
+        })
+        .await
+    }
+
     pub async fn list(&self) -> Result<Vec<JobInfo>> {
         self.call(|reply| Command::List {
             authority: self.authority.clone(),
@@ -2565,6 +2603,11 @@ pub(super) enum Command {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
         reply: oneshot::Sender<Result<JobListeningPorts>>,
+    },
+    JobByKey {
+        authority: WorkspaceAuthoritySnapshot,
+        key: AdmissionKey,
+        reply: oneshot::Sender<Result<JobId>>,
     },
     List {
         authority: WorkspaceAuthoritySnapshot,
@@ -3014,6 +3057,27 @@ impl SupervisorActor {
                     }
                 }
             }
+            Command::JobByKey {
+                authority,
+                key,
+                reply,
+            } => {
+                let result = self.validate_authority(&authority).and_then(|()| {
+                    match self.artifacts.admitted(&key) {
+                        AdmissionLookup::Admitted { job_id, .. } => Ok(job_id),
+                        AdmissionLookup::Absent => Err(CowshedError::not_found(
+                            "the admission key admitted no job in this workspace incarnation",
+                            "exec the request under the key; nothing ran under it",
+                        )),
+                        AdmissionLookup::Unprovable { set_aside } => Err(
+                            CowshedError::admission_refusal(AdmissionRefusal::Unprovable {
+                                set_aside: set_aside.to_path_buf(),
+                            }),
+                        ),
+                    }
+                });
+                let _ = reply.send(result);
+            }
             Command::List { authority, reply } => {
                 // A job the store refused to seal makes the list fail with that refusal rather
                 // than vanish from it or appear with a projection no record backs.
@@ -3401,6 +3465,48 @@ impl SupervisorActor {
         });
     }
 
+    /// What `key` binds: `request` as the caller sent it, in `session`, before the session lends
+    /// it a cwd or an environment. Withheld credential names are no part of it, as they are no
+    /// part of any job's environment, and so never reach the job record.
+    fn job_admission(
+        &self,
+        key: AdmissionKey,
+        request: &ExecRequest,
+        session: Option<&SessionToken>,
+    ) -> Result<JobAdmission> {
+        let stdin = match &request.stdin {
+            StdinSource::Empty => AdmittedStdin::Empty,
+            StdinSource::Inline(bytes) => AdmittedStdin::Inline {
+                sha256: Sha256Digest::compute(bytes),
+                bytes: u64::try_from(bytes.len())
+                    .map_err(|_| CowshedError::internal("inline stdin length exceeds u64"))?,
+            },
+            StdinSource::Stream(_) => AdmittedStdin::Stream,
+            StdinSource::WorkspaceFile(path) => AdmittedStdin::WorkspaceFile(path.clone()),
+        };
+        Ok(JobAdmission {
+            key,
+            cwd: request.cwd.clone(),
+            mode: request.mode,
+            env: request
+                .env
+                .iter()
+                .filter(|(name, _)| !self.credential_env_names.contains(*name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            stdin,
+            session: match session {
+                None => AdmittedSession::None,
+                Some(token) => token
+                    .name
+                    .clone()
+                    .map_or(AdmittedSession::Unnamed, AdmittedSession::Named),
+            },
+            stdout_copy: request.stdout_copy.clone(),
+            stderr_copy: request.stderr_copy.clone(),
+        })
+    }
+
     /// Admit and spawn one job, granted `build_volume`.
     async fn admit_exec(
         &mut self,
@@ -3425,6 +3531,42 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
+        // A key's repeat answers before anything else is touched: its session keeps the cwd and
+        // environment it had, no build volume is held and no job id is taken.
+        let admission = match &request.admission_key {
+            None => None,
+            Some(key) => {
+                let admission = self.job_admission(key.clone(), &request, session.as_ref())?;
+                match self.artifacts.admitted(key) {
+                    AdmissionLookup::Absent => Some(admission),
+                    AdmissionLookup::Admitted {
+                        job_id,
+                        command,
+                        admission: admitted,
+                    } => {
+                        let fields = admitted.differences(command, &admission, &request.command);
+                        return if !fields.is_empty() {
+                            Err(CowshedError::admission_refusal(
+                                AdmissionRefusal::KeyConflict { job_id, fields },
+                            ))
+                        } else if admission.stdin == AdmittedStdin::Stream {
+                            Err(CowshedError::admission_refusal(
+                                AdmissionRefusal::StdinBound { job_id },
+                            ))
+                        } else {
+                            Ok(job_id)
+                        };
+                    }
+                    AdmissionLookup::Unprovable { set_aside } => {
+                        return Err(CowshedError::admission_refusal(
+                            AdmissionRefusal::Unprovable {
+                                set_aside: set_aside.to_path_buf(),
+                            },
+                        ));
+                    }
+                }
+            }
+        };
         let build_hold = self.hold_build_volume(build_volume.as_deref())?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this
         // checkout's name, once.
@@ -3449,6 +3591,7 @@ impl SupervisorActor {
             stdin,
             stdout_copy,
             stderr_copy,
+            admission_key: _,
         } = request;
         command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
@@ -3510,7 +3653,7 @@ impl SupervisorActor {
         {
             let _span = crate::timing::span("admit", "record");
             self.artifacts
-                .admit(job_id, self.authority.grant_revision, &command)?;
+                .admit(job_id, self.authority.grant_revision, &command, admission)?;
         }
         self.next_job_id = expected_next;
         let admission = crate::timing::spanned(
@@ -5238,13 +5381,21 @@ fn missing_artifact_token(job_id: JobId) -> CowshedError {
 }
 
 /// A store refusal as the caller reports it: records a newer cowshed wrote are a version
-/// conflict this build must not touch; anything else is damage to the store.
+/// conflict this build must not touch, and a key another writer bound first is the caller's to
+/// look up; anything else is damage to the store.
 pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
     match error {
         ArtifactError::NewerLayout { .. } => CowshedError::conflict(
             error.to_string(),
             "run the cowshed that wrote these records; this build is older",
         ),
+        ArtifactError::AdmissionKeyTaken { admitted, .. } => CowshedError::conflict(
+            error.to_string(),
+            format!("reach job {} with jobByKey", admitted.get()),
+        ),
+        ArtifactError::AdmissionKeyUnprovable { set_aside } => {
+            CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })
+        }
         error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
     }
 }
@@ -6241,6 +6392,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 7,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6263,6 +6415,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(2).unwrap(),
                 8,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -6387,6 +6540,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();

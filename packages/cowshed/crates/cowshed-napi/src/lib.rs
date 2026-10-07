@@ -19,8 +19,8 @@ use std::{
 
 use bytes::Bytes;
 use cowshed_core::{
-    Coordinator as CoreCoordinator, Cowshed, CowshedError, JobHandle as CoreJobHandle,
-    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
+    AdmissionRefusal, Coordinator as CoreCoordinator, Cowshed, CowshedError,
+    JobHandle as CoreJobHandle, Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
@@ -43,6 +43,8 @@ struct AddonFailure {
     code: &'static str,
     message: String,
     hint: String,
+    /// The keyed exec refusal core typed, carried to JavaScript as its own property.
+    admission: Option<AdmissionRefusal>,
 }
 
 // Constructors delegate to `CowshedError` so the addon can never invent a code spelling or a
@@ -66,6 +68,7 @@ impl From<CowshedError> for AddonFailure {
     fn from(error: CowshedError) -> Self {
         Self {
             code: error.code.as_str(),
+            admission: error.admission_source().cloned(),
             message: error.message,
             hint: error.hint,
         }
@@ -75,7 +78,9 @@ impl From<CowshedError> for AddonFailure {
 type AddonResult<T> = std::result::Result<T, AddonFailure>;
 
 /// Hands JavaScript a `CowshedError`-shaped rejection: `code` from core's taxonomy, `message`
-/// unmodified, and `hint` as a real property on the JS `Error`.
+/// unmodified, and `hint` as a real property on the JS `Error`; a typed admission refusal rides
+/// as an `admission` property holding its canonical JSON, which `src/index.ts` decodes with the
+/// generated validator.
 ///
 /// The hint used to be appended to `message` behind a `\nnext: ` delimiter that `src/index.ts`
 /// split back off, which made one wire delimiter a literal in two languages and turned any
@@ -87,11 +92,12 @@ fn to_napi_error(env: Env, failure: AddonFailure) -> napi::Error {
         code,
         message,
         hint,
+        admission,
     } = failure;
-    if let Ok(hinted) = hinted_error(env, code, &message, &hint) {
+    if let Ok(hinted) = hinted_error(env, code, &message, &hint, admission.as_ref()) {
         return hinted;
     }
-    // Setting the property is the only fallible step, and only the environment can refuse it. The
+    // Setting a property is the only fallible step, and only the environment can refuse it. The
     // code and message still have to reach JavaScript when it does; `index.ts` then declines to
     // recognise a hintless error as ours rather than inventing a hint for it.
     napi::Error::from(JsError::from(napi::Error::new(code, message)).into_unknown(env))
@@ -102,11 +108,18 @@ fn hinted_error(
     code: &'static str,
     message: &str,
     hint: &str,
+    admission: Option<&AdmissionRefusal>,
 ) -> napi::Result<napi::Error> {
     let mut error = JsError::from(napi::Error::new(code, message.to_owned()))
         .into_unknown(env)
         .coerce_to_object()?;
     error.set_named_property("hint", hint)?;
+    if let Some(admission) = admission {
+        let admission = serde_json::to_string(admission).map_err(|error| {
+            napi::Error::from_reason(format!("cannot encode an admission refusal: {error}"))
+        })?;
+        error.set_named_property("admission", admission)?;
+    }
     Ok(napi::Error::from(error.into_unknown()))
 }
 

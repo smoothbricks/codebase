@@ -750,6 +750,8 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stdin: ExecStdin,
             stdout_copy: Option<OutputPublication>,
             stderr_copy: Option<OutputPublication>,
+            #[serde(default)]
+            admission_key: Option<AdmissionKey>,
         }
         let Caller {
             session,
@@ -762,6 +764,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stdin,
             stdout_copy,
             stderr_copy,
+            admission_key,
         } = decode::<WorkerExec, Caller>(arguments)?;
         Ok(ExecParams {
             repo_id: owned(authority.repo_id),
@@ -777,6 +780,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stdin,
             stdout_copy,
             stderr_copy,
+            admission_key,
         })
     }
 }
@@ -884,6 +888,28 @@ impl Serves<WorkerJob> for WorkspaceHandle {
             workspace: owned(authority.workspace),
             workspace_incarnation: owned(authority.workspace_incarnation),
             job_id,
+        })
+    }
+}
+
+impl Serves<WorkerJobByKey> for WorkspaceHandle {
+    const BOUND: &'static [&'static str] = &["repoId", "workspace", "workspaceIncarnation"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<AdmissionKeyRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            admission_key: AdmissionKey,
+        }
+        let Caller { admission_key } = decode::<WorkerJobByKey, Caller>(arguments)?;
+        Ok(AdmissionKeyRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            admission_key,
         })
     }
 }
@@ -1219,6 +1245,7 @@ pub(crate) fn each_served(
     check.served::<WorkerShell, _>(workspace_handle, &[]);
     check.served::<WorkerListJobs, _>(workspace_handle, &[]);
     check.served::<WorkerJob, _>(workspace_handle, &[]);
+    check.served::<WorkerJobByKey, _>(workspace_handle, &[]);
     check.served::<WorkerCheckpoint, _>(workspace_handle, &[]);
     check.served::<WorkerPush, _>(workspace_handle, &[]);
     check.served::<SessionClose, _>(workspace_handle, &[]);

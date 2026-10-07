@@ -2030,6 +2030,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
                 .stderr_copy
                 .map(|path| publication(path, "stderr copy"))
                 .transpose()?,
+            admission_key: None,
         },
         session: args.session,
         background: args.background,
@@ -4915,6 +4916,7 @@ mod tests {
                     stdin: StdinSource::Empty,
                     stdout_copy: None,
                     stderr_copy: None,
+                    admission_key: None,
                 })
                 .await
                 .expect("exec")

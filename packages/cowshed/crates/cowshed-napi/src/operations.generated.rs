@@ -382,6 +382,13 @@ impl WorkspaceHandle {
         super::job_call::<operations::WorkerJob>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Names the job an admission key admitted in the workspace incarnation: the job whose exec
+    /// reply was lost.
+    #[napi(js_name = "jobByKey")]
+    pub fn job_by_key(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::job_call::<operations::WorkerJobByKey>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Takes a checkpoint.
     #[napi(js_name = "checkpoint")]
     pub fn checkpoint(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

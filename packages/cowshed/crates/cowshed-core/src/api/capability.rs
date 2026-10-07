@@ -1,6 +1,6 @@
 use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
+    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
     GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
     LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
@@ -10,6 +10,7 @@ use super::dto::{
 };
 use super::frame;
 use super::operations::{
+    AdmissionKeyRequest,
     self, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest, CreateRequest, DestroyRequest,
     ExecParams, ExecStdin, GcRequest, GrantRequest, JobRequest, JobStream, LandRequest, LogsChunk,
     LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation, ProjectGrantRequest,
@@ -307,6 +308,7 @@ impl ControllerRuntime for ActorRuntime {
             stdin,
             stdout_copy,
             stderr_copy,
+            admission_key,
         } = request;
         let (stdin, inline, mut stream) = match stdin {
             StdinSource::Empty => (ExecStdin::Empty, None, None),
@@ -334,6 +336,7 @@ impl ControllerRuntime for ActorRuntime {
             stdin,
             stdout_copy,
             stderr_copy,
+            admission_key,
         };
         let job_id = match inline {
             Some(bytes) => invoke_upload::<operations::WorkerExec>(self, &params, bytes).await?,
@@ -1938,6 +1941,24 @@ impl WorkspaceHandle {
         Ok(self.job_handle(id))
     }
 
+    /// The job `key` admitted in this workspace incarnation: reached when the exec's reply was
+    /// lost, without exec'ing again.
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobHandle> {
+        let WorkerScope {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+        } = self.authority.scope();
+        let request = AdmissionKeyRequest {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+            admission_key: key,
+        };
+        let id = invoke::<operations::WorkerJobByKey>(&*self.runtime, &request).await?;
+        Ok(self.job_handle(id))
+    }
+
     /// A job's terminal record from the workspace's durable records, and a handle whose
     /// [`JobHandle::logs`] reads its sealed output from any offset. Answered for any job of this
     /// incarnation that has ended — including one an earlier supervisor ran and sealed, which
@@ -2434,6 +2455,7 @@ mod tests {
             stdin,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         }
     }
     fn workspace_ref(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceRef {
