@@ -238,26 +238,27 @@ Both runtimes receive the same typed `CowshedError` with stable kebab-case `code
 `hint`. Workspace and grant DTOs are serialized directly from cowshed-core and Typia-validated by the TypeScript facade.
 
 The addon exposes coordinator lifecycle operations, workspace exec and named sessions, numeric job lookup, `status()`,
-`wait()`, `kill()`, attachment/detachment, and buffered `readLogs(stream, follow?)`. Dropping a job handle or detaching
-its view does not kill the job. `readLogs` reads from byte zero and resolves only when its selected stream closes when
-following; it is not a bounded running-command tail.
+`wait()`, `kill()`, `detach()`, and `logs({ stream, offset, follow })`. Dropping a job handle or detaching its view does
+not kill the job. `logs` answers one chunk of a stream from `offset` with its `nextOffset` and `eof`; reading again from
+`nextOffset` continues where the chunk ended, and `follow` waits for bytes or the stream's end. It is not a bounded
+running-command tail.
 
 ### Implementation status — monitoring gaps
 
 Job resource samples, progress events, cursor-addressed bounded tails, resumable N-API raw-byte streams, attachment
 stdio/EOF, identity-fenced group-listener queries, and `AbortSignal` plumbing are unbuilt. The Rust core already
-supports offset-addressed raw log reads, numeric-job reattachment, and attachment stdin writes; its `JobStdin` has no
-explicit close operation. The addon does not yet expose that full surface. One-use worker descriptor connection is also
-unbuilt. Fork/exec tree observations, per-process CPU/RSS/I/O and blocker facts, typed process event streams,
-CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt. Complete cgroup job totals, separate
-charged-memory counters, measured fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt
-as well.
+supports numeric-job reattachment and attachment stdin writes; its `JobStdin` has no explicit close operation. The addon
+does not yet expose attachment. One-use worker descriptor connection is also unbuilt. Fork/exec tree observations,
+per-process CPU/RSS/I/O and blocker facts, typed process event streams, CPU-winning leaf identity, and their
+`process.run`/job spans are also unbuilt. Complete cgroup job totals, separate charged-memory counters, measured
+fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt as well.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
-TypeScript public types and validators are generated projections, never a second hand-maintained field list. This
-generation is unbuilt: the addon serializes core DTOs, while its requests, TypeScript declarations, and adapter methods
-are handwritten; the shared wire corpus checks their agreement but does not generate them.
+TypeScript public types and validators are generated projections, never a second hand-maintained field list. Every
+declared controller operation reaches the addon as a generated adapter on the handle that binds its authority, with a
+generated TypeScript declaration whose argument type picks exactly the request fields the caller names. Of the
+monitoring surface above, only `kill` is declared yet; the rest is generated once it is declared.
 
 Each `JobResourceSample` carries its own `jobId`. Its start baseline is the first job-owned process, including a cold
 shell's activation; progress and terminal accounting include that activation, but never charge the idle time of a
