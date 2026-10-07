@@ -1411,29 +1411,79 @@ index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab
          for (let t of taskResults) {
              this.allCompletedTasks.set(t.task.id, t.task);
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..e64948e720a0a4ce916d2e5071439276ff61e9e4 100644
+index 4e64afa..44e0eed 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
-@@ -739,8 +739,20 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -374,7 +374,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+         nxArgs.targets.includes(t.target.target));
+     const { lifeCycle, renderIsDone, printSummary, restoreTerminal } = await getTerminalOutputLifeCycle(initiatingProject, initiatingTasks, projectNames, tasks, taskGraph, nxArgs, nxJson, overrides);
+     try {
+-        const taskResults = await invokeTasksRunner({
++        const { taskResults, skippedTaskIds } = await runTasks({
+             tasks,
+             projectGraph,
+             taskGraph,
+@@ -395,7 +395,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+             logger_1.logger.log((0, nx_key_1.createNxKeyLicenseeInformation)(nxKey));
+         return {
+             taskResults,
+-            completed: didCommandComplete(tasks, taskResults),
++            completed: didCommandComplete(tasks, taskResults, skippedTaskIds),
+         };
+     }
+     catch (e) {
+@@ -424,13 +424,15 @@ async function printConfigureAiAgentsDisclaimer() {
+         // Silently ignore errors
+     }
+ }
+-function didCommandComplete(tasks, taskResults) {
++function didCommandComplete(tasks, taskResults, skippedTaskIds) {
+     if (tasks.length === 0)
+         return true;
+     for (const task of tasks) {
+         if (!task.continuous) {
+-            // Discrete task must have a result (was started and finished)
+-            if (!taskResults[task.id])
++            // Discrete task must have a result (was started and finished), or
++            // have been skipped because a dependency failed: neither is an
++            // interrupted run.
++            if (!taskResults[task.id] && !skippedTaskIds.has(task.id))
+                 return false;
+         }
+     }
+@@ -659,7 +661,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
+         process.env.NX_LOAD_DOT_ENV_FILES = 'true';
+     }
+ }
+-async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nxJson, nxArgs, loadDotEnvFiles, initiatingProject, initiatingTasks, }) {
++/**
++ * Runs the tasks and returns what every life cycle saw end, unchanged from
++ * what Nx has always returned: a task the orchestrator skips because a
++ * dependency failed reaches no life cycle, so it has no result here, and
++ * callers that replay Nx's skip rule over these results keep working.
++ */
++async function invokeTasksRunner(args) {
++    return (await runTasks(args)).taskResults;
++}
++async function runTasks({ tasks, projectGraph, taskGraph, lifeCycle, nxJson, nxArgs, loadDotEnvFiles, initiatingProject, initiatingTasks, }) {
+     setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
+     // this needs to be done before we start to run the tasks
+     const taskDetails = (0, hash_task_1.getTaskDetails)();
+@@ -739,8 +750,15 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
      if (promiseOrObservable.subscribe) {
          promiseOrObservable = convertObservableToPromise(promiseOrObservable);
      }
 -    await promiseOrObservable;
 -    return taskResultsLifecycle.getTaskResults();
 +    const statuses = await promiseOrObservable;
-+    const taskResults = taskResultsLifecycle.getTaskResults();
-+    // The orchestrator tells no life cycle about a task it skips because a
-+    // dependency failed (the terminal output lists it among the tasks it never
-+    // saw end), so only the runner's own answer knows of it. Without a result
-+    // for it, didCommandComplete takes the run for an interrupted one and an
-+    // ordinary failure exits 130 instead of 1. A custom runner's answer is
-+    // typed `any`, so a runner that answers nothing adds nothing.
-+    for (const [taskId, status] of Object.entries(statuses ?? {})) {
-+        if (status === 'skipped' && !taskResults[taskId]) {
-+            taskResults[taskId] = { task: taskGraph.tasks[taskId], status, code: 1 };
-+        }
-+    }
-+    return taskResults;
++    // Only the runner's own answer knows the tasks it skipped because a
++    // dependency failed; runCommandForTasks needs them to tell an ordinary
++    // failure from an interrupted run. A custom runner's answer is typed `any`,
++    // so a runner that answers nothing names none.
++    const skippedTaskIds = new Set(Object.entries(statuses ?? {})
++        .filter(([, status]) => status === 'skipped')
++        .map(([taskId]) => taskId));
++    return { taskResults: taskResultsLifecycle.getTaskResults(), skippedTaskIds };
  }
  function constructLifeCycles(lifeCycle, taskGraph, nxJson, skipNxCache) {
      const lifeCycles = [];

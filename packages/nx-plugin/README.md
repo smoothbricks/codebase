@@ -646,9 +646,12 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   failed one, and tells no life cycle about a skipped task, so the results `nx` reads its exit status from had none for
   it; `didCommandComplete` takes a discrete task without a result for one the run never finished, and `nx` exited 130,
   the status of an interrupted run. A gate then reported `Failed to run "nx" due to exit code 130` for an ordinary test
-  failure. The patch records each task the runner reports skipped as a skipped result, so the exit status is 1; the
-  terminal output, which already listed it under "Tasks not run", is unchanged. Not yet proposed upstream: Nx `master`
-  reports skipped tasks the same way.
+  failure. The patch has `didCommandComplete` also accept a task the runner reports skipped, so the exit status is 1;
+  the terminal output, which already listed it under "Tasks not run", is unchanged. Only that check sees the runner's
+  skipped tasks: `invokeTasksRunner` and the plugins' `postTasksExecution` hooks still get Nx's own results, with none
+  for a skipped task, so a caller that replays Nx's skip rule over them counts it once. (An earlier version of this hunk
+  added a skipped result to those results, and such a caller counted no task as skipped.) Not yet proposed upstream: Nx
+  `master` reports skipped tasks the same way.
 - **A workspace has one daemon, and a second one leaves it alone.** Every daemon overwrote `server-process.json` with
   its own pid, so two clients that each found no daemon started two, and the later one displaced the earlier. A client
   of the displaced daemon lost its socket mid-request (`EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`) after the run had printed
