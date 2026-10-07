@@ -1,13 +1,15 @@
-//! Measures the Linux process event sources the supervisor chooses between (07_api.md,
-//! "Complete job accounting and observation reconciliation"): proc connector `CN_PROC` and ptrace
-//! fork/exec/exit tracing, each against an unobserved baseline and a census control that reads
-//! the tree before and after a burst, as a one-second poll would.
+//! Measures ptrace fork/exec/exit tracing, the Linux process event source a supervisor can run
+//! as the job's parent (07_api.md, "Complete job accounting and observation reconciliation"),
+//! against an unobserved baseline and a census that reads the tree before and after a burst, as
+//! a one-second poll would. The proc connector is measured on the same workload by a probe built
+//! against the kernel's own `cn_proc.h`: no crate this workspace locks carries those records.
 //!
 //! One workload runs unchanged under every mode. The harness re-executes this test binary as the
-//! job's root, held on a gate pipe until the observer is ready. The root forks children one after
-//! another; each forks a grandchild that execs `true proc-source <i>`. Every parent records each
-//! child it reaps -- pid, parent, kernel start time read while the child is an unreaped zombie,
-//! wait status and exec index -- into an oracle file, independently of any observer.
+//! job's root, held on a gate pipe until the observer is ready. The root starts children one
+//! after another, each this binary again in the child role; each child starts a grandchild that
+//! execs `true proc-source <i>`. Every parent records each process it reaps -- pid, parent,
+//! kernel start time read while it is an unreaped zombie, wait status and the argv it was given
+//! -- as a JSON line in an oracle file, independently of any observer.
 //!
 //! A mode the kernel or sandbox refuses is reported with the refused call and its errno, never
 //! as an observation with zero events. The report is printed and, when
@@ -18,24 +20,27 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
 use std::time::Instant;
 
-use serde::Serialize;
+use cowshed_core::api::CommandArg;
+use serde::{Deserialize, Serialize};
 
 const ROLE: &str = "COWSHED_PROCESS_SOURCE_ROLE";
 const TRUE_PROGRAM: &str = "COWSHED_PROCESS_SOURCE_TRUE";
 const REPORT: &str = "COWSHED_PROCESS_SOURCE_REPORT";
-const ROOT_TEST: &str = "process_source_workload_root";
+const ROLE_TEST: &str = "process_source_workload_role";
 
-/// The fds the root inherits.
+/// The fds the root inherits; a child inherits only the oracle.
 const GATE_FD: RawFd = 3;
 const ORACLE_FD: RawFd = 4;
 const DONE_FD: RawFd = 5;
@@ -43,190 +48,207 @@ const HOLD_FD: RawFd = 6;
 
 /// A burst a one-second census cannot see, and a fork-heavy run for overhead.
 const COVERAGE_BURST: u32 = 32;
-const OVERHEAD_BURST: u32 = 512;
+const OVERHEAD_BURST: u32 = 256;
 const REPETITIONS: u32 = 5;
-
-const RECORD_BYTES: usize = 24;
 
 /// The root's exit code when `PTRACE_TRACEME` fails; the errno follows on the error pipe.
 const TRACEME_FAILED: c_int = 121;
 
-const CN_IDX_PROC: u32 = 1;
-const CN_VAL_PROC: u32 = 1;
-const PROC_CN_MCAST_LISTEN: u32 = 1;
-const PROC_EVENT_NONE: u32 = 0;
-const PROC_EVENT_FORK: u32 = 1;
-const PROC_EVENT_EXEC: u32 = 2;
-const PROC_EVENT_EXIT: u32 = 0x8000_0000;
-/// The `ack` of this fixture's listen request.
-const LISTEN_ACK: u32 = 0x6373_6864;
-const NLMSG_HEADER: usize = 16;
-const CN_MSG_HEADER: usize = 20;
-
 // ---------------------------------------------------------------------------------------------
-// The workload root.
+// The workload.
 
-/// The job's root, run only when the harness re-executes this binary with [`ROLE`] set.
+/// What the harness asks a re-executed test binary to be.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "role", rename_all = "camelCase")]
+enum Role {
+    Root { burst: u32 },
+    Child { index: u32 },
+}
+
+/// One process a fixture parent reaped.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OracleRecord {
+    pid: u32,
+    ppid: u32,
+    start: u64,
+    wait_status: i32,
+    argv: Vec<CommandArg>,
+}
+
+/// The workload's root or child, run only when the harness re-executes this binary with
+/// [`ROLE`] set.
 #[test]
-fn process_source_workload_root() {
-    let Some(burst) = std::env::var_os(ROLE) else {
+fn process_source_workload_role() {
+    let Some(role) = std::env::var_os(ROLE) else {
         return;
     };
-    let burst: u32 = burst
-        .to_str()
-        .and_then(|burst| burst.parse().ok())
-        .expect("burst size");
-    let program = CString::new(
-        std::env::var_os(TRUE_PROGRAM)
-            .expect("true program")
-            .into_vec(),
-    )
-    .expect("program path");
-    let arguments: Vec<[CString; 3]> = (0..burst)
-        .map(|index| {
-            [
-                CString::new("true").expect("argv"),
-                CString::new("proc-source").expect("argv"),
-                CString::new(index.to_string()).expect("argv"),
-            ]
-        })
-        .collect();
-    let argv: Vec<[*const c_char; 4]> = arguments
-        .iter()
-        .map(|[a, b, c]| [a.as_ptr(), b.as_ptr(), c.as_ptr(), ptr::null()])
-        .collect();
-    let environment: [*const c_char; 1] = [ptr::null()];
-
-    read_byte(GATE_FD).expect("gate");
-    for (index, argv) in argv.iter().enumerate() {
-        let index = i32::try_from(index).expect("index");
-        // SAFETY: after fork the child calls only async-signal-safe functions on memory
-        // prepared before the fork.
-        match unsafe { libc::fork() } {
-            -1 => panic!("fork: {}", io::Error::last_os_error()),
-            0 => unsafe {
-                let grandchild = libc::fork();
-                if grandchild == 0 {
-                    libc::execve(program.as_ptr(), argv.as_ptr(), environment.as_ptr());
-                    libc::_exit(127);
-                }
-                if grandchild < 0 || !reap_recording(grandchild, index) {
-                    libc::_exit(125);
-                }
-                libc::_exit(0);
-            },
-            child => assert!(reap_recording(child, -1), "record child {child}"),
+    let role: Role = serde_json::from_slice(role.as_bytes()).expect("role");
+    match role {
+        Role::Root { burst } => {
+            let image = Image::test_binary();
+            let children: Vec<Exec> = (0..burst)
+                .map(|index| image.exec(Role::Child { index }))
+                .collect();
+            read_byte(GATE_FD).expect("gate");
+            for child in &children {
+                child.run_and_record();
+            }
+            write_byte(DONE_FD).expect("done");
+            read_byte(HOLD_FD).expect("hold");
         }
-    }
-    write_byte(DONE_FD).expect("done");
-    read_byte(HOLD_FD).expect("hold");
-}
-
-/// Wait for `pid` to exit without reaping it, read its start time while it is a zombie, reap it
-/// and append its record to the oracle. Async-signal-safe: no allocation.
-fn reap_recording(pid: libc::pid_t, exec_index: i32) -> bool {
-    let Ok(id) = libc::id_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: plain syscalls on stack memory.
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        if libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) != 0 {
-            return false;
+        Role::Child { index } => {
+            let program = std::env::var_os(TRUE_PROGRAM).expect("true program");
+            // An empty and a non-UTF-8 argument: argv is compared byte for byte.
+            Exec::new(
+                program.into_vec(),
+                vec![
+                    b"true".to_vec(),
+                    b"proc-source".to_vec(),
+                    index.to_string().into_bytes(),
+                    Vec::new(),
+                    b"\xff\xfe".to_vec(),
+                ],
+                Vec::new(),
+            )
+            .run_and_record();
         }
-        let Some(start) = start_time(pid) else {
-            return false;
-        };
-        let mut status = 0;
-        if libc::waitpid(pid, &mut status, 0) != pid {
-            return false;
-        }
-        let Ok(pid) = u32::try_from(pid) else {
-            return false;
-        };
-        let Ok(parent) = u32::try_from(libc::getpid()) else {
-            return false;
-        };
-        let mut record = [0_u8; RECORD_BYTES];
-        record[0..4].copy_from_slice(&pid.to_ne_bytes());
-        record[4..8].copy_from_slice(&parent.to_ne_bytes());
-        record[8..16].copy_from_slice(&start.to_ne_bytes());
-        record[16..20].copy_from_slice(&status.to_ne_bytes());
-        record[20..24].copy_from_slice(&exec_index.to_ne_bytes());
-        let written = libc::write(ORACLE_FD, record.as_ptr().cast(), RECORD_BYTES);
-        usize::try_from(written).is_ok_and(|written| written == RECORD_BYTES)
     }
 }
 
-/// Field 22 of `/proc/<pid>/stat`: clock ticks after boot. Async-signal-safe.
-fn start_time(pid: libc::pid_t) -> Option<u64> {
-    let mut path = [0_u8; 32];
-    let mut length = 0;
-    for &byte in b"/proc/" {
-        path[length] = byte;
-        length += 1;
-    }
-    let mut digits = [0_u8; 10];
-    let mut count = 0;
-    let mut value = u32::try_from(pid).ok()?;
-    loop {
-        digits[count] = b'0' + u8::try_from(value % 10).ok()?;
-        count += 1;
-        value /= 10;
-        if value == 0 {
-            break;
+/// A program, argv and environment prepared before a fork, so the forked child of this
+/// multithreaded process does nothing but `execve`.
+struct Exec {
+    program: CString,
+    argv: Vec<CommandArg>,
+    argv_c: Vec<CString>,
+    envp_c: Vec<CString>,
+}
+
+impl Exec {
+    fn new(program: Vec<u8>, argv: Vec<Vec<u8>>, environment: Vec<CString>) -> Self {
+        Self {
+            program: CString::new(program).expect("program"),
+            argv_c: argv
+                .iter()
+                .map(|argument| CString::new(argument.clone()).expect("argv"))
+                .collect(),
+            argv: argv
+                .into_iter()
+                .map(|argument| CommandArg::new(OsString::from_vec(argument)))
+                .collect(),
+            envp_c: environment,
         }
     }
-    for index in (0..count).rev() {
-        path[length] = digits[index];
-        length += 1;
-    }
-    for &byte in b"/stat\0" {
-        path[length] = byte;
-        length += 1;
-    }
-    let mut buffer = [0_u8; 1024];
-    let mut filled = 0;
-    // SAFETY: plain syscalls on stack memory.
-    unsafe {
-        let fd = libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        loop {
-            let read = libc::read(
-                fd,
-                buffer[filled..].as_mut_ptr().cast(),
-                buffer.len() - filled,
-            );
-            match usize::try_from(read) {
-                Ok(0) => break,
-                Ok(read) => {
-                    filled += read;
-                    if filled == buffer.len() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    libc::close(fd);
-                    return None;
-                }
+
+    /// Start it, wait for it to exit, read its start time while it is a zombie, reap it and
+    /// append its record to the oracle.
+    fn run_and_record(&self) {
+        let argv: Vec<*const c_char> = self
+            .argv_c
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .chain([ptr::null()])
+            .collect();
+        let envp: Vec<*const c_char> = self
+            .envp_c
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .chain([ptr::null()])
+            .collect();
+        // SAFETY: the child only calls execve and _exit on memory prepared before the fork.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::execve(self.program.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
             }
         }
-        libc::close(fd);
+        assert!(pid > 0, "fork: {}", io::Error::last_os_error());
+        let id = libc::id_t::try_from(pid).expect("pid");
+        // SAFETY: waiting for our own child without reaping it.
+        let waited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        assert_eq!(waited, 0, "waitid: {}", io::Error::last_os_error());
+        let start = start_time(pid).expect("an unreaped child's start time");
+        let mut status = 0;
+        // SAFETY: reaping our own child.
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(reaped, pid, "waitpid: {}", io::Error::last_os_error());
+        let mut line = serde_json::to_vec(&OracleRecord {
+            pid: u32::try_from(pid).expect("pid"),
+            ppid: std::process::id(),
+            start,
+            wait_status: status,
+            argv: self.argv.clone(),
+        })
+        .expect("record");
+        line.push(b'\n');
+        // SAFETY: the oracle fd is inherited and stays open for this process's life.
+        let mut oracle = ManuallyDrop::new(unsafe { fs::File::from_raw_fd(ORACLE_FD) });
+        // One write of an O_APPEND file: records from concurrent writers never interleave.
+        let written = oracle.write(&line).expect("oracle write");
+        assert_eq!(written, line.len(), "short oracle write");
     }
-    let stat = &buffer[..filled];
+}
+
+/// This test binary, re-executed in a role.
+struct Image {
+    program: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    environment: Vec<CString>,
+}
+
+impl Image {
+    fn test_binary() -> Self {
+        let executable = std::env::current_exe().expect("test binary");
+        let program = executable.as_os_str().as_bytes().to_vec();
+        let argv = vec![
+            program.clone(),
+            b"--exact".to_vec(),
+            ROLE_TEST.as_bytes().to_vec(),
+            b"--nocapture".to_vec(),
+        ];
+        let true_program = match std::env::var_os(TRUE_PROGRAM) {
+            Some(program) => PathBuf::from(program),
+            None => find_program("true"),
+        };
+        let environment = std::env::vars_os()
+            .filter(|(key, _)| key != ROLE && key != TRUE_PROGRAM)
+            .map(|(key, value)| environment_entry(key.as_bytes(), value.as_bytes()))
+            .chain([environment_entry(
+                TRUE_PROGRAM.as_bytes(),
+                true_program.as_os_str().as_bytes(),
+            )])
+            .collect();
+        Self {
+            program,
+            argv,
+            environment,
+        }
+    }
+
+    fn exec(&self, role: Role) -> Exec {
+        let role = serde_json::to_vec(&role).expect("role");
+        let mut environment = self.environment.clone();
+        environment.push(environment_entry(ROLE.as_bytes(), &role));
+        Exec::new(self.program.clone(), self.argv.clone(), environment)
+    }
+}
+
+fn environment_entry(key: &[u8], value: &[u8]) -> CString {
+    CString::new([key, b"=", value].concat()).expect("environment")
+}
+
+/// Field 22 of `/proc/<pid>/stat`: clock ticks after boot.
+fn start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
     let close = stat.iter().rposition(|&byte| byte == b')')?;
     // Field 3 (state) follows ") "; field 22 is the 20th from there.
-    let field = stat[close + 2..].split(|&byte| byte == b' ').nth(19)?;
-    let mut ticks: u64 = 0;
-    for &byte in field {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        ticks = ticks.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
-    }
-    Some(ticks)
+    let field = stat.get(close + 2..)?.split(|&byte| byte == b' ').nth(19)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 fn read_byte(fd: RawFd) -> io::Result<()> {
@@ -263,7 +285,6 @@ fn write_byte(fd: RawFd) -> io::Result<()> {
 enum Mode {
     Baseline,
     Census,
-    CnProc,
     Ptrace,
 }
 
@@ -273,7 +294,6 @@ struct Report {
     kernel: String,
     namespaces: NamespaceFacts,
     runs: Vec<Run>,
-    cn_proc_overflow: Overflow,
 }
 
 #[derive(Serialize)]
@@ -317,10 +337,11 @@ struct Measurement {
     workload_sys_us: u64,
     expected: Expected,
     coverage: Coverage,
-    /// Observations whose identity, argv or status could not be read, retained as observed.
+    /// Every observation, as observed.
     observed: Observed,
-    /// Netlink only: buffer overflow reports and per-CPU sequence discontinuities.
-    losses: Vec<String>,
+    /// Observations naming an identity observed before, or one no fixture process had.
+    duplicates: Vec<String>,
+    unexpected: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -331,7 +352,7 @@ struct Expected {
     exits: usize,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Coverage {
     births_matched: usize,
@@ -345,7 +366,7 @@ struct Coverage {
     exits_mismatched: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 struct Identity {
     pid: u32,
     start: u64,
@@ -355,8 +376,11 @@ struct Identity {
 #[serde(rename_all = "camelCase")]
 struct Observed {
     births: Vec<Birth>,
-    execs: Vec<Exec>,
+    execs: Vec<ExecSeen>,
     exits: Vec<Exit>,
+    /// Threads the tracer followed for their forks; they are not process lives.
+    threads_born: usize,
+    threads_exited: usize,
 }
 
 #[derive(Serialize)]
@@ -365,16 +389,19 @@ struct Birth {
     pid: u32,
     ppid: u32,
     start: Result<u64, String>,
-    /// Whether a pidfd could be opened when the birth was observed.
+    /// Whether a pidfd could be opened when the birth was observed; it is held to the end of
+    /// the run, so the identity it names cannot be reused meanwhile.
     pidfd: Result<(), String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Exec {
+struct ExecSeen {
     pid: u32,
     start: Result<u64, String>,
-    argv: Result<Vec<String>, String>,
+    argv: Result<Vec<CommandArg>, String>,
+    /// The thread id the process had before a non-leader thread's exec made it the leader.
+    former_tid: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -385,21 +412,6 @@ struct Exit {
     wait_status: Option<i32>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Overflow {
-    outcome: Result<OverflowCounts, String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OverflowCounts {
-    receive_buffer_bytes: i32,
-    events: usize,
-    enobufs: usize,
-    sequence_gaps: Vec<String>,
-}
-
 // ---------------------------------------------------------------------------------------------
 // The harness.
 
@@ -408,17 +420,16 @@ fn linux_process_event_sources_are_measured() {
     if std::env::var_os(ROLE).is_some() {
         return;
     }
-    let fixture = Fixture::new();
+    let image = Image::test_binary();
     let mut runs = Vec::new();
     for repetition in 0..REPETITIONS {
         for burst in [COVERAGE_BURST, OVERHEAD_BURST] {
-            for mode in [Mode::Baseline, Mode::Census, Mode::CnProc, Mode::Ptrace] {
-                let outcome = fixture.run(mode, burst);
+            for mode in [Mode::Baseline, Mode::Census, Mode::Ptrace] {
                 runs.push(Run {
                     mode,
                     burst,
                     repetition,
-                    outcome,
+                    outcome: run(&image, mode, burst),
                 });
             }
         }
@@ -428,7 +439,6 @@ fn linux_process_event_sources_are_measured() {
             .map(|release| release.trim().to_owned())
             .unwrap_or_else(|error| format!("unreadable: {error}")),
         namespaces: namespace_facts(),
-        cn_proc_overflow: fixture.cn_proc_overflow(),
         runs,
     };
     let json = serde_json::to_string_pretty(&report).expect("report");
@@ -439,108 +449,89 @@ fn linux_process_event_sources_are_measured() {
 
     for run in &report.runs {
         let Outcome::Measured(measured) = &run.outcome else {
-            assert!(
-                matches!(run.mode, Mode::CnProc | Mode::Ptrace),
-                "{:?} cannot be unavailable",
-                run.mode
-            );
+            assert_eq!(run.mode, Mode::Ptrace, "only tracing can be refused");
             continue;
         };
-        if run.mode == Mode::Census && run.burst == COVERAGE_BURST {
-            assert!(
-                !measured.coverage.births_missing.is_empty(),
-                "a census before and after the burst must miss its short-lived births"
-            );
+        let coverage = &measured.coverage;
+        match run.mode {
+            Mode::Baseline => {}
+            Mode::Census => {
+                if run.burst == COVERAGE_BURST {
+                    assert!(
+                        !coverage.births_missing.is_empty(),
+                        "a census before and after the burst must miss its short-lived births"
+                    );
+                }
+            }
+            // An event source that ran must have seen every life exactly, or it is not one.
+            Mode::Ptrace => {
+                let expected = &measured.expected;
+                assert_eq!(
+                    (
+                        coverage.births_matched,
+                        coverage.execs_matched,
+                        coverage.exits_matched
+                    ),
+                    (expected.births, expected.execs, expected.exits),
+                    "ptrace run {} of {}: {coverage:?}",
+                    run.repetition,
+                    run.burst
+                );
+                assert!(measured.duplicates.is_empty(), "{:?}", measured.duplicates);
+                assert!(measured.unexpected.is_empty(), "{:?}", measured.unexpected);
+            }
         }
     }
 }
 
-struct Fixture {
-    executable: CString,
-    argv: Vec<CString>,
-    environment: Vec<CString>,
-    harness: u32,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let executable = std::env::current_exe().expect("test binary");
-        let true_program = find_program("true");
-        let argv = [
-            executable.as_os_str().as_bytes(),
-            b"--exact",
-            ROOT_TEST.as_bytes(),
-            b"--nocapture",
-        ]
-        .iter()
-        .map(|argument| CString::new(argument.to_vec()).expect("argv"))
-        .collect();
-        let environment = std::env::vars_os()
-            .filter(|(key, _)| key != ROLE && key != TRUE_PROGRAM)
-            .map(|(key, value)| {
-                let mut entry = key.into_vec();
-                entry.push(b'=');
-                entry.extend(value.into_vec());
-                CString::new(entry).expect("environment")
-            })
-            .chain([CString::new(
-                [
-                    TRUE_PROGRAM.as_bytes(),
-                    b"=",
-                    true_program.as_os_str().as_bytes(),
-                ]
-                .concat(),
-            )
-            .expect("environment")])
-            .collect();
-        Self {
-            executable: CString::new(executable.into_os_string().into_vec()).expect("path"),
-            argv,
-            environment,
-            harness: std::process::id(),
-        }
-    }
-
-    fn run(&self, mode: Mode, burst: u32) -> Outcome {
-        let netlink = match mode {
-            Mode::CnProc => match Netlink::listen(None) {
-                Ok(netlink) => Some(netlink),
-                Err(unavailable) => return unavailable,
-            },
-            _ => None,
-        };
-        let root = match self.spawn(burst, mode == Mode::Ptrace) {
-            Ok(root) => root,
+fn run(image: &Image, mode: Mode, burst: u32) -> Outcome {
+    let root_exec = image.exec(Role::Root { burst });
+    let root = match Root::spawn(&root_exec, mode == Mode::Ptrace) {
+        Ok(root) => root,
+        Err(unavailable) => return unavailable,
+    };
+    let workload_before = rusage(libc::RUSAGE_CHILDREN);
+    let sight = match mode {
+        Mode::Baseline => root.run_unobserved(),
+        Mode::Census => root.run_with_census(),
+        Mode::Ptrace => match root.run_traced() {
+            Ok(sight) => sight,
             Err(unavailable) => return unavailable,
-        };
-        let workload_before = rusage(libc::RUSAGE_CHILDREN);
-        let measured = match mode {
-            Mode::Baseline => root.run_unobserved(),
-            Mode::Census => root.run_with_census(),
-            Mode::CnProc => root.run_with_netlink(netlink.expect("listening"), self.harness),
-            Mode::Ptrace => match root.run_traced() {
-                Ok(measured) => measured,
-                Err(unavailable) => return unavailable,
-            },
-        };
-        let workload = rusage(libc::RUSAGE_CHILDREN).minus(workload_before);
-        let oracle = root.oracle();
-        let root_exec = self
-            .argv
-            .iter()
-            .map(|argument| String::from_utf8_lossy(argument.as_bytes()).into_owned())
-            .collect();
-        Outcome::Measured(Box::new(score(
-            measured,
-            workload,
-            &oracle,
-            root.identity,
-            root_exec,
-        )))
-    }
+        },
+    };
+    let workload = rusage(libc::RUSAGE_CHILDREN).minus(workload_before);
+    let mut oracle = root.oracle();
+    oracle.push(OracleRecord {
+        pid: root.identity.pid,
+        ppid: std::process::id(),
+        start: root.identity.start,
+        wait_status: 0,
+        argv: root_exec.argv,
+    });
+    Outcome::Measured(Box::new(score(sight, workload, &oracle)))
+}
 
+struct Root {
+    pid: libc::pid_t,
+    identity: Identity,
+    gate: OwnedFd,
+    done: OwnedFd,
+    hold: OwnedFd,
+    oracle: OracleFile,
+}
+
+/// What a mode saw while the burst ran.
+struct Sight {
+    wall_ns: u64,
+    observer: Usage,
+    observed: Observed,
+    /// The pidfds of observed births, held until the run is scored.
+    pidfds: Vec<OwnedFd>,
+}
+
+impl Root {
     /// Fork the root, held on its gate; `traced` makes it ask this thread to trace it.
-    fn spawn(&self, burst: u32, traced: bool) -> Result<Root, Outcome> {
+    fn spawn(exec: &Exec, traced: bool) -> Result<Self, Outcome> {
         let gate = Pipe::new();
         let done = Pipe::new();
         let hold = Pipe::new();
@@ -553,15 +544,14 @@ impl Fixture {
                 .expect("/dev/null")
                 .into(),
         );
-        let mut environment = self.environment.clone();
-        environment.push(CString::new(format!("{ROLE}={burst}")).expect("environment"));
-        let argv: Vec<*const c_char> = self
-            .argv
+        let argv: Vec<*const c_char> = exec
+            .argv_c
             .iter()
             .map(|argument| argument.as_ptr())
             .chain([ptr::null()])
             .collect();
-        let envp: Vec<*const c_char> = environment
+        let envp: Vec<*const c_char> = exec
+            .envp_c
             .iter()
             .map(|entry| entry.as_ptr())
             .chain([ptr::null()])
@@ -603,7 +593,7 @@ impl Fixture {
                         libc::_exit(126);
                     }
                 }
-                libc::execve(self.executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::execve(exec.program.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 libc::_exit(127);
             }
         }
@@ -616,26 +606,23 @@ impl Fixture {
             assert_eq!(waited, pid, "waitpid: {}", io::Error::last_os_error());
             if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == TRACEME_FAILED {
                 let mut errno = [0_u8; size_of::<c_int>()];
-                let read = fs::File::from(error.read).read_exact_or_short(&mut errno);
+                let read = io::Read::read_exact(&mut fs::File::from(error.read), &mut errno);
                 return Err(Outcome::Unavailable {
                     call: "ptrace(PTRACE_TRACEME)".to_owned(),
-                    errno: read.then(|| c_int::from_ne_bytes(errno)),
+                    errno: read.is_ok().then(|| c_int::from_ne_bytes(errno)),
                     detail: "the root could not ask to be traced".to_owned(),
                 });
             }
-            if !(libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP) {
-                return Err(Outcome::Unavailable {
-                    call: "ptrace(PTRACE_TRACEME)".to_owned(),
-                    errno: None,
-                    detail: format!("the root ended before its first stop: wait status {status}"),
-                });
-            }
+            assert!(
+                libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+                "the root's first stop: wait status {status}"
+            );
         }
         let identity = Identity {
             pid: u32::try_from(pid).expect("pid"),
             start: start_time(pid).expect("the gated root's start time"),
         };
-        Ok(Root {
+        Ok(Self {
             pid,
             identity,
             gate: gate.write,
@@ -645,72 +632,6 @@ impl Fixture {
         })
     }
 
-    /// Fill a minimal receive buffer while the reader is held, then drain it.
-    fn cn_proc_overflow(&self) -> Overflow {
-        let netlink = match Netlink::listen(Some(0)) {
-            Ok(netlink) => netlink,
-            Err(Outcome::Unavailable {
-                call,
-                errno,
-                detail,
-            }) => {
-                return Overflow {
-                    outcome: Err(format!("{call}: errno {errno:?}: {detail}")),
-                };
-            }
-            Err(Outcome::Measured(_)) => unreachable!("listen measures nothing"),
-        };
-        let root = match self.spawn(COVERAGE_BURST, false) {
-            Ok(root) => root,
-            Err(_) => unreachable!("an untraced spawn is never unavailable"),
-        };
-        write_byte(root.hold.as_raw_fd()).expect("hold");
-        write_byte(root.gate.as_raw_fd()).expect("gate");
-        let status = root.wait();
-        assert_eq!(status, 0, "root wait status");
-        let mut events = Vec::new();
-        let mut losses = Vec::new();
-        let mut sequence = Sequences::default();
-        let enobufs = netlink.drain(&mut events, &mut losses, &mut sequence);
-        Overflow {
-            outcome: Ok(OverflowCounts {
-                receive_buffer_bytes: netlink.receive_buffer(),
-                events: events.len(),
-                enobufs,
-                sequence_gaps: sequence.gaps,
-            }),
-        }
-    }
-}
-
-trait ReadShort {
-    fn read_exact_or_short(self, buffer: &mut [u8]) -> bool;
-}
-
-impl ReadShort for fs::File {
-    fn read_exact_or_short(mut self, buffer: &mut [u8]) -> bool {
-        io::Read::read_exact(&mut self, buffer).is_ok()
-    }
-}
-
-struct Root {
-    pid: libc::pid_t,
-    identity: Identity,
-    gate: OwnedFd,
-    done: OwnedFd,
-    hold: OwnedFd,
-    oracle: OracleFile,
-}
-
-/// What a mode saw while the burst ran.
-struct Sight {
-    wall_ns: u64,
-    observer: Usage,
-    observed: Observed,
-    losses: Vec<String>,
-}
-
-impl Root {
     fn release(&self) -> Instant {
         let released = Instant::now();
         write_byte(self.gate.as_raw_fd()).expect("gate");
@@ -722,24 +643,27 @@ impl Root {
         u64::try_from(released.elapsed().as_nanos()).expect("wall")
     }
 
-    fn wait(&self) -> c_int {
+    fn wait(&self) {
         let mut status = 0;
         // SAFETY: waiting for our own child.
         let waited = unsafe { libc::waitpid(self.pid, &mut status, 0) };
         assert_eq!(waited, self.pid, "waitpid: {}", io::Error::last_os_error());
-        status
+        assert_eq!(status, 0, "root wait status");
     }
 
+    /// The harness thread only waits: its CPU over the same window is the baseline observer's.
     fn run_unobserved(&self) -> Sight {
         write_byte(self.hold.as_raw_fd()).expect("hold");
+        let before = rusage(libc::RUSAGE_THREAD);
         let released = self.release();
         let wall_ns = self.await_done(released);
-        assert_eq!(self.wait(), 0, "root wait status");
+        let observer = rusage(libc::RUSAGE_THREAD).minus(before);
+        self.wait();
         Sight {
             wall_ns,
-            observer: Usage::default(),
+            observer,
             observed: Observed::default(),
-            losses: Vec::new(),
+            pidfds: Vec::new(),
         }
     }
 
@@ -749,77 +673,19 @@ impl Root {
         let before = rusage(libc::RUSAGE_THREAD);
         let mut observed = Observed::default();
         let mut seen = HashSet::new();
-        census(self.pid, &mut observed, &mut seen);
+        let mut pidfds = Vec::new();
+        census(self.pid, &mut observed, &mut seen, &mut pidfds);
         let released = self.release();
         let wall_ns = self.await_done(released);
-        census(self.pid, &mut observed, &mut seen);
+        census(self.pid, &mut observed, &mut seen, &mut pidfds);
         let observer = rusage(libc::RUSAGE_THREAD).minus(before);
         write_byte(self.hold.as_raw_fd()).expect("hold");
-        assert_eq!(self.wait(), 0, "root wait status");
+        self.wait();
         Sight {
             wall_ns,
             observer,
             observed,
-            losses: Vec::new(),
-        }
-    }
-
-    fn run_with_netlink(&self, netlink: Netlink, harness: u32) -> Sight {
-        write_byte(self.hold.as_raw_fd()).expect("hold");
-        let stop = Pipe::new();
-        let stop_read = stop.read;
-        let reader = std::thread::spawn(move || {
-            let before = rusage(libc::RUSAGE_THREAD);
-            let mut events = Vec::new();
-            let mut losses = Vec::new();
-            let mut sequence = Sequences::default();
-            let mut tree = TreeFilter::new(harness);
-            let mut observed = Observed::default();
-            loop {
-                let mut fds = [
-                    libc::pollfd {
-                        fd: netlink.fd.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: stop_read.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                // SAFETY: two pollfds on the stack; no deadline: the stop pipe ends the wait.
-                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "poll: {error}");
-                    continue;
-                }
-                netlink.drain(&mut events, &mut losses, &mut sequence);
-                for event in events.drain(..) {
-                    tree.observe(event, &mut observed);
-                }
-                if fds[1].revents != 0 {
-                    netlink.drain(&mut events, &mut losses, &mut sequence);
-                    for event in events.drain(..) {
-                        tree.observe(event, &mut observed);
-                    }
-                    break;
-                }
-            }
-            losses.extend(sequence.gaps);
-            (observed, losses, rusage(libc::RUSAGE_THREAD).minus(before))
-        });
-        let released = self.release();
-        let wall_ns = self.await_done(released);
-        assert_eq!(self.wait(), 0, "root wait status");
-        write_byte(stop.write.as_raw_fd()).expect("stop");
-        let (observed, losses, observer) = reader.join().expect("netlink reader");
-        Sight {
-            wall_ns,
-            observer,
-            observed,
-            losses,
+            pidfds,
         }
     }
 
@@ -843,9 +709,11 @@ impl Root {
         } == -1
         {
             let error = io::Error::last_os_error();
-            // SAFETY: killing our own stopped child.
-            unsafe { libc::kill(self.pid, libc::SIGKILL) };
-            self.wait();
+            // SAFETY: killing our own stopped child, then reaping it.
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+                libc::waitpid(self.pid, ptr::null_mut(), 0);
+            }
             return Err(Outcome::Unavailable {
                 call: "ptrace(PTRACE_SETOPTIONS)".to_owned(),
                 errno: error.raw_os_error(),
@@ -857,6 +725,7 @@ impl Root {
         resume(self.pid, 0);
         let released = self.release();
         let mut observed = Observed::default();
+        let mut pidfds = Vec::new();
         let mut started = HashSet::from([self.pid]);
         // The tracer must stay on this thread; another reads the root's DONE byte, so the wall
         // time ends at the same boundary as in every other mode.
@@ -876,45 +745,51 @@ impl Root {
                 }
                 if !libc::WIFSTOPPED(status) {
                     if pid == self.pid {
-                        assert!(
-                            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                            "root wait status {status}"
-                        );
+                        assert_eq!(status, 0, "root wait status");
                     }
                     continue;
                 }
                 let signal = libc::WSTOPSIG(status);
-                let event = status >> 16;
                 let tracee = u32::try_from(pid).expect("pid");
-                match event {
+                match status >> 16 {
                     libc::PTRACE_EVENT_FORK
                     | libc::PTRACE_EVENT_VFORK
                     | libc::PTRACE_EVENT_CLONE => {
-                        let child = event_message(pid);
-                        let child = libc::pid_t::try_from(child).expect("child pid");
-                        observed.births.push(Birth {
-                            pid: u32::try_from(child).expect("pid"),
-                            ppid: thread_group(pid),
-                            start: start_time(child).ok_or_else(|| "unreadable".to_owned()),
-                            pidfd: open_pidfd(child),
-                        });
+                        let child = libc::pid_t::try_from(event_message(pid)).expect("child");
+                        // A thread is traced for the forks it makes; it is not a process life.
+                        if thread_group(child) == u32::try_from(child).expect("pid") {
+                            observed.births.push(Birth {
+                                pid: u32::try_from(child).expect("pid"),
+                                ppid: thread_group(pid),
+                                start: start_time(child).ok_or_else(|| "unreadable".to_owned()),
+                                pidfd: hold_pidfd(child, &mut pidfds),
+                            });
+                        } else {
+                            observed.threads_born += 1;
+                        }
                         resume(pid, 0);
                     }
                     libc::PTRACE_EVENT_EXEC => {
-                        observed.execs.push(Exec {
+                        let former = u32::try_from(event_message(pid)).expect("former tid");
+                        observed.execs.push(ExecSeen {
                             pid: tracee,
                             start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
                             argv: command_line(pid),
+                            former_tid: (former != tracee).then_some(former),
                         });
                         resume(pid, 0);
                     }
                     libc::PTRACE_EVENT_EXIT => {
                         let wait_status = event_message(pid);
-                        observed.exits.push(Exit {
-                            pid: tracee,
-                            start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
-                            wait_status: i32::try_from(wait_status).ok(),
-                        });
+                        if thread_group(pid) == tracee {
+                            observed.exits.push(Exit {
+                                pid: tracee,
+                                start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
+                                wait_status: i32::try_from(wait_status).ok(),
+                            });
+                        } else {
+                            observed.threads_exited += 1;
+                        }
                         resume(pid, 0);
                     }
                     _ if signal == libc::SIGSTOP && started.insert(pid) => resume(pid, 0),
@@ -928,139 +803,99 @@ impl Root {
             wall_ns,
             observer,
             observed,
-            losses: Vec::new(),
+            pidfds,
         })
     }
 
     fn oracle(&self) -> Vec<OracleRecord> {
-        let bytes = fs::read(&self.oracle.path).expect("oracle");
-        let (records, torn) = bytes.as_chunks::<RECORD_BYTES>();
-        assert!(torn.is_empty(), "torn oracle record");
-        records
-            .iter()
-            .map(|record| OracleRecord {
-                identity: Identity {
-                    pid: u32::from_ne_bytes(record[0..4].try_into().expect("pid")),
-                    start: u64::from_ne_bytes(record[8..16].try_into().expect("start")),
-                },
-                ppid: u32::from_ne_bytes(record[4..8].try_into().expect("ppid")),
-                wait_status: i32::from_ne_bytes(record[16..20].try_into().expect("status")),
-                exec_index: i32::from_ne_bytes(record[20..24].try_into().expect("index")),
-            })
+        fs::read_to_string(&self.oracle.path)
+            .expect("oracle")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("oracle record"))
             .collect()
     }
 }
 
-struct OracleRecord {
-    identity: Identity,
-    ppid: u32,
-    wait_status: i32,
-    exec_index: i32,
-}
-
-fn score(
-    sight: Sight,
-    workload: Usage,
-    oracle: &[OracleRecord],
-    root: Identity,
-    root_exec: Vec<String>,
-) -> Measurement {
+fn score(sight: Sight, workload: Usage, oracle: &[OracleRecord]) -> Measurement {
     assert!(
         oracle.iter().all(|record| record.wait_status == 0),
         "every fixture process exits 0"
     );
-    let mut coverage = Coverage::default();
+    let identity = |record: &OracleRecord| Identity {
+        pid: record.pid,
+        start: record.start,
+    };
+    let expected: HashSet<Identity> = oracle.iter().map(identity).collect();
     let observed = sight.observed;
+    let mut duplicates = Vec::new();
+    let mut unexpected = Vec::new();
+    // Key each readable observation by identity, keeping every duplicate and stranger.
+    let mut index = |kind: &str, pid: u32, start: &Result<u64, String>| {
+        let start = *start.as_ref().ok()?;
+        let key = Identity { pid, start };
+        if !expected.contains(&key) {
+            unexpected.push(format!("{kind} {key:?}"));
+            return None;
+        }
+        Some(key)
+    };
+    let mut births = HashMap::new();
+    for birth in &observed.births {
+        if let Some(key) = index("birth", birth.pid, &birth.start)
+            && births.insert(key, birth.ppid).is_some()
+        {
+            duplicates.push(format!("birth {key:?}"));
+        }
+    }
+    let mut execs = HashMap::new();
+    for exec in &observed.execs {
+        if let Some(key) = index("exec", exec.pid, &exec.start)
+            && execs.insert(key, &exec.argv).is_some()
+        {
+            duplicates.push(format!("exec {key:?}"));
+        }
+    }
+    let mut exits = HashMap::new();
+    for exit in &observed.exits {
+        if let Some(key) = index("exit", exit.pid, &exit.start)
+            && exits.insert(key, exit.wait_status).is_some()
+        {
+            duplicates.push(format!("exit {key:?}"));
+        }
+    }
 
-    let births: HashMap<Identity, u32> = observed
-        .births
-        .iter()
-        .filter_map(|birth| {
-            let start = *birth.start.as_ref().ok()?;
-            Some((
-                Identity {
-                    pid: birth.pid,
-                    start,
-                },
-                birth.ppid,
-            ))
-        })
-        .collect();
+    let mut coverage = Coverage::default();
     for record in oracle {
-        match births.get(&record.identity) {
-            Some(&ppid) if ppid == record.ppid => coverage.births_matched += 1,
-            Some(&ppid) => coverage.births_wrong_parent.push(format!(
-                "{:?}: observed parent {ppid}, expected {}",
-                record.identity, record.ppid
-            )),
-            None => coverage.births_missing.push(record.identity),
+        let identity = identity(record);
+        // The root's birth is the harness's own fork, not an observation.
+        if record.ppid != std::process::id() {
+            match births.get(&identity) {
+                Some(&ppid) if ppid == record.ppid => coverage.births_matched += 1,
+                Some(&ppid) => coverage.births_wrong_parent.push(format!(
+                    "{identity:?}: observed parent {ppid}, expected {}",
+                    record.ppid
+                )),
+                None => coverage.births_missing.push(identity),
+            }
         }
-    }
-
-    let mut expected_execs: BTreeMap<Identity, Vec<String>> = oracle
-        .iter()
-        .filter(|record| record.exec_index >= 0)
-        .map(|record| {
-            (
-                record.identity,
-                vec![
-                    "true".to_owned(),
-                    "proc-source".to_owned(),
-                    record.exec_index.to_string(),
-                ],
-            )
-        })
-        .collect();
-    expected_execs.insert(root, root_exec);
-    let execs: HashMap<Identity, &Result<Vec<String>, String>> = observed
-        .execs
-        .iter()
-        .filter_map(|exec| {
-            Some((
-                Identity {
-                    pid: exec.pid,
-                    start: *exec.start.as_ref().ok()?,
-                },
-                &exec.argv,
-            ))
-        })
-        .collect();
-    for (identity, argv) in &expected_execs {
-        match execs.get(identity) {
-            Some(Ok(observed)) if observed == argv => coverage.execs_matched += 1,
-            Some(observed) => coverage.execs_mismatched.push(format!(
-                "{identity:?}: observed {observed:?}, expected {argv:?}"
+        match execs.get(&identity) {
+            Some(Ok(argv)) if *argv == record.argv => coverage.execs_matched += 1,
+            Some(argv) => coverage.execs_mismatched.push(format!(
+                "{identity:?}: observed {argv:?}, expected {:?}",
+                record.argv
             )),
-            None => coverage.execs_missing.push(*identity),
+            None => coverage.execs_missing.push(identity),
         }
-    }
-
-    let exits: HashMap<Identity, Option<i32>> = observed
-        .exits
-        .iter()
-        .filter_map(|exit| {
-            Some((
-                Identity {
-                    pid: exit.pid,
-                    start: *exit.start.as_ref().ok()?,
-                },
-                exit.wait_status,
-            ))
-        })
-        .collect();
-    for (identity, status) in oracle
-        .iter()
-        .map(|record| (record.identity, record.wait_status))
-        .chain([(root, 0)])
-    {
         match exits.get(&identity) {
-            Some(Some(observed)) if *observed == status => coverage.exits_matched += 1,
-            Some(observed) => coverage.exits_mismatched.push(format!(
-                "{identity:?}: observed {observed:?}, expected {status}"
+            Some(Some(status)) if *status == record.wait_status => coverage.exits_matched += 1,
+            Some(status) => coverage.exits_mismatched.push(format!(
+                "{identity:?}: observed {status:?}, expected {}",
+                record.wait_status
             )),
             None => coverage.exits_missing.push(identity),
         }
     }
+    drop(sight.pidfds);
 
     Measurement {
         wall_ns: sight.wall_ns,
@@ -1069,35 +904,25 @@ fn score(
         workload_user_us: workload.user_us,
         workload_sys_us: workload.sys_us,
         expected: Expected {
-            births: oracle.len(),
-            execs: expected_execs.len(),
-            exits: oracle.len() + 1,
+            births: oracle.len() - 1,
+            execs: oracle.len(),
+            exits: oracle.len(),
         },
         coverage,
-        observed: Observed {
-            births: observed
-                .births
-                .into_iter()
-                .filter(|birth| birth.start.is_err() || birth.pidfd.is_err())
-                .collect(),
-            execs: observed
-                .execs
-                .into_iter()
-                .filter(|exec| exec.start.is_err() || exec.argv.is_err())
-                .collect(),
-            exits: observed
-                .exits
-                .into_iter()
-                .filter(|exit| exit.start.is_err() || exit.wait_status.is_none())
-                .collect(),
-        },
-        losses: sight.losses,
+        observed,
+        duplicates,
+        unexpected,
     }
 }
 
 /// Every process now in the tree under `root`, read through each of its threads'
 /// `/proc/<pid>/task/<tid>/children`: a child belongs to the thread that forked it.
-fn census(root: libc::pid_t, observed: &mut Observed, seen: &mut HashSet<Identity>) {
+fn census(
+    root: libc::pid_t,
+    observed: &mut Observed,
+    seen: &mut HashSet<Identity>,
+    pidfds: &mut Vec<OwnedFd>,
+) {
     let mut parents = vec![root];
     while let Some(parent) = parents.pop() {
         let Ok(threads) = fs::read_dir(format!("/proc/{parent}/task")) else {
@@ -1123,12 +948,13 @@ fn census(root: libc::pid_t, observed: &mut Observed, seen: &mut HashSet<Identit
                 pid,
                 ppid: u32::try_from(parent).expect("pid"),
                 start: start.clone(),
-                pidfd: open_pidfd(child),
+                pidfd: hold_pidfd(child, pidfds),
             });
-            observed.execs.push(Exec {
+            observed.execs.push(ExecSeen {
                 pid,
                 start,
                 argv: command_line(child),
+                former_tid: None,
             });
         }
     }
@@ -1144,26 +970,26 @@ fn thread_group(tid: libc::pid_t) -> u32 {
         .expect("Tgid")
 }
 
-fn command_line(pid: libc::pid_t) -> Result<Vec<String>, String> {
+/// The argv bytes of a process; each argument is NUL-terminated, an empty one included.
+fn command_line(pid: libc::pid_t) -> Result<Vec<CommandArg>, String> {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).map_err(|error| error.to_string())?;
-    if bytes.is_empty() {
+    let Some(arguments) = bytes.strip_suffix(b"\0") else {
         return Err("empty: the process exited".to_owned());
-    }
-    Ok(bytes
-        .strip_suffix(b"\0")
-        .unwrap_or(&bytes)
+    };
+    Ok(arguments
         .split(|&byte| byte == 0)
-        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .map(|argument| CommandArg::new(OsString::from_vec(argument.to_vec())))
         .collect())
 }
 
-fn open_pidfd(pid: libc::pid_t) -> Result<(), String> {
+/// Open a pidfd for `pid` and keep it in `pidfds`.
+fn hold_pidfd(pid: libc::pid_t, pidfds: &mut Vec<OwnedFd>) -> Result<(), String> {
     // SAFETY: pidfd_open with no flags.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     match RawFd::try_from(fd) {
         Ok(fd) if fd >= 0 => {
             // SAFETY: the syscall returned a new fd we own.
-            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            pidfds.push(unsafe { OwnedFd::from_raw_fd(fd) });
             Ok(())
         }
         _ => Err(io::Error::last_os_error().to_string()),
@@ -1283,10 +1109,11 @@ struct OracleFile {
 
 impl OracleFile {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "cowshed-process-source-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos() ^ u128::from(next_oracle())
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let file = fs::File::options()
             .create_new(true)
@@ -1304,11 +1131,6 @@ impl Drop for OracleFile {
     fn drop(&mut self) {
         fs::remove_file(&self.path).expect("remove oracle file");
     }
-}
-
-fn next_oracle() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn find_program(name: &str) -> PathBuf {
@@ -1341,300 +1163,5 @@ fn namespace_facts() -> NamespaceFacts {
         yama_ptrace_scope: read("/proc/sys/kernel/yama/ptrace_scope"),
         seccomp: status_line("Seccomp:"),
         cap_eff: status_line("CapEff:"),
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Proc connector.
-
-struct Netlink {
-    fd: OwnedFd,
-}
-
-/// One decoded proc connector event.
-enum ProcEvent {
-    Fork { parent: u32, child: u32 },
-    Exec { pid: u32 },
-    Exit { pid: u32, wait_status: u32 },
-}
-
-#[derive(Default)]
-struct Sequences {
-    last: HashMap<u32, u32>,
-    gaps: Vec<String>,
-}
-
-impl Sequences {
-    fn observe(&mut self, cpu: u32, sequence: u32) {
-        if let Some(previous) = self.last.insert(cpu, sequence)
-            && previous.wrapping_add(1) != sequence
-        {
-            self.gaps
-                .push(format!("cpu {cpu}: sequence {previous} then {sequence}"));
-        }
-    }
-}
-
-impl Netlink {
-    /// Subscribe to every proc event; `receive_buffer` shrinks the socket's buffer.
-    fn listen(receive_buffer: Option<c_int>) -> Result<Self, Outcome> {
-        let unavailable = |call: &str, error: io::Error| Outcome::Unavailable {
-            call: call.to_owned(),
-            errno: error.raw_os_error(),
-            detail: error.to_string(),
-        };
-        // SAFETY: socket(2).
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-                libc::NETLINK_CONNECTOR,
-            )
-        };
-        if fd < 0 {
-            return Err(unavailable(
-                "socket(AF_NETLINK, NETLINK_CONNECTOR)",
-                io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: socket returned a new fd we own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        if let Some(bytes) = receive_buffer {
-            // SAFETY: setsockopt with an int.
-            let set = unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    ptr::from_ref(&bytes).cast(),
-                    libc::socklen_t::try_from(size_of::<c_int>()).expect("socklen"),
-                )
-            };
-            assert_eq!(set, 0, "SO_RCVBUF: {}", io::Error::last_os_error());
-        }
-        // SAFETY: a zeroed sockaddr_nl is valid; its fields are set below.
-        let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        address.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK).expect("family");
-        address.nl_groups = CN_IDX_PROC;
-        // SAFETY: bind with a sockaddr_nl.
-        if unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                ptr::from_ref(&address).cast(),
-                libc::socklen_t::try_from(size_of::<libc::sockaddr_nl>()).expect("socklen"),
-            )
-        } != 0
-        {
-            return Err(unavailable("bind(CN_IDX_PROC)", io::Error::last_os_error()));
-        }
-        let mut message = Vec::with_capacity(NLMSG_HEADER + CN_MSG_HEADER + 4);
-        let length = u32::try_from(NLMSG_HEADER + CN_MSG_HEADER + 4).expect("length");
-        message.extend(length.to_ne_bytes());
-        message.extend(u16::try_from(libc::NLMSG_DONE).expect("type").to_ne_bytes());
-        message.extend(0_u16.to_ne_bytes());
-        message.extend(0_u32.to_ne_bytes());
-        message.extend(std::process::id().to_ne_bytes());
-        message.extend(CN_IDX_PROC.to_ne_bytes());
-        message.extend(CN_VAL_PROC.to_ne_bytes());
-        message.extend(0_u32.to_ne_bytes());
-        // The acknowledgement answers with this plus one, which tells it from another
-        // listener's.
-        message.extend(LISTEN_ACK.to_ne_bytes());
-        message.extend(4_u16.to_ne_bytes());
-        message.extend(0_u16.to_ne_bytes());
-        message.extend(PROC_CN_MCAST_LISTEN.to_ne_bytes());
-        // SAFETY: send from a byte buffer.
-        let sent = unsafe { libc::send(fd.as_raw_fd(), message.as_ptr().cast(), message.len(), 0) };
-        if usize::try_from(sent).ok() != Some(message.len()) {
-            return Err(unavailable(
-                "send(PROC_CN_MCAST_LISTEN)",
-                io::Error::last_os_error(),
-            ));
-        }
-        // The connector runs the listen request in the sender's send(2), and multicasts its
-        // acknowledgement to this socket's group before send returns: an acknowledgement not
-        // queued now never arrives. The kernel sends none for a listener outside the initial
-        // user and PID namespaces.
-        let netlink = Self { fd };
-        let mut buffer = vec![0_u8; 64 * 1024];
-        loop {
-            // SAFETY: recv into a byte buffer, without blocking.
-            let read = unsafe {
-                libc::recv(
-                    netlink.fd.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            let Ok(read) = usize::try_from(read) else {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Err(Outcome::Unavailable {
-                        call: "send(PROC_CN_MCAST_LISTEN)".to_owned(),
-                        errno: None,
-                        detail: "no acknowledgement was queued by the listen request".to_owned(),
-                    });
-                }
-                return Err(unavailable("recv(acknowledgement)", error));
-            };
-            for (what, _, _, ack, data) in messages(&buffer[..read]) {
-                if what == PROC_EVENT_NONE && ack == LISTEN_ACK.wrapping_add(1) {
-                    let error = u32::from_ne_bytes(data[0..4].try_into().expect("err"));
-                    if error != 0 {
-                        return Err(Outcome::Unavailable {
-                            call: "send(PROC_CN_MCAST_LISTEN)".to_owned(),
-                            errno: i32::try_from(error).ok(),
-                            detail: "the acknowledgement carries an error".to_owned(),
-                        });
-                    }
-                    return Ok(netlink);
-                }
-            }
-        }
-    }
-
-    fn receive_buffer(&self) -> c_int {
-        let mut bytes: c_int = 0;
-        let mut length = libc::socklen_t::try_from(size_of::<c_int>()).expect("socklen");
-        // SAFETY: getsockopt into an int.
-        let got = unsafe {
-            libc::getsockopt(
-                self.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                ptr::from_mut(&mut bytes).cast(),
-                &mut length,
-            )
-        };
-        assert_eq!(got, 0, "SO_RCVBUF: {}", io::Error::last_os_error());
-        bytes
-    }
-
-    /// Read every queued event without blocking; returns the number of overflow reports.
-    fn drain(
-        &self,
-        events: &mut Vec<(u32, ProcEvent)>,
-        losses: &mut Vec<String>,
-        sequence: &mut Sequences,
-    ) -> usize {
-        let mut overflows = 0;
-        let mut buffer = vec![0_u8; 64 * 1024];
-        loop {
-            // SAFETY: recv into a byte buffer, without blocking.
-            let read = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            let Ok(read) = usize::try_from(read) else {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::EAGAIN) => return overflows,
-                    Some(libc::EINTR) => continue,
-                    Some(libc::ENOBUFS) => {
-                        overflows += 1;
-                        losses.push("ENOBUFS: the receive buffer overflowed".to_owned());
-                        continue;
-                    }
-                    _ => panic!("recv: {error}"),
-                }
-            };
-            for (what, cpu, seq, _, data) in messages(&buffer[..read]) {
-                sequence.observe(cpu, seq);
-                let word = |index: usize| {
-                    u32::from_ne_bytes(data[index * 4..index * 4 + 4].try_into().expect("word"))
-                };
-                let event = match what {
-                    PROC_EVENT_FORK if word(2) == word(3) => ProcEvent::Fork {
-                        parent: word(1),
-                        child: word(3),
-                    },
-                    PROC_EVENT_EXEC if word(0) == word(1) => ProcEvent::Exec { pid: word(1) },
-                    PROC_EVENT_EXIT if word(0) == word(1) => ProcEvent::Exit {
-                        pid: word(1),
-                        wait_status: word(2),
-                    },
-                    _ => continue,
-                };
-                events.push((cpu, event));
-            }
-        }
-    }
-}
-
-/// Each netlink message in a datagram: (`what`, `cpu`, cn_msg `seq` and `ack`, event data).
-fn messages(datagram: &[u8]) -> impl Iterator<Item = (u32, u32, u32, u32, &[u8])> {
-    let mut offset = 0;
-    std::iter::from_fn(move || {
-        let header = datagram.get(offset..offset + NLMSG_HEADER)?;
-        let length = usize::try_from(u32::from_ne_bytes(header[0..4].try_into().ok()?)).ok()?;
-        let message = datagram.get(offset..offset + length)?;
-        offset += length.next_multiple_of(4).max(NLMSG_HEADER);
-        let connector = message.get(NLMSG_HEADER..NLMSG_HEADER + CN_MSG_HEADER)?;
-        let seq = u32::from_ne_bytes(connector[8..12].try_into().ok()?);
-        let ack = u32::from_ne_bytes(connector[12..16].try_into().ok()?);
-        let event = message.get(NLMSG_HEADER + CN_MSG_HEADER..)?;
-        let what = u32::from_ne_bytes(event.get(0..4)?.try_into().ok()?);
-        let cpu = u32::from_ne_bytes(event.get(4..8)?.try_into().ok()?);
-        Some((what, cpu, seq, ack, event.get(16..)?))
-    })
-}
-
-/// Keeps the events of processes descended from the harness's children, reading each one's
-/// identity and argv when its event is handled -- after the fact, as a listener must.
-struct TreeFilter {
-    harness: u32,
-    tree: HashSet<u32>,
-}
-
-impl TreeFilter {
-    fn new(harness: u32) -> Self {
-        Self {
-            harness,
-            tree: HashSet::new(),
-        }
-    }
-
-    fn observe(&mut self, (_, event): (u32, ProcEvent), observed: &mut Observed) {
-        match event {
-            ProcEvent::Fork { parent, child } => {
-                let root = parent == self.harness;
-                if !root && !self.tree.contains(&parent) {
-                    return;
-                }
-                self.tree.insert(child);
-                if root {
-                    return;
-                }
-                let pid = libc::pid_t::try_from(child).expect("pid");
-                observed.births.push(Birth {
-                    pid: child,
-                    ppid: parent,
-                    start: start_time(pid).ok_or_else(|| "unreadable".to_owned()),
-                    pidfd: open_pidfd(pid),
-                });
-            }
-            ProcEvent::Exec { pid } if self.tree.contains(&pid) => {
-                let process = libc::pid_t::try_from(pid).expect("pid");
-                observed.execs.push(Exec {
-                    pid,
-                    start: start_time(process).ok_or_else(|| "unreadable".to_owned()),
-                    argv: command_line(process),
-                });
-            }
-            ProcEvent::Exit { pid, wait_status } if self.tree.contains(&pid) => {
-                let process = libc::pid_t::try_from(pid).expect("pid");
-                observed.exits.push(Exit {
-                    pid,
-                    start: start_time(process).ok_or_else(|| "unreadable".to_owned()),
-                    wait_status: i32::try_from(wait_status).ok(),
-                });
-            }
-            ProcEvent::Exec { .. } | ProcEvent::Exit { .. } => {}
-        }
     }
 }
