@@ -155,7 +155,7 @@ impl Fixture {
                 None,
             )
             .await?;
-        Ok(response.into_parts().0)
+        Ok(response.into_answer()?.0)
     }
 
     async fn create(
