@@ -1327,29 +1327,11 @@ mod tests {
             .collect()
     }
 
-    /// `struct pipe_fdinfo` of `<sys/proc_info.h>`, which the libc crate does not declare.
-    #[cfg(target_os = "macos")]
-    #[repr(C)]
-    struct PipeFdInfo {
-        fi_openflags: u32,
-        fi_status: u32,
-        fi_offset: libc::off_t,
-        fi_type: i32,
-        fi_guardflags: u32,
-        pipe_stat: libc::vinfo_stat,
-        pipe_handle: u64,
-        pipe_peerhandle: u64,
-        pipe_status: libc::c_int,
-        rfu_1: libc::c_int,
-    }
-
-    /// `PROC_PIDFDPIPEINFO` of `<sys/proc_info.h>`.
-    #[cfg(target_os = "macos")]
-    const PROC_PIDFDPIPEINFO: libc::c_int = 6;
-
     /// The kernel's identity of pipe end `descriptor` in process `pid`: its pipe handle.
     #[cfg(target_os = "macos")]
     fn pipe_end(pid: u32, descriptor: RawFd) -> Option<u64> {
+        use crate::runtime::process_blocker::{PROC_PIDFDPIPEINFO, PipeFdInfo};
+
         let mut info = std::mem::MaybeUninit::<PipeFdInfo>::uninit();
         let size = libc::c_int::try_from(size_of::<PipeFdInfo>()).unwrap();
         // SAFETY: `info` provides `size` writable bytes.
