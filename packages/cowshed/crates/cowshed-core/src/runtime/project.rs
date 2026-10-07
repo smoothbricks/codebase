@@ -3564,6 +3564,7 @@ impl NativeProjectRuntimeHost {
         };
         for workspace in self.authoritative().await? {
             let name = workspace.derived.workspace.name().clone();
+            let checkout = self.workspace_mount_path(&name)?;
             links.owners.insert(super::build_volumes::Owner {
                 name: name.clone(),
                 incarnation: workspace.derived.workspace.incarnation().clone(),
@@ -3572,12 +3573,13 @@ impl NativeProjectRuntimeHost {
                 workspace.derived.mount_state,
                 crate::storage::lifecycle::MountState::Mounted { .. }
             ) {
-                if let Some(id) = volumes.layout.linked(&self.workspace_mount_path(&name)?)? {
+                if let Some(id) = volumes.layout.linked(&checkout)? {
                     links.volumes.insert(id);
                 }
             } else {
-                links.detached.insert(name);
+                links.detached.insert(name.clone());
             }
+            links.checkouts.insert(name, checkout);
         }
         Ok((images, links))
     }
@@ -3629,21 +3631,23 @@ impl NativeProjectRuntimeHost {
             seeded: false,
             adoption: Adoption::Skipped { reason },
         };
-        if volumes.layout.linked(landing)?.is_none() {
+        let Some(landing_volume) = volumes.hold_landing(landing)? else {
             return Ok(skipped(AdoptionSkip::NoLandingVolume));
-        }
+        };
         if volumes.layout.linked(&into.mount)?.is_none() {
             return Ok(skipped(AdoptionSkip::NoTargetVolume));
         }
         // Step 4: the supervisor stops every job of the landing workspace; the volume's own
-        // daemon and database holders are then the build volume module's to settle.
+        // daemon and database holders are then the build volume module's to settle. The land
+        // holds the volume from before the jobs let go of it until the target's link and record
+        // name it, so no collection takes it between, whatever links that collection read.
         let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
         drop(stopped);
         let quiet = match timed_async(
             "land",
             "quiesce",
-            volumes.quiesce(landing.to_owned(), into.mount.clone()),
+            volumes.quiesce(landing_volume, into.mount.clone()),
         )
         .await?
         {

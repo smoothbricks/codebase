@@ -9,7 +9,7 @@
 //! still being created may own ([`Links::creating`]). What a crash leaves behind is a volume
 //! nothing links, which [`BuildVolumes::collect`] deletes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,14 +22,14 @@ use crate::api::dto::{
 };
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
-    BuildStateRefresh, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
+    BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
+    BuildVolumeRole, BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
-    BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
+    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
 };
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
@@ -48,20 +48,35 @@ pub(crate) struct Owner {
 /// ones being created: a create or fork forks its build volume and seed into the staged checkout,
 /// and an adopt mints main's first one beside main's image, before the workspace exists, so until
 /// its intent completes nothing readable names either.
+///
+/// `checkouts` is where each existing workspace's checkout is, so a release can read that
+/// checkout's link again under its claim: a land that moves a target's link onto a volume this
+/// snapshot saw linked by nothing makes the volume the target's after the snapshot was taken.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Links {
     pub volumes: BTreeSet<BuildVolumeId>,
     pub owners: BTreeSet<Owner>,
     pub detached: BTreeSet<WorkspaceName>,
     pub creating: BTreeSet<WorkspaceName>,
+    pub checkouts: BTreeMap<WorkspaceName, PathBuf>,
 }
 
-/// The landing workspace's volume once nothing writes it (Land step 4).
+/// The landing workspace's volume, held for its land from before the landing workspace's jobs
+/// stop until the target's link and record name it (Land steps 4–6): no collection, in this
+/// process or another, releases it meanwhile, whatever links it read before the move.
+#[derive(Debug)]
+pub(crate) struct Landing {
+    id: BuildVolumeId,
+    hold: BuildVolumeHold,
+}
+
+/// The landing workspace's volume once nothing writes it (Land step 4), still held.
 #[derive(Clone, Debug)]
 pub(crate) struct Quiet {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
+    _hold: Arc<BuildVolumeHold>,
 }
 
 /// A fork's live volume, cloned from its source's latest seed and mounted while the source's
@@ -687,22 +702,44 @@ impl BuildVolumes {
         }
     }
 
+    /// Hold the volume `checkout` links for its land (Land step 4), or `None` when it links
+    /// none. Taken before the landing workspace's jobs stop, so the volume is never without a
+    /// hold between their release of it and the target's link naming it.
+    pub fn hold_landing(&self, checkout: &Path) -> Result<Option<Landing>> {
+        let Some(id) = self.layout.linked(checkout)? else {
+            return Ok(None);
+        };
+        match self.layout.hold(&id) {
+            Ok(hold) => Ok(Some(Landing { id, hold })),
+            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                Err(CowshedError::conflict(
+                    format!("cannot hold the landing build volume for the land: {error}"),
+                    "another cowshed process released it as unlinked; `cowshed doctor --json` \
+                     reports the landing workspace's build link",
+                ))
+            }
+            Err(error) => Err(io(
+                "hold the landing build volume",
+                &self.layout.hold_path(&id),
+                &error,
+            )),
+        }
+    }
+
     /// Land step 4, after the landing workspace's supervisor has stopped its jobs: the landing
     /// volume's Nx daemon is stopped and its task database must have no holder left. The quiet
     /// volume then grows to the target's capacity when it is smaller, before the seed is frozen
     /// from it, so an adoption never shrinks the target and the seed inherits the larger cap: a
-    /// workspace forked before a resize of its target lands at the target's capacity.
+    /// workspace forked before a resize of its target lands at the target's capacity. The
+    /// landing hold goes with the quiet volume.
     pub async fn quiesce(
         &self,
-        checkout: PathBuf,
+        landing: Landing,
         target_checkout: PathBuf,
     ) -> Result<std::result::Result<Quiet, AdoptionSkip>> {
-        let id = self.layout.linked(&checkout)?;
         let target = self.layout.linked(&target_checkout)?;
         self.blocking(move |host, layout| {
-            let Some(id) = id else {
-                return Ok(Err(AdoptionSkip::NoLandingVolume));
-            };
+            let Landing { id, hold } = landing;
             let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             if let Err(busy) = nx::close(&mount, &state)
@@ -726,7 +763,12 @@ impl BuildVolumes {
                     Err(error) => return Err(storage(error)),
                 }
             }
-            Ok(Ok(Quiet { id, mount, state }))
+            Ok(Ok(Quiet {
+                id,
+                mount,
+                state,
+                _hold: Arc::new(hold),
+            }))
         })
         .await
     }
@@ -1090,9 +1132,12 @@ impl BuildVolumes {
     }
 
     /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms of `images`, listed
-    /// before `links` was read. A volume a job still holds, or whose release fails, is deferred
-    /// to the next pass with the reason, beside what the plan itself deferred; one release that
-    /// fails never keeps the others. Every process a forced unmount cut off is named on stderr.
+    /// before `links` was read. Each doomed volume is claimed first and decided again under the
+    /// claim: one whose record now names a checkout that links it ([`relinked`]) is kept, since a
+    /// land moved that checkout onto it after `links` was read. A volume a job or a land still
+    /// holds, or whose release fails, is deferred to the next pass with the reason, beside what
+    /// the plan itself deferred; one release that fails never keeps the others. Every process a
+    /// forced unmount cut off is named on stderr.
     pub async fn collect(
         &self,
         images: Vec<BuildVolumeId>,
@@ -1115,59 +1160,99 @@ impl BuildVolumes {
             };
             for Doomed { id, reason, bytes } in plan.doomed {
                 let image = layout.image(&id);
-                collection.candidates.push(GcCandidate {
+                let deferral = if dry_run {
+                    // What the release would answer, asked without claiming.
+                    match (relinked(layout, &links, &id), layout.held(&id)) {
+                        (Ok(Some(checkout)), _) => Some(Deferral::Relinked(checkout)),
+                        (Err(error), _) => Some(Deferral::ReleaseFailed(format!(
+                            "cannot tell whether a checkout links it: {error}"
+                        ))),
+                        (Ok(None), Ok(false)) => None,
+                        (Ok(None), Ok(true)) => Some(Deferral::Held(Vec::new())),
+                        (Ok(None), Err(error)) => Some(Deferral::ReleaseFailed(format!(
+                            "cannot tell whether a job holds it: {error}"
+                        ))),
+                    }
+                } else {
+                    match release_unless_relinked(host, layout, &links, &id) {
+                        Ok(Ok(refused)) => {
+                            say_release(&id, "collected", &BuildVolumeRelease::Deleted { refused });
+                            collection.reclaimed += 1;
+                            None
+                        }
+                        Ok(Err(deferral)) => Some(deferral),
+                        Err(error) => Some(Deferral::ReleaseFailed(error.to_string())),
+                    }
+                };
+                let candidate = GcCandidate {
                     identity: Sha256Digest::compute(image.as_os_str().as_encoded_bytes()),
                     path: image.clone(),
                     bytes,
                     reason,
-                });
-                if dry_run {
-                    // What the release would answer for a job's hold, asked without claiming.
-                    match layout.held(&id) {
-                        Ok(false) => {
-                            collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
-                        }
-                        Ok(true) => {
-                            collection.candidates.pop();
-                            collection.deferred.push(Deferred {
-                                path: image,
-                                deferral: Deferral::Held(Vec::new()),
-                            });
-                        }
-                        Err(error) => {
-                            collection.candidates.pop();
-                            collection.deferred.push(Deferred {
-                                path: image,
-                                deferral: Deferral::ReleaseFailed(format!(
-                                    "cannot tell whether a job holds it: {error}"
-                                )),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                match host.release_build_volume(layout, &id) {
-                    Ok(release @ BuildVolumeRelease::Deleted { .. }) => {
-                        say_release(&id, "collected", &release);
-                        collection.reclaimed += 1;
+                };
+                match deferral {
+                    None => {
+                        collection.candidates.push(candidate);
                         collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
                     }
-                    Ok(BuildVolumeRelease::Held { open }) => {
+                    Some(deferral) => {
+                        // A collection names what it tried to release; a volume a checkout
+                        // links is not garbage, and a dry run tries nothing.
+                        if !dry_run && !matches!(deferral, Deferral::Relinked(_)) {
+                            collection.candidates.push(candidate);
+                        }
                         collection.deferred.push(Deferred {
                             path: image,
-                            deferral: Deferral::Held(open),
+                            deferral,
                         });
                     }
-                    Err(error) => collection.deferred.push(Deferred {
-                        path: image,
-                        deferral: Deferral::ReleaseFailed(error.to_string()),
-                    }),
                 }
             }
             Ok(collection)
         })
         .await
     }
+}
+
+/// The checkout that links `id` now, read from `id`'s record and that checkout's own link: a
+/// land records the volume it adopted as the target's only after the target's link names it,
+/// and holds the volume across both, so under a release's claim the two agree or the volume is
+/// not the target's.
+fn relinked(
+    layout: &BuildVolumeLayout,
+    links: &Links,
+    id: &BuildVolumeId,
+) -> Result<Option<WorkspaceName>> {
+    let Some(BuildVolumeRecord {
+        role: BuildVolumeRole::Linked { checkout },
+        ..
+    }) = layout.read_record_present(id)?
+    else {
+        return Ok(None);
+    };
+    let Some(path) = links.checkouts.get(&checkout) else {
+        return Ok(None);
+    };
+    Ok((layout.linked(path)?.as_ref() == Some(id)).then_some(checkout))
+}
+
+/// Release doomed volume `id` unless, under the release's claim, something holds it or a
+/// checkout links it now. Answers the unforced unmount's refusal of a release, or why the volume
+/// stays.
+fn release_unless_relinked(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    links: &Links,
+    id: &BuildVolumeId,
+) -> Result<std::result::Result<Option<BuildVolumeRefusal>, Deferral>> {
+    let claim = match host.claim_build_volume(layout, id).map_err(storage)? {
+        BuildVolumeClaim::Claimed(claim) => claim,
+        BuildVolumeClaim::Held { open } => return Ok(Err(Deferral::Held(open))),
+    };
+    if let Some(checkout) = relinked(layout, links, id)? {
+        return Ok(Err(Deferral::Relinked(checkout)));
+    }
+    host.release_claimed(layout, claim).map(Ok).map_err(storage)
 }
 
 /// Why collection leaves a build volume for a later pass instead of deleting it.
@@ -1196,6 +1281,9 @@ pub(crate) enum Deferral {
         detached: Vec<WorkspaceName>,
         creating: Vec<WorkspaceName>,
     },
+    /// Under the release's claim, its record names `0` as its checkout and `0`'s build link
+    /// names it: a land moved `0` onto it after this collection read the links, so it is `0`'s.
+    Relinked(WorkspaceName),
 }
 
 impl Deferral {
@@ -1219,7 +1307,9 @@ impl std::fmt::Display for Deferral {
         };
         match self {
             Self::Held(open) => {
-                formatter.write_str("a job admitted on it still runs")?;
+                formatter.write_str(
+                    "a job admitted on it, or a land moving a link onto it, still runs",
+                )?;
                 if !open.is_empty() {
                     formatter.write_str(", open in ")?;
                     write_holders(formatter, open)?;
@@ -1236,6 +1326,10 @@ impl std::fmt::Display for Deferral {
             Self::Creating(workspace) => write!(
                 formatter,
                 "its record names {workspace}, whose create, fork or adopt has not finished; decided once it has"
+            ),
+            Self::Relinked(checkout) => write!(
+                formatter,
+                "{checkout}'s build link names it since this collection read the links: a land moved {checkout} onto it, so it is {checkout}'s"
             ),
             Self::Unrecorded { detached, creating } => {
                 formatter.write_str("it has no record, and the links of")?;
@@ -2161,16 +2255,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(collected.reclaimed, 2, "{:?}", collected.candidates);
-        let refusal = scratch
-            .layout
-            .resolve_link(&lane.name, &forked)
-            .unwrap_err();
+        // The fork's link names what that collection took: its mount no longer refuses, and
+        // settles the link from the fork's own seed, which went too.
         assert_eq!(
-            refusal.message,
-            format!(
-                "lane's build link names {forked}, which lane does not own, and 0 build volumes \
-                 are recorded as lane's"
-            )
+            scratch.layout.resolve_link(&lane.name, &forked).unwrap(),
+            crate::build_volume::LinkResolution::Vanished
         );
         scratch.release_all();
     }
@@ -2415,6 +2504,14 @@ mod tests {
             (checkout, id, mount)
         }
 
+        /// The volume `checkout` links, held for a land.
+        fn landing(&self, checkout: &Path) -> Landing {
+            self.volumes
+                .hold_landing(checkout)
+                .unwrap()
+                .expect("the landing checkout links a volume")
+        }
+
         fn release_all(&self) {
             for id in self.layout.list().unwrap() {
                 let release = self.host.release_build_volume(&self.layout, &id).unwrap();
@@ -2534,7 +2631,7 @@ mod tests {
         let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
             .volumes
-            .quiesce(topic_checkout, main_checkout.clone())
+            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -2569,6 +2666,8 @@ mod tests {
             .await
             .unwrap()
             .expect("nothing opened the target's volume since");
+        // The land lets go of the landing volume once main's link and record name it.
+        drop(quiet);
         assert_eq!(
             scratch.volumes.layout.linked(&main_checkout).unwrap(),
             Some(topic.clone())
@@ -2589,7 +2688,7 @@ mod tests {
         let (other_checkout, other, _) = scratch.linked_checkout("other", 3);
         scratch
             .volumes
-            .quiesce(other_checkout, main_checkout)
+            .quiesce(scratch.landing(&other_checkout), main_checkout)
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -2964,5 +3063,175 @@ mod tests {
         drop(entered);
         assert!(!scratch.layout.image(&dropped.id).exists());
         assert_eq!(scratch.layout.list().unwrap(), []);
+    }
+
+    /// The `cowshed land <ws>` then `cowshed rm <ws>` that left main's build link naming a
+    /// volume that no longer existed, on real APFS. The `rm` retired the landing workspace while
+    /// its land was still running, so its collection saw the landing volume linked by nothing:
+    /// main still linked its own previous volume, and the landing workspace was gone. That
+    /// collection ran once while the land held the quiet volume and once after the land had moved
+    /// main's link onto it, both times from the snapshot it took before the adoption. Neither
+    /// may take the volume: main ends owning the adopted volume, mounted, at the capacity a
+    /// resize gave main before the land. Main's link left naming a volume that is gone anyway is
+    /// what `cowshed doctor --repair` and every other opening's mount then settle: main reforks
+    /// from the seed its land froze.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_collection_planned_before_a_land_adopted_never_takes_the_adopted_volume() {
+        let scratch = Scratch::new("build-adopt-rm");
+        let main = owner("main", '0');
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
+        scratch
+            .volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(2),
+            )
+            .await
+            .expect("grow main's build volume");
+        let (topic_checkout, topic, topic_mount) = scratch.linked_checkout("topic", 1);
+        // What the `rm` of the landing workspace read: every image, then main, mounted, linking
+        // its own volume; the landing workspace already retired.
+        let rm_listed = scratch.layout.list().unwrap();
+        let rm_saw = || Links {
+            volumes: [main_live.clone()].into_iter().collect(),
+            owners: [main.clone()].into_iter().collect(),
+            checkouts: [(main.name.clone(), main_checkout.clone())]
+                .into_iter()
+                .collect(),
+            ..Links::default()
+        };
+        let kept = |collection: &Collection| {
+            collection
+                .deferred
+                .iter()
+                .find(|deferred| deferred.path == scratch.layout.image(&topic))
+                .map(|deferred| deferred.deferral.clone())
+        };
+
+        let quiet = scratch
+            .volumes
+            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        let during = scratch
+            .volumes
+            .collect(rm_listed.clone(), rm_saw(), false)
+            .await
+            .unwrap();
+        assert!(
+            scratch.layout.image(&topic).exists(),
+            "a collection took the landing volume while its land held it quiet"
+        );
+        assert!(
+            matches!(kept(&during), Some(Deferral::Held(_))),
+            "{:?}",
+            during.deferred
+        );
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        scratch
+            .volumes
+            .freeze_seed(&quiet, main.clone(), tree.clone())
+            .await
+            .unwrap();
+        let closed = scratch
+            .volumes
+            .close_target(main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the target's volume");
+        let adopted = scratch
+            .volumes
+            .adopt(
+                &quiet,
+                closed,
+                WorkspaceName::main(),
+                main_checkout.clone(),
+                tree,
+            )
+            .await
+            .unwrap()
+            .expect("nothing opened the target's volume since");
+        drop(quiet);
+        scratch
+            .volumes
+            .release_previous(adopted.previous)
+            .await
+            .unwrap();
+
+        let after = scratch
+            .volumes
+            .collect(rm_listed, rm_saw(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept(&after),
+            Some(Deferral::Relinked(main.name.clone())),
+            "{:?}",
+            after.deferred
+        );
+        assert_eq!(
+            scratch.layout.linked(&main_checkout).unwrap(),
+            Some(topic.clone())
+        );
+        assert_eq!(
+            scratch.layout.resolve_link(&main.name, &topic).unwrap(),
+            crate::build_volume::LinkResolution::Keep,
+            "main owns the volume it adopted"
+        );
+        assert!(scratch.layout.image(&topic).exists());
+        assert_ne!(
+            fs::metadata(&topic_mount).unwrap().dev(),
+            fs::metadata(topic_mount.parent().unwrap()).unwrap().dev(),
+            "main's adopted volume is still mounted"
+        );
+        assert!(
+            scratch
+                .host
+                .build_volume_capacity(&scratch.layout, &topic)
+                .unwrap()
+                >= ImageCapacity::from_gibibytes(2),
+            "the adopted volume keeps the capacity main was resized to"
+        );
+
+        // The incident's end state: main's link names a volume that is gone.
+        let released = scratch
+            .host
+            .release_build_volume(&scratch.layout, &topic)
+            .unwrap();
+        assert!(
+            matches!(released, BuildVolumeRelease::Deleted { .. }),
+            "{released:?}"
+        );
+        scratch
+            .host
+            .settle_build_link(
+                &scratch.layout,
+                &main.name,
+                &main.incarnation,
+                &main_checkout,
+                &topic,
+            )
+            .expect("main reforks from the seed its land froze");
+        let relinked = scratch
+            .layout
+            .linked(&main_checkout)
+            .unwrap()
+            .expect("main links a volume again");
+        assert_ne!(relinked, topic);
+        assert_eq!(
+            scratch.layout.resolve_link(&main.name, &relinked).unwrap(),
+            crate::build_volume::LinkResolution::Keep,
+            "main owns the volume it reforked"
+        );
+        let remount = scratch.layout.mount(&relinked);
+        assert_ne!(
+            fs::metadata(&remount).unwrap().dev(),
+            fs::metadata(remount.parent().unwrap()).unwrap().dev(),
+            "main's reforked volume is mounted"
+        );
+        scratch.release_all();
     }
 }

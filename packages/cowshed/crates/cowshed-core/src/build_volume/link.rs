@@ -69,6 +69,21 @@ pub fn point(checkout: &Path, mount: &Path) -> Result<()> {
         })
 }
 
+/// Remove `checkout`'s build link, so it links no volume; an absent link is already gone. Only
+/// for a link whose volume no longer exists: the build-state links then dangle until the
+/// checkout's next refresh makes its first volume and links it.
+pub fn unlink(checkout: &Path) -> Result<()> {
+    let link = checkout.join(BUILD_LINK);
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&link).map_err(|error| link_error(&link, &error))
+        }
+        Ok(_) => Err(not_a_link(&link)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(link_error(&link, &error)),
+    }
+}
+
 /// Make every build-state path of `checkout` the fixed relative link through its build link,
 /// with the directory it names present in the volume mounted at `volume`.
 ///

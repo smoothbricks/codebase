@@ -61,7 +61,9 @@ mod build_volumes;
 pub use blank_template::{
     BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
 };
-pub use build_volumes::{Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease};
+pub use build_volumes::{
+    Claim as BuildVolumeClaim, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
+};
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
@@ -4216,29 +4218,13 @@ where
                 target.display()
             ))
         })?;
-        match layout.resolve_link(workspace.name(), &id).map_err(host)? {
-            crate::build_volume::LinkResolution::Keep => {
-                self.mount_build_volume(&layout, &id).map(|_| ())
-            }
-            crate::build_volume::LinkResolution::Repoint(own) => {
-                let mount = self.mount_build_volume(&layout, &own)?;
-                crate::build_volume::link::point(checkout, &mount).map_err(host)
-            }
-            crate::build_volume::LinkResolution::Refork(seed) => {
-                let tree = layout.read_record(&seed).map_err(host)?.tree;
-                let (_, mount) = self.fork_build_volume(
-                    &layout,
-                    &seed,
-                    &crate::build_volume::BuildVolumeRecord::new(
-                        tree,
-                        crate::build_volume::BuildVolumeRole::Linked {
-                            checkout: workspace.name().clone(),
-                        },
-                    ),
-                )?;
-                crate::build_volume::link::point(checkout, &mount).map_err(host)
-            }
-        }
+        self.settle_build_link(
+            &layout,
+            workspace.name(),
+            workspace.incarnation(),
+            checkout,
+            &id,
+        )
     }
 
     fn resize(

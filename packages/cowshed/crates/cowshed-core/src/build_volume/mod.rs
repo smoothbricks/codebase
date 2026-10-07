@@ -479,6 +479,11 @@ pub enum LinkResolution {
     /// checkout takes a fresh clone of this seed, the adopting target's latest, exactly as the
     /// refork would have given it.
     Refork(BuildVolumeId),
+    /// The link names a volume whose image no longer exists, and the checkout owns none: it
+    /// was collected or deleted out from under the checkout. Mounting gives the checkout a fresh
+    /// clone of its own latest seed, or no link at all when it has none, so its next build-state
+    /// refresh makes its first volume; what the lost volume held beyond that seed is gone.
+    Vanished,
 }
 
 /// Where one project's build volumes live.
@@ -579,7 +584,10 @@ impl BuildVolumeLayout {
     pub fn claim_release(&self, id: &BuildVolumeId) -> io::Result<Option<ReleaseClaim>> {
         let file = open_hold(&self.hold_path(id))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(ReleaseClaim { _file: file })),
+            Ok(()) => Ok(Some(ReleaseClaim {
+                id: id.clone(),
+                _file: file,
+            })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
@@ -709,22 +717,29 @@ impl BuildVolumeLayout {
     /// landing volume before its record moved. It is then re-pointed at the one volume recorded
     /// as `checkout`'s. When `checkout` owns none and `linked` is another checkout's live
     /// volume, a target adopted it from this checkout before a `land --no-retire` reforked it:
-    /// the checkout reforks from that target's latest seed. Anything else refuses, so a checkout
-    /// never writes a volume another checkout, a target or a seed owns.
+    /// the checkout reforks from that target's latest seed. When `checkout` owns none and
+    /// `linked`'s image is gone, whatever its record still says, nobody owns what the link names:
+    /// [`LinkResolution::Vanished`]. Anything else refuses, so a checkout never writes a volume
+    /// another checkout, a target or a seed owns.
     pub fn resolve_link(
         &self,
         checkout: &WorkspaceName,
         linked: &BuildVolumeId,
     ) -> crate::Result<LinkResolution> {
         let owns = |record: &BuildVolumeRecord| matches!(&record.role, BuildVolumeRole::Linked { checkout: owner } if owner == checkout);
+        // A creation makes the image before anything links it and a release deletes the image
+        // first, so a link to a missing image names a volume that no longer exists: its record,
+        // when one is left, speaks for nothing.
+        let vanished = !self.image(linked).exists();
         let adopter = match self.read_record_present(linked)? {
+            _ if vanished => None,
             Some(record) if owns(&record) => return Ok(LinkResolution::Keep),
-            None if self.image(linked).exists() => return Ok(LinkResolution::Keep),
+            None => return Ok(LinkResolution::Keep),
             Some(BuildVolumeRecord {
                 role: BuildVolumeRole::Linked { checkout: adopter },
                 ..
             }) => Some(adopter),
-            _ => None,
+            Some(_) => None,
         };
         let mut owned = Vec::new();
         let mut adopter_seeds = Vec::new();
@@ -739,10 +754,13 @@ impl BuildVolumeLayout {
                 _ => {}
             }
         }
-        if owned.is_empty()
-            && let Some((_, seed)) = adopter_seeds.into_iter().max()
-        {
-            return Ok(LinkResolution::Refork(seed));
+        if owned.is_empty() {
+            if let Some((_, seed)) = adopter_seeds.into_iter().max() {
+                return Ok(LinkResolution::Refork(seed));
+            }
+            if vanished {
+                return Ok(LinkResolution::Vanished);
+            }
         }
         match owned.as_slice() {
             [id] => Ok(LinkResolution::Repoint(id.clone())),
@@ -789,10 +807,18 @@ pub struct BuildVolumeHold {
     _file: fs::File,
 }
 
-/// A release's exclusive claim on a build volume ([`BuildVolumeLayout::claim_release`]).
+/// A release's exclusive claim on build volume `id` ([`BuildVolumeLayout::claim_release`]).
 #[derive(Debug)]
 pub struct ReleaseClaim {
+    id: BuildVolumeId,
     _file: fs::File,
+}
+
+impl ReleaseClaim {
+    /// The volume this claim keeps every new hold off.
+    pub fn id(&self) -> &BuildVolumeId {
+        &self.id
+    }
 }
 
 fn open_hold(path: &Path) -> io::Result<fs::File> {
@@ -1116,16 +1142,30 @@ mod tests {
         let latest = seed("2026-10-05T00:00:01Z");
         assert_eq!(
             layout.resolve_link(&orphan, &adopted).unwrap(),
-            LinkResolution::Refork(latest)
+            LinkResolution::Refork(latest.clone())
         );
         // A checkout that owns a volume is re-pointed at it, never reforked.
         assert_eq!(
             layout.resolve_link(&topic, &adopted).unwrap(),
             LinkResolution::Repoint(own.clone())
         );
-        // A link to a seed or a collected volume never reforks: nobody adopted it from here.
-        let error = layout.resolve_link(&orphan, &collected).unwrap_err();
+        // A link to a seed never reforks: nobody adopted it from here.
+        let error = layout.resolve_link(&orphan, &latest).unwrap_err();
         assert!(error.message.contains("0 build volumes"), "{error:?}");
+        // A link to a volume whose image is gone names nothing anybody owns, whatever record it
+        // left: what main's link named once a collection took the volume main had adopted.
+        assert_eq!(
+            layout.resolve_link(&orphan, &collected).unwrap(),
+            LinkResolution::Vanished
+        );
+        let gone = WorkspaceName::new("gone").unwrap();
+        let released = volume(linked(&gone));
+        fs::remove_file(layout.image(&released)).unwrap();
+        assert_eq!(
+            layout.resolve_link(&gone, &released).unwrap(),
+            LinkResolution::Vanished,
+            "a record left beside no image does not keep the link"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

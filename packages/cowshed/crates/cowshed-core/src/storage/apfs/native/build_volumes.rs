@@ -12,8 +12,11 @@ use std::time::SystemTime;
 use super::{MacOsApfsExecutionHost, io_error};
 use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
 use crate::build_volume::nx::Holder;
-use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord};
-use crate::metadata::ImageCapacity;
+use crate::build_volume::{
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
+    ReleaseClaim, link,
+};
+use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 
@@ -25,6 +28,15 @@ pub enum Release {
     Deleted { refused: Option<Refusal> },
     /// A job admitted on the volume still runs, so its hold keeps the volume; nothing was
     /// changed. `open` names the processes that have the volume open now.
+    Held { open: Vec<Holder> },
+}
+
+/// Whether a release may take a build volume now ([`MacOsApfsExecutionHost::claim_build_volume`]).
+#[derive(Debug)]
+pub enum Claim {
+    /// No job holds the volume, and none can until the claim is dropped.
+    Claimed(ReleaseClaim),
+    /// A job admitted on the volume still runs; `open` names what has the volume open now.
     Held { open: Vec<Holder> },
 }
 
@@ -213,20 +225,53 @@ where
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<Release, ApfsStorageError> {
+        match self.claim_build_volume(layout, id)? {
+            Claim::Claimed(claim) => Ok(Release::Deleted {
+                refused: self.release_claimed(layout, claim)?,
+            }),
+            Claim::Held { open } => Ok(Release::Held { open }),
+        }
+    }
+
+    /// Claim build volume `id` for its release, or answer what holds it. A caller that decided
+    /// the volume is garbage from what it read before the claim reads again under it: nothing
+    /// that holds the volume (a job admitted on it, a land moving a link onto it) can still be
+    /// changing it once the claim is taken.
+    pub fn claim_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<Claim, ApfsStorageError> {
+        self.verify_controller_path(&layout.image(id))?;
+        let hold = layout.hold_path(id);
+        match layout
+            .claim_release(id)
+            .map_err(|error| io_error("claim a build volume for release", &hold, error))?
+        {
+            Some(claim) => Ok(Claim::Claimed(claim)),
+            None => {
+                let mount = layout.mount(id);
+                let open = match self.mounted_at(&mount)? {
+                    Some(_) => holders_of(&mount)?,
+                    None => Vec::new(),
+                };
+                Ok(Claim::Held { open })
+            }
+        }
+    }
+
+    /// [`Self::release_build_volume`] of the volume `claim` claimed. Answers the unforced
+    /// unmount's refusal, when there was one. The claim is dropped once the image and its hold
+    /// file are gone, so a hold taken after that finds no image.
+    pub fn release_claimed(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: ReleaseClaim,
+    ) -> Result<Option<Refusal>, ApfsStorageError> {
+        let id = claim.id();
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         let mount = layout.mount(id);
-        let hold = layout.hold_path(id);
-        let Some(_claim) = layout
-            .claim_release(id)
-            .map_err(|error| io_error("claim a build volume for release", &hold, error))?
-        else {
-            let open = match self.mounted_at(&mount)? {
-                Some(_) => holders_of(&mount)?,
-                None => Vec::new(),
-            };
-            return Ok(Release::Held { open });
-        };
         let mut refused = None;
         // A minted volume is formatted before anything attaches it, so an attachment of a build
         // image is an APFS one; anything else is refused, not released.
@@ -259,7 +304,7 @@ where
         }
         self.backend.delete_image(&image)?;
         remove_if_present(&layout.record(id))?;
-        remove_if_present(&hold)?;
+        remove_if_present(&layout.hold_path(id))?;
         match fs::remove_dir(&mount) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -267,7 +312,62 @@ where
                 return Err(io_error("remove build volume mountpoint", &mount, error));
             }
         }
-        Ok(Release::Deleted { refused })
+        drop(claim);
+        Ok(refused)
+    }
+
+    /// Mount what `workspace`'s checkout links, whose build link names `linked`, once the link
+    /// is settled by [`BuildVolumeLayout::resolve_link`] (16_build_volumes.md, "One link per
+    /// checkout"). A link to a volume that no longer exists is said on stderr and replaced: by a
+    /// fresh clone of `workspace`'s latest seed at `incarnation`, or, when it has none, by no
+    /// link, so the next build-state refresh makes its first volume.
+    pub fn settle_build_link(
+        &self,
+        layout: &BuildVolumeLayout,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+        checkout: &Path,
+        linked: &BuildVolumeId,
+    ) -> Result<(), ApfsStorageError> {
+        let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
+        let refork = |seed: &BuildVolumeId| {
+            let tree = layout.read_record(seed).map_err(host)?.tree;
+            let (_, mount) = self.fork_build_volume(
+                layout,
+                seed,
+                &BuildVolumeRecord::new(
+                    tree,
+                    BuildVolumeRole::Linked {
+                        checkout: workspace.clone(),
+                    },
+                ),
+            )?;
+            link::point(checkout, &mount).map_err(host)
+        };
+        match layout.resolve_link(workspace, linked).map_err(host)? {
+            LinkResolution::Keep => self.mount_build_volume(layout, linked).map(|_| ()),
+            LinkResolution::Repoint(own) => {
+                let mount = self.mount_build_volume(layout, &own)?;
+                link::point(checkout, &mount).map_err(host)
+            }
+            LinkResolution::Refork(seed) => refork(&seed),
+            LinkResolution::Vanished => {
+                match layout.seed_of(workspace, incarnation).map_err(host)? {
+                    Some((seed, _)) => {
+                        eprintln!(
+                            "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists; {workspace} now links a fresh clone of its seed {seed}, and what {linked} held beyond that seed is lost"
+                        );
+                        refork(&seed)
+                    }
+                    None => {
+                        eprintln!(
+                            "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists, and {workspace} has no seed to clone; the link is removed, and {workspace}'s next build-state refresh makes its first volume"
+                        );
+                        link::unlink(checkout).map_err(host)
+                    }
+                }
+            }
+        }
     }
 
     /// The capacity build volume `id`'s image holds, attached or not.

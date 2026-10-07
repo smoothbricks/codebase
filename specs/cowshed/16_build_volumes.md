@@ -128,11 +128,15 @@ Mounting a checkout mounts the volume its link names only when that volume's sid
 or the volume has no sidecar yet (a creation in progress, whose sidecar is written last). Any other link is stale and is
 re-pointed at the one volume recorded as the checkout's. When the checkout owns none and the link names another
 checkout's live volume, a target adopted it from this checkout and a `land --no-retire` stopped before reforking it: the
-checkout takes a fresh clone of that target's latest seed, exactly as the refork would have. Anything else (several
-volumes, or none and no adopter's seed) refuses. Why: the link lives inside the source image, so a restored checkpoint
-carries the link it had when taken, and a land interrupted between renaming a target's link and updating the sidecars
-leaves the target naming the landing volume. Mounting such a link as found would let the checkout write a volume a
-target or another checkout owns, or one already collected. A restore therefore never rewinds the build volume.
+checkout takes a fresh clone of that target's latest seed, exactly as the refork would have. When the checkout owns none
+and the link names a volume whose image is gone, whatever sidecar it left, nobody owns what the link names: the checkout
+takes a fresh clone of its own latest seed, or, with no seed, loses the link, so its next build-state refresh makes its
+first volume; either is said on stderr with the lost volume's id. Every opening's mount settles this,
+`cowshed doctor --repair` and `cowshed setup` included. Anything else (several volumes, or none and no adopter's seed
+for a volume that exists) refuses. Why: the link lives inside the source image, so a restored checkpoint carries the
+link it had when taken, and a land interrupted between renaming a target's link and updating the sidecars leaves the
+target naming the landing volume. Mounting such a link as found would let the checkout write a volume a target or
+another checkout owns, or one already collected. A restore therefore never rewinds the build volume.
 
 **Refresh.** Before a job of a checkout is admitted (exec, a land check, the adoption check), at adoption for main, and
 from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it fingerprints the
@@ -344,9 +348,11 @@ same for main and for an integration workspace; "the target" is whichever one it
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
 3. **Fast-forward the target** under its repository lock (as today).
-4. **Quiesce the landing workspace.** Its supervisor stops the workspace's jobs and its sandboxed Nx daemon, and the
-   landing build volume's Nx task database must have no open file descriptors. If it still does, adoption is **skipped**
-   and reported, as for the target below. The landing volume now has no writer.
+4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.asif.hold` a job holds,
+   GC below) from before the workspace's jobs stop until step 6 has renamed the target's link and recorded the target as
+   the volume's owner, so no collection in any process releases it in between. Its supervisor stops the workspace's jobs
+   and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no open file descriptors. If
+   it still does, adoption is **skipped** and reported, as for the target below. The landing volume now has no writer.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
@@ -496,9 +502,16 @@ again at any level above it.
 - The last checkout link is the reclaim moment. Removing or retiring a checkout, adopting a replacement, failing a fork,
   or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
-- Ownership is a job hold or an unfinished create/fork/adopt in the lifecycle intent journal, not the kernel's refusal
-  to unmount. Every admitted cowshed job holds a shared flock on the build volume's `<id>.asif.hold` for its lifetime;
-  release must claim it exclusively. A running job therefore keeps main's previous volume across a swap.
+- Ownership is a job hold, a land's hold on its landing volume, or an unfinished create/fork/adopt in the lifecycle
+  intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
+  volume's `<id>.asif.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
+  previous volume across a swap.
+- Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retired
+  the landing workspace while that workspace's land still ran saw the landing volume linked by nothing, and once it
+  released it, main's link named a volume that no longer existed. So each release claims the volume first and reads
+  again under the claim: a volume whose sidecar names a checkout whose link names it now is that checkout's, and stays.
+  The land's hold spans its rename and its sidecar write, so under the claim the two agree or the volume is not the
+  target's.
 - Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
   to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
   the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold file and
