@@ -855,10 +855,11 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    here (typically well under a second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint
    facts left behind during this asynchronous phase neither republish the workspace nor authorize deletion by
    themselves; malformed, foreign, and duplicate facts remain integrity errors.
-5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
-   and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
-   then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
-   only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
+5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s monotonic wall-clock grace,
+   including disk-lease and command waits, not merely poll sleeps), unlink the trashed image and companions, every
+   checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact, then the empty checkpoint
+   and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc` only from exact, revalidated
+   retirement trash metadata; a missing canonical image alone is never cleanup authority.
 
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale

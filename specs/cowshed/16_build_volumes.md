@@ -485,9 +485,10 @@ again at any level above it.
 - Ownership is a job hold or an unfinished create/fork in the lifecycle intent journal, not the kernel's refusal to
   unmount. Every admitted cowshed job holds a shared flock on the build volume's `<id>.asif.hold` for its lifetime;
   release must claim it exclusively. A running job therefore keeps main's previous volume across a swap.
-- Once no owner remains, release first requests a non-forced unmount and allows a bounded grace for holders to release
-  it. If the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold
-  file and mountpoint. At the initial unforced refusal, it records the holders and names each pid and command on stderr,
+- Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
+  to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
+  the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold file and
+  mountpoint. At the initial unforced refusal, it records the holders and names each pid and command on stderr,
   distinguishing release within the grace from a forced unmount. Editors or indexers holding files or a working
   directory without a cowshed job hold cannot keep an unlinked volume attached indefinitely. Force revokes their access
   to the volume; it does not kill them.

@@ -729,6 +729,14 @@ pub struct DetachGrace {
     pub poll: Duration,
 }
 
+impl DetachGrace {
+    /// Command and lease waits spend the real grace too. Requested polls also advance the
+    /// injected sleeper's logical clock, without counting a real sleep twice.
+    fn expired(self, polled: Duration, elapsed: Duration) -> bool {
+        polled.max(elapsed) >= self.total
+    }
+}
+
 impl Default for DetachGrace {
     fn default() -> Self {
         Self {
@@ -738,10 +746,11 @@ impl Default for DetachGrace {
     }
 }
 
-/// The grace's only side effect, injected so unit tests spend no wall-clock time proving the
-/// escalation order.
+/// The grace's clock and sleep boundary, injected so unit tests prove escalation without
+/// spending wall-clock time or letting scheduler delays advance a mocked clock.
 pub trait Sleeper {
     fn sleep(&self, duration: Duration);
+    fn elapsed(&self, since: std::time::Instant) -> Duration;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -750,6 +759,10 @@ pub struct ThreadSleeper;
 impl Sleeper for ThreadSleeper {
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn elapsed(&self, since: std::time::Instant) -> Duration {
+        since.elapsed()
     }
 }
 
@@ -1484,6 +1497,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         operation: &'static str,
     ) -> Result<(), ApfsError> {
         let mut waited = Duration::ZERO;
+        let mut started = None;
         let mut force = false;
         loop {
             let mut args = Vec::with_capacity(1 + usize::from(force));
@@ -1501,7 +1515,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     if intent == DetachIntent::WhenIdle {
                         return Err(error);
                     }
-                    if waited >= self.grace.total {
+                    let started = started.get_or_insert_with(std::time::Instant::now);
+                    if self.grace.expired(waited, self.sleeper.elapsed(*started)) {
                         force = true;
                     } else {
                         self.sleeper.sleep(self.grace.poll);
@@ -2048,6 +2063,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
         let target = OsStr::new(target);
         let mut waited = Duration::ZERO;
+        let mut started = None;
         loop {
             match self.detach_once(target, false) {
                 Ok(()) => return Ok(()),
@@ -2055,7 +2071,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     if intent == DetachIntent::WhenIdle {
                         return Err(error);
                     }
-                    if waited >= self.grace.total {
+                    let started = started.get_or_insert_with(std::time::Instant::now);
+                    if self.grace.expired(waited, self.sleeper.elapsed(*started)) {
                         return self.detach_once(target, true);
                     }
                     self.sleeper.sleep(self.grace.poll);
@@ -4352,6 +4369,34 @@ mod tests {
         fn sleep(&self, duration: Duration) {
             self.0.borrow_mut().push(duration);
         }
+
+        fn elapsed(&self, _since: std::time::Instant) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    #[test]
+    fn release_grace_counts_wall_time_without_double_counting_requested_polls() {
+        let grace = DetachGrace {
+            total: Duration::from_millis(20),
+            poll: Duration::from_millis(10),
+        };
+        assert!(!grace.expired(Duration::ZERO, Duration::from_millis(19)));
+        assert!(grace.expired(Duration::ZERO, grace.total));
+        assert!(!grace.expired(grace.poll, grace.poll));
+        assert!(grace.expired(grace.total, Duration::ZERO));
+    }
+
+    #[test]
+    fn recorded_grace_polls_do_not_advance_from_wall_clock_or_scheduler_delays() {
+        let sleeper = RecordingSleeper::default();
+        let since = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(sleeper.elapsed(since), Duration::ZERO);
+        sleeper.sleep(Duration::from_millis(10));
+        assert_eq!(sleeper.elapsed(since), Duration::ZERO);
+        assert_eq!(*sleeper.waits(), [Duration::from_millis(10)]);
     }
 
     /// A backend whose detach graces each admit exactly two retries before giving up. The sleeper only
