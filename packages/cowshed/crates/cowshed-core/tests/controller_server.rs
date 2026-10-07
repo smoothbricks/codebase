@@ -980,3 +980,119 @@ async fn invalid_version_nonce_replay_and_non_socket_peer_fail_before_router_eff
     assert_eq!(error.code, ErrorCode::EnvironmentMissing);
     assert!(records.try_recv().is_err());
 }
+
+/// Saturating ordinary calls must not stop a stream's close demand from being read.
+#[tokio::test]
+async fn review_stream_close_is_read_at_the_ordinary_call_cap() {
+    let (router, mut commands) =
+        RouterHandle::channel(NonZeroUsize::new(128).expect("router capacity"));
+    let (held, mut pending) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let (request, reply) = command.into_parts();
+            if request.method() == "job.progress" {
+                let _ = reply.send(Ok(RouterResponse::events(Box::new(OneEvent(Some(
+                    json!({ "n": 1 }),
+                ))))));
+            } else {
+                held.send(reply).expect("the test holds ordinary calls");
+            }
+        }
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    client
+        .write_json(&json!({ "id": 1, "method": "job.progress", "params": params("job.progress") }))
+        .await;
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "event": { "n": 1 } })
+    );
+    let mut replies = Vec::new();
+    for id in 2..=65 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.status", "params": params("job.status") }),
+            )
+            .await;
+        replies.push(pending.recv().await.expect("ordinary call routed"));
+    }
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        read_value(&mut client),
+    )
+    .await;
+    // Release ordinary calls before asserting so the measured failure owns no hanging jobs.
+    for reply in replies {
+        let _ = reply.send(Ok(RouterResponse::json(json!({}))));
+    }
+    for _ in 0..if closed.is_ok() { 64 } else { 65 } {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), read_value(&mut client))
+            .await
+            .expect("released ordinary calls and close all answer");
+    }
+    drop(client);
+    server
+        .await
+        .expect("server joins")
+        .expect("clean disconnect");
+    assert_eq!(
+        closed.expect("the ordinary-call cap must not starve a stream close"),
+        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null })
+    );
+}
+
+/// The stream cap refuses the sixty-fifth stream without disabling demand frames.
+#[tokio::test]
+async fn review_stream_cap_refuses_an_extra_stream_and_allows_close() {
+    let (router, mut commands) =
+        RouterHandle::channel(NonZeroUsize::new(128).expect("router capacity"));
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let (_, reply) = command.into_parts();
+            let _ = reply.send(Ok(RouterResponse::events(Box::new(OneEvent(Some(
+                json!({ "n": 1 }),
+            ))))));
+        }
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    for id in 1..=64 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.progress", "params": params("job.progress") }),
+            )
+            .await;
+        assert_eq!(
+            read_value(&mut client).await,
+            json!({ "id": id, "event": { "n": 1 } })
+        );
+    }
+    client
+        .write_json(
+            &json!({ "id": 65, "method": "job.progress", "params": params("job.progress") }),
+        )
+        .await;
+    let refusal: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refusal.id, refusal.ok), (65, false));
+    assert_eq!(
+        refusal.error.expect("typed cap error").code,
+        ErrorCode::Conflict
+    );
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    let close = tokio::time::timeout(std::time::Duration::from_secs(1), read_value(&mut client))
+        .await
+        .expect("stream-only saturation still reads close");
+    assert_eq!(
+        close,
+        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null })
+    );
+    drop(client);
+    server
+        .await
+        .expect("server joins")
+        .expect("clean disconnect");
+}
