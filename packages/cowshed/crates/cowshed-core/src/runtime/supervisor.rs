@@ -44,6 +44,7 @@ use crate::runtime::job_groups::Birth;
 use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling, StreamTally};
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
+use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
     SealedCheckpointManifest, StreamKind,
@@ -106,6 +107,10 @@ pub struct WorkspaceSupervisorConfig {
     pub inherited_groups: Vec<super::job_groups::UnresolvedGroup>,
     /// What this supervisor names its checkout's volumes, and how; `None` names nothing.
     pub volume_labels: Option<VolumeLabels>,
+    /// The workspace volume each job's resource samples stat, mounted at `workspace_root`, beside
+    /// the build volume each job's admission grants (07_api.md "Job monitoring"). `None` stats
+    /// no volume: every job's volumes are then unconfigured.
+    pub workspace_volume: Option<VolumeMountpoint>,
 }
 
 /// How a volume's label stood when its supervisor looked.
@@ -169,6 +174,18 @@ impl WorkspaceSupervisorConfig {
                 "reattach the authoritative workspace mount",
             ));
         }
+        if let Some(volume) = &self.workspace_volume
+            && volume.path() != self.workspace_root
+        {
+            return Err(CowshedError::usage(
+                format!(
+                    "the workspace volume {} is not mounted at the supervisor workspace root {}",
+                    volume.path().display(),
+                    self.workspace_root.display()
+                ),
+                "configure the volume mounted at the workspace root",
+            ));
+        }
         // The sandbox's profiles are rendered by `SandboxPolicy::render` at start, which refuses
         // a sandbox that cannot compile.
         self.artifacts.validate().map_err(map_artifact_error)
@@ -223,6 +240,7 @@ impl Default for WorkspaceSupervisorConfig {
             telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
+            workspace_volume: None,
         }
     }
 }
@@ -2450,6 +2468,7 @@ impl WorkspaceSupervisor {
             policy,
             build_volume_layout: config.build_volume_layout,
             volume_labels: config.volume_labels,
+            workspace_volume: config.workspace_volume,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger,
             job_spans,
@@ -2688,6 +2707,9 @@ struct JobStateRecord {
     /// What the job's resource reads answer: nothing before it owns a process, live samples
     /// while it does, its terminal sample -- or why that failed -- once it ended.
     sampling: Sampling,
+    /// The job's volumes as its admission found them, immediately before its first process was
+    /// dispatched: every sample's volume deltas count from here, activation and command alike.
+    volumes: VolumeBaseline<HostVolume>,
     output_limit: Option<OutputLimitInfo>,
     kill_reason: Option<KillReason>,
     stdout_copy: Option<OutputPublication>,
@@ -2767,6 +2789,8 @@ struct SupervisorActor {
     build_volume_layout: Option<crate::build_volume::BuildVolumeLayout>,
     /// See [`WorkspaceSupervisorConfig::volume_labels`].
     volume_labels: Option<VolumeLabels>,
+    /// See [`WorkspaceSupervisorConfig::workspace_volume`].
+    workspace_volume: Option<VolumeMountpoint>,
     /// Names withheld from every child; see [`WorkspaceSupervisorConfig::credential_env_names`].
     credential_env_names: BTreeSet<String>,
     term_grace: Duration,
@@ -3550,6 +3574,15 @@ impl SupervisorActor {
         if let Some(job_spans) = &self.job_spans {
             job_spans.record(&info, JobSpanEdge::Start);
         }
+        // Read before the job's first process is dispatched, so nothing it writes precedes its
+        // baseline: a warm host may start the command before its start is reported here.
+        let volumes = {
+            let _span = crate::timing::span("admit", "volume-baseline");
+            VolumeBaseline::admitted(
+                self.workspace_volume.as_ref(),
+                self.policy.ceiling().build_volume_mount.as_deref(),
+            )
+        };
         let spawn_span = crate::timing::span("admit", "spawn");
         let spawn = self
             .spawner
@@ -3588,6 +3621,7 @@ impl SupervisorActor {
             conclusion: None,
             birth: None,
             sampling: Sampling::Unowned,
+            volumes,
             output_limit: None,
             kill_reason: None,
             stdout_copy,
@@ -4348,7 +4382,7 @@ impl SupervisorActor {
         // process, or whose last observation failed -- a read says which.
         job.info.resources = job
             .sampling
-            .freeze(|sampler| observe(sampler, job.stdout_tally, job.stderr_tally));
+            .freeze(|sampler| observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally));
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
@@ -4823,7 +4857,7 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
     let job_id = job.info.job_id;
     if let Some(sampler) = job.sampling.own(job_id, process) {
-        match observe(sampler, job.stdout_tally, job.stderr_tally) {
+        match observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
             Err(error) => eprintln!(
@@ -4835,11 +4869,14 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
 }
 
-/// Observe the job's processes now, with its streams as admitted so far: the one imperative step
-/// of a sample. Each member's resident memory is read right after the membership; a member that
-/// exited in between holds nothing and is no member any more.
+/// Observe the job's processes and volumes now, with its streams as admitted so far: the one
+/// imperative step of a sample. Each member's resident memory is read right after the
+/// membership; a member that exited in between holds nothing and is no member any more. Each
+/// volume answers for itself: one that cannot be read is its own unavailability, never the
+/// sample's failure.
 fn observe(
     sampler: &mut JobSampler,
+    volumes: &VolumeBaseline<HostVolume>,
     stdout: StreamTally,
     stderr: StreamTally,
 ) -> Result<JobResourceSample> {
@@ -4889,11 +4926,13 @@ fn observe(
     );
     #[cfg(not(target_os = "macos"))]
     let accounting = None;
+    let volumes = volumes.sample(&HostVolumeStat);
     sampler.sample(Observation {
         now: Instant::now(),
         sampled_at,
         members,
         host,
+        volumes,
         stdout,
         stderr,
         accounting,
@@ -4924,7 +4963,7 @@ fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> Co
 /// terminal sample or why it has none.
 fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
     let sample = job.sampling.read(job.info.job_id, |sampler| {
-        observe(sampler, job.stdout_tally, job.stderr_tally)
+        observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally)
     })?;
     if !job.terminal() {
         job.info.resources = Some(sample.clone());
@@ -6300,6 +6339,7 @@ mod lifecycle_commitment_tests {
             telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
+            workspace_volume: None,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

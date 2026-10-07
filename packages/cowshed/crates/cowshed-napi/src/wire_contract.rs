@@ -24,13 +24,14 @@ use cowshed_core::{
         AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros, CpuTotals,
         DoctorReport, EgressMode, EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate,
         GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
-        JobInfo, JobResourceSample, JobState, JobStreamWatermark, LandReport, LandingCommits,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
-        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
-        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
-        StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UtcTimestamp, WallMicros,
-        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
-        WorkspaceRole, WorkspaceState,
+        JobInfo, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, LandReport,
+        LandingCommits, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput,
+        PushReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule,
+        ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo,
+        StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UtcTimestamp,
+        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -147,6 +148,31 @@ fn empty_stdin() -> StdinInfo {
     }
 }
 
+/// An ended job's terminal sample: one leader, nothing of its group left, and `volumes`.
+fn sample(job: u64, volumes: JobVolumeUsage) -> JobResourceSample {
+    let wall = WallMicros::new(1_234_000).expect("fixture wall");
+    let stream = JobStreamWatermark {
+        bytes: StreamBytes::new(3).expect("fixture stream bytes"),
+        lines: StreamLines::new(1).expect("fixture stream lines"),
+    };
+    JobResourceSample {
+        job_id: JobId::new(job).expect("fixture job id"),
+        sampled_at: timestamp(),
+        wall_ms: wall.millis(),
+        wall_us: wall,
+        leader_pid: 4243,
+        members: Vec::new(),
+        host_start: HostLoadSample::new(2.0, 10).expect("fixture host"),
+        host: HostLoadSample::new(2.5, 10).expect("fixture host"),
+        rss_bytes: ResidentBytes::new(0).expect("fixture resident bytes"),
+        rss_peak_bytes: ResidentBytes::new(12 << 20).expect("fixture resident bytes"),
+        accounting: None,
+        volumes,
+        stdout: stream,
+        stderr: stream,
+    }
+}
+
 fn job_infos() -> BTreeMap<&'static str, Value> {
     // A queued job: no exit, no duration, no output limit, argv that is entirely UTF-8, and the
     // narrowest stdin. This is the shape `listJobs` returns most often.
@@ -207,6 +233,18 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
                 },
                 io: None,
             }),
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(64 << 20).expect("fixture delta"),
+                },
+                build: Some(VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Failed {
+                        message: "volume used-byte stat failed: no volume is mounted at the build \
+                                  mount"
+                            .into(),
+                    },
+                }),
+            },
             stdout: JobStreamWatermark {
                 bytes: StreamBytes::new(4096).expect("fixture stream bytes"),
                 lines: StreamLines::new(64).expect("fixture stream lines"),
@@ -245,7 +283,16 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(1_234),
-        resources: None,
+        // A supervisor configured with no volume sampled it: its volumes say so.
+        resources: Some(sample(
+            3,
+            JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Unconfigured,
+                },
+                build: None,
+            },
+        )),
         exit: Some(ExitStatus::Exited { code: 0 }),
         stdout: inline_stream("ok\n"),
         stderr: inline_stream(""),
@@ -277,7 +324,19 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         cwd: None,
         started: timestamp(),
         duration_ms: Some(9),
-        resources: None,
+        // A platform with no used-bytes stat for the workspace volume, and a build volume that
+        // shrank.
+        resources: Some(sample(
+            4,
+            JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::UnsupportedPlatform,
+                },
+                build: Some(VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(-(16 << 20)).expect("fixture delta"),
+                }),
+            },
+        )),
         exit: Some(ExitStatus::Signaled {
             signal: 9,
             core_dumped: true,
@@ -325,6 +384,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
     let killed = JobInfo {
         job_id: JobId::new(6).expect("fixture job id"),
         state: JobState::Killed,
+        resources: None,
         exit: Some(ExitStatus::Signaled {
             signal: 15,
             core_dumped: false,
@@ -343,6 +403,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::Failed,
         exit: None,
         pid: None,
+        resources: None,
         stdout: inline_stream(""),
         stderr: inline_stream("spawn refused\n"),
         ..exited.clone()
@@ -365,6 +426,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ),
         exit: Some(ExitStatus::Exited { code: 2 }),
         pid: None,
+        resources: None,
         stdout: inline_stream(""),
         stderr: inline_stream("syntax error: unterminated subshell\n"),
         failure: Some(cowshed_core::api::JobFailure::ScriptSyntax),
@@ -950,5 +1012,44 @@ fn argv_carries_both_command_arg_encodings() {
         argv.last().and_then(|argument| argument.get("data")),
         Some(&Value::String("//6A".to_owned())),
         "the non-UTF-8 argument must be canonical standard base64 of its bytes"
+    );
+}
+
+/// Each volume answers for itself, read or why not: every `VolumeUsage` and `VolumeUnavailable`
+/// variant, and a sample without a build volume, reach the corpus, so `types.ts` is verified
+/// against each.
+#[test]
+fn every_volume_usage_appears_in_the_corpus() {
+    let samples: Vec<Value> = job_infos()
+        .into_values()
+        .filter_map(|value| value.get("resources").cloned())
+        .collect();
+    let volumes: Vec<&Value> = samples
+        .iter()
+        .flat_map(|sample| ["workspace", "build"].map(|volume| &sample["volumes"][volume]))
+        .collect();
+    let kinds = |usage: &Value| {
+        (
+            usage["kind"].as_str().map(str::to_owned),
+            usage["reason"]["kind"].as_str().map(str::to_owned),
+        )
+    };
+    for (kind, reason) in [
+        ("read", None),
+        ("unavailable", Some("unconfigured")),
+        ("unavailable", Some("unsupportedPlatform")),
+        ("unavailable", Some("failed")),
+    ] {
+        let wanted = (Some(kind.to_owned()), reason.map(str::to_owned));
+        assert!(
+            volumes.iter().any(|usage| kinds(usage) == wanted),
+            "no volume in the corpus is {kind} {reason:?}"
+        );
+    }
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample["volumes"].get("build").is_none()),
+        "a sample without a build volume omits it"
     );
 }

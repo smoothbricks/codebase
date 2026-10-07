@@ -31,8 +31,8 @@ use crate::api::dto::{
 };
 use crate::api::resources::{
     CpuMicros, CpuTotals, HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark,
-    ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
-    WallMicros,
+    JobVolumeUsage, ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes,
+    StreamLines, VolumeUsage, WallMicros,
 };
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
@@ -84,10 +84,12 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// The one layout records are written and read in: version 6 carries a terminal job's resource
-/// sample in [`RESOURCE_COLUMNS`]. A store holding a record in an earlier layout is set aside
-/// whole ([`SetAsideStore`]), never read.
-const RECORD_SCHEMA_VERSION: u64 = 6;
+/// The one layout records are written and read in: version 7 carries a terminal job's resource
+/// sample in [`RESOURCE_COLUMNS`], its accounting in [`ACCOUNTING_COLUMNS`], then each of its
+/// volumes' usage in [`VOLUME_COLUMNS`], appended after every column of version 6 (11_shell.md:
+/// layouts grow only by trailing columns). A store holding a record in an earlier layout is set
+/// aside whole ([`SetAsideStore`]), never read.
+const RECORD_SCHEMA_VERSION: u64 = 7;
 /// Where a store in an earlier record layout is moved, beside the records it no longer is.
 const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
@@ -128,6 +130,12 @@ const ACCOUNTING_COLUMNS: [&str; 5] = [
 const ACCOUNTING_COLUMN: usize = RESOURCE_COLUMN + RESOURCE_COLUMNS.len();
 /// [`JobAccounting::MacOsRusageChildren`] in its source column: its wire kind.
 const RUSAGE_CHILDREN_SOURCE: &str = "macOsRusageChildren";
+/// Each of the terminal sample's volumes' usage as its wire JSON, after [`ACCOUNTING_COLUMNS`]:
+/// the workspace volume's, present in every sample, then the build volume's, null for a sample of
+/// a job that ran with no build volume. Both null for a record without a sample.
+const VOLUME_COLUMNS: [&str; 2] = ["resources_volume_workspace", "resources_volume_build"];
+/// Where [`VOLUME_COLUMNS`]' workspace volume is; the build volume's follows it.
+const VOLUME_COLUMN: usize = ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len();
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -3550,6 +3558,8 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(ACCOUNTING_COLUMNS[2], DataType::UInt64, true),
         field(ACCOUNTING_COLUMNS[3], DataType::UInt64, true),
         field(ACCOUNTING_COLUMNS[4], DataType::UInt64, true),
+        field(VOLUME_COLUMNS[0], DataType::Utf8, true),
+        field(VOLUME_COLUMNS[1], DataType::Utf8, true),
     ]))
 }
 
@@ -3764,6 +3774,16 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             (Some(RUSAGE_CHILDREN_SOURCE), Some(*cpu), *io)
         }
     };
+    let volume = |usage: &VolumeUsage| {
+        serde_json::to_string(usage).map_err(|error| ArtifactError::Arrow(error.to_string()))
+    };
+    let workspace_volume = resources
+        .map(|sample| volume(&sample.volumes.workspace))
+        .transpose()?;
+    let build_volume = resources
+        .and_then(|sample| sample.volumes.build.as_ref())
+        .map(volume)
+        .transpose()?;
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
@@ -3873,6 +3893,8 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt64Array::from(vec![cpu.map(|cpu| cpu.sys_us.get())])),
         Arc::new(UInt64Array::from(vec![io.map(|io| io.read_bytes.get())])),
         Arc::new(UInt64Array::from(vec![io.map(|io| io.write_bytes.get())])),
+        Arc::new(StringArray::from(vec![workspace_volume])),
+        Arc::new(StringArray::from(vec![build_volume])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3981,7 +4003,8 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
 }
 
 /// The terminal resource sample of a current-layout job batch: absent when every one of
-/// [`RESOURCE_COLUMNS`] is null; a partly null sample is damage.
+/// [`RESOURCE_COLUMNS`] is null, and [`ACCOUNTING_COLUMNS`] and [`VOLUME_COLUMNS`] with them; a
+/// partly null sample, or one without its workspace volume, is damage.
 fn decode_resources(
     batch: &RecordBatch,
     job_id: JobId,
@@ -3991,11 +4014,16 @@ fn decode_resources(
         .clone()
         .filter(|&column| batch.column(column).is_null(0))
         .count();
+    let no_workspace_volume = batch.column(VOLUME_COLUMN).is_null(0);
+    let no_build_volume = batch.column(VOLUME_COLUMN + 1).is_null(0);
     let accounting = decode_accounting(batch)?;
     if nulls == RESOURCE_COLUMNS.len() {
-        return match accounting {
-            None => Ok(None),
-            Some(_) => Err(ArtifactError::Arrow(
+        return match (no_workspace_volume && no_build_volume, accounting) {
+            (true, None) => Ok(None),
+            (false, _) => Err(ArtifactError::Arrow(
+                "a record without a resource sample has no volume usage".into(),
+            )),
+            (true, Some(_)) => Err(ArtifactError::Arrow(
                 "accounting columns belong to a resource sample, and this record has none".into(),
             )),
         };
@@ -4003,6 +4031,11 @@ fn decode_resources(
     if nulls != 0 {
         return Err(ArtifactError::Arrow(
             "resource columns must all be null or all present".into(),
+        ));
+    }
+    if no_workspace_volume {
+        return Err(ArtifactError::Arrow(
+            "a resource sample always says what its workspace volume is".into(),
         ));
     }
     let unit = |error: ResourceUnitError| ArtifactError::Arrow(error.to_string());
@@ -4031,6 +4064,20 @@ fn decode_resources(
         )?;
         HostLoadSample::new(load1.value(0), cores.value(0)).map_err(unit)
     };
+    let volume = |column: usize| -> Result<VolumeUsage, ArtifactError> {
+        serde_json::from_str(string(batch, column)?.value(0)).map_err(|error| {
+            ArtifactError::Arrow(format!(
+                "{} is no volume usage: {error}",
+                batch.schema().field(column).name()
+            ))
+        })
+    };
+    let volumes = JobVolumeUsage {
+        workspace: volume(VOLUME_COLUMN)?,
+        build: (!no_build_volume)
+            .then(|| volume(VOLUME_COLUMN + 1))
+            .transpose()?,
+    };
     let stream = |column: usize| -> Result<JobStreamWatermark, ArtifactError> {
         Ok(JobStreamWatermark {
             bytes: StreamBytes::new(uint64(batch, column)?.value(0)).map_err(unit)?,
@@ -4048,6 +4095,7 @@ fn decode_resources(
         host: host(RESOURCE_COLUMN + 6)?,
         rss_bytes: rss,
         rss_peak_bytes: rss_peak,
+        volumes,
         stdout: stream(RESOURCE_COLUMN + 10)?,
         stderr: stream(RESOURCE_COLUMN + 12)?,
         accounting,
@@ -5461,6 +5509,7 @@ mod tests {
     }
 
     fn sample(job_id: u64, wall_us: u64, leader_pid: u32) -> JobResourceSample {
+        use crate::api::resources::{VolumeUnavailable, VolumeUsedBytesDelta};
         let wall = WallMicros::new(wall_us).unwrap();
         JobResourceSample {
             job_id: JobId::new(job_id).unwrap(),
@@ -5480,8 +5529,111 @@ mod tests {
                 },
                 io: None,
             }),
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(-(16 << 20)).unwrap(),
+                },
+                build: Some(VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Failed {
+                        message: "no volume is mounted at /build".into(),
+                    },
+                }),
+            },
             stdout: watermark(5, 3),
             stderr: watermark(2_097_152, 2_097_152),
+        }
+    }
+
+    /// Each volume's usage is kept as it was sampled, read or not; a job that ran with no build
+    /// volume keeps none, and a volume's usage beside no sample, a sample without its workspace
+    /// volume, or a volume column that holds no usage, is damage. The volume columns are the
+    /// layout's tail, after layout 6's last column, so a layout-6 reader meets layout 7 as a newer
+    /// writer's (11_shell.md: layouts grow only by trailing columns).
+    #[test]
+    fn the_current_layout_keeps_each_volumes_usage_and_only_a_sampled_build_volume() {
+        let schema = protected_record_schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            (names[VOLUME_COLUMN - 1], &names[VOLUME_COLUMN..]),
+            ("resources_accounting_io_write_bytes", &VOLUME_COLUMNS[..]),
+            "layout 7 appends the volumes after layout 6's last column, and nothing else"
+        );
+        use crate::api::resources::VolumeUnavailable;
+        let mut no_build = sample(9, 1, 1);
+        no_build.volumes = JobVolumeUsage {
+            workspace: VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::UnsupportedPlatform,
+            },
+            build: None,
+        };
+        for resources in [sample(9, 1, 1), no_build] {
+            let record = JobArtifactRecord {
+                exit: Some(ExitStatus::Exited { code: 0 }),
+                duration_ms: Some(1),
+                resources: Some(resources),
+                ..valid_job_record(9)
+            };
+            let batch = job_record_to_batch(&record).unwrap();
+            assert_eq!(
+                batch.column(VOLUME_COLUMN + 1).is_null(0),
+                record
+                    .resources
+                    .as_ref()
+                    .is_some_and(|sample| sample.volumes.build.is_none())
+            );
+            let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
+                panic!("a job record");
+            };
+            assert_eq!(read, record);
+        }
+
+        let unsampled = job_record_to_batch(&valid_job_record(9)).unwrap();
+        for column in [VOLUME_COLUMN, VOLUME_COLUMN + 1] {
+            let mut columns = unsampled.columns().to_vec();
+            columns[column] =
+                Arc::new(StringArray::from(vec![r#"{"kind":"read","deltaBytes":1}"#]));
+            let stray = RecordBatch::try_new(unsampled.schema(), columns).unwrap();
+            assert!(
+                batch_to_protected_record(&stray).is_err(),
+                "{}'s usage beside no sample",
+                VOLUME_COLUMNS[column - VOLUME_COLUMN]
+            );
+        }
+
+        let sampled = job_record_to_batch(&JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1),
+            resources: Some(sample(9, 1, 1)),
+            ..valid_job_record(9)
+        })
+        .unwrap();
+        let mut columns = sampled.columns().to_vec();
+        columns[VOLUME_COLUMN] = new_null_array(&DataType::Utf8, 1);
+        let no_workspace = RecordBatch::try_new(sampled.schema(), columns).unwrap();
+        assert!(
+            batch_to_protected_record(&no_workspace).is_err(),
+            "a sample without its workspace volume"
+        );
+        for (column, text) in [
+            (VOLUME_COLUMN, r#"{"kind":"read"}"#),
+            (
+                VOLUME_COLUMN + 1,
+                r#"{"kind":"unavailable","reason":{"kind":"gone"}}"#,
+            ),
+            (VOLUME_COLUMN, "0"),
+        ] {
+            let mut columns = sampled.columns().to_vec();
+            columns[column] = Arc::new(StringArray::from(vec![text]));
+            let damaged = RecordBatch::try_new(sampled.schema(), columns).unwrap();
+            assert!(
+                batch_to_protected_record(&damaged).is_err(),
+                "{text} in {} is no volume usage",
+                sampled.schema().field(column).name()
+            );
         }
     }
 

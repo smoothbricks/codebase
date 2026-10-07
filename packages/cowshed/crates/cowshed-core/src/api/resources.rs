@@ -585,6 +585,8 @@ pub struct JobResourceSample {
     /// the limits that source names. Absent only where no source exists yet (Linux, until its
     /// cgroup v2 totals).
     pub accounting: Option<JobAccounting>,
+    /// Each of the job's volumes: its used-bytes change since spawn, or why it has none.
+    pub volumes: JobVolumeUsage,
     pub stdout: JobStreamWatermark,
     pub stderr: JobStreamWatermark,
 }
@@ -666,6 +668,16 @@ mod tests {
         }
     }
 
+    /// A supervisor configured with no volume: neither volume is read.
+    fn unconfigured() -> JobVolumeUsage {
+        JobVolumeUsage {
+            workspace: VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::Unconfigured,
+            },
+            build: None,
+        }
+    }
+
     fn sample(wall: WallMicros, stdout: JobStreamWatermark) -> JobResourceSample {
         JobResourceSample {
             job_id: JobId::new(3).expect("job"),
@@ -679,6 +691,7 @@ mod tests {
             rss_bytes: bytes(0),
             rss_peak_bytes: bytes(0),
             accounting: None,
+            volumes: unconfigured(),
             stdout,
             stderr: stream(0, 0),
         }
@@ -699,6 +712,7 @@ mod tests {
             rss_bytes: bytes(4096),
             rss_peak_bytes: bytes(8192),
             accounting: None,
+            volumes: unconfigured(),
             stdout: stream(0, 0),
             stderr: stream(0, 0),
         };
@@ -724,6 +738,7 @@ mod tests {
             rss_bytes: bytes(8192),
             rss_peak_bytes: bytes(4096),
             accounting: None,
+            volumes: unconfigured(),
             stdout: stream(0, 0),
             stderr: stream(0, 0),
         };
@@ -801,6 +816,16 @@ mod tests {
                 },
                 io: None,
             }),
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(-4096).expect("exact"),
+                },
+                build: Some(VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Failed {
+                        message: "the build volume left".into(),
+                    },
+                }),
+            },
             stdout: stream(5, 3),
             stderr: stream(0, 0),
         };
@@ -823,6 +848,13 @@ mod tests {
                     "cpu": {"userUs": 1_250_000, "sysUs": 80_000},
                     "io": null,
                 },
+                "volumes": {
+                    "workspace": { "kind": "read", "deltaBytes": -4096 },
+                    "build": {
+                        "kind": "unavailable",
+                        "reason": { "kind": "failed", "message": "the build volume left" },
+                    },
+                },
                 "stdout": {"bytes": 5, "lines": 3},
                 "stderr": {"bytes": 0, "lines": 0},
             })
@@ -841,6 +873,10 @@ mod tests {
             ),
             ("/stdout/bytes", serde_json::json!(MAX_EXACT_INTEGER + 1)),
             ("/stderr/lines", serde_json::json!(MAX_EXACT_INTEGER + 1)),
+            (
+                "/volumes/workspace/deltaBytes",
+                serde_json::json!(-i64::try_from(MAX_EXACT_INTEGER + 1).expect("fits")),
+            ),
         ] {
             let mut refused = json.clone();
             *refused.pointer_mut(pointer).expect("field") = inexact;
@@ -876,6 +912,15 @@ mod tests {
                 "{why}"
             );
         }
+        let mut no_volumes = json.clone();
+        no_volumes
+            .as_object_mut()
+            .expect("an object")
+            .remove("volumes");
+        assert!(
+            serde_json::from_value::<JobResourceSample>(no_volumes).is_err(),
+            "a sample always says what each volume is, read or not"
+        );
         let mut sourceless = json;
         sourceless["accounting"]["kind"] = serde_json::json!("liveMembers");
         assert!(

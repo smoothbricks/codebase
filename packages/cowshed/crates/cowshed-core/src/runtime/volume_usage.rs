@@ -6,6 +6,9 @@
 //! A volume that cannot be read at spawn or at a sample is that volume's typed unavailability in
 //! the sample, never a zero delta and never the failure of the whole sample.
 
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
+
 use crate::api::resources::{
     JobVolumeUsage, ResourceUnitError, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
 };
@@ -93,6 +96,99 @@ impl<V> VolumeBaseline<V> {
     }
 }
 
+impl VolumeBaseline<HostVolume> {
+    /// A job's volumes as its admission finds them, immediately before its first process is
+    /// dispatched: the supervisor's configured `workspace` volume, and the `build` volume the
+    /// admission grants. A supervisor configured with no volume stats neither.
+    pub fn admitted(workspace: Option<&VolumeMountpoint>, build: Option<&Path>) -> Self {
+        let unconfigured = || VolumeAtSpawn::Unavailable(VolumeUnavailable::Unconfigured);
+        match workspace {
+            Some(workspace) => Self {
+                workspace: at_spawn(workspace.path()),
+                build: build.map(at_spawn),
+            },
+            None => Self {
+                workspace: unconfigured(),
+                build: build.map(|_| unconfigured()),
+            },
+        }
+    }
+}
+
+/// A path a volume is mounted at, checked when a supervisor's configuration is built: a
+/// directory on its parent's volume would answer for that parent, so it is never configured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeMountpoint(PathBuf);
+
+impl VolumeMountpoint {
+    /// `path`, when a volume other than its parent's is mounted there.
+    pub fn new(path: PathBuf) -> Result<Self, CowshedError> {
+        let refused = |why: &dyn std::fmt::Display| {
+            CowshedError::usage(
+                format!("{} is no volume mountpoint: {why}", path.display()),
+                "configure the path a volume is mounted at",
+            )
+        };
+        if !path.is_absolute() {
+            return Err(refused(&"the path is relative"));
+        }
+        let own = std::fs::symlink_metadata(&path).map_err(|error| refused(&error))?;
+        if !own.is_dir() {
+            return Err(refused(&"it is no directory"));
+        }
+        if let Some(parent) = path.parent() {
+            let parent = std::fs::metadata(parent).map_err(|error| refused(&error))?;
+            if parent.dev() == own.dev() {
+                return Err(refused(&"it is a directory on its parent's volume"));
+            }
+        }
+        Ok(Self(path))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// The volume this host's substrate stats, an APFS volume fenced by its mount's filesystem id,
+/// and the stat that reads it.
+#[cfg(target_os = "macos")]
+pub use crate::storage::apfs::native::{
+    ApfsVolume as HostVolume, ApfsVolumeStat as HostVolumeStat,
+};
+
+/// The volume mounted at `mount` as a job's spawn finds it: its identity and used bytes, or why
+/// it has neither.
+#[cfg(target_os = "macos")]
+pub fn at_spawn(mount: &Path) -> VolumeAtSpawn<HostVolume> {
+    VolumeAtSpawn::observed(HostVolume::capture(mount))
+}
+
+/// No volume here has a used-bytes stat until the ZFS dataset stat exists: no value of this type
+/// can be made.
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostVolume {}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostVolumeStat;
+
+#[cfg(not(target_os = "macos"))]
+impl VolumeStat for HostVolumeStat {
+    type Volume = HostVolume;
+
+    fn used_bytes(&self, volume: &HostVolume) -> Result<u64, VolumeStatError> {
+        match *volume {}
+    }
+}
+
+/// Every volume here is unsupported: nothing is read.
+#[cfg(not(target_os = "macos"))]
+pub fn at_spawn(_mount: &Path) -> VolumeAtSpawn<HostVolume> {
+    VolumeAtSpawn::Unavailable(VolumeUnavailable::UnsupportedPlatform)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,7 +196,7 @@ mod tests {
 
     /// The real pure transform over typed snapshots: no substrate reads anything here. A volume
     /// is named by the string a test gives it.
-    fn at_spawn(used: u64) -> VolumeAtSpawn<&'static str> {
+    fn spawned(used: u64) -> VolumeAtSpawn<&'static str> {
         VolumeAtSpawn::observed(Ok(("volume", used)))
     }
 
@@ -199,7 +295,7 @@ mod tests {
             "a spawn stat that failed"
         );
         assert_eq!(
-            at_spawn(100).against(move |_| Err(failure)),
+            spawned(100).against(move |_| Err(failure)),
             expected,
             "a sample stat that failed"
         );
@@ -209,7 +305,7 @@ mod tests {
     fn a_delta_no_projection_holds_exactly_is_unavailable_not_clamped() {
         let VolumeUsage::Unavailable {
             reason: VolumeUnavailable::Failed { message },
-        } = at_spawn(0).against(now(u64::MAX))
+        } = spawned(0).against(now(u64::MAX))
         else {
             panic!("an inexact delta is no reading");
         };
@@ -233,7 +329,7 @@ mod tests {
     #[test]
     fn no_build_volume_stays_absent() {
         let baseline = VolumeBaseline {
-            workspace: at_spawn(100),
+            workspace: spawned(100),
             build: None,
         };
         assert_eq!(
@@ -241,6 +337,71 @@ mod tests {
             JobVolumeUsage {
                 workspace: read(-60),
                 build: None,
+            }
+        );
+    }
+
+    fn unavailable(reason: VolumeUnavailable) -> VolumeUsage {
+        VolumeUsage::Unavailable { reason }
+    }
+
+    #[test]
+    fn only_a_path_a_volume_is_mounted_at_is_a_volume_mountpoint() {
+        let devfs = VolumeMountpoint::new(PathBuf::from("/dev")).expect("devfs is mounted at /dev");
+        assert_eq!(devfs.path(), Path::new("/dev"));
+        let root = crate::temp_root::TempRoot::new("cowshed-volume-mountpoint");
+        let directory = root.join("checkout");
+        std::fs::create_dir(&directory).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, b"").unwrap();
+        for refused in [
+            directory,
+            file,
+            root.join("absent"),
+            PathBuf::from("relative/checkout"),
+        ] {
+            let error = VolumeMountpoint::new(refused.clone()).expect_err("no mountpoint");
+            assert_eq!(
+                error.code,
+                ErrorCode::Usage,
+                "{}: {error:?}",
+                refused.display()
+            );
+            assert!(
+                error.message.contains("is no volume mountpoint"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_supervisor_with_no_volume_reports_each_job_volume_unconfigured() {
+        assert_eq!(
+            VolumeBaseline::admitted(None, Some(Path::new("/build"))).sample(&HostVolumeStat),
+            JobVolumeUsage {
+                workspace: unavailable(VolumeUnavailable::Unconfigured),
+                build: Some(unavailable(VolumeUnavailable::Unconfigured)),
+            }
+        );
+        assert_eq!(
+            VolumeBaseline::admitted(None, None).sample(&HostVolumeStat),
+            JobVolumeUsage {
+                workspace: unavailable(VolumeUnavailable::Unconfigured),
+                build: None,
+            }
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn no_volume_has_a_used_bytes_stat_on_this_platform() {
+        let devfs = VolumeMountpoint::new(PathBuf::from("/dev")).expect("devfs is mounted at /dev");
+        assert_eq!(
+            VolumeBaseline::admitted(Some(&devfs), Some(Path::new("/dev"))).sample(&HostVolumeStat),
+            JobVolumeUsage {
+                workspace: unavailable(VolumeUnavailable::UnsupportedPlatform),
+                build: Some(unavailable(VolumeUnavailable::UnsupportedPlatform)),
             }
         );
     }

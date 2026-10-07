@@ -11,8 +11,8 @@ use super::job_groups::Birth;
 use super::supervisor::{OwnedProcess, byte_count};
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::resources::{
-    HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark, ResidentBytes,
-    ResourceUnitError, StreamBytes, StreamLines, WallMicros,
+    HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark, JobVolumeUsage,
+    ResidentBytes, ResourceUnitError, StreamBytes, StreamLines, WallMicros,
 };
 use crate::error::{CowshedError, Result};
 use crate::host_load::HostLoadError;
@@ -129,6 +129,8 @@ pub(super) struct Observation {
     /// Every process of the group the sampler's leader leads that was running when its resident
     /// memory was read: the complete membership, less any member that exited before its read.
     pub members: Vec<Member>,
+    /// Each of the job's volumes against its admission's baseline, read at this boundary.
+    pub volumes: JobVolumeUsage,
     /// The job's output streams as the supervisor had admitted them by the boundary.
     pub stdout: StreamTally,
     pub stderr: StreamTally,
@@ -274,6 +276,7 @@ impl JobSampler {
             host: observed.host,
             rss_bytes: rss,
             rss_peak_bytes: self.rss_peak,
+            volumes: observed.volumes,
             stdout,
             stderr,
             accounting: observed.accounting,
@@ -286,7 +289,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::api::resources::MAX_EXACT_INTEGER;
+    use crate::api::resources::{
+        MAX_EXACT_INTEGER, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
+    };
 
     fn owned(pid: u32, spawned: Instant) -> OwnedProcess {
         OwnedProcess {
@@ -325,6 +330,12 @@ mod tests {
                     resident: ResidentBytes::new(resident).expect("exact"),
                 })
                 .collect(),
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Unavailable {
+                    reason: VolumeUnavailable::Unconfigured,
+                },
+                build: None,
+            },
             stdout: StreamTally::default(),
             stderr: StreamTally::default(),
             accounting: None,
@@ -521,6 +532,53 @@ mod tests {
             running.wall_us.get(),
             40_000,
             "the activation's spawn stays the baseline"
+        );
+    }
+
+    /// Each volume's usage is what its observation read at the boundary, and the terminal sample
+    /// keeps the last of it.
+    #[test]
+    fn a_sample_carries_each_volume_as_observed_and_the_terminal_keeps_it() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let volumes = |workspace: i64, build: VolumeUsage| JobVolumeUsage {
+            workspace: VolumeUsage::Read {
+                delta_bytes: VolumeUsedBytesDelta::new(workspace).expect("exact"),
+            },
+            build: Some(build),
+        };
+        let failed = VolumeUsage::Unavailable {
+            reason: VolumeUnavailable::Failed {
+                message: "the build volume left".into(),
+            },
+        };
+        let activating = sampling
+            .own(job(), owned(100, spawn))
+            .expect("live")
+            .sample(Observation {
+                volumes: volumes(8 << 20, failed.clone()),
+                ..seen(spawn, &[100])
+            })
+            .expect("sample");
+        assert_eq!(activating.volumes, volumes(8 << 20, failed.clone()));
+        let read = VolumeUsage::Read {
+            delta_bytes: VolumeUsedBytesDelta::new(-(4 << 20)).expect("exact"),
+        };
+        let terminal = sampling
+            .freeze(|sampler| {
+                sampler.sample(Observation {
+                    volumes: volumes(24 << 20, read.clone()),
+                    ..seen(spawn, &[])
+                })
+            })
+            .expect("a terminal sample");
+        assert_eq!(terminal.volumes, volumes(24 << 20, read));
+        assert_eq!(
+            sampling
+                .read(job(), |_| unreachable!("frozen"))
+                .expect("frozen")
+                .volumes,
+            terminal.volumes
         );
     }
 

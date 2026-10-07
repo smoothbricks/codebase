@@ -83,6 +83,12 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
                 },
                 io: None,
             }),
+            volumes: JobVolumeUsage {
+                workspace: VolumeUsage::Read {
+                    delta_bytes: VolumeUsedBytesDelta::new(-4096).unwrap(),
+                },
+                build: None,
+            },
             stdout: JobStreamWatermark {
                 bytes: StreamBytes::new(3).unwrap(),
                 lines: StreamLines::new(1).unwrap(),
@@ -452,7 +458,7 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "cwd": "packages/app",
             "started": "2026-07-11T12:34:56Z",
             "durationMs": 1250,
-            "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296,"accounting":{"kind":"macOsRusageChildren","cpu":{"userUs":1_100_000,"sysUs":90_000},"io":null},"stdout":{"bytes":3,"lines":1},"stderr":{"bytes":0,"lines":0}},
+            "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296,"accounting":{"kind":"macOsRusageChildren","cpu":{"userUs":1_100_000,"sysUs":90_000},"io":null},"volumes":{"workspace":{"kind":"read","deltaBytes":-4096}},"stdout":{"bytes":3,"lines":1},"stderr":{"bytes":0,"lines":0}},
             "exit": {"kind":"signaled","signal":15,"coreDumped":false},
             "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
             "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
@@ -514,7 +520,7 @@ fn root_job_info_requires_explicit_null_cwd() {
         "cwd": null,
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 1250,
-        "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296,"accounting":{"kind":"macOsRusageChildren","cpu":{"userUs":1_100_000,"sysUs":90_000},"io":null},"stdout":{"bytes":3,"lines":1},"stderr":{"bytes":0,"lines":0}},
+        "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296,"accounting":{"kind":"macOsRusageChildren","cpu":{"userUs":1_100_000,"sysUs":90_000},"io":null},"volumes":{"workspace":{"kind":"read","deltaBytes":-4096}},"stdout":{"bytes":3,"lines":1},"stderr":{"bytes":0,"lines":0}},
         "exit": {"kind":"signaled","signal":15,"coreDumped":false},
         "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
         "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},

@@ -594,6 +594,82 @@ mod tests {
         )
     }
 
+    /// A checkout mounted from an image of its own, with its own build volume recorded, linked and
+    /// reached through a `target` build-state link: what a job of the checkout runs on.
+    struct Lane {
+        attachment: crate::apfs::AttachedImage,
+        checkout: PathBuf,
+        build_id: BuildVolumeId,
+        /// The volume `WorkspaceRef::build_volume` names for the checkout.
+        build_mount: PathBuf,
+    }
+
+    impl Lane {
+        fn mount(
+            root: &Path,
+            host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+            layout: &BuildVolumeLayout,
+        ) -> Self {
+            use crate::build_volume::link;
+            use crate::capabilities::BuildStatePath;
+
+            let image = root.join("store/lane.asif");
+            crate::blank_image::blank_image(&image);
+            let attachment = host
+                .backend
+                .attach_verified(&image)
+                .expect("attach the workspace");
+            let checkout = root.join("lane");
+            fs::create_dir_all(&checkout).unwrap();
+            host.backend
+                .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
+                .expect("mount the workspace");
+            fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+
+            let build_id = BuildVolumeId::mint();
+            crate::blank_image::blank_image(&layout.image(&build_id));
+            let build_mount = host
+                .mount_build_volume(layout, &build_id)
+                .expect("mount the build volume");
+            layout.write_record(&build_id, &linked("lane")).unwrap();
+            link::point(&checkout, &build_mount).unwrap();
+            link::link_paths(
+                &checkout,
+                &build_mount,
+                &[BuildStatePath::new("target", "target").unwrap()],
+            )
+            .unwrap();
+            let named = layout
+                .grant(&WorkspaceName::new("lane").unwrap(), &checkout)
+                .unwrap()
+                .expect("the workspace links a build volume");
+            assert_eq!(named, build_mount);
+            Self {
+                attachment,
+                checkout,
+                build_id,
+                build_mount,
+            }
+        }
+
+        fn release(
+            self,
+            host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+            layout: &BuildVolumeLayout,
+        ) {
+            host.backend
+                .unmount_verified(&self.attachment, DetachIntent::WhenIdle)
+                .expect("unmount the workspace");
+            host.backend
+                .detach(&self.attachment, DetachIntent::Release)
+                .expect("detach the workspace");
+            assert_eq!(
+                host.release_build_volume(layout, &self.build_id).unwrap(),
+                Release::Deleted { refused: None }
+            );
+        }
+    }
+
     /// Every regular file and directory under `root` with its bytes and modification time.
     fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, SystemTime)> {
         let mut entries = Vec::new();
@@ -811,8 +887,6 @@ mod tests {
     #[test]
     fn real_apfs_volume_usage_reads_the_owned_volumes_and_nothing_else() {
         use crate::api::resources::VolumeUsage;
-        use crate::build_volume::link;
-        use crate::capabilities::BuildStatePath;
         use crate::runtime::volume_usage::{
             VolumeAtSpawn, VolumeBaseline, VolumeStat as _, VolumeStatError,
         };
@@ -820,41 +894,8 @@ mod tests {
 
         let root = crate::scratch_apfs::ScratchRoot::new("volume-usage").expect("scratch root");
         let (host, layout) = fixture(root.path());
-
-        // The workspace: an image of its own, mounted as the checkout.
-        let image = root.path().join("store/lane.asif");
-        crate::blank_image::blank_image(&image);
-        let attachment = host
-            .backend
-            .attach_verified(&image)
-            .expect("attach the workspace");
-        let checkout = root.path().join("lane");
-        fs::create_dir_all(&checkout).unwrap();
-        host.backend
-            .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
-            .expect("mount the workspace");
-        fs::create_dir_all(checkout.join(".cowshed")).unwrap();
-
-        // Its build volume, recorded as the workspace's own and linked, with one build-state link.
-        let build_id = BuildVolumeId::mint();
-        crate::blank_image::blank_image(&layout.image(&build_id));
-        let build_mount = host
-            .mount_build_volume(&layout, &build_id)
-            .expect("mount the build volume");
-        layout.write_record(&build_id, &linked("lane")).unwrap();
-        link::point(&checkout, &build_mount).unwrap();
-        link::link_paths(
-            &checkout,
-            &build_mount,
-            &[BuildStatePath::new("target", "target").unwrap()],
-        )
-        .unwrap();
-        // The volume `WorkspaceRef::build_volume` names for this workspace.
-        let named = layout
-            .grant(&WorkspaceName::new("lane").unwrap(), &checkout)
-            .unwrap()
-            .expect("the workspace links a build volume");
-        assert_eq!(named, build_mount);
+        let lane = Lane::mount(root.path(), &host, &layout);
+        let (attachment, checkout, named) = (&lane.attachment, &lane.checkout, &lane.build_mount);
 
         // A sibling volume in the workspace's own container, nothing to do with the job.
         let container = attachment
@@ -887,13 +928,13 @@ mod tests {
             added.device(),
         ]);
 
-        job(&checkout, &write("predates.bin", 16));
+        job(checkout, &write("predates.bin", 16));
         let captured = |mount: &Path, what: &str| {
             VolumeAtSpawn::observed(Ok(ApfsVolume::capture(mount).expect(what)))
         };
         let baseline = VolumeBaseline {
-            workspace: captured(&checkout, "the workspace volume"),
-            build: Some(captured(&named, "the build volume")),
+            workspace: captured(checkout, "the workspace volume"),
+            build: Some(captured(named, "the build volume")),
         };
         let delta = |usage: Option<VolumeUsage>| match usage {
             Some(VolumeUsage::Read { delta_bytes }) => delta_bytes.get(),
@@ -905,7 +946,7 @@ mod tests {
         };
 
         job(
-            &checkout,
+            checkout,
             &format!(
                 "{} && {}",
                 write("job.bin", 64),
@@ -929,7 +970,7 @@ mod tests {
             "build volume after a sibling volume's write",
         );
 
-        job(&checkout, "rm predates.bin");
+        job(checkout, "rm predates.bin");
         let (pruned, pruned_build) = sample();
         near(
             workspace - pruned,
@@ -942,7 +983,7 @@ mod tests {
             "build volume after a workspace deletion",
         );
 
-        job(&checkout, "rm job.bin");
+        job(checkout, "rm job.bin");
         let (emptied, _) = sample();
         assert!(
             emptied < 0,
@@ -967,15 +1008,332 @@ mod tests {
             "a directory on its parent's volume is no volume"
         );
 
-        host.backend
-            .unmount_verified(&attachment, DetachIntent::WhenIdle)
-            .expect("unmount the workspace");
-        host.backend
-            .detach(&attachment, DetachIntent::Release)
-            .expect("detach the workspace");
-        assert_eq!(
-            host.release_build_volume(&layout, &build_id).unwrap(),
-            Release::Deleted { refused: None }
+        lane.release(&host, &layout);
+    }
+
+    /// A process group of its own the test leads, standing in for a job's activation or command:
+    /// the supervisor samples it like any job group.
+    fn lone_group() -> std::process::Child {
+        use crate::fork_lock::Spawn as _;
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .spawn_locked()
+            .expect("a test-owned process group")
+    }
+
+    /// End the group `leader` leads and wait for the leader's exit without reaping it: like a
+    /// job's parent, the test holds it until nothing reads its rusage any more ([`reap`]).
+    fn end_group(leader: &std::process::Child) {
+        let pgid = i32::try_from(leader.id()).unwrap();
+        // SAFETY: the unreaped test child leads this group.
+        assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+        // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waiting for our own child without reaping it.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                leader.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+    }
+
+    /// Reap a leader once nothing reads it any more: its interval closed, or its job concluded.
+    fn reap(mut leader: std::process::Child) {
+        leader.wait().unwrap();
+    }
+
+    /// The job's volumes, each read: `(workspace, build)` deltas.
+    fn read_volumes(sample: &crate::api::resources::JobResourceSample) -> (i64, i64) {
+        use crate::api::resources::VolumeUsage;
+        let delta = |usage: Option<&VolumeUsage>| match usage {
+            Some(VolumeUsage::Read { delta_bytes }) => delta_bytes.get(),
+            other => panic!("each of the job's volumes is read: {other:?}"),
+        };
+        (
+            delta(Some(&sample.volumes.workspace)),
+            delta(sample.volumes.build.as_ref()),
+        )
+    }
+
+    /// A job's volumes through the supervisor that runs it, on real APFS volumes. The baseline is
+    /// read at admission, before the job's first process is dispatched: the activation writes 8
+    /// MiB into the workspace before its spawn even returns, and the first sample counts it. The
+    /// command that takes the lead keeps that baseline, so its 16 MiB in the workspace and 4 MiB
+    /// through the build-state link add to it. The terminal sample is sealed with each volume's
+    /// usage, and a store opened afresh reads the same sample back.
+    #[tokio::test]
+    async fn a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record() {
+        use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, JobId, StdinSource};
+        use crate::runtime::job_groups::Birth;
+        use crate::runtime::supervisor::{
+            ArtifactSink as _, ArtifactStoreSink, CommitmentDraft, CommitmentSink, OwnedProcess,
+            ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SpawnSink,
+            WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+        };
+        use crate::runtime::volume_usage::VolumeMountpoint;
+        use crate::storage::job_artifact::StreamKind;
+        use tokio::sync::mpsc;
+
+        /// The job's first process is an activation that writes into the workspace before its
+        /// spawn returns, as a warm host may start work before the supervisor hears of it; its
+        /// processes are reported through the events the test is handed.
+        struct Activation {
+            checkout: PathBuf,
+            dispatched: mpsc::UnboundedSender<mpsc::Sender<ProcessEvent>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SpawnSink for Activation {
+            async fn spawn(
+                &mut self,
+                _request: ProcessSpawnRequest,
+                events: mpsc::Sender<ProcessEvent>,
+            ) -> crate::error::Result<Box<dyn RunningProcess>> {
+                job(&self.checkout, &write("activation.bin", 8));
+                self.dispatched
+                    .send(events)
+                    .expect("the test awaits the job");
+                Ok(Box::new(Reported))
+            }
+        }
+
+        /// A job whose processes arrive as events.
+        struct Reported;
+
+        impl RunningProcess for Reported {
+            fn process(&self) -> Option<&OwnedProcess> {
+                None
+            }
+
+            fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> crate::error::Result<bool> {
+                Ok(true)
+            }
+
+            fn close_stdin(&mut self) -> crate::error::Result<()> {
+                Ok(())
+            }
+
+            fn end_stdin(&mut self) {}
+
+            fn signal_process_tree(&mut self, _signal: ProcessSignal) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct Commitments;
+
+        #[async_trait::async_trait]
+        impl CommitmentSink for Commitments {
+            async fn record(&mut self, _draft: CommitmentDraft) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Deliver `event`, then one stdout byte, and return once the supervisor served that byte
+        /// at `offset`: it handles a job's events in order, so `event` has been handled too.
+        async fn deliver(
+            handle: &WorkspaceSupervisorHandle,
+            events: &mpsc::Sender<ProcessEvent>,
+            job_id: JobId,
+            event: ProcessEvent,
+            offset: u64,
+        ) {
+            events.send(event).await.unwrap();
+            events
+                .send(ProcessEvent::Output {
+                    job_id,
+                    stream: StreamKind::Stdout,
+                    bytes: bytes::Bytes::from_static(b"."),
+                })
+                .await
+                .unwrap();
+            let chunk = handle
+                .log_read(job_id, StreamKind::Stdout, offset, true)
+                .await
+                .unwrap();
+            assert_eq!(chunk.bytes.as_ref(), b".");
+        }
+
+        let owned = |leader: &std::process::Child| OwnedProcess {
+            birth: Birth::of(leader.id()),
+            spawned: Instant::now(),
+            host: crate::host_load::read_host_load(),
+        };
+
+        let root = crate::scratch_apfs::ScratchRoot::new("job-volumes").expect("scratch root");
+        let (host, layout) = fixture(root.path());
+        let lane = Lane::mount(root.path(), &host, &layout);
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            workspace_root: lane.checkout.clone(),
+            default_cwd: None,
+            sandbox: crate::sandbox::SandboxConfig {
+                // The host mount root the build volume is mounted under.
+                mount_root: root.path().join("mnt"),
+                workspace_mount: lane.checkout.clone(),
+                build_volume_mount: Some(lane.build_mount.clone()),
+                ..defaults.sandbox
+            },
+            build_volume_layout: Some(layout.clone()),
+            workspace_volume: Some(
+                VolumeMountpoint::new(lane.checkout.clone()).expect("the checkout is a volume"),
+            ),
+            ..defaults
+        };
+        let store = || {
+            ArtifactStoreSink::open(
+                config.workspace_root.clone(),
+                &config.owned_repo_ids,
+                &config.authority,
+                config.artifacts.clone(),
+            )
+            .expect("open the artifact store")
+        };
+        let (dispatched, mut dispatches) = mpsc::unbounded_channel();
+        let handle = WorkspaceSupervisor::start_with_sinks(
+            config.clone(),
+            Box::new(Activation {
+                checkout: lane.checkout.clone(),
+                dispatched,
+            }),
+            Box::new(store()),
+            Box::new(Commitments),
+        )
+        .expect("start the supervisor");
+
+        let job_id = handle
+            .exec(
+                None,
+                Some(lane.build_mount.clone()),
+                ExecRequest {
+                    command: ExecCommand::Argv(vec!["true".into()]),
+                    cwd: None,
+                    mode: crate::api::dto::RunSandboxMode::ReadWrite,
+                    env: std::collections::HashMap::new(),
+                    trace: None,
+                    stdin: StdinSource::Empty,
+                    stdout_copy: None,
+                    stderr_copy: None,
+                },
+            )
+            .await
+            .expect("admit the job");
+        let events = dispatches.recv().await.expect("the job was dispatched");
+
+        let activation = lone_group();
+        deliver(
+            &handle,
+            &events,
+            job_id,
+            ProcessEvent::Activating {
+                job_id,
+                process: owned(&activation),
+            },
+            0,
+        )
+        .await;
+        let (workspace, build) = read_volumes(&handle.resources(job_id).await.unwrap());
+        near(
+            workspace,
+            8 * MIB,
+            "the activation's write, made before its spawn returned",
         );
+        near(build, 0, "the build volume before anything wrote to it");
+
+        job(
+            &lane.checkout,
+            &format!(
+                "{} && {}",
+                write("command.bin", 16),
+                write("target/command.bin", 4)
+            ),
+        );
+        // The activation ended: its parent read what it cost while it still held it, and only
+        // then does the command take the lead (runtime::job_accounting).
+        events
+            .send(ProcessEvent::ActivationEnded {
+                job_id,
+                usage: crate::runtime::job_accounting::read_leader(&Birth::of(activation.id())),
+            })
+            .await
+            .unwrap();
+        let command = lone_group();
+        deliver(
+            &handle,
+            &events,
+            job_id,
+            ProcessEvent::Started {
+                job_id,
+                process: owned(&command),
+            },
+            1,
+        )
+        .await;
+        end_group(&activation);
+        reap(activation);
+        let running = handle.resources(job_id).await.unwrap();
+        assert_eq!(
+            running.leader_pid,
+            command.id(),
+            "the command leads the job"
+        );
+        let (workspace, build) = read_volumes(&running);
+        near(
+            workspace,
+            24 * MIB,
+            "the workspace since admission, across both processes",
+        );
+        near(build, 4 * MIB, "the build volume since admission");
+
+        end_group(&command);
+        events
+            .send(ProcessEvent::Exited {
+                job_id,
+                exit: ExitStatus::Exited { code: 0 },
+            })
+            .await
+            .unwrap();
+        for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+            events
+                .send(ProcessEvent::OutputEof { job_id, stream })
+                .await
+                .unwrap();
+        }
+        let terminal = handle
+            .wait(job_id)
+            .await
+            .unwrap()
+            .resources
+            .expect("a terminal sample");
+        let (workspace, build) = read_volumes(&terminal);
+        near(workspace, 24 * MIB, "the terminal sample's workspace");
+        near(build, 4 * MIB, "the terminal sample's build volume");
+        assert!(
+            terminal.accounting.is_some(),
+            "the job's CPU totals ride the same terminal sample as its volumes"
+        );
+        assert_eq!(
+            handle.sealed(job_id).await.unwrap().resources.as_ref(),
+            Some(&terminal),
+            "the sealed sample is the terminal one"
+        );
+        handle.quiesce().await.unwrap();
+        handle.retire().await.unwrap();
+        drop(handle);
+        assert_eq!(
+            store().sealed(job_id).and_then(|sealed| sealed.resources),
+            Some(terminal),
+            "the stored record decodes to the terminal sample, its volumes and accounting with it"
+        );
+
+        reap(command);
+        lane.release(&host, &layout);
     }
 }

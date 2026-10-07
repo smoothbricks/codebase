@@ -409,6 +409,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         telemetry_root: None,
         inherited_groups: Vec::new(),
         volume_labels: None,
+        workspace_volume: None,
     }
 }
 

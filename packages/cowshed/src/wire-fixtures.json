@@ -178,6 +178,41 @@
       "jobId": 3,
       "pid": 4243,
       "repoId": "smoothbricks/codebase",
+      "resources": {
+        "accounting": null,
+        "host": {
+          "cores": 10,
+          "load1": 2.5
+        },
+        "hostStart": {
+          "cores": 10,
+          "load1": 2.0
+        },
+        "jobId": 3,
+        "leaderPid": 4243,
+        "members": [],
+        "rssBytes": 0,
+        "rssPeakBytes": 12582912,
+        "sampledAt": "2026-01-02T03:04:05Z",
+        "stderr": {
+          "bytes": 3,
+          "lines": 1
+        },
+        "stdout": {
+          "bytes": 3,
+          "lines": 1
+        },
+        "volumes": {
+          "workspace": {
+            "kind": "unavailable",
+            "reason": {
+              "kind": "unconfigured"
+            }
+          }
+        },
+        "wallMs": 1234,
+        "wallUs": 1234000
+      },
       "started": "2026-01-02T03:04:05Z",
       "state": "exited",
       "stderr": {
@@ -563,6 +598,19 @@
             "bytes": 4096,
             "lines": 64
           },
+          "volumes": {
+            "build": {
+              "kind": "unavailable",
+              "reason": {
+                "kind": "failed",
+                "message": "volume used-byte stat failed: no volume is mounted at the build mount"
+              }
+            },
+            "workspace": {
+              "deltaBytes": 67108864,
+              "kind": "read"
+            }
+          },
           "wallMs": 1250,
           "wallUs": 1250400
         },
@@ -792,6 +840,19 @@
           "bytes": 4096,
           "lines": 64
         },
+        "volumes": {
+          "build": {
+            "kind": "unavailable",
+            "reason": {
+              "kind": "failed",
+              "message": "volume used-byte stat failed: no volume is mounted at the build mount"
+            }
+          },
+          "workspace": {
+            "deltaBytes": 67108864,
+            "kind": "read"
+          }
+        },
         "wallMs": 1250,
         "wallUs": 1250400
       },
@@ -941,6 +1002,45 @@
       "jobId": 4,
       "pid": 4244,
       "repoId": "smoothbricks/codebase",
+      "resources": {
+        "accounting": null,
+        "host": {
+          "cores": 10,
+          "load1": 2.5
+        },
+        "hostStart": {
+          "cores": 10,
+          "load1": 2.0
+        },
+        "jobId": 4,
+        "leaderPid": 4243,
+        "members": [],
+        "rssBytes": 0,
+        "rssPeakBytes": 12582912,
+        "sampledAt": "2026-01-02T03:04:05Z",
+        "stderr": {
+          "bytes": 3,
+          "lines": 1
+        },
+        "stdout": {
+          "bytes": 3,
+          "lines": 1
+        },
+        "volumes": {
+          "build": {
+            "deltaBytes": -16777216,
+            "kind": "read"
+          },
+          "workspace": {
+            "kind": "unavailable",
+            "reason": {
+              "kind": "unsupportedPlatform"
+            }
+          }
+        },
+        "wallMs": 1234,
+        "wallUs": 1234000
+      },
       "started": "2026-01-02T03:04:05Z",
       "state": "signaled",
       "stderr": {

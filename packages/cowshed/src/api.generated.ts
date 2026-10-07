@@ -903,6 +903,10 @@ export type JobResourceSample = {
    * cgroup v2 totals).
    */
   readonly accounting: JobAccounting | null;
+  /**
+   * Each of the job's volumes: its used-bytes change since spawn, or why it has none.
+   */
+  readonly volumes: JobVolumeUsage;
   readonly stdout: JobStreamWatermark;
   readonly stderr: JobStreamWatermark;
 };

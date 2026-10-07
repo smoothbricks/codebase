@@ -5950,6 +5950,9 @@ impl NativeProjectRuntimeHost {
             current.derived.workspace.incarnation(),
             crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
         )?;
+        // Each job's resource samples stat the workspace volume mounted here; a checkout no volume
+        // is mounted at is a configuration error, never a sample's.
+        let workspace_volume = super::volume_usage::VolumeMountpoint::new(mount.clone())?;
         let mut config = super::supervisor::WorkspaceSupervisorConfig {
             authority: needed,
             owned_repo_ids: self.owned_repo_ids()?,
@@ -5991,6 +5994,7 @@ impl NativeProjectRuntimeHost {
                 build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
                 labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
             }),
+            workspace_volume: Some(workspace_volume),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this
