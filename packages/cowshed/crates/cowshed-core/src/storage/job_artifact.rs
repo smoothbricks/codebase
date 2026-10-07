@@ -621,7 +621,27 @@ fn keyed_history_set_aside(
         let path = entry.path();
         let served = path.join(SET_ASIDE_INCARNATION_FILE);
         let may_hold = match fs::read(&served) {
-            Ok(bytes) => bytes == incarnation.as_str().as_bytes(),
+            Ok(bytes) => {
+                let value = String::from_utf8(bytes).map_err(|error| {
+                    integrity(
+                        0,
+                        &format!(
+                            "invalid set-aside incarnation in {}: {error}",
+                            served.display()
+                        ),
+                    )
+                })?;
+                let recorded = WorkspaceIncarnation::new(value).map_err(|error| {
+                    integrity(
+                        0,
+                        &format!(
+                            "invalid set-aside incarnation in {}: {error}",
+                            served.display()
+                        ),
+                    )
+                })?;
+                &recorded == incarnation
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => return Err(io_error(&served, error)),
         };
@@ -6817,6 +6837,37 @@ mod tests {
                 assert!(begun.is_ok(), "{label}: {begun:?}");
             }
             fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_corrupt_archived_incarnation_never_proves_a_key_absent() {
+        let cases: &[(&str, &[u8])] = &[
+            ("invalid-text", b"not-an-incarnation"),
+            ("empty", b""),
+            ("invalid-utf8", &[0xff]),
+            ("uppercase", b"0198F2C0B7E34DC795F17B238B331C80"),
+        ];
+        for &(label, marker) in cases {
+            let root = temp_root(&format!("admission-corrupt-incarnation-{label}"));
+            let job_root = ensure_private_job_root(&root).unwrap();
+            let set_aside = job_root
+                .join(SET_ASIDE_DIRECTORY)
+                .join(format!("layout-{FIRST_KEYED_LAYOUT}"));
+            fs::create_dir_all(&set_aside).unwrap();
+            fs::write(set_aside.join(SET_ASIDE_INCARNATION_FILE), marker).unwrap();
+            let error = ArtifactStore::open(
+                &root,
+                OwnedRepoIds::sole(repo()),
+                incarnation(),
+                ArtifactConfig::default(),
+            )
+            .err();
+            fs::remove_dir_all(&root).unwrap();
+            assert!(
+                matches!(error, Some(ArtifactError::Integrity { .. })),
+                "{label}: corrupt history must refuse store open, not prove key absence: {error:?}"
+            );
         }
     }
 
