@@ -141,6 +141,12 @@ export interface JobHandle {
    * child counts, a port another process holds never does, and nothing connects to a port.
    */
   listeningPorts(): Promise<Api.JobListeningPorts>;
+  /**
+   * A bounded raw slice of both streams after `cursor`, or their latest bounded tail when there is
+   * none; `next` is the cursor that continues after it. A cursor past what the job admitted is a
+   * usage error.
+   */
+  tail(cursor: Api.JobJournalCursor | undefined, limits: Api.JobTailLimits): Promise<Api.JobTail>;
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;
