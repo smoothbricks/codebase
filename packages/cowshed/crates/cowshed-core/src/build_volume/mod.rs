@@ -489,6 +489,7 @@ pub enum LinkResolution {
 /// Where one project's build volumes live.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildVolumeLayout {
+    project: PathBuf,
     images: PathBuf,
     mounts: PathBuf,
 }
@@ -502,9 +503,15 @@ impl BuildVolumeLayout {
             .strip_prefix(&project.host_mount_root)
             .map_err(|_| StorageLayoutError::EscapesStoreRoot)?;
         Ok(Self {
+            project: project.project_root.clone(),
             images: project.project_root.join(IMAGES_DIRECTORY),
             mounts: project.host_mount_root.join(MOUNTS_DIRECTORY).join(encoded),
         })
+    }
+
+    /// The project's store directory, whose deletion log journals every build volume release.
+    pub fn project_root(&self) -> &Path {
+        &self.project
     }
 
     pub fn images(&self) -> &Path {

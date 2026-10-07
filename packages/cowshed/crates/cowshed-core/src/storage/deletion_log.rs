@@ -19,6 +19,11 @@
 //!   take no project parameter — threading one through the [`ApfsExecutionHost`] trait would
 //!   couple every substrate caller to journal layout. When the layout is unrecognized the
 //!   entry is skipped, never guessed.
+//! * A build volume's release writes one line, for its image, whatever else it deletes: the
+//!   volume's sidecar record, hold file and mountpoint are its own bookkeeping, gone with it
+//!   under the release's claim. The line says whether the sidecar recorded the volume as a
+//!   seed and names the workspace it recorded, read before anything was deleted, because
+//!   that is what nothing else can tell once the volume is gone.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -39,6 +44,13 @@ pub enum DeletionKind {
     Companion,
     Sidecar,
     Image,
+    /// A build volume's image whose sidecar did not record it as a seed: a checkout's live
+    /// volume, one recorded unlinked, or one with no readable sidecar.
+    #[serde(rename = "build-volume")]
+    BuildVolume,
+    /// A build volume's image whose sidecar recorded it as a target's seed.
+    #[serde(rename = "build-seed")]
+    BuildSeed,
     Other,
 }
 
@@ -60,6 +72,8 @@ pub enum DeletionOp {
     RemoveOrphanStagingMetadata,
     #[serde(rename = "remove-orphan-mountpoint")]
     RemoveOrphanMountpoint,
+    #[serde(rename = "release-build-volume")]
+    ReleaseBuildVolume,
 }
 
 impl std::fmt::Display for DeletionOp {
@@ -72,6 +86,7 @@ impl std::fmt::Display for DeletionOp {
             Self::RemoveStagingMount => "remove-staging-mount",
             Self::RemoveOrphanStagingMetadata => "remove-orphan-staging-metadata",
             Self::RemoveOrphanMountpoint => "remove-orphan-mountpoint",
+            Self::ReleaseBuildVolume => "release-build-volume",
         };
         formatter.write_str(tag)
     }

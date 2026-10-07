@@ -276,7 +276,8 @@ where
 
     /// [`Self::release_build_volume`] of the volume `claim` claimed. Answers the unforced
     /// unmount's refusal, when there was one. The claim is dropped once the image and its hold
-    /// file are gone, so a hold taken after that finds no image.
+    /// file are gone, so a hold taken after that finds no image. The image's deletion is
+    /// journaled in the project's deletion log, with whose its sidecar said the volume was.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
@@ -286,12 +287,18 @@ where
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         let mount = layout.mount(id);
+        let present = image.exists();
+        // Read before anything is deleted: once the volume is gone, nothing else says whose it
+        // was. Evidence only, like the log it goes to, so an unreadable sidecar names nobody.
+        let recorded = layout
+            .read_record_present(id)
+            .ok()
+            .flatten()
+            .map(|record| record.role);
         let mut refused = None;
         // A minted volume is formatted before anything attaches it, so an attachment of a build
         // image is an APFS one; anything else is refused, not released.
-        if image.exists()
-            && let Some(attachment) = self.backend.existing_attachment(&image)?
-        {
+        if present && let Some(attachment) = self.backend.existing_attachment(&image)? {
             let mounted = self
                 .mount_source
                 .mounts()?
@@ -317,6 +324,9 @@ where
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
         self.backend.delete_image(&image)?;
+        if present {
+            journal_release(layout, &image, recorded.as_ref());
+        }
         remove_if_present(&layout.record(id))?;
         remove_if_present(&layout.hold_path(id))?;
         match fs::remove_dir(&mount) {
@@ -495,6 +505,28 @@ fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error("remove build volume record", path, error)),
     }
+}
+
+/// The deletion log's line for a released build volume's image: a seed's or another volume's,
+/// naming the workspace its sidecar `recorded` (the checkout that linked it, the target whose
+/// seed it was), or nobody for one recorded unlinked or with no readable sidecar.
+fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&BuildVolumeRole>) {
+    use crate::storage::deletion_log::{DeletionKind, DeletionOp, log_deletion};
+    let (kind, workspace) = match recorded {
+        Some(BuildVolumeRole::Seed { target, .. }) => (DeletionKind::BuildSeed, target.as_str()),
+        Some(BuildVolumeRole::Linked { checkout }) => {
+            (DeletionKind::BuildVolume, checkout.as_str())
+        }
+        Some(BuildVolumeRole::Unlinked) | None => (DeletionKind::BuildVolume, ""),
+    };
+    log_deletion(
+        layout.project_root(),
+        DeletionOp::ReleaseBuildVolume,
+        kind,
+        workspace,
+        Some(image),
+        image,
+    );
 }
 
 /// A path asked about, against the kernel's mount table. The kernel records a mount point as

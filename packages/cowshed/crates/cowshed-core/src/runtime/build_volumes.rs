@@ -3253,4 +3253,82 @@ mod tests {
         );
         scratch.release_all();
     }
+
+    /// Every build volume release is a line in the project's deletion log, saying whether the
+    /// volume was a seed and whose its sidecar said it was: a land's release of main's previous
+    /// volume once left no trace at all. A held volume is not released, and leaves no line.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_every_build_volume_release_is_journaled() {
+        use crate::storage::deletion_log::{
+            DELETION_LOG_FILE, DeletionKind, DeletionLogEntry, DeletionOp,
+        };
+        let scratch = Scratch::new("build-release-journal");
+        let main = owner("main", '0');
+        let (_, live, _) = scratch.linked_checkout("main", 1);
+        let clone = |role: BuildVolumeRole| {
+            let id = BuildVolumeId::mint();
+            scratch
+                .host
+                .clone_build_volume(
+                    &scratch.layout,
+                    &live,
+                    &id,
+                    &BuildVolumeRecord::new(None, role),
+                )
+                .expect("clone main's volume");
+            id
+        };
+        let seed = clone(BuildVolumeRole::Seed {
+            target: main.name.clone(),
+            incarnation: main.incarnation.clone(),
+        });
+        let unlinked = clone(BuildVolumeRole::Unlinked);
+        let job = scratch.layout.hold(&live).expect("a job's hold");
+        assert!(matches!(
+            scratch.host.release_build_volume(&scratch.layout, &live),
+            Ok(BuildVolumeRelease::Held { .. })
+        ));
+        drop(job);
+        for id in [&seed, &unlinked, &live] {
+            let release = scratch.host.release_build_volume(&scratch.layout, id);
+            assert!(
+                matches!(release, Ok(BuildVolumeRelease::Deleted { .. })),
+                "{release:?}"
+            );
+        }
+
+        let log =
+            fs::read_to_string(scratch.layout.project_root().join(DELETION_LOG_FILE)).unwrap();
+        let entries = log
+            .lines()
+            .map(|line| serde_json::from_str::<DeletionLogEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.image.as_ref() == Some(&entry.artifact)),
+            "{entries:?}"
+        );
+        let journaled = entries
+            .into_iter()
+            .map(|entry| (entry.op, entry.kind, entry.workspace, entry.artifact))
+            .collect::<Vec<_>>();
+        let release = |kind, workspace: &str, id: &BuildVolumeId| {
+            (
+                DeletionOp::ReleaseBuildVolume,
+                kind,
+                workspace.to_owned(),
+                scratch.layout.image(id),
+            )
+        };
+        assert_eq!(
+            journaled,
+            vec![
+                release(DeletionKind::BuildSeed, "main", &seed),
+                release(DeletionKind::BuildVolume, "", &unlinked),
+                release(DeletionKind::BuildVolume, "main", &live),
+            ]
+        );
+    }
 }

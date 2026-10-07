@@ -57,7 +57,7 @@ layout root:
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
-    deletion-log.jsonl               # one line per artifact the controller unlinked (storage/deletion_log.rs)
+    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released (storage/deletion_log.rs)
     main.asif                        # adopted main image (created here behind a PendingFence sidecar)
     main.asif.grants.json            # controller-owned grants + detached metadata
     main.asif.ca.key                 # main's workspace CA private key, 0600
