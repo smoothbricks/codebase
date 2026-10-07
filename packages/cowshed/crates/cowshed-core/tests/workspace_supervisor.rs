@@ -3469,6 +3469,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     let adopted = layout.mount(&adopted_id);
     std::fs::create_dir_all(layout.images()).unwrap();
     for id in [&before_id, &adopted_id] {
+        std::fs::File::create(layout.image(id)).unwrap();
         let mount = layout.mount(id);
         std::fs::create_dir_all(mount.join("nx/cache")).unwrap();
         std::fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
