@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { expandWildcardTargetConfiguration } from 'nx/src/tasks-runner/utils.js';
 import {
   CARGO_TEST_ARCHIVE_TARGET,
   CARGO_TEST_COMPILE_TARGET,
@@ -223,6 +224,7 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
  * to catch.
  */
 function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string): boolean {
+  const targetNames = [...project.targets];
   const visiting = new Set<string>();
   const visit = (targetName: string): boolean => {
     if (visiting.has(targetName) || !project.targets.has(targetName)) {
@@ -238,7 +240,7 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
     const reached =
       runs ||
       (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>
-        matchingResolvedTargets(dependency, project.targets).some(visit),
+        matchingResolvedTargets(dependency, project.targets, targetNames).some(visit),
       );
     visiting.delete(targetName);
     return reached;
@@ -252,6 +254,7 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
  * inference uses; the child list is the graph, not a hand-written crate list.
  */
 function cargoTestPackageChildren(project: ResolvedProjectTargets): string[] {
+  const targetNames = [...project.targets];
   const packages = new Set<string>();
   const visiting = new Set<string>();
   const visit = (targetName: string): void => {
@@ -264,7 +267,7 @@ function cargoTestPackageChildren(project: ResolvedProjectTargets): string[] {
       packages.add(pkg);
     }
     for (const dependency of project.targetDependencies?.get(targetName) ?? []) {
-      for (const matched of matchingResolvedTargets(dependency, project.targets)) {
+      for (const matched of matchingResolvedTargets(dependency, project.targets, targetNames)) {
         visit(matched);
       }
     }
@@ -314,11 +317,12 @@ function commandOf(project: ResolvedProjectTargets, targetName: string): string 
   if (options === undefined || options === null) {
     return undefined;
   }
-  const command = (options as Record<string, unknown>).command;
+  const command = options.command;
   return typeof command === 'string' ? command : undefined;
 }
 
 function resolvedTargetReaches(project: ResolvedProjectTargets, from: string, goal: string): boolean {
+  const targetNames = [...project.targets];
   const visiting = new Set<string>();
   const visit = (targetName: string): boolean => {
     if (targetName === goal) {
@@ -329,7 +333,7 @@ function resolvedTargetReaches(project: ResolvedProjectTargets, from: string, go
     }
     visiting.add(targetName);
     const reached = (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>
-      matchingResolvedTargets(dependency, project.targets).some(visit),
+      matchingResolvedTargets(dependency, project.targets, targetNames).some(visit),
     );
     visiting.delete(targetName);
     return reached;
@@ -381,7 +385,7 @@ function boundableTestTarget(
   if (!isRecord(target)) {
     return true;
   }
-  if (isNoopAggregateTarget(target)) {
+  if (target.executor === 'nx:noop' || isNoopAggregateTarget(target)) {
     return false;
   }
   const targetOptions = isRecord(target.options) ? target.options : undefined;
@@ -432,8 +436,8 @@ function bunTestTimeoutIsBounded(command: string, timeoutMs: number): boolean {
     return true;
   }
   let found = false;
-  for (const match of command.matchAll(/(^|\s)--timeout(?:=|\s+)(\S+)/g)) {
-    const value = match[2];
+  for (const match of command.matchAll(/(?:^|\s)--timeout(?==|\s|$)(?:=(\S*)|\s+(\S+))?/g)) {
+    const value = match[1] ?? match[2];
     const perTestTimeoutMs = Number(value);
     if (
       value === undefined ||
@@ -460,6 +464,7 @@ function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefi
   if (!project?.targetDependencies || !project.targetExecutors || !project.targetOptions) {
     return false;
   }
+  const targetNames = [...project.targets];
   const visiting = new Set<string>();
   const verified = new Map<string, boolean>();
   const allowedCwds = new Set(
@@ -476,33 +481,36 @@ function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefi
     }
     visiting.add(targetName);
     const executor = project.targetExecutors?.get(targetName);
-    let valid: boolean;
-    if (executor !== undefined && executor !== 'nx:noop') {
-      valid = isBoundedExecutionTarget(executor, project.targetOptions?.get(targetName), allowedCwds);
-    } else {
-      const dependencies = project.targetDependencies?.get(targetName) ?? [];
-      let hasTestLeg = false;
-      valid = true;
-      for (const dependency of dependencies) {
+    const executes = executor !== undefined && executor !== 'nx:noop';
+    let valid = !executes || isBoundedExecutionTarget(executor, project.targetOptions?.get(targetName), allowedCwds);
+    let hasTestLeg = executes;
+    if (valid) {
+      for (const dependency of project.targetDependencies?.get(targetName) ?? []) {
         if (dependency.startsWith('^')) {
           continue;
         }
-        const matches = matchingResolvedTargets(dependency, project.targets).filter(isTestLegTargetName);
-        if (matches.length === 0) {
-          if (isTestLegTargetName(dependency)) {
-            valid = false;
-            break;
-          }
-          continue;
-        }
-        hasTestLeg = true;
-        if (!matches.every(visit)) {
+        const matches = matchingResolvedTargets(dependency, project.targets, targetNames);
+        if (matches.length === 0 && isTestLegTargetName(dependency)) {
           valid = false;
           break;
         }
+        for (const matched of matches) {
+          // Nx omits a task's dependency on itself, including a glob that selects it.
+          if (matched === targetName || !isTestLegTargetName(matched)) {
+            continue;
+          }
+          hasTestLeg = true;
+          if (!visit(matched)) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) {
+          break;
+        }
       }
-      valid = valid && hasTestLeg;
     }
+    valid = valid && hasTestLeg;
     visiting.delete(targetName);
     verified.set(targetName, valid);
     return valid;
@@ -511,15 +519,20 @@ function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefi
   return visit('test');
 }
 
-function matchingResolvedTargets(dependency: string, targets: ReadonlySet<string>): string[] {
+function matchingResolvedTargets(dependency: string, targets: ReadonlySet<string>, targetNames: string[]): string[] {
   if (dependency.startsWith('^')) {
     return [];
   }
-  if (!dependency.startsWith('*')) {
-    return targets.has(dependency) ? [dependency] : [];
+  if (targets.has(dependency)) {
+    return [dependency];
   }
-  const suffix = dependency.slice(1);
-  return [...targets].filter((targetName) => targetName.endsWith(suffix));
+  const matches: string[] = [];
+  for (const { target } of expandWildcardTargetConfiguration({ target: dependency, projects: [] }, targetNames)) {
+    if (targets.has(target)) {
+      matches.push(target);
+    }
+  }
+  return matches;
 }
 
 function resolvedProjectFor(

@@ -250,10 +250,106 @@ describe('bounded test target policy', () => {
       'bun test --timeout=9007199254740992',
       'bun test --timeout=600001',
       'bun test --timeout=30000 --timeout=600001',
+      'bun test --timeout=30000 --timeout',
+      'bun test --timeout=30000 --timeout=',
     ]) {
       expect(check(command)).toBe(false);
     }
     expect(check('bun test --timeout=600000', BOUNDED_TEST_TIMEOUT_MS)).toBe(false);
+  });
+
+  it('checks every test leg selected by Nx target wildcards', () => {
+    const packageJson: BoundedTestPolicyPackageJson = {
+      nx: { targets: { test: { executor: 'nx:noop', dependsOn: ['test-*'] } } },
+    };
+    const options = {
+      command: `bun test ${TIMEOUT_FLAG}`,
+      cwd: '{projectRoot}',
+      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    };
+    const project: ResolvedProjectTargets = {
+      targets: new Set(['test', 'test-shard1', 'test-shard2', 'build', 'typecheck-tests']),
+      targetExecutors: new Map([
+        ['test', 'nx:noop'],
+        ['test-shard1', BOUNDED_TEST_EXECUTOR],
+        ['test-shard2', BOUNDED_TEST_EXECUTOR],
+      ]),
+      targetOptions: new Map([
+        ['test-shard1', options],
+        ['test-shard2', options],
+      ]),
+    };
+    for (const pattern of ['test-*', '*test*', 'test-shard[12]', 'test-{shard1,shard2}']) {
+      const resolvedProject = {
+        ...project,
+        targetDependencies: new Map([['test', ['^build', 'build', 'typecheck-tests', pattern]]]),
+      };
+      expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example', resolvedProject })).toBe(true);
+    }
+    const unbounded: ResolvedProjectTargets = {
+      ...project,
+      targets: new Set([...project.targets, 'test-extra']),
+      targetDependencies: new Map([['test', ['test-shard1', '*test*']]]),
+      targetExecutors: new Map([
+        ['test', 'nx:noop'],
+        ['test-shard1', BOUNDED_TEST_EXECUTOR],
+        ['test-shard2', BOUNDED_TEST_EXECUTOR],
+        ['test-extra', 'nx:run-commands'],
+      ]),
+    };
+    expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example', resolvedProject: unbounded })).toBe(
+      false,
+    );
+  });
+
+  it('checks local test prerequisites of bounded execution legs and rejects their cycles', () => {
+    const packageJson: BoundedTestPolicyPackageJson = {
+      nx: { targets: { test: { executor: 'nx:noop', dependsOn: ['test-second'] } } },
+    };
+    const options = {
+      command: `bun test ${TIMEOUT_FLAG}`,
+      cwd: '{projectRoot}',
+      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    };
+    const project: ResolvedProjectTargets = {
+      targets: new Set(['test', 'test-first', 'test-second', 'build']),
+      targetDependencies: new Map([
+        ['test', ['test-second']],
+        ['test-second', ['^build', 'build', 'test-first']],
+      ]),
+      targetExecutors: new Map([
+        ['test', 'nx:noop'],
+        ['test-second', BOUNDED_TEST_EXECUTOR],
+        ['test-first', 'nx:run-commands'],
+      ]),
+      targetOptions: new Map([
+        ['test-first', options],
+        ['test-second', options],
+      ]),
+    };
+    const check = (resolvedProject: ResolvedProjectTargets) =>
+      checkBoundedTestTargetPolicy(packageJson, { projectName: 'example', resolvedProject });
+    expect(check(project)).toBe(false);
+    project.targetExecutors = new Map([
+      ['test', 'nx:noop'],
+      ['test-second', BOUNDED_TEST_EXECUTOR],
+      ['test-first', BOUNDED_TEST_EXECUTOR],
+    ]);
+    expect(check(project)).toBe(true);
+    project.targetDependencies = new Map([
+      ['test', ['test-second']],
+      ['test-second', ['test-first']],
+      ['test-first', ['test-second']],
+    ]);
+    expect(check(project)).toBe(false);
+    project.targetDependencies = new Map([
+      ['test', ['test-second']],
+      ['test-second', ['test-first']],
+      ['test-first', ['test-first']],
+    ]);
+    expect(check(project)).toBe(true);
   });
 
   it('bounds where `bun test` starts but not where other bounded legs run', () => {
@@ -449,11 +545,25 @@ describe('bounded test target policy', () => {
       await writeJson(projectPath, { targets: { test, 'test-shard1': shard, 'test-shard2': shard } });
       const beforePackage = await readFile(packagePath, 'utf8');
       const beforeProject = await readFile(projectPath, 'utf8');
+      const emptyTargets = [{ executor: 'nx:noop', dependsOn: [] }, { executor: 'nx:noop' }];
+      const unchanged = new Map<string, string>();
+      for (const [index, emptyTest] of emptyTargets.entries()) {
+        const emptyPackagePath = join(root, `packages/empty${index}/package.json`);
+        const emptyProjectPath = join(root, `packages/empty-project${index}/project.json`);
+        await writeJson(emptyPackagePath, { name: `empty${index}`, nx: { targets: { test: emptyTest } } });
+        await writeJson(join(root, `packages/empty-project${index}/package.json`), { name: `empty-project${index}` });
+        await writeJson(emptyProjectPath, { targets: { test: emptyTest } });
+        unchanged.set(emptyPackagePath, await readFile(emptyPackagePath, 'utf8'));
+        unchanged.set(emptyProjectPath, await readFile(emptyProjectPath, 'utf8'));
+      }
 
       expect(applyWorkspaceBoundedTestTargetPolicy(root)).toBe(false);
       expect(await readFile(packagePath, 'utf8')).toBe(beforePackage);
       expect(await readFile(projectPath, 'utf8')).toBe(beforeProject);
-      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toHaveLength(2);
+      for (const [path, before] of unchanged) {
+        expect(await readFile(path, 'utf8')).toBe(before);
+      }
+      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toHaveLength(6);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -48,12 +48,6 @@ standard 120-second target deadline stay unchanged. Refresh the portable timing 
 with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data, not a test
 allowlist.
 
-Workspace updates preserve no-op test aggregates rather than adding a second test runner. The bounded-test check
-requires at least one local test execution leg and verifies every such leg through nested no-op aggregates; upstream and
-non-test prerequisites such as `^build`, `build`, and `typecheck-tests` are not test legs. Each bounded Bun leg must
-declare a positive per-test `--timeout` no greater than its own `timeoutMs`; the migration's 30-second default is not a
-limit on explicitly bounded lanes.
-
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
 Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own
 `nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline,
@@ -841,16 +835,19 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 - executor `@smoothbricks/nx-plugin:bounded-exec`
 - command preserved from an existing `nx:run-commands` test target or direct `scripts.test`
 - `cwd: "{projectRoot}"`
-- `timeoutMs: 600000`
+- `timeoutMs: 120000`
 - `killAfterMs: 10000`
 - package script alias `nx run <project>:test --outputStyle=stream`
 
-A `test` aggregate that is a no-op target passes the check when every target it depends on, transitively, is a bounded
-leg: `bounded-exec` with a command, a `cwd`, and positive `timeoutMs` and `killAfterMs`. A bare prerequisite target
-(`^build`, `build`, a target in another project) is not a bounded leg, so name prerequisites on the legs that read them.
-Only a leg that runs `bun test` must start in the project root or its `src/`, where Bun's test-file discovery is cheap;
-any other command (a cargo workspace's per-crate nextest legs run from the workspace root, a gate may run a script that
-lives in another project) may use any `cwd`.
+Workspace updates preserve no-op test targets rather than adding a second test runner. A no-op `test` aggregate passes
+the check when it reaches at least one local test execution leg and every such leg is bounded, including through nested
+no-op aggregates: `bounded-exec` with a command, a `cwd`, and positive `timeoutMs` and `killAfterMs`. Upstream and
+non-test prerequisites such as `^build`, `build`, `typecheck-tests`, and Cargo compilation/archive targets are ignored
+by this test-leg check. Each bounded Bun leg must declare a positive per-test `--timeout` no greater than its own
+`timeoutMs`; the migration's 30-second default is not a limit on explicitly bounded lanes. Only a leg that runs
+`bun test` must start in the project root or its `src/`, where Bun's test-file discovery is cheap; any other command (a
+cargo workspace's per-crate nextest legs run from the workspace root, a gate may run a script that lives in another
+project) may use any `cwd`.
 
 ## Test Fixtures That Run Nx
 
