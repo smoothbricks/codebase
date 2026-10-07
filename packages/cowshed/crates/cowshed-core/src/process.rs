@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -307,6 +308,455 @@ pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
         .ok_or_else(|| invalid("holds more bytes than a u64 counts"))
 }
 
+/// The local ports of the TCP sockets in `LISTEN` that the descriptors of process `pid` hold,
+/// IPv4 and IPv6 alike, each port once. A socket that is merely bound, or connected, or of
+/// another protocol is no listener. The read names only the pid and never decides that the
+/// process exited: a read that fails is an error, which the caller judges by the identity of the
+/// process it means, read afterwards (`Process::listening_ports`) -- a process shown gone held
+/// nothing, a process shown running left its sockets unread.
+///
+/// Darwin reads each socket descriptor's `socket_fdinfo` (`proc_pidfdinfo`), whose TCP record
+/// carries the connection's state, as `lsof` and `netstat` read it.
+#[cfg(target_os = "macos")]
+pub(crate) fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
+    let descriptors = descriptors(pid)?;
+    let size =
+        libc::c_int::try_from(std::mem::size_of::<SocketFdInfo>()).map_err(io::Error::other)?;
+    let socket = u32::try_from(libc::PROX_FDTYPE_SOCKET).map_err(io::Error::other)?;
+    let mut ports = BTreeSet::new();
+    for descriptor in descriptors
+        .iter()
+        .filter(|descriptor| descriptor.proc_fdtype == socket)
+    {
+        let mut info = std::mem::MaybeUninit::<SocketFdInfo>::zeroed();
+        // SAFETY: `info` is writable storage of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                descriptor.proc_fd,
+                PROC_PIDFDSOCKETINFO,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written == size {
+            // SAFETY: proc_pidfdinfo filled all `size` bytes.
+            let info = unsafe { info.assume_init() };
+            if info.psi.soi_kind != SOCKINFO_TCP {
+                continue;
+            }
+            // SAFETY: the kernel fills `pri_tcp` for a socket of kind `SOCKINFO_TCP`.
+            let tcp = unsafe { info.psi.soi_proto.pri_tcp };
+            if tcp.tcpsi_state == TSI_S_LISTEN {
+                ports.insert(listening_port(pid, tcp.tcpsi_ini.insi_lport)?);
+            }
+            continue;
+        }
+        if written > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "proc_pidfdinfo returned {written} bytes of process {pid}'s descriptor {}, \
+                     expected {size}",
+                    descriptor.proc_fd
+                ),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("process {pid} was gone before its sockets were read: {error}"),
+                ));
+            }
+            // Closed since the descriptors were listed: it holds no listener now.
+            Some(libc::EBADF) => {}
+            _ => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "socket descriptor {} of process {pid} cannot be read: {error}",
+                        descriptor.proc_fd
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(ports)
+}
+
+/// The port a `LISTEN` socket's `insi_lport` holds: the kernel copies `inp_lport`, a port in
+/// network byte order, into that `int`.
+#[cfg(target_os = "macos")]
+fn listening_port(pid: libc::pid_t, local_port: libc::c_int) -> io::Result<u16> {
+    u16::try_from(local_port).map(u16::from_be).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("process {pid} listens on local port {local_port}, which no u16 holds"),
+        )
+    })
+}
+
+/// Every descriptor of process `pid` (`PROC_PIDLISTFDS`).
+#[cfg(target_os = "macos")]
+fn descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::proc_fdinfo>> {
+    let empty = libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    };
+    let mut descriptors = vec![empty; 64];
+    loop {
+        let bytes = libc::c_int::try_from(std::mem::size_of_val(descriptors.as_slice()))
+            .map_err(io::Error::other)?;
+        // SAFETY: errno is thread-local; libproc writes at most `bytes` into this live slice.
+        let written = unsafe {
+            *libc::__error() = 0;
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                descriptors.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            return if written == 0 && error.raw_os_error() == Some(0) {
+                Ok(Vec::new())
+            } else {
+                Err(io::Error::new(
+                    error.kind(),
+                    format!("the descriptors of process {pid} cannot be listed: {error}"),
+                ))
+            };
+        }
+        let written = usize::try_from(written).map_err(io::Error::other)?;
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        if written % entry != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proc_pidinfo listed {written} bytes of process {pid}'s descriptors"),
+            ));
+        }
+        let count = written / entry;
+        // A full buffer is never evidence that every descriptor was listed.
+        if count < descriptors.len() {
+            descriptors.truncate(count);
+            return Ok(descriptors);
+        }
+        let length = descriptors.len().checked_mul(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the descriptors of process {pid} overflowed"),
+            )
+        })?;
+        descriptors.resize(length, empty);
+    }
+}
+
+/// `PROC_PIDFDSOCKETINFO` (`<sys/proc_info.h>`), which the `libc` crate does not declare.
+#[cfg(target_os = "macos")]
+const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+/// `SOCKINFO_TCP`: `soi_kind` of a TCP socket, IPv4 or IPv6.
+#[cfg(target_os = "macos")]
+const SOCKINFO_TCP: libc::c_int = 2;
+/// `TSI_S_LISTEN`: `tcpsi_state` of a listening socket.
+#[cfg(target_os = "macos")]
+const TSI_S_LISTEN: libc::c_int = 1;
+
+// The records `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` writes, as `<sys/proc_info.h>` declares
+// them and the `libc` crate does not. Field for field, in the header's order and types; a field
+// nothing here reads carries its header name behind `_`. The sizes and offsets below were
+// measured with the SDK's own header (clang `sizeof`/`offsetof`, Darwin 25.6 arm64) and are
+// asserted at compile time.
+
+/// `struct proc_fileinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ProcFileInfo {
+    _fi_openflags: u32,
+    _fi_status: u32,
+    _fi_offset: libc::off_t,
+    _fi_type: i32,
+    _fi_guardflags: u32,
+}
+
+/// `struct sockbuf_info`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SockbufInfo {
+    _sbi_cc: u32,
+    _sbi_hiwat: u32,
+    _sbi_mbcnt: u32,
+    _sbi_mbmax: u32,
+    _sbi_lowat: u32,
+    _sbi_flags: libc::c_short,
+    _sbi_timeo: libc::c_short,
+}
+
+/// `struct in4in6_addr`: an IPv4 address in the last word of an IPv6-sized one.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct In4In6Addr {
+    _i46a_pad32: [u32; 3],
+    _i46a_addr4: libc::in_addr,
+}
+
+/// The `insi_faddr`/`insi_laddr` union of `struct in_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+union InSockAddress {
+    _ina_46: In4In6Addr,
+    _ina_6: libc::in6_addr,
+}
+
+/// The `insi_v4` member of `struct in_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InSockV4 {
+    _in4_tos: libc::c_uchar,
+}
+
+/// The `insi_v6` member of `struct in_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InSockV6 {
+    _in6_hlim: u8,
+    _in6_cksum: libc::c_int,
+    _in6_ifindex: libc::c_ushort,
+    _in6_hops: libc::c_short,
+}
+
+/// `struct in_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InSockInfo {
+    _insi_fport: libc::c_int,
+    insi_lport: libc::c_int,
+    _insi_gencnt: u64,
+    _insi_flags: u32,
+    _insi_flow: u32,
+    _insi_vflag: u8,
+    _insi_ip_ttl: u8,
+    _rfu_1: u32,
+    _insi_faddr: InSockAddress,
+    _insi_laddr: InSockAddress,
+    _insi_v4: InSockV4,
+    _insi_v6: InSockV6,
+}
+
+/// `struct tcp_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TcpSockInfo {
+    tcpsi_ini: InSockInfo,
+    tcpsi_state: libc::c_int,
+    /// `TSI_T_NTIMERS` timers.
+    _tcpsi_timer: [libc::c_int; 4],
+    _tcpsi_mss: libc::c_int,
+    _tcpsi_flags: u32,
+    _rfu_1: u32,
+    _tcpsi_tp: u64,
+}
+
+/// The `unsi_addr`/`unsi_caddr` union of `struct un_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+union UnSockAddress {
+    _ua_sun: libc::sockaddr_un,
+    /// `SOCK_MAXADDRLEN` bytes.
+    _ua_dummy: [libc::c_char; 255],
+}
+
+/// `struct un_sockinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct UnSockInfo {
+    _unsi_conn_so: u64,
+    _unsi_conn_pcb: u64,
+    _unsi_addr: UnSockAddress,
+    _unsi_caddr: UnSockAddress,
+}
+
+/// The `soi_proto` union of `struct socket_info`. Its other members -- `ndrv_info`,
+/// `kern_event_info`, `kern_ctl_info`, `vsock_sockinfo` -- are smaller than `un_sockinfo` and
+/// never read here, so leaving them out changes neither its size nor its alignment.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+union SocketProtocolInfo {
+    _pri_in: InSockInfo,
+    pri_tcp: TcpSockInfo,
+    _pri_un: UnSockInfo,
+}
+
+/// `struct socket_info`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SocketInfo {
+    _soi_stat: libc::vinfo_stat,
+    _soi_so: u64,
+    _soi_pcb: u64,
+    _soi_type: libc::c_int,
+    _soi_protocol: libc::c_int,
+    _soi_family: libc::c_int,
+    _soi_options: libc::c_short,
+    _soi_linger: libc::c_short,
+    _soi_state: libc::c_short,
+    _soi_qlen: libc::c_short,
+    _soi_incqlen: libc::c_short,
+    _soi_qlimit: libc::c_short,
+    _soi_timeo: libc::c_short,
+    _soi_error: libc::c_ushort,
+    _soi_oobmark: u32,
+    _soi_rcv: SockbufInfo,
+    _soi_snd: SockbufInfo,
+    soi_kind: libc::c_int,
+    _rfu_1: u32,
+    soi_proto: SocketProtocolInfo,
+}
+
+/// `struct socket_fdinfo`: what `PROC_PIDFDSOCKETINFO` writes.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SocketFdInfo {
+    _pfi: ProcFileInfo,
+    psi: SocketInfo,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<ProcFileInfo>() == 24);
+    assert!(size_of::<libc::vinfo_stat>() == 136);
+    assert!(size_of::<SockbufInfo>() == 24);
+    assert!(size_of::<InSockInfo>() == 80);
+    assert!(offset_of!(InSockInfo, insi_lport) == 4);
+    assert!(size_of::<TcpSockInfo>() == 120);
+    assert!(offset_of!(TcpSockInfo, tcpsi_state) == 80);
+    assert!(size_of::<UnSockInfo>() == 528);
+    assert!(size_of::<SocketInfo>() == 768);
+    assert!(size_of::<SocketFdInfo>() == 792);
+    assert!(offset_of!(SocketFdInfo, psi) == 24);
+    assert!(offset_of!(SocketFdInfo, psi._soi_family) == 184);
+    assert!(offset_of!(SocketFdInfo, psi.soi_kind) == 256);
+    assert!(offset_of!(SocketFdInfo, psi.soi_proto) == 264);
+};
+
+/// [`listening_ports`] from procfs: the socket inodes of `/proc/<pid>/fd`, matched against the
+/// `LISTEN` rows of `/proc/<pid>/net/tcp` and `tcp6`, the tables of the network namespace the
+/// process is in.
+///
+/// Those tables list only that namespace's sockets, so this answer is complete because a job
+/// lives in one namespace: its workspace's private network namespace, which its processes can
+/// neither leave nor exchange for another (`unshare`/`setns` are refused, 04_sandbox.md, Linux
+/// "Egress"). A process that held a socket made in another namespace would have it missing here.
+#[cfg(target_os = "linux")]
+pub(crate) fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let unreadable = |what: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("the {what} of process {pid} cannot be read: {error}"),
+        )
+    };
+    let mut sockets = std::collections::HashSet::new();
+    for descriptor in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|error| unreadable("descriptors", error))?
+    {
+        let descriptor = descriptor.map_err(|error| unreadable("descriptors", error))?;
+        let target = match std::fs::read_link(descriptor.path()) {
+            Ok(target) => target,
+            // Closed since the directory was read: it holds no listener now.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(unreadable("descriptors", error)),
+        };
+        if let Some(inode) = socket_inode(target.as_os_str().as_bytes()) {
+            sockets.insert(inode);
+        }
+    }
+    let mut ports = BTreeSet::new();
+    if sockets.is_empty() {
+        return Ok(ports);
+    }
+    for table in ["tcp", "tcp6"] {
+        let rows = match std::fs::read_to_string(format!("/proc/{pid}/net/{table}")) {
+            Ok(rows) => rows,
+            // A kernel built without IPv6 has no tcp6 table, and so no IPv6 listener: the
+            // process's tcp table was just read, so the process was there to have one.
+            Err(error) if table == "tcp6" && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(unreadable(table, error)),
+        };
+        tcp_listeners(&rows, &sockets, &mut ports).map_err(|reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("process {pid}'s /proc/{pid}/net/{table} {reason}"),
+            )
+        })?;
+    }
+    Ok(ports)
+}
+
+/// The inode of a descriptor link that names a socket: `socket:[<inode>]`.
+#[cfg(target_os = "linux")]
+fn socket_inode(target: &[u8]) -> Option<u64> {
+    let inode = target.strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
+    std::str::from_utf8(inode).ok()?.parse().ok()
+}
+
+/// Adds to `ports` the local port of each row of a procfs TCP table (`net/tcp`, `net/tcp6`) in
+/// state `LISTEN` whose socket inode is one of `sockets`. Each row is `sl local rem st
+/// tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode …`, an address being
+/// `<hex address>:<hex port>` (`tcp4_seq_show`, `tcp6_seq_show`); a row of another shape is
+/// refused, never skipped.
+#[cfg(any(target_os = "linux", test))]
+fn tcp_listeners(
+    table: &str,
+    sockets: &std::collections::HashSet<u64>,
+    ports: &mut BTreeSet<u16>,
+) -> Result<(), String> {
+    /// `TCP_LISTEN` in `include/net/tcp_states.h`, as the table prints it.
+    const LISTEN: &str = "0A";
+    let mut rows = table.lines();
+    match rows.next() {
+        Some(header) if header.trim_start().starts_with("sl") => {}
+        header => return Err(format!("has no table header: {header:?}")),
+    }
+    for row in rows {
+        let mut fields = row.split_whitespace();
+        let (Some(local), Some(state), Some(inode)) = (fields.nth(1), fields.nth(1), fields.nth(5))
+        else {
+            return Err(format!("has a row of no socket: {row:?}"));
+        };
+        let inode: u64 = inode
+            .parse()
+            .map_err(|_| format!("has a row whose inode is no number: {row:?}"))?;
+        if state != LISTEN || !sockets.contains(&inode) {
+            continue;
+        }
+        let port = local
+            .rsplit_once(':')
+            .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())
+            .ok_or_else(|| format!("has a row whose local address has no port: {row:?}"))?;
+        ports.insert(port);
+    }
+    Ok(())
+}
+
 /// How a child process terminated, without collapsing signals into a synthetic exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessStatus {
@@ -494,6 +944,41 @@ impl fmt::Display for DiagnosticBytes<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A procfs TCP table names a port only for a `LISTEN` row whose socket the process holds:
+    /// a connected socket on the same port, another process's listener and a time-wait row are
+    /// none, IPv4 and IPv6 listeners on one port are one port, and a row of another shape is
+    /// refused rather than skipped.
+    #[test]
+    fn a_procfs_tcp_table_names_only_the_listeners_a_process_holds() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            \x20  0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n\
+            \x20  1: 0100007F:1F90 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 12346 1 0000000000000000 20 4 30 10 -1\n\
+            \x20  2: 0100007F:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 999 1 0000000000000000 100 0 0 10 0\n\
+            \x20  3: 0100007F:1F91 0100007F:C351 06 00000000:00000000 03:00001770 00000000     0        0 0 3 0000000000000000\n";
+        let tcp6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            \x20  0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 22222 1 0000000000000000 100 0 0 10 0\n\
+            \x20  1: 00000000000000000000000001000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 33333 1 0000000000000000 100 0 0 10 0\n";
+        let held = std::collections::HashSet::from([12345, 12346, 22222, 33333]);
+        let mut ports = BTreeSet::new();
+        tcp_listeners(tcp, &held, &mut ports).expect("tcp");
+        tcp_listeners(tcp6, &held, &mut ports).expect("tcp6");
+        assert_eq!(ports, BTreeSet::from([3000, 8080]));
+
+        let header = tcp.lines().next().expect("header");
+        for refused in [
+            String::new(),
+            "   0: 0100007F:1F90 00000000:0000 0A\n".to_owned(),
+            format!("{header}\n   0: 0100007F:1F90 00000000:0000 0A 0:0 0:0 0 1000 0\n"),
+            format!("{header}\n   0: 0100007F:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 inode\n"),
+            format!("{header}\n   0: 0100007F 00000000:0000 0A 0:0 0:0 0 1000 0 12345\n"),
+        ] {
+            assert!(
+                tcp_listeners(&refused, &held, &mut BTreeSet::new()).is_err(),
+                "{refused:?}"
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     fn procargs(argc: i32, strings: &[u8]) -> Vec<u8> {
