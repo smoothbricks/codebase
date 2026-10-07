@@ -358,6 +358,29 @@ mod tests {
         assert!(script.asked.recv().await.is_none());
     }
 
+    /// Dropping while the read is pending must release the subscription, not await that read.
+    #[tokio::test]
+    async fn review_drop_stops_a_subscription_during_a_pending_read() {
+        let (mut script, read) = script();
+        let mut stream = subscribe(
+            ProgressRead::Running(sample(0)),
+            Duration::from_millis(1),
+            read,
+            std::future::pending(),
+        )
+        .expect("subscribe");
+        stream.next().await.expect("first").expect("sample");
+        script.asked.recv().await.expect("a read started");
+        drop(stream);
+        let stopped = tokio::time::timeout(Duration::from_millis(200), script.asked.recv()).await;
+        // Let the pending read finish even on the old implementation before asserting.
+        let _ = script.answers.send(Ok(ProgressRead::Running(sample(1))));
+        assert_eq!(
+            stopped.expect("dropping the reader must cancel its pending read"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn an_interval_past_the_clock_s_range_is_refused() {
         let (_script, read) = script();
