@@ -303,25 +303,25 @@ gives back less space.
 Attach is `diskutil image attach --nobrowse --noMount --plist <image>` (`hdiutil attach` refuses ASIF outright with
 _"use 'diskutil image attach'"_), whose machine-readable output names the APFS volume device. Before the first mount,
 cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a workspace
-mount. It then mounts with the kernel helper as the invoking user, `mount_apfs -o nobrowse,owners <device> <path>`
-(`--browse` omits `nobrowse`), not `diskutil mount`: Disk Arbitration serialises every mount on the host, and under a
-loaded fleet a mount `mount_apfs` completes in about a second queued there for 68 s at the median. Owned-image detach is
-`hdiutil detach <whole-device>`, using the disk-image driver's release interface rather than general `diskutil eject`;
-the latter spent 11.086 s detaching a mounted staging image in a hosted arm64 release. A local real-ASIF comparison
-measured 127–173 ms for the image-driver detach against 257–298 ms for general eject; this does not establish a hosted
-latency bound. `WhenIdle` returns the observed EBUSY/resource-busy refusal without forcing. `Release` retains its
-existing grace and then uses `hdiutil detach -force`; every other error remains authoritative. There is no general-eject
-fallback. Every detach runs `-verbose`, and hdiutil's account becomes an attribute of the `detach image` span: a refused
-eject prints `dissent=<reason>`, and an accepted one slower than 1 s prints `waited=<account>`. A forced eject of an
-unmounted volume measured 2.57 s on a loaded host with no dissent in its account: the wait is DiskArbitration's own
-queue (the unmount and eject callbacks), which `-force` does not bypass. The kernel's I/O Registry is the one host view
-that maps an image's path to its devices (`diskutil image info` reports none): one
-`IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its `AppleDiskImageDevice` and that device's
-`DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other image attaches or detaches it answers a
-truncated image list with nothing marking it (a reviewer probe that kept one image attached while churning another saw
-it missing from 11–89 of every 648–1551 polls, and from none of the same polls' registry reads). Reading that omission
-as absence once skipped a post-format release, leaving the image attached for `diskutil image resize` to refuse as busy,
-and once lost a mounted workspace's attachment on restart.
+mount. It then mounts with the kernel helper as the invoking user,
+`mount_apfs -o nobrowse,owners,noatime <device> <path>` (`--browse` omits `nobrowse`), not `diskutil mount`: Disk
+Arbitration serialises every mount on the host, and under a loaded fleet a mount `mount_apfs` completes in about a
+second queued there for 68 s at the median. Owned-image detach is `hdiutil detach <whole-device>`, using the disk-image
+driver's release interface rather than general `diskutil eject`; the latter spent 11.086 s detaching a mounted staging
+image in a hosted arm64 release. A local real-ASIF comparison measured 127–173 ms for the image-driver detach against
+257–298 ms for general eject; this does not establish a hosted latency bound. `WhenIdle` returns the observed
+EBUSY/resource-busy refusal without forcing. `Release` retains its existing grace and then uses `hdiutil detach -force`;
+every other error remains authoritative. There is no general-eject fallback. Every detach runs `-verbose`, and hdiutil's
+account becomes an attribute of the `detach image` span: a refused eject prints `dissent=<reason>`, and an accepted one
+slower than 1 s prints `waited=<account>`. A forced eject of an unmounted volume measured 2.57 s on a loaded host with
+no dissent in its account: the wait is DiskArbitration's own queue (the unmount and eject callbacks), which `-force`
+does not bypass. The kernel's I/O Registry is the one host view that maps an image's path to its devices
+(`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its
+`AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other
+image attaches or detaches it answers a truncated image list with nothing marking it (a reviewer probe that kept one
+image attached while churning another saw it missing from 11–89 of every 648–1551 polls, and from none of the same
+polls' registry reads). Reading that omission as absence once skipped a post-format release, leaving the image attached
+for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment on restart.
 
 The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
 reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
@@ -395,6 +395,67 @@ For every mounted attachment:
   mountpoint, a detached image, a mount owned by another project, or overlapping active mounts never grants a
   `WorkspaceRef`.
 - Personal workspaces may opt into Finder visibility with `--browse` at attach time.
+- Every workspace and build-volume mount is `noatime`: builds are read-heavy, and access-time updates on read are
+  metadata writes no workflow here consults (the Linux copy path carries an existing atime across; nothing decides on
+  one). The store and caches volumes were already `noatime` (their fstab entries).
+
+### The event log
+
+`fseventsd`, the one root daemon behind every FSEvents stream on the host, also keeps a persistent per-volume event log
+under the volume root's `.fseventsd` (Apple, _File System Events Programming Guide_, "Preventing File System Event
+Storage"). Cowshed volumes do not want it: a checkout's watchers (the Nx daemon, editors) subscribe live and never
+replay history, while the log costs the daemon work for every event on every logged volume. On a host saturating
+`fseventsd` — measured 2026-10-07: 100–107 % of a core for days, resident memory 7.06 GB growing to 8.30 GB in 18
+minutes, at only 600–720 events/s visible to a user stream across all volumes — 52 of 66 mounted cowshed volumes kept a
+log.
+
+What decides it, measured on this host without root (`FSEventsCopyUUIDForDevice` answers a log's UUID for a device only
+while `fseventsd` writes one):
+
+- `fseventsd` decides when a volume mounts. A browsable mount gets a log, created as root, mode 0700; a fresh volume
+  mounted `nobrowse` gets none, even after 100 000 file creations. A log already on the volume is kept.
+- A log travels with the volume: a clone carries its source's `.fseventsd`. Every workspace cloned from a main that was
+  once mounted browsable, and every build volume forked from such a seed, was logged by inheritance.
+- An empty `.fseventsd/no_log` the user created is honored at the next mount: no log, while live delivery to streams is
+  unchanged (a sentinel written after a 200-file burst on an opted-out workspace arrived in 330 ms, no drop flags).
+  Planting it under a mounted, logged volume — renaming root's `.fseventsd` aside, which the volume's owner may do —
+  changes nothing until the volume mounts again.
+
+So every read-write mount opts its volume out, after `mount_apfs` returns and before the mount is handed back:
+
+- No `.fseventsd`: create it (0700) and an empty `no_log` in it, exclusively; nothing is followed through a symlink. It
+  governs the next mount and every clone made from the volume; this mount was `nobrowse` and fresh, so `fseventsd` gave
+  it no log anyway.
+- A `.fseventsd` that is a real directory holding an empty regular `no_log` the user can see: opted out, nothing to do.
+- Root's log (the marker lookup is refused): unmount, mount `nobrowse,noowners` — ownership ignored, so root's directory
+  is the user's to change — add the marker to root's log, set the directory 0711, unmount, and mount again as asked. The
+  log's records stay, as `fseventsd` wrote them and unlisted; the Apple guide reserves purging them for an
+  administrator. 0711 rather than root's 0700 lets the owner look the marker up under every later mount that honors
+  ownership — under 0700 the lookup is refused, and every mount would retire the log again (measured: 3 runs in 3).
+  `fseventsd` can carry the old log across that immediate remount (three runs in four on this host); the volume is
+  unlogged from its next mount, and every clone of it from the first.
+- A symlink or file holding `.fseventsd`, or anything but an empty regular file holding `no_log`: reported and left as
+  found, never written through.
+- Failing to opt out is reported on stderr and the mount stands: the mount is what the caller asked for, the log is host
+  load. Only failing to mount the volume back is an error.
+
+Templates are never mounted and carry no `.fseventsd`; their clones are opted out at their first mount. Mains are opted
+out at their next mount. Seeds are never mounted: a seed is a clone of a live build volume, so it carries the marker
+once that volume has mounted, and every fork of it mounts opted out. The bounded-exec RAM volume (nx-plugin) is already
+unlogged — a fresh volume mounted `nobrowse` once, never remounted — so it plants nothing.
+
+Opting out removes the log's work, not the daemon's live delivery work, and does not make delivery reliable on a
+saturated host: a volume's first events after its mount can go missing with no drop flag, logged or not (the first
+50-file burst after a mount delivered 12 of ~80 events, the next all of them; a single update written after a stream
+went live on a just-mounted volume, logged or opted out, was missed for its whole bound in 8 of 23 runs before the
+regression synchronized on the mount). Even synchronized on `fseventsd`'s own `Mount` event, on this host (2026-10-07)
+one update missed a 10 s bound in 3 of 8 runs — on the browsable, logged arm and the opted-out arms alike, before or
+after cowshed touched the volume: the host's `fseventsd` losing a just-mounted volume's events, not the opt-out. Live
+delivery is therefore a measurement here, not a regression assertion: on an opted-out workspace after detach and attach,
+a sentinel arrived in 330 ms with 0 drop flags. The real-APFS regression asserts only what the mount decides: the
+`owners` and `noatime` flags, the marker as an empty regular file, root's directory kept at uid 0 mode 0711, and no log
+UUID once the retired volume mounts again. It waits for `fseventsd`'s `Mount` event — on a stream watching the directory
+the volumes mount under — before reading the log.
 
 ## How the APFS host degrades
 

@@ -38,6 +38,8 @@ use cowshed_core::workspace_credentials::mint_workspace_credentials;
 
 #[path = "../support/blank_image.rs"]
 mod blank_image;
+#[path = "../support/fsevents.rs"]
+mod fsevents;
 #[path = "../support/scratch_apfs.rs"]
 mod scratch_apfs;
 
@@ -4530,6 +4532,120 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
             mount.display(),
             String::from_utf8_lossy(&unmounted.stderr)
         );
+    }
+}
+
+/// fseventsd's persistent event log on real volumes (01_storage.md, "The event log"). A fresh
+/// volume is opted out at its first read-write mount. A volume carrying a log a root fseventsd
+/// created — what a browsable mount leaves, and what every clone of such a volume inherits — has
+/// it replaced by the marker at its next mount, through one mount that ignores ownership; the
+/// mount after that runs without a log and retires nothing. fseventsd can carry the old log
+/// across the immediate remount (measured: three runs in four), so only the marker is asserted
+/// there. Every mount, the retiring one included, ends honoring ownership and without access
+/// times. Live delivery is not asserted: on this host fseventsd loses a just-mounted volume's
+/// events whether it is logged or not (01_storage.md records the measurement).
+#[test]
+fn real_apfs_mount_opts_volumes_out_of_the_event_log_and_retires_an_inherited_one() {
+    let fixture = RealFixture::new("event-log");
+    let host = fixture.host();
+    let backend = host.backend();
+    let assert_opted_out = |mount: &Path, label: &str| {
+        let marker = std::fs::symlink_metadata(mount.join(".fseventsd/no_log"))
+            .unwrap_or_else(|error| panic!("{label}: the opt-out marker: {error}"));
+        assert!(
+            marker.file_type().is_file() && marker.len() == 0,
+            "{label}: the opt-out marker is an empty regular file: {marker:?}"
+        );
+    };
+    let unmount = |mount: &Path| {
+        let unmounted = SystemCommandRunner
+            .run(&CommandRequest::new("/sbin/umount", [mount]))
+            .expect("umount");
+        assert!(
+            unmounted.succeeded(),
+            "umount {}: {}",
+            mount.display(),
+            String::from_utf8_lossy(&unmounted.stderr)
+        );
+    };
+    let assert_canonical_flags = |mount: &Path, label: &str| {
+        let path = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).expect("C path");
+        // SAFETY: `path` is NUL-terminated and `statfs` writes only the zeroed buffer.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::statfs(path.as_ptr(), &mut stat) },
+            0,
+            "statfs"
+        );
+        assert_eq!(
+            stat.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32,
+            0,
+            "{label}: honors ownership"
+        );
+        assert_ne!(
+            stat.f_flags & libc::MNT_NOATIME as u32,
+            0,
+            "{label}: no access times"
+        );
+    };
+    use fsevents::Transition::{Mounted, Unmounted};
+    let mut mounts = fsevents::Watch::start(fixture.root());
+
+    let fresh_image = fixture.root().join("fresh.asif");
+    let fresh = fixture.root().join("fresh");
+    fixture.blank_image(&fresh_image);
+    let attachment = backend.attach_verified(&fresh_image).expect("attach fresh");
+    backend
+        .mount(&attachment, &fresh, MountAccess::ReadWrite, false)
+        .expect("mount fresh");
+    mounts.wait_for(&fresh, Mounted);
+    assert_canonical_flags(&fresh, "fresh");
+    assert_opted_out(&fresh, "fresh");
+    assert!(!fsevents::keeps_event_log(&fresh));
+
+    let logged_image = fixture.root().join("logged.asif");
+    let logged = fixture.root().join("logged");
+    fixture.blank_image(&logged_image);
+    let attachment = fixture.mount_left_behind(&logged_image, &logged, "owners");
+    mounts.wait_for(&logged, Mounted);
+    // fseventsd opens a browsable volume's log once a stream asks about the volume.
+    drop(fsevents::Watch::start(&logged));
+    assert!(
+        fsevents::keeps_event_log(&logged),
+        "a browsable mount is logged"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(logged.join(".fseventsd/no_log"))
+            .expect_err("root's log")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the log is root's"
+    );
+    unmount(&logged);
+    mounts.wait_for(&logged, Unmounted);
+
+    // The retiring mount mounts twice more — once ignoring ownership, once as asked — and the
+    // retired one once.
+    for mount in ["retiring", "retired"] {
+        backend
+            .mount(&attachment, &logged, MountAccess::ReadWrite, false)
+            .unwrap_or_else(|error| panic!("{mount} mount: {error}"));
+        mounts.wait_for(&logged, Mounted);
+        assert_canonical_flags(&logged, mount);
+        // Readable under ownership: the next mount finds the volume opted out, with nothing to
+        // retire.
+        assert_opted_out(&logged, mount);
+        let kept = std::fs::symlink_metadata(logged.join(".fseventsd")).expect("event log");
+        assert_eq!(
+            (kept.uid(), kept.mode() & 0o777),
+            (0, 0o711),
+            "{mount}: root's log is kept, its records unlisted"
+        );
+        if mount == "retired" {
+            assert!(!fsevents::keeps_event_log(&logged), "{mount}: no log");
+        }
+        unmount(&logged);
+        mounts.wait_for(&logged, Unmounted);
     }
 }
 

@@ -1603,6 +1603,103 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         })
     }
 
+    /// Opt the read-write volume just mounted at `mount_point` out of fseventsd's persistent
+    /// event log (01_storage.md, "The event log"): an empty `.fseventsd/no_log` at its root.
+    /// fseventsd reads the marker when the volume mounts, so it governs the next mount and every
+    /// clone. A log a root fseventsd created is root's to write, so only a mount that ignores
+    /// ownership can replace it: that volume is mounted once more without ownership, its log
+    /// replaced by the marker, and mounted back as asked. The mount is what the caller asked
+    /// for; the log is host load, so a failure to opt out is reported and the volume stays
+    /// mounted. Only a failure to mount it back is an error.
+    fn opt_out_of_event_log(
+        &self,
+        attachment: &AttachedImage,
+        mount_point: &Path,
+        options: &str,
+    ) -> Result<(), ApfsError> {
+        match opt_out_of_event_log(mount_point) {
+            Ok(EventLog::OptedOut) => Ok(()),
+            Ok(EventLog::Inherited) => {
+                self.retire_inherited_event_log(attachment, mount_point, options)
+            }
+            Ok(EventLog::Squatted) => {
+                eprintln!(
+                    "cowshed: apfs {} has a {EVENT_LOG_DIRECTORY} that is not a directory, or a \
+                     {EVENT_LOG_OPT_OUT} that is not an empty regular file; left as found, not \
+                     written through",
+                    mount_point.display()
+                );
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!(
+                    "cowshed: apfs {} keeps fseventsd's event log: {error}",
+                    mount_point.display()
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn retire_inherited_event_log(
+        &self,
+        attachment: &AttachedImage,
+        mount_point: &Path,
+        options: &str,
+    ) -> Result<(), ApfsError> {
+        let unmount = || CommandRequest::new(UMOUNT, [OsString::from(&attachment.volume_device)]);
+        if let Err(error) = self.run_checked("unmount to retire an inherited event log", unmount())
+        {
+            eprintln!(
+                "cowshed: apfs {} keeps fseventsd's inherited event log: {error}",
+                mount_point.display()
+            );
+            return Ok(());
+        }
+        let retired = self
+            .run_checked(
+                "mount ignoring ownership to retire an inherited event log",
+                mount_request(attachment, "nobrowse,noowners", mount_point),
+            )
+            .and_then(|_| {
+                let replaced =
+                    retire_event_log(mount_point).map_err(|source| ApfsError::FileOperation {
+                        operation: "opt an inherited event log out",
+                        path: mount_point.join(EVENT_LOG_DIRECTORY),
+                        source,
+                    });
+                let unmounted = self.run_checked("unmount the ownership-ignoring mount", unmount());
+                match (replaced, unmounted) {
+                    (Ok(()), unmounted) => unmounted.map(|_| ()),
+                    (Err(replaced), Ok(_)) => Err(replaced),
+                    (Err(replaced), Err(unmounted)) => {
+                        eprintln!(
+                            "cowshed: apfs {} keeps fseventsd's inherited event log: {replaced}",
+                            mount_point.display()
+                        );
+                        Err(unmounted)
+                    }
+                }
+            });
+        if let Err(error) = &retired {
+            eprintln!(
+                "cowshed: apfs {} keeps fseventsd's inherited event log: {error}",
+                mount_point.display()
+            );
+        }
+        self.run_checked(
+            "mount verified APFS volume",
+            mount_request(attachment, options, mount_point),
+        )?;
+        if retired.is_ok() {
+            eprintln!(
+                "cowshed: apfs {} retired fseventsd's inherited event log",
+                mount_point.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Create a blank ASIF image, attach it without mounting, and format its whole device as one
     /// case-sensitive APFS volume (`newfs_apfs -e`) owned by the invoking user (`-U`/`-G`).
     /// Nothing here runs as root.
@@ -2269,26 +2366,30 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             path: mount_point.to_owned(),
             source,
         })?;
+        // `noatime`: builds are read-heavy, and access-time updates on read are metadata writes no
+        // workflow here consults.
         let options = match (access, browse) {
-            (MountAccess::ReadWrite, false) => "nobrowse,owners",
-            (MountAccess::ReadWrite, true) => "owners",
-            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners",
-            (MountAccess::ReadOnly, true) => "rdonly,owners",
+            (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
+            (MountAccess::ReadWrite, true) => "owners,noatime",
+            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
+            (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
         };
-        let request = CommandRequest::new(
-            MOUNT_APFS,
-            [
-                OsString::from("-o"),
-                OsString::from(options),
-                OsString::from(&attachment.volume_device),
-                mount_point.as_os_str().to_owned(),
-            ],
-        );
         let mounted = timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
-            self.run_checked("mount verified APFS volume", request)
+            self.run_checked(
+                "mount verified APFS volume",
+                mount_request(attachment, options, mount_point),
+            )
         });
+        let opted_out = match (&mounted, access) {
+            (Ok(_), MountAccess::ReadWrite) => {
+                timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
+                    self.opt_out_of_event_log(attachment, mount_point, options)
+                })
+            }
+            _ => Ok(()),
+        };
         inherited_pin.take();
-        mounted.map(|_| ())
+        mounted.and(opted_out)
     }
 
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
@@ -2515,6 +2616,170 @@ pub(crate) fn detach_was_dissented(error: &ApfsError) -> bool {
             && request.args.first().is_some_and(|arg| arg == "detach")
             && output.status == ProcessStatus::Exit(libc::EBUSY))
             || (request.program == Path::new(UMOUNT) && output.status == ProcessStatus::Exit(1)))
+}
+
+fn mount_request(attachment: &AttachedImage, options: &str, mount_point: &Path) -> CommandRequest {
+    CommandRequest::new(
+        MOUNT_APFS,
+        [
+            OsString::from("-o"),
+            OsString::from(options),
+            OsString::from(&attachment.volume_device),
+            mount_point.as_os_str().to_owned(),
+        ],
+    )
+}
+
+/// fseventsd's directory at a volume's root: its persistent event log, or, holding an empty
+/// [`EVENT_LOG_OPT_OUT`], the volume's refusal of one.
+pub const EVENT_LOG_DIRECTORY: &str = ".fseventsd";
+/// The marker fseventsd reads when a volume mounts: present, it keeps no log of the volume and
+/// still delivers the volume's live events to every stream.
+pub const EVENT_LOG_OPT_OUT: &str = "no_log";
+
+/// Where a mounted volume stands with fseventsd's persistent event log.
+#[derive(Debug, Eq, PartialEq)]
+enum EventLog {
+    /// `.fseventsd` is a real directory holding an empty regular `no_log`: no log from the next
+    /// mount.
+    OptedOut,
+    /// `.fseventsd` is a directory this user may not search: a log a root fseventsd created
+    /// when the volume, or the one it was cloned from, mounted without the marker.
+    Inherited,
+    /// A symlink or file holds `.fseventsd`, or anything but an empty regular file holds the
+    /// marker's name. Nothing is written through it, and nothing is removed: it is reported.
+    Squatted,
+}
+
+/// [`EVENT_LOG_DIRECTORY`] and [`EVENT_LOG_OPT_OUT`] as the path components the fd-relative
+/// calls take.
+const EVENT_LOG_DIRECTORY_C: &std::ffi::CStr = c".fseventsd";
+const EVENT_LOG_OPT_OUT_C: &std::ffi::CStr = c"no_log";
+/// Opening a directory for lookups alone needs only search permission: root's 0700 refuses
+/// it, the 0711 a retirement leaves grants it. Linux names the same access `O_PATH`.
+#[cfg(target_vendor = "apple")]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(target_vendor = "apple"))]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+
+/// Open `name` under `directory` (or the absolute `name` itself) as a directory with `access`,
+/// never through a symlink.
+fn open_directory_at(
+    directory: Option<&File>,
+    name: &std::ffi::CStr,
+    access: libc::c_int,
+) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    let flags = access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and outlives the call; `directory`, when given, is an
+    // open directory fd. A non-negative answer is a new descriptor this File then owns.
+    let fd = unsafe {
+        match directory {
+            Some(directory) => libc::openat(directory.as_raw_fd(), name.as_ptr(), flags),
+            None => libc::open(name.as_ptr(), flags),
+        }
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The volume root at `mount_point`, opened without following a symlink.
+fn open_volume_root(mount_point: &Path) -> io::Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes())?;
+    open_directory_at(None, &path, libc::O_RDONLY)
+}
+
+/// Plant the opt-out marker under `mount_point` unless it is there, answering where the volume
+/// stands. Every step is relative to a descriptor opened without following a symlink, so a
+/// `.fseventsd` swapped for a symlink mid-way is refused, never written through.
+fn opt_out_of_event_log(mount_point: &Path) -> io::Result<EventLog> {
+    let root = open_volume_root(mount_point)?;
+    // SAFETY: `root` is an open directory fd and the name a NUL-terminated component.
+    if unsafe { libc::mkdirat(root.as_raw_fd(), EVENT_LOG_DIRECTORY_C.as_ptr(), 0o700) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    match open_directory_at(Some(&root), EVENT_LOG_DIRECTORY_C, SEARCH_ONLY) {
+        Ok(directory) => opt_out_in(&directory),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(EventLog::Inherited),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            Ok(EventLog::Squatted)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Plant the marker in the open `.fseventsd`, exclusively, unless an empty regular one is there.
+fn opt_out_in(directory: &File) -> io::Result<EventLog> {
+    let marker = EVENT_LOG_OPT_OUT_C;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `directory` is an open directory fd and `marker` a NUL-terminated component. A
+    // non-negative answer is a new descriptor, closed at once.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), marker.as_ptr(), flags, 0o644) };
+    if fd >= 0 {
+        // SAFETY: `fd` is the fresh descriptor just opened.
+        unsafe { libc::close(fd) };
+        return Ok(EventLog::OptedOut);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => Ok(EventLog::Inherited),
+        io::ErrorKind::AlreadyExists => {
+            // SAFETY: an all-zero `stat` is a valid buffer for `fstatat` to fill.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above; `AT_SYMLINK_NOFOLLOW` reports a symlink as itself.
+            let found = unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    marker.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if found != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(
+                if stat.st_mode & libc::S_IFMT == libc::S_IFREG && stat.st_size == 0 {
+                    EventLog::OptedOut
+                } else {
+                    EventLog::Squatted
+                },
+            )
+        }
+        _ => Err(error),
+    }
+}
+
+/// Opt root's log out under a mount that ignores ownership, where its directory is the user's
+/// to change. The log stays, records and all: the marker joins it, and the directory's mode
+/// becomes 0711, so under every later mount that honors ownership its owner can still look the
+/// marker up — root's 0700 would refuse the lookup, and each such mount would find the log
+/// inherited and retire it again — while its records stay unlisted. The marker goes first: only
+/// a log it opted out has its mode relaxed, so a squatted marker leaves root's 0700 as found.
+/// The marker and the mode go through one descriptor opened without following a symlink.
+fn retire_event_log(mount_point: &Path) -> io::Result<()> {
+    let root = open_volume_root(mount_point)?;
+    let directory = open_directory_at(Some(&root), EVENT_LOG_DIRECTORY_C, libc::O_RDONLY)?;
+    match opt_out_in(&directory)? {
+        EventLog::OptedOut => {}
+        state => {
+            return Err(io::Error::other(format!(
+                "the event log stayed {state:?} under a mount that ignores ownership"
+            )));
+        }
+    }
+    // SAFETY: `directory` is an open directory fd.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o711) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
