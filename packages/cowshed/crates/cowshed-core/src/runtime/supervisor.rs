@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -96,6 +96,49 @@ pub struct WorkspaceSupervisorConfig {
     /// gone ([`super::job_groups::take_lost`]): never signalled, carried in every ledger this
     /// supervisor writes until nothing holds their ids.
     pub inherited_groups: Vec<super::job_groups::UnresolvedGroup>,
+    /// What this supervisor names its checkout's volumes, and how; `None` names nothing.
+    pub volume_labels: Option<VolumeLabels>,
+}
+
+/// How a volume's label stood when its supervisor looked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Labelled {
+    /// Nothing is mounted at the path: the directory belongs to another volume, never renamed.
+    NotMounted,
+    /// The file system already reports the label.
+    Already,
+    /// Renamed to the label.
+    Renamed,
+}
+
+/// Names the volume mounted at a path: reads the file system's own name for it and renames it
+/// through the APFS host (Disk Arbitration) when it differs. Injected, so the supervisor names
+/// its checkout's volumes without owning the storage backend.
+pub trait VolumeLabeller: Send + Sync + 'static {
+    fn ensure_label(&self, mount: &Path, label: &str) -> std::io::Result<Labelled>;
+}
+
+/// The labels of one checkout's two volumes (16_build_volumes.md, "Substrate"): the workspace
+/// image's, and the build volume's it links. A clone carries its source's label, the blank
+/// template's `[cowshed]` or another checkout's, until its supervisor names it here: when the
+/// supervisor starts, and whenever a job is admitted on a build volume the checkout's link moved
+/// to (a land, a refork). Renaming queues on Disk Arbitration, measured at 10–28 s on a busy host,
+/// so it runs in the background and never on a command's path; the outcome goes to stderr.
+#[derive(Clone)]
+pub struct VolumeLabels {
+    pub workspace: String,
+    pub build: String,
+    pub labeller: Arc<dyn VolumeLabeller>,
+}
+
+impl std::fmt::Debug for VolumeLabels {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VolumeLabels")
+            .field("workspace", &self.workspace)
+            .field("build", &self.build)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkspaceSupervisorConfig {
@@ -170,6 +213,7 @@ impl Default for WorkspaceSupervisorConfig {
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: None,
             inherited_groups: Vec::new(),
+            volume_labels: None,
         }
     }
 }
@@ -2203,6 +2247,19 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Name the build volume mounted at `build_volume` for this checkout, in the background
+    /// ([`VolumeLabels`]): a land or a refork moved the checkout's link onto it, and it carries
+    /// the label of the checkout that built it until this runs. Answered once the rename is
+    /// queued, never after it.
+    pub async fn name_build_volume(&self, build_volume: Option<PathBuf>) -> Result<()> {
+        self.call(|reply| Command::NameBuildVolume {
+            authority: self.authority.clone(),
+            build_volume,
+            reply,
+        })
+        .await
+    }
+
     async fn call<T>(&self, make: impl FnOnce(oneshot::Sender<Result<T>>) -> Command) -> Result<T> {
         let (reply, receive) = oneshot::channel();
         self.commands.send(make(reply)).await.map_err(|_| {
@@ -2285,12 +2342,13 @@ impl WorkspaceSupervisor {
         };
         let nx_daemon =
             NxDaemonKeeper::for_role(WorkspaceRole::for_name(&config.authority.workspace));
-        let actor = SupervisorActor {
+        let mut actor = SupervisorActor {
             authority: config.authority,
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             policy,
             build_volume_layout: config.build_volume_layout,
+            volume_labels: config.volume_labels,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger,
             inherited_groups: config.inherited_groups,
@@ -2311,7 +2369,11 @@ impl WorkspaceSupervisor {
             retire_waiters: Vec::new(),
             command_lane_closed: false,
             nx_daemon,
+            labelled_build: None,
         };
+        // Whatever the checkout's volumes were cloned from, they are named for it from here.
+        let build = actor.policy.ceiling().build_volume_mount.clone();
+        actor.relabel(true, build.as_deref());
         tokio::spawn(actor.run());
         Ok(handle)
     }
@@ -2402,6 +2464,11 @@ pub(super) enum Command {
     },
     Retire {
         authority: WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    NameBuildVolume {
+        authority: WorkspaceAuthoritySnapshot,
+        build_volume: Option<PathBuf>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// The authority the actor holds now; unfenced, because it is how a caller learns it.
@@ -2505,6 +2572,10 @@ struct JobStateRecord {
     kill_waiters: Vec<oneshot::Sender<Result<()>>>,
     log_waiters: Vec<PendingLog>,
     session_identity: Option<u64>,
+    /// The job's claim on the build volume it was admitted with, from admission until the job
+    /// ends: while it lives, no release unmounts that volume, whatever moved the checkout's link
+    /// meanwhile (16_build_volumes.md, "Process lifetime across a swap").
+    build_hold: Option<crate::build_volume::BuildVolumeHold>,
 }
 
 impl JobStateRecord {
@@ -2564,6 +2635,8 @@ struct SupervisorActor {
     /// The sandbox of the authority served, rendered once when it was taken.
     policy: SandboxPolicy,
     build_volume_layout: Option<crate::build_volume::BuildVolumeLayout>,
+    /// See [`WorkspaceSupervisorConfig::volume_labels`].
+    volume_labels: Option<VolumeLabels>,
     /// Names withheld from every child; see [`WorkspaceSupervisorConfig::credential_env_names`].
     credential_env_names: BTreeSet<String>,
     term_grace: Duration,
@@ -2584,6 +2657,8 @@ struct SupervisorActor {
     command_lane_closed: bool,
     /// A shed's keeper of its sandboxed Nx daemon ([`super::nx_daemon`]); main keeps none.
     nx_daemon: Option<NxDaemonKeeper>,
+    /// The build volume this supervisor last asked to be named for its checkout.
+    labelled_build: Option<PathBuf>,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -2802,6 +2877,17 @@ impl SupervisorActor {
                     self.quiesce_waiters.push(reply);
                 }
             }
+            Command::NameBuildVolume {
+                authority,
+                build_volume,
+                reply,
+            } => {
+                let named = self.validate_authority(&authority);
+                if named.is_ok() {
+                    self.relabel(false, build_volume.as_deref());
+                }
+                let _ = reply.send(named);
+            }
             Command::Retire { authority, reply } => {
                 if let Err(error) = self.validate_authority(&authority) {
                     let _ = reply.send(Err(error));
@@ -3017,6 +3103,60 @@ impl SupervisorActor {
         Ok(())
     }
 
+    /// Name the checkout's volumes in the background (see [`VolumeLabels`]): its workspace
+    /// volume when `workspace`, and the build volume mounted at `build` unless this supervisor
+    /// already named that one. A Disk Arbitration rename is queued only when the file system's
+    /// own name differs; the outcome goes to stderr.
+    fn relabel(&mut self, workspace: bool, build: Option<&Path>) {
+        let Some(labels) = &self.volume_labels else {
+            return;
+        };
+        let mut volumes = Vec::new();
+        if workspace {
+            volumes.push((
+                "volume",
+                self.workspace_root.clone(),
+                labels.workspace.clone(),
+            ));
+        }
+        if let Some(build) = build
+            && self.labelled_build.as_deref() != Some(build)
+        {
+            self.labelled_build = Some(build.to_owned());
+            volumes.push(("build volume", build.to_owned(), labels.build.clone()));
+        }
+        if volumes.is_empty() {
+            return;
+        }
+        let labeller = Arc::clone(&labels.labeller);
+        let name = self.authority.workspace.clone();
+        let checkout = self.workspace_root.clone();
+        drop(tokio::task::spawn_blocking(move || {
+            for (what, mount, label) in volumes {
+                // A land may have moved the link off this build volume since the rename was
+                // asked for; the volume is then another checkout's to name, never this one's.
+                if what == "build volume"
+                    && !matches!(crate::build_volume::link::linked(&checkout), Ok(Some(linked)) if linked == mount)
+                {
+                    continue;
+                }
+                let started = Instant::now();
+                match labeller.ensure_label(&mount, &label) {
+                    Ok(Labelled::Renamed) => eprintln!(
+                        "cowshed: named workspace {name}'s {what} {label:?} in {:?}",
+                        started.elapsed()
+                    ),
+                    Ok(Labelled::Already | Labelled::NotMounted) => {}
+                    Err(error) => eprintln!(
+                        "cowshed: could not name workspace {name}'s {what} at {} {label:?} after {:?}: {error}",
+                        mount.display(),
+                        started.elapsed()
+                    ),
+                }
+            }
+        }));
+    }
+
     /// Admit and spawn one job, granted `build_volume`.
     async fn admit_exec(
         &mut self,
@@ -3041,6 +3181,10 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
+        let build_hold = self.hold_build_volume(build_volume.as_deref())?;
+        // A volume the link moved to (a land, a refork) was another checkout's: it takes this
+        // checkout's name, once.
+        self.relabel(false, build_volume.as_deref());
         // The checkout's build volume moved (a land adopted another, a mount re-pointed a stale
         // link): this job and every later one, the Nx daemon keeper's included, run with the
         // volume the controller resolved. A running job keeps the profile it was spawned with,
@@ -3231,6 +3375,7 @@ impl SupervisorActor {
             kill_waiters: Vec::new(),
             log_waiters: Vec::new(),
             session_identity,
+            build_hold,
         };
         match spawn {
             Ok(process) => {
@@ -3268,6 +3413,58 @@ impl SupervisorActor {
                 self.finalize_job(job_id, Some(JobState::Failed)).await;
                 Err(error)
             }
+        }
+    }
+
+    /// Hold the build volume mounted at `grant` for one job (16_build_volumes.md, "Garbage
+    /// collection"): a land that moves the checkout's link meanwhile leaves the volume unlinked,
+    /// and the hold is what tells its release that this job still runs there. Refused while a
+    /// release claims the volume, since the job would start on a volume being deleted.
+    fn hold_build_volume(
+        &self,
+        grant: Option<&Path>,
+    ) -> Result<Option<crate::build_volume::BuildVolumeHold>> {
+        let Some(grant) = grant else {
+            return Ok(None);
+        };
+        let Some(layout) = &self.build_volume_layout else {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the supervisor of {} was handed build volume {} but has no controller-owned \
+                     build-volume layout to hold it by",
+                    self.authority.workspace,
+                    grant.display()
+                ),
+                "restart this workspace's supervisor with the current cowshed",
+            ));
+        };
+        let id = layout.volume_at(grant).ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "build volume grant {} is not one of this project's build volumes",
+                    grant.display()
+                ),
+                "cowshed doctor --json",
+            )
+        })?;
+        match layout.hold(&id) {
+            Ok(hold) => Ok(Some(hold)),
+            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                Err(CowshedError::conflict(
+                    format!(
+                        "{}'s job cannot start on build volume {id}: {error}",
+                        self.authority.workspace
+                    ),
+                    "retry: the next admission resolves the checkout's current build volume",
+                ))
+            }
+            Err(error) => Err(CowshedError::environment_missing(
+                format!(
+                    "cannot hold build volume {id} at {}: {error}",
+                    layout.hold_path(&id).display()
+                ),
+                "check the cowshed store's permissions and retry",
+            )),
         }
     }
 
@@ -3908,6 +4105,8 @@ impl SupervisorActor {
         job.conclusion = Some(conclusion);
         // The job concluded: nothing signals its group any more, and its leader is reaped.
         job.process = None;
+        // Nor does it run on its build volume any more: a release may take it.
+        job.build_hold = None;
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
@@ -5448,6 +5647,7 @@ mod lifecycle_commitment_tests {
             shell_pool: defaults.shell_pool,
             group_ledger: None,
             inherited_groups: Vec::new(),
+            volume_labels: None,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

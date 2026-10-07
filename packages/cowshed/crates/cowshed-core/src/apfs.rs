@@ -830,6 +830,14 @@ pub enum DetachIntent {
     WhenIdle,
 }
 
+/// How a `Release` unmount went: through at once or within the grace, or forced once the grace
+/// ran out past whatever still held the volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unmounted {
+    Unforced,
+    Forced,
+}
+
 #[derive(Debug)]
 pub struct AttachedImage {
     image: PathBuf,
@@ -1444,6 +1452,23 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         attachment: &AttachedImage,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
+        self.unmount_reporting(attachment, intent).map(|_| ())
+    }
+
+    /// [`Self::unmount_verified`] with `Release`, answering whether the grace ran out and the
+    /// unmount was forced past whatever still held the volume.
+    pub(crate) fn unmount_within_grace(
+        &self,
+        attachment: &AttachedImage,
+    ) -> Result<Unmounted, ApfsError> {
+        self.unmount_reporting(attachment, DetachIntent::Release)
+    }
+
+    fn unmount_reporting(
+        &self,
+        attachment: &AttachedImage,
+        intent: DetachIntent,
+    ) -> Result<Unmounted, ApfsError> {
         let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
         self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
@@ -1470,7 +1495,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 self.run_checked(operation, CommandRequest::new(UMOUNT, args))
             });
             match result {
-                Ok(_) => return Ok(()),
+                Ok(_) if force => return Ok(Unmounted::Forced),
+                Ok(_) => return Ok(Unmounted::Unforced),
                 Err(error) if !force && detach_was_dissented(&error) => {
                     if intent == DetachIntent::WhenIdle {
                         return Err(error);

@@ -27,7 +27,9 @@ use crate::build_volume::{
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
-use crate::storage::apfs::native::{BuildVolumeRelease, MacOsApfsExecutionHost};
+use crate::storage::apfs::native::{
+    BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
+};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 
@@ -428,10 +430,7 @@ impl BuildVolumes {
             })
             .await;
         match released {
-            Ok(BuildVolumeRelease::Deleted) => {}
-            Ok(BuildVolumeRelease::Busy(diagnostic)) => eprintln!(
-                "cowshed: build volume {live} of a fork that never staged stays: still in use: {diagnostic}; `cowshed gc` retries it"
-            ),
+            Ok(release) => say_release(&live, "a fork that never staged", &release),
             Err(error) => eprintln!(
                 "cowshed: build volume {live} of a fork that never staged stays: {error}; `cowshed gc` retries it"
             ),
@@ -709,8 +708,9 @@ impl BuildVolumes {
             }
             nx::discard_daemon_records(&quiet.mount, &quiet.state)
                 .map_err(|error| io("discard the landing daemon record", &quiet.mount, &error))?;
-            nx::hand_over_daemon_records(&previous.mount, &previous.state, &quiet.mount)
-                .map_err(|error| io("hand over the target's daemon record", &quiet.mount, &error))?;
+            nx::hand_over_daemon_records(&previous.mount, &previous.state, &quiet.mount).map_err(
+                |error| io("hand over the target's daemon record", &quiet.mount, &error),
+            )?;
             link::point(&target_checkout, &quiet.mount)?;
             // Every Nx process waiting to open now resolves the link to the adopted volume. The
             // locks are files in the previous volume, so they go before it is released.
@@ -734,14 +734,12 @@ impl BuildVolumes {
                     ..layout.read_record(&previous)?
                 },
             )?;
-            // A process still on the previous volume keeps it; collection retries it.
-            if let BuildVolumeRelease::Busy(reason) =
-                host.release_build_volume(layout, &previous).map_err(storage)?
-            {
-                eprintln!(
-                    "cowshed: {target}'s previous build volume {previous} stays until it is idle ({reason}); `cowshed gc` reclaims it then"
-                );
-            }
+            // Nothing links the previous volume now, so it goes now: only a job admitted on it
+            // before the move keeps it, and the collection after that job ends reclaims it.
+            let release = host
+                .release_build_volume(layout, &previous)
+                .map_err(storage)?;
+            say_release(&previous, &format!("{target}'s previous"), &release);
             Ok(Ok(millis(elapsed)))
         })
         .await
@@ -827,9 +825,10 @@ impl BuildVolumes {
         .await
     }
 
-    /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms when the kernel
-    /// lets go of it. A volume the kernel refuses to detach is deferred to the next pass with
-    /// the kernel's words, beside what the plan itself deferred.
+    /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms. A volume a job
+    /// still holds, or whose release fails, is deferred to the next pass with the reason, beside
+    /// what the plan itself deferred; one release that fails never keeps the others. Every
+    /// process a forced unmount cut off is named on stderr.
     pub async fn collect(&self, links: Links, dry_run: bool) -> Result<Collection> {
         self.blocking(move |host, layout| {
             let plan = plan(layout, &links)?;
@@ -854,20 +853,46 @@ impl BuildVolumes {
                     reason,
                 });
                 if dry_run {
-                    collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
+                    // What the release would answer for a job's hold, asked without claiming.
+                    match layout.held(&id) {
+                        Ok(false) => {
+                            collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
+                        }
+                        Ok(true) => {
+                            collection.candidates.pop();
+                            collection.deferred.push(Deferred {
+                                path: image,
+                                deferral: Deferral::Held(Vec::new()),
+                            });
+                        }
+                        Err(error) => {
+                            collection.candidates.pop();
+                            collection.deferred.push(Deferred {
+                                path: image,
+                                deferral: Deferral::ReleaseFailed(format!(
+                                    "cannot tell whether a job holds it: {error}"
+                                )),
+                            });
+                        }
+                    }
                     continue;
                 }
-                match host.release_build_volume(layout, &id).map_err(storage)? {
-                    BuildVolumeRelease::Deleted => {
+                match host.release_build_volume(layout, &id) {
+                    Ok(release @ BuildVolumeRelease::Deleted { .. }) => {
+                        say_release(&id, "collected", &release);
                         collection.reclaimed += 1;
                         collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
                     }
-                    BuildVolumeRelease::Busy(diagnostic) => {
+                    Ok(BuildVolumeRelease::Held { open }) => {
                         collection.deferred.push(Deferred {
                             path: image,
-                            deferral: Deferral::Busy(diagnostic),
+                            deferral: Deferral::Held(open),
                         });
                     }
+                    Err(error) => collection.deferred.push(Deferred {
+                        path: image,
+                        deferral: Deferral::ReleaseFailed(error.to_string()),
+                    }),
                 }
             }
             Ok(collection)
@@ -879,8 +904,11 @@ impl BuildVolumes {
 /// Why collection leaves a build volume for a later pass instead of deleting it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Deferral {
-    /// The kernel refused a non-forced detach: something still uses the volume.
-    Busy(String),
+    /// A job admitted on the volume still runs and holds it; `0` names the processes that had
+    /// the volume open when the release looked.
+    Held(Vec<nx::Holder>),
+    /// Its release failed; the next pass tries again.
+    ReleaseFailed(String),
     /// Its record exists but cannot be read, so nothing proves it unreachable.
     RecordUnreadable(String),
     /// Its image's size cannot be read.
@@ -921,7 +949,15 @@ impl std::fmt::Display for Deferral {
             Ok(())
         };
         match self {
-            Self::Busy(diagnostic) => write!(formatter, "still in use: {diagnostic}"),
+            Self::Held(open) => {
+                formatter.write_str("a job admitted on it still runs")?;
+                if !open.is_empty() {
+                    formatter.write_str(", open in ")?;
+                    write_holders(formatter, open)?;
+                }
+                Ok(())
+            }
+            Self::ReleaseFailed(error) => write!(formatter, "its release failed: {error}"),
             Self::RecordUnreadable(error) => write!(formatter, "its record is unreadable: {error}"),
             Self::SizeUnreadable(error) => write!(formatter, "its size is unreadable: {error}"),
             Self::DetachedCheckout(checkout) => write!(
@@ -1094,8 +1130,8 @@ fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolume
     Ok(seeds)
 }
 
-/// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted, so
-/// nothing can hold it.
+/// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted and no
+/// job is admitted on one, so a hold on it is an integrity fault.
 fn retire_seeds(
     host: &Host,
     layout: &BuildVolumeLayout,
@@ -1103,17 +1139,83 @@ fn retire_seeds(
     previous: Vec<BuildVolumeId>,
 ) -> Result<()> {
     for old in previous {
-        if let BuildVolumeRelease::Busy(reason) =
-            host.release_build_volume(layout, &old).map_err(storage)?
-        {
-            return Err(CowshedError::integrity(
-                format!(
-                    "seed {old} of {} is attached and in use: {reason}",
-                    target.name
-                ),
-                "cowshed doctor --json",
-            ));
+        match host.release_build_volume(layout, &old).map_err(storage)? {
+            release @ BuildVolumeRelease::Deleted { .. } => {
+                say_release(
+                    &old,
+                    &format!("{}'s superseded seed", target.name),
+                    &release,
+                );
+            }
+            BuildVolumeRelease::Held { .. } => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "seed {old} of {} is held by a job, but no job is ever admitted on a seed",
+                        target.name
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+/// Say on stderr what a release did beyond deleting a volume nothing had open: each process its
+/// forced unmount cut off, pid and argv, so the holder is fixed where it lives (an indexer or an
+/// editor that keeps a checkout's build state open after its link moved), or that a job's hold
+/// keeps the volume until the job ends.
+fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
+    let outcome = |forced: bool| {
+        if forced {
+            "nothing of cowshed's owned it, so its unmount was forced once the grace ran out"
+        } else {
+            "it was let go within the grace"
+        }
+    };
+    match release {
+        BuildVolumeRelease::Deleted { refused: None } => {}
+        BuildVolumeRelease::Deleted {
+            refused: Some(BuildVolumeRefusal { open, forced }),
+        } if open.is_empty() => eprintln!(
+            "cowshed: {whose} build volume {id} was held only by processes this user cannot see; {}",
+            outcome(*forced)
+        ),
+        BuildVolumeRelease::Deleted {
+            refused: Some(BuildVolumeRefusal { open, forced }),
+        } => eprintln!(
+            "cowshed: {whose} build volume {id} was open in {} when its unforced unmount was refused; {}",
+            Holders(open),
+            outcome(*forced)
+        ),
+        BuildVolumeRelease::Held { open } if open.is_empty() => eprintln!(
+            "cowshed: {whose} build volume {id} stays while a job admitted on it runs; the next rm, land or gc after it ends reclaims it"
+        ),
+        BuildVolumeRelease::Held { open } => eprintln!(
+            "cowshed: {whose} build volume {id} stays while a job admitted on it runs (open in {}); the next rm, land or gc after it ends reclaims it",
+            Holders(open)
+        ),
+    }
+}
+
+/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
+struct Holders<'a>(&'a [nx::Holder]);
+
+impl std::fmt::Display for Holders<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_holders(formatter, self.0)
+    }
+}
+
+fn write_holders(
+    formatter: &mut std::fmt::Formatter<'_>,
+    holders: &[nx::Holder],
+) -> std::fmt::Result {
+    for (index, holder) in holders.iter().enumerate() {
+        if index > 0 {
+            formatter.write_str("; ")?;
+        }
+        write!(formatter, "{holder}")?;
     }
     Ok(())
 }
@@ -1876,9 +1978,10 @@ mod tests {
         );
 
         for id in layout.list().unwrap() {
-            assert_eq!(
-                host.release_build_volume(&layout, &id).unwrap(),
-                BuildVolumeRelease::Deleted
+            let release = host.release_build_volume(&layout, &id).unwrap();
+            assert!(
+                matches!(release, BuildVolumeRelease::Deleted { .. }),
+                "{release:?}"
             );
         }
     }
@@ -1938,9 +2041,10 @@ mod tests {
 
         fn release_all(&self) {
             for id in self.layout.list().unwrap() {
-                assert_eq!(
-                    self.host.release_build_volume(&self.layout, &id).unwrap(),
-                    BuildVolumeRelease::Deleted
+                let release = self.host.release_build_volume(&self.layout, &id).unwrap();
+                assert!(
+                    matches!(release, BuildVolumeRelease::Deleted { .. }),
+                    "{release:?}"
                 );
             }
         }

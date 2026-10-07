@@ -46,6 +46,9 @@ const IMAGES_DIRECTORY: &str = "build";
 const MOUNTS_DIRECTORY: &str = ".build";
 /// The record beside each image: `<id>.asif.json`.
 const RECORD_SUFFIX: &str = ".json";
+/// The lock beside each image that every job admitted on the volume holds shared for its whole
+/// run, and that a release takes exclusively: `<id>.asif.hold` ([`BuildVolumeHold`]).
+const HOLD_SUFFIX: &str = ".hold";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -520,6 +523,68 @@ impl BuildVolumeLayout {
         self.mounts.join(id.as_str())
     }
 
+    /// The lock file jobs hold `id` by ([`Self::hold`]); a release deletes it with the image.
+    pub fn hold_path(&self, id: &BuildVolumeId) -> PathBuf {
+        self.images
+            .join(format!("{id}.{IMAGE_EXTENSION}{HOLD_SUFFIX}"))
+    }
+
+    /// Hold `id` for one job admitted on it, for as long as the answer lives: while any hold
+    /// lives, no release unmounts the volume (16_build_volumes.md, "Garbage collection"). Refused
+    /// with [`io::ErrorKind::ResourceBusy`] while a release has claimed the volume, and once one
+    /// has deleted it: a release deletes the image before it lets go of its claim, so a hold
+    /// taken after that finds no image, and the hold file it made is removed again.
+    pub fn hold(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
+        let path = self.hold_path(id);
+        let file = open_hold(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) if self.image(id).exists() => Ok(BuildVolumeHold { _file: file }),
+            Ok(()) => {
+                drop(file);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("build volume {id} was released"),
+                ))
+            }
+            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("build volume {id} is being released"),
+            )),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Whether a job holds `id` now, asked without taking or creating anything: what a dry run
+    /// reports in place of a release.
+    pub fn held(&self, id: &BuildVolumeId) -> io::Result<bool> {
+        let file = match fs::File::open(self.hold_path(id)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(false),
+            Err(fs::TryLockError::WouldBlock) => Ok(true),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Claim `id` for its release: `None` while a job holds it. The claim keeps every new hold
+    /// out until it is dropped, which the release does once the image and its hold file are gone.
+    pub fn claim_release(&self, id: &BuildVolumeId) -> io::Result<Option<ReleaseClaim>> {
+        let file = open_hold(&self.hold_path(id))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(ReleaseClaim { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     /// The volume a build link's target names, or `None` when the target is not one of this
     /// project's build mountpoints.
     pub fn volume_at(&self, target: &Path) -> Option<BuildVolumeId> {
@@ -713,6 +778,30 @@ impl BuildVolumeLayout {
         seeds.sort_by(|left, right| left.1.created_at.cmp(&right.1.created_at));
         Ok(seeds.pop())
     }
+}
+
+/// One job's claim on the build volume it was admitted with ([`BuildVolumeLayout::hold`]): a
+/// shared lock that keeps every release from unmounting the volume until it is dropped, when the
+/// job ends. The kernel drops it with the process that held it, so a crashed supervisor leaves
+/// no stale claim.
+#[derive(Debug)]
+pub struct BuildVolumeHold {
+    _file: fs::File,
+}
+
+/// A release's exclusive claim on a build volume ([`BuildVolumeLayout::claim_release`]).
+#[derive(Debug)]
+pub struct ReleaseClaim {
+    _file: fs::File,
+}
+
+fn open_hold(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 fn unknown_version(path: &Path, version: u32) -> crate::CowshedError {

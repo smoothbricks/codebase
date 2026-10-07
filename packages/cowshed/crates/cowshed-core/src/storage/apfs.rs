@@ -3345,6 +3345,19 @@ pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
     )
 }
 
+/// The label of the build volume `checkout` links (16_build_volumes.md, "Substrate"): the
+/// checkout's own label with `build` before its name, so Disk Utility lists the two volumes of
+/// one checkout side by side and says which one holds the build state. Like [`volume_label`] it
+/// is never an authority: the checkout's link says which volume is its.
+pub fn build_volume_label(repo: &RepoId, checkout: &WorkspaceName) -> String {
+    format!(
+        "[cowshed] {} · {} — build {}",
+        repo.owner(),
+        repo.repo(),
+        checkout.as_str()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

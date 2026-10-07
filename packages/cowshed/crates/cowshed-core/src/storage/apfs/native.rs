@@ -61,7 +61,7 @@ mod build_volumes;
 pub use blank_template::{
     BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
 };
-pub use build_volumes::Release as BuildVolumeRelease;
+pub use build_volumes::{Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease};
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";

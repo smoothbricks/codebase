@@ -401,6 +401,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         shell_pool: Default::default(),
         group_ledger: None,
         inherited_groups: Vec::new(),
+        volume_labels: None,
     }
 }
 

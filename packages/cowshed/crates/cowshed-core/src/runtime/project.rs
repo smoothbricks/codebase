@@ -3535,6 +3535,35 @@ impl NativeProjectRuntimeHost {
         Ok(links)
     }
 
+    /// The build-volume collection `rm` and `land` run once a checkout let go of its volume
+    /// (16_build_volumes.md, "Garbage collection"): every volume no checkout links is reclaimed
+    /// now unless a job holds it, and every one left is said on stderr with the reason, the
+    /// routine ones (a detached or still-forming workspace's own) counted on one line, so a
+    /// volume that stays is never a silent skip.
+    async fn collect_build_volumes(&self) -> Result<()> {
+        let links = self.build_volume_links().await?;
+        let collection = self.build_volumes()?.collect(links, false).await?;
+        let mut routine = 0_usize;
+        for deferred in collection.deferred {
+            if deferred.deferral.is_routine() {
+                routine += 1;
+                continue;
+            }
+            eprintln!(
+                "cowshed: build volume {} stays: {}; `cowshed gc` retries it",
+                deferred.path.display(),
+                deferred.deferral
+            );
+        }
+        if routine > 0 {
+            eprintln!(
+                "cowshed: {routine} build volume{} of detached or still-forming workspaces stay until those attach or finish forming; `cowshed gc --dry-run` names them",
+                if routine == 1 { "" } else { "s" }
+            );
+        }
+        Ok(())
+    }
+
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
     /// target's Nx state and carry the target's cache entries into the landing volume, freeze
     /// the target's seed from that volume, move the target's build link onto it, and re-run the
@@ -3629,10 +3658,18 @@ impl NativeProjectRuntimeHost {
         {
             Err(reason) => Adoption::Skipped { reason },
             Ok(elapsed_ms) => {
+                // Each moved link's volume carries the label of the checkout that built it: the
+                // target's supervisor names the adopted one now, in the background, and a kept
+                // workspace's supervisor, started on its fresh clone, names that one as it starts.
+                let target = self.ensure_supervisor(&into.name).await?;
+                target
+                    .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
+                    .await?;
                 if !retire {
                     volumes
                         .refork(owner, workspace.clone(), landing.to_owned())
                         .await?;
+                    self.ensure_supervisor(workspace).await?;
                 }
                 let check = timed_async(
                     "land",
@@ -5105,17 +5142,9 @@ impl NativeProjectRuntimeHost {
             };
             self.finish_retirement(current).await?;
             // The workspace's build volume and seed retire with it, unless a target adopted the
-            // volume (16_build_volumes.md, "Garbage collection"); a busy one waits for `gc`.
-            let links = self.build_volume_links().await?;
-            for deferred in self.build_volumes()?.collect(links, false).await?.deferred {
-                if !deferred.deferral.is_routine() {
-                    eprintln!(
-                        "cowshed: build volume {} stays: {}; `cowshed gc` retries it",
-                        deferred.path.display(),
-                        deferred.deferral
-                    );
-                }
-            }
+            // volume (16_build_volumes.md, "Garbage collection"), and with them whatever else no
+            // checkout links.
+            self.collect_build_volumes().await?;
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -5752,6 +5781,11 @@ impl NativeProjectRuntimeHost {
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
             // Filled from the lost predecessor's ledger once this process holds the socket.
             inherited_groups: Vec::new(),
+            volume_labels: Some(super::supervisor::VolumeLabels {
+                workspace: crate::storage::apfs::volume_label(&self.descriptor.repo_id, name),
+                build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
+                labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
+            }),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this
@@ -6095,7 +6129,6 @@ impl NativeProjectRuntimeHost {
             ));
         }
         self.supervisors.remove(&name);
-        self.relabel_off_the_path(&name)?;
         let mut idle_since: Option<tokio::time::Instant> = None;
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));
         let ended = loop {
@@ -6136,44 +6169,6 @@ impl NativeProjectRuntimeHost {
         };
         self.forget_served(&name).await?;
         ended
-    }
-
-    /// Name the workspace's volume after the workspace, off every command's path.
-    ///
-    /// A clone inherits its source's volume label. The label is human-facing only — Finder shows
-    /// it in place of the mount directory's name, and nothing parses it — while relabelling is a
-    /// Disk Arbitration round trip, which serializes every client on the host and was measured
-    /// at 10–28 s on a busy one. So provisioning leaves it, and the supervisor, once it serves,
-    /// relabels in the background when the file system's own name for the volume is not already
-    /// the workspace's. The outcome goes to this process's stderr, the daemon log.
-    fn relabel_off_the_path(&self, name: &WorkspaceName) -> Result<()> {
-        use crate::storage::apfs::ApfsExecutionHost;
-        let mount = self.workspace_mount_path(name)?;
-        let label = crate::storage::apfs::volume_label(&self.descriptor.repo_id, name);
-        let host = self.substrate.shared_host();
-        let name = name.clone();
-        drop(tokio::task::spawn_blocking(move || {
-            match crate::apfs::volume_name(&mount) {
-                Ok(current) if current == label.as_str() => return,
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("cowshed: cannot read workspace {name}'s volume label: {error}");
-                    return;
-                }
-            }
-            let started = std::time::Instant::now();
-            match host.rename_volume(&mount, &label) {
-                Ok(()) => eprintln!(
-                    "cowshed: relabelled workspace {name}'s volume in {:?}",
-                    started.elapsed()
-                ),
-                Err(error) => eprintln!(
-                    "cowshed: could not relabel workspace {name}'s volume after {:?}: {error}",
-                    started.elapsed()
-                ),
-            }
-        }));
-        Ok(())
     }
 
     /// Serve the served supervisor of `name` under the workspace's grants as they are now.
@@ -9870,6 +9865,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         kept.hint,
                     )
                 })?;
+        } else {
+            // Retiring collects; a land that keeps the workspace collects here, so the target's
+            // previous volume and whatever else no checkout links goes with every land.
+            self.collect_build_volumes().await.map_err(|failed| {
+                CowshedError::new(
+                    failed.code,
+                    format!(
+                        "landed {source_head} on {target_branch}, but its build volumes were not collected: {}",
+                        failed.message
+                    ),
+                    failed.hint,
+                )
+            })?;
         }
         Ok(LandReport {
             landed_head: source_head,
@@ -14507,6 +14515,53 @@ async fn close_checkout_nx(
             "cowshed doctor --json",
         )
     })
+}
+
+/// Whether a file system is mounted exactly at `path`: its device differs from its parent's.
+/// A path nothing is mounted at is a directory of the volume that holds it.
+#[cfg(target_os = "macos")]
+fn is_mount_point(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = path.parent() else {
+        return Ok(true);
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.dev() != std::fs::metadata(parent)?.dev()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Names a mounted volume through the APFS host's Disk Arbitration rename, after reading the
+/// file system's own name for it so a name already right costs no round trip.
+#[cfg(target_os = "macos")]
+struct ApfsLabeller(
+    std::sync::Arc<
+        crate::storage::apfs::native::MacOsApfsExecutionHost<crate::apfs::SystemCommandRunner>,
+    >,
+);
+
+#[cfg(target_os = "macos")]
+impl super::supervisor::VolumeLabeller for ApfsLabeller {
+    fn ensure_label(
+        &self,
+        mount: &Path,
+        label: &str,
+    ) -> std::io::Result<super::supervisor::Labelled> {
+        use super::supervisor::Labelled;
+        use crate::storage::apfs::ApfsExecutionHost;
+        // A path nothing is mounted at names the volume that holds the directory: never renamed.
+        if !is_mount_point(mount)? {
+            return Ok(Labelled::NotMounted);
+        }
+        if crate::apfs::volume_name(mount)? == label {
+            return Ok(Labelled::Already);
+        }
+        self.0
+            .rename_volume(mount, label)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Labelled::Renamed)
+    }
 }
 
 /// The kernel refused to unmount `workspace` at `mount` because something holds it: name every

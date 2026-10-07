@@ -423,9 +423,13 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
         fs::read_to_string(checkout.join("source.rs")).unwrap(),
         "source stays"
     );
-    assert_eq!(
-        host.release_build_volume(&layout, &id).unwrap(),
-        crate::storage::apfs::native::BuildVolumeRelease::Deleted
+    let release = host.release_build_volume(&layout, &id).unwrap();
+    assert!(
+        matches!(
+            release,
+            crate::storage::apfs::native::BuildVolumeRelease::Deleted { .. }
+        ),
+        "{release:?}"
     );
 }
 

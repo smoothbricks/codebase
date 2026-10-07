@@ -308,6 +308,11 @@ enum Call {
         fail_if_busy: bool,
     },
     Retire,
+    /// Name the build volume a land or refork moved the checkout's link onto.
+    #[serde(rename_all = "camelCase")]
+    NameBuildVolume {
+        build_volume: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -1131,6 +1136,10 @@ async fn answer(
             supervisor.retire().await?;
             (unit()?, Bytes::new())
         }
+        Call::NameBuildVolume { build_volume } => {
+            supervisor.name_build_volume(build_volume).await?;
+            (unit()?, Bytes::new())
+        }
     })
 }
 
@@ -1616,6 +1625,21 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         }
         Command::Retire { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::Retire, Bytes::new()).await);
+        }
+        Command::NameBuildVolume {
+            authority,
+            build_volume,
+            reply,
+        } => {
+            let _ = reply.send(
+                call(
+                    path,
+                    &authority,
+                    Call::NameBuildVolume { build_volume },
+                    Bytes::new(),
+                )
+                .await,
+            );
         }
         Command::CurrentAuthority { reply } => {
             let _ = reply.send(hello(path).await.map(|hello| hello.authority));

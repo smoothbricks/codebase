@@ -21,10 +21,13 @@ use crate::storage::verify_no_symlinks;
 /// a repository owner (`is_reserved_store_namespace`).
 const BLANK_TEMPLATE_DIRECTORY: &str = ".blank";
 
-/// The label every template's volume carries, and so every image minted from one until its
-/// workspace's supervisor relabels it (`relabel_off_the_path`): labels are human-facing only, and
-/// a relabel queues on Disk Arbitration (01_storage.md, "Ownership, identity, and the volume
-/// label").
+/// The label every template's volume carries, and so every image minted from one until the
+/// supervisor of the checkout it serves names it (`VolumeLabels` in the runtime's supervisor):
+/// after its workspace, a build volume after the checkout that links it. Relabelling queues on
+/// Disk Arbitration, so it runs off every provisioning path, but it always runs: Disk Utility
+/// shows every attached volume, and one named only this says nothing about what it is
+/// (01_storage.md, "Ownership, identity, and the volume label"; 16_build_volumes.md,
+/// "Substrate").
 pub const BLANK_TEMPLATE_LABEL: &str = "[cowshed]";
 
 /// `<store>/.blank/<bytes>-<uid>-<gid>.asif`: the template a mint at `capacity` clones for the

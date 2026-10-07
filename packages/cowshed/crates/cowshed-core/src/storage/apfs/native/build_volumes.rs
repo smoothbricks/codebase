@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
 use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
+use crate::build_volume::nx::Holder;
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord};
 use crate::metadata::ImageCapacity;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
@@ -19,11 +20,24 @@ use crate::storage::lifecycle::ResizeOutcome;
 /// What releasing a build volume did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Release {
-    /// Detached, its image, record and mountpoint deleted.
-    Deleted,
-    /// The image driver refused a non-forced detach: a process has a file or its working
-    /// directory in the volume. Nothing was changed; the next collection tries again.
-    Busy(String),
+    /// Detached, its image, record, hold and mountpoint deleted; `refused` is the unforced
+    /// unmount's refusal, when there was one.
+    Deleted { refused: Option<Refusal> },
+    /// A job admitted on the volume still runs, so its hold keeps the volume; nothing was
+    /// changed. `open` names the processes that have the volume open now.
+    Held { open: Vec<Holder> },
+}
+
+/// The kernel refused a build volume's unforced unmount: something nobody in cowshed owns had
+/// it open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Refusal {
+    /// Each process that had the volume open when the unmount was refused, as the kernel
+    /// answers for this user's processes: empty when only processes this user cannot see held
+    /// it (`mds`, `fseventsd`).
+    pub open: Vec<Holder>,
+    /// The grace ran out and the unmount was forced past them; otherwise they let go in time.
+    pub forced: bool,
 }
 
 impl<R> MacOsApfsExecutionHost<R>
@@ -34,8 +48,9 @@ where
     /// `clonefile` of the store's blank template and one attach (01_storage.md, "Images"). The
     /// caller writes the record last, once the volume holds what it should (a migration's copied
     /// build state); until then the volume is an interrupted creation, which collection deletes
-    /// unless a live build link names it. The volume keeps the template's label: a label is
-    /// human-facing only, and a build volume is mounted `nobrowse`.
+    /// unless a live build link names it. The clone carries the template's label until the
+    /// checkout's supervisor names it after the checkout (16_build_volumes.md, "Substrate"):
+    /// relabelling queues on Disk Arbitration, so it never runs on a provisioning path.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -187,10 +202,12 @@ where
             .map(|mounted| mounted.source_device))
     }
 
-    /// Unmount and detach build volume `id` without force, then delete its image, record and
-    /// mountpoint. The kernel's refusal is the only judge of whether the volume is in use
-    /// (16_build_volumes.md, "Garbage collection"): it is reported as [`Release::Busy`] and
-    /// nothing is touched.
+    /// Unmount and detach build volume `id`, then delete its image, record, hold and mountpoint
+    /// (16_build_volumes.md, "Garbage collection"). Only cowshed's own claims keep a volume: a job
+    /// admitted on it holds it ([`BuildVolumeLayout::hold`]), which answers [`Release::Held`] and
+    /// touches nothing. Anything else that has it open does not own it: when the kernel refuses
+    /// the unforced unmount, the holders are named, given the detach grace to let go, and then
+    /// forced, so a volume no checkout links never outlives the operation that unlinked it.
     pub fn release_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -198,6 +215,19 @@ where
     ) -> Result<Release, ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
+        let mount = layout.mount(id);
+        let hold = layout.hold_path(id);
+        let Some(_claim) = layout
+            .claim_release(id)
+            .map_err(|error| io_error("claim a build volume for release", &hold, error))?
+        else {
+            let open = match self.mounted_at(&mount)? {
+                Some(_) => holders_of(&mount)?,
+                None => Vec::new(),
+            };
+            return Ok(Release::Held { open });
+        };
+        let mut refused = None;
         // A minted volume is formatted before anything attaches it, so an attachment of a build
         // image is an APFS one; anything else is refused, not released.
         if image.exists()
@@ -207,21 +237,29 @@ where
                 .mount_source
                 .mounts()?
                 .into_iter()
-                .any(|mount| mount.source_device == attachment.volume_device());
-            if mounted
-                && let Err(error) = self
+                .any(|mounted| mounted.source_device == attachment.volume_device());
+            if mounted {
+                match self
                     .backend
                     .unmount_verified(&attachment, DetachIntent::WhenIdle)
-            {
-                return busy_or(error);
+                {
+                    Ok(()) => {}
+                    Err(error) if crate::apfs::detach_was_dissented(&error) => {
+                        let open = holders_of(&mount)?;
+                        let unmounted = self.backend.unmount_within_grace(&attachment)?;
+                        refused = Some(Refusal {
+                            open,
+                            forced: unmounted == crate::apfs::Unmounted::Forced,
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
-            if let Err(error) = self.backend.detach(&attachment, DetachIntent::WhenIdle) {
-                return busy_or(error);
-            }
+            self.backend.detach(&attachment, DetachIntent::Release)?;
         }
         self.backend.delete_image(&image)?;
         remove_if_present(&layout.record(id))?;
-        let mount = layout.mount(id);
+        remove_if_present(&hold)?;
         match fs::remove_dir(&mount) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -229,7 +267,7 @@ where
                 return Err(io_error("remove build volume mountpoint", &mount, error));
             }
         }
-        Ok(Release::Deleted)
+        Ok(Release::Deleted { refused })
     }
 
     /// The capacity build volume `id`'s image holds, attached or not.
@@ -296,13 +334,17 @@ where
     }
 }
 
-/// A detach the image driver dissented from is the kernel saying "in use"; any other failure is
-/// an error.
-fn busy_or(error: crate::apfs::ApfsError) -> Result<Release, ApfsStorageError> {
-    if crate::apfs::detach_was_dissented(&error) {
-        Ok(Release::Busy(error.to_string()))
-    } else {
-        Err(error.into())
+/// Every process that has the volume mounted at `mount` open, as the kernel answers for this
+/// user's processes; nothing when nothing is mounted there.
+fn holders_of(mount: &Path) -> Result<Vec<Holder>, ApfsStorageError> {
+    match crate::build_volume::nx::volume_holders(mount) {
+        Ok(holders) => Ok(holders),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(io_error(
+            "list the processes holding a build volume",
+            mount,
+            error,
+        )),
     }
 }
 
@@ -429,10 +471,11 @@ mod tests {
     }
 
     /// A build volume's clone holds every byte and every modification time of its source (rule
-    /// "Clones preserve mtimes"), in milliseconds; a volume with a file open refuses release and
-    /// keeps everything; an idle one is deleted with its record and mountpoint.
+    /// "Clones preserve mtimes"), in milliseconds; a volume a job holds refuses release and keeps
+    /// everything; one a process merely has a file open in is released past it, the process
+    /// named; an idle one is deleted with its record, hold and mountpoint.
     #[test]
-    fn real_apfs_build_volumes_clone_with_mtimes_and_release_only_when_idle() {
+    fn real_apfs_build_volumes_clone_with_mtimes_and_release_unless_a_job_holds_them() {
         let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");
         let (host, layout) = fixture(root.path());
         let source = BuildVolumeId::mint();
@@ -484,10 +527,17 @@ mod tests {
             linked("topic").role
         );
 
-        let held = fs::File::open(clone_mount.join("target/debug/deps/a.rlib")).unwrap();
+        let hold = layout.hold(&clone).expect("a job's hold");
+        let open = fs::File::open(clone_mount.join("target/debug/deps/a.rlib")).unwrap();
+        let me = i32::try_from(std::process::id()).unwrap();
         match host.release_build_volume(&layout, &clone).unwrap() {
-            Release::Busy(_) => {}
-            Release::Deleted => panic!("a volume with an open file was released"),
+            Release::Held { open } => assert!(
+                open.iter().any(|holder| holder.pid == me),
+                "the refusal names what has the volume open: {open:?}"
+            ),
+            released @ Release::Deleted { .. } => {
+                panic!("a volume a job holds was released: {released:?}")
+            }
         }
         assert!(layout.image(&clone).exists() && layout.record(&clone).exists());
         assert_eq!(
@@ -495,17 +545,32 @@ mod tests {
             before,
             "a refused release changes nothing"
         );
-        drop(held);
         assert_eq!(
-            host.release_build_volume(&layout, &clone).unwrap(),
-            Release::Deleted
+            layout.claim_release(&clone).unwrap().map(|_| ()),
+            None,
+            "the hold keeps every release out"
         );
+        drop(hold);
+        match host.release_build_volume(&layout, &clone).unwrap() {
+            Release::Deleted {
+                refused: Some(Refusal { open, forced }),
+            } => {
+                assert!(forced, "the file stayed open through the grace");
+                assert!(
+                    open.iter().any(|holder| holder.pid == me),
+                    "the refusal names the process the force cut off: {open:?}"
+                );
+            }
+            other => panic!("an open file refuses the unforced unmount: {other:?}"),
+        }
+        drop(open);
         assert!(!layout.image(&clone).exists());
         assert!(!layout.record(&clone).exists());
+        assert!(!layout.hold_path(&clone).exists());
         assert!(!layout.mount(&clone).exists());
         assert_eq!(
             host.release_build_volume(&layout, &source).unwrap(),
-            Release::Deleted
+            Release::Deleted { refused: None }
         );
         assert_eq!(layout.list().unwrap(), []);
     }
