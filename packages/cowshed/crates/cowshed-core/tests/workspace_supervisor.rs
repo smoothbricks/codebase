@@ -3843,7 +3843,9 @@ async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_seal
     end_group(&command);
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     remote.wait(job_id).await.unwrap();
+    let terminal = remote.resources(job_id).await.unwrap();
     let sealed = remote.sealed(job_id).await.unwrap().resources.unwrap();
+    assert_eq!(terminal, sealed, "resources and the sealed sample agree");
     let mut after = Vec::new();
     while let Some(sample) = progress.next().await {
         after.push(sample.unwrap());
