@@ -36,6 +36,8 @@ const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
 const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
+/// A writable directory on block storage ([`block_storage_directory`]).
+const STORAGE: &str = "COWSHED_JOB_CGROUP_STORAGE";
 
 /// CPU a placed process can spend outside its job: from its fork to its placement write, in the
 /// spawning library's child setup. Measured deficits are printed beside every comparison.
@@ -66,6 +68,13 @@ struct Workload {
     /// A file beside this binary to fill with this many MiB through the page cache, held until
     /// the workload ends and removed then.
     page_cache: Option<(PathBuf, u64)>,
+    /// A file beside this binary to write this many MiB to past the page cache (`O_DIRECT`),
+    /// flushed, then read this many MiB of it back the same way, and remove it.
+    direct_io: Option<(PathBuf, u64, u64)>,
+    /// A file the page cache already holds, read whole through it.
+    cached_read: Option<PathBuf>,
+    /// A file to allocate this many MiB to without writing it, held until the workload ends.
+    allocate_file: Option<(PathBuf, u64)>,
     /// Started one after another once the burns are done, each waited for.
     children: Vec<Workload>,
     /// Once every child was reaped, report [`HELD`] and wait for one byte on stdin.
@@ -104,10 +113,14 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
     let delegate = serde_json::to_string(&Role::Delegate { uid, gid }).expect("role");
     let mut assignment = OsString::from(format!("{ROLE}="));
     assignment.push(delegate);
+    // Chosen here, in the invoking user's own environment, which sudo does not pass on.
+    let mut storage = OsString::from(format!("{STORAGE}="));
+    storage.push(block_storage_directory());
     let output = Command::new(find_program("sudo"))
         .arg("-n")
         .arg(find_program("env"))
         .arg(assignment)
+        .arg(storage)
         .arg(find_program("systemd-run"))
         .args([
             "--scope",
@@ -201,6 +214,16 @@ fn work(workload: &Workload) {
     if let Some((path, mebibytes)) = &workload.page_cache {
         fill_page_cache(path, *mebibytes);
     }
+    if let Some((path, write, read)) = &workload.direct_io {
+        uncached_io(path, *write, *read);
+        std::fs::remove_file(path).expect("remove the direct I/O file");
+    }
+    if let Some(path) = &workload.cached_read {
+        read_through_cache(path);
+    }
+    if let Some((path, mebibytes)) = &workload.allocate_file {
+        allocate(path, *mebibytes);
+    }
     let children = workload
         .children
         .iter()
@@ -220,6 +243,9 @@ fn work(workload: &Workload) {
     }
     if let Some((path, _)) = &workload.page_cache {
         std::fs::remove_file(path).expect("remove the page cache file");
+    }
+    if let Some((path, _)) = &workload.allocate_file {
+        std::fs::remove_file(path).expect("remove the allocated file");
     }
     let report = WorkloadReport {
         pid: std::process::id(),
@@ -258,6 +284,7 @@ fn control() {
     late_migration_misses_initial_cpu(&jobs);
     burst_cpu_outlives_its_processes(&jobs);
     charged_memory_is_not_resident_memory(&jobs);
+    storage_io_outlives_its_processes(&jobs);
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
 
@@ -452,7 +479,7 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
     let job = jobs.admit(job_id(10)).expect("admit");
-    let file = beside_test_binary("page-cache");
+    let file = on_block_storage("page-cache");
     let mut running = Spawned::placed(
         &job,
         &Workload {
@@ -512,6 +539,106 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     );
 }
 
+/// Children that move bytes to and from storage past the page cache, then exit before anyone
+/// looks, leave their I/O in the job's `io.stat`: a census of live members finds none of it, a
+/// volume's allocation is no transfer, a read the cache served is none, and a concurrent job's
+/// writes stay its own.
+fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
+    const MIB: u64 = 1 << 20;
+    let job = jobs.admit(job_id(11)).expect("admit");
+    let neighbour_job = jobs.admit(job_id(12)).expect("admit");
+    let scratch = on_block_storage("probe");
+    println!(
+        "storage I/O scratch {} on filesystem type {:#x}",
+        scratch.display(),
+        filesystem_type(scratch.parent().expect("a directory")).expect("statfs")
+    );
+    // Cached by the controller, outside every job: the job's read of it is served from memory.
+    let cached = on_block_storage("cached");
+    fill_page_cache(&cached, 32);
+    std::fs::File::open(&cached)
+        .and_then(|file| file.sync_all())
+        .expect("flush the cached file");
+    read_through_cache(&cached);
+    let allocated = on_block_storage("allocated");
+    let children = (0..3)
+        .map(|index| Workload {
+            direct_io: Some((on_block_storage(&format!("direct-{index}")), 8, 4)),
+            ..Workload::default()
+        })
+        .collect();
+    let neighbour = Spawned::placed(
+        &neighbour_job,
+        &Workload {
+            direct_io: Some((on_block_storage("neighbour"), 16, 0)),
+            ..Workload::default()
+        },
+    );
+    let mut running = Spawned::placed(
+        &job,
+        &Workload {
+            cached_read: Some(cached.clone()),
+            allocate_file: Some((allocated.clone(), 64)),
+            children,
+            hold: true,
+            ..Workload::default()
+        },
+    );
+    running.await_marker(HELD);
+    neighbour.finish();
+    let io = job.storage_io().expect("the job's io.stat");
+    let raw = std::fs::read_to_string(job.path().join("io.stat")).expect("read io.stat");
+    let (raw_read, raw_written) = raw_io_stat_sum(&raw);
+    let live = live_members_storage_io_bytes(&job);
+    let allocated_bytes = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(&allocated)
+            .expect("allocated file")
+            .blocks()
+            * 512
+    };
+    let (read, written) = (io.read_bytes.get(), io.write_bytes.get());
+    println!(
+        "storage I/O: read {read} B, written {written} B; io.stat {raw:?} sums to read \
+         {raw_read} B, written {raw_written} B; live members {live} B; allocated {allocated_bytes} B"
+    );
+    assert!(
+        read <= raw_read && written <= raw_written,
+        "aggregation only ever leaves stacked devices out"
+    );
+    assert!(
+        written >= 24 * MIB && read >= 12 * MIB,
+        "three children wrote 8 MiB and read 4 MiB each past the cache: read {read} B, written \
+         {written} B"
+    );
+    assert!(
+        written < 24 * MIB + 8 * MIB,
+        "neither the neighbour's 16 MiB nor the 64 MiB allocation is this job's writing: \
+         {written} B"
+    );
+    assert!(
+        read < 12 * MIB + 8 * MIB,
+        "the 32 MiB the cache served is no storage read: {read} B"
+    );
+    assert!(
+        allocated_bytes >= 64 * MIB && allocated_bytes > written + 16 * MIB,
+        "a volume-allocation proxy would report {allocated_bytes} B for {written} B written"
+    );
+    assert!(
+        live + 16 * MIB < read + written,
+        "a live-members census misses the reaped children's I/O: live {live} B"
+    );
+    running.release();
+    running.finish();
+    let neighbour_io = neighbour_job.storage_io().expect("the neighbour's io.stat");
+    assert!(
+        neighbour_io.write_bytes.get() >= 16 * MIB,
+        "the neighbour's own writes are its own: {:?}",
+        neighbour_io
+    );
+    std::fs::remove_file(&cached).expect("remove the cached file");
+}
+
 fn retirement_waits_for_the_last_process(jobs: &IncarnationCgroups) {
     let job = jobs.admit(job_id(6)).expect("admit");
     let identity = job.identity().clone();
@@ -566,7 +693,7 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
         .collect();
     assert_eq!(
         outstanding,
-        [1, 2, 3, 4, 5, 7, 8, 9, 10],
+        [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12],
         "job 6 was retired"
     );
 
@@ -830,13 +957,229 @@ fn fill_page_cache(path: &Path, mebibytes: u64) {
     }
 }
 
-/// A scratch path beside this test binary: on the build's own storage, never a memory-backed
-/// temporary directory.
-fn beside_test_binary(name: &str) -> PathBuf {
-    test_binary()
-        .parent()
-        .expect("the test binary's directory")
+/// Filesystems whose file pages the memory controller charges to the cgroup that faults them in
+/// and whose writeback and direct I/O reach a block device as that cgroup's own bios, so
+/// `memory.current` and `io.stat` see them. ZFS is not one: its ARC is no page cache, and its
+/// own threads issue its I/O.
+const BLOCK_FILESYSTEMS: [(libc::c_long, &str); 3] = [
+    (0xEF53, "ext4"),
+    (0x5846_5342, "xfs"),
+    (0x9123_683E, "btrfs"),
+];
+
+/// A scratch path in the block-storage directory the harness chose.
+fn on_block_storage(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(STORAGE).expect("the harness's storage directory"))
         .join(format!("job-cgroup-{}-{name}", std::process::id()))
+}
+
+/// The first writable directory among the build's and the user's usual scratch places that lies
+/// on a [`BLOCK_FILESYSTEMS`] filesystem. None is a failure that lists what each candidate is and
+/// every mount, never a skipped scenario.
+fn block_storage_directory() -> PathBuf {
+    let mut candidates = vec![
+        test_binary()
+            .parent()
+            .expect("the test binary's directory")
+            .to_path_buf(),
+    ];
+    candidates.extend(
+        ["TMPDIR", "RUNNER_TEMP", "HOME"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from),
+    );
+    candidates.extend(["/var/tmp", "/tmp"].map(PathBuf::from));
+    let mut measured = Vec::new();
+    for candidate in candidates {
+        let f_type = filesystem_type(&candidate);
+        let writable = writable_directory(&candidate);
+        let block = f_type.as_ref().ok().and_then(|f_type| {
+            BLOCK_FILESYSTEMS
+                .iter()
+                .find(|(magic, _)| magic == f_type)
+                .map(|(_, name)| *name)
+        });
+        if let (Some(name), true) = (block, writable) {
+            println!("block storage: {} on {name}", candidate.display());
+            return candidate;
+        }
+        measured.push(format!(
+            "{}: f_type {f_type:x?}, writable {writable}",
+            candidate.display()
+        ));
+    }
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_else(|error| format!("unreadable: {error}"))
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let mount = before.split_whitespace().nth(4)?;
+            let mut after = after.split_whitespace();
+            Some(format!(
+                "{mount} {} {}",
+                after.next()?,
+                after.next().unwrap_or("")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    panic!(
+        "no writable scratch directory on ext4, xfs or btrfs:\n{}\nmounts:\n{mounts}",
+        measured.join("\n")
+    );
+}
+
+fn writable_directory(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path and plain flags.
+    unsafe { libc::access(name.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+/// Write `write` MiB to a new file at `path`, flushed to storage, then read `read` MiB of it
+/// back, every transfer past the page cache (`O_DIRECT`) from one page-aligned buffer.
+fn uncached_io(path: &Path, write: u64, read: u64) {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const CHUNK: usize = 1 << 20;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    let open = |flags: libc::c_int| -> OwnedFd {
+        // SAFETY: a NUL-terminated path and plain flags.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                flags | libc::O_DIRECT | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "open {}: {}", path.display(), last_error());
+        // SAFETY: a new descriptor this workload owns.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    // SAFETY: a fresh private anonymous mapping, page-aligned by construction.
+    let buffer = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            CHUNK,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(buffer, libc::MAP_FAILED, "mmap: {}", last_error());
+    // SAFETY: the whole writable mapping made above.
+    unsafe { std::ptr::write_bytes(buffer.cast::<u8>(), 0x5a, CHUNK) };
+    let file = open(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
+    for _ in 0..write {
+        // SAFETY: CHUNK readable bytes of the mapping.
+        let written = unsafe { libc::write(file.as_raw_fd(), buffer, CHUNK) };
+        assert_eq!(
+            usize::try_from(written).ok(),
+            Some(CHUNK),
+            "write: {}",
+            last_error()
+        );
+    }
+    // SAFETY: a live descriptor.
+    assert_eq!(
+        unsafe { libc::fsync(file.as_raw_fd()) },
+        0,
+        "fsync: {}",
+        last_error()
+    );
+    drop(file);
+    let file = open(libc::O_RDONLY);
+    for _ in 0..read {
+        // SAFETY: CHUNK writable bytes of the mapping.
+        let got = unsafe { libc::read(file.as_raw_fd(), buffer, CHUNK) };
+        assert_eq!(
+            usize::try_from(got).ok(),
+            Some(CHUNK),
+            "read: {}",
+            last_error()
+        );
+    }
+    // SAFETY: the whole mapping made above, unmapped once.
+    assert_eq!(unsafe { libc::munmap(buffer, CHUNK) }, 0, "munmap");
+}
+
+/// Read `path` whole through the page cache, into one reused buffer.
+fn read_through_cache(path: &Path) {
+    let mut file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let mut buffer = vec![0_u8; 1 << 20];
+    while file.read(&mut buffer).expect("read through the cache") > 0 {}
+}
+
+/// Give `path` `mebibytes` of storage without writing a byte of it.
+fn allocate(path: &Path, mebibytes: u64) {
+    use std::os::fd::AsRawFd as _;
+
+    let file = std::fs::File::create(path)
+        .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+    let length = libc::off_t::try_from(mebibytes << 20).expect("length");
+    // SAFETY: a live descriptor and plain integers.
+    let allocated = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
+    assert_eq!(allocated, 0, "posix_fallocate: errno {allocated}");
+}
+
+/// `statfs(2)`'s `f_type` of the filesystem holding `path`.
+fn filesystem_type(path: &Path) -> std::io::Result<libc::c_long> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: an all-zero statfs is a valid output buffer.
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a buffer of the right type.
+    if unsafe { libc::statfs(name.as_ptr(), &mut statfs) } != 0 {
+        return Err(last_error());
+    }
+    Ok(statfs.f_type)
+}
+
+/// Every device line's `rbytes` and `wbytes` of `io.stat`, summed without regard to stacking.
+fn raw_io_stat_sum(stat: &str) -> (u64, u64) {
+    let counter = |line: &str, name: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+    };
+    stat.lines()
+        .filter(|line| !line.trim().is_empty())
+        .fold((0, 0), |(read, written), line| {
+            (
+                read + counter(line, "rbytes"),
+                written + counter(line, "wbytes"),
+            )
+        })
+}
+
+/// What a census of the job's live members finds in their own `/proc/<pid>/io` storage counters.
+fn live_members_storage_io_bytes(job: &JobCgroup) -> u64 {
+    let procs = job.path().join("cgroup.procs");
+    std::fs::read_to_string(&procs)
+        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
+        .lines()
+        .filter_map(|pid| {
+            let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+            Some(
+                io.lines()
+                    .filter_map(|line| {
+                        let (key, value) = line.split_once(": ")?;
+                        matches!(key, "read_bytes" | "write_bytes")
+                            .then(|| value.parse::<u64>().expect("a count"))
+                    })
+                    .sum::<u64>(),
+            )
+        })
+        .sum()
 }
 
 /// Spend `millis` of this process's own CPU, as `getrusage` measures it.
