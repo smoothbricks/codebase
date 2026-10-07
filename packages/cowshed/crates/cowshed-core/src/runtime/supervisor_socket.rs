@@ -260,6 +260,8 @@ enum Call {
     #[serde(rename_all = "camelCase")]
     StdinWrite {
         job_id: JobId,
+        /// Where the request's raw frame starts in the job's input.
+        offset: u64,
     },
     #[serde(rename_all = "camelCase")]
     StdinClose {
@@ -404,6 +406,8 @@ enum StdinWire {
     Inline,
     /// The bytes follow as `StreamChunk` calls and end with `StreamEnd`.
     Stream,
+    /// Stdin stays open: `StdinWrite` calls feed it and `StdinClose` ends it.
+    Open,
     #[serde(rename_all = "camelCase")]
     WorkspaceFile {
         workspace_path: WorkspacePath,
@@ -1055,6 +1059,7 @@ async fn answer(
                     writer = Some(sender);
                     StdinSource::Stream(Box::pin(ChannelReader::new(receiver)))
                 }
+                StdinWire::Open => StdinSource::Open,
             };
             let exec = ExecRequest {
                 command,
@@ -1082,8 +1087,8 @@ async fn answer(
             }
             (to_value(&job_id)?, Bytes::new())
         }
-        Call::StdinWrite { job_id } => {
-            supervisor.stdin_write(job_id, payload).await?;
+        Call::StdinWrite { job_id, offset } => {
+            supervisor.stdin_write(job_id, offset, payload).await?;
             (unit()?, Bytes::new())
         }
         Call::StdinClose { job_id } => {
@@ -1564,10 +1569,12 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         Command::StdinWrite {
             authority,
             job_id,
+            offset,
             bytes,
             reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::StdinWrite { job_id }, bytes).await);
+            let call_request = Call::StdinWrite { job_id, offset };
+            let _ = reply.send(call(path, &authority, call_request, bytes).await);
         }
         Command::StdinClose {
             authority,
@@ -1783,6 +1790,7 @@ async fn forward_exec(
             None,
         ),
         StdinSource::Stream(reader) => (StdinWire::Stream, Bytes::new(), Some(reader)),
+        StdinSource::Open => (StdinWire::Open, Bytes::new(), None),
     };
     let (argv, script) = match request.command {
         ExecCommand::Argv(argv) => (Some(argv), None),

@@ -5194,12 +5194,14 @@ mod tests {
             CoreStdinSource::Stream(_) => "--stdin",
             CoreStdinSource::WorkspaceFile(_) => "--stdin-file",
             CoreStdinSource::Inline(_) => "--stdin-base64",
+            CoreStdinSource::Open => "(no CLI spelling: an attachment feeds open stdin)",
         }
     }
 
-    /// Every core variant is named, and every name it gives is a flag `exec` actually accepts.
+    /// Every core variant is named, and every flag it names is one `exec` actually accepts.
     ///
-    /// The match above is the compile-time seam; constructing all four is what makes it a test.
+    /// The match above is the compile-time seam; constructing every variant is what makes it a
+    /// test.
     /// Leaving `WorkspaceFile` out meant a wrong `--stdin-file` spelling could not go red, and
     /// asserting the string alone would still not prove the flag exists — so the second half
     /// parses each spelling and checks it selects the CLI source that maps back to that variant.
@@ -5222,6 +5224,10 @@ mod tests {
         assert_eq!(
             cli_stdin_spelling(&CoreStdinSource::Inline(bytes::Bytes::new())),
             "--stdin-base64"
+        );
+        assert_eq!(
+            cli_stdin_spelling(&CoreStdinSource::Open),
+            "(no CLI spelling: an attachment feeds open stdin)"
         );
 
         let parsed = |argv: &[&str]| {

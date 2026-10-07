@@ -73,6 +73,10 @@ enum Event {
         admission_key: Option<cowshed_core::api::AdmissionKey>,
     },
     JobByKey(WorkspaceName, cowshed_core::api::AdmissionKey),
+    OpenStdin,
+    /// A write's offset in the job's input, and its bytes.
+    StdinWrite(u64, Vec<u8>),
+    StdinClose,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -245,6 +249,9 @@ struct FakeHost {
     /// The supervisor serving each workspace whose jobs are real; a workspace without one runs
     /// none.
     supervisors: std::collections::BTreeMap<WorkspaceName, WorkspaceSupervisorHandle>,
+    /// When set, a stdin write is taken only once this is notified, as a job that has not yet
+    /// read its input holds the write that would overfill it.
+    stdin_gate: Option<Arc<Notify>>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
     /// Background reclaims `remove` started, for `settle_reclaims`.
@@ -292,6 +299,7 @@ impl FakeHost {
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
             supervisors: std::collections::BTreeMap::new(),
+            stdin_gate: None,
             create_gate: None,
             reclaims: Vec::new(),
             bundles: Vec::new(),
@@ -1254,6 +1262,9 @@ impl ProjectRuntimeHost for FakeHost {
                 admission_key: request.admission_key,
             })
             .ok();
+        if matches!(request.stdin, StdinSource::Open) {
+            self.events.send(Event::OpenStdin).ok();
+        }
         JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
     }
 
@@ -1262,10 +1273,19 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-        _bytes: Bytes,
-    ) -> Result<()> {
+        offset: u64,
+        bytes: Bytes,
+    ) -> Result<JobAnswer<()>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        let gate = self.stdin_gate.clone();
+        let events = self.events.clone();
+        Ok(Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            events.send(Event::StdinWrite(offset, bytes.to_vec())).ok();
+            Ok(())
+        }))
     }
 
     async fn stdin_close(
@@ -1273,9 +1293,10 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<()>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        self.events.send(Event::StdinClose).ok();
+        Ok(Box::pin(async { Ok(()) }))
     }
 
     async fn list_jobs(
@@ -3127,6 +3148,188 @@ async fn an_attachment_resumes_each_stream_at_its_cursor() {
     let (stdout, stderr) = tokio::join!(drain(stdout), drain(stderr));
     assert_eq!(stdout, b"new\n", "no stdout byte before the cursor arrives");
     assert_eq!(stderr, b"warning\n");
+}
+
+/// The wire's open stdin reaches the host as open stdin, with no producer bound to it, and an
+/// attachment's end of input is routed as its own call to the workspace's host.
+#[tokio::test]
+async fn the_controller_admits_open_stdin_and_routes_its_end() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    while events.try_recv().is_ok() {}
+    let exec = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "session": null,
+        "argv": [{"encoding": "utf8", "data": "cat"}],
+        "cwd": null,
+        "mode": "readWrite",
+        "env": {},
+        "trace": null,
+        "stdin": {"kind": "open"},
+        "stdoutCopy": null,
+        "stderrCopy": null
+    });
+    assert_eq!(
+        route(&router, coordinator(repo.clone()), "worker.exec", exec)
+            .await
+            .expect("open stdin is admitted"),
+        json!(1)
+    );
+    let job = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "jobId": 1
+    });
+    assert_eq!(
+        route(&router, coordinator(repo.clone()), "job.attachClose", job)
+            .await
+            .expect("the attachment's end of input is routed"),
+        json!({})
+    );
+    // The host acted before each route answered, so its events are already queued.
+    let mut stdin_events = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, Event::OpenStdin | Event::StdinClose) {
+            stdin_events.push(event);
+        }
+    }
+    assert_eq!(stdin_events, [Event::OpenStdin, Event::StdinClose]);
+}
+
+/// A stdin write lasts until the job takes it, which a job that stops reading may never do. The
+/// router therefore never holds it: while one write waits, the same job's status still answers,
+/// and the write answers once the job takes it.
+#[tokio::test]
+async fn a_pending_stdin_write_holds_no_other_call() {
+    let root = test_root();
+    let (events, mut observed) = mpsc::unbounded_channel();
+    let held = HeldJob::new(incarnation(1));
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.held_job = Some(Arc::clone(&held));
+    host.stdin_gate = Some(Arc::clone(&gate));
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    adopt(&router, &repo).await;
+    let job = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": held.incarnation,
+        "jobId": 1
+    });
+    let mut at = job.clone();
+    at["offset"] = json!(3);
+    let write = router.route(
+        coordinator(repo.clone()),
+        OperationRequest::decode("job.attachWrite", &at).expect("write request"),
+        Some(Bytes::from_static(b"line\n")),
+        None,
+    );
+    tokio::pin!(write);
+    let status = tokio::select! {
+        biased;
+        written = &mut write => panic!("the write answered before the job took it: {written:?}"),
+        status = tokio::time::timeout(
+            Duration::from_secs(5),
+            route(&router, coordinator(repo.clone()), "job.status", job.clone()),
+        ) => status,
+    };
+    let status = status
+        .expect("the status answers while the write is pending")
+        .expect("status");
+    assert_eq!(status["state"], json!("running"));
+
+    gate.notify_one();
+    write
+        .await
+        .expect("the write answers once the job takes it");
+    while let Some(event) = observed.recv().await {
+        if let Event::StdinWrite(offset, bytes) = event {
+            assert_eq!((offset, bytes.as_slice()), (3, &b"line\n"[..]));
+            return;
+        }
+    }
+    panic!("the host never took the write");
+}
+
+/// Over one client connection: a job admitted with open stdin is fed through its attachment, and
+/// its end of input is the attachment's own call — every `close` reaches the host, whose
+/// supervisor makes a repeat idempotent. Detaching the job's view asks the host for nothing
+/// that ends the job's input or the job.
+#[tokio::test]
+async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() {
+    let root = test_root();
+    let (events, mut observed) = mpsc::unbounded_channel();
+    let held = HeldJob::new(incarnation(1));
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.held_job = Some(Arc::clone(&held));
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    adopt(&router, &repo).await;
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let _connection = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator(repo.clone()),
+        router.clone(),
+    ));
+    let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+    let project = cowshed.open(root.join("checkout")).await.expect("open");
+    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+    let worker = coordinator.worker("main").await.expect("worker");
+    let job = worker
+        .exec(ExecRequest {
+            command: ExecCommand::Argv(vec![CommandArg::from("cat")]),
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Open,
+            stdout_copy: None,
+            stderr_copy: None,
+        })
+        .await
+        .expect("exec");
+    let (stdin, _stdout, _stderr) = job.attach().await.expect("attach").into_parts();
+    for line in [&b"line\n"[..], &b"more\n"[..]] {
+        stdin.write(Bytes::from_static(line)).await.expect("write");
+    }
+    stdin.close().await.expect("close");
+    stdin.close().await.expect("a repeated close");
+    job.detach().await.expect("detach");
+    assert_eq!(
+        job.status().await.expect("status").state,
+        JobState::Running,
+        "neither the end of input nor detaching ended the job"
+    );
+    held.end();
+    assert_eq!(job.wait().await.expect("wait").state, JobState::Exited);
+
+    let mut stdin_events = Vec::new();
+    while let Ok(event) = observed.try_recv() {
+        if matches!(
+            event,
+            Event::OpenStdin | Event::StdinWrite(..) | Event::StdinClose
+        ) {
+            stdin_events.push(event);
+        }
+    }
+    assert_eq!(
+        stdin_events,
+        [
+            Event::OpenStdin,
+            Event::StdinWrite(0, b"line\n".to_vec()),
+            Event::StdinWrite(5, b"more\n".to_vec()),
+            Event::StdinClose,
+            Event::StdinClose,
+        ]
+    );
 }
 
 /// A create that asks for its steps hears each one as it happens, over the controller connection

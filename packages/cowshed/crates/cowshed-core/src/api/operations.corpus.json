@@ -83,7 +83,8 @@
     "repoId": "acme/widget",
     "workspace": "feature",
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
-    "jobId": 7
+    "jobId": 7,
+    "offset": 4096
   },
   "worker.stdinClose": {
     "repoId": "acme/widget",
@@ -175,6 +176,13 @@
     "everyMs": 1000
   },
   "job.attachWrite": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7,
+    "offset": 4096
+  },
+  "job.attachClose": {
     "repoId": "acme/widget",
     "workspace": "feature",
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",

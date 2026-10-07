@@ -104,6 +104,14 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     admission: Option<Box<AdmissionRefusal>>,
+    /// Present only on a job stdin write or close refused at the job's input, naming why and
+    /// where that input stands. Absent from the wire otherwise, like `fence`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_to_this_build"
+    )]
+    stdin: Option<Box<StdinRefusal>>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
@@ -205,6 +213,44 @@ pub enum AdmissionRefusal {
     Unprovable { set_aside: std::path::PathBuf },
 }
 
+/// Why a job's stdin refused a write (07_api "Readiness and attachment stdin"). A write names the
+/// byte of the job's input it starts at; `cursor` is always how many bytes of that input reached
+/// the job's stdin pipe, which is where a writer resumes. Every variant is a `Conflict`; none is
+/// safe to retry unchanged.
+///
+/// Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+/// refusal (`CowshedError::stdin_source` answers `None`) rather than losing the whole error.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum StdinRefusal {
+    /// The job's stdin has ended -- its attachment closed it, or the job's leader ended -- and
+    /// takes no more bytes.
+    Ended { cursor: u64 },
+    /// The write at `offset` neither continues the input, whose next byte is `admitted`, nor
+    /// repeats bytes the input already holds.
+    Discontinuous {
+        offset: u64,
+        cursor: u64,
+        admitted: u64,
+    },
+    /// The write at `offset` repeats bytes the input already holds, and carries other bytes.
+    ReplayMismatch { offset: u64, cursor: u64 },
+    /// The write at `offset` repeats bytes older than `retained_from`, the oldest the supervisor
+    /// keeps, so nothing can prove them equal to what the job received.
+    ReplayUnprovable {
+        offset: u64,
+        cursor: u64,
+        retained_from: u64,
+    },
+    /// A write to the job's stdin pipe failed partway: how much of the input past `cursor`
+    /// reached the job is unknown, so the stdin takes nothing more, whatever a writer resends.
+    DeliveryUnknown { cursor: u64 },
+}
+
 /// The most paths a [`FenceRefusal`] names; `total` still counts every one.
 pub const MAX_FENCE_PATHS: usize = 64;
 
@@ -291,6 +337,7 @@ impl CowshedError {
             fence: None,
             retry: None,
             admission: None,
+            stdin: None,
             lifecycle_conflict: None,
         }
     }
@@ -319,6 +366,7 @@ impl CowshedError {
             fence: None,
             retry: None,
             admission: None,
+            stdin: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -344,6 +392,7 @@ impl CowshedError {
             fence: None,
             retry: None,
             admission: None,
+            stdin: None,
             lifecycle_conflict: None,
         }
     }
@@ -371,6 +420,7 @@ impl CowshedError {
             fence: None,
             retry: None,
             admission: None,
+            stdin: None,
             lifecycle_conflict: None,
         }
     }
@@ -393,6 +443,7 @@ impl CowshedError {
             fence: None,
             retry: None,
             admission: None,
+            stdin: None,
             lifecycle_conflict: None,
         }
     }
@@ -471,6 +522,19 @@ impl CowshedError {
         Self {
             admission: Some(Box::new(refusal)),
             ..error
+        }
+    }
+
+    /// A job stdin refusal: always a `Conflict`, carrying the reason and the input's cursor as
+    /// [`StdinRefusal`].
+    pub fn stdin_refusal(
+        refusal: StdinRefusal,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            stdin: Some(Box::new(refusal)),
+            ..Self::conflict(message, hint)
         }
     }
 
@@ -600,6 +664,11 @@ impl CowshedError {
     /// Why a keyed exec spawned nothing, when this is that refusal.
     pub fn admission_source(&self) -> Option<&AdmissionRefusal> {
         self.admission.as_deref()
+    }
+
+    /// Why the job's stdin refused, when this is a stdin write's or close's refusal.
+    pub fn stdin_source(&self) -> Option<StdinRefusal> {
+        self.stdin.as_deref().copied()
     }
 
     pub const fn exit_code(&self) -> u8 {

@@ -24,7 +24,7 @@ use crate::api::dto::{
 };
 use crate::api::journal_tail::tail_journals;
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, SampleInterval};
-use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result};
+use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
@@ -58,6 +58,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 64;
 const PROCESS_IO_CHUNK: usize = 64 * 1024;
 const MAX_LOG_READ: usize = 64 * 1024;
 const MAX_PENDING_STDIN_BYTES: usize = 256 * 1024;
+/// How much of a job's delivered input the actor keeps to compare a repeated write with: every
+/// byte a write can still be waiting on (the queue's budget and the lane's two frames), so a
+/// writer that repeats its unanswered writes after a lost answer is always provable.
+const RETAINED_STDIN_BYTES: usize = MAX_PENDING_STDIN_BYTES + 2 * PROCESS_IO_CHUNK;
 
 /// Exact immutable authority carried by every cheap supervisor handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,11 +423,21 @@ pub enum ProcessEvent {
         job_id: JobId,
         error: CowshedError,
     },
+    /// The pump wrote the oldest write its lane took, whole, to the child's stdin: the input's
+    /// cursor moves past it, and the lane has room again.
     StdinReady {
         job_id: JobId,
     },
+    /// A write to the child's stdin failed partway, after an unknown number of its bytes. The
+    /// pump has dropped the pipe.
+    StdinBroken {
+        job_id: JobId,
+        error: String,
+    },
     StdinPumpWrite {
         job_id: JobId,
+        /// Where `bytes` start in the input the pump delivers.
+        offset: u64,
         bytes: Bytes,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -497,7 +511,10 @@ pub trait RunningProcess: Send {
     fn process(&self) -> Option<&OwnedProcess>;
     /// `Ok(false)` means the bounded process-input lane is full.
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
-    fn close_stdin(&mut self) -> Result<()>;
+    /// Sends the job's one EOF. `false` means the lane still holds a write its pump has not
+    /// taken: nothing was sent, and the pump's next [`ProcessEvent::StdinReady`] is the time to
+    /// retry. Once it has answered `true`, every later call answers `true` and sends nothing.
+    fn close_stdin(&mut self) -> bool;
     /// The leader ended: close the job's stdin for good, so descendants reading it see its end.
     fn end_stdin(&mut self);
     /// Signal the job's process group, only while the process that reaps its leader holds the
@@ -1920,27 +1937,21 @@ impl StdinLane {
         }
     }
 
-    pub(super) fn close(&mut self) -> Result<()> {
+    /// Queues the pump's one EOF: `false` while the lane's slot still holds a write.
+    pub(super) fn close(&mut self) -> bool {
         if self.closed {
-            return Ok(());
+            return true;
         }
         let Some(sender) = &self.sender else {
             self.closed = true;
-            return Ok(());
+            return true;
         };
         match sender.try_send(SystemStdin::Close) {
-            Ok(()) => {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.closed = true;
-                Ok(())
+                true
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(CowshedError::conflict(
-                "job stdin still has a pending write",
-                "retry stdin close after the pending write is accepted",
-            )),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.closed = true;
-                Ok(())
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => false,
         }
     }
 
@@ -1966,7 +1977,7 @@ impl RunningProcess for SystemRunningProcess {
         self.stdin.try_write(bytes)
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
+    fn close_stdin(&mut self) -> bool {
         self.stdin.close()
     }
 
@@ -1995,6 +2006,9 @@ impl Drop for SystemRunningProcess {
     }
 }
 
+/// Writes the lane's bytes to the child's stdin in order, reporting each write once it is whole.
+/// A write that fails partway is reported as broken and ends the pipe; the lane then stays open
+/// and unread until it ends, so no write sees a closed lane before the actor has heard why.
 pub(super) async fn run_system_stdin<W>(
     job_id: JobId,
     mut stdin: W,
@@ -2006,8 +2020,16 @@ pub(super) async fn run_system_stdin<W>(
     while let Some(message) = receiver.recv().await {
         match message {
             SystemStdin::Write(bytes) => {
-                if stdin.write_all(&bytes).await.is_err() {
-                    break;
+                if let Err(error) = stdin.write_all(&bytes).await {
+                    drop(stdin);
+                    let broken = ProcessEvent::StdinBroken {
+                        job_id,
+                        error: error.to_string(),
+                    };
+                    if events.send(broken).await.is_ok() {
+                        while receiver.recv().await.is_some() {}
+                    }
+                    return;
                 }
                 if events
                     .send(ProcessEvent::StdinReady { job_id })
@@ -2201,7 +2223,9 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    pub async fn stdin_write(&self, job_id: JobId, bytes: Bytes) -> Result<()> {
+    /// Writes `bytes` as the job's input from byte `offset` on, answering once they reached the
+    /// child's stdin; see the actor's `stdin_write`.
+    pub async fn stdin_write(&self, job_id: JobId, offset: u64, bytes: Bytes) -> Result<()> {
         if bytes.len() > PROCESS_IO_CHUNK {
             return Err(CowshedError::usage(
                 "stdin write exceeds the 64 KiB bounded frame",
@@ -2211,6 +2235,7 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::StdinWrite {
             authority: self.authority.clone(),
             job_id,
+            offset,
             bytes,
             reply,
         })
@@ -2611,6 +2636,7 @@ pub(super) enum Command {
     StdinWrite {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
+        offset: u64,
         bytes: Bytes,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -2737,9 +2763,128 @@ enum KillReason {
     ScriptSyntax,
 }
 
-struct PendingStdin {
-    bytes: Bytes,
-    reply: oneshot::Sender<Result<()>>,
+/// A job's stdin as the actor delivers it, in input order: the bytes the pump wrote to the
+/// child's stdin (`delivered`, the cursor), the writes in the pump's lane, and the writes waiting
+/// for it. Every accepted write is answered once the cursor passes its end.
+#[derive(Default)]
+struct StdinDelivery {
+    /// Bytes of the input the pump wrote, whole, to the child's stdin.
+    delivered: u64,
+    /// The last delivered bytes, ending at `delivered` and at most [`RETAINED_STDIN_BYTES`]
+    /// long: what a repeated write is compared with.
+    retained: VecDeque<Bytes>,
+    retained_bytes: usize,
+    /// Writes the lane took, oldest first; each `StdinReady` delivers the front one.
+    in_lane: VecDeque<Bytes>,
+    /// Writes waiting for the lane, oldest first.
+    queued: VecDeque<Bytes>,
+    queued_bytes: usize,
+    /// Each accepted write's answer, due once `delivered` reaches the write's end.
+    waiters: Vec<(u64, oneshot::Sender<Result<()>>)>,
+    /// Why a write to the pipe failed partway, once one did: nothing past `delivered` is known
+    /// to have reached the child, and the input takes nothing more.
+    broken: Option<String>,
+}
+
+/// What a write over input the job already holds compares as.
+enum Replay {
+    Equal,
+    Mismatch,
+    /// It starts before `retained_from`, the oldest byte kept to compare with.
+    Unprovable {
+        retained_from: u64,
+    },
+}
+
+impl StdinDelivery {
+    /// The byte a write continues the input at.
+    fn admitted(&self) -> u64 {
+        let in_lane: usize = self.in_lane.iter().map(Bytes::len).sum();
+        self.delivered + byte_count(in_lane) + byte_count(self.queued_bytes)
+    }
+
+    /// Compares `bytes`, which start at `offset` and end within the admitted input, with the
+    /// input there: the retained delivered bytes, then the lane's, then the queue's.
+    fn replay(&self, offset: u64, bytes: &[u8]) -> Replay {
+        let mut at = self.delivered - byte_count(self.retained_bytes);
+        if offset < at {
+            return Replay::Unprovable { retained_from: at };
+        }
+        let mut rest = bytes;
+        let mut next = offset;
+        for held in self
+            .retained
+            .iter()
+            .chain(&self.in_lane)
+            .chain(&self.queued)
+        {
+            if rest.is_empty() {
+                break;
+            }
+            let end = at + byte_count(held.len());
+            if next < end {
+                let from = usize::try_from(next - at).expect("an offset within one held write");
+                let shared = (held.len() - from).min(rest.len());
+                if held[from..from + shared] != rest[..shared] {
+                    return Replay::Mismatch;
+                }
+                rest = &rest[shared..];
+                next += byte_count(shared);
+            }
+            at = end;
+        }
+        Replay::Equal
+    }
+
+    /// The pump wrote the lane's front write: the cursor moves past it, its bytes become what a
+    /// repeat is compared with, and every write it completes is answered.
+    fn deliver_front(&mut self) {
+        let Some(written) = self.in_lane.pop_front() else {
+            return;
+        };
+        self.delivered += byte_count(written.len());
+        self.retained_bytes += written.len();
+        self.retained.push_back(written);
+        while self.retained_bytes > RETAINED_STDIN_BYTES {
+            let Some(oldest) = self.retained.pop_front() else {
+                break;
+            };
+            self.retained_bytes -= oldest.len();
+        }
+        let delivered = self.delivered;
+        let (due, waiting) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(end, _)| *end <= delivered);
+        self.waiters = waiting;
+        for (_, reply) in due {
+            let _ = reply.send(Ok(()));
+        }
+    }
+
+    /// The queued writes can never reach the job: they are dropped, and every write waiting on
+    /// a byte past the lane is refused with `error`.
+    fn drop_queued(&mut self, error: &CowshedError) {
+        self.queued.clear();
+        self.queued_bytes = 0;
+        let reachable = self.admitted();
+        let (refused, waiting) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(end, _)| *end > reachable);
+        self.waiters = waiting;
+        for (_, reply) in refused {
+            let _ = reply.send(Err(error.clone()));
+        }
+    }
+
+    /// Nothing more reaches the child: every write still waiting is refused with `error`.
+    fn refuse_waiting(&mut self, error: &CowshedError) {
+        self.in_lane.clear();
+        self.queued.clear();
+        self.queued_bytes = 0;
+        for (_, reply) in self.waiters.drain(..) {
+            let _ = reply.send(Err(error.clone()));
+        }
+    }
 }
 
 struct PendingLog {
@@ -2804,8 +2949,7 @@ struct JobStateRecord {
     kill_reason: Option<KillReason>,
     stdout_copy: Option<OutputPublication>,
     stderr_copy: Option<OutputPublication>,
-    pending_stdin: VecDeque<PendingStdin>,
-    pending_stdin_bytes: usize,
+    stdin_delivery: StdinDelivery,
     close_stdin_when_drained: bool,
     close_waiters: Vec<oneshot::Sender<Result<()>>>,
     waiters: Vec<oneshot::Sender<Result<JobInfo>>>,
@@ -3041,9 +3185,10 @@ impl SupervisorActor {
             Command::StdinWrite {
                 authority,
                 job_id,
+                offset,
                 bytes,
                 reply,
-            } => self.stdin_write(&authority, job_id, bytes, reply),
+            } => self.stdin_write(&authority, job_id, offset, bytes, reply),
             Command::StdinClose {
                 authority,
                 job_id,
@@ -3901,8 +4046,7 @@ impl SupervisorActor {
             kill_reason: None,
             stdout_copy,
             stderr_copy,
-            pending_stdin: VecDeque::new(),
-            pending_stdin_bytes: 0,
+            stdin_delivery: StdinDelivery::default(),
             close_stdin_when_drained: false,
             close_waiters: Vec::new(),
             waiters: Vec::new(),
@@ -4083,10 +4227,16 @@ impl SupervisorActor {
         }
     }
 
+    /// Takes `bytes` as the job's input from byte `offset` on, answering once the pump wrote
+    /// them to the child's stdin. A write continues the input at its next byte. One that lies
+    /// within input the job already holds -- a writer repeating a write whose answer it lost --
+    /// delivers nothing again, and is answered once those bytes reached the child, but only when
+    /// its bytes equal them. Anything else is a [`StdinRefusal`] naming the cursor.
     fn stdin_write(
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
+        offset: u64,
         bytes: Bytes,
         reply: oneshot::Sender<Result<()>>,
     ) {
@@ -4098,10 +4248,72 @@ impl SupervisorActor {
             let _ = reply.send(Err(not_found_job(job_id)));
             return;
         };
-        if job.terminal() || job.info.stdin.complete {
+        let delivery = &mut job.stdin_delivery;
+        let cursor = delivery.delivered;
+        if let Some(broken) = &delivery.broken {
+            let _ = reply.send(Err(stdin_delivery_unknown(cursor, broken)));
+            return;
+        }
+        // A close that waits for the lane already ended this stdin for every later write.
+        if job.conclusion.is_some() || job.info.stdin.complete || job.close_stdin_when_drained {
+            let _ = reply.send(Err(stdin_ended(cursor)));
+            return;
+        }
+        let admitted = delivery.admitted();
+        let end = offset.checked_add(byte_count(bytes.len()));
+        if let Some(end) = end
+            && end <= admitted
+        {
+            let answer = match delivery.replay(offset, &bytes) {
+                Replay::Equal if end <= cursor => Ok(()),
+                Replay::Equal => {
+                    delivery.waiters.push((end, reply));
+                    return;
+                }
+                Replay::Mismatch => Err(CowshedError::stdin_refusal(
+                    StdinRefusal::ReplayMismatch { offset, cursor },
+                    format!(
+                        "job stdin write at byte {offset} repeats input the job already holds, \
+                         with other bytes; {cursor} bytes reached the job"
+                    ),
+                    "resend the input exactly as first written, or resume at the job's cursor",
+                )),
+                Replay::Unprovable { retained_from } => Err(CowshedError::stdin_refusal(
+                    StdinRefusal::ReplayUnprovable {
+                        offset,
+                        cursor,
+                        retained_from,
+                    },
+                    format!(
+                        "job stdin write at byte {offset} repeats input older than byte \
+                         {retained_from}, the oldest kept to compare with; {cursor} bytes \
+                         reached the job"
+                    ),
+                    "resume writing at the job's cursor",
+                )),
+            };
+            let _ = reply.send(answer);
+            return;
+        }
+        let Some(end) = end.filter(|_| offset == admitted) else {
+            let _ = reply.send(Err(CowshedError::stdin_refusal(
+                StdinRefusal::Discontinuous {
+                    offset,
+                    cursor,
+                    admitted,
+                },
+                format!(
+                    "job stdin write at byte {offset} does not continue the input, whose next \
+                     byte is {admitted}; {cursor} bytes reached the job"
+                ),
+                "resume writing at the job's cursor",
+            )));
+            return;
+        };
+        if delivery.queued_bytes.saturating_add(bytes.len()) > MAX_PENDING_STDIN_BYTES {
             let _ = reply.send(Err(CowshedError::conflict(
-                "job stdin is closed",
-                "inspect the job status",
+                "job stdin backpressure budget is full",
+                "wait for the pending stdin write to drain",
             )));
             return;
         }
@@ -4112,26 +4324,24 @@ impl SupervisorActor {
             )));
             return;
         };
-        match process.try_write_stdin(bytes.clone()) {
-            Ok(true) => {
-                job.info.stdin.bytes = job.info.stdin.bytes.saturating_add(byte_count(bytes.len()));
-                let _ = reply.send(Ok(()));
-            }
+        // Behind a queued write the lane is not this write's to take: it would overtake.
+        let handed = if delivery.queued.is_empty() {
+            process.try_write_stdin(bytes.clone())
+        } else {
+            Ok(false)
+        };
+        match handed {
+            Ok(true) => delivery.in_lane.push_back(bytes),
             Ok(false) => {
-                if job.pending_stdin_bytes.saturating_add(bytes.len()) > MAX_PENDING_STDIN_BYTES {
-                    let _ = reply.send(Err(CowshedError::conflict(
-                        "job stdin backpressure budget is full",
-                        "wait for the pending stdin write to drain",
-                    )));
-                } else {
-                    job.pending_stdin_bytes += bytes.len();
-                    job.pending_stdin.push_back(PendingStdin { bytes, reply });
-                }
+                delivery.queued_bytes += bytes.len();
+                delivery.queued.push_back(bytes);
             }
             Err(error) => {
                 let _ = reply.send(Err(error));
+                return;
             }
         }
+        delivery.waiters.push((end, reply));
     }
 
     fn stdin_close(
@@ -4152,22 +4362,31 @@ impl SupervisorActor {
             let _ = reply.send(Ok(()));
             return;
         }
-        if !job.pending_stdin.is_empty() {
+        if let Some(broken) = &job.stdin_delivery.broken {
+            let cursor = job.stdin_delivery.delivered;
+            let _ = reply.send(Err(stdin_delivery_unknown(cursor, broken)));
+            return;
+        }
+        if !job.stdin_delivery.queued.is_empty() || job.close_stdin_when_drained {
             job.close_stdin_when_drained = true;
             job.close_waiters.push(reply);
             return;
         }
-        let result = job
-            .process
-            .as_mut()
-            .ok_or_else(|| {
-                CowshedError::conflict("job process is unavailable", "inspect job status")
-            })
-            .and_then(|process| process.close_stdin());
-        if result.is_ok() {
+        let Some(process) = job.process.as_mut() else {
+            let _ = reply.send(Err(CowshedError::conflict(
+                "job process is unavailable",
+                "inspect job status",
+            )));
+            return;
+        };
+        if process.close_stdin() {
             job.info.stdin.complete = true;
+            let _ = reply.send(Ok(()));
+        } else {
+            // The lane still holds a write its pump has not taken; its `StdinReady` retries.
+            job.close_stdin_when_drained = true;
+            job.close_waiters.push(reply);
         }
-        let _ = reply.send(result);
     }
 
     fn wait(
@@ -4400,13 +4619,25 @@ impl SupervisorActor {
                 end_job_stdin(job);
             }
             ProcessEvent::StdinReady { job_id } => self.flush_stdin(job_id),
+            ProcessEvent::StdinBroken { job_id, error } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    let refusal = stdin_delivery_unknown(job.stdin_delivery.delivered, &error);
+                    job.stdin_delivery.refuse_waiting(&refusal);
+                    job.stdin_delivery.broken = Some(error);
+                    job.close_stdin_when_drained = false;
+                    for waiter in job.close_waiters.drain(..) {
+                        let _ = waiter.send(Err(refusal.clone()));
+                    }
+                }
+            }
             ProcessEvent::StdinPumpWrite {
                 job_id,
+                offset,
                 bytes,
                 reply,
             } => {
                 let authority = self.authority.clone();
-                self.stdin_write(&authority, job_id, bytes, reply);
+                self.stdin_write(&authority, job_id, offset, bytes, reply);
             }
             ProcessEvent::StdinPumpClose { job_id } => {
                 let (reply, _receive) = oneshot::channel();
@@ -4539,45 +4770,41 @@ impl SupervisorActor {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        while let Some(pending) = job.pending_stdin.pop_front() {
+        let delivery = &mut job.stdin_delivery;
+        delivery.deliver_front();
+        job.info.stdin.bytes = delivery.delivered;
+        while let Some(next) = delivery.queued.front() {
             let Some(process) = job.process.as_mut() else {
-                let _ = pending.reply.send(Err(CowshedError::conflict(
-                    "job process is unavailable",
-                    "inspect the terminal job status",
-                )));
-                continue;
+                break;
             };
-            match process.try_write_stdin(pending.bytes.clone()) {
+            match process.try_write_stdin(next.clone()) {
                 Ok(true) => {
-                    job.pending_stdin_bytes -= pending.bytes.len();
-                    job.info.stdin.bytes = job
-                        .info
-                        .stdin
-                        .bytes
-                        .saturating_add(byte_count(pending.bytes.len()));
-                    let _ = pending.reply.send(Ok(()));
+                    let next = delivery
+                        .queued
+                        .pop_front()
+                        .expect("the front write was just seen");
+                    delivery.queued_bytes -= next.len();
+                    delivery.in_lane.push_back(next);
                 }
-                Ok(false) => {
-                    job.pending_stdin.push_front(pending);
-                    break;
-                }
+                Ok(false) => break,
                 Err(error) => {
-                    job.pending_stdin_bytes -= pending.bytes.len();
-                    let _ = pending.reply.send(Err(error));
+                    delivery.drop_queued(&error);
+                    break;
                 }
             }
         }
-        if job.pending_stdin.is_empty() && job.close_stdin_when_drained {
-            let result = job
+        if delivery.queued.is_empty() && job.close_stdin_when_drained {
+            let closed = job
                 .process
                 .as_mut()
-                .map_or(Ok(()), |process| process.close_stdin());
-            if result.is_ok() {
+                .is_none_or(|process| process.close_stdin());
+            // Unclosed, the last write is still in the lane; its own `StdinReady` retries.
+            if closed {
                 job.info.stdin.complete = true;
                 job.close_stdin_when_drained = false;
-            }
-            for waiter in job.close_waiters.drain(..) {
-                let _ = waiter.send(result.clone());
+                for waiter in job.close_waiters.drain(..) {
+                    let _ = waiter.send(Ok(()));
+                }
             }
         }
     }
@@ -4708,6 +4935,13 @@ impl SupervisorActor {
         };
         job.conclusion = Some(conclusion);
         // The job concluded: nothing signals its group any more, and its leader is reaped.
+        // Nor does anything deliver its stdin any more: a write the pump never reported whole
+        // may or may not have reached it.
+        let cursor = job.stdin_delivery.delivered;
+        job.stdin_delivery.refuse_waiting(&stdin_delivery_unknown(
+            cursor,
+            "the job concluded before the write was reported whole",
+        ));
         job.process = None;
         // Nor does it run on its build volume any more: a release may take it.
         job.build_hold = None;
@@ -4784,45 +5018,81 @@ impl SupervisorActor {
     }
 }
 
+/// Starts delivering `stdin`'s source, then its one EOF. Open stdin has no source: its attachment
+/// writes it and ends it, so nothing starts.
 fn launch_stdin_pump(
     job_id: JobId,
     stdin: StdinSource,
     workspace_root: PathBuf,
     events: mpsc::Sender<ProcessEvent>,
 ) {
-    tokio::spawn(async move {
-        let result = match stdin {
-            StdinSource::Empty => Ok(()),
-            StdinSource::Inline(bytes) => pump_one(job_id, bytes, &events).await,
-            StdinSource::Stream(reader) => pump_reader(job_id, reader, &events).await,
-            StdinSource::WorkspaceFile(path) => {
-                match tokio::fs::File::open(workspace_root.join(path.as_path())).await {
-                    Ok(reader) => pump_reader(job_id, Box::pin(reader), &events).await,
-                    Err(error) => Err(CowshedError::environment_missing(
-                        format!("workspace stdin file could not be opened: {error}"),
-                        "verify the workspace-relative stdin path",
-                    )),
-                }
-            }
-        };
-        match result {
-            Ok(()) => {
-                let _ = events.send(ProcessEvent::StdinPumpClose { job_id }).await;
-            }
-            Err(error) => {
-                let _ = events
-                    .send(ProcessEvent::StdinPumpFailed { job_id, error })
-                    .await;
-            }
+    match stdin {
+        StdinSource::Open => {}
+        StdinSource::Empty => {
+            tokio::spawn(async move { finish_stdin_pump(job_id, Ok(()), &events).await });
         }
-    });
+        StdinSource::Inline(bytes) => {
+            tokio::spawn(async move {
+                let delivered = pump_one(job_id, 0, bytes, &events).await;
+                finish_stdin_pump(job_id, delivered, &events).await;
+            });
+        }
+        StdinSource::Stream(reader) => {
+            tokio::spawn(async move {
+                let delivered = pump_reader(job_id, reader, &events).await;
+                finish_stdin_pump(job_id, delivered, &events).await;
+            });
+        }
+        StdinSource::WorkspaceFile(path) => {
+            tokio::spawn(async move {
+                let delivered =
+                    match tokio::fs::File::open(workspace_root.join(path.as_path())).await {
+                        Ok(reader) => pump_reader(job_id, Box::pin(reader), &events).await,
+                        Err(error) => Err(CowshedError::environment_missing(
+                            format!("workspace stdin file could not be opened: {error}"),
+                            "verify the workspace-relative stdin path",
+                        )),
+                    };
+                finish_stdin_pump(job_id, delivered, &events).await;
+            });
+        }
+    }
 }
 
-async fn pump_one(job_id: JobId, bytes: Bytes, events: &mpsc::Sender<ProcessEvent>) -> Result<()> {
+/// A delivered source ends the job's stdin; a failed one fails the job. A job whose stdin ended
+/// or broke first -- its leader exited, or stopped reading and closed the pipe -- simply took no
+/// more of the source: that is the job's business, not a failure of its input.
+async fn finish_stdin_pump(
+    job_id: JobId,
+    delivered: Result<()>,
+    events: &mpsc::Sender<ProcessEvent>,
+) {
+    let event = match delivered {
+        Ok(()) => ProcessEvent::StdinPumpClose { job_id },
+        Err(error)
+            if matches!(
+                error.stdin_source(),
+                Some(StdinRefusal::Ended { .. } | StdinRefusal::DeliveryUnknown { .. })
+            ) =>
+        {
+            return;
+        }
+        Err(error) => ProcessEvent::StdinPumpFailed { job_id, error },
+    };
+    let _ = events.send(event).await;
+}
+
+async fn pump_one(
+    job_id: JobId,
+    offset: u64,
+    bytes: Bytes,
+    events: &mpsc::Sender<ProcessEvent>,
+) -> Result<()> {
     let (reply, receive) = oneshot::channel();
     events
         .send(ProcessEvent::StdinPumpWrite {
             job_id,
+            offset,
             bytes,
             reply,
         })
@@ -4839,6 +5109,7 @@ async fn pump_reader(
     events: &mpsc::Sender<ProcessEvent>,
 ) -> Result<()> {
     let mut buffer = vec![0_u8; PROCESS_IO_CHUNK];
+    let mut offset = 0_u64;
     loop {
         let count = reader.read(&mut buffer).await.map_err(|error| {
             CowshedError::environment_missing(
@@ -4849,7 +5120,14 @@ async fn pump_reader(
         if count == 0 {
             return Ok(());
         }
-        pump_one(job_id, Bytes::copy_from_slice(&buffer[..count]), events).await?;
+        pump_one(
+            job_id,
+            offset,
+            Bytes::copy_from_slice(&buffer[..count]),
+            events,
+        )
+        .await?;
+        offset += byte_count(count);
     }
 }
 
@@ -4867,7 +5145,7 @@ fn stdin_info(stdin: &StdinSource) -> StdinInfo {
             workspace_path: None,
             complete: bytes.is_empty(),
         },
-        StdinSource::Stream(_) => StdinInfo {
+        StdinSource::Stream(_) | StdinSource::Open => StdinInfo {
             kind: StdinKind::Stream,
             bytes: 0,
             workspace_path: None,
@@ -5163,17 +5441,35 @@ fn end_job_stdin(job: &mut JobStateRecord) {
     if let Some(process) = job.process.as_mut() {
         process.end_stdin();
     }
-    for pending in job.pending_stdin.drain(..) {
-        let _ = pending.reply.send(Err(CowshedError::conflict(
-            "job exited before stdin was accepted",
-            "inspect the terminal job status",
-        )));
-    }
-    job.pending_stdin_bytes = 0;
+    // The lane's writes may still reach a descendant holding the pipe; the queue's never will.
+    let cursor = job.stdin_delivery.delivered;
+    job.stdin_delivery.drop_queued(&stdin_ended(cursor));
     for waiter in job.close_waiters.drain(..) {
         let _ = waiter.send(Ok(()));
     }
     job.info.stdin.complete = true;
+}
+
+/// The refusal of a write to a job's stdin that has ended.
+fn stdin_ended(cursor: u64) -> CowshedError {
+    CowshedError::stdin_refusal(
+        StdinRefusal::Ended { cursor },
+        format!("job stdin has ended; {cursor} bytes reached the job"),
+        "inspect the job status",
+    )
+}
+
+/// The refusal of every write to a job's stdin once delivery past `cursor` is unknown, saying
+/// `why`.
+fn stdin_delivery_unknown(cursor: u64, why: &str) -> CowshedError {
+    CowshedError::stdin_refusal(
+        StdinRefusal::DeliveryUnknown { cursor },
+        format!(
+            "job stdin delivery is unknown past byte {cursor}: {why}; the job's stdin takes no \
+             more input"
+        ),
+        "inspect the job status; resending cannot be told apart from what may have arrived",
+    )
 }
 
 /// One bounded chunk of a sealed stream, read out of the artifact store.
@@ -7000,5 +7296,81 @@ mod tail_tests {
         assert_eq!(read_live_range(&chunks, 1..4).unwrap(), b"bcd");
         let error = read_live_range(&chunks, 3..8).err().unwrap();
         assert_eq!(error.code, crate::error::ErrorCode::Internal);
+    }
+}
+
+#[cfg(test)]
+mod stdin_lane_tests {
+    use super::*;
+
+    /// A close that arrives while the lane's one slot still holds a write its pump has not taken
+    /// is the ordinary end of a write-then-close: it waits for the lane instead of refusing, and
+    /// the pipe then carries every byte and one EOF.
+    #[tokio::test]
+    async fn a_close_behind_an_untaken_write_waits_for_the_lane_instead_of_refusing() {
+        use std::io::Read as _;
+        let (sender, receiver) = mpsc::channel(1);
+        let mut lane = StdinLane::new(sender);
+        assert!(lane.try_write(Bytes::from_static(b"line\n")).unwrap());
+        assert!(
+            !lane.close(),
+            "the slot still holds the write, so no EOF was queued behind it"
+        );
+
+        let (mut read_end, write_end) = std::io::pipe().unwrap();
+        let pipe =
+            tokio::net::unix::pipe::Sender::from_owned_fd(std::os::fd::OwnedFd::from(write_end))
+                .unwrap();
+        let job_id = JobId::new(1).unwrap();
+        let (events, mut observed) = mpsc::channel(4);
+        let pump = tokio::spawn(run_system_stdin(job_id, pipe, receiver, events));
+        assert!(matches!(
+            observed.recv().await,
+            Some(ProcessEvent::StdinReady { job_id: ready }) if ready == job_id
+        ));
+        assert!(
+            lane.close(),
+            "the pump took the write, so the EOF is queued"
+        );
+        assert!(
+            lane.close(),
+            "a repeated close is answered and sends nothing"
+        );
+        pump.await.unwrap();
+        let mut received = Vec::new();
+        read_end.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"line\n");
+    }
+
+    /// A child that closed its stdin makes the pump's write fail: the pump reports the input
+    /// broken instead of a write taken, and keeps the lane open and unread, so a write after the
+    /// failure is the actor's to refuse rather than the lane's to report closed.
+    #[tokio::test]
+    async fn a_write_the_pipe_refuses_is_reported_broken_and_the_lane_stays_open() {
+        let (sender, receiver) = mpsc::channel(1);
+        let mut lane = StdinLane::new(sender);
+        let (read_end, write_end) = std::io::pipe().unwrap();
+        drop(read_end);
+        let pipe =
+            tokio::net::unix::pipe::Sender::from_owned_fd(std::os::fd::OwnedFd::from(write_end))
+                .unwrap();
+        let job_id = JobId::new(1).unwrap();
+        let (events, mut observed) = mpsc::channel(4);
+        let pump = tokio::spawn(run_system_stdin(job_id, pipe, receiver, events));
+        assert!(lane.try_write(Bytes::from_static(b"lost\n")).unwrap());
+        assert!(matches!(
+            observed.recv().await,
+            Some(ProcessEvent::StdinBroken { job_id: broken, .. }) if broken == job_id
+        ));
+        assert!(
+            lane.try_write(Bytes::from_static(b"later\n")).unwrap(),
+            "the lane still takes writes: only the actor refuses them"
+        );
+        lane.end();
+        pump.await.unwrap();
+        assert!(
+            observed.recv().await.is_none(),
+            "nothing reported after the break"
+        );
     }
 }

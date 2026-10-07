@@ -30,7 +30,7 @@ use crate::api::dto::{
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
     LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest, ProjectOpenRequest,
-    ProjectOpened, RepoRequest, Scope, TailRequest, WorkerScope, WorkspaceAtRequest,
+    ProjectOpened, RepoRequest, Scope, StdinWriteRequest, TailRequest, WorkerScope, WorkspaceAtRequest,
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
 };
 use crate::api::resources::{JobResourceSample, SampleInterval};
@@ -255,19 +255,23 @@ pub trait ProjectRuntimeHost: Send + 'static {
         session: Option<String>,
         request: ExecRequest,
     ) -> Result<JobId>;
+    /// Taken once `bytes`, the job's input from byte `offset` on, reached the job's stdin, which
+    /// lasts as long as the job leaves its input unread.
     async fn stdin_write(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
+        offset: u64,
         bytes: Bytes,
-    ) -> Result<()>;
+    ) -> Result<JobAnswer<()>>;
+    /// The job's one EOF, once every write it took reached it.
     async fn stdin_close(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<()>;
+    ) -> Result<JobAnswer<()>>;
     async fn list_jobs(
         &mut self,
         workspace: WorkspaceName,
@@ -1072,24 +1076,28 @@ impl ProjectActor {
                 &self.worker_exec(&authority, params, upload).await?,
             ),
             Op::WorkerStdinChunk(params) => {
-                self.stdin_chunk(&authority, params, upload).await?;
-                respond::<operations::WorkerStdinChunk>(&EmptyResult {})
+                return self
+                    .stdin_chunk::<operations::WorkerStdinChunk>(&authority, params, upload)
+                    .await
+                    .map(Routed::Later);
             }
             Op::JobAttachWrite(params) => {
-                self.stdin_chunk(&authority, params, upload).await?;
-                respond::<operations::JobAttachWrite>(&EmptyResult {})
+                return self
+                    .stdin_chunk::<operations::JobAttachWrite>(&authority, params, upload)
+                    .await
+                    .map(Routed::Later);
             }
             Op::WorkerStdinClose(params) => {
-                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
-                    .await?;
-                self.host
-                    .stdin_close(
-                        params.workspace,
-                        params.workspace_incarnation,
-                        params.job_id,
-                    )
-                    .await?;
-                respond::<operations::WorkerStdinClose>(&EmptyResult {})
+                return self
+                    .stdin_end::<operations::WorkerStdinClose>(&authority, params)
+                    .await
+                    .map(Routed::Later);
+            }
+            Op::JobAttachClose(params) => {
+                return self
+                    .stdin_end::<operations::JobAttachClose>(&authority, params)
+                    .await
+                    .map(Routed::Later);
             }
             Op::WorkerShell(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
@@ -1398,12 +1406,13 @@ impl ProjectActor {
             .await
     }
 
-    async fn stdin_chunk(
+    /// A stdin write lasts until the job takes it, so the router answers it on a task of its own.
+    async fn stdin_chunk<O: Operation<Result = EmptyResult>>(
         &mut self,
         authority: &ConnectionAuthority,
-        params: JobRequest,
+        params: StdinWriteRequest,
         upload: Option<Bytes>,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<RouterResponse>> {
         self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
         let bytes = upload.ok_or_else(|| {
@@ -1412,14 +1421,42 @@ impl ProjectActor {
                 "retry the stdin write",
             )
         })?;
-        self.host
+        let taken = self
+            .host
             .stdin_write(
                 params.workspace,
                 params.workspace_incarnation,
                 params.job_id,
+                params.offset,
                 bytes,
             )
-            .await
+            .await?;
+        Ok(Box::pin(async move {
+            taken.await?;
+            respond::<O>(&EmptyResult {})
+        }))
+    }
+
+    /// The end of a job's stdin waits for the writes it took, so it is answered like one.
+    async fn stdin_end<O: Operation<Result = EmptyResult>>(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let ended = self
+            .host
+            .stdin_close(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            ended.await?;
+            respond::<O>(&EmptyResult {})
+        }))
     }
 
     async fn job_info(
@@ -1831,6 +1868,15 @@ fn exec_request(
                 "stream stdin requires the controller streaming channel",
                 "retry through WorkspaceHandle::exec",
             ));
+        }
+        ExecStdin::Open => {
+            if upload.is_some() {
+                return Err(CowshedError::usage(
+                    "open stdin admission unexpectedly included binary data",
+                    "write through the job's attachment after admission",
+                ));
+            }
+            StdinSource::Open
         }
         ExecStdin::WorkspaceFile { workspace_path } => {
             if upload.is_some() {
@@ -10979,14 +11025,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
+        offset: u64,
         bytes: Bytes,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<()>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        self.ensure_supervisor(&workspace)
-            .await?
-            .stdin_write(job, bytes)
-            .await
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move {
+            supervisor.stdin_write(job, offset, bytes).await
+        }))
     }
 
     async fn stdin_close(
@@ -10994,13 +11041,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<()>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        self.ensure_supervisor(&workspace)
-            .await?
-            .stdin_close(job)
-            .await
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move { supervisor.stdin_close(job).await }))
     }
 
     async fn list_jobs(
@@ -12707,8 +12752,8 @@ mod removal_supervisor_tests {
             Ok(true)
         }
 
-        fn close_stdin(&mut self) -> Result<()> {
-            Ok(())
+        fn close_stdin(&mut self) -> bool {
+            true
         }
 
         fn end_stdin(&mut self) {}

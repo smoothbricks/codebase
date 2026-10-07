@@ -319,8 +319,8 @@ operations! {
     internal json "coordinator.refreshBuildState" CoordinatorRefreshBuildState(WorkspaceRequest) -> BuildStateRefresh;
     /// Admits one job; inline stdin travels as the upload frame.
     worker upload "worker.exec" WorkerExec(ExecParams) -> JobId;
-    /// Writes one chunk of a streamed stdin.
-    worker upload "worker.stdinChunk" WorkerStdinChunk(JobRequest) -> EmptyResult;
+    /// Writes one chunk of a streamed stdin at its byte offset.
+    worker upload "worker.stdinChunk" WorkerStdinChunk(StdinWriteRequest) -> EmptyResult;
     /// Ends a streamed stdin.
     worker json "worker.stdinClose" WorkerStdinClose(JobRequest) -> EmptyResult;
     /// Opens a shell session.
@@ -352,8 +352,11 @@ operations! {
     /// Streams one job's resource samples: the latest at once, one every interval while it runs,
     /// then its terminal sample once.
     worker stream "job.progress" JobProgress(ProgressRequest) -> JobResourceSample;
-    /// Writes to an attached job's stdin.
-    worker upload "job.attachWrite" JobAttachWrite(JobRequest) -> EmptyResult;
+    /// Writes to an attached job's stdin at its byte offset, answered once the bytes reached the
+    /// job's stdin pipe.
+    worker upload "job.attachWrite" JobAttachWrite(StdinWriteRequest) -> EmptyResult;
+    /// Ends an attached job's stdin: one EOF however often it is called; the job continues.
+    worker json "job.attachClose" JobAttachClose(JobRequest) -> EmptyResult;
     /// Detaches from a job.
     worker json "job.detach" JobDetach(JobRequest) -> EmptyResult;
     /// Waits for a job to end.
@@ -590,13 +593,16 @@ pub struct QuotaRequest {
 }
 
 /// Where an admitted job's stdin comes from. Inline bytes travel as the call's upload frame; a
-/// stream's chunks follow admission as `worker.stdinChunk` calls.
+/// stream's chunks follow admission as `worker.stdinChunk` calls from the client that admitted
+/// it. Open stdin has no producer: it stays open after admission, its attachment writes it with
+/// `job.attachWrite`, and `job.attachClose` ends it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ExecStdin {
     Empty,
     Inline,
     Stream,
+    Open,
     WorkspaceFile {
         #[serde(rename = "workspacePath")]
         workspace_path: WorkspacePath,
@@ -643,6 +649,20 @@ pub struct JobRequest {
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
+}
+
+/// One write of a job's stdin: the job's fence, and the byte of the job's input at which the
+/// call's upload frame starts. A write continues the input at its next byte; one within input
+/// the job already holds is answered without delivering anything twice, but only when its bytes
+/// equal what the job holds there.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StdinWriteRequest {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub offset: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

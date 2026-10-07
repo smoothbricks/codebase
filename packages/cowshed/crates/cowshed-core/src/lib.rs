@@ -67,7 +67,7 @@ mod temp_root;
 
 pub use error::{
     AdmissionRefusal, CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild, Result,
-    Retry,
+    Retry, StdinRefusal,
 };
 pub use gateway_inventory::{
     AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,

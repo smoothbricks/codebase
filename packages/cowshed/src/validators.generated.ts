@@ -1089,6 +1089,19 @@ export const parseStdinKind = (json: string): Api.StdinKind => assertStdinKind(J
 export const assertStdinKindList = typia.createAssertEquals<readonly Api.StdinKind[]>();
 export const parseStdinKindList = (json: string): readonly Api.StdinKind[] => assertStdinKindList(JSON.parse(json));
 
+export const assertStdinRefusal = typia.createAssertEquals<Api.StdinRefusal>();
+export const parseStdinRefusal = (json: string): Api.StdinRefusal => assertStdinRefusal(JSON.parse(json));
+export const assertStdinRefusalList = typia.createAssertEquals<readonly Api.StdinRefusal[]>();
+export const parseStdinRefusalList = (json: string): readonly Api.StdinRefusal[] =>
+  assertStdinRefusalList(JSON.parse(json));
+
+export const assertStdinWriteRequest = typia.createAssertEquals<Api.StdinWriteRequest>();
+export const parseStdinWriteRequest = (json: string): Api.StdinWriteRequest =>
+  assertStdinWriteRequest(JSON.parse(json));
+export const assertStdinWriteRequestList = typia.createAssertEquals<readonly Api.StdinWriteRequest[]>();
+export const parseStdinWriteRequestList = (json: string): readonly Api.StdinWriteRequest[] =>
+  assertStdinWriteRequestList(JSON.parse(json));
+
 export const assertStepReport = typia.createAssertEquals<Api.StepReport>();
 export const parseStepReport = (json: string): Api.StepReport => assertStepReport(JSON.parse(json));
 export const assertStepReportList = typia.createAssertEquals<readonly Api.StepReport[]>();

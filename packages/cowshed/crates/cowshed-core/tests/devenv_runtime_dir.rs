@@ -1157,7 +1157,7 @@ impl SandboxedChild {
     }
 
     fn close_stdin(&mut self) {
-        self.process.close_stdin().expect("close stdin");
+        assert!(self.process.close_stdin(), "a fresh lane takes the EOF");
     }
 
     fn finished(&self) -> bool {

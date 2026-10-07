@@ -502,12 +502,15 @@ export type ExecRecordRef = {
 
 /**
  * Where an admitted job's stdin comes from. Inline bytes travel as the call's upload frame; a
- * stream's chunks follow admission as `worker.stdinChunk` calls.
+ * stream's chunks follow admission as `worker.stdinChunk` calls from the client that admitted
+ * it. Open stdin has no producer: it stays open after admission, its attachment writes it with
+ * `job.attachWrite`, and `job.attachClose` ends it.
  */
 export type ExecStdin =
   | { readonly kind: 'empty' }
   | { readonly kind: 'inline' }
   | { readonly kind: 'stream' }
+  | { readonly kind: 'open' }
   | ({ readonly kind: 'workspaceFile' } & {
       readonly workspacePath: WorkspacePath;
     });
@@ -1893,6 +1896,51 @@ export type StdinInfo = {
 };
 
 export type StdinKind = 'empty' | 'inline' | 'stream' | 'workspaceFile';
+
+/**
+ * Why a job's stdin refused a write (07_api "Readiness and attachment stdin"). A write names the
+ * byte of the job's input it starts at; `cursor` is always how many bytes of that input reached
+ * the job's stdin pipe, which is where a writer resumes. Every variant is a `Conflict`; none is
+ * safe to retry unchanged.
+ *
+ * Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+ * refusal (`CowshedError::stdin_source` answers `None`) rather than losing the whole error.
+ */
+export type StdinRefusal =
+  | ({ readonly reason: 'ended' } & {
+      readonly cursor: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly reason: 'discontinuous' } & {
+      readonly offset: number & tags.Type<'uint64'>;
+      readonly cursor: number & tags.Type<'uint64'>;
+      readonly admitted: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly reason: 'replayMismatch' } & {
+      readonly offset: number & tags.Type<'uint64'>;
+      readonly cursor: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly reason: 'replayUnprovable' } & {
+      readonly offset: number & tags.Type<'uint64'>;
+      readonly cursor: number & tags.Type<'uint64'>;
+      readonly retainedFrom: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly reason: 'deliveryUnknown' } & {
+      readonly cursor: number & tags.Type<'uint64'>;
+    });
+
+/**
+ * One write of a job's stdin: the job's fence, and the byte of the job's input at which the
+ * call's upload frame starts. A write continues the input at its next byte; one within input
+ * the job already holds is answered without delivering anything twice, but only when its bytes
+ * equal what the job holds there.
+ */
+export type StdinWriteRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly jobId: JobId;
+  readonly offset: number & tags.Type<'uint64'>;
+};
 
 /**
  * One lifecycle step of a controller call that asked for its steps, reported when the step starts

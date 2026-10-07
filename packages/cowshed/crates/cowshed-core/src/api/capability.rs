@@ -15,7 +15,7 @@ use super::operations::{
     LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
     ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
     RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest, RestoreRequest,
-    SessionRequest, SlotRequest, SourceDestinationRequest, StreamOperation, TailRequest,
+    SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest,
     WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
     WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
@@ -99,6 +99,16 @@ impl WorkspaceAuthority {
             workspace: self.workspace.clone(),
             workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
+        }
+    }
+
+    fn stdin_write(&self, job_id: JobId, offset: u64) -> StdinWriteRequest {
+        StdinWriteRequest {
+            repo_id: self.repo_id.clone(),
+            workspace: self.workspace.clone(),
+            workspace_incarnation: self.workspace_incarnation.clone(),
+            job_id,
+            offset,
         }
     }
 
@@ -343,6 +353,7 @@ impl ControllerRuntime for ActorRuntime {
                 (ExecStdin::WorkspaceFile { workspace_path }, None, None)
             }
             StdinSource::Stream(stream) => (ExecStdin::Stream, None, Some(stream)),
+            StdinSource::Open => (ExecStdin::Open, None, None),
         };
         let (argv, script) = match command {
             crate::api::dto::ExecCommand::Argv(argv) => (Some(argv), None),
@@ -369,8 +380,8 @@ impl ControllerRuntime for ActorRuntime {
             None => invoke::<operations::WorkerExec>(self, &params).await?,
         };
         if let Some(reader) = stream.as_mut() {
-            let job = authority.job(job_id);
             let mut buffer = [0_u8; MAX_BINARY_FRAME_BYTES];
+            let mut offset = 0_u64;
             loop {
                 let count = reader.read(&mut buffer).await.map_err(|error| {
                     CowshedError::new(
@@ -384,12 +395,14 @@ impl ControllerRuntime for ActorRuntime {
                 }
                 let EmptyResult {} = invoke_upload::<operations::WorkerStdinChunk>(
                     self,
-                    &job,
+                    &authority.stdin_write(job_id, offset),
                     Bytes::copy_from_slice(&buffer[..count]),
                 )
                 .await?;
+                offset += frame_length(count);
             }
-            let EmptyResult {} = invoke::<operations::WorkerStdinClose>(self, &job).await?;
+            let EmptyResult {} =
+                invoke::<operations::WorkerStdinClose>(self, &authority.job(job_id)).await?;
         }
         Ok(job_id)
     }
@@ -418,6 +431,11 @@ impl ControllerRuntime for ActorRuntime {
         id: JobId,
         cursor: JobJournalCursor,
     ) -> Result<JobAttachment> {
+        // Writes continue the job's input where it stands, whoever wrote what came before.
+        let input_cursor = invoke::<operations::JobStatus>(self, &authority.job(id))
+            .await?
+            .stdin
+            .bytes;
         let stdout = self
             .logs(
                 Arc::clone(&authority),
@@ -440,11 +458,7 @@ impl ControllerRuntime for ActorRuntime {
         Ok(JobAttachment {
             authority: Arc::clone(&authority),
             id,
-            stdin: JobStdin {
-                authority,
-                id,
-                runtime: Arc::clone(&runtime),
-            },
+            stdin: JobStdin::new(authority, id, Arc::clone(&runtime), input_cursor),
             stdout,
             stderr,
             runtime,
@@ -743,18 +757,59 @@ pub struct JobStdin {
     authority: Arc<WorkspaceAuthority>,
     id: JobId,
     runtime: Arc<dyn ControllerRuntime>,
+    /// The byte of the job's input the next write starts at. Held across a write, so writes
+    /// through one handle reach the job whole and in call order.
+    offset: tokio::sync::Mutex<u64>,
 }
 
 impl JobStdin {
-    pub async fn write(&self, bytes: Bytes) -> Result<()> {
-        invoke_upload::<operations::JobAttachWrite>(
-            &*self.runtime,
-            &self.authority.job(self.id),
-            bytes,
-        )
-        .await
-        .map(|EmptyResult {}| ())
+    fn new(
+        authority: Arc<WorkspaceAuthority>,
+        id: JobId,
+        runtime: Arc<dyn ControllerRuntime>,
+        offset: u64,
+    ) -> Self {
+        Self {
+            authority,
+            id,
+            runtime,
+            offset: tokio::sync::Mutex::new(offset),
+        }
     }
+
+    /// Answers once all of `bytes` reached the job's stdin, sent as bounded frames that each
+    /// wait for the job to take them. A write that fails moves the handle's offset nowhere, so
+    /// repeating it resends the same bytes at the same offsets: what already reached the job is
+    /// answered without being delivered twice. A refusal is typed as
+    /// [`crate::error::StdinRefusal`] and names how many bytes reached the job.
+    pub async fn write(&self, bytes: Bytes) -> Result<()> {
+        let mut offset = self.offset.lock().await;
+        let mut next = *offset;
+        for frame in bytes.chunks(MAX_BINARY_FRAME_BYTES) {
+            let EmptyResult {} = invoke_upload::<operations::JobAttachWrite>(
+                &*self.runtime,
+                &self.authority.stdin_write(self.id, next),
+                bytes.slice_ref(frame),
+            )
+            .await?;
+            next += frame_length(frame.len());
+        }
+        *offset = next;
+        Ok(())
+    }
+
+    /// Ends the job's stdin once every accepted write reached it: one EOF however often it is
+    /// called. The job is not cancelled.
+    pub async fn close(&self) -> Result<()> {
+        invoke::<operations::JobAttachClose>(&*self.runtime, &self.authority.job(self.id))
+            .await
+            .map(|EmptyResult {}| ())
+    }
+}
+
+/// A frame's length as a count of input bytes.
+fn frame_length(length: usize) -> u64 {
+    u64::try_from(length).expect("supported platforms have at most 64-bit usize")
 }
 
 impl fmt::Debug for JobStdin {
@@ -3250,6 +3305,7 @@ mod tests {
                     "workspace": "raven",
                     "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
                     "jobId": 7,
+                    "offset": 0,
                 })
             );
             assert!(!chunk_header.contains(&0));
@@ -3288,46 +3344,48 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    /// Each write is one exact raw frame addressed by the byte of the job's input it starts at:
+    /// the handle starts where the job's input stood and moves past every answered write.
     #[cfg(unix)]
     #[tokio::test]
-    async fn attachment_stdin_write_uses_one_exact_raw_frame() {
+    async fn attachment_stdin_write_uses_one_exact_raw_frame_at_its_offset() {
         let (runtime, mut server) = actor_pair();
         let payload = Bytes::from_static(&[0, 0xfe, 0xff, b'i', b'n']);
         let expected = payload.clone();
         let server_task = tokio::spawn(async move {
-            let (header, request) = read_rpc_request(&mut server).await;
-            assert_eq!(request["method"], "job.attachWrite");
-            assert_eq!(request["binaryLength"], expected.len());
-            assert!(request["params"].get("bytes").is_none());
-            assert_eq!(
-                request["params"],
-                json!({
-                    "repoId": "acme/widget",
-                    "workspace": "raven",
-                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
-                    "jobId": 7,
-                })
-            );
-            assert!(!header.contains(&0));
-            assert!(!header.contains(&0xff));
-            let frame = read_binary_frame(&mut server, expected.len())
-                .await
-                .unwrap();
-            assert_eq!(frame, expected.as_ref());
-            write_rpc_success(
-                &mut server,
-                request["id"].as_u64().unwrap(),
-                json!({}),
-                None,
-            )
-            .await;
+            for offset in [4096, 4096 + expected.len()] {
+                let (header, request) = read_rpc_request(&mut server).await;
+                assert_eq!(request["method"], "job.attachWrite");
+                assert_eq!(request["binaryLength"], expected.len());
+                assert!(request["params"].get("bytes").is_none());
+                assert_eq!(
+                    request["params"],
+                    json!({
+                        "repoId": "acme/widget",
+                        "workspace": "raven",
+                        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                        "jobId": 7,
+                        "offset": offset,
+                    })
+                );
+                assert!(!header.contains(&0));
+                assert!(!header.contains(&0xff));
+                let frame = read_binary_frame(&mut server, expected.len())
+                    .await
+                    .unwrap();
+                assert_eq!(frame, expected.as_ref());
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({}),
+                    None,
+                )
+                .await;
+            }
         });
-        let stdin = JobStdin {
-            authority: test_authority(),
-            id: JobId::new(7).unwrap(),
-            runtime,
-        };
+        let stdin = JobStdin::new(test_authority(), JobId::new(7).unwrap(), runtime, 4096);
 
+        stdin.write(payload.clone()).await.unwrap();
         stdin.write(payload).await.unwrap();
         server_task.await.unwrap();
     }
@@ -4184,11 +4242,7 @@ mod tests {
         let attachment = JobAttachment {
             authority: Arc::clone(&authority),
             id,
-            stdin: JobStdin {
-                authority,
-                id,
-                runtime: Arc::clone(&runtime_trait),
-            },
+            stdin: JobStdin::new(authority, id, Arc::clone(&runtime_trait), 0),
             stdout: RawByteStream {
                 receiver: stdout_receiver,
             },

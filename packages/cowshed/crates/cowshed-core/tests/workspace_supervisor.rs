@@ -11,6 +11,7 @@ use cowshed_core::api::{
     ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark,
     JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
     OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
+    StdinKind,
     StdinSource, StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
@@ -78,7 +79,7 @@ impl SpawnSink for FakeSpawner {
         self.spawned
             .send(Spawned {
                 request: request.clone(),
-                events,
+                events: events.clone(),
             })
             .expect("spawn observer");
         let pid = 10_000 + u32::try_from(request.job_id.get()).unwrap();
@@ -94,8 +95,10 @@ impl SpawnSink for FakeSpawner {
                 host: cowshed_core::host_load::read_host_load(),
             },
             observations: self.process_observations.clone(),
+            events,
             backpressure: self.backpressure,
             writes: 0,
+            closes: 0,
         }))
     }
 }
@@ -104,8 +107,14 @@ struct FakeProcess {
     job_id: JobId,
     process: OwnedProcess,
     observations: mpsc::UnboundedSender<ProcessObservation>,
+    /// Where an unbackpressured fake reports each write it took as written to the child.
+    events: mpsc::Sender<ProcessEvent>,
+    /// A backpressured fake refuses its second write and its first close: its one-slot lane is
+    /// still busy with the write before. It reports no write written; the test sends each
+    /// `StdinReady` itself.
     backpressure: bool,
     writes: usize,
+    closes: usize,
 }
 
 impl RunningProcess for FakeProcess {
@@ -121,14 +130,23 @@ impl RunningProcess for FakeProcess {
         self.observations
             .send(ProcessObservation::Stdin(self.job_id, bytes))
             .expect("process observer");
+        if !self.backpressure {
+            let events = self.events.clone();
+            let job_id = self.job_id;
+            tokio::spawn(async move { events.send(ProcessEvent::StdinReady { job_id }).await });
+        }
         Ok(true)
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
+    fn close_stdin(&mut self) -> bool {
+        self.closes += 1;
+        if self.backpressure && self.closes == 1 {
+            return false;
+        }
         self.observations
             .send(ProcessObservation::StdinClosed(self.job_id))
             .expect("process observer");
-        Ok(())
+        true
     }
 
     // A fake has no pipe to close; the supervisor's own stdin state says it ended.
@@ -700,7 +718,7 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
                 .spawn(spawned.request, events)
                 .await
                 .expect("spawn admitted job");
-            process.close_stdin().unwrap();
+            assert!(process.close_stdin(), "a fresh lane takes the EOF");
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut eof_count = 0;
@@ -1042,47 +1060,68 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
     ));
 }
 
+/// A write is answered once the pump reports it written to the child, and the job's stdin cursor
+/// counts only such bytes: a write the lane took but the pump has not written is neither answered
+/// nor counted, and one behind it waits in the queue until the lane has room.
 #[tokio::test]
-async fn stdin_write_observes_bounded_backpressure() {
+async fn stdin_write_observes_bounded_backpressure_and_counts_only_delivered_bytes() {
     let (mut h, _root) = harness(1, 1024, false, true);
-    let (stream_writer, stream_reader) = tokio::io::duplex(8);
     let job = h
         .handle
-        .exec(
-            None,
-            None,
-            request(StdinSource::Stream(Box::pin(stream_reader))),
-        )
+        .exec(None, None, request(StdinSource::Open))
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
+    let delivered = |handle: WorkspaceSupervisorHandle| async move {
+        handle.info(job).await.unwrap().stdin.bytes
+    };
 
-    h.handle
-        .stdin_write(job, Bytes::from_static(b"first"))
-        .await
-        .unwrap();
+    let handle = h.handle.clone();
+    let first = tokio::spawn(async move {
+        handle
+            .stdin_write(job, 0, Bytes::from_static(b"first"))
+            .await
+    });
     assert_eq!(
         h.process.recv().await.unwrap(),
         ProcessObservation::Stdin(job, Bytes::from_static(b"first"))
     );
+    assert_eq!(
+        delivered(h.handle.clone()).await,
+        0,
+        "the lane took the write; nothing reached the child"
+    );
+    assert!(!first.is_finished());
 
-    let handle = h.handle.clone();
-    let second =
-        tokio::spawn(async move { handle.stdin_write(job, Bytes::from_static(b"second")).await });
-    tokio::task::yield_now().await;
-    assert!(!second.is_finished());
+    // Sent on its first poll, ahead of the status read behind it: the write is queued behind the
+    // busy lane before the pump reports anything.
+    let second = h.handle.stdin_write(job, 5, Bytes::from_static(b"second"));
+    tokio::pin!(second);
+    let sent = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(second.as_mut().poll(context).is_pending())
+    })
+    .await;
+    assert!(sent, "the write waits for the lane");
+    assert_eq!(delivered(h.handle.clone()).await, 0);
     spawned
         .events
         .send(ProcessEvent::StdinReady { job_id: job })
         .await
         .unwrap();
-    second.await.unwrap().unwrap();
+    first.await.unwrap().unwrap();
     assert_eq!(
         h.process.recv().await.unwrap(),
         ProcessObservation::Stdin(job, Bytes::from_static(b"second"))
     );
+    assert_eq!(delivered(h.handle.clone()).await, 5);
+    spawned
+        .events
+        .send(ProcessEvent::StdinReady { job_id: job })
+        .await
+        .unwrap();
+    second.await.unwrap();
+    assert_eq!(delivered(h.handle.clone()).await, 11);
 
-    drop(stream_writer);
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 }
@@ -1622,7 +1661,7 @@ impl SpawnSink for ReapedGroupSpawner {
         self.spawned
             .send(Spawned {
                 request: request.clone(),
-                events,
+                events: events.clone(),
             })
             .expect("spawn observer");
         self.births.send(birth.clone()).expect("birth observer");
@@ -1634,8 +1673,10 @@ impl SpawnSink for ReapedGroupSpawner {
                 host: cowshed_core::host_load::read_host_load(),
             },
             observations: self.process_observations.clone(),
+            events,
             backpressure: false,
             writes: 0,
+            closes: 0,
         }))
     }
 }
@@ -2901,6 +2942,302 @@ async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
         .unwrap_err();
     assert_eq!(lookup.admission_source(), Some(&unprovable));
     assert!(h.spawned.try_recv().is_err(), "nothing ran under the key");
+}
+
+/// A job admitted with open stdin keeps it open for its attachment, over the socket the
+/// controller reaches its supervisor through: a written line reaches the job and its echo is
+/// readable before any EOF; ending stdin twice delivers one EOF; a later write is a conflict;
+/// and neither ends the job, which exits 0 on its own.
+#[tokio::test]
+async fn an_open_stdin_answers_before_one_eof_and_never_ends_the_job() {
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, request(StdinSource::Open))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let admitted = remote.info(job).await.unwrap().stdin;
+    assert_eq!(
+        (admitted.kind, admitted.complete),
+        (StdinKind::Stream, false)
+    );
+
+    let line = Bytes::from_static(b"line\n");
+    remote.stdin_write(job, 0, line.clone()).await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, line.clone()),
+        "the line reached the job before anything ended its stdin"
+    );
+    spawned
+        .events
+        .send(ProcessEvent::Output {
+            job_id: job,
+            stream: StreamKind::Stdout,
+            bytes: line.clone(),
+        })
+        .await
+        .unwrap();
+    let echoed = remote
+        .log_read(job, StreamKind::Stdout, 0, true)
+        .await
+        .unwrap();
+    assert_eq!((echoed.bytes, echoed.eof), (line, false));
+
+    remote.stdin_close(job).await.unwrap();
+    remote.stdin_close(job).await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    let late = remote
+        .stdin_write(job, 5, Bytes::from_static(b"late\n"))
+        .await
+        .unwrap_err();
+    assert_eq!(late.code, ErrorCode::Conflict, "{late:?}");
+    assert_eq!(
+        late.stdin_source(),
+        Some(cowshed_core::StdinRefusal::Ended { cursor: 5 })
+    );
+    // Both closes and the refused write were answered after the actor acted on them, so a
+    // second EOF or a late byte would already be queued here.
+    assert_eq!(
+        h.process.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "one EOF and nothing after it reached the job"
+    );
+    let running = remote.info(job).await.unwrap();
+    assert_eq!(running.state, JobState::Running, "EOF did not end the job");
+    assert_eq!((running.stdin.bytes, running.stdin.complete), (5, true));
+
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = remote.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.exit),
+        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }))
+    );
+}
+
+/// A close that finds the job's lane still holding its last write waits for the lane rather than
+/// failing, refuses every write after it at once, and sends its one EOF when the pump reports
+/// the write taken.
+#[tokio::test]
+async fn a_close_behind_a_busy_lane_waits_for_it_and_refuses_later_writes() {
+    let (mut h, _root) = harness(1, 1024, false, true);
+    let job = h
+        .handle
+        .exec(None, None, request(StdinSource::Open))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let handle = h.handle.clone();
+    let last = tokio::spawn(async move {
+        handle
+            .stdin_write(job, 0, Bytes::from_static(b"last\n"))
+            .await
+    });
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, Bytes::from_static(b"last\n"))
+    );
+
+    // The close reaches the actor before the write: each call is sent on its first poll.
+    let close = h.handle.stdin_close(job);
+    tokio::pin!(close);
+    let late = tokio::select! {
+        biased;
+        closed = &mut close => panic!("the close answered while the lane was busy: {closed:?}"),
+        late = h.handle.stdin_write(job, 5, Bytes::from_static(b"late\n")) => late,
+    };
+    assert_eq!(late.unwrap_err().code, ErrorCode::Conflict);
+    assert_eq!(
+        h.process.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "no EOF while the lane still holds the write"
+    );
+
+    spawned
+        .events
+        .send(ProcessEvent::StdinReady { job_id: job })
+        .await
+        .unwrap();
+    last.await.unwrap().unwrap();
+    close.await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.exit, ended.stdin.bytes, ended.stdin.complete),
+        (Some(ExitStatus::Exited { code: 0 }), 5, true)
+    );
+}
+
+/// A writer that repeats bytes the job already holds -- the answer to its write was lost -- is
+/// answered without anything reaching the job twice, but only when the bytes are the ones the
+/// job received: other bytes over the same range are a typed conflict naming the cursor, and so
+/// is a write that neither continues the input nor lies within it.
+#[tokio::test]
+async fn a_repeated_write_is_answered_once_and_only_with_the_bytes_delivered() {
+    use cowshed_core::StdinRefusal;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, request(StdinSource::Open))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    remote
+        .stdin_write(job, 0, Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, Bytes::from_static(b"abc"))
+    );
+
+    for (offset, bytes) in [(0, &b"abc"[..]), (1, &b"bc"[..]), (3, &b""[..])] {
+        remote
+            .stdin_write(job, offset, Bytes::from_static(bytes))
+            .await
+            .unwrap_or_else(|error| panic!("repeat at {offset}: {error:?}"));
+    }
+    let refusal = |offset, bytes: &'static [u8]| {
+        let remote = remote.clone();
+        async move {
+            let error = remote
+                .stdin_write(job, offset, Bytes::from_static(bytes))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+            error.stdin_source()
+        }
+    };
+    assert_eq!(
+        refusal(0, b"abX").await,
+        Some(StdinRefusal::ReplayMismatch {
+            offset: 0,
+            cursor: 3
+        })
+    );
+    assert_eq!(
+        refusal(2, b"cde").await,
+        Some(StdinRefusal::Discontinuous {
+            offset: 2,
+            cursor: 3,
+            admitted: 3
+        })
+    );
+    assert_eq!(
+        refusal(5, b"z").await,
+        Some(StdinRefusal::Discontinuous {
+            offset: 5,
+            cursor: 3,
+            admitted: 3
+        })
+    );
+    // Every call above was answered after the actor acted on it: a repeated byte would be here.
+    assert_eq!(
+        h.process.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "nothing reached the job twice"
+    );
+    assert_eq!(remote.info(job).await.unwrap().stdin.bytes, 3);
+
+    remote
+        .stdin_write(job, 3, Bytes::from_static(b"def"))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, Bytes::from_static(b"def"))
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(remote.wait(job).await.unwrap().stdin.bytes, 6);
+}
+
+/// A write the pipe refused partway leaves how much of it reached the job unknown: the write in
+/// flight is refused with the cursor before it, and so is every later write and close, however
+/// exactly they repeat it. The job itself runs on.
+#[tokio::test]
+async fn a_partly_delivered_write_refuses_every_later_write_with_the_last_known_cursor() {
+    use cowshed_core::StdinRefusal;
+    let (mut h, _root) = harness(1, 1024, false, true);
+    let job = h
+        .handle
+        .exec(None, None, request(StdinSource::Open))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let handle = h.handle.clone();
+    let delivered = tokio::spawn(async move {
+        handle
+            .stdin_write(job, 0, Bytes::from_static(b"kept"))
+            .await
+    });
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, Bytes::from_static(b"kept"))
+    );
+    spawned
+        .events
+        .send(ProcessEvent::StdinReady { job_id: job })
+        .await
+        .unwrap();
+    delivered.await.unwrap().unwrap();
+
+    // The fake's lane refuses its second write, so it waits in the queue -- sent on its first
+    // poll, ahead of the status read behind it -- and the lane takes it as its third.
+    let queued = h.handle.stdin_write(job, 4, Bytes::from_static(b"lost"));
+    tokio::pin!(queued);
+    let sent = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(queued.as_mut().poll(context).is_pending())
+    })
+    .await;
+    assert!(sent, "the write waits for the lane");
+    assert_eq!(h.handle.info(job).await.unwrap().stdin.bytes, 4);
+    spawned
+        .events
+        .send(ProcessEvent::StdinReady { job_id: job })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, Bytes::from_static(b"lost"))
+    );
+    spawned
+        .events
+        .send(ProcessEvent::StdinBroken {
+            job_id: job,
+            error: "Broken pipe (os error 32)".into(),
+        })
+        .await
+        .unwrap();
+    let unknown = Some(StdinRefusal::DeliveryUnknown { cursor: 4 });
+    let lost = queued.await.unwrap_err();
+    assert_eq!(lost.stdin_source(), unknown, "{lost:?}");
+    assert!(lost.message.contains("Broken pipe"), "{}", lost.message);
+    for repeat in [
+        h.handle
+            .stdin_write(job, 4, Bytes::from_static(b"lost"))
+            .await,
+        h.handle
+            .stdin_write(job, 0, Bytes::from_static(b"kept"))
+            .await,
+        h.handle.stdin_close(job).await,
+    ] {
+        assert_eq!(repeat.unwrap_err().stdin_source(), unknown);
+    }
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.state, info.stdin.bytes, info.stdin.complete),
+        (JobState::Running, 4, false)
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(job).await.unwrap().state, JobState::Exited);
 }
 
 #[tokio::test]

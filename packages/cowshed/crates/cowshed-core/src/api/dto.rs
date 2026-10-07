@@ -2196,9 +2196,11 @@ impl<'de> Deserialize<'de> for ExecRecord {
 /// its own spelling and maps into it here:
 ///
 /// - CLI flags (`cowshed-cli/src/runtime.rs`, `exec_command`): no flag → `Empty`,
-///   `--stdin` → `Stream`, `--stdin-file` → `WorkspaceFile`, `--stdin-base64` → `Inline`.
+///   `--stdin` → `Stream`, `--stdin-file` → `WorkspaceFile`, `--stdin-base64` → `Inline`;
+///   `Open` has no flag.
 /// - napi wire (`cowshed-napi/src/lib.rs`, `NapiExecRequest`): `stdin` string → `Inline`,
-///   `stdinWorkspacePath` → `WorkspaceFile`, neither → `Empty`; `Stream` has no wire spelling.
+///   `stdinWorkspacePath` → `WorkspaceFile`, neither → `Empty`; `Stream` and `Open` have no wire
+///   spelling.
 ///
 /// Each frontend pins its mapping with an exhaustive-match seam (`cli_stdin_spelling`,
 /// `wire_stdin_spelling`), so adding a variant here breaks those matches at compile time instead
@@ -2208,6 +2210,10 @@ pub enum StdinSource {
     Inline(Bytes),
     Stream(Pin<Box<dyn AsyncRead + Send>>),
     WorkspaceFile(WorkspacePath),
+    /// Stdin stays open after admission with no source behind it: the job's attachment writes it
+    /// through `JobStdin::write` and ends it, once, through `JobStdin::close`. Its `StdinInfo`
+    /// kind is `stream`.
+    Open,
 }
 
 impl fmt::Debug for StdinSource {
@@ -2219,6 +2225,7 @@ impl fmt::Debug for StdinSource {
             Self::WorkspaceFile(path) => {
                 formatter.debug_tuple("WorkspaceFile").field(path).finish()
             }
+            Self::Open => formatter.write_str("Open"),
         }
     }
 }

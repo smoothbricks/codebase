@@ -365,7 +365,7 @@ impl RunningProcess for PooledProcess {
         self.stdin.try_write(bytes)
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
+    fn close_stdin(&mut self) -> bool {
         self.stdin.close()
     }
 
