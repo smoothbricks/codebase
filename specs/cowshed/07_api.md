@@ -773,7 +773,9 @@ by zero. RSS is the simultaneously sampled group sum; peak is its maximum observ
 current group, never a truncated membership claim; CPU/RSS accounting covers every member. A sample exceeding the
 generated frame bound is a typed error, not a silently shortened list. `leaderPid` retains the job's observed leader
 after exit; terminal membership may be empty. An incomplete kernel membership read is an operational error, never
-evidence of an empty group.
+evidence of an empty group. On Linux a retained pidfd judges each procfs read after it completes: a process proven
+departed is no current member, even when its stat read reports `ESRCH`; a read failure for a process still alive remains
+an operational error.
 
 `volumes` compares the used bytes of the workspace volume and the job's build volume at spawn with those at the sample
 boundary. Deltas are signed and never clamped: deletion can shrink a volume. They describe volume-wide usage, not
