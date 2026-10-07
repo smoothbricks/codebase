@@ -682,8 +682,8 @@ impl fmt::Debug for Cowshed {
 #[derive(Clone)]
 pub struct Project {
     repo_id: RepoId,
-    binding: RepositoryBinding,
-    git_root: PathBuf,
+    binding: Arc<RepositoryBinding>,
+    git_root: Arc<Path>,
     paths: ProjectPaths,
     runtime: Arc<dyn ControllerRuntime>,
 }
@@ -2340,8 +2340,8 @@ mod tests {
         .unwrap();
         let project = Project {
             repo_id: repo_id.clone(),
-            binding,
-            git_root: PathBuf::from("/repo"),
+            binding: Arc::new(binding),
+            git_root: Arc::from(Path::new("/repo")),
             paths: ProjectPaths::with_mount_root(
                 "/tmp/cowshed-capability-tests",
                 "/tmp/cowshed-capability-tests/mnt",

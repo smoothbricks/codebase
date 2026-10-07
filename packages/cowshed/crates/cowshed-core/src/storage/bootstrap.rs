@@ -749,7 +749,7 @@ pub enum MountGuardError {
 /// a root a caller provisioned itself ([`Self::at`]), such as a scratch store of real APFS images.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
-    store: PathBuf,
+    store: Arc<Path>,
     telemetry: PathBuf,
 }
 
@@ -760,10 +760,18 @@ impl CanonicalRoots {
 
     pub fn at(store: PathBuf) -> Self {
         let telemetry = store.join("telemetry");
-        Self { store, telemetry }
+        Self {
+            store: Arc::from(store),
+            telemetry,
+        }
     }
 
     pub fn store(&self) -> &Path {
+        &self.store
+    }
+
+    /// The store root shared, so a project's identity answer names it without copying it.
+    pub fn shared_store(&self) -> &Arc<Path> {
         &self.store
     }
 

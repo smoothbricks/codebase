@@ -59,7 +59,8 @@ impl RepoId {
                 };
             RepoIdError::InvalidComponent { component }
         })?;
-        Ok(Self(Arc::from(format!("{owner}/{repo}"))))
+        // Exactly two validated components: `value` is already the canonical `owner/repo`.
+        Ok(Self(Arc::from(value)))
     }
 
     pub fn from_remote_url(value: &str) -> Result<Self, RemoteUrlError> {

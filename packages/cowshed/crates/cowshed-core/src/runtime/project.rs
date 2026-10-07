@@ -67,8 +67,8 @@ pub struct WorkspaceSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectDescriptor {
     pub repo_id: RepoId,
-    pub binding: RepositoryBinding,
-    pub git_root: PathBuf,
+    pub binding: std::sync::Arc<RepositoryBinding>,
+    pub git_root: std::sync::Arc<Path>,
     pub storage: crate::storage::bootstrap::ValidatedHostStorage,
 }
 
@@ -1159,9 +1159,9 @@ impl ProjectActor {
         let descriptor = self.host.descriptor();
         Ok(ProjectOpened {
             repo_id: descriptor.repo_id.clone(),
-            binding: descriptor.binding.clone(),
-            git_root: descriptor.git_root.clone(),
-            store_root: descriptor.storage.store().to_path_buf(),
+            binding: std::sync::Arc::clone(&descriptor.binding),
+            git_root: std::sync::Arc::clone(&descriptor.git_root),
+            store_root: std::sync::Arc::clone(descriptor.storage.roots().shared_store()),
         })
     }
 
@@ -1221,14 +1221,21 @@ impl ProjectActor {
             .map(|snapshot| snapshot.info)
     }
 
+    /// A workspace's grants. A request that holds an incarnation is fenced on it whatever its
+    /// connection: a worker handle minted on the coordinator's connection holds one too, and a
+    /// name recreated meanwhile never answers for the incarnation it was minted for.
     async fn workspace_grants(
         &mut self,
         authority: &ConnectionAuthority,
         params: WorkspaceGrantsRequest,
     ) -> Result<GrantSet> {
-        self.scoped_snapshot(authority, &params.repo_id, &params.workspace)
-            .await
-            .map(|snapshot| snapshot.grants)
+        let snapshot = self
+            .scoped_snapshot(authority, &params.repo_id, &params.workspace)
+            .await?;
+        if let Some(held) = &params.workspace_incarnation {
+            Self::require_held_incarnation(&snapshot, held)?;
+        }
+        Ok(snapshot.grants)
     }
 
     /// The build volume a job of the workspace would be granted now: what a coordinator that
@@ -1239,16 +1246,7 @@ impl ProjectActor {
         self.require_repo(&params.repo_id)?;
         let snapshots = self.host.snapshots().await?;
         let snapshot = find_workspace(&snapshots, &params.workspace)?;
-        if snapshot.info.workspace_incarnation != params.workspace_incarnation {
-            return Err(CowshedError::fence_refusal(
-                crate::error::FenceRefusal::IncarnationMoved {
-                    workspace: params.workspace,
-                    observed: snapshot.info.workspace_incarnation.clone(),
-                },
-                "workspace incarnation is stale",
-                "resolve the workspace again and retry",
-            ));
-        }
+        Self::require_held_incarnation(snapshot, &params.workspace_incarnation)?;
         if snapshot.info.state != WorkspaceState::Attached {
             return Err(CowshedError::conflict(
                 format!(
@@ -1260,6 +1258,25 @@ impl ProjectActor {
         }
         let volume = self.host.build_volume(params.workspace).await?;
         Ok(BuildVolume { volume })
+    }
+
+    /// Refuses a request that holds another incarnation of `snapshot`'s workspace than the one it
+    /// is now.
+    fn require_held_incarnation(
+        snapshot: &WorkspaceSnapshot,
+        held: &WorkspaceIncarnation,
+    ) -> Result<()> {
+        if &snapshot.info.workspace_incarnation == held {
+            return Ok(());
+        }
+        Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::IncarnationMoved {
+                workspace: snapshot.info.workspace.clone(),
+                observed: snapshot.info.workspace_incarnation.clone(),
+            },
+            "workspace incarnation is stale",
+            "resolve the workspace again and retry",
+        ))
     }
 
     async fn coordinator_adopt(&mut self, params: AdoptRequest) -> Result<WorkspaceView> {
@@ -2694,8 +2711,8 @@ impl NativeProjectRuntimeHost {
         .await?;
         let descriptor = ProjectDescriptor {
             repo_id,
-            binding,
-            git_root,
+            binding: std::sync::Arc::new(binding),
+            git_root: std::sync::Arc::from(git_root),
             storage,
         };
         Ok(Self {
@@ -3261,7 +3278,7 @@ impl NativeProjectRuntimeHost {
     /// Persist a transport move and serve under it from now on.
     async fn record_binding(&mut self, moved: RepositoryBinding) -> Result<()> {
         persist_binding(&self.layout, &moved).await?;
-        self.descriptor.binding = moved;
+        self.descriptor.binding = std::sync::Arc::new(moved);
         Ok(())
     }
 
@@ -3912,7 +3929,7 @@ impl NativeProjectRuntimeHost {
     fn rebind_checkout(&mut self, checkout_path: &Path) -> Result<()> {
         let config = self.substrate_config.rebind_checkout(checkout_path);
         self.rebind_substrate(config)?;
-        self.descriptor.git_root = checkout_path.to_owned();
+        self.descriptor.git_root = std::sync::Arc::from(checkout_path);
         self.git = crate::git::GitRepository::from_root(checkout_path);
         Ok(())
     }
@@ -3934,7 +3951,7 @@ impl NativeProjectRuntimeHost {
         self.rebind_substrate(config)?;
         self.layout = layout;
         self.descriptor.repo_id = repo_id;
-        self.descriptor.binding = binding;
+        self.descriptor.binding = std::sync::Arc::new(binding);
         self.lifecycle_intents_path = self
             .layout
             .project()
@@ -4422,7 +4439,7 @@ impl NativeProjectRuntimeHost {
         git_worktree: bool,
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
         Ok(crate::storage::lifecycle::OperationIdentity {
-            project_root: self.descriptor.git_root.clone(),
+            project_root: self.descriptor.git_root.to_path_buf(),
             base_commit: self.git.head_oid().await?.as_str().to_owned(),
             // One clock for the runtime module. Spawning `/bin/date` was a process, a pipe, and
             // a UTF-8 parse to render what `SystemTime` already holds.
@@ -4589,7 +4606,7 @@ impl NativeProjectRuntimeHost {
         let main = || -> Result<NativeLandingInto> {
             Ok(NativeLandingInto {
                 name: main_name(),
-                root: self.descriptor.git_root.clone(),
+                root: self.descriptor.git_root.to_path_buf(),
                 mount: self.workspace_mount_path(&main_name())?,
             })
         };
@@ -5359,7 +5376,7 @@ impl NativeProjectRuntimeHost {
                 }
                 let actual = crate::metadata::read_json::<RepositoryBinding>(path)
                     .map_err(native_integrity_error)?;
-                if actual != expected {
+                if &actual != expected.as_ref() {
                     return Err(CowshedError::integrity(
                         "repository binding changed during adoption rollback",
                         "restore the exact binding and retry",
@@ -7692,7 +7709,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             "adopt",
             "secrets",
             enforce_adopt_secret_policy(
-                self.descriptor.git_root.clone(),
+                self.descriptor.git_root.to_path_buf(),
                 self.layout.project().waivers.clone(),
                 self.layout.project().quarantine.clone(),
                 options.quarantine,
@@ -7720,7 +7737,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 repo: self.descriptor.repo_id.clone(),
                 capacity,
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
-                source_checkout: self.descriptor.git_root.clone(),
+                source_checkout: self.descriptor.git_root.to_path_buf(),
                 pre_cowshed_checkout: pre_cowshed,
                 identity,
             })
@@ -11280,7 +11297,7 @@ pub async fn bind_remote_identity(
                 "cowshed doctor --json",
             )
         })?;
-        let remotes = crate::git::GitRepository::from_root(&descriptor.git_root)
+        let remotes = crate::git::GitRepository::from_root(&*descriptor.git_root)
             .remotes()
             .await?;
         let store = descriptor.storage.store().to_path_buf();

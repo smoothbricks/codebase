@@ -260,8 +260,8 @@ impl FakeHost {
         Self {
             descriptor: ProjectDescriptor {
                 repo_id,
-                binding,
-                git_root: root.join("checkout"),
+                binding: std::sync::Arc::new(binding),
+                git_root: std::sync::Arc::from(root.join("checkout")),
                 storage: cowshed_core::storage::bootstrap::ValidatedHostStorage::new(
                     root.join("home"),
                     cowshed_core::storage::bootstrap::CanonicalRoots::at(root.join("store")),
@@ -349,7 +349,7 @@ impl FakeHost {
                 },
                 mount: workspace.mount.clone().unwrap_or_else(|| {
                     if workspace.name.is_main() {
-                        self.descriptor.git_root.clone()
+                        self.descriptor.git_root.to_path_buf()
                     } else {
                         self.descriptor
                             .storage
@@ -673,13 +673,13 @@ impl ProjectRuntimeHost for FakeHost {
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
         // The checkout path is the descriptor's project root, and main's mount is derived from it,
         // so the returned mount is what witnesses that the move reached the host at all.
-        if destination == self.descriptor.git_root {
+        if *destination == *self.descriptor.git_root {
             return Err(CowshedError::usage(
                 "the checkout is already there",
                 "choose a different destination path",
             ));
         }
-        self.descriptor.git_root = destination;
+        self.descriptor.git_root = std::sync::Arc::from(destination);
         let main = WorkspaceName::new("main").expect("main");
         let current = self.workspace(&main)?;
         Ok(self.snapshot(current))
@@ -690,9 +690,9 @@ impl ProjectRuntimeHost for FakeHost {
         // replaces it. Sessions never converge — only main's checkout has a recorded path.
         if let Some(observed) = options.observed_path
             && workspace.is_main()
-            && observed != self.descriptor.git_root
+            && *observed != *self.descriptor.git_root
         {
-            self.descriptor.git_root = observed;
+            self.descriptor.git_root = std::sync::Arc::from(observed);
         }
         self.workspace_mut(&workspace)?.attached = true;
         self.persist()
@@ -906,7 +906,7 @@ impl ProjectRuntimeHost for FakeHost {
             if !self.removal.restore_swapped {
                 self.events
                     .send(Event::AtomicCheckoutRestore(
-                        self.descriptor.git_root.clone(),
+                        self.descriptor.git_root.to_path_buf(),
                     ))
                     .ok();
                 self.removal.pre_cowshed_present = false;
@@ -2236,6 +2236,49 @@ async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation
     .expect_err("a detached checkout's link is not read");
     assert_eq!(detached.code, ErrorCode::Conflict);
     assert!(detached.fence_source().is_none(), "{detached:?}");
+}
+
+/// A worker handle minted on the coordinator's own connection holds its incarnation, and its
+/// grants read is fenced on it although the connection is not a worker's: a stale incarnation is
+/// refused, while a reference that holds none still reads by name.
+#[tokio::test]
+async fn a_grants_read_that_holds_an_incarnation_is_fenced_on_a_coordinator_connection() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let created = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "fenced", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    let held = created["info"]["workspaceIncarnation"].clone();
+    let read = |incarnation: Option<Value>| {
+        let mut params = json!({ "repoId": repo, "workspace": "fenced" });
+        if let Some(incarnation) = incarnation {
+            params["workspaceIncarnation"] = incarnation;
+        }
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "workspace.grants",
+            params,
+        )
+    };
+
+    let current = read(Some(held)).await.expect("the held incarnation reads");
+    assert_eq!(current, created["grants"]);
+    let stale = read(Some(json!(incarnation(9_999))))
+        .await
+        .expect_err("another incarnation is never answered for");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+    assert!(stale.fence_source().is_some(), "{stale:?}");
+    let named = read(None)
+        .await
+        .expect("a reference that holds none reads by name");
+    assert_eq!(named, created["grants"]);
 }
 
 #[tokio::test]

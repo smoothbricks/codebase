@@ -499,7 +499,7 @@ impl ActorBridge {
     fn git_root(&self) -> Result<&Path> {
         self.runtime
             .as_ref()
-            .map(|runtime| runtime.descriptor().git_root.as_path())
+            .map(|runtime| &*runtime.descriptor().git_root)
             .ok_or_else(|| {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })

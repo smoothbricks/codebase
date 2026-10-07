@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Who may call an operation over a controller connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,13 +330,15 @@ pub struct ProjectOpenRequest {
     pub path: String,
 }
 
+/// The bound project's identity. Its fields are the controller's own shared values, so answering
+/// an open copies them once, into the wire form.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectOpened {
     pub repo_id: RepoId,
-    pub binding: RepositoryBinding,
-    pub git_root: PathBuf,
-    pub store_root: PathBuf,
+    pub binding: Arc<RepositoryBinding>,
+    pub git_root: Arc<Path>,
+    pub store_root: Arc<Path>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
