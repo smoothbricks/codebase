@@ -29,12 +29,13 @@ use crate::api::dto::{
 };
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
-    LogsChunk, LogsRequest, Operation, OperationRequest, ProjectOpenRequest, ProjectOpened,
-    RepoRequest, Scope, TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest,
-    WorkspaceRequest, WorkspaceView, encode_result,
+    LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest, ProjectOpenRequest,
+    ProjectOpened, RepoRequest, Scope, TailRequest, WorkerScope, WorkspaceAtRequest,
+    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
 };
+use crate::api::resources::SampleInterval;
 use crate::api::server::{
-    ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
+    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 #[cfg(target_os = "macos")]
@@ -43,6 +44,7 @@ use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
+use crate::runtime::job_progress::JobProgressStream;
 #[cfg(target_os = "macos")]
 use crate::timing::timed_async;
 
@@ -340,6 +342,14 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobAnswer<JobListeningPorts>>;
+    /// The job's progress, sampled every `every`: its first read is the only wait.
+    async fn progress_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: SampleInterval,
+    ) -> Result<JobAnswer<JobProgressStream>>;
 }
 
 /// An answer a job gives when it reaches a point — its end, its next output — and so may take
@@ -848,6 +858,12 @@ impl ProjectActor {
             Op::JobListeningPortsRead(params) => {
                 return self
                     .job_listening_ports(&authority, params)
+                    .await
+                    .map(Routed::Later);
+            }
+            Op::JobProgress(params) => {
+                return self
+                    .job_progress(&authority, params)
                     .await
                     .map(Routed::Later);
             }
@@ -1486,6 +1502,29 @@ impl ProjectActor {
         }))
     }
 
+    async fn job_progress(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: ProgressRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let progress = self
+            .host
+            .progress_job(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+                params.every_ms,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            Ok(RouterResponse::events(Box::new(ProgressEvents(
+                progress.await?,
+            ))))
+        }))
+    }
+
     async fn job_wait(
         &mut self,
         authority: &ConnectionAuthority,
@@ -1681,6 +1720,17 @@ fn workspace_view(snapshot: WorkspaceSnapshot) -> WorkspaceView {
 /// Answers a call with its operation's declared result.
 fn respond<O: Operation>(result: &O::Result) -> Result<RouterResponse> {
     encode_result::<O>(result).map(RouterResponse::json)
+}
+
+/// A job's progress subscription, as the events of its `job.progress` call.
+struct ProgressEvents(JobProgressStream);
+
+#[async_trait]
+impl EventSource for ProgressEvents {
+    async fn next(&mut self) -> Option<Result<serde_json::Value>> {
+        let sample = self.0.next().await?;
+        Some(sample.and_then(|sample| encode_result::<operations::JobProgress>(&sample)))
+    }
 }
 
 fn canonical_input_path(path: &str) -> Result<PathBuf> {
@@ -11052,6 +11102,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let supervisor = self.ensure_supervisor(&workspace).await?;
         Ok(Box::pin(
             async move { supervisor.listening_ports(job).await },
+        ))
+    }
+
+    async fn progress_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: SampleInterval,
+    ) -> Result<JobAnswer<JobProgressStream>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(
+            async move { supervisor.progress(job, every).await },
         ))
     }
 }

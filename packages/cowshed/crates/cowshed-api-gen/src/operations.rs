@@ -1,7 +1,7 @@
 //! The controller's operation table, read from the one `operations!` invocation that declares it
 //! (`cowshed-core/src/api/operations.rs`). Each row parses exactly as the macro matches it:
-//! `scope lane "method" Marker(Request) -> Result;`, `lane` being `json`, `upload` or
-//! `download(offset_field)`.
+//! `scope lane "method" Marker(Request) -> Result;`, `lane` being `json`, `upload`,
+//! `download(offset_field)` or `stream`.
 
 use syn::parse::{Parse, ParseStream};
 use syn::{Attribute, Ident, Item, LitStr, Token, Type, parenthesized};
@@ -19,6 +19,8 @@ pub enum Lane {
     Upload,
     /// The request field the raw-byte frame starts at.
     Download(String),
+    /// Events of the result type, one per demand, then the call's end.
+    Stream,
 }
 
 pub struct Operation {
@@ -120,6 +122,7 @@ fn row(input: ParseStream<'_>) -> syn::Result<Operation> {
             let field: Ident = offset.parse()?;
             Lane::Download(field.to_string())
         }
+        "stream" => Lane::Stream,
         _ => return Err(syn::Error::new_spanned(lane, "unknown operation lane")),
     };
     let method: LitStr = input.parse()?;
@@ -154,17 +157,20 @@ mod tests {
                 worker download(offset) "job.logs" JobLogs(LogsRequest) -> LogsChunk;
                 /// Lists jobs.
                 worker json "worker.listJobs" WorkerListJobs(WorkerScope) -> Vec<JobInfo>;
+                /// Streams one job's resource samples.
+                worker stream "job.progress" JobProgress(ProgressRequest) -> JobResourceSample;
             }
             "#,
         )
         .expect("table");
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 3);
         assert_eq!(operations[0].lane, Lane::Download("offset".to_owned()));
         assert_eq!(operations[0].prefix(), "job");
         assert_eq!(operations[0].name(), "logs");
         assert_eq!(operations[0].marker, "JobLogs");
         assert_eq!(operations[1].scope, Scope::Worker);
         assert_eq!(operations[1].docs, ["Lists jobs."]);
+        assert_eq!(operations[2].lane, Lane::Stream);
     }
 
     #[test]

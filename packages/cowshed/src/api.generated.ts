@@ -1362,6 +1362,17 @@ export type ProcessUsage = {
 };
 
 /**
+ * A progress subscription to one job, sampled every `everyMs`.
+ */
+export type ProgressRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly jobId: JobId;
+  readonly everyMs: SampleInterval;
+};
+
+/**
  * A change to the project's standing policy: read grants, egress grants and
  * workspace-relative denies. A write allow stays per-workspace (`GrantDelta`).
  */
@@ -1716,6 +1727,12 @@ export type Retry = { readonly reason: 'gcPlanStale' };
 export type RevisionTarget = { readonly branch: BranchName } | { readonly ref: GitRef } | { readonly oid: GitOid };
 
 export type RunSandboxMode = 'readWrite' | 'readOnly';
+
+/**
+ * How often a progress subscriber is sent a job's sample, in whole milliseconds: positive, and
+ * within the bound every projection holds exactly.
+ */
+export type SampleInterval = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
 
 /**
  * What the running sccache daemon reports about itself.
