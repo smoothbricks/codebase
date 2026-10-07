@@ -427,7 +427,21 @@ async fn drive(
     // A copy of the job's stderr, for saying why no command ran. It is closed the moment the
     // command starts: while this process holds a writer, the job's stderr never ends, and the
     // job never concludes.
-    let mut diagnostics = io.stderr.try_clone().ok();
+    let mut diagnostics = match io.stderr.try_clone() {
+        Ok(stderr) => Some(std::fs::File::from(stderr)),
+        Err(cause) => {
+            let error = CowshedError::environment_missing(
+                format!("cannot clone the job's stderr for diagnostics: {cause}"),
+                "retry the command; check the supervisor's descriptor limit",
+            );
+            note(&Some(std::fs::File::from(io.stderr)), &error);
+            control.finish();
+            let _ = events
+                .send(ProcessEvent::LaunchFailed { job_id, error })
+                .await;
+            return;
+        }
+    };
     let outcome = run_pooled(
         pool,
         io,
@@ -445,14 +459,7 @@ async fn drive(
         Outcome::Reported => return,
         Outcome::Unobserved(error) => ProcessEvent::WaitFailed { job_id, error },
         Outcome::NotLaunched(error) => {
-            if let Some(diagnostics) = diagnostics {
-                use std::io::Write as _;
-                let _ = writeln!(
-                    std::fs::File::from(diagnostics),
-                    "cowshed: {}",
-                    error.message
-                );
-            }
+            note(&diagnostics, &error);
             ProcessEvent::LaunchFailed { job_id, error }
         }
         Outcome::ScriptSyntax => ProcessEvent::ScriptSyntax { job_id },
@@ -461,12 +468,10 @@ async fn drive(
 }
 
 /// Tell the job, on its own stderr, why its command did not run.
-fn note(stderr: &Option<OwnedFd>, error: &CowshedError) {
+fn note(stderr: &Option<std::fs::File>, error: &CowshedError) {
     use std::io::Write as _;
-    if let Some(stderr) = stderr
-        && let Ok(stderr) = stderr.try_clone()
-    {
-        let _ = writeln!(std::fs::File::from(stderr), "cowshed: {}", error.message);
+    if let Some(mut stderr) = stderr.as_ref() {
+        let _ = writeln!(stderr, "cowshed: {}", error.message);
     }
 }
 
@@ -489,7 +494,7 @@ async fn run_pooled(
     command: RunCommand,
     control: &JobControl,
     mut released: oneshot::Receiver<()>,
-    diagnostics: &mut Option<OwnedFd>,
+    diagnostics: &mut Option<std::fs::File>,
     job_id: JobId,
     events: &mpsc::Sender<ProcessEvent>,
 ) -> Outcome {
@@ -1466,3 +1471,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "shell_job_diagnostics_tests.rs"]
+mod diagnostics_tests;
