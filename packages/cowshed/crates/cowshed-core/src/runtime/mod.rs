@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 pub(crate) mod build_volumes;
 pub mod commitment_feed;
+#[cfg(target_os = "linux")]
+pub mod job_cgroup;
 pub mod job_groups;
 mod job_resources;
 pub(crate) mod nx_daemon;
