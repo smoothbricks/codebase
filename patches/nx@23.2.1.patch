@@ -18,6 +18,238 @@ index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d516
      }
      catch {
          try {
+diff --git a/dist/src/daemon/cache.d.ts b/dist/src/daemon/cache.d.ts
+index 65e58a0..cb060c6 100644
+--- a/dist/src/daemon/cache.d.ts
++++ b/dist/src/daemon/cache.d.ts
+@@ -2,9 +2,29 @@ export interface DaemonProcessJson {
+     processId: number;
+     socketPath: string;
+     nxVersion: string;
++    /** The root the daemon serves; a record written before the claim existed has none. */
++    workspaceRoot?: string;
+ }
+ export declare const serverProcessJsonPath: string;
+ export declare function readDaemonProcessJsonCache(): DaemonProcessJson | null;
+ export declare function deleteDaemonJsonProcessCache(): void;
+-export declare function writeDaemonJsonProcessCache(daemonJson: DaemonProcessJson): Promise<void>;
++/**
++ * What claiming the workspace's daemon record found: the record is now this
++ * process's, another daemon serves the workspace, or one is starting to (retry).
++ * `owner` is `null` for a record still being written.
++ */
++export type DaemonClaim = {
++    kind: 'claimed';
++} | {
++    kind: 'serving';
++    owner: DaemonProcessJson;
++} | {
++    kind: 'starting';
++    owner: DaemonProcessJson | null;
++};
++/**
++ * Makes this process the workspace's daemon of record, unless another daemon of
++ * the same Nx version already serves the same root or is starting to.
++ */
++export declare function claimDaemonJsonProcessCache(daemonJson: DaemonProcessJson): Promise<DaemonClaim>;
+ export declare function getDaemonProcessIdSync(): number | null;
+diff --git a/dist/src/daemon/cache.js b/dist/src/daemon/cache.js
+index 757fd20..1bf7e57 100644
+--- a/dist/src/daemon/cache.js
++++ b/dist/src/daemon/cache.js
+@@ -3,9 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.serverProcessJsonPath = void 0;
+ exports.readDaemonProcessJsonCache = readDaemonProcessJsonCache;
+ exports.deleteDaemonJsonProcessCache = deleteDaemonJsonProcessCache;
+-exports.writeDaemonJsonProcessCache = writeDaemonJsonProcessCache;
++exports.claimDaemonJsonProcessCache = claimDaemonJsonProcessCache;
+ exports.getDaemonProcessIdSync = getDaemonProcessIdSync;
+ const node_fs_1 = require("node:fs");
++const node_net_1 = require("node:net");
+ const path_1 = require("path");
+ const tmp_dir_1 = require("./tmp-dir");
+ const fileutils_1 = require("../utils/fileutils");
+@@ -38,9 +39,177 @@ function deleteDaemonJsonProcessCache() {
+     }
+     catch { }
+ }
+-async function writeDaemonJsonProcessCache(daemonJson) {
+-    await (0, fileutils_1.writeJsonFileAsync)(exports.serverProcessJsonPath, daemonJson, {
+-        appendNewLine: true,
++/**
++ * How long a daemon may take from claiming the record to answering on its
++ * socket: a client waits as long (6000 polls 10 ms apart) for a daemon it starts.
++ */
++const DAEMON_STARTUP_GRACE_MS = 60000;
++/**
++ * Makes this process the workspace's daemon of record, unless another daemon of
++ * the same Nx version already serves the same root (`serving`) or is starting to
++ * (`starting`, retry); `claimed` once the record is this process's. Socket paths
++ * are not compared: by default each daemon's socket directory hashes its own pid.
++ *
++ * Each daemon used to overwrite the record unconditionally, so two clients that
++ * both found no daemon started two, and the later one displaced the first along
++ * with every client connected to it. The record is now created exclusively, with
++ * link(2) from a staged file, so of two daemons racing for a free record exactly
++ * one wins and no reader sees it half written. A holder starts when it claims,
++ * so its record's mtime dates its start: a live holder that does not answer is
++ * starting while its record is younger than the startup grace, and stale after,
++ * as is one that is dead, of another Nx version or root (a copied workspace),
++ * from before the claim existed, or unreadable. A stale record is renamed aside
++ * and replaced; if what was renamed aside is no longer the record judged
++ * (another daemon claimed it in between), it is put back rather than discarded.
++ */
++async function claimDaemonJsonProcessCache(daemonJson) {
++    const text = `${JSON.stringify(daemonJson, null, 2)}\n`;
++    const staged = `${exports.serverProcessJsonPath}.${process.pid}`;
++    const aside = `${exports.serverProcessJsonPath}.replaced.${process.pid}`;
++    (0, node_fs_1.mkdirSync)((0, path_1.dirname)(exports.serverProcessJsonPath), { recursive: true });
++    (0, node_fs_1.writeFileSync)(staged, text);
++    try {
++        // Each pass either claims, defers, or replaces one judged record; a record
++        // that changes under every pass is a fight no daemon should win silently.
++        for (let pass = 0; pass < 8; pass++) {
++            if (createExclusively(exports.serverProcessJsonPath, staged, text)) {
++                return { kind: 'claimed' };
++            }
++            const judged = readRecordOrNull();
++            if (judged === null)
++                continue;
++            const holder = await judgeHolder(judged, daemonJson);
++            if (holder !== null)
++                return holder;
++            try {
++                (0, node_fs_1.renameSync)(exports.serverProcessJsonPath, aside);
++            }
++            catch (e) {
++                if (e.code === 'ENOENT')
++                    continue;
++                throw e;
++            }
++            const movedAside = readFileOrNull(aside);
++            if (movedAside !== null && movedAside !== judged.text) {
++                // A third daemon claimed the free path first if this finds it
++                // taken. The claim moved aside is then lost; its daemon finds
++                // the record is not its own and stops, as a displaced daemon
++                // always has.
++                createExclusively(exports.serverProcessJsonPath, aside, movedAside);
++            }
++            (0, node_fs_1.rmSync)(aside, { force: true });
++        }
++        throw new Error(`The Nx daemon record ${exports.serverProcessJsonPath} changed under every attempt to claim it.`);
++    }
++    finally {
++        (0, node_fs_1.rmSync)(staged, { force: true });
++    }
++}
++/**
++ * Whether the record judged names a daemon this one must not displace: `null`
++ * when it is stale.
++ */
++async function judgeHolder({ text, mtimeMs }, daemonJson) {
++    const starting = Date.now() - mtimeMs < DAEMON_STARTUP_GRACE_MS;
++    const owner = parseDaemonJson(text);
++    if (owner === null) {
++        // Only an exclusive create without link(2) shows a record half written.
++        return starting ? { kind: 'starting', owner: null } : null;
++    }
++    if (owner.processId === process.pid ||
++        owner.nxVersion !== daemonJson.nxVersion ||
++        owner.workspaceRoot !== daemonJson.workspaceRoot ||
++        !isProcessAlive(owner.processId)) {
++        return null;
++    }
++    if (await socketAnswers(owner.socketPath)) {
++        return { kind: 'serving', owner };
++    }
++    // A serving daemon exits once its socket is gone, so a live pid that has not
++    // answered past the grace is not this workspace's daemon: a reused pid.
++    return starting ? { kind: 'starting', owner } : null;
++}
++/**
++ * Creates `path` holding `text` unless it exists: by link(2) from `source`,
++ * which holds `text`, or on a filesystem without hard links by an exclusive
++ * create, whose half-written record a judge takes for one still starting.
++ */
++function createExclusively(path, source, text) {
++    try {
++        (0, node_fs_1.linkSync)(source, path);
++        return true;
++    }
++    catch (e) {
++        if (e.code === 'EEXIST')
++            return false;
++        if (e.code !== 'EPERM' && e.code !== 'ENOTSUP' && e.code !== 'ENOSYS')
++            throw e;
++    }
++    try {
++        (0, node_fs_1.writeFileSync)(path, text, { flag: 'wx' });
++        return true;
++    }
++    catch (e) {
++        if (e.code === 'EEXIST')
++            return false;
++        throw e;
++    }
++}
++function readRecordOrNull() {
++    let fd;
++    try {
++        fd = (0, node_fs_1.openSync)(exports.serverProcessJsonPath, 'r');
++    }
++    catch (e) {
++        if (e.code === 'ENOENT')
++            return null;
++        throw e;
++    }
++    try {
++        return {
++            text: (0, node_fs_1.readFileSync)(fd, 'utf-8'),
++            mtimeMs: (0, node_fs_1.fstatSync)(fd).mtimeMs,
++        };
++    }
++    finally {
++        (0, node_fs_1.closeSync)(fd);
++    }
++}
++function readFileOrNull(path) {
++    try {
++        return (0, node_fs_1.readFileSync)(path, 'utf-8');
++    }
++    catch (e) {
++        if (e.code === 'ENOENT')
++            return null;
++        throw e;
++    }
++}
++function parseDaemonJson(text) {
++    try {
++        return JSON.parse(text);
++    }
++    catch {
++        return null;
++    }
++}
++/** `kill(pid, 0)` reports EPERM for a live process this user may not signal. */
++function isProcessAlive(pid) {
++    try {
++        process.kill(pid, 0);
++        return true;
++    }
++    catch (e) {
++        return e.code === 'EPERM';
++    }
++}
++function socketAnswers(socketPath) {
++    return new Promise((resolve) => {
++        const socket = (0, node_net_1.connect)(socketPath, () => {
++            socket.destroy();
++            resolve(true);
++        });
++        socket.once('error', () => resolve(false));
+     });
+ }
+ // Must be sync for the help output use case
 diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
 index 9bd7b61..c552b4b 100644
 --- a/dist/src/daemon/client/client.d.ts
@@ -42,7 +274,7 @@ index 9bd7b61..c552b4b 100644
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d..9a76320 100644
+index cebfd6d..a0389a0 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -81,6 +313,20 @@ index cebfd6d..9a76320 100644
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
+@@ -1132,8 +1110,11 @@ class DaemonClient {
+          */
+         const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
+         if (available) {
+-            logger_1.clientLogger.log(`[Client] Daemon server started, pid=${backgroundProcess.pid}`);
+-            return backgroundProcess.pid;
++            // The process spawned here exits instead of serving when another daemon
++            // already serves the workspace; the record names the one that answered.
++            const daemonPid = (0, cache_1.getDaemonProcessIdSync)() ?? backgroundProcess.pid;
++            logger_1.clientLogger.log(`[Client] Daemon server available, pid=${daemonPid}`);
++            return daemonPid;
+         }
+         else {
+             // A permission refusal from either source wins, then the poll's errno,
 diff --git a/dist/src/daemon/message-types/task-history.d.ts b/dist/src/daemon/message-types/task-history.d.ts
 deleted file mode 100644
 index cc2b606..0000000
@@ -195,7 +441,7 @@ index 0051f7f..0000000
 -    };
 -}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e..43d3f13 100644
+index b1c143e..9c0159e 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -34,7 +34,6 @@ const hash_glob_1 = require("../message-types/hash-glob");
@@ -230,6 +476,214 @@ index b1c143e..43d3f13 100644
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
+@@ -348,7 +337,40 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+         (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
+     }
+ };
++/**
++ * Claims the workspace's daemon record: `null` once the record is this
++ * process's, otherwise the record of the daemon that serves the workspace. A
++ * holder that is starting is waited for until it answers or its record ages
++ * past the startup grace, when it is replaced as stale.
++ */
++async function claimDaemonOrDefer(socketPath) {
++    while (true) {
++        const claim = await (0, cache_1.claimDaemonJsonProcessCache)({
++            processId: process.pid,
++            socketPath,
++            nxVersion: versions_1.nxVersion,
++            workspaceRoot: workspace_root_1.workspaceRoot,
++        });
++        switch (claim.kind) {
++            case 'claimed':
++                return null;
++            case 'serving':
++                return claim.owner;
++            case 'starting':
++                await new Promise((resolve) => setTimeout(resolve, 10));
++        }
++    }
++}
+ async function startServer() {
++    const socketPath = (0, socket_utils_1.getFullOsSocketPath)();
++    // Claim the workspace before doing anything: a daemon another client started
++    // for it serves this client too, and a second one used to displace it, cutting
++    // off every client mid-request.
++    const owner = await claimDaemonOrDefer(socketPath);
++    if (owner !== null) {
++        logger_1.serverLogger.log(`[Server] Daemon ${owner.processId} already serves this workspace on ${owner.socketPath}, so daemon ${process.pid} exits`);
++        process.exit(0);
++    }
+     // Watch before scan: a file written during boot must be visible to the
+     // watcher or the scan below. Scan-first left a blind window where such
+     // files stayed invisible to both until an unrelated change arrived.
+@@ -359,18 +381,11 @@ async function startServer() {
+     (0, workspace_context_1.setupWorkspaceContext)(workspace_root_1.workspaceRoot);
+     // Initialize analytics for daemon process
+     await (0, analytics_1.startAnalytics)();
+-    const socketPath = (0, socket_utils_1.getFullOsSocketPath)();
+     // Log daemon startup information for debugging
+     logger_1.serverLogger.log(`New daemon starting from: ${__filename}`);
+     logger_1.serverLogger.log(`New daemon __dirname: ${__dirname}`);
+     logger_1.serverLogger.log(`New daemon nxVersion: ${versions_1.nxVersion}`);
+     logger_1.serverLogger.log(`New daemon getInstalledNxVersion(): ${(0, installed_nx_version_1.getInstalledNxVersion)()}`);
+-    // Persist metadata about the background process so that it can be cleaned up later if needed
+-    await (0, cache_1.writeDaemonJsonProcessCache)({
+-        processId: process.pid,
+-        socketPath,
+-        nxVersion: versions_1.nxVersion,
+-    });
+     // See notes in socket-command-line-utils.ts on OS differences regarding clean up of existings connections.
+     if (!socket_utils_1.isWindows) {
+         (0, socket_utils_1.killSocketOrPath)();
+@@ -384,6 +399,13 @@ async function startServer() {
+                 sockets: exports.openSockets,
+             });
+         }
++        if ((0, socket_utils_1.ownSocketState)() === 'lost') {
++            return (0, shutdown_utils_1.handleServerProcessTermination)({
++                server,
++                reason: `its socket ${socketPath} was removed or replaced, so no client can reach it`,
++                sockets: exports.openSockets,
++            });
++        }
+         const outdated = daemonIsOutdated();
+         if (outdated) {
+             logger_1.serverLogger.log(`[Server] Daemon outdated: ${outdated}`);
+@@ -432,6 +454,7 @@ async function startServer() {
+                             // Best effort; the 0700 socket directory is the primary control.
+                         }
+                     }
++                    (0, socket_utils_1.recordOwnSocket)(socketPath);
+                     // this triggers the storage of the lock file hash
+                     daemonIsOutdated();
+                     if (!(0, shutdown_utils_1.getOutputWatcherInstance)()) {
+diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/shutdown-utils.js
+index a449f2f..ecb6886 100644
+--- a/dist/src/daemon/server/shutdown-utils.js
++++ b/dist/src/daemon/server/shutdown-utils.js
+@@ -85,15 +85,31 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
+     await startNewDaemonInBackground();
+     await performShutdown(server, reason, sockets);
+ }
+-async function performShutdown(server, reason, sockets) {
++/** The shutdown under way: each later reason to stop joins it. */
++let shutdown;
++function performShutdown(server, reason, sockets) {
++    shutdown ??= shutDown(server, reason, sockets);
++    return shutdown;
++}
++async function shutDown(server, reason, sockets) {
+     try {
++        // Closing a listening Unix socket unlinks its path. Once another daemon
++        // has bound that path, the path is that daemon's socket, and closing this
++        // server would cut every client off from it. Such a server is left to end
++        // with the process, which leaves the path alone.
++        const closesServer = (0, socket_utils_1.ownSocketState)() !== 'lost';
+         await new Promise((res) => {
+-            server.close(() => {
+-                res(null);
+-            });
++            if (closesServer) {
++                server.close(() => {
++                    res(null);
++                });
++            }
+             for (const socket of sockets) {
+                 socket.destroy();
+             }
++            if (!closesServer) {
++                res(null);
++            }
+         });
+         if (watcherInstance) {
+             await watcherInstance.stop();
+diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
+index 52b621b..1c13e49 100644
+--- a/dist/src/daemon/socket-utils.d.ts
++++ b/dist/src/daemon/socket-utils.d.ts
+@@ -11,6 +11,21 @@ export declare const getForkedProcessOsSocketPath: (id: string) => string;
+ export declare const getPluginOsSocketPath: (id: string) => string;
+ export declare function getPluginSocketFileName(id: string): string;
+ export declare function killSocketOrPath(): void;
++/**
++ * Notes which socket file this daemon's server bound at `socketPath`, so that it
++ * can tell its own socket from one a later daemon bound at the same path. The
++ * path is kept rather than derived again: the daemon takes on each client's
++ * environment, `NX_SOCKET_DIR` included, so deriving it later can name another
++ * directory.
++ */
++export declare function recordOwnSocket(socketPath: string): void;
++/**
++ * Whether the path this daemon bound still names its listening socket: `unbound`
++ * before it listens, `ours` while it does, and `lost` once the path is gone or
++ * names another daemon's socket. A daemon whose socket is lost is one no client
++ * can reach, and closing it would unlink the path, whatever it now names.
++ */
++export declare function ownSocketState(): 'unbound' | 'ours' | 'lost';
+ export declare function serializeResult(error: Error | null, serializedProjectGraph: string | null, serializedSourceMaps: string | null): string | null;
+ /**
+  * Serialize using `preferred`, falling back to the other format when it throws.
+diff --git a/dist/src/daemon/socket-utils.js b/dist/src/daemon/socket-utils.js
+index 6637161..92b1f00 100644
+--- a/dist/src/daemon/socket-utils.js
++++ b/dist/src/daemon/socket-utils.js
+@@ -3,6 +3,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.getPluginOsSocketPath = exports.getForkedProcessOsSocketPath = exports.getFullOsSocketPath = exports.isWindows = void 0;
+ exports.getPluginSocketFileName = getPluginSocketFileName;
+ exports.killSocketOrPath = killSocketOrPath;
++exports.recordOwnSocket = recordOwnSocket;
++exports.ownSocketState = ownSocketState;
+ exports.serializeResult = serializeResult;
+ exports.serializeWithFallback = serializeWithFallback;
+ exports.serialize = serialize;
+@@ -75,6 +77,46 @@ function killSocketOrPath() {
+     }
+     catch { }
+ }
++/**
++ * The socket this daemon listens on, once it listens: the path it bound and that
++ * socket's inode, or `true` for a named pipe, which is not a file another daemon
++ * can replace.
++ */
++let ownSocket;
++/**
++ * Notes which socket file this daemon's server bound at `socketPath`, so that it
++ * can tell its own socket from one a later daemon bound at the same path. The
++ * path is kept rather than derived again: the daemon takes on each client's
++ * environment, `NX_SOCKET_DIR` included, so deriving it later can name another
++ * directory.
++ */
++function recordOwnSocket(socketPath) {
++    ownSocket = exports.isWindows
++        ? true
++        : { path: socketPath, ino: (0, fs_1.statSync)(socketPath).ino };
++}
++/**
++ * Whether the path this daemon bound still names its listening socket: `unbound`
++ * before it listens, `ours` while it does, and `lost` once the path is gone or
++ * names another daemon's socket. A daemon whose socket is lost is one no client
++ * can reach, and closing it would unlink the path, whatever it now names.
++ */
++function ownSocketState() {
++    if (ownSocket === undefined) {
++        return 'unbound';
++    }
++    if (ownSocket === true) {
++        return 'ours';
++    }
++    try {
++        return (0, fs_1.statSync)(ownSocket.path).ino === ownSocket.ino ? 'ours' : 'lost';
++    }
++    catch (e) {
++        if (e.code === 'ENOENT')
++            return 'lost';
++        throw e;
++    }
++}
+ // Prepare a serialized project graph result for sending over IPC from the server to the client
+ function serializeResult(error, serializedProjectGraph, serializedSourceMaps) {
+     // We do not want to repeat work `JSON.stringify`ing an object containing the potentially large project graph so merge as strings
 diff --git a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
 index 81a6ebea371390c69fc2c3ab3da95d7dbec13a37..5746704ac8457eddfcedfbcd171504f3e36082e1 100644
 --- a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js

@@ -646,6 +646,19 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   failure. The patch records each task the runner reports skipped as a skipped result, so the exit status is 1; the
   terminal output, which already listed it under "Tasks not run", is unchanged. Not yet proposed upstream: Nx `master`
   reports skipped tasks the same way.
+- **A workspace has one daemon, and a second one leaves it alone.** Every daemon overwrote `server-process.json` with
+  its own pid, so two clients that each found no daemon started two, and the later one displaced the earlier. A client
+  of the displaced daemon lost its socket mid-request (`EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`) after the run had printed
+  its summary. Under a configured `NX_SOCKET_DIR`, every daemon binds the same path, and closing a listening Unix socket
+  unlinks its path. The displaced daemon's shutdown therefore removed its successor's socket, the next client found no
+  daemon and started another, and one workspace saw a new daemon every five seconds. Before it does anything else, the
+  patched daemon creates the record with link(2), which never replaces a file. If a live daemon of the same Nx version
+  that serves the same root holds the record, the new one waits for that daemon to answer and then exits. A record whose
+  holder is dead, runs another Nx version, or serves another root (a copied workspace) is replaced. A daemon whose
+  socket, at the path it bound, has been removed or rebound exits within 20 ms, since no client can reach it. It leaves
+  a path another daemon has bound alone, so that daemon's socket is not unlinked. A holder starts when it claims, so a
+  live one that has not answered by the time its record is a minute old (a pid reused after a crash) is stale and
+  replaced. On a filesystem without hard links the record is created exclusively instead. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -654,10 +667,10 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive and skipped-task exit regressions
-pass; preserve any repair not yet released. The restore-time regression fails without its hunk only on macOS, where the
-copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every
-hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit and
+daemon-claim regressions pass; preserve any repair not yet released. The restore-time regression fails without its hunk
+only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping
+the hunk. When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 

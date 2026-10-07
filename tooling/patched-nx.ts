@@ -51,6 +51,10 @@ const NOT_YET_UPSTREAM = [
   ],
   ['file hashes', 'hash every file again when the archive may hold a hash taken in the second its file was rewritten'],
   ['exit status', 'exit 1, not 130, when a failure skips the tasks that depend on it (`invokeTasksRunner`)'],
+  [
+    'daemon claim',
+    'start at most one daemon per workspace, and never close a socket another daemon bound (`startServer`)',
+  ],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
