@@ -753,6 +753,12 @@ export const parseReseedSkip = (json: string): Api.ReseedSkip => assertReseedSki
 export const assertReseedSkipList = typia.createAssertEquals<readonly Api.ReseedSkip[]>();
 export const parseReseedSkipList = (json: string): readonly Api.ReseedSkip[] => assertReseedSkipList(JSON.parse(json));
 
+export const assertResidentBytes = typia.createAssertEquals<Api.ResidentBytes>();
+export const parseResidentBytes = (json: string): Api.ResidentBytes => assertResidentBytes(JSON.parse(json));
+export const assertResidentBytesList = typia.createAssertEquals<readonly Api.ResidentBytes[]>();
+export const parseResidentBytesList = (json: string): readonly Api.ResidentBytes[] =>
+  assertResidentBytesList(JSON.parse(json));
+
 export const assertResizeRequest = typia.createAssertEquals<Api.ResizeRequest>();
 export const parseResizeRequest = (json: string): Api.ResizeRequest => assertResizeRequest(JSON.parse(json));
 export const assertResizeRequestList = typia.createAssertEquals<readonly Api.ResizeRequest[]>();

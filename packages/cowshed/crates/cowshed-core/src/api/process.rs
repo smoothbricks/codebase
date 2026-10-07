@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
-use super::resources::CpuMicros;
+use super::resources::{CpuMicros, ResidentBytes};
 
 /// Every process a job owned that its observer saw, the exited ones included, and whether the
 /// observer saw all of them.
@@ -65,6 +65,10 @@ pub struct ProcessUsage {
     /// Whether its own CPU over the supervisor's last sample window was at least 1 % of one
     /// core.
     pub busy: bool,
+    /// What it holds resident now; zero once it has exited.
+    pub rss_bytes: ResidentBytes,
+    /// The most it was read holding: never another process's, nor the group's sum.
+    pub rss_peak_bytes: ResidentBytes,
 }
 
 /// Whether the tree holds every process the job owned. A gap is absorbing: once an observation

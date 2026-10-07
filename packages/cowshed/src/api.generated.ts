@@ -1001,6 +1001,14 @@ export type ProcessUsage = {
    * core.
    */
   readonly busy: boolean;
+  /**
+   * What it holds resident now; zero once it has exited.
+   */
+  readonly rssBytes: ResidentBytes;
+  /**
+   * The most it was read holding: never another process's, nor the group's sum.
+   */
+  readonly rssPeakBytes: ResidentBytes;
 };
 
 /**
@@ -1292,6 +1300,12 @@ export type ReseedSkip =
       readonly lock: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
     });
+
+/**
+ * Bytes of memory resident in RAM: what processes hold now, never memory charged to them
+ * elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
+ */
+export type ResidentBytes = number & tags.Type<'uint64'>;
 
 export type ResizeRequest = {
   readonly repoId: RepoId;

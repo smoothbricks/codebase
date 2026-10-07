@@ -66,6 +66,38 @@ impl From<CpuMicros> for u64 {
     }
 }
 
+/// Bytes of memory resident in RAM: what processes hold now, never memory charged to them
+/// elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ResidentBytes(u64);
+
+impl ResidentBytes {
+    pub const ZERO: Self = Self(0);
+
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("rssBytes", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ResidentBytes {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ResidentBytes> for u64 {
+    fn from(value: ResidentBytes) -> Self {
+        value.0
+    }
+}
+
 fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
     u64::try_from(value)
         .ok()

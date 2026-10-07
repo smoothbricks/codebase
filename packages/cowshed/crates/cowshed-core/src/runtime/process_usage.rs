@@ -1,6 +1,6 @@
 //! What each observed process of a job has cost itself (07_api.md, "Process-tree observations"):
-//! its own CPU, never that of the children it waited for, and whether it was busy over the
-//! supervisor's last sample window.
+//! its own CPU, never that of the children it waited for, whether it was busy over the
+//! supervisor's last sample window, and the memory it holds resident now and at most.
 //!
 //! The fold is pure: the supervisor's sampler is its only writer, and it applies each reading of
 //! a life it read from the kernel. Reading the folded usage changes nothing, so a second reader
@@ -17,7 +17,7 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use crate::api::process::{BUSY_CPU_PERMILLE, ProcessUsage};
-use crate::api::resources::{CpuMicros, ResourceUnitError};
+use crate::api::resources::{CpuMicros, ResidentBytes, ResourceUnitError};
 use crate::runtime::process_tree::ProcessIdentity;
 
 /// When a process started, on the kernel clock the counters were read with: macOS
@@ -36,6 +36,8 @@ pub struct UsageReading {
     pub at: Instant,
     pub cpu_user: CpuMicros,
     pub cpu_sys: CpuMicros,
+    /// What it holds resident now: nothing once it has exited.
+    pub resident: ResidentBytes,
 }
 
 impl UsageReading {
@@ -85,6 +87,8 @@ struct Counted {
     /// predecessor.
     window: UsageReading,
     busy: bool,
+    /// The most it was read holding.
+    rss_peak: ResidentBytes,
 }
 
 #[derive(Debug, Default)]
@@ -113,6 +117,7 @@ impl ProcessUsageFold {
                         window: reading,
                         // No span has passed in which it could have been busy.
                         busy: false,
+                        rss_peak: reading.resident,
                     },
                     Some(counted) => counted.read(process.pid, reading)?,
                 };
@@ -137,6 +142,8 @@ impl ProcessUsageFold {
             cpu_user_us: counted.latest.cpu_user,
             cpu_sys_us: counted.latest.cpu_sys,
             busy: counted.busy,
+            rss_bytes: counted.latest.resident,
+            rss_peak_bytes: counted.rss_peak,
         })
     }
 
@@ -177,6 +184,7 @@ impl Counted {
                 });
             }
         }
+        let rss_peak = self.rss_peak.max(reading.resident);
         let span = reading.at.duration_since(self.window.at);
         if span.is_zero() {
             // No time passed in which to judge: the window stays open, the judgment stands.
@@ -184,12 +192,14 @@ impl Counted {
                 latest: reading,
                 window: self.window,
                 busy: self.busy,
+                rss_peak,
             });
         }
         Ok(Self {
             latest: reading,
             window: reading,
             busy: busy(reading.cpu_total() - self.window.cpu_total(), span),
+            rss_peak,
         })
     }
 }
@@ -206,7 +216,7 @@ fn busy(cpu_us: u64, span: Duration) -> bool {
 /// Why a life's counters could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum SampleError {
-    #[error("reading the own CPU of process {pid} failed: {source}")]
+    #[error("reading the own counters of process {pid} failed: {source}")]
     Read { pid: u32, source: io::Error },
     #[error(transparent)]
     Fold(#[from] UsageFoldError),
@@ -296,6 +306,7 @@ fn fold_counters(
             at,
             cpu_user: counters.cpu_user,
             cpu_sys: counters.cpu_sys,
+            resident: counters.resident,
         },
     })?;
     Ok(Sampled::Read)
@@ -333,6 +344,9 @@ struct OwnCounters {
     started: StartStamp,
     cpu_user: CpuMicros,
     cpu_sys: CpuMicros,
+    /// Zero for an exited process, whatever size the kernel last recorded for it: it holds
+    /// nothing now, on either platform.
+    resident: ResidentBytes,
 }
 
 fn unit(error: ResourceUnitError) -> io::Error {
@@ -340,9 +354,11 @@ fn unit(error: ResourceUnitError) -> io::Error {
 }
 
 /// `proc_pid_rusage(RUSAGE_INFO_V4)`: the process's own CPU (not `ri_child_*`, the children it
-/// reaped), which still answers for an exited process its parent has not reaped. `None` once it
-/// is reaped. Its times are Mach ticks (xnu `task_power_info_locked` stores `rm_time_mach`
-/// unconverted; measured 125/3 ns per tick on Apple silicon), converted once by the timebase.
+/// reaped) and resident size, which still answers for an exited process its parent has not
+/// reaped. `None` once it is reaped. Its times are Mach ticks (xnu `task_power_info_locked`
+/// stores `rm_time_mach` unconverted; measured 125/3 ns per tick on Apple silicon), converted
+/// once by the timebase. An exited process (`ri_proc_exit_abstime` set) answers with the size
+/// it last held; it holds none.
 #[cfg(target_os = "macos")]
 fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
@@ -361,10 +377,16 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let info = unsafe { info.assume_init() };
     let (numerator, denominator) = mach_tick()?;
     let cpu = |ticks| CpuMicros::of_ticks(ticks, numerator, denominator).map_err(unit);
+    let exited = info.ri_proc_exit_abstime != 0;
     Ok(Some(OwnCounters {
         started: StartStamp(info.ri_proc_start_abstime),
         cpu_user: cpu(info.ri_user_time)?,
         cpu_sys: cpu(info.ri_system_time)?,
+        resident: if exited {
+            ResidentBytes::ZERO
+        } else {
+            ResidentBytes::new(info.ri_resident_size).map_err(unit)?
+        },
     }))
 }
 
@@ -403,8 +425,9 @@ fn mach_tick() -> io::Result<(u32, NonZeroU32)> {
 }
 
 /// `/proc/<pid>/stat`'s `utime` and `stime` (fields 14 and 15: the process's own, not the
-/// `cutime`/`cstime` of children it waited for) and `starttime` (field 22), read at once. An
-/// exited process keeps its stat until it is reaped; `None` once it is.
+/// `cutime`/`cstime` of children it waited for), `starttime` (field 22) and `rss` pages
+/// (field 24), read at once. An exited process keeps its stat until it is reaped; `None` once it
+/// is. An exited one (state `Z` or `X`) holds no memory.
 #[cfg(target_os = "linux")]
 fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -437,17 +460,31 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
             .parse()
             .map_err(|_| invalid("holds a field that is no count"))
     };
+    let state = *fields.first().ok_or_else(|| invalid("has no state"))?;
     // SAFETY: sysconf takes a plain integer and touches no memory of ours.
     let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let hertz = u32::try_from(hertz)
         .ok()
         .and_then(NonZeroU32::new)
         .ok_or_else(|| io::Error::other(format!("the clock tick rate {hertz} is no rate")))?;
+    // SAFETY: sysconf takes a plain integer and touches no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = u64::try_from(page)
+        .map_err(|_| io::Error::other(format!("the page size {page} is no size")))?;
     let cpu = |ticks| CpuMicros::of_ticks(ticks, 1_000_000_000, hertz).map_err(unit);
+    let resident = if matches!(state, "Z" | "X") {
+        ResidentBytes::ZERO
+    } else {
+        let bytes = field(24)?
+            .checked_mul(page)
+            .ok_or_else(|| invalid("holds more resident bytes than a u64 counts"))?;
+        ResidentBytes::new(bytes).map_err(unit)?
+    };
     Ok(Some(OwnCounters {
         started: StartStamp(field(22)?),
         cpu_user: cpu(field(14)?)?,
         cpu_sys: cpu(field(15)?)?,
+        resident,
     }))
 }
 
@@ -462,7 +499,7 @@ mod tests {
         UsageReading, own_counters, sample,
     };
     use crate::api::process::ProcessUsage;
-    use crate::api::resources::CpuMicros;
+    use crate::api::resources::{CpuMicros, ResidentBytes};
     use crate::fork_lock::Spawn as _;
     use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
 
@@ -483,12 +520,24 @@ mod tests {
         CpuMicros::new(micros).expect("a CPU time")
     }
 
+    fn resident(bytes: u64) -> ResidentBytes {
+        ResidentBytes::new(bytes).expect("a resident size")
+    }
+
     fn reading(at: Instant, user_us: u64, sys_us: u64) -> UsageReading {
         UsageReading {
             started: StartStamp(7),
             at,
             cpu_user: cpu(user_us),
             cpu_sys: cpu(sys_us),
+            resident: resident(1 << 20),
+        }
+    }
+
+    fn holding(bytes: u64, reading: UsageReading) -> UsageReading {
+        UsageReading {
+            resident: resident(bytes),
+            ..reading
         }
     }
 
@@ -531,8 +580,39 @@ mod tests {
                 cpu_user_us: cpu(519_000),
                 cpu_sys_us: cpu(100_000),
                 busy: true,
+                rss_bytes: resident(1 << 20),
+                rss_peak_bytes: resident(1 << 20),
             })
         );
+    }
+
+    #[test]
+    fn current_resident_memory_falls_and_the_peak_it_was_read_at_stays() {
+        let process = identity(46);
+        let start = Instant::now();
+        let second = |n| start + Duration::from_secs(n);
+        let mut fold = ProcessUsageFold::default();
+        let rss = |fold: &ProcessUsageFold| {
+            let usage = fold.usage(process).expect("a read life");
+            (usage.rss_bytes.get(), usage.rss_peak_bytes.get())
+        };
+        fold.apply(read(process, holding(4 << 20, reading(start, 0, 0))))
+            .unwrap();
+        assert_eq!(rss(&fold), (4 << 20, 4 << 20));
+        fold.apply(read(process, holding(96 << 20, reading(second(1), 0, 0))))
+            .unwrap();
+        assert_eq!(rss(&fold), (96 << 20, 96 << 20));
+        fold.apply(read(process, holding(8 << 20, reading(second(2), 0, 0))))
+            .unwrap();
+        assert_eq!(rss(&fold), (8 << 20, 96 << 20), "released, the peak stays");
+        // A zero-length window still takes the reading's size.
+        fold.apply(read(process, holding(128 << 20, reading(second(2), 0, 0))))
+            .unwrap();
+        assert_eq!(rss(&fold), (128 << 20, 128 << 20));
+        fold.apply(read(process, holding(0, reading(second(3), 0, 0))))
+            .unwrap();
+        fold.apply(UsageObservation::Exited { process }).unwrap();
+        assert_eq!(rss(&fold), (0, 128 << 20), "exited, it holds nothing");
     }
 
     #[test]
@@ -719,6 +799,42 @@ mod tests {
                 out.flush().expect("report");
                 // Exits once the test writes one byte.
                 assert!(hold_byte(), "the release byte");
+            }
+            Some(role) if role.starts_with("allocate ") => {
+                let mebibytes: usize = role["allocate ".len()..].parse().expect("MiB");
+                let length = mebibytes << 20;
+                // SAFETY: a fresh private anonymous mapping no other code knows of.
+                let region = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        length,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(
+                    region,
+                    libc::MAP_FAILED,
+                    "mmap: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: sysconf takes a plain integer and touches no memory of ours.
+                let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                    .expect("a page size");
+                for offset in (0..length).step_by(page) {
+                    // SAFETY: inside the writable mapping made above.
+                    unsafe { region.cast::<u8>().add(offset).write_volatile(1) };
+                }
+                writeln!(out, "{MARK} allocated {}", std::process::id()).expect("report");
+                out.flush().expect("report");
+                assert!(hold_byte(), "the release byte");
+                // SAFETY: the whole mapping made above, unmapped once.
+                assert_eq!(unsafe { libc::munmap(region, length) }, 0, "munmap");
+                writeln!(out, "{MARK} released").expect("report");
+                out.flush().expect("report");
+                assert!(hold_byte(), "the exit byte");
             }
             other => panic!("unknown role {other:?}"),
         }
@@ -973,5 +1089,131 @@ mod tests {
         })
         .expect("its exit");
         assert_eq!(fold.usage(life.identity), None);
+    }
+
+    /// A re-executed allocator holding `mebibytes` of touched anonymous memory.
+    struct Allocator {
+        child: std::process::Child,
+        release: std::process::ChildStdin,
+        lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
+        life: Observed,
+    }
+
+    impl Allocator {
+        fn start(mebibytes: u32) -> Self {
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", ROLE_TEST, "--nocapture"])
+                .env(ROLE, format!("allocate {mebibytes}"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn_locked()
+                .expect("spawn an allocator");
+            let release = child.stdin.take().expect("stdin");
+            let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+            next_report(&mut lines, "allocated");
+            let life = observed(child.id());
+            Self {
+                child,
+                release,
+                lines,
+                life,
+            }
+        }
+
+        /// Its resident bytes, read by a different kernel call than the reader under test.
+        fn independent_resident(&self) -> u64 {
+            let pid = libc::pid_t::try_from(self.life.identity.pid).expect("pid");
+            #[cfg(target_os = "macos")]
+            {
+                let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+                let size = libc::c_int::try_from(size_of::<libc::proc_taskinfo>()).expect("size");
+                // SAFETY: `info` is writable storage of exactly `size` bytes.
+                let written = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDTASKINFO,
+                        0,
+                        info.as_mut_ptr().cast(),
+                        size,
+                    )
+                };
+                assert_eq!(
+                    written,
+                    size,
+                    "proc_pidinfo: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: proc_pidinfo filled all `size` bytes.
+                unsafe { info.assume_init() }.pti_resident_size
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).expect("statm");
+                let pages: u64 = statm
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("resident pages")
+                    .parse()
+                    .expect("a page count");
+                // SAFETY: sysconf takes a plain integer and touches no memory of ours.
+                let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                    .expect("a page size");
+                pages * page
+            }
+        }
+
+        fn step(&mut self, report: &str) {
+            self.release.write_all(b"x").expect("release");
+            next_report(&mut self.lines, report);
+        }
+
+        /// Release whichever holds remain (the release and the exit), then reap it.
+        fn finish(mut self) {
+            self.release.write_all(b"xx").expect("release");
+            drop(self.release);
+            let status = self.child.wait().expect("reap");
+            assert!(status.success(), "allocator: {status}");
+        }
+    }
+
+    /// Each process's resident memory is its own, matches an independent kernel read, and falls
+    /// when it releases memory while its peak stays.
+    #[test]
+    fn each_process_holds_its_own_resident_memory_and_keeps_its_peak() {
+        const MIB: u64 = 1 << 20;
+        let mut large = Allocator::start(96);
+        let small = Allocator::start(24);
+        let mut fold = ProcessUsageFold::default();
+        let read = |fold: &mut ProcessUsageFold, allocator: &Allocator| {
+            assert_eq!(tick(fold, &allocator.life), Sampled::Read);
+            let usage = fold.usage(allocator.life.identity).expect("usage");
+            let independent = allocator.independent_resident();
+            assert!(
+                usage.rss_bytes.get().abs_diff(independent) <= 2 * MIB,
+                "read {} bytes resident, the kernel's other call {independent}",
+                usage.rss_bytes.get()
+            );
+            usage
+        };
+        let held = read(&mut fold, &large);
+        let other = read(&mut fold, &small);
+        assert!(held.rss_bytes.get() >= 96 * MIB, "{held:?}");
+        assert!(
+            (24 * MIB..96 * MIB).contains(&other.rss_bytes.get()),
+            "the small allocator holds its own, not the large one's or their sum: {other:?}"
+        );
+
+        large.step("released");
+        let released = read(&mut fold, &large);
+        assert!(
+            released.rss_bytes.get() + 64 * MIB <= held.rss_bytes.get(),
+            "released memory leaves: {released:?} after {held:?}"
+        );
+        assert_eq!(released.rss_peak_bytes, held.rss_bytes, "the peak stays");
+        let other = read(&mut fold, &small);
+        assert!(other.rss_peak_bytes.get() < 96 * MIB, "{other:?}");
+
+        large.finish();
+        small.finish();
     }
 }
