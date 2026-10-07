@@ -519,10 +519,10 @@ in {
         TMPDIR="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
         export TMPDIR="''${TMPDIR:-/tmp}"
       fi
-      export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
-      export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
-      export TTSC_GO_CACHE_DIR="''${TTSC_GO_CACHE_DIR:-$TTSC_CACHE_DIR/go-build}"
-      mkdir -p "$TTSC_GO_CACHE_DIR"
+      # ttsc's compiler and caches: tooling/direnv/ttsc-env.sh, shared with the
+      # git hooks, which run outside this shell. It reads the inherited
+      # NX_WORKSPACE_ROOT_PATH, so it runs before nx-socket-dir.sh rebinds it.
+      . "$DEVENV_ROOT/ttsc-env.sh"
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       ${lib.optionalString uvProject ''

@@ -228,10 +228,10 @@ describe('managed raw files', () => {
     await mkdir(bin);
     const devenv = join(bin, 'devenv');
     // Emulates `devenv shell [flags] -- cmd...` the way devenv.smoo.nix's
-    // enterShell behaves: cd to the workspace root, compute TTSC_CACHE_DIR
-    // honoring a host-provided value, then run the command — so build-shell's
-    // wholesale environment capture sees real shell exports instead of a
-    // hand-copied list.
+    // enterShell behaves: cd to the workspace root, source ttsc-env.sh, which
+    // computes TTSC_CACHE_DIR honoring a host-provided value, then run the
+    // command — so build-shell's wholesale environment capture sees real shell
+    // exports instead of a hand-copied list.
     await writeFile(
       devenv,
       [
@@ -242,7 +242,7 @@ describe('managed raw files', () => {
         'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
         'shift',
         'cd ../..',
-        'export TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"',
+        '. tooling/direnv/ttsc-env.sh',
         'exec "$@"',
         '',
       ].join('\n'),

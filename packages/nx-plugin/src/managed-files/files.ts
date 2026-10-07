@@ -137,6 +137,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/ttsc-env.sh',
+    target: 'tooling/direnv/ttsc-env.sh',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/apple-developer.sh',
     target: 'tooling/direnv/apple-developer.sh',
   },

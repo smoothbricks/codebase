@@ -429,9 +429,12 @@ nothing when nothing changed:
   `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
   or a script change.
 - Shell secrets resolve only for an entry that installs; see below.
-- ttsc caches in the checkout's `.cache/ttsc`, its Go build cache in `.cache/ttsc/go-build`, and `GOFLAGS` carries
-  `-trimpath`. A value the caller already exported wins, so a host or a sandbox that shares these caches across
-  checkouts sets them itself; Go's own caches keep Go's defaults.
+- `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
+  `TTSC_TSGO_BINARY`, caches ttsc in the checkout's `.cache/ttsc` and its Go build cache in `.cache/ttsc/go-build`.
+  `GOFLAGS` carries `-trimpath`. A cache the caller already exported wins, so a host or a sandbox that shares these
+  caches across checkouts sets them itself, unless the caller's environment was bound for another workspace (its
+  `NX_WORKSPACE_ROOT_PATH` names another directory): that workspace's caches are dropped. Go's own caches keep Go's
+  defaults.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
   `.cowshed/env` names a `COWSHED_RUNTIME_LINK` uses `<that link>/nx`, the literal path cowshed gives its sandboxed

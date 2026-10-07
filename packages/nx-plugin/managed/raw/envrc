@@ -24,6 +24,7 @@ watch_file \
   package.json bun.lock uv.lock Cargo.lock \
   tooling/direnv/repo-path \
   tooling/direnv/nx-socket-dir.sh \
+  tooling/direnv/ttsc-env.sh \
   tooling/direnv/apple-developer.sh \
   tooling/direnv/setup-environment.ts \
   tooling/direnv/secret-references.ts \
