@@ -808,7 +808,10 @@ pub struct JobProcessTree {
     pub coverage: ProcessCoverage,
 }
 pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<CommandArg> }
-pub enum ProcessBlockedOn { None, Lock, Socket, Pipe, Child, Stdin, Disk }
+pub enum ProcessBlockedOn {               // lock detail exists only on a lock: no stale path or holder
+    None, Lock { path: String, holder: Option<LockHolder> }, Socket, Pipe, Child, Stdin, Disk,
+}
+pub struct LockHolder { pub pid: u32, pub job: Option<JobId> }
 pub struct JobProcessSample {
     pub pid: u32,
     pub ppid: u32,
@@ -817,9 +820,6 @@ pub struct JobProcessSample {
     pub born_at: UtcTimestamp,
     pub usage: Option<ProcessUsage>,          // absent until its counters are first read, never zeroes
     pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
-    pub blocked_path: Option<String>,
-    pub blocked_holder_pid: Option<u32>,
-    pub blocked_holder_job: Option<JobId>,
     pub exit: Option<ProcessExit>,
 }
 pub struct ProcessExit { pub status: ExitStatus, pub exited_at: UtcTimestamp }
@@ -840,13 +840,19 @@ pub enum ProcessIoUnavailable {
     NotPermitted,                          // the kernel refused this observer the counters
     NotAccounted,                          // the kernel keeps no per-process storage I/O counters
 }
-pub enum JobProcessEvent {
-    Born(JobProcessSample),
-    Exec(JobProcessSample),
-    Changed(JobProcessDelta),          // generated non-empty sparse projection of changed fields
-    Heartbeat(JobProcessTree),
-    Exited(JobProcessSample),          // final own-process usage, exit and exitedAt
+pub const PROCESS_HEARTBEAT: Duration = Duration::from_secs(60); // per live process, not per tree
+pub enum JobProcessEvent {             // `index`: the record's position in `JobProcessTree.processes`
+    Born { index: u32, process: JobProcessSample },
+    Exec { index: u32, process: JobProcessSample },
+    Changed(JobProcessDelta),          // non-empty sparse change of one process
+    Heartbeat { index: u32, process: JobProcessSample }, // one unchanged live process, once a minute
+    Exited { index: u32, process: JobProcessSample }, // final own-process usage, exit and exitedAt
 }
+pub enum JobProcessDelta {            // one changed field; no shape changes nothing
+    Usage { index: u32, usage: ProcessUsage },          // usage is never cleared
+    Blocker { index: u32, blocked_on: BlockerChange },
+}
+pub enum BlockerChange { Set(ProcessBlockedOn), Clear }
 pub struct JobProcessStream { /* bounded stream of Result<JobProcessEvent, CowshedError> */ }
 pub enum ProcessCoverage { Complete, Gap { reason: ProcessCoverageGap } }
 pub enum ProcessCoverageGap {      // the first observation the tree is known to lack
@@ -906,11 +912,19 @@ counters.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one heartbeat per minute for
 each unchanged live process, and each process's final usage on exit. The sampling/subscriber interval `everyMs` does not
-set the heartbeat cadence; changed-state and terminal events are immediate. State or blocker transitions, an RSS
-crossing of a 2× step, and a busy/idle CPU flip produce change records; an unchanged ordinary sample does not. Closing a
-reader never kills the process. Consumers use these observed facts without declaring or deriving an expectation from a
-command's argv. The generated sparse delta distinguishes unchanged, SET, and CLEAR; clearing a blocker path or holder
-never leaves the preceding lock's detail in the current snapshot. Its constructor rejects an empty change event.
+set the heartbeat cadence; changed-state and terminal events are immediate. A blocker transition, resident memory
+crossing a power of two (`[2ⁿ⁻¹, 2ⁿ)` is one step), a busy/idle CPU flip, and a process's first usage read produce
+change records; a sample that only moves counters does not. A live process whose usage no record restated for
+`PROCESS_HEARTBEAT` gets its own heartbeat restating its whole record; a blocker change restates no usage, so it does
+not postpone one. A read taken after a process exited is withheld from every record until its `Exited` event carries
+it, once, as final usage: from that read the process is no longer live, so no heartbeat restates it, no blocker read of
+it is accepted, and a late exec event still shows the usage read before the exit. Nothing about that process follows
+its exit. Closing a reader never kills the process. Consumers use these observed facts without declaring or deriving an
+expectation from a command's argv. Events name a process by `index`, its record's position in birth-observation order,
+never by a pid that another life may reuse. The generated sparse delta changes exactly one field, usage or blocker;
+absent is unchanged. A blocker observed afresh, `none` included, is SET, and a blocker no longer observed is CLEAR.
+Because lock detail lives inside `Lock`, setting any other blocker leaves no stale path or holder. No delta shape
+changes nothing, so neither Rust nor the generated validators admit an empty one.
 
 The `leaf` in `JobResourceSample` is the observed process, live or exited, with the most own CPU (user+system
 microseconds), ties broken by birth identity then PID. It does not need a complete tree: it needs the observed processes

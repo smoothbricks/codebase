@@ -66,6 +66,12 @@ export const parseBinaryData = (json: string): Api.BinaryData => assertBinaryDat
 export const assertBinaryDataList = typia.createAssertEquals<readonly Api.BinaryData[]>();
 export const parseBinaryDataList = (json: string): readonly Api.BinaryData[] => assertBinaryDataList(JSON.parse(json));
 
+export const assertBlockerChange = typia.createAssertEquals<Api.BlockerChange>();
+export const parseBlockerChange = (json: string): Api.BlockerChange => assertBlockerChange(JSON.parse(json));
+export const assertBlockerChangeList = typia.createAssertEquals<readonly Api.BlockerChange[]>();
+export const parseBlockerChangeList = (json: string): readonly Api.BlockerChange[] =>
+  assertBlockerChangeList(JSON.parse(json));
+
 export const assertBoundIdentity = typia.createAssertEquals<Api.BoundIdentity>();
 export const parseBoundIdentity = (json: string): Api.BoundIdentity => assertBoundIdentity(JSON.parse(json));
 export const assertBoundIdentityList = typia.createAssertEquals<readonly Api.BoundIdentity[]>();
@@ -421,6 +427,18 @@ export const assertJobJournalCursorList = typia.createAssertEquals<readonly Api.
 export const parseJobJournalCursorList = (json: string): readonly Api.JobJournalCursor[] =>
   assertJobJournalCursorList(JSON.parse(json));
 
+export const assertJobProcessDelta = typia.createAssertEquals<Api.JobProcessDelta>();
+export const parseJobProcessDelta = (json: string): Api.JobProcessDelta => assertJobProcessDelta(JSON.parse(json));
+export const assertJobProcessDeltaList = typia.createAssertEquals<readonly Api.JobProcessDelta[]>();
+export const parseJobProcessDeltaList = (json: string): readonly Api.JobProcessDelta[] =>
+  assertJobProcessDeltaList(JSON.parse(json));
+
+export const assertJobProcessEvent = typia.createAssertEquals<Api.JobProcessEvent>();
+export const parseJobProcessEvent = (json: string): Api.JobProcessEvent => assertJobProcessEvent(JSON.parse(json));
+export const assertJobProcessEventList = typia.createAssertEquals<readonly Api.JobProcessEvent[]>();
+export const parseJobProcessEventList = (json: string): readonly Api.JobProcessEvent[] =>
+  assertJobProcessEventList(JSON.parse(json));
+
 export const assertJobProcessSample = typia.createAssertEquals<Api.JobProcessSample>();
 export const parseJobProcessSample = (json: string): Api.JobProcessSample => assertJobProcessSample(JSON.parse(json));
 export const assertJobProcessSampleList = typia.createAssertEquals<readonly Api.JobProcessSample[]>();
@@ -515,6 +533,11 @@ export const assertLandingCommitsList = typia.createAssertEquals<readonly Api.La
 export const parseLandingCommitsList = (json: string): readonly Api.LandingCommits[] =>
   assertLandingCommitsList(JSON.parse(json));
 
+export const assertLockHolder = typia.createAssertEquals<Api.LockHolder>();
+export const parseLockHolder = (json: string): Api.LockHolder => assertLockHolder(JSON.parse(json));
+export const assertLockHolderList = typia.createAssertEquals<readonly Api.LockHolder[]>();
+export const parseLockHolderList = (json: string): readonly Api.LockHolder[] => assertLockHolderList(JSON.parse(json));
+
 export const assertLogsChunk = typia.createAssertEquals<Api.LogsChunk>();
 export const parseLogsChunk = (json: string): Api.LogsChunk => assertLogsChunk(JSON.parse(json));
 export const assertLogsChunkList = typia.createAssertEquals<readonly Api.LogsChunk[]>();
@@ -589,6 +612,12 @@ export const assertPortBlock = typia.createAssertEquals<Api.PortBlock>();
 export const parsePortBlock = (json: string): Api.PortBlock => assertPortBlock(JSON.parse(json));
 export const assertPortBlockList = typia.createAssertEquals<readonly Api.PortBlock[]>();
 export const parsePortBlockList = (json: string): readonly Api.PortBlock[] => assertPortBlockList(JSON.parse(json));
+
+export const assertProcessBlockedOn = typia.createAssertEquals<Api.ProcessBlockedOn>();
+export const parseProcessBlockedOn = (json: string): Api.ProcessBlockedOn => assertProcessBlockedOn(JSON.parse(json));
+export const assertProcessBlockedOnList = typia.createAssertEquals<readonly Api.ProcessBlockedOn[]>();
+export const parseProcessBlockedOnList = (json: string): readonly Api.ProcessBlockedOn[] =>
+  assertProcessBlockedOnList(JSON.parse(json));
 
 export const assertProcessCoverage = typia.createAssertEquals<Api.ProcessCoverage>();
 export const parseProcessCoverage = (json: string): Api.ProcessCoverage => assertProcessCoverage(JSON.parse(json));

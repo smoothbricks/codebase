@@ -119,6 +119,11 @@ export type AuditEvent = {
  */
 export type BinaryData = TaggedBytesRef;
 
+/**
+ * A changed [`JobProcessSample::blocked_on`].
+ */
+export type BlockerChange = { readonly set: ProcessBlockedOn } | 'clear';
+
 export type BoundIdentity = {
   readonly repoId: RepoId;
   readonly remoteName: string | null;
@@ -716,6 +721,48 @@ export type JobJournalCursor = {
 };
 
 /**
+ * The one field of one process that changed; every other field is unchanged. A usage read and
+ * a blocker read are separate observations, so a change names exactly one of them, and a
+ * change of nothing can be neither built nor decoded.
+ */
+export type JobProcessDelta =
+  | {
+      readonly index: number & tags.Type<'uint32'>;
+      /**
+       * Usage only ever becomes known or moves on; it is never cleared.
+       */
+      readonly usage: ProcessUsage;
+    }
+  | {
+      readonly index: number & tags.Type<'uint32'>;
+      readonly blockedOn: BlockerChange;
+    };
+
+/**
+ * One change to a job's process tree, in the order the supervisor folded it. `index` is the
+ * process's position in [`JobProcessTree::processes`]: the order births were observed, which
+ * never changes, so it names one life where a pid could name two.
+ */
+export type JobProcessEvent =
+  | ({ readonly kind: 'born' } & {
+      readonly index: number & tags.Type<'uint32'>;
+      readonly process: JobProcessSample;
+    })
+  | ({ readonly kind: 'exec' } & {
+      readonly index: number & tags.Type<'uint32'>;
+      readonly process: JobProcessSample;
+    })
+  | ({ readonly kind: 'changed' } & JobProcessDelta)
+  | ({ readonly kind: 'heartbeat' } & {
+      readonly index: number & tags.Type<'uint32'>;
+      readonly process: JobProcessSample;
+    })
+  | ({ readonly kind: 'exited' } & {
+      readonly index: number & tags.Type<'uint32'>;
+      readonly process: JobProcessSample;
+    });
+
+/**
  * One life of one process: the image it runs now (or ran last), its parent, and how it ended.
  */
 export type JobProcessSample = {
@@ -734,6 +781,15 @@ export type JobProcessSample = {
    */
   readonly argv: ReadonlyArray<CommandArg>;
   readonly bornAt: UtcTimestamp;
+  /**
+   * Absent until its counters are first read; never zeroes in their place.
+   */
+  readonly usage?: ProcessUsage;
+  /**
+   * What it was last observed waiting on; absent while no blocker was observed, never a
+   * fabricated [`ProcessBlockedOn::None`].
+   */
+  readonly blockedOn?: ProcessBlockedOn;
   /**
    * Absent until the exit is observed.
    */
@@ -959,6 +1015,17 @@ export type LandingCommits =
     });
 
 /**
+ * The process holding a lock another one waits for.
+ */
+export type LockHolder = {
+  readonly pid: number & tags.Type<'uint32'>;
+  /**
+   * The cowshed job that owns the holder, when one does.
+   */
+  readonly job?: JobId;
+};
+
+/**
  * The JSON half of a `job.logs` answer; the bytes follow as its raw-byte frame.
  */
 export type LogsChunk = {
@@ -1064,6 +1131,22 @@ export type PortBlock = {
   readonly base: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly size: number & tags.Type<'uint32'> & tags.Maximum<65535>;
 };
+
+/**
+ * What a process was observed waiting on. A lock's detail exists only on a lock, so no other
+ * blocker can carry a stale path or holder.
+ */
+export type ProcessBlockedOn =
+  | { readonly kind: 'none' }
+  | ({ readonly kind: 'lock' } & {
+      readonly path: string;
+      readonly holder?: LockHolder;
+    })
+  | { readonly kind: 'socket' }
+  | { readonly kind: 'pipe' }
+  | { readonly kind: 'child' }
+  | { readonly kind: 'stdin' }
+  | { readonly kind: 'disk' };
 
 /**
  * Whether the tree holds every process the job owned. A gap is absorbing: once an observation

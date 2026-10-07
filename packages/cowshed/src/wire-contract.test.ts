@@ -224,6 +224,31 @@ describe('checked resource units', () => {
   }
 });
 
+describe('process events', () => {
+  it('refuses a process change that changes nothing', () => {
+    // Rust cannot build a change of nothing; the generated validator must not admit one either,
+    // or a TypeScript consumer accepts an event no supervisor can emit.
+    const usage = {
+      cpuUserUs: 10,
+      cpuSysUs: 0,
+      busy: false,
+      rssBytes: 4096,
+      rssPeakBytes: 4096,
+      io: { kind: 'read', readBytes: 0, writeBytes: 0 },
+    };
+    for (const change of [{ blockedOn: { set: { kind: 'none' } } }, { blockedOn: 'clear' }, { usage }]) {
+      const event = { kind: 'changed', index: 3, ...change };
+      expect<unknown>(validators.assertJobProcessEvent(event)).toEqual(event);
+      expect<unknown>(validators.parseJobProcessEvent(JSON.stringify(event))).toEqual(event);
+    }
+    expect(() => validators.assertJobProcessEvent({ kind: 'changed', index: 3 })).toThrow();
+    expect(() => validators.parseJobProcessEvent('{"kind":"changed","index":3}')).toThrow();
+    expect(() => validators.assertJobProcessDelta({ index: 3 })).toThrow();
+    // One observation changes one field: a usage and a blocker are two changes, as in Rust.
+    expect(() => validators.assertJobProcessDelta({ index: 3, usage, blockedOn: 'clear' })).toThrow();
+  });
+});
+
 const assertGeneratedModule = typia.createAssert<{
   readonly assertWorkspaceInfo: (value: unknown) => unknown;
   readonly parseWorkspaceInfo: (json: string) => unknown;
