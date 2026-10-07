@@ -320,10 +320,10 @@ unmount and eject callbacks), which `-force` does not bypass. The kernel's I/O R
 an image's path to its devices (`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")`
 snapshot, each node walked up to its `AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is
 not an inventory: while any other image attaches or detaches it answers a truncated image list with nothing marking it
-(a reviewer probe that kept one image attached while churning another saw it missing from 11–89 of every 648–1551
-polls, and from none of the same polls' registry reads). Reading that omission as absence once skipped a post-format
-release, leaving the image attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's
-attachment on restart.
+(a reviewer probe that kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls,
+and from none of the same polls' registry reads). Reading that omission as absence once skipped a post-format release,
+leaving the image attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment
+on restart.
 
 The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
 reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
@@ -358,6 +358,11 @@ source. `WhenIdle` returns native unmount's observed resource-busy refusal witho
 grace before `umount -f`. Other errors remain errors. Only after filesystem removal does the image driver's detach
 release the device. Local real mounted-image probes measured 29–42 ms for native unmount; hosted deadline closure is not
 implied.
+
+Concurrent mount-table reads use `getfsstat(MNT_NOWAIT)` into a buffer each call owns: count first, allocate checked
+space with room for new mounts, and grow and reread if the returned buffer is full. No reader borrows `getmntinfo`'s
+process-static array, which another thread can overwrite during iteration. Every snapshot retains complete mountpoint
+and source-device records; an empty mountpoint is a real inventory fault, not an entry to silently discard.
 
 Disk device names are reusable, not image identities. Each image has its own private per-user lease,
 `/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256 of the identity>.lock`: an `flock` on a regular owner-only 0600
@@ -638,13 +643,13 @@ sizing. The complete create/mount/pin transaction uses the one provisioning auth
 
 Host-storage planning takes its APFS listing from the kernel, never from `diskutil apfs list`. One IORegistry snapshot
 names every container (BSD name, capacity ceiling) and every volume (BSD name, name, volume UUID, `RoleValue`,
-`Encrypted`); the kernel mount table (`getmntinfo`) names where each volume is mounted, and a volume with no mount entry
-is detached. That one snapshot selects the container holding the home directory's exact mount-source volume and is the
-global reserved-name guard, so the two decisions cannot observe different listings. The snapshot is read once, with no
-retry or delay, and fails closed: an unreadable registry, an empty registry, a duplicated container or volume
-identifier, a volume outside its container or at snapshot depth, an empty name, a non-canonical volume UUID, a zero
-capacity, or two kernel mounts of one volume is an error, never evidence that a reserved volume is absent. The listing
-`diskutil apfs list -plist` read back an empty root while an unrelated image detached; the registry has no such
+`Encrypted`); the kernel mount table (`getfsstat` into an owned buffer) names where each volume is mounted, and a volume
+with no mount entry is detached. That one snapshot selects the container holding the home directory's exact mount-source
+volume and is the global reserved-name guard, so the two decisions cannot observe different listings. The snapshot is
+read once, with no retry or delay, and fails closed: an unreadable registry, an empty registry, a duplicated container
+or volume identifier, a volume outside its container or at snapshot depth, an empty name, a non-canonical volume UUID, a
+zero capacity, or two kernel mounts of one volume is an error, never evidence that a reserved volume is absent. The
+listing `diskutil apfs list -plist` read back an empty root while an unrelated image detached; the registry has no such
 transient projection. A volume mounted somewhere other than its canonical path is attested by `statfs` at that path
 before it is reported as mis-mounted.
 
@@ -761,7 +766,7 @@ deliberately blunt: any user may retire any shed, because `noowners` already mad
 | Question                | Source of truth                                                                                                                              |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main`                                  |
-| What is attached where? | Kernel mount table (`getmntinfo`), matched by mount point, identity confirmed by the in-image marker                                         |
+| What is attached where? | Kernel mount table (`getfsstat` into an owned buffer), matched by mount point, identity confirmed by the in-image marker                     |
 | Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                                                    |
 | Grants                  | Sibling file `<image>.grants.json`                                                                                                           |
 | Concurrency             | `flock` on `<image>.lock` per lifecycle operation; `<workspace>.intent.lock` held by the process executing that workspace's lifecycle intent |
@@ -890,8 +895,8 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
 
 **No SQLite / state store.** Any database row describing mounts or workspaces is a cache of kernel or filesystem state
 that drifts on reboot and Finder ejects, and drift demands reconciliation machinery. Deriving state makes "what cowshed
-believes" and "what is on disk" the same thing by construction; `cowshed doctor` shrinks to invariant checks. The cost —
-a few `readdir`/`getmntinfo` calls per command — is microseconds.
+believes" and "what is on disk" the same thing by construction; `cowshed doctor` shrinks to invariant checks. Commands
+read the source directories and owned kernel mount snapshots rather than maintaining a mutable cache of them.
 
 **SPARSE and sparsebundle rejected; one format, no fallback.** Sparsebundle band files reintroduce thousands of host
 inodes per workspace for no benefit (network-volume support is irrelevant here). SPARSE (`.sparseimage`) is the legacy

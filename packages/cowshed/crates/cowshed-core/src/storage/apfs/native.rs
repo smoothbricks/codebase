@@ -6088,6 +6088,33 @@ mod tests {
     use super::*;
     use crate::fork_lock::Run as _;
 
+    /// Concurrent-reader smoke coverage of kernel snapshot invariants; race timing is not forced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parallel_mount_reads_own_complete_snapshots() {
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                threads.spawn(|| {
+                    start.wait();
+                    for _ in 0..32 {
+                        let mounts = system_kernel_mounts().expect("owned kernel mount snapshot");
+                        assert!(
+                            mounts
+                                .iter()
+                                .all(|mount| !mount.mount_point.as_os_str().is_empty())
+                        );
+                        assert!(
+                            mounts
+                                .iter()
+                                .any(|mount| mount.mount_point == Path::new("/"))
+                        );
+                    }
+                });
+            }
+        });
+    }
+
     /// A recovery pass lists a directory other workspaces' lifecycle verbs write to at the same
     /// time: an entry removed between the listing and its inspection is skipped, never a failure
     /// of the pass (a sibling's retirement removing its `.asif.ca.key` failed every job poll of
