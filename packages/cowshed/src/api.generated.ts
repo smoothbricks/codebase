@@ -783,8 +783,9 @@ export type JobResourceSample = {
    */
   readonly leaderPid: number & tags.Type<'uint32'>;
   /**
-   * The pid of every running process in the job's group, the leader's among them while it
-   * runs: the complete membership, never a truncated one. Empty once nothing of the group runs.
+   * The pid of every running process in the job's group whose resident memory was read at
+   * this boundary, the leader's among them while it runs: the complete membership, never a
+   * truncated one. Empty once nothing of the group runs.
    */
   readonly members: ReadonlyArray<number & tags.Type<'uint32'>>;
   /**
@@ -795,6 +796,15 @@ export type JobResourceSample = {
    * The host's load and online cores at this sample boundary.
    */
   readonly host: HostLoadSample;
+  /**
+   * What the `members` held resident together, each read at this boundary.
+   */
+  readonly rssBytes: ResidentBytes;
+  /**
+   * The largest `rssBytes` this job has been sampled at, this sample's included: a group's
+   * peak, never the sum of its processes' separate peaks.
+   */
+  readonly rssPeakBytes: ResidentBytes;
 };
 
 export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';

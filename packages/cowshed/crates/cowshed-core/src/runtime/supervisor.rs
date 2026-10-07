@@ -21,7 +21,7 @@ use crate::api::dto::{
     OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind,
     StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
 };
-use crate::api::resources::{HostLoadSample, JobResourceSample};
+use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
 use crate::error::{CowshedError, Result};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
@@ -40,7 +40,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
-use crate::runtime::job_resources::{JobSampler, Observation, Sampling};
+use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -4729,24 +4729,45 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
 }
 
-/// Observe the job's processes now: the one imperative step of a sample.
-fn observe(sampler: &JobSampler) -> Result<JobResourceSample> {
+/// Observe the job's processes now: the one imperative step of a sample. Each member's resident
+/// memory is read right after the membership; a member that exited in between holds nothing
+/// and is no member any more.
+fn observe(sampler: &mut JobSampler) -> Result<JobResourceSample> {
     let sampled_at = utc_now()?;
-    let members = super::job_groups::job_members(sampler.leader()).map_err(|error| {
+    let leader = sampler.leader().pid();
+    let unreadable = |what: &str, error: std::io::Error| {
         CowshedError::environment_missing(
-            format!(
-                "the membership of job group {} could not be read: {error}",
-                sampler.leader().pid()
-            ),
+            format!("the {what} of job group {leader} could not be read: {error}"),
             "the job runs on; read its resources again",
         )
-    })?;
+    };
     let host = crate::host_load::read_host_load().map_err(|error| {
         CowshedError::environment_missing(
             format!("the sample's host observation could not be read: {error}"),
             "the command runs on; inspect the host's load and core reporting",
         )
     })?;
+    let processes = super::job_groups::job_members(sampler.leader())
+        .map_err(|error| unreadable("membership", error))?;
+    let mut members = Vec::with_capacity(processes.len());
+    for process in &processes {
+        let pid = u32::try_from(process.pid()).map_err(|error| {
+            CowshedError::internal(format!(
+                "job group {leader} holds process {}, which is no pid: {error}",
+                process.pid()
+            ))
+        })?;
+        let Some(resident) = process
+            .resident_bytes()
+            .map_err(|error| unreadable("resident memory", error))?
+        else {
+            continue;
+        };
+        let resident = ResidentBytes::new(resident).map_err(|error| {
+            CowshedError::internal(format!("process {pid} of job group {leader}: {error}"))
+        })?;
+        members.push(Member { pid, resident });
+    }
     sampler.sample(Observation {
         now: Instant::now(),
         sampled_at,

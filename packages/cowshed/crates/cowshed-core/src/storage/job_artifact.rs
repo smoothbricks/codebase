@@ -29,7 +29,7 @@ use crate::api::dto::{
     WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
     validate_command_argv,
 };
-use crate::api::resources::{HostLoadSample, JobResourceSample, WallMicros};
+use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, WallMicros};
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -90,9 +90,9 @@ const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
 /// The terminal resource sample's columns, in order: its time, wall duration, leader, its group's
-/// members, and the host's load at spawn and at the sample. All null for a record without a
-/// sample.
-const RESOURCE_COLUMNS: [&str; 8] = [
+/// members, the host's load at spawn and at the sample, and the members' resident sum and the
+/// job's peak of it. All null for a record without a sample.
+const RESOURCE_COLUMNS: [&str; 10] = [
     "resources_sampled_at",
     "resources_wall_us",
     "resources_leader_pid",
@@ -101,6 +101,8 @@ const RESOURCE_COLUMNS: [&str; 8] = [
     "resources_host_start_cores",
     "resources_host_load1",
     "resources_host_cores",
+    "resources_rss_bytes",
+    "resources_rss_peak_bytes",
 ];
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
@@ -350,7 +352,8 @@ impl JobArtifactRecord {
         {
             return Err(integrity(
                 0,
-                "a record's resource sample must be its own job's, its wallMs its wallUs",
+                "a record's resource sample must be its own job's, its wallMs its wallUs and its \
+                 rssPeakBytes at least its rssBytes",
             ));
         }
         if self.sequence == 0 {
@@ -3513,6 +3516,8 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(RESOURCE_COLUMNS[5], DataType::UInt16, true),
         field(RESOURCE_COLUMNS[6], DataType::Float64, true),
         field(RESOURCE_COLUMNS[7], DataType::UInt16, true),
+        field(RESOURCE_COLUMNS[8], DataType::UInt64, true),
+        field(RESOURCE_COLUMNS[9], DataType::UInt64, true),
     ]))
 }
 
@@ -3807,6 +3812,12 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt16Array::from(vec![
             resources.map(|sample| sample.host.cores.get()),
         ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.rss_bytes.get()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            resources.map(|sample| sample.rss_peak_bytes.get()),
+        ])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3936,6 +3947,12 @@ fn decode_resources(
     let sampled_at = UtcTimestamp::new(string(batch, RESOURCE_COLUMN)?.value(0))?;
     let wall = WallMicros::new(uint64(batch, RESOURCE_COLUMN + 1)?.value(0))
         .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    let resident = |column: usize| {
+        ResidentBytes::new(uint64(batch, column)?.value(0))
+            .map_err(|error| ArtifactError::Arrow(error.to_string()))
+    };
+    let rss = resident(RESOURCE_COLUMN + 8)?;
+    let rss_peak = resident(RESOURCE_COLUMN + 9)?;
     let leader_pid = uint32(batch, RESOURCE_COLUMN + 2)?.value(0);
     let members = list(batch, RESOURCE_COLUMN + 3)?.value(0);
     let members = downcast::<UInt32Array>(members.as_ref(), "resources_members.values")?;
@@ -3956,15 +3973,18 @@ fn decode_resources(
         HostLoadSample::new(load1.value(0), cores.value(0))
             .map_err(|error| ArtifactError::Arrow(error.to_string()))
     };
-    Ok(Some(JobResourceSample::new(
+    Ok(Some(JobResourceSample {
         job_id,
         sampled_at,
-        wall,
+        wall_ms: wall.millis(),
+        wall_us: wall,
         leader_pid,
-        members.values().to_vec(),
-        host(RESOURCE_COLUMN + 4)?,
-        host(RESOURCE_COLUMN + 6)?,
-    )))
+        members: members.values().to_vec(),
+        host_start: host(RESOURCE_COLUMN + 4)?,
+        host: host(RESOURCE_COLUMN + 6)?,
+        rss_bytes: rss,
+        rss_peak_bytes: rss_peak,
+    }))
 }
 
 fn visible_storage_name(kind: VisibleStorageKind) -> &'static str {
@@ -5328,15 +5348,19 @@ mod tests {
     }
 
     fn sample(job_id: u64, wall_us: u64, leader_pid: u32) -> JobResourceSample {
-        JobResourceSample::new(
-            JobId::new(job_id).unwrap(),
-            UtcTimestamp::new("2026-10-07T12:00:00Z").unwrap(),
-            WallMicros::new(wall_us).unwrap(),
+        let wall = WallMicros::new(wall_us).unwrap();
+        JobResourceSample {
+            job_id: JobId::new(job_id).unwrap(),
+            sampled_at: UtcTimestamp::new("2026-10-07T12:00:00Z").unwrap(),
+            wall_ms: wall.millis(),
+            wall_us: wall,
             leader_pid,
-            vec![leader_pid, leader_pid + 1],
-            HostLoadSample::new(0.5, 4).unwrap(),
-            HostLoadSample::new(3.75, 10).unwrap(),
-        )
+            members: vec![leader_pid, leader_pid + 1],
+            host_start: HostLoadSample::new(0.5, 4).unwrap(),
+            host: HostLoadSample::new(3.75, 10).unwrap(),
+            rss_bytes: ResidentBytes::new(128 << 20).unwrap(),
+            rss_peak_bytes: ResidentBytes::new(256 << 20).unwrap(),
+        }
     }
 
     #[test]
@@ -5352,13 +5376,40 @@ mod tests {
             panic!("a job record");
         };
         assert_eq!(read, sampled);
+        assert_eq!(
+            read.resources
+                .map(|sample| (sample.rss_bytes, sample.rss_peak_bytes)),
+            Some((
+                ResidentBytes::new(128 << 20).unwrap(),
+                ResidentBytes::new(256 << 20).unwrap()
+            )),
+            "the sealed sample keeps both the group's last resident sum and its peak"
+        );
 
         // A sample missing one of its columns is damage, not a job without a sample.
-        let mut columns = batch.columns().to_vec();
-        columns[RESOURCE_COLUMN + 2] = Arc::new(UInt32Array::from(vec![Option::<u32>::None]));
-        let partial = RecordBatch::try_new(batch.schema(), columns).unwrap();
-        assert!(batch_to_protected_record(&partial).is_err());
+        let missing: [(usize, ArrayRef); 2] = [
+            (
+                RESOURCE_COLUMN + 2,
+                Arc::new(UInt32Array::from(vec![Option::<u32>::None])),
+            ),
+            (
+                RESOURCE_COLUMN + 9,
+                Arc::new(UInt64Array::from(vec![Option::<u64>::None])),
+            ),
+        ];
+        for (column, missing) in missing {
+            let mut columns = batch.columns().to_vec();
+            columns[column] = missing;
+            let partial = RecordBatch::try_new(batch.schema(), columns).unwrap();
+            assert!(
+                batch_to_protected_record(&partial).is_err(),
+                "{} null alone",
+                RESOURCE_COLUMNS[column - RESOURCE_COLUMN]
+            );
+        }
 
+        let mut below_peak = sample(9, 1, 1);
+        below_peak.rss_peak_bytes = ResidentBytes::new(1).unwrap();
         for (record, why) in [
             (
                 JobArtifactRecord {
@@ -5374,6 +5425,13 @@ mod tests {
                     ..valid_job_record(9)
                 },
                 "a running job's record has no terminal sample",
+            ),
+            (
+                JobArtifactRecord {
+                    resources: Some(below_peak),
+                    ..valid_job_record(9)
+                },
+                "a peak is never below the sample it includes",
             ),
         ] {
             assert!(record.validate().is_err(), "{why}");

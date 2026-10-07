@@ -523,7 +523,8 @@ pub fn group_has_live_members(pgid: i32) -> io::Result<bool> {
     Ok(!members_of(pgid)?.is_empty())
 }
 
-/// The pid of every running process in the job's group, which `leader` leads.
+/// Every running process in the job's group, which `leader` leads, each held by the identity it
+/// had when read ([`Process`]).
 ///
 /// While its parent holds the leader unreaped, the leader holding its pid -- the group id --
 /// before the members are read and still after proves every process read the job's; an exited
@@ -532,25 +533,19 @@ pub fn group_has_live_members(pgid: i32) -> io::Result<bool> {
 /// group whoever held it. Anything else -- an unidentified leader, a pid that names another
 /// process, processes holding the id of a leader gone, a membership not read in full -- is an
 /// error, never a guessed or empty membership.
-pub fn job_members(leader: &Birth) -> io::Result<Vec<u32>> {
+pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
     let pgid = i32::try_from(leader.pid()).map_err(io::Error::other)?;
     // `Some(true)` while the leader holds its pid, `Some(false)` while another process does,
     // `None` once no process holds it.
     let holds = |leader: GroupLeader| -> io::Result<Option<bool>> {
         Ok(birth_time(leader.pgid)?.map(|birth| birth == leader.birth))
     };
-    let pids = |members: Vec<Process>| -> io::Result<Vec<u32>> {
-        members
-            .iter()
-            .map(|member| u32::try_from(member.pid()).map_err(io::Error::other))
-            .collect()
-    };
     if let Birth::Observed(leader) = leader {
         match holds(*leader)? {
             Some(true) => {
                 let members = members_of(pgid)?;
                 if holds(*leader)? == Some(true) {
-                    return pids(members);
+                    return Ok(members);
                 }
             }
             Some(false) => {
@@ -670,6 +665,7 @@ fn read_exit(pid: i32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
 /// A process held by an identity the kernel never gives another: its pid and that pid's version,
 /// as an audit token carries them. Signalling it reaches that process or nothing.
 #[cfg(target_os = "macos")]
+#[derive(Debug)]
 pub struct Process {
     pid: i32,
     version: u32,
@@ -911,6 +907,19 @@ impl Process {
             )),
         }
     }
+
+    /// The bytes this process holds resident now; `None` once it has exited. The read names
+    /// only the pid, so it counts only if the pid's running process still carries this
+    /// process's version afterwards: then this process ran throughout and the size read was its
+    /// own, not that of a later process given the pid. A read that failed for a process gone
+    /// since is its exit, not an error.
+    pub(super) fn resident_bytes(&self) -> io::Result<Option<u64>> {
+        let read = crate::process::resident_bytes(self.pid);
+        match running_info(self.pid)? {
+            Some(info) if info.unique.id_version.cast_unsigned() == self.version => read,
+            Some(_) | None => Ok(None),
+        }
+    }
 }
 
 /// A process's exit, watched from a moment it ran (`Process::watch_exit`). The kernel reports
@@ -1036,6 +1045,7 @@ fn group_pids(pgid: i32) -> io::Result<Vec<i32>> {
 /// A process held by an identity the kernel never gives another: a pidfd, which names the one
 /// process it was opened for. Signalling it reaches that process or nothing.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub struct Process {
     pid: i32,
     handle: std::os::fd::OwnedFd,
@@ -1044,7 +1054,7 @@ pub struct Process {
 /// Every running process that holds the group id, each held by a pidfd.
 #[cfg(target_os = "linux")]
 fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::FromRawFd as _;
 
     let mut members = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
@@ -1072,18 +1082,9 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        // A pidfd becomes readable when its process exits. Still unreadable after the stat was
-        // read, the process it names ran throughout, so the stat was that process's.
-        let mut exited = libc::pollfd {
-            fd: handle.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live pollfd entry.
-        if unsafe { libc::poll(&mut exited, 1, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if exited.revents != 0 {
+        // Still running after the stat was read, the process the pidfd names ran throughout,
+        // so the stat was that process's.
+        if pidfd_exited(&handle)? {
             continue;
         }
         let closing = stat.rfind(')').ok_or_else(|| {
@@ -1185,6 +1186,35 @@ impl Process {
     pub(super) fn watch_exit(&self) -> io::Result<ExitWatch> {
         self.handle.try_clone().map(ExitWatch)
     }
+
+    /// The bytes this process holds resident now; `None` once it has exited. The read names
+    /// only the pid, so it counts only if the pidfd -- which names this process alone -- says it
+    /// still runs afterwards: then the size read was its own, not that of a later process given
+    /// the pid. A read that failed for a process gone since is its exit, not an error.
+    pub(super) fn resident_bytes(&self) -> io::Result<Option<u64>> {
+        let read = crate::process::resident_bytes(self.pid);
+        if pidfd_exited(&self.handle)? {
+            return Ok(None);
+        }
+        read
+    }
+}
+
+/// Whether the process `handle` names has exited: a pidfd becomes readable when it does.
+#[cfg(target_os = "linux")]
+fn pidfd_exited(handle: &std::os::fd::OwnedFd) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut exited = libc::pollfd {
+        fd: handle.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live pollfd entry.
+    if unsafe { libc::poll(&mut exited, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(exited.revents != 0)
 }
 
 /// The leader's start time, or confirmed absence. An unreadable process is never absent.
@@ -1344,12 +1374,21 @@ mod tests {
         pids
     }
 
+    fn pids(members: Vec<super::Process>) -> Vec<u32> {
+        sorted(
+            members
+                .iter()
+                .map(|member| u32::try_from(member.pid()).expect("a pid"))
+                .collect(),
+        )
+    }
+
     #[test]
     fn a_job_s_members_are_its_whole_running_group_and_none_once_it_ended() {
         let (mut job, sleeper) = group_with_child("sleep 300 & echo $!; wait");
         let birth = super::Birth::of(job.id());
         assert_eq!(
-            sorted(super::job_members(&birth).expect("members")),
+            pids(super::job_members(&birth).expect("members")),
             sorted(vec![job.id(), sleeper])
         );
 
@@ -1361,14 +1400,51 @@ mod tests {
         // The leader's `wait` returns once its child died, and the leader exits.
         super::await_exit_unreaped(i32::try_from(job.id()).unwrap()).expect("leader exit");
         assert_eq!(
-            super::job_members(&birth).expect("an exited, unreaped leader proves its group"),
+            pids(super::job_members(&birth).expect("an exited, unreaped leader proves its group")),
             Vec::<u32>::new()
         );
         job.wait().expect("reap the leader");
         assert_eq!(
-            super::job_members(&birth).expect("an id nothing holds names an empty group"),
+            pids(super::job_members(&birth).expect("an id nothing holds names an empty group")),
             Vec::<u32>::new()
         );
+    }
+
+    /// A member's resident memory is read while it runs; once it has exited -- reaped, or
+    /// exited and not yet reaped -- it holds nothing, and that is no error.
+    #[test]
+    fn a_member_s_resident_memory_is_read_while_it_runs_and_none_once_it_exited() {
+        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!; wait");
+        let birth = super::Birth::of(job.id());
+        let members = super::job_members(&birth).expect("members");
+        assert_eq!(members.len(), 2, "the leader and its child");
+        for member in &members {
+            let resident = member.resident_bytes().expect("a running member's memory");
+            assert!(
+                resident.is_some_and(|bytes| bytes > 0),
+                "process {} runs, so it holds memory: {resident:?}",
+                member.pid()
+            );
+        }
+
+        // SAFETY: plain kill of the test's own grandchild, which is still running.
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(sleeper).unwrap(), libc::SIGKILL) },
+            0
+        );
+        // The leader reaped its child, then exited; this test holds it unreaped.
+        super::await_exit_unreaped(i32::try_from(job.id()).unwrap()).expect("leader exit");
+        for member in &members {
+            assert_eq!(
+                member
+                    .resident_bytes()
+                    .expect("an exited member is no error"),
+                None,
+                "process {} has exited",
+                member.pid()
+            );
+        }
+        job.wait().expect("reap the leader");
     }
 
     #[test]

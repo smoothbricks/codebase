@@ -544,6 +544,8 @@
           "jobId": 2,
           "leaderPid": 4242,
           "members": [4242, 4243],
+          "rssBytes": 50331648,
+          "rssPeakBytes": 100663296,
           "sampledAt": "2026-01-02T03:04:05Z",
           "wallMs": 1250,
           "wallUs": 1250400
@@ -755,6 +757,8 @@
         "jobId": 2,
         "leaderPid": 4242,
         "members": [4242, 4243],
+        "rssBytes": 50331648,
+        "rssPeakBytes": 100663296,
         "sampledAt": "2026-01-02T03:04:05Z",
         "wallMs": 1250,
         "wallUs": 1250400

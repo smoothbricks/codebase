@@ -3442,6 +3442,136 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     );
 }
 
+/// What each [`Holder`] keeps resident.
+const HELD: u64 = 128 << 20;
+
+/// A process this test started in the job's group: it holds [`HELD`] bytes of its own, every
+/// page written, from the line it writes on stdout until its stdin -- a pipe this test holds --
+/// closes.
+struct Holder(std::process::Child);
+
+impl Holder {
+    /// Start a holder in the group `leader` leads and return once its memory is resident.
+    fn hold(leader: &std::process::Child) -> Self {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        // One buffer, filled 1 MiB at a time with random bytes: no page of it is one the kernel
+        // can share or compress away, and no large transient copy -- whose freed pages Darwin's
+        // allocator may leave resident -- inflates what the holder holds.
+        let script = format!(
+            "import os, sys\nheld = bytearray({HELD})\nfor at in range(0, {HELD}, 1 << 20):\n    held[at:at + (1 << 20)] = os.urandom(1 << 20)\nprint('held', flush=True)\nsys.stdin.read()\n"
+        );
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(i32::try_from(leader.id()).unwrap())
+            .spawn_locked()
+            .expect("python3, which the development shell provides");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "held\n", "the holder wrote every page it holds");
+        Self(child)
+    }
+
+    /// Close its stdin, and reap it once it exits: it holds nothing any more.
+    fn release(mut self) {
+        drop(self.0.stdin.take());
+        assert!(self.0.wait().unwrap().success());
+    }
+}
+
+/// A job's resident memory is what its group holds together at a sample, and its peak the
+/// largest such sum read: two processes holding memory at once raise it, two holding the same
+/// amount one after the other do not, and the sealed sample keeps it.
+#[tokio::test]
+async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_read() {
+    let (supervisor_config, _root) = isolated_config("resources-rss");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut leader = lone_group();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader, Instant::now()),
+        },
+        0,
+    )
+    .await;
+
+    let (first, second) = (Holder::hold(&leader), Holder::hold(&leader));
+    let both = handle.resources(job_id).await.unwrap();
+    let mut members = both.members.clone();
+    members.sort_unstable();
+    let mut expected = vec![leader.id(), first.0.id(), second.0.id()];
+    expected.sort_unstable();
+    assert_eq!(members, expected, "the leader and both holders");
+    assert!(
+        both.rss_bytes.get() >= 2 * HELD,
+        "two holders hold {} bytes together, not {}",
+        2 * HELD,
+        both.rss_bytes.get()
+    );
+    assert_eq!(
+        both.rss_peak_bytes, both.rss_bytes,
+        "the largest sum read so far"
+    );
+    first.release();
+    second.release();
+
+    for _ in 0..2 {
+        let holder = Holder::hold(&leader);
+        let one = handle.resources(job_id).await.unwrap();
+        assert!(
+            (HELD..2 * HELD).contains(&one.rss_bytes.get()),
+            "one holder holds {HELD} bytes, not {}",
+            one.rss_bytes.get()
+        );
+        assert_eq!(
+            one.rss_peak_bytes, both.rss_peak_bytes,
+            "a smaller sum leaves the peak where it was"
+        );
+        assert!(
+            one.rss_peak_bytes.get() < 4 * HELD,
+            "the peak is no sum of every holder's own peak"
+        );
+        holder.release();
+    }
+
+    end_group(&mut leader);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    assert_eq!(
+        (
+            terminal.members.clone(),
+            terminal.rss_bytes.get(),
+            terminal.rss_peak_bytes
+        ),
+        (Vec::new(), 0, both.rss_peak_bytes),
+        "an emptied group holds nothing, and the job's peak stays"
+    );
+    assert_eq!(
+        handle.sealed(job_id).await.unwrap().resources,
+        Some(terminal),
+        "the sealed sample keeps the peak"
+    );
+}
+
 #[tokio::test]
 async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
     let (supervisor_config, _root) = isolated_config("resources-unspawned");

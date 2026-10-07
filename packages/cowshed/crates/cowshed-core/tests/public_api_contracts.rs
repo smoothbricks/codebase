@@ -65,15 +65,18 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
         cwd,
         started: timestamp(),
         duration_ms: Some(1250),
-        resources: Some(JobResourceSample::new(
-            JobId::new(7).unwrap(),
-            timestamp(),
-            WallMicros::new(1_249_731).unwrap(),
-            4242,
-            vec![4242, 4243],
-            HostLoadSample::new(1.25, 8).unwrap(),
-            HostLoadSample::new(4.5, 16).unwrap(),
-        )),
+        resources: Some(JobResourceSample {
+            job_id: JobId::new(7).unwrap(),
+            sampled_at: timestamp(),
+            wall_ms: WallMicros::new(1_249_731).unwrap().millis(),
+            wall_us: WallMicros::new(1_249_731).unwrap(),
+            leader_pid: 4242,
+            members: vec![4242, 4243],
+            host_start: HostLoadSample::new(1.25, 8).unwrap(),
+            host: HostLoadSample::new(4.5, 16).unwrap(),
+            rss_bytes: ResidentBytes::new(48 << 20).unwrap(),
+            rss_peak_bytes: ResidentBytes::new(96 << 20).unwrap(),
+        }),
         exit: Some(ExitStatus::Signaled {
             signal: 15,
             core_dumped: false,
@@ -434,7 +437,7 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "cwd": "packages/app",
             "started": "2026-07-11T12:34:56Z",
             "durationMs": 1250,
-            "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16}},
+            "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296},
             "exit": {"kind":"signaled","signal":15,"coreDumped":false},
             "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
             "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
@@ -459,11 +462,17 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
     let mut foreign = info.clone();
     foreign.resources.as_mut().unwrap().job_id = JobId::new(8).unwrap();
     assert!(foreign.validate().is_err(), "a sample of another job");
-    let mut disagreeing = info;
+    let mut disagreeing = info.clone();
     disagreeing.resources.as_mut().unwrap().wall_us = WallMicros::new(2_000_000).unwrap();
     assert!(
         disagreeing.validate().is_err(),
         "wallMs must project wallUs"
+    );
+    let mut past_peak = info;
+    past_peak.resources.as_mut().unwrap().rss_bytes = ResidentBytes::new(97 << 20).unwrap();
+    assert!(
+        past_peak.validate().is_err(),
+        "rssPeakBytes includes the sample's own rssBytes"
     );
 }
 
@@ -484,7 +493,7 @@ fn root_job_info_requires_explicit_null_cwd() {
         "cwd": null,
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 1250,
-        "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16}},
+        "resources": {"jobId":7,"sampledAt":"2026-07-11T12:34:56Z","wallMs":1249,"wallUs":1_249_731,"leaderPid":4242,"members":[4242,4243],"hostStart":{"load1":1.25,"cores":8},"host":{"load1":4.5,"cores":16},"rssBytes":50_331_648,"rssPeakBytes":100_663_296},
         "exit": {"kind":"signaled","signal":15,"coreDumped":false},
         "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
         "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},

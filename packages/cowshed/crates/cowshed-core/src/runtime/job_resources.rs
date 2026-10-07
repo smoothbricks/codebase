@@ -10,7 +10,9 @@ use std::time::Instant;
 use super::job_groups::Birth;
 use super::supervisor::OwnedProcess;
 use crate::api::dto::{JobId, UtcTimestamp};
-use crate::api::resources::{HostLoadSample, JobResourceSample, WallMicros};
+use crate::api::resources::{
+    HostLoadSample, JobResourceSample, ResidentBytes, ResourceUnitError, WallMicros,
+};
 use crate::error::{CowshedError, Result};
 use crate::host_load::HostLoadError;
 
@@ -29,7 +31,7 @@ impl Sampling {
     /// The job owns `process`. Its first process starts the sampling; a later one -- its
     /// command, after its activation -- takes the lead and keeps the spawn's baselines. Returns
     /// the sampler to observe, or `None` once the job ended.
-    pub(super) fn own(&mut self, job_id: JobId, process: OwnedProcess) -> Option<&JobSampler> {
+    pub(super) fn own(&mut self, job_id: JobId, process: OwnedProcess) -> Option<&mut JobSampler> {
         match self {
             Self::Unowned => {
                 *self = Self::Live(JobSampler::spawned(job_id, process));
@@ -50,7 +52,7 @@ impl Sampling {
     /// could not be taken. Returns the terminal sample, if one exists.
     pub(super) fn freeze(
         &mut self,
-        observe: impl FnOnce(&JobSampler) -> Result<JobResourceSample>,
+        observe: impl FnOnce(&mut JobSampler) -> Result<JobResourceSample>,
     ) -> Option<JobResourceSample> {
         if let Self::Live(sampler) = self {
             *self = Self::Frozen(observe(sampler));
@@ -64,9 +66,9 @@ impl Sampling {
     /// A resources read: a live job observed now through `observe`, an ended job's frozen
     /// outcome, or why there is nothing to sample.
     pub(super) fn read(
-        &self,
+        &mut self,
         job_id: JobId,
-        observe: impl FnOnce(&JobSampler) -> Result<JobResourceSample>,
+        observe: impl FnOnce(&mut JobSampler) -> Result<JobResourceSample>,
     ) -> Result<JobResourceSample> {
         match self {
             Self::Live(sampler) => observe(sampler),
@@ -86,9 +88,17 @@ impl Sampling {
 pub(super) struct Observation {
     pub now: Instant,
     pub sampled_at: UtcTimestamp,
-    /// The complete running membership of the group the sampler's leader leads.
-    pub members: Vec<u32>,
     pub host: HostLoadSample,
+    /// Every process of the group the sampler's leader leads that was running when its resident
+    /// memory was read: the complete membership, less any member that exited before its read.
+    pub members: Vec<Member>,
+}
+
+/// One process of the job's group, as read at a sample boundary.
+pub(super) struct Member {
+    pub pid: u32,
+    /// Its resident memory, read at this boundary.
+    pub resident: ResidentBytes,
 }
 
 pub(super) struct JobSampler {
@@ -99,6 +109,8 @@ pub(super) struct JobSampler {
     leader: Birth,
     /// The first spawn's observation, never replaced by a later process or sample.
     host_start: std::result::Result<HostLoadSample, HostLoadError>,
+    /// The largest group resident sum a sample of this job has observed.
+    rss_peak: ResidentBytes,
 }
 
 impl JobSampler {
@@ -108,6 +120,7 @@ impl JobSampler {
             spawned: first.spawned,
             leader: first.birth,
             host_start: first.host,
+            rss_peak: ResidentBytes::ZERO,
         }
     }
 
@@ -120,9 +133,10 @@ impl JobSampler {
         &self.leader
     }
 
-    /// The job's sample from what was observed of it.
-    pub(super) fn sample(&self, observed: Observation) -> Result<JobResourceSample> {
-        let host_start = self.host_start.as_ref().map_err(|error| {
+    /// The job's sample from what was observed of it. Its resident sum joins the job's peak; a
+    /// sample that cannot be taken leaves the peak as it was.
+    pub(super) fn sample(&mut self, observed: Observation) -> Result<JobResourceSample> {
+        let host_start = *self.host_start.as_ref().map_err(|error| {
             CowshedError::environment_missing(
                 format!(
                     "job {} spawn host observation failed: {error}",
@@ -131,21 +145,33 @@ impl JobSampler {
                 "the command runs on; inspect the host's load and core reporting",
             )
         })?;
-        let wall = WallMicros::of(observed.now.duration_since(self.spawned)).map_err(|error| {
+        let unsampled = |error: ResourceUnitError| {
             CowshedError::internal(format!(
                 "job {} cannot be sampled: {error}",
                 self.job_id.get()
             ))
-        })?;
-        Ok(JobResourceSample::new(
-            self.job_id,
-            observed.sampled_at,
-            wall,
-            self.leader.pid(),
-            observed.members,
-            *host_start,
-            observed.host,
-        ))
+        };
+        let wall = WallMicros::of(observed.now.duration_since(self.spawned)).map_err(unsampled)?;
+        let rss = observed
+            .members
+            .iter()
+            .try_fold(ResidentBytes::ZERO, |sum, member| {
+                sum.checked_add(member.resident)
+            })
+            .map_err(unsampled)?;
+        self.rss_peak = self.rss_peak.max(rss);
+        Ok(JobResourceSample {
+            job_id: self.job_id,
+            sampled_at: observed.sampled_at,
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid: self.leader.pid(),
+            members: observed.members.iter().map(|member| member.pid).collect(),
+            host_start,
+            host: observed.host,
+            rss_bytes: rss,
+            rss_peak_bytes: self.rss_peak,
+        })
     }
 }
 
@@ -154,6 +180,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::api::resources::MAX_EXACT_INTEGER;
 
     fn owned(pid: u32, spawned: Instant) -> OwnedProcess {
         OwnedProcess {
@@ -175,12 +202,77 @@ mod tests {
     }
 
     fn seen(now: Instant, members: &[u32]) -> Observation {
+        let members: Vec<(u32, u64)> = members.iter().map(|&pid| (pid, 0)).collect();
+        held(now, &members)
+    }
+
+    /// An observation of `members`, each `(pid, resident bytes)`.
+    fn held(now: Instant, members: &[(u32, u64)]) -> Observation {
         Observation {
             now,
             sampled_at: at(),
-            members: members.to_vec(),
             host: HostLoadSample::new(1.25, 8).expect("host snapshot"),
+            members: members
+                .iter()
+                .map(|&(pid, resident)| Member {
+                    pid,
+                    resident: ResidentBytes::new(resident).expect("exact"),
+                })
+                .collect(),
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// The group's peak is the largest simultaneous sum: neither the leader's own memory nor
+    /// the sum of every process's separate peak.
+    #[test]
+    fn the_rss_peak_is_the_largest_group_sum_observed_and_survives_the_end() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sampler = sampling.own(job(), owned(100, spawn)).expect("live");
+        let mut fold = |members: &[(u32, u64)]| {
+            sampler
+                .sample(held(spawn, members))
+                .ok()
+                .map(|sample| (sample.rss_bytes.get(), sample.rss_peak_bytes.get()))
+        };
+        assert_eq!(fold(&[(100, 0)]), Some((0, 0)));
+        assert_eq!(
+            fold(&[(100, 0), (101, 128 * MIB), (102, 128 * MIB)]),
+            Some((256 * MIB, 256 * MIB)),
+            "two children hold their memory at once"
+        );
+        assert_eq!(
+            fold(&[(100, 0), (103, 128 * MIB)]),
+            Some((128 * MIB, 256 * MIB)),
+            "a later child's memory is not added to an earlier one's"
+        );
+        assert_eq!(
+            fold(&[(100, 0), (104, 128 * MIB)]),
+            Some((128 * MIB, 256 * MIB))
+        );
+        // A sample that cannot be taken leaves the peak as it was.
+        assert_eq!(
+            fold(&[(100, MAX_EXACT_INTEGER), (101, MAX_EXACT_INTEGER)]),
+            None,
+            "a sum no projection holds exactly is an error"
+        );
+
+        let terminal = sampling
+            .freeze(|sampler| sampler.sample(seen(spawn, &[])))
+            .expect("a terminal sample");
+        assert_eq!(
+            (terminal.rss_bytes.get(), terminal.rss_peak_bytes.get()),
+            (0, 256 * MIB),
+            "the terminal sample keeps the job's peak"
+        );
+        assert_eq!(
+            sampling
+                .read(job(), |_| unreachable!("frozen"))
+                .expect("frozen"),
+            terminal
+        );
     }
 
     #[test]

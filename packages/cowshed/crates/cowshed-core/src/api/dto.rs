@@ -1789,7 +1789,8 @@ impl JobInfo {
             }
             if !resources.consistent() {
                 return Err(DtoError::InvalidJobProjection(
-                    "resources.wallMs must be resources.wallUs in whole milliseconds",
+                    "resources.wallMs must be resources.wallUs in whole milliseconds, and \
+                     resources.rssPeakBytes at least resources.rssBytes",
                 ));
             }
         }

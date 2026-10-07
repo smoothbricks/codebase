@@ -95,6 +95,11 @@ impl ResidentBytes {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// What `self` and `other` hold together.
+    pub fn checked_add(self, other: Self) -> Result<Self, ResourceUnitError> {
+        exact("rssBytes", u128::from(self.0) + u128::from(other.0)).map(Self)
+    }
 }
 
 impl TryFrom<u64> for ResidentBytes {
@@ -311,40 +316,26 @@ pub struct JobResourceSample {
     /// The job's observed leader: the activation's while a cold host activates, then the
     /// command's. Retained after it exits.
     pub leader_pid: u32,
-    /// The pid of every running process in the job's group, the leader's among them while it
-    /// runs: the complete membership, never a truncated one. Empty once nothing of the group runs.
+    /// The pid of every running process in the job's group whose resident memory was read at
+    /// this boundary, the leader's among them while it runs: the complete membership, never a
+    /// truncated one. Empty once nothing of the group runs.
     pub members: Vec<u32>,
     /// Captured once with the first owned process, even when that process is activation.
     pub host_start: HostLoadSample,
     /// The host's load and online cores at this sample boundary.
     pub host: HostLoadSample,
+    /// What the `members` held resident together, each read at this boundary.
+    pub rss_bytes: ResidentBytes,
+    /// The largest `rssBytes` this job has been sampled at, this sample's included: a group's
+    /// peak, never the sum of its processes' separate peaks.
+    pub rss_peak_bytes: ResidentBytes,
 }
 
 impl JobResourceSample {
-    pub fn new(
-        job_id: JobId,
-        sampled_at: UtcTimestamp,
-        wall: WallMicros,
-        leader_pid: u32,
-        members: Vec<u32>,
-        host_start: HostLoadSample,
-        host: HostLoadSample,
-    ) -> Self {
-        Self {
-            job_id,
-            sampled_at,
-            wall_ms: wall.millis(),
-            wall_us: wall,
-            leader_pid,
-            members,
-            host_start,
-            host,
-        }
-    }
-
-    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`.
+    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`, and no
+    /// peak lies below the sample it includes.
     pub fn consistent(&self) -> bool {
-        self.wall_ms == self.wall_us.millis()
+        self.wall_ms == self.wall_us.millis() && self.rss_bytes <= self.rss_peak_bytes
     }
 }
 
@@ -403,23 +394,62 @@ mod tests {
         HostLoadSample::new(1.25, 8).expect("host snapshot")
     }
 
+    fn bytes(value: u64) -> ResidentBytes {
+        ResidentBytes::new(value).expect("exact")
+    }
+
     #[test]
     fn wall_milliseconds_project_the_microseconds() {
         let wall = WallMicros::of(Duration::from_micros(12_345_999)).expect("exact");
-        let sample = JobResourceSample::new(
-            JobId::new(7).expect("job"),
-            timestamp(),
-            wall,
-            41,
-            vec![41],
-            host(),
-            host(),
-        );
+        let sample = JobResourceSample {
+            job_id: JobId::new(7).expect("job"),
+            sampled_at: timestamp(),
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid: 41,
+            members: vec![41],
+            host_start: host(),
+            host: host(),
+            rss_bytes: bytes(4096),
+            rss_peak_bytes: bytes(8192),
+        };
         assert_eq!(
             (sample.wall_us.get(), sample.wall_ms.get()),
             (12_345_999, 12_345)
         );
         assert!(sample.consistent());
+    }
+
+    #[test]
+    fn a_peak_below_its_own_sample_is_inconsistent() {
+        let wall = WallMicros::new(1).expect("exact");
+        let sample = JobResourceSample {
+            job_id: JobId::new(7).expect("job"),
+            sampled_at: timestamp(),
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid: 41,
+            members: vec![41],
+            host_start: host(),
+            host: host(),
+            rss_bytes: bytes(8192),
+            rss_peak_bytes: bytes(4096),
+        };
+        assert!(!sample.consistent());
+    }
+
+    #[test]
+    fn resident_bytes_no_projection_holds_exactly_are_an_error() {
+        let inexact = Err(ResourceUnitError::Inexact {
+            unit: "rssBytes",
+            value: u128::from(MAX_EXACT_INTEGER) + 1,
+        });
+        assert_eq!(ResidentBytes::new(MAX_EXACT_INTEGER + 1), inexact);
+        assert_eq!(bytes(MAX_EXACT_INTEGER).checked_add(bytes(1)), inexact);
+        assert_eq!(
+            bytes(MAX_EXACT_INTEGER - 1).checked_add(bytes(1)),
+            Ok(bytes(MAX_EXACT_INTEGER))
+        );
     }
 
     #[test]
@@ -438,15 +468,18 @@ mod tests {
     #[test]
     fn the_wire_is_camel_case_numbers_and_refuses_an_inexact_unit() {
         let wall = WallMicros::new(1_500).expect("exact");
-        let sample = JobResourceSample::new(
-            JobId::new(3).expect("job"),
-            timestamp(),
-            wall,
-            99,
-            vec![99, 100],
-            host(),
-            host(),
-        );
+        let sample = JobResourceSample {
+            job_id: JobId::new(3).expect("job"),
+            sampled_at: timestamp(),
+            wall_ms: wall.millis(),
+            wall_us: wall,
+            leader_pid: 99,
+            members: vec![99, 100],
+            host_start: host(),
+            host: host(),
+            rss_bytes: bytes(1 << 20),
+            rss_peak_bytes: bytes(3 << 20),
+        };
         let json = serde_json::to_value(&sample).expect("serialize");
         assert_eq!(
             json,
@@ -459,23 +492,26 @@ mod tests {
                 "members": [99, 100],
                 "hostStart": { "load1": 1.25, "cores": 8 },
                 "host": { "load1": 1.25, "cores": 8 },
+                "rssBytes": 1_048_576,
+                "rssPeakBytes": 3_145_728,
             })
         );
         assert_eq!(
             serde_json::from_value::<JobResourceSample>(json).expect("round trip"),
             sample
         );
-        let inexact = serde_json::json!({
-            "jobId": 3,
-            "sampledAt": "2026-10-07T12:00:00Z",
-            "wallMs": 1,
-            "wallUs": MAX_EXACT_INTEGER + 1,
-            "leaderPid": 99,
-            "members": [99, 100],
-            "hostStart": { "load1": 1.25, "cores": 8 },
-            "host": { "load1": 1.25, "cores": 8 },
-        });
-        assert!(serde_json::from_value::<JobResourceSample>(inexact).is_err());
+        let at = |field: &str, value: u64| {
+            let mut json = serde_json::to_value(&sample).expect("serialize");
+            json[field] = serde_json::json!(value);
+            json
+        };
+        for field in ["wallUs", "rssBytes", "rssPeakBytes"] {
+            assert!(
+                serde_json::from_value::<JobResourceSample>(at(field, MAX_EXACT_INTEGER + 1))
+                    .is_err(),
+                "{field} beyond the exact bound is refused"
+            );
+        }
     }
 }
 

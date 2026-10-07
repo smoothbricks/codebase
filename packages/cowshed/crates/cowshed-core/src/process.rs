@@ -219,6 +219,94 @@ pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
     Ok(!matches!(state, "Z" | "X"))
 }
 
+/// The bytes the process `pid` names holds resident now; `None` once the kernel says no such
+/// process runs. An exited process never counts as holding memory: this reads
+/// `pti_resident_size` of `proc_pidinfo(PROC_PIDTASKINFO)`, which answers `ESRCH` once the
+/// process has no task, not `ri_resident_size` of `proc_pid_rusage`, which still answers for an
+/// exited, unreaped process with the size it last held (measured: 1.1 MB for a zombie).
+#[cfg(target_os = "macos")]
+pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>())
+        .map_err(io::Error::other)?;
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == size {
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        return Ok(Some(unsafe { info.assume_init() }.pti_resident_size));
+    }
+    if written > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proc_pidinfo returned {written} bytes of process {pid}'s task, expected {size}"
+            ),
+        ));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(None),
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("the resident memory of process {pid} cannot be read: {error}"),
+        )),
+    }
+}
+
+/// [`resident_bytes`] from procfs: `statm`'s resident pages times the page size. A pid without
+/// a `statm` (`ENOENT`), or one reaped while it is read (`ESRCH`), names no process; an exited,
+/// unreaped one has no memory left to count, and its `statm` reads zero pages.
+#[cfg(target_os = "linux")]
+pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+    let statm = match std::fs::read_to_string(format!("/proc/{pid}/statm")) {
+        Ok(statm) => statm,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("the resident memory of process {pid} cannot be read: {error}"),
+            ));
+        }
+    };
+    let invalid = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("process {pid}'s statm {statm:?} {what}"),
+        )
+    };
+    let pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| invalid("has no resident field"))?
+        .parse()
+        .map_err(|_| invalid("has a resident field that is no page count"))?;
+    // SAFETY: sysconf takes a plain integer and touches no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = u64::try_from(page).map_err(|_| {
+        io::Error::other(format!(
+            "the page size cannot be read: {}",
+            io::Error::last_os_error()
+        ))
+    })?;
+    pages
+        .checked_mul(page)
+        .map(Some)
+        .ok_or_else(|| invalid("holds more bytes than a u64 counts"))
+}
+
 /// How a child process terminated, without collapsing signals into a synthetic exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessStatus {
