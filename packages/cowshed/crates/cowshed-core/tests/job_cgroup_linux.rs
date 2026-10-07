@@ -1261,10 +1261,12 @@ fn make_device_node(path: &Path, sys_dev: &Path, kind: libc::mode_t) -> Result<(
 fn report_loop_unavailable(reason: &str) {
     println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
     let status = std::fs::read_to_string("/proc/self/status").expect("root status");
-    for line in status
-        .lines()
-        .filter(|line| line.starts_with("CapEff:") || line.starts_with("NoNewPrivs:"))
-    {
+    for line in status.lines().filter(|line| {
+        line.starts_with("CapEff:")
+            || line.starts_with("NoNewPrivs:")
+            || line.starts_with("Seccomp:")
+            || line.starts_with("Seccomp_filters:")
+    }) {
         println!("scratch availability: {line}");
     }
     println!(
@@ -1350,16 +1352,18 @@ impl Drop for Scratch {
 }
 
 /// A refused command unwinds through the same guard as failed setup or a failed scenario.
-/// Prove association cleanup both before mount and after it, as well as mount/image removal.
+/// When loop access is refused, report unmounted tmpfs cleanup only, not association proof.
 fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
-    for mounted in [false, true] {
-        let scratch = if mounted {
+    for requested_mount in [false, true] {
+        let scratch = if requested_mount {
             Scratch::make(uid, gid)
         } else {
             let name = format!("cowshed-job-cgroup-{}", std::process::id());
             Scratch::prepare(std::env::temp_dir().join(name), uid, gid)
         };
         let root = scratch.root.clone();
+        let actual_mounted = scratch.mounted;
+        let associated = scratch.loop_file.is_some();
         let outcome = std::panic::catch_unwind(move || {
             let _scratch = scratch;
             run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
@@ -1370,7 +1374,11 @@ fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
             "cleanup removed {} after refusal",
             root.display()
         );
-        println!("scratch cleanup: command failure and panic unwind verified (mounted {mounted})");
+        println!(
+            "scratch cleanup: command failure and panic unwind verified \
+             (requested mount {requested_mount}, actual mounted {actual_mounted}, \
+             loop associated {associated})"
+        );
     }
 }
 
