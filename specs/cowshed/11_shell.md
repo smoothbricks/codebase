@@ -353,11 +353,26 @@ non-empty first element, no NUL, and the same per-element and aggregate byte bou
 and a script needs its JSON to decode to a valid script. This preserves non-UTF-8 Unix argv across crash recovery and
 rejects malformed complete batches as `Integrity`; protected storage never downgrades argv to Arrow Utf8.
 
-Record layouts grow only by trailing columns, and each build reads its own layout and every earlier one. A complete,
-intact batch that begins with every column of this build's layout and has more — a job record in it declares a version
-above this build's — was written by a newer cowshed: recovery refuses it as `Conflict`, naming the record's layout and
-the newest this build reads, and never truncates, rewrites or seals it. Only a batch in no layout at all, or holding
-other than one row, is `Integrity`.
+Record layouts grow only by trailing columns, and each build reads exactly its own layout. A store that holds a
+complete, intact record in an earlier layout (one row whose leading `record_kind` and `record_version` columns declare a
+version below this build's) is set aside whole the first time this build opens it. Under the records lock, recovery
+reads only the common allocation header of each intact frame, the `record_kind` and the `job_id` every layout keeps in
+its fifth column: a job's id is required and checked, and only a checkpoint manifest has none. A frame whose header is
+missing, malformed or mislabeled refuses the set-aside as `Integrity` before anything is written or moved. The highest
+id the store handed out raises the checked `records.job-floor` counter beside the records: an inline job leaves no job
+directory, so without that floor the empty store would hand its id out again under the same incarnation. Then
+`records.sequence` and every `records.barrier.*` move into a fresh `.cowshed/job/set-aside/layout-<v>/`
+(`layout-<v>.<n>` when that name already holds records), and `records.arrow` moves last: an open interrupted mid-move
+meets the same earlier layout again and finishes into the first such directory that holds no records yet. Recovery
+reports the set-aside store and says so on stderr, an empty store starts, and new job ids are allocated above the floor,
+the job directories that stay, and every frame. The checkpoint manifests in those records go with them: a checkpoint
+taken before the set-aside no longer attests to anything in the new store. Nothing else of an earlier layout is read,
+and nothing is projected from one. A complete, intact batch that begins with every column of this build's layout and has
+more (a job record in it declares a version above this build's) was written by a newer cowshed: recovery refuses it as
+`Conflict`, naming the record's layout and the newest this build reads, and never truncates, rewrites or seals it. A
+torn trailing batch is cut as above only in a store that stays; a store being set aside moves with its bytes as they
+are, torn suffix included. A batch in no layout at all, an earlier layout claiming this build's version, this build's
+layout claiming another version, or a batch holding other than one row is `Integrity`.
 
 A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each
 create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation that
