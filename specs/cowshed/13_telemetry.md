@@ -292,10 +292,22 @@ job as the two elements `\0script` and the script's JSON, a nullable `failure` n
 status of its own says so (`supervisorLost`), then `exit_code` (Int32) or `exit_signal, exit_core_dumped` (Int32,
 Boolean) for the status `wait(2)` reported, and `duration_ms` (UInt64). The exit and duration columns are null on a
 running record and on a terminal one whose end nothing observed (a job refused before its command ran,
-`supervisorLost`). Records are written at `record_version` 5. Version-4 records carry two more Utf8 columns,
-`warm_base, warm_head`, between `failure` and the exit columns; they are read with those columns skipped. Version-3
-records, which have every column up to `failure`, and version-2 records, which lack `failure` too, are read as they
-were, and a batch whose layout and version disagree is rejected. A CheckpointManifest row instead uses
+`supervisorLost`). A terminal job's resource sample follows: `resources_sampled_at` (Utf8), `resources_wall_us`
+(UInt64), `resources_leader_pid` (UInt32), `resources_members: List<UInt32>`,
+`resources_host_start_load1, resources_host_start_cores, resources_host_load1, resources_host_cores` (Float64, UInt16,
+Float64, UInt16), `resources_rss_bytes, resources_rss_peak_bytes` (UInt64), the four UInt64 stream tallies
+`resources_stdout_bytes, resources_stdout_lines, resources_stderr_bytes, resources_stderr_lines`, then the sample's
+`JobAccounting`: `resources_accounting_source` (Utf8, its wire kind, today only `macOsRusageChildren`),
+`resources_accounting_cpu_user_us, resources_accounting_cpu_sys_us` (UInt64), and
+`resources_accounting_io_read_bytes, resources_accounting_io_write_bytes` (UInt64), then, appended in version 7,
+`resources_volume_workspace` and `resources_volume_build`, each that volume's `VolumeUsage` as its 07_api.md wire JSON
+(Utf8). Every resource column is null on a record without a sample. A sample always carries
+`resources_volume_workspace`; `resources_volume_build` is null for a sample of a job that ran with no build volume; the
+accounting columns are all null for a sample without accounting, and its two byte columns are null together where the
+source has no byte totals; any other null combination is rejected. Records are written and read at `record_version` 7
+only: a store holding a record in an earlier layout is set aside whole and never read (11_shell.md), and a batch whose
+layout and version disagree is rejected; version 7 is version 6 with the two volume columns appended, so a version-6
+reader meets it as a newer writer's. A CheckpointManifest row instead uses
 `origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
 `visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the
