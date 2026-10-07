@@ -3166,6 +3166,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
             stdin: StdinSource::Open,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         })
         .await
         .expect("open exec");
@@ -3322,6 +3323,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
             stdin: StdinSource::Open,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         })
         .await
         .expect("exec");
@@ -3573,6 +3575,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
             stdin: StdinSource::Open,
             stdout_copy: None,
             stderr_copy: None,
+            admission_key: None,
         })
         .await
         .expect("exec");

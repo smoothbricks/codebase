@@ -41,9 +41,11 @@ describe('Cowshed attachment Node-API boundary', () => {
       ${inputFixture}
       const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
       const worker = await coordinator.worker('main');
-      const job = await worker.exec({ argv: ['attachment-oracle'], stdin: { kind: 'open' } });
+      const job = await worker.exec({ argv: ['attachment-oracle'], admissionKey: 'attachment-open', stdin: { kind: 'open' } });
       assert.equal(job.id, 1);
-      let attachment = await job.attach();
+      const recovered = await worker.jobByKey('attachment-open');
+      assert.equal(recovered.id, job.id);
+      let attachment = await recovered.attach();
       let cursor = 0;
 
       const deliver = async (bytes) => {
@@ -261,8 +263,13 @@ describe('Cowshed attachment Node-API boundary', () => {
               argv: [{ encoding: 'utf8', data: openCalls === 1 ? 'attachment-oracle' : 'delivery-unknown-oracle' }],
               session: null, cwd: null, mode: 'readWrite', env: {}, trace: null,
               stdin: { kind: 'open' }, stdoutCopy: null, stderrCopy: null,
+              ...(openCalls === 1 ? { admissionKey: 'attachment-open' } : {}),
             });
             answer(message.id, openCalls);
+            break;
+          case 'worker.jobByKey':
+            assert.deepEqual(message.params, { ...fence, admissionKey: 'attachment-open' });
+            answer(message.id, 1);
             break;
           case 'job.status': {
             const { jobId } = message.params;

@@ -11,8 +11,7 @@ use cowshed_core::api::{
     ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark,
     JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
     OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
-    StdinKind,
-    StdinSource, StreamInfo, WorkspacePath,
+    StdinKind, StdinSource, StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
@@ -2631,6 +2630,135 @@ fn keyed(key: &str, stdin: StdinSource) -> ExecRequest {
         admission_key: Some(AdmissionKey::new(key).unwrap()),
         ..request(stdin)
     }
+}
+
+/// Open remains a distinct wire source with no reader behind it. Its durable stream-kind
+/// identity replays the same job; a repeat that supplies a reader receives StdinBound and
+/// drops that reader without a single poll, so it can never replace the attachment's input.
+#[tokio::test]
+async fn a_keyed_open_repeat_reaches_the_same_job_and_never_binds_a_reader() {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::sync::oneshot;
+
+    struct Unread {
+        polls: Arc<AtomicUsize>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Unread {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Err(io::Error::other(
+                "a refused reader must never be polled",
+            )))
+        }
+    }
+    impl Drop for Unread {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    let (supervisor_config, _root) = isolated_config("keyed-open");
+    let mut h = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, keyed("op-open", StdinSource::Open))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        remote
+            .exec(None, None, keyed("op-open", StdinSource::Open))
+            .await
+            .unwrap(),
+        job
+    );
+    assert_eq!(
+        remote
+            .job_by_key(AdmissionKey::new("op-open").unwrap())
+            .await
+            .unwrap(),
+        job
+    );
+    let before = remote.info(job).await.unwrap().stdin;
+    assert_eq!(
+        (before.kind, before.bytes, before.complete),
+        (StdinKind::Stream, 0, false)
+    );
+    assert!(h.spawned.try_recv().is_err(), "Open replay spawned nothing");
+    assert_eq!(
+        h.process.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "Open admission and replay bind no reader and send no EOF"
+    );
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let (dropped, reader_dropped) = oneshot::channel();
+    let refused = remote
+        .exec(
+            None,
+            None,
+            keyed(
+                "op-open",
+                StdinSource::Stream(Box::pin(Unread {
+                    polls: Arc::clone(&polls),
+                    dropped: Some(dropped),
+                })),
+            ),
+        )
+        .await
+        .unwrap_err();
+    reader_dropped
+        .await
+        .expect("the refused reader was dropped");
+    assert_eq!(polls.load(Ordering::Relaxed), 0);
+    assert_eq!(refused.code, ErrorCode::Usage);
+    assert_eq!(
+        refused.admission_source(),
+        Some(&AdmissionRefusal::StdinBound { job_id: job })
+    );
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "a second reader spawned nothing"
+    );
+
+    let input = Bytes::from_static(b"line\n");
+    remote.stdin_write(job, 0, input.clone()).await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, input)
+    );
+    remote.stdin_close(job).await.unwrap();
+    remote.stdin_close(job).await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    assert_eq!(h.process.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    complete(&spawned, b"line\n", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(job).await.unwrap();
+    assert_eq!(
+        remote
+            .exec(None, None, keyed("op-open", StdinSource::Open))
+            .await
+            .unwrap(),
+        job,
+        "a terminal Open replay is still the original job"
+    );
+    assert!(h.spawned.try_recv().is_err());
 }
 
 /// 07_api "Keyed admission": a key's first exec binds its stdin stream to the job it admits. A

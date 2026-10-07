@@ -344,6 +344,11 @@ export type CowshedError = {
    * like `fence`.
    */
   readonly admission?: AdmissionRefusal;
+  /**
+   * Present only on a job stdin write or close refused at the job's input, naming why and
+   * where that input stands. Absent from the wire otherwise, like `fence`.
+   */
+  readonly stdin?: StdinRefusal;
 };
 
 /**

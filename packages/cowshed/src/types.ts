@@ -13,12 +13,7 @@ export class CowshedError extends Error {
   readonly admission?: Api.AdmissionRefusal;
   readonly stdin: Api.StdinRefusal | undefined;
 
-  constructor(
-    code: Api.ErrorCode,
-    message: string,
-    hint: string,
-    options?: CowshedErrorOptions,
-  ) {
+  constructor(code: Api.ErrorCode, message: string, hint: string, options?: CowshedErrorOptions) {
     super(message, options);
     this.name = 'CowshedError';
     this.code = code;

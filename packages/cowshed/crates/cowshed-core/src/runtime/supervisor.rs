@@ -3689,7 +3689,7 @@ impl SupervisorActor {
                 bytes: u64::try_from(bytes.len())
                     .map_err(|_| CowshedError::internal("inline stdin length exceeds u64"))?,
             },
-            StdinSource::Stream(_) => AdmittedStdin::Stream,
+            StdinSource::Stream(_) | StdinSource::Open => AdmittedStdin::Stream,
             StdinSource::WorkspaceFile(path) => AdmittedStdin::WorkspaceFile(path.clone()),
         };
         Ok(JobAdmission {
@@ -3749,7 +3749,9 @@ impl SupervisorActor {
                 AdmittedStdin::Inline { sha256, bytes }
                     if *bytes == byte_count(input.len()) && *sha256 == Sha256Digest::compute(input)
             ),
-            StdinSource::Stream(_) => matches!(admitted.stdin, AdmittedStdin::Stream),
+            StdinSource::Stream(_) | StdinSource::Open => {
+                matches!(admitted.stdin, AdmittedStdin::Stream)
+            }
             StdinSource::WorkspaceFile(path) => matches!(
                 &admitted.stdin,
                 AdmittedStdin::WorkspaceFile(known) if known == path

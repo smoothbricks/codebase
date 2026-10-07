@@ -499,6 +499,52 @@ impl JobHandle {
     }
 }
 
+use super::JobAttachment;
+
+#[napi]
+impl JobAttachment {
+    #[napi(js_name = "write")]
+    pub fn write(&self, env: Env, bytes: Buffer) -> napi::Result<JsObject> {
+        let stdin = Arc::clone(&self.stdin);
+        let bytes = super::owned_bytes(bytes);
+        super::spawn_promise(env, async move {
+            stdin.write(bytes).await?;
+            Ok(())
+        })
+    }
+    #[napi(js_name = "end")]
+    pub fn end(&self, env: Env) -> napi::Result<JsObject> {
+        let stdin = Arc::clone(&self.stdin);
+        super::spawn_promise(env, async move {
+            stdin.close().await?;
+            Ok(())
+        })
+    }
+    #[napi(js_name = "detach")]
+    pub fn detach(&self, env: Env) -> napi::Result<JsObject> {
+        let inner = Arc::clone(&self.inner);
+        super::spawn_promise(env, async move {
+            inner.detach().await?;
+            Ok(())
+        })
+    }
+}
+
+#[napi]
+impl JobHandle {
+    #[napi(js_name = "attach")]
+    pub fn attach(&self, env: Env, cursor: Option<String>) -> napi::Result<JsObject> {
+        let inner = Arc::clone(&self.inner);
+        super::spawn_promise(env, async move {
+            let result = inner
+                .attach(super::optional_argument::<
+                    cowshed_core::api::JobJournalCursor,
+                >("JobHandle.attach", cursor.as_deref())?)
+                .await?;
+            Ok(super::attachment(inner, result))
+        })
+    }
+}
 
 /// The canonical core error, with every serialized detail retained on the JS Error.
 pub(super) fn cowshed_error(
@@ -549,6 +595,12 @@ pub(super) fn cowshed_error(
         error.set_named_property(
             "admission",
             details.get_named_property::<napi::JsUnknown>("admission")?,
+        )?;
+    }
+    if details.has_named_property("stdin")? {
+        error.set_named_property(
+            "stdin",
+            details.get_named_property::<napi::JsUnknown>("stdin")?,
         )?;
     }
     Ok(napi::Error::from(error.into_unknown()))
