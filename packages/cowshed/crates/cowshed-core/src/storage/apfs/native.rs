@@ -22,6 +22,7 @@ use crate::apfs::{
     MountAccess, RecoveredImageAttachment,
 };
 use crate::copy::copy_until_quiescent_blocking;
+#[cfg(target_os = "macos")]
 use crate::fsio::AnchoredDirectory;
 use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, IMAGE_EXTENSION, ImageCapacity,
@@ -1143,9 +1144,11 @@ struct RetiredCleanupArtifacts {
 
 enum RetiredMountpoint {
     Empty(PathBuf),
+    #[cfg(target_os = "macos")]
     RootHeld(RootHeldDirectory),
 }
 
+#[cfg(target_os = "macos")]
 struct RootHeldDirectory {
     path: PathBuf,
     parent: AnchoredDirectory,
@@ -1157,9 +1160,11 @@ struct RootHeldDirectory {
 enum StrayCleanup {
     Empty,
     Work(Vec<PathBuf>),
+    #[cfg(target_os = "macos")]
     RootHeld,
 }
 
+#[cfg(target_os = "macos")]
 enum RootHeldInspection {
     OnlyLog,
     RetainedLog,
@@ -2254,6 +2259,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 }
                 match remove_stray_junk(&mount_point, &self.config.checkout_path)? {
                     StrayCleanup::Empty => {}
+                    #[cfg(target_os = "macos")]
                     StrayCleanup::RootHeld => {
                         return self
                             .hold_root_held_mountpoint(&mount_point)
@@ -2284,6 +2290,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(RetiredMountpoint::Empty(mount_point))
     }
 
+    #[cfg(target_os = "macos")]
     /// Hold the actual bare directory and its parent, without following a mutable path component.
     /// The kernel mount table, fd-relative metadata and sole-entry check are the retention proof.
     fn hold_root_held_mountpoint(
@@ -2294,6 +2301,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .ok_or(ApfsStorageError::GcPlanStale)
     }
 
+    #[cfg(target_os = "macos")]
     fn inspect_root_held_mountpoint(
         &self,
         path: &Path,
@@ -2372,6 +2380,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }))
     }
 
+    #[cfg(target_os = "macos")]
     fn retain_root_held_mountpoint(
         &self,
         held: RootHeldDirectory,
@@ -2541,6 +2550,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
         }
         let retained = match cleanup.mount_point {
+            #[cfg(target_os = "macos")]
             Some(RetiredMountpoint::RootHeld(held)) => {
                 Some(self.retain_root_held_mountpoint(held)?)
             }
@@ -2758,7 +2768,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut retained_pinned = 0_usize;
         let mut retained_recent = 0_usize;
         let mut retained_active = 0_usize;
-        let mut root_held_mountpoints = Vec::new();
+        let mut root_held_mountpoints: Vec<RootHeldMountpoint> = Vec::new();
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
         let trash_images = self.retired_trash_images(&trash)?;
@@ -2807,6 +2817,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 claimed_checkpoint_names.insert(retired.workspace().name().clone());
             }
             let cleanup = self.retired_cleanup_artifacts(project, &retired, &path, scope)?;
+            #[cfg(target_os = "macos")]
             if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
                 root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
             }
@@ -3154,6 +3165,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                     continue;
                 };
+                #[cfg(target_os = "macos")]
                 if name.starts_with(crate::storage::recovery::ROOT_HELD_MOUNT_PREFIX) {
                     if let Some(held) =
                         self.inspect_root_held_mountpoint(&path, RootHeldInspection::RetainedLog)?
@@ -3171,6 +3183,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 if !metadata.file_type().is_dir() || metadata.dev() != root_metadata.dev() {
                     continue;
                 }
+                #[cfg(target_os = "macos")]
                 if let Some(held) =
                     self.inspect_root_held_mountpoint(&path, RootHeldInspection::OnlyLog)?
                 {
@@ -3524,6 +3537,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         }
                         match remove_stray_junk(candidate.path(), &self.config.checkout_path)? {
                             StrayCleanup::Empty => {}
+                            #[cfg(target_os = "macos")]
                             StrayCleanup::RootHeld => {
                                 let held = self.hold_root_held_mountpoint(candidate.path())?;
                                 report
@@ -6143,6 +6157,7 @@ fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
+#[cfg(target_os = "macos")]
 fn root_owned_event_log(metadata: &libc::stat) -> bool {
     metadata.st_uid == 0
         && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -6168,6 +6183,7 @@ fn remove_stray_junk(
     let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
+    #[cfg(target_os = "macos")]
     let mut root_held = false;
     while let Some(dir) = stack.pop() {
         visited.push(dir.clone());
@@ -6181,6 +6197,7 @@ fn remove_stray_junk(
             let file_type = entry
                 .file_type()
                 .map_err(|error| io_error("inspect stray", &path, error))?;
+            #[cfg(target_os = "macos")]
             if relative == Path::new(".fseventsd") && file_type.is_dir() {
                 let metadata = fs::symlink_metadata(&path).map_err(|error| {
                     io_error("inspect root-held event-log candidate", &path, error)
@@ -6203,6 +6220,7 @@ fn remove_stray_junk(
             }
             strays.push((path, judged, file_type.is_dir(), file_type.is_file()));
         }
+        #[cfg(target_os = "macos")]
         if root_held {
             if strays.is_empty() && hidden.is_empty() {
                 return Ok(StrayCleanup::RootHeld);
