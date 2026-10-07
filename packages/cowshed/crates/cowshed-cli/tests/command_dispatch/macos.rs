@@ -873,6 +873,16 @@ async fn real_apfs_a_git_worktree_workspace_starts_its_supervisor_and_executes()
         .reconcile_gateway()
         .await
         .expect("serve the project");
+    // Main's own supervisor, started by the adoption, already wrote cowshed's excludes into
+    // main's file; take them out again, so only the worktree's supervisor can put them back.
+    let main_exclude = fixture.checkout.join(".git/info/exclude");
+    let stripped = fs::read_to_string(&main_exclude)
+        .expect("main's exclude file")
+        .lines()
+        .filter(|line| ![".cowshed/", ".Trashes/", ".fseventsd/"].contains(line))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    fs::write(&main_exclude, stripped).expect("strip cowshed's excludes from main's");
     let (created, _, stderr) = run(&mut service, ["new", "linked-topic", "--git-worktree"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
