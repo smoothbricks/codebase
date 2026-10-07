@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SPANS_TABLE_INIT_SQL } from '../sqlite-common.js';
+import { createNodeSQLiteDatabase, openWalDatabase } from '../sqlite-node.js';
+import { SQLiteTraceWriter } from '../sqlite-writer.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/sqlite-concurrent-open.fixture.ts', import.meta.url));
 const WORKERS = 32;
@@ -75,6 +77,22 @@ function assertCommittedWorkers(dbPath: string, mode: string): void {
 }
 
 describe('SQLiteTraceWriter concurrent process open', () => {
+  it.each(['', ':memory:'])('opens fileless path %j without publishing a draft', (dbPath) => {
+    const opened: string[] = [];
+    const db = openWalDatabase(dbPath, (path) => {
+      opened.push(path);
+      return createNodeSQLiteDatabase(path);
+    });
+    try {
+      new SQLiteTraceWriter(db);
+      expect(opened).toEqual([dbPath]);
+      expect(db.prepare('PRAGMA database_list').all()).toEqual([{ seq: 0, name: 'main', file: '' }]);
+      expect(db.prepare("SELECT name FROM sqlite_schema WHERE name = 'spans'").all()).toEqual([{ name: 'spans' }]);
+    } finally {
+      db.close();
+    }
+  });
+
   it('opens an existing recoverable sink without upgrading a held reader lock', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'lmao-open-reader-'));
     const dbPath = join(directory, 'traces.db');
