@@ -21,11 +21,11 @@ use crate::api::dto::RunSandboxMode;
 use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobTail, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions,
-    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    RemovedWorkspace, SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState,
-    WorkspaceTarget,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
+    LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
+    RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, RemovedWorkspace, SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceState, WorkspaceTarget,
 };
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
@@ -326,6 +326,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
         cursor: Option<JobJournalCursor>,
         limits: JobTailLimits,
     ) -> Result<JobAnswer<JobTail>>;
+    /// The TCP ports the job's process group listens on, read from the kernel.
+    async fn read_listening_ports(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobListeningPorts>>;
 }
 
 /// An answer a job gives when it reaches a point — its end, its next output — and so may take
@@ -830,6 +837,12 @@ impl ProjectActor {
             }
             Op::JobTailRead(params) => {
                 return self.job_tail(&authority, params).await.map(Routed::Later);
+            }
+            Op::JobListeningPortsRead(params) => {
+                return self
+                    .job_listening_ports(&authority, params)
+                    .await
+                    .map(Routed::Later);
             }
             Op::JobWait(params) => {
                 return self.job_wait(&authority, params).await.map(Routed::Later);
@@ -1429,6 +1442,26 @@ impl ProjectActor {
             .await?;
         Ok(Box::pin(async move {
             respond::<operations::JobTailRead>(&tail.await?)
+        }))
+    }
+
+    async fn job_listening_ports(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let ports = self
+            .host
+            .read_listening_ports(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            respond::<operations::JobListeningPortsRead>(&ports.await?)
         }))
     }
 
@@ -10963,6 +10996,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         Ok(Box::pin(async move {
             supervisor.tail(job, cursor, limits).await
         }))
+    }
+
+    async fn read_listening_ports(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobListeningPorts>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(
+            async move { supervisor.listening_ports(job).await },
+        ))
     }
 }
 

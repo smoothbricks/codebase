@@ -17,9 +17,10 @@ use uuid::Uuid;
 
 use crate::api::dto::{
     BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
-    JobJournalCursor, JobState, JobTail, JobTailLimits, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind,
-    StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
+    JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits, OutputLimitInfo,
+    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob, Sha256Digest,
+    StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp,
+    WorkspacePath,
 };
 use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes};
 use crate::error::{CowshedError, Result};
@@ -2282,6 +2283,18 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// The TCP ports the job's process group listens on now, read from the kernel; once the job
+    /// ended, those its ended group still holds -- none, unless a process it left holds the
+    /// group's id, which nothing then proves the job's and is an error.
+    pub async fn listening_ports(&self, job_id: JobId) -> Result<JobListeningPorts> {
+        self.call(|reply| Command::ListeningPorts {
+            authority: self.authority.clone(),
+            job_id,
+            reply,
+        })
+        .await
+    }
+
     pub async fn checkpoint_barrier(&self, checkpoint_id: String) -> Result<CheckpointBarrier> {
         self.call(|reply| Command::Checkpoint {
             authority: self.authority.clone(),
@@ -2528,6 +2541,11 @@ pub(super) enum Command {
     TraceHealth {
         authority: WorkspaceAuthoritySnapshot,
         reply: oneshot::Sender<Result<TraceHealth>>,
+    },
+    ListeningPorts {
+        authority: WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+        reply: oneshot::Sender<Result<JobListeningPorts>>,
     },
     List {
         authority: WorkspaceAuthoritySnapshot,
@@ -3008,6 +3026,17 @@ impl SupervisorActor {
                 limits,
                 reply,
             } => self.tail(&authority, job_id, cursor, limits, reply),
+            Command::ListeningPorts {
+                authority,
+                job_id,
+                reply,
+            } => {
+                let result = self
+                    .validate_authority(&authority)
+                    .and_then(|()| self.job(job_id))
+                    .and_then(listening_ports);
+                let _ = reply.send(result);
+            }
             Command::Checkpoint {
                 authority,
                 checkpoint_id,
@@ -4901,6 +4930,38 @@ fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
         job.info.resources = Some(sample.clone());
     }
     Ok(sample)
+}
+
+/// A listening-ports read: the group the job's sampling follows while it runs -- its shell
+/// activation's, then its command's -- and the group that last led once it ended. A job that
+/// never owned a process has no group to read, and says so.
+fn listening_ports(job: &JobStateRecord) -> Result<JobListeningPorts> {
+    let job_id = job.info.job_id;
+    let leader = job.sampling.leader().ok_or_else(|| {
+        CowshedError::conflict(
+            format!(
+                "job {} owns no process: it has not started one, or ended before it did",
+                job_id.get()
+            ),
+            "read its listening ports once the job has started; its status says how it ended",
+        )
+    })?;
+    let sampled_at = utc_now()?;
+    let ports = super::job_groups::job_listening_ports(leader).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "the listening sockets of job {}'s group {} could not be read: {error}",
+                job_id.get(),
+                leader.pid()
+            ),
+            "the job runs on; read its listening ports again",
+        )
+    })?;
+    Ok(JobListeningPorts {
+        job_id,
+        sampled_at,
+        ports: ports.into_iter().collect(),
+    })
 }
 
 /// Record the job's process as its parent observed it. A leader no one could identify keeps the

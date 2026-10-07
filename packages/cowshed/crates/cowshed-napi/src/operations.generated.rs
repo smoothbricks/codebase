@@ -427,6 +427,16 @@ impl JobHandle {
         super::json_call::<operations::JobTailRead, _>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Reads the TCP ports the job's process group listens on, from the kernel.
+    #[napi(js_name = "listeningPorts")]
+    pub fn listening_ports(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::JobListeningPortsRead, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
+
     /// Writes to an attached job's stdin.
     #[napi(js_name = "attachWrite")]
     pub fn attach_write(
