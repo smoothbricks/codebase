@@ -4,6 +4,14 @@ Two surfaces over one core: the `cowshed-core` Rust crate and `@smoothbricks/cow
 is a thin third client of the same core — anything the CLI can do is assembled from the same capability-scoped APIs,
 with identical semantics and error taxonomy.
 
+> **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
+> duration, protected per-stream output, offset reads, attach/detach, and complete-group termination. Job resource
+> samples and terminal persistence, progress streams, bounded cursor tails, keyed admission/lookup, and generation of
+> the controller protocol and N-API surface from one API declaration are unbuilt. The N-API addon exposes exec,
+> sessions, numeric job lookup, status/wait/kill, attach/detach, and buffered output reads from byte zero; resumable raw
+> streams, attachment stdio, and abort plumbing are unbuilt. Its request DTO and TypeScript types are hand-maintained;
+> the shared wire corpus checks agreement, not generated parity.
+
 ## Authority model (frozen)
 
 Four handle types, one rule: **a handle reachable from inside a sandbox must not authorize escalation or select another
@@ -117,6 +125,7 @@ pub struct ExecRequest {
     pub stdin: StdinSource,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
+    pub admission_key: Option<String>,  // idempotent admission within the exact workspace incarnation
 }
 
 pub enum ExecCommand {
@@ -300,10 +309,11 @@ pub struct JobInfo {
     pub state: JobState,
     pub pid: Option<u32>,
     pub grant_revision: u64,
-    pub argv: Vec<CommandArg>,
+    pub command: ExecCommand,            // flattened as exactly one of argv or script on the wire
     pub cwd: Option<WorkspacePath>,        // None is the workspace mount root
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
+    pub resources: Option<JobResourceSample>, // absent before spawn, never a fabricated zero sample
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
@@ -323,10 +333,14 @@ pub struct JobHandle { /* immutable repo/workspace/incarnation fence + JobId + a
 impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
+    pub async fn resources(&self) -> Result<JobResourceSample, CowshedError>;
+    pub async fn progress(&self, every_ms: u64) -> Result<JobProgressStream, CowshedError>;
+    pub async fn tail(&self, cursor: Option<JobJournalCursor>, limits: JobTailLimits)
+        -> Result<JobTail, CowshedError>;
     // From `offset` on: a reader holding the first `offset` bytes continues where it stopped.
     pub async fn logs(&self, stream: JobStream, offset: u64, follow: bool)
         -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
-    pub async fn attach(&self) -> Result<JobAttachment, CowshedError>;
+    pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment, CowshedError>;
     pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
     pub async fn kill(&self) -> Result<(), CowshedError>;            // awaits complete process-tree termination
@@ -513,6 +527,7 @@ impl WorkspaceHandle {
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
     pub async fn job(&self, id: JobId) -> Result<JobHandle, CowshedError>;
+    pub async fn job_by_key(&self, key: &str) -> Result<JobHandle, CowshedError>;
     // An ended job's terminal record and a handle reading its sealed output, also for a job an
     // earlier supervisor of the incarnation ran (11_shell.md "Draining a supervisor of another build").
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle), CowshedError>;
@@ -594,6 +609,11 @@ subagent holding one cannot grant itself anything.
 
 ## DTO freeze (single source of truth)
 
+The canonical API declarations own operation signatures, authority scopes, request/result/event records, units, wire
+names, and validation bounds. They generate the controller protocol, N-API adapter signatures, TypeScript public types,
+and validators as one surface. There is no separate handwritten N-API request or TypeScript DTO field list. Shared
+corpus tests check every generated projection and reject a deliberately changed or omitted field.
+
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
 `CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
@@ -627,6 +647,96 @@ Public request/result and controller-commitment definitions live in `cowshed_cor
 `JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
 reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
+### Job monitoring
+
+`JobInfo.resources` and `SealedJob.resources` carry the latest `JobResourceSample` once the child has spawned, frozen at
+terminal publication. They are absent for a queued job or a failure before spawn: no leader or start baseline exists to
+sample. Every live resource progress event carries the same type, not a lighter telemetry DTO. `resources()` reads it
+without waiting for exit and reports a typed not-ready conflict before spawn; `progress(everyMs)` emits the latest
+sample once available, periodic samples even when neither stream advances, then the terminal sample exactly once before
+closing. The interval is positive and uses the declaration's bounded duration contract. A slow reader may coalesce
+intermediate samples; terminal evidence and journal bytes are never lost.
+
+```rust
+pub struct HostLoadSample { pub load1: f64, pub cores: u32 }
+pub struct JobVolumeUsage { pub workspace_delta_bytes: i64, pub build_delta_bytes: Option<i64> }
+pub struct JobStreamWatermark { pub bytes: u64, pub lines: u64 }
+pub struct JobResourceSample {
+    pub sampled_at: UtcTimestamp,
+    pub wall_ms: u64,
+    pub leader_pid: u32,              // observed leader; this sample exists only after spawn
+    pub members: Vec<u32>,            // complete current membership of the owned job process group
+    pub cpu_user_ms: u64,
+    pub cpu_sys_ms: u64,
+    pub cpu_pct: f64,
+    pub rss_bytes: u64,
+    pub rss_peak_bytes: u64,
+    pub host_start: HostLoadSample,
+    pub host: HostLoadSample,          // current sample; end host facts in the terminal sample
+    pub volumes: JobVolumeUsage,
+    pub stdout: JobStreamWatermark,
+    pub stderr: JobStreamWatermark,
+}
+pub struct JobJournalCursor { pub stdout: u64, pub stderr: u64 }
+pub struct JobTailLimits { pub bytes_per_stream: u32, pub lines_per_stream: u32 }
+pub struct JobTail {
+    pub stdout: BinaryData,
+    pub stderr: BinaryData,
+    pub next: JobJournalCursor,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+pub struct JobProgressStream { /* bounded stream of Result<JobResourceSample, CowshedError> */ }
+```
+
+`sampledAt` uses the existing RFC3339 timestamp contract; elapsed wall time and CPU durations use monotonic integer
+milliseconds. `hostStart` is captured once at job spawn and survives every later sample; `host` is captured at the
+sample boundary. CPU user/sys time is cumulative across the complete owned process group, retaining exited and reaped
+descendants without double-counting them. `cpuPct` is the user+system delta divided by the elapsed window since the
+preceding supervisor sample, multiplied by 100; it is one-core normalized and may exceed 100. Reading resources or
+starting a second subscriber does not reset that window. The first zero-length window reports zero share, not a division
+by zero. RSS is the simultaneously sampled group sum; peak is its maximum observed sum. `members` retains the complete
+current group, never a truncated membership claim; CPU/RSS accounting covers every member. A sample exceeding the
+generated frame bound is a typed error, not a silently shortened list. `leaderPid` retains the job's observed leader
+after exit; terminal membership may be empty. An incomplete kernel membership read is an operational error, never
+evidence of an empty group.
+
+`volumes` compares the used bytes of the workspace volume and its build volume at spawn with those at the sample
+boundary. Deltas are signed and never clamped: deletion can shrink a volume. They describe volume-wide usage, not
+per-process write syscalls or exclusive attribution when commands overlap. Usage is a volume stat, never a recursive
+scan or a shared-store/container free-space proxy. `buildDeltaBytes` is absent when the workspace has no build volume;
+failure to sample an existing volume is a typed error, never absence or zero usage.
+
+Stream watermarks count admitted bytes and newline-delimited lines separately for stdout/stderr; a non-empty trailing
+partial line counts as one line. `bytes` is also the next byte cursor. `tail(cursor, limits)` returns a bounded raw
+slice after each supplied cursor and its next cursor; an omitted cursor selects the latest bounded tail. Limits are
+positive, with at most 64 KiB per stream. Truncation is explicit, offsets remain representation-transparent through
+inline/file promotion, and a cursor beyond admitted bytes is a typed usage error. `attach(cursor)` resumes each stream
+at its supplied offset; omission means byte zero. It never starts a process.
+
+All monitoring methods retain the immutable repo/workspace/incarnation fence of the `JobHandle`. The same handle exposes
+`kill()` for explicit complete-group cancellation; a monitoring executor maps its own operation key to this exact job
+before calling it. Disconnecting a reader, detaching an attachment, or reaching a soft deadline never kills the job.
+Sampling failure is a typed operational error with the unavailable metric's cause, not fabricated zeroes; captured
+output and the actual exit status remain preserved.
+
+### Keyed admission and restart attachment
+
+`ExecRequest.admissionKey` is optional for ordinary direct callers and mandatory for an executor admitting an idempotent
+operation. Cowshed atomically commits the admission key, exact request identity, and allocated job id within the
+immutable workspace incarnation before spawn. A repeated exec with the same key and request answers the existing job,
+never a second spawn; the same key with different command, cwd, environment, stdin, sandbox mode, session, or
+publication arguments is a typed conflict. The key never grants authority or crosses an incarnation.
+`WorkspaceHandle.jobByKey(key)` reaches the admitted job even when the original exec reply was lost.
+
+An executor persists its own operation-to-key binding before dispatch, and its operation-to-job binding before
+acknowledging admission. After a crash it looks up the original key or job number, resumes progress/tails, and replays
+only a recorded terminal. A missing reply is not evidence that the effect did not run. No attach, restart, or missing
+in-memory handle causes an unkeyed exec to repeat. The terminal resource sample remains readable from `sealed` after the
+supervisor that ran the job retires.
+
+### Frozen wire projections
+
 - `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, mount, state, branch?, baseCommit?, createdAt?, checkpoints, snapshotStale }`;
   `state` is `"attached" | "detached"`. `checkpoints` is always an array of
   `CheckpointInfo = { label, revision, pinned }` facts derived from canonical storage. Detached rows without a cached
@@ -646,7 +756,7 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles; execution revalidates
   the plan before the first effect.
 - `JobId` is a positive integer no greater than `2^53-1`.
-  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
+  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
   `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
   `failure` is present only on a `failed` job: `"scriptSyntax"` when its script did not parse (exit
@@ -908,9 +1018,10 @@ export type JobInfo = JobCommand & {
   pid?: number;
   grantRevision: number;
   failure?: JobFailure;
-  cwd: string;
-  started: Date;
+  cwd: string | null;
+  started: string; // canonical RFC3339 wire timestamp, not a JavaScript Date
   durationMs?: number;
+  resources?: JobResourceSample; // absent before spawn; generated camelCase projection
   exit?: ExitStatus;
   stdout: StreamInfo;
   stderr: StreamInfo;
@@ -920,10 +1031,16 @@ export type JobInfo = JobCommand & {
 };
 
 export interface JobHandle {
-  readonly jobId: JobId;
+  readonly id: JobId;
   status(): Promise<JobInfo>;
-  logs(stream: JobStream, opts?: { follow?: boolean; signal?: AbortSignal }): AsyncIterable<Uint8Array>;
-  attach(opts?: { signal?: AbortSignal }): Promise<JobAttachment>;
+  resources(): Promise<JobResourceSample>;
+  progress(everyMs: number): AsyncIterable<JobResourceSample>;
+  tail(cursor: JobJournalCursor | undefined, limits: JobTailLimits): Promise<JobTail>;
+  logs(
+    stream: JobStream,
+    opts?: { offset?: number; follow?: boolean; signal?: AbortSignal }
+  ): AsyncIterable<Uint8Array>;
+  attach(opts?: { cursor?: JobJournalCursor; signal?: AbortSignal }): Promise<JobAttachment>;
   detach(): Promise<void>;
   kill(): Promise<void>;
   wait(opts?: { signal?: AbortSignal }): Promise<JobInfo>;
@@ -955,6 +1072,7 @@ export interface ExecOptions {
   signal?: AbortSignal;
   onStdout?: (line: string) => void;
   onStderr?: (line: string) => void;
+  admissionKey?: string;
 }
 
 export interface CheckpointOptions {
@@ -969,6 +1087,7 @@ export interface WorkspaceHandle {
   background(request: ExecRequest): Promise<JobHandle>;
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
+  jobByKey(key: string): Promise<JobHandle>;
   checkpoint(opts?: CheckpointOptions): Promise<string>;
   push(opts?: PushOptions): Promise<PushReport>;
   grants(): Promise<GrantSet>; // read-only

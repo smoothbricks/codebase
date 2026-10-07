@@ -213,11 +213,12 @@ other domain errors.
 Node and Bun use the same napi-rs `.node` addon. There is no separate synchronous `bun:ffi` lane: workspace discovery,
 attachment, execution, and lifecycle calls are IO-bound and remain Promise-based on both runtimes.
 
-The first binding surface is intentionally read-only and endpoint-backed. A trusted spawner supplies a connected
-controller descriptor out of band; `coordinatorEndpoint` takes ownership, marks it close-on-exec, and permits exactly
-one handshake attempt. `openProject` discards coordinator authority before exposing `Project` and `WorkspaceRef`. Every
-handle opened from one endpoint shares its one connection, and calls on it run concurrently: a pending `job.wait()` or
-following log read never holds another call.
+The binding is endpoint-backed. A trusted spawner supplies a connected controller descriptor out of band;
+`coordinatorEndpoint` takes ownership, marks it close-on-exec, and permits exactly one handshake attempt. `openProject`
+discards coordinator authority before exposing `Project` and `WorkspaceRef`; `connectCoordinator` retains it in a
+`Coordinator`, whose `worker(workspace)` returns a non-escalating one-workspace handle. Every handle opened from one
+endpoint shares its connection, and calls run concurrently: a pending `job.wait()` or following log read never holds
+another call.
 
 ```ts
 import { coordinatorEndpoint, openProject } from '@smoothbricks/cowshed';
@@ -236,9 +237,23 @@ const grants = await main.grants();
 Both runtimes receive the same typed `CowshedError` with stable kebab-case `code`, exact `message`, and actionable
 `hint`. Workspace and grant DTOs are serialized directly from cowshed-core and Typia-validated by the TypeScript facade.
 
-Coordinator mutation, one-use worker descriptors, jobs, raw-byte streams with backpressure, and `AbortSignal`
-cancellation remain the next binding slice. They must preserve the existing core authority boundaries; the addon does
-not expose raw RPC, `ProjectRuntime`, or the CLI's in-process `ActorBridge` as a shortcut.
+The addon exposes coordinator lifecycle operations, workspace exec and named sessions, numeric job lookup, `status()`,
+`wait()`, `kill()`, attachment/detachment, and buffered `readLogs(stream, follow?)`. Dropping a job handle or detaching
+its view does not kill the job. `readLogs` reads from byte zero and resolves only when its selected stream closes when
+following; it is not a bounded running-command tail.
+
+### Implementation status — monitoring gaps
+
+Job resource samples, progress events, cursor-addressed bounded tails, resumable N-API raw-byte streams, attachment
+stdio, and `AbortSignal` plumbing are unbuilt. The Rust core already supports offset-addressed raw log reads and
+reattachment by the workspace's numeric job id; the addon does not yet expose that full surface. One-use worker
+descriptor connection is also unbuilt.
+
+The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
+and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
+TypeScript public types and validators are generated projections, never a second hand-maintained field list. This
+generation is unbuilt: the addon serializes core DTOs, while its requests, TypeScript declarations, and adapter methods
+are handwritten; the shared wire corpus checks their agreement but does not generate them.
 
 The CLI remains the integration point for shell-only consumers. Rust, N-API, CLI, and MCP frontends must agree on
 lifecycle, grant propagation, numeric jobs, tiered artifact storage, bounded summaries and control responses, raw

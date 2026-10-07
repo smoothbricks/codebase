@@ -8,6 +8,11 @@ Built on the core crates directly, the server keeps typed grants, streamed exec 
 and the `Coordinator`/`WorkspaceHandle` split (07_api.md); shelling out to the CLI would reserialize everything through
 argv/JSON and lose exactly those properties.
 
+> **Implementation status:** the MCP server binary, tools, and capability handshake are unbuilt. The contracts below
+> reuse the existing Rust core rather than claiming a deployed MCP surface. Resource-bearing job results, bounded cursor
+> tails, and progress events inherit the canonical generated API declaration in 07_api.md; the same unbuilt monitoring
+> and generation gaps apply here.
+
 ## v1 scope: tools only
 
 cowshed-mcp v1 is a **tools-only** server. `resources/list` returns an empty array, no resource templates, **no
@@ -122,20 +127,21 @@ base. `push` remains the separate worker-scoped preservation primitive and inten
 
 ### Worker tools (one-use descriptor; scoped to that workspace)
 
-| Tool         | Args                                                                                                                           | Returns                                                                                    |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?`, `stdoutCopy?: OutputPublication`, `stderrCopy?: OutputPublication` | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
-| `job_list`   | `state?`                                                                                                                       | numeric job ids, state, timings, trace identity, per-stream info                           |
-| `job_status` | `jobId` (numeric)                                                                                                              | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
-| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`                                                                        | raw bytes resolved representation-transparently from the protected artifact                |
-| `checkpoint` | `label?`                                                                                                                       | label                                                                                      |
-| `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }`    | source head, non-checked-out destination ref, previous destination head?                   |
+| Tool         | Args                                                                                                                           | Returns                                                                                          |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?`, `stdoutCopy?: OutputPublication`, `stderrCopy?: OutputPublication` | `JobInfo`, including resources, per-stream info, stdin metadata, and exit metadata when terminal |
+| `job_list`   | `state?`                                                                                                                       | resource-bearing `JobInfo` rows, with numeric job ids and trace identity                         |
+| `job_status` | `jobId` (numeric)                                                                                                              | resource-bearing `JobInfo` with current or terminal sample                                       |
+| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `offset?`, `follow?`                                                             | raw bytes resolved representation-transparently from the protected artifact                      |
+| `checkpoint` | `label?`                                                                                                                       | label                                                                                            |
+| `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }`    | source head, non-checked-out destination ref, previous destination head?                         |
 
 `bash` is the workhorse: it runs through the workspace supervisor (warm shell, 11_shell.md), honors `session` for
 stateful multi-step work, and returns the workspace-local monotonic numeric `jobId` for **every accepted exec
-submission**, including foreground jobs. Auto-backgrounding changes only state, not identity. The result surfaces
-`exitCode 6` with the resolving `grant` **only on authoritative denial evidence** (06_cli.md — never synthesized from
-stdout, stderr, or their summaries). A spawn failure is a terminal job with the already-allocated id.
+submission**, including foreground jobs. Foreground waiting and detachment are client attachment choices over the same
+supervisor-owned job, never a later transfer of execution or a new job identity. The result surfaces `exitCode 6` with
+the resolving `grant` **only on authoritative denial evidence** (06_cli.md — never synthesized from stdout, stderr, or
+their summaries). A spawn failure is a terminal job with the already-allocated id.
 
 `bash.stdin` is a discriminated union with exactly one source: `{ "inlineBase64": "…" }` for opaque inline bytes,
 `{ "stream": true }` for subsequent framed channel-1 bytes on socket transport, or `{ "workspaceFile": "rel/path" }` for
@@ -173,6 +179,14 @@ Compact controller commitments own existence/status/order/lineage and expected c
 or artifact paths. The server reconciles both: missing/altered committed content, invalid complete batches, and
 count/hash/batch/lineage mismatch return `Integrity` (`-32006`), preserving both sides rather than trusting whichever
 appears newer. Discarding only an incomplete trailing batch is successful recovery.
+
+The resource sample is exactly `JobResourceSample` from 07_api.md: wall time, cumulative process-group CPU user/sys time
+and one-core CPU share, current/peak group RSS, immutable start and current/end host load1/cores, separate signed
+workspace/build-volume used-byte deltas, complete group membership and leader pid, and both stream byte/line watermarks
+as journal cursors. The numeric job id is the supervisor's id, not an adapter-local surrogate. MCP consumes the same
+status/progress/tail operations as the controller and N-API surface; it neither samples resources itself nor scans a
+workspace or buffers an unbounded stream to produce a tail. Progress carries the sample while the job remains in flight;
+deadline and cancellation policy stay with the consuming orchestrator.
 
 `bash` takes shell text for agent ergonomics and converts it explicitly to `["/bin/sh","-c",command]`. A real shell AST
 may classify only a proven simple literal `>`/`2>` as `Redirect`, and only when the supervisor controls the actual

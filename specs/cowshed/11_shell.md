@@ -5,6 +5,12 @@ mounts, sandbox profiles, grants) and every client that runs commands (CLI, MCP,
 supervisor per workspace holding warm exec hosts with the workspace shell already activated, a framed stdio protocol
 over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
+> **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
+> journals, offset-addressed reads, attach/detach, and complete-group termination. Job resource samples and their
+> terminal persistence, periodic progress subscriptions, bounded cursor tails, and generation of controller and N-API
+> monitoring bindings from one API declaration are unbuilt. The process-group ownership ledger is implemented; it is not
+> a resource-sampling API.
+
 ## Shell activation and process reuse
 
 A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
@@ -268,6 +274,13 @@ The protocol is transport for every client — the controller behind the CLI (06
 (12_mcp.md). JSON is bounded control/result transport: it may carry a tagged, bounded inline artifact, but never an
 unbounded stdout/stderr stream. Controller commitments never carry output payload.
 
+Monitoring operations and their request/result/event records come from the same canonical API declarations as the N-API
+bindings (07_api.md, Job monitoring). Clients consume the supervisor's samples and journal accounting; no adapter shells
+out to `ps`, scans the checkout, or recaptures output. A progress subscription begins with the latest sample, advances
+while the job runs even when it writes nothing, and ends with the same final sample that is sealed in its terminal
+result. Slow subscribers may coalesce intermediate samples, never the final sample or journal bytes. Status, tails,
+cancel, and other job admissions remain serviceable while another client follows progress or waits.
+
 ## Job control
 
 Every exec submission is a job. At admission the supervisor allocates a positive `u64`-backed `jobId` in `1..=2^53-1`,
@@ -340,6 +353,15 @@ produced them, and the new allocator starts above the inherited maximum. Thus th
 `(repoId, workspaceIncarnation, jobId)`: `jobId` is the familiar workspace-local handle, while the full tuple remains
 unique across checkpoint copies and recycled workspace names.
 
+**Detached birth, client attachment.** A job is owned by its supervisor from admission, not by an open tool call. A
+monitoring executor requests detached admission immediately; a long-running command never moves to another execution
+mechanism because a caller stops waiting. Foreground CLI presentation is an attached view of that same job. A caller
+disconnect, dropped handle, soft deadline, or progress-subscription close does not terminate it. Explicit cancellation,
+quota enforcement, and workspace retirement terminate the owned group; a soft timeout does not. An embedding executor
+persists its operation-to-`(repoId, workspaceIncarnation, jobId)` binding before acknowledging admission and reopens
+that job by its number after it restarts; reopening never executes the command again. The admission contract closes the
+spawn-before-reply crash window as specified in 07_api.md.
+
 - **Foreground commands wait.** A foreground command's output streams to the caller while it runs, and the caller waits
   for its end however long it runs; there is no default timeout. A caller that sets one (`--timeout`) reads the job's
   status when it passes: a job still running is detached and the caller is told it still runs, never given a success
@@ -349,8 +371,9 @@ unique across checkpoint copies and recycled workspace names.
   `job-backgrounded` fires. The client already has the job id and can poll or reattach through the API. A later
   checkpoint uses the barrier/manifest protocol below.
 - **`--background`** detaches and promotes immediately, and the caller gets the job id.
-- **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) → SIGTERM, then SIGKILL after a
-  grace, drain both pipes to EOF, then mark the job `killed:timeout`.
+- **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) sends SIGTERM, then SIGKILL after a
+  grace, drains both pipes to EOF, and marks the job `killed:timeout`. **Implementation status:** this configured
+  job-killing timeout is unbuilt; the implemented CLI `--timeout` detaches and never kills.
 - **Combined output quota.** Each job has one configurable quota across stdout and stderr, default **1 GiB**. Accounting
   includes protected bytes plus bytes read from either child pipe but still buffered/in flight. The first read whose
   inclusion would cross the quota atomically trips the limit: the supervisor admits no payload beyond the exact
@@ -362,6 +385,28 @@ unique across checkpoint copies and recycled workspace names.
   representation-transparently across memory/file promotion.
 - **Logs**: `Job::logs` resolves `StreamInfo.storage.artifact`; callers never need to distinguish inline Arrow Binary
   from a protected file and no path is promised.
+
+### Job resource and journal facts
+
+Every live sample and terminal result carries the canonical `JobResourceSample` defined in 07_api.md. CPU user/sys time
+covers the job's complete process group, including exited members; CPU share is normalized to one core, so a parallel
+build can exceed 100%. Current RSS is the group's resident-byte sum, and peak RSS is the maximum observed group sum, not
+a sum of unrelated per-process peaks. A leader that exits before descendants does not end accounting: the same ownership
+fence that retains the group for cancellation retains it for sampling through terminal drain.
+
+Workspace and build-volume used-byte deltas are separate volume statistics, never a tree scan or a claim about
+per-process write syscalls. They compare usage at spawn with usage at the sample or terminal boundary and may be
+negative after deletion. Concurrent writers on the same volume contribute to its delta; this fact remains explicit. No
+unrelated shared-store/container free-space counter may substitute for usage of the owned volume.
+
+The supervisor counts bytes and newline-delimited lines as it admits each stream, retaining partial-line state across
+reads. The journal cursors are independent stdout/stderr byte offsets and survive inline/file promotion. A bounded tail
+resumes from those cursors without replaying an already-read prefix; omission requests the latest bounded tail. A final
+unterminated non-empty line counts as a line. Tails preserve raw bytes and expose their next cursors and truncation,
+never substitute a summary or merge stdout and stderr.
+
+An unavailable kernel sample reports a typed operational error with its cause; missing CPU, RSS, membership, load, or
+volume evidence never becomes invented zeroes. Job output and the actual exit status remain preserved.
 
 ### Exec records, stream storage, and tiered authority
 
