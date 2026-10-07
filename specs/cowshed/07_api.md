@@ -6,8 +6,8 @@ with identical semantics and error taxonomy.
 
 > **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
 > duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
-> and complete-group termination. Core job resource samples and terminal persistence are implemented; periodic progress
-> streams and keyed admission/lookup are not yet complete. Controller request/result codecs, TypeScript types and
+> and complete-group termination. Core job resource samples, terminal persistence and keyed admission/lookup are
+> implemented; periodic progress streams are not yet complete. Controller request/result codecs, TypeScript types and
 > validators, and N-API operation bindings derive from one Rust API declaration. The addon exposes the declared offset
 > log reads, the bounded `job.tail` operation and `job.listeningPorts`; async stream backpressure, attachment stdin EOF,
 > and abort plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no
@@ -130,7 +130,7 @@ pub struct ExecRequest {
     pub stdin: StdinSource,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
-    pub admission_key: Option<String>,  // idempotent admission within the exact workspace incarnation
+    pub admission_key: Option<AdmissionKey>, // idempotent admission within the exact workspace incarnation
 }
 
 pub enum ExecCommand {
@@ -171,6 +171,9 @@ pub struct StdinInfo {
     pub workspace_path: Option<WorkspacePath>, // normalized relative path; never host-absolute
     pub complete: bool,                  // true only after clean source EOF reached child stdin
 }
+
+/// Raw UTF-8 spelling, 1..=4096 bytes; AdmissionKey::new enforces the invariant. Never hashed.
+pub struct AdmissionKey(String);
 
 pub struct TraceContext { pub trace_id: TraceId, pub span_id: SpanId } // validated non-zero lowercase hex
 
@@ -236,7 +239,26 @@ pub struct JobArtifactRecord {
     pub failure: Option<JobFailure>,
     pub exit: Option<ExitStatus>,           // terminal records whose end was observed
     pub duration_ms: Option<u64>,           // terminal records whose end was observed
+    pub resources: Option<JobResourceSample>,
+    pub admission: Option<JobAdmission>,   // raw key and authored identity, present on every keyed job record
 }
+pub struct JobAdmission {
+    pub key: AdmissionKey,
+    pub cwd: Option<WorkspacePath>,
+    pub mode: RunSandboxMode,
+    pub env: BTreeMap<String, String>,      // sorted; withheld credential names never enter this record
+    pub stdin: AdmittedStdin,
+    pub session: AdmittedSession,
+    pub stdout_copy: Option<OutputPublication>,
+    pub stderr_copy: Option<OutputPublication>,
+}
+pub enum AdmittedStdin {
+    Empty,
+    Inline { sha256: Sha256Digest, bytes: u64 },
+    Stream,                              // a live reader's bytes are not request identity
+    WorkspaceFile(WorkspacePath),
+}
+pub enum AdmittedSession { None, Unnamed(Uuid), Named(String) }
 #[serde(rename_all = "kebab-case")]
 pub enum VisibleStorageKind { CapturedInline, CapturedFile, RedirectInline, RedirectFile }
 pub struct VisibleStreamCommitment {
@@ -538,7 +560,7 @@ impl WorkspaceHandle {
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
     pub async fn job(&self, id: JobId) -> Result<JobHandle, CowshedError>;
-    pub async fn job_by_key(&self, key: &str) -> Result<JobHandle, CowshedError>;
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobHandle, CowshedError>;
     // An ended job's terminal record and a handle reading its sealed output, also for a job an
     // earlier supervisor of the incarnation ran (11_shell.md "Draining a supervisor of another build").
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle), CowshedError>;
@@ -1021,12 +1043,29 @@ records remain typed; no JSON string column carries a process tree or metric pay
 
 ### Keyed admission and restart attachment
 
-`ExecRequest.admissionKey` is optional for ordinary direct callers and mandatory for an executor admitting an idempotent
-operation. Cowshed atomically commits the admission key, exact request identity, and allocated job id within the
-immutable workspace incarnation before spawn. A repeated exec with the same key and request answers the existing job,
-never a second spawn; the same key with different command, cwd, environment, stdin, sandbox mode, session, or
-publication arguments is a typed conflict. The key never grants authority or crosses an incarnation.
-`WorkspaceHandle.jobByKey(key)` reaches the admitted job even when the original exec reply was lost.
+`ExecRequest.admissionKey` is a raw string of 1 to 4096 UTF-8 bytes, compared byte for byte. It is optional for ordinary
+direct callers and mandatory for an executor admitting an idempotent operation. Before spawn, cowshed commits the key,
+the authored request identity and the allocated job id in the job's first record, under the lock ordering the workspace
+incarnation's records. The identity is the request before a session lends it a cwd or environment: command, cwd,
+environment less withheld credential names, sandbox mode, session, publications and stdin source. Inline input is
+identified by its SHA-256 and length, a workspace file by its path, and a stream only by its kind, never its bytes.
+Named sessions compare by name; unnamed sessions carry a distinct UUID, including across supervisor restart. The command
+remains the record's own, not a second copy inside admission metadata.
+
+A repeated exec with the same key and request answers the existing job and spawns nothing. A changed request is a typed
+`Conflict`, `admission: { reason: "keyConflict", jobId, fields }`. The first stream admission binds its reader; a repeat
+carrying another reader returns typed `Usage`, `stdin already bound to job N; attach to write`, with
+`admission: { reason: "stdinBound", jobId }`. The refused reader is never polled.
+
+`WorkspaceHandle.jobByKey(key)` reads the admitted job id from durable records even after a lost reply or supervisor
+restart. A provably absent key is `NotFound`. A keyed store set aside while it may have served this incarnation makes
+unreadable keys unprovable, so lookup and exec return typed `Conflict`, `admission: { reason: "unprovable", setAside }`,
+never `NotFound` or a spawn. A missing archived incarnation marker leaves its history unprovable; a malformed marker is
+an integrity failure, never proof of absence. The key grants no authority and never crosses an incarnation.
+
+Record layout 8 preserves layout 7's resource, accounting and volume columns, then appends the fourteen admission
+columns. Native error causes are object projections generated from the canonical `CowshedError` declaration, not JSON
+strings or parsed message text; the TypeScript facade validates the generated type directly.
 
 An executor persists its own operation-to-key binding before dispatch, and its operation-to-job binding before
 acknowledging admission. After a crash it looks up the original key or job number, resumes progress/tails, and replays
@@ -1180,11 +1219,12 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
     pub fn fence_source(&self) -> Option<&FenceRefusal>;
+    pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
 }
 
 pub enum ErrorCode {

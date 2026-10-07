@@ -7,13 +7,13 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 
 > **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
 > journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
-> termination. Core job resource samples and terminal persistence are implemented; periodic progress subscriptions are
-> not yet complete. Controller and N-API operation bindings derive from one API declaration, group-owned TCP-listener
-> queries among them. Attachment stdin EOF remains unbuilt; Rust attachment writes exist. The process-group ownership
-> ledger identifies groups for sampling and termination. Complete fork/exec tree observation, per-process usage and
-> blocker samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
-> Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead measurement and
-> unattributed-usage reconciliation are unbuilt too.
+> termination. Core job resource samples, terminal persistence and keyed admission/lookup are implemented; periodic
+> progress subscriptions are not yet complete. Controller and N-API operation bindings derive from one API declaration,
+> group-owned TCP-listener queries among them. Attachment stdin EOF remains unbuilt; Rust attachment writes exist. The
+> process-group ownership ledger identifies groups for sampling and termination. Complete fork/exec tree observation,
+> per-process usage and blocker samples, process event streams, CPU-winning leaf identity, and process/job resource
+> spans are unbuilt as well. Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead
+> measurement and unattributed-usage reconciliation are unbuilt too.
 
 ## Shell activation and process reuse
 
@@ -267,11 +267,13 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
-  `streamEnd`, `info`, `sealed`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per
-  supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it
-  fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the
-  wrong profile. An accepted `exec` answers with the numeric `jobId`, allocated before process creation; a spawn failure
-  is therefore a terminal job, not a response with no identity. `info`, `list`, `kill` and `wait` answer the
+  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one
+  per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly
+  as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under
+  the wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
+  durable existing id and spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity.
+  `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; an unreadable
+  keyed history is an explicit unprovable refusal, never absence. `info`, `list`, `kill` and `wait` answer the
   supervisor's own jobs; `sealed` answers a job's terminal record from the workspace's records — state, exit, failure,
   duration, output limit and both streams — for any job of the incarnation that has one, including a job an earlier
   supervisor ran and sealed, and `logRead` reads such a job's sealed streams from any offset as it reads its own

@@ -236,18 +236,24 @@ const grants = await main.grants();
 
 Both runtimes receive the same typed `CowshedError` with stable kebab-case `code`, exact `message`, and actionable
 `hint`. Workspace and grant DTOs are serialized directly from cowshed-core and Typia-validated by the TypeScript facade.
+Keyed refusal details are native objects generated from that same declaration: `CowshedError.admission` distinguishes
+changed request fields, an already-bound stdin reader, and unreadable keyed history. No message parsing or JSON-string
+cause conversion is involved.
 
-The addon exposes coordinator lifecycle operations, workspace exec and named sessions, numeric job lookup, `status()`,
-`wait()`, `kill()`, `detach()`, and `logs({ stream, offset, follow })`. Dropping a job handle or detaching its view does
+The addon exposes coordinator lifecycle operations, workspace exec and named sessions, numeric and keyed job lookup,
+`status()`, `wait()`, `kill()`, `detach()`, and `logs({ stream, offset, follow })`. An exec's optional `admissionKey`
+binds its authored request to one job of the immutable workspace incarnation before spawn; repeating it returns that
+job, and `worker.jobByKey(key)` recovers its handle after a lost reply. Dropping a job handle or detaching its view does
 not kill the job. `logs` answers one chunk of a stream from `offset` with its `nextOffset` and `eof`; reading again from
 `nextOffset` continues where the chunk ended, and `follow` waits for bytes or the stream's end. It is not a bounded
 running-command tail.
 
 ### Implementation status — monitoring gaps
 
-Job resource samples, progress events, cursor-addressed bounded tails, resumable N-API raw-byte streams, attachment
-stdio/EOF, and `AbortSignal` plumbing are unbuilt. The Rust core already supports numeric-job reattachment and
-attachment stdin writes; its `JobStdin` has no explicit close operation. The addon does not yet expose attachment.
+Core job resource samples and terminal persistence, controller cursor-addressed bounded tails, and keyed admission and
+lookup are implemented. Periodic progress events, resumable N-API raw-byte streams, full attachment stdio/EOF and
+`AbortSignal` plumbing remain unbuilt. The Rust core supports numeric and keyed reattachment and attachment stdin
+writes; its `JobStdin` still has no explicit close operation on main, and the addon does not yet expose attachment.
 One-use worker descriptor connection is also unbuilt. Fork/exec tree observations, per-process CPU/RSS/I/O and blocker
 facts, typed process event streams, CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt.
 Complete cgroup job totals, separate charged-memory counters, measured fork/exec/exit observation and explicit
