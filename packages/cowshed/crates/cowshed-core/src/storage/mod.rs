@@ -23,6 +23,7 @@ pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
+pub mod trace_segment;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
 /// The undo-image grammar [`CheckpointLabel`] refuses and the restorer writes. One constant,
@@ -998,7 +999,7 @@ mod tests {
             prop_assert_eq!(first, reparsed);
         }
 
-        // Production utc_date and CommitmentDate store years that fit u16, from unix
+        // TelemetryDate::new takes years that fit u16, from unix
         // epoch day 0 (1970-01-01) through 65535-12-31. Pre-1970 dates are outside
         // this pair: civil_from_days is total over u64 days, not over negative time_t.
         #[test]

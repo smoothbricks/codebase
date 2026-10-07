@@ -18,12 +18,11 @@
 //! are `commitment-<order>-<writer>.arrow` with a writer-local, monotone `order` and a fresh
 //! writer id per process, so concurrent controllers never contend and no lock is needed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use thiserror::Error;
@@ -38,8 +37,12 @@ use crate::api::dto::{
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::storage::job_artifact::write_controller_commitment;
+use crate::storage::trace_segment::TelemetryDate;
 
-use crate::fsio::{Durability, rename_noreplace};
+use crate::fsio::{
+    Durability, TemporaryAt, create_private_file_at, open_directory_nofollow,
+    open_or_create_child_directory, rename_noreplace,
+};
 
 /// How durable one commitment is before it is acknowledged. A job's admission and terminal
 /// commitments are written for every exec and stay the job's own: they survive the writer's death
@@ -321,35 +324,6 @@ impl AuditSink for NullAuditSink {
     }
 }
 
-/// A validated UTC calendar date used as a telemetry partition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CommitmentDate {
-    year: u16,
-    month: u8,
-    day: u8,
-}
-
-impl CommitmentDate {
-    pub fn new(year: u16, month: u8, day: u8) -> Result<Self, AuditSinkError> {
-        if super::days_from_civil(u64::from(year), u64::from(month), u64::from(day)).is_none() {
-            return Err(AuditSinkError::Integrity {
-                message: "invalid UTC commitment date".into(),
-            });
-        }
-        Ok(Self { year, month, day })
-    }
-}
-
-impl fmt::Display for CommitmentDate {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{:04}-{:02}-{:02}",
-            self.year, self.month, self.day
-        )
-    }
-}
-
 /// Publication checkpoints exposed only to make crash behavior deterministic under test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitmentPublicationPoint {
@@ -362,7 +336,7 @@ pub enum CommitmentPublicationPoint {
 /// Production callers use [`ArrowAuditSink::open`]. This seam lets focused tests inject a UTC
 /// date and failures at the two crash-relevant publication boundaries.
 pub trait AuditSinkEnvironment: Send {
-    fn utc_date(&self) -> io::Result<CommitmentDate>;
+    fn utc_date(&self) -> io::Result<TelemetryDate>;
 
     fn sync_directory(&self, directory: &File) -> io::Result<()> {
         directory.sync_all()
@@ -432,8 +406,9 @@ impl ArrowAuditSink {
             .environment
             .utc_date()
             .map_err(|source| io_failure("reading UTC date", source))?;
-        let (date_directory, created) =
-            open_or_create_child_directory(&self.root, &date.to_string())?;
+        let date_name = CString::new(date.to_string()).expect("a formatted date contains no NUL");
+        let (date_directory, created) = open_or_create_child_directory(&self.root, &date_name)
+            .map_err(|source| io_failure("creating commitment date directory", source))?;
         if created {
             self.environment
                 .sync_directory(&self.root)
@@ -449,8 +424,9 @@ impl ArrowAuditSink {
             .map_err(|_| integrity("temporary segment name contains NUL"))?;
         let sealed = CString::new(sealed_name.as_bytes())
             .map_err(|_| integrity("sealed segment name contains NUL"))?;
-        let mut file = create_new_file_at(&date_directory, &temporary)?;
-        let mut cleanup = TemporaryCleanup::new(date_directory.as_raw_fd(), temporary.clone());
+        let mut file = create_private_file_at(&date_directory, &temporary)
+            .map_err(|source| io_failure("creating temporary commitment segment", source))?;
+        let cleanup = TemporaryAt::new(&date_directory, &temporary);
         write_controller_commitment(&mut file, commitment)
             .map_err(|error| integrity(error.to_string()))?;
         file.flush()
@@ -502,22 +478,14 @@ impl AuditSink for ArrowAuditSink {
 struct SystemEnvironment;
 
 impl AuditSinkEnvironment for SystemEnvironment {
-    fn utc_date(&self) -> io::Result<CommitmentDate> {
+    fn utc_date(&self) -> io::Result<TelemetryDate> {
         let mut timestamp: libc::time_t = 0;
         if unsafe { libc::time(&mut timestamp) } == -1 {
             return Err(io::Error::last_os_error());
         }
         let seconds = u64::try_from(timestamp)
             .map_err(|_| io::Error::other("UTC timestamp is before the epoch"))?;
-        let (year, month, day) = super::civil_from_days(seconds / 86_400);
-        Ok(CommitmentDate {
-            year: u16::try_from(year)
-                .map_err(|_| io::Error::other("UTC year is outside the supported range"))?,
-            month: u8::try_from(month)
-                .map_err(|_| io::Error::other("UTC month is outside the supported range"))?,
-            day: u8::try_from(day)
-                .map_err(|_| io::Error::other("UTC day is outside the supported range"))?,
-        })
+        Ok(TelemetryDate::from_unix_seconds(seconds))
     }
 }
 
@@ -531,121 +499,8 @@ fn open_or_create_directory_chain(path: &Path) -> Result<File, AuditSinkError> {
         return Err(integrity("telemetry root is empty"));
     }
     fs::create_dir_all(path).map_err(|source| io_failure("creating telemetry root", source))?;
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| integrity("telemetry root contains NUL"))?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(io_failure(
-            "opening telemetry root without following links",
-            io::Error::last_os_error(),
-        ))
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn open_or_create_child_directory(
-    parent: &File,
-    name: &str,
-) -> Result<(File, bool), AuditSinkError> {
-    let name = CString::new(name).map_err(|_| integrity("date directory contains NUL"))?;
-    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
-    let created = if result == 0 {
-        true
-    } else if io::Error::last_os_error().kind() == io::ErrorKind::AlreadyExists {
-        false
-    } else {
-        return Err(io_failure(
-            "creating commitment date directory",
-            io::Error::last_os_error(),
-        ));
-    };
-    let directory = open_directory_at(parent.as_raw_fd(), name.as_c_str()).map_err(|source| {
-        io_failure(
-            "opening commitment date directory without following links",
-            source,
-        )
-    })?;
-    Ok((directory, created))
-}
-
-fn open_directory_at(parent: RawFd, name: &CStr) -> io::Result<File> {
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn create_new_file_at(directory: &File, name: &CStr) -> Result<File, AuditSinkError> {
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        Err(io_failure(
-            "creating temporary commitment segment",
-            io::Error::last_os_error(),
-        ))
-    } else if unsafe { libc::fchmod(fd, 0o600) } != 0 {
-        let source = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-            libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
-        }
-        Err(io_failure(
-            "setting temporary commitment segment mode",
-            source,
-        ))
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-struct TemporaryCleanup {
-    directory: RawFd,
-    name: CString,
-    armed: bool,
-}
-
-impl TemporaryCleanup {
-    fn new(directory: RawFd, name: CString) -> Self {
-        Self {
-            directory,
-            name,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TemporaryCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            unsafe {
-                libc::unlinkat(self.directory, self.name.as_ptr(), 0);
-            }
-        }
-    }
+    open_directory_nofollow(path)
+        .map_err(|source| io_failure("opening telemetry root without following links", source))
 }
 
 fn io_failure(operation: &'static str, source: io::Error) -> AuditSinkError {

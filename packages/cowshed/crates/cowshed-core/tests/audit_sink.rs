@@ -15,12 +15,13 @@ use cowshed_core::api::{ControllerCommitment, JobId, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{CommitmentPublisher, CommitmentSink};
 use cowshed_core::storage::audit::{
-    ArrowAuditSink, AuditSink, AuditSinkEnvironment, AuditSinkError, CommitmentDate,
-    CommitmentDraft, CommitmentPublicationPoint, ContinuityAudit, NullAuditSink,
+    ArrowAuditSink, AuditSink, AuditSinkEnvironment, AuditSinkError, CommitmentDraft,
+    CommitmentPublicationPoint, ContinuityAudit, NullAuditSink,
 };
 use cowshed_core::storage::job_artifact::{
     controller_commitment_schema, decode_controller_commitments,
 };
+use cowshed_core::storage::trace_segment::TelemetryDate;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -51,13 +52,13 @@ impl Drop for TempRoot {
 }
 
 struct FixedEnvironment {
-    date: CommitmentDate,
+    date: TelemetryDate,
     fail_at: Option<CommitmentPublicationPoint>,
     count_syncs: bool,
 }
 
 impl AuditSinkEnvironment for FixedEnvironment {
-    fn utc_date(&self) -> io::Result<CommitmentDate> {
+    fn utc_date(&self) -> io::Result<TelemetryDate> {
         Ok(self.date)
     }
 
@@ -82,8 +83,8 @@ fn sink_with(root: &Path, environment: FixedEnvironment) -> ArrowAuditSink {
     ArrowAuditSink::open_with_environment(root, Box::new(environment)).unwrap()
 }
 
-fn date(year: u16, month: u8, day: u8) -> CommitmentDate {
-    CommitmentDate::new(year, month, day).unwrap()
+fn date(year: u16, month: u8, day: u8) -> TelemetryDate {
+    TelemetryDate::new(year, month, day).unwrap()
 }
 
 fn repo() -> RepoId {
@@ -294,12 +295,12 @@ fn sealed_segment_is_private_and_its_directories_are_synced() {
 
 /// Counts directory syncs for one sink alone, so it runs beside every other test.
 struct CountingEnvironment {
-    date: CommitmentDate,
+    date: TelemetryDate,
     directory_syncs: Arc<AtomicUsize>,
 }
 
 impl AuditSinkEnvironment for CountingEnvironment {
-    fn utc_date(&self) -> io::Result<CommitmentDate> {
+    fn utc_date(&self) -> io::Result<TelemetryDate> {
         Ok(self.date)
     }
 

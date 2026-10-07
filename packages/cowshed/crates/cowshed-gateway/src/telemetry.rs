@@ -1,21 +1,17 @@
 use std::{
     collections::VecDeque,
-    fs::{self, File, OpenOptions},
-    io,
+    fs, io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use arrow_array::{
-    ArrayRef, DictionaryArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-    builder::StringDictionaryBuilder,
-    types::{UInt8Type, UInt32Type},
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt16Array, UInt64Array};
+use arrow_schema::{DataType, Field};
+use cowshed_core::storage::trace_segment::{
+    EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, seal_segment, trace_batch,
 };
-use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
@@ -528,83 +524,24 @@ fn write_segment(root: &Path, writer_id: Uuid, events: &[AuditEvent]) -> Result<
         .first()
         .ok_or_else(|| AuditError("cannot write an empty audit batch".to_owned()))?;
     let last = events.last().expect("non-empty batch has a last event");
-    let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(first.timestamp_unix_ms) * 1_000_000,
-    )
-    .map_err(|_| AuditError("audit timestamp is outside the UTC calendar".to_owned()))?;
     let batch = event_batch(events)?;
-    let date = format!(
-        "{:04}-{:02}-{:02}",
-        timestamp.year(),
-        u8::from(timestamp.month()),
-        timestamp.day()
-    );
-    let partition = root.join(date);
-    if let Ok(metadata) = fs::symlink_metadata(&partition)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(AuditError(
-            "telemetry partition cannot be a symlink".to_owned(),
-        ));
-    }
-    fs::create_dir_all(&partition).map_err(io_error("creating telemetry partition"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&partition, fs::Permissions::from_mode(0o700))
-            .map_err(io_error("securing telemetry partition"))?;
-    }
-    sync_directory(root)?;
     let stem = format!(
         "gateway-{:020}-{:020}-{writer_id}",
         first.sequence, last.sequence
     );
-    let temporary = partition.join(format!(".{stem}.tmp"));
-    let final_path = partition.join(format!("{stem}.arrow"));
-    if final_path.exists() {
-        return Err(AuditError("audit segment already exists".to_owned()));
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let result = (|| {
-        let mut file = options
-            .open(&temporary)
-            .map_err(io_error("creating audit segment"))?;
-        {
-            let mut writer = StreamWriter::try_new(&mut file, &batch.schema())
-                .map_err(|error| AuditError(format!("creating Arrow stream: {error}")))?;
-            writer
-                .write(&batch)
-                .map_err(|error| AuditError(format!("writing Arrow batch: {error}")))?;
-            writer
-                .finish()
-                .map_err(|error| AuditError(format!("finishing Arrow stream: {error}")))?;
-        }
-        file.sync_all().map_err(io_error("syncing audit segment"))?;
-        fs::rename(&temporary, &final_path).map_err(io_error("publishing audit segment"))?;
-        sync_directory(&partition)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    seal_segment(
+        root,
+        TelemetryDate::from_unix_seconds(first.timestamp_unix_ms / 1_000),
+        &stem,
+        &batch,
+    )
+    .map_err(|error| AuditError(error.to_string()))?;
+    Ok(())
 }
 
 fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
     let row_capacity = events.len().saturating_mul(4);
-    let mut timestamp = Vec::with_capacity(row_capacity);
-    let mut trace_id = Vec::with_capacity(row_capacity);
-    let mut thread_id = Vec::with_capacity(row_capacity);
-    let mut span_id = Vec::with_capacity(row_capacity);
-    let mut parent_thread_id = Vec::with_capacity(row_capacity);
-    let mut parent_span_id = Vec::with_capacity(row_capacity);
-    let mut entry_type = Vec::with_capacity(row_capacity);
-    let mut message = Vec::with_capacity(row_capacity);
+    let mut system = SystemColumns::with_capacity(row_capacity);
     let mut sequence = Vec::with_capacity(row_capacity);
     let mut w3c_span_id = Vec::with_capacity(row_capacity);
     let mut w3c_parent_span_id = Vec::with_capacity(row_capacity);
@@ -654,45 +591,52 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
             .map(enum_name)
             .transpose()?;
 
-        let mut push_row =
-            |at: u64,
-             local_span: u32,
-             local_parent: Option<u32>,
-             wire_span: u64,
-             wire_parent: Option<u64>,
-             entry: &'static str,
-             span_name: &'static str|
-             -> Result<(), AuditError> {
-                timestamp.push(i64::try_from(at).map_err(|_| {
-                    AuditError("audit timestamp exceeds i64 nanoseconds".to_owned())
-                })?);
-                trace_id.push(trace.clone());
-                thread_id.push(thread);
-                span_id.push(local_span);
-                parent_thread_id.push(local_parent.map(|_| thread));
-                parent_span_id.push(local_parent);
-                entry_type.push(entry_type_key(entry)?);
-                message.push(Some(span_name.to_owned()));
-                sequence.push(event.sequence);
-                w3c_span_id.push(wire_span);
-                w3c_parent_span_id.push(wire_parent);
-                workspace_id.push(event.workspace_id.clone());
-                repo_id.push(event.repo_id.clone());
-                revision.push(event.revision);
-                endpoint.push(event.endpoint.clone());
-                kind.push(kind_value.clone());
-                host.push(event.host.clone());
-                method.push(event.method.clone());
-                path.push(event.path.clone());
-                decision.push(decision_value.clone());
-                http_status.push(event.http_status);
-                bytes.push(event.bytes);
-                grant_hint.push(event.grant_hint.clone());
-                classification.push(event.classification.clone());
-                mirror_cache_status.push(cache_value.clone());
-                tracestate.push(event.tracestate.clone());
-                Ok(())
-            };
+        let mut push_row = |at: u64,
+                            local_span: u32,
+                            local_parent: Option<u32>,
+                            wire_span: u64,
+                            wire_parent: Option<u64>,
+                            entry_type: EntryType,
+                            span_name: &'static str|
+         -> Result<(), AuditError> {
+            system
+                .push(SystemRow {
+                    timestamp_ns: i64::try_from(at).map_err(|_| {
+                        AuditError("audit timestamp exceeds i64 nanoseconds".to_owned())
+                    })?,
+                    trace_id: &trace,
+                    span: SpanAddress {
+                        thread_id: thread,
+                        span_id: local_span,
+                    },
+                    parent: local_parent.map(|span_id| SpanAddress {
+                        thread_id: thread,
+                        span_id,
+                    }),
+                    entry_type,
+                    message: Some(span_name),
+                })
+                .map_err(|error| AuditError(format!("building audit batch: {error}")))?;
+            sequence.push(event.sequence);
+            w3c_span_id.push(wire_span);
+            w3c_parent_span_id.push(wire_parent);
+            workspace_id.push(event.workspace_id.clone());
+            repo_id.push(event.repo_id.clone());
+            revision.push(event.revision);
+            endpoint.push(event.endpoint.clone());
+            kind.push(kind_value.clone());
+            host.push(event.host.clone());
+            method.push(event.method.clone());
+            path.push(event.path.clone());
+            decision.push(decision_value.clone());
+            http_status.push(event.http_status);
+            bytes.push(event.bytes);
+            grant_hint.push(event.grant_hint.clone());
+            classification.push(event.classification.clone());
+            mirror_cache_status.push(cache_value.clone());
+            tracestate.push(event.tracestate.clone());
+            Ok(())
+        };
 
         push_row(
             request_start_ns,
@@ -700,7 +644,7 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
             None,
             event.span_id,
             event.parent_span_id,
-            "span-start",
+            EntryType::SpanStart,
             "gateway.request",
         )?;
         if let Some(upstream_span) = event.upstream_span_id {
@@ -710,7 +654,7 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
                 Some(local_request_span),
                 upstream_span,
                 Some(event.span_id),
-                "span-start",
+                EntryType::SpanStart,
                 "gateway.upstream",
             )?;
             push_row(
@@ -734,150 +678,82 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
         )?;
     }
 
-    let trace_id = dictionary_u32(trace_id.into_iter().map(Some))?;
-    let message = dictionary_u32(message)?;
-    let entry_type = DictionaryArray::<UInt8Type>::try_new(
-        UInt8Array::from(entry_type),
-        Arc::new(StringArray::from_iter_values(ENTRY_TYPE_NAMES)) as ArrayRef,
-    )
-    .map_err(|error| AuditError(format!("building audit entry dictionary: {error}")))?;
-    let row_count = timestamp.len();
-    let package_name = dictionary_u32(vec![None::<String>; row_count])?;
-    let package_file = dictionary_u32(vec![None::<String>; row_count])?;
-    let git_sha = dictionary_u32(vec![None::<String>; row_count])?;
-
-    // `lmao-arrow::trace_schema` cannot be imported alone: that crate also links its sibling
-    // `lmao-core` runtime. Keep this prefix byte-for-byte aligned until the schema is extracted
-    // into a dependency-free crate shared by both packages.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
+    let custom: Vec<(Field, ArrayRef)> = vec![
+        (
+            Field::new("sequence", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(sequence)),
         ),
-        Field::new("trace_id", dict_type(DataType::UInt32), false),
-        Field::new("thread_id", DataType::UInt64, false),
-        Field::new("span_id", DataType::UInt32, false),
-        Field::new("parent_thread_id", DataType::UInt64, true),
-        Field::new("parent_span_id", DataType::UInt32, true),
-        Field::new("entry_type", dict_type(DataType::UInt8), false),
-        Field::new("message", dict_type(DataType::UInt32), true),
-        Field::new("package_name", dict_type(DataType::UInt32), true),
-        Field::new("package_file", dict_type(DataType::UInt32), true),
-        Field::new("git_sha", dict_type(DataType::UInt32), true),
-        Field::new("line", DataType::UInt32, false),
-        Field::new("sequence", DataType::UInt64, false),
-        Field::new("w3c_span_id", DataType::UInt64, false),
-        Field::new("w3c_parent_span_id", DataType::UInt64, true),
-        Field::new("workspace_id", DataType::Utf8, false),
-        Field::new("repo_id", DataType::Utf8, false),
-        Field::new("revision", DataType::UInt64, false),
-        Field::new("endpoint", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("host", DataType::Utf8, true),
-        Field::new("method", DataType::Utf8, true),
-        Field::new("path", DataType::Utf8, true),
-        Field::new("decision", DataType::Utf8, false),
-        Field::new("http_status", DataType::UInt16, true),
-        Field::new("bytes", DataType::UInt64, false),
-        Field::new("grant_hint", DataType::Utf8, true),
-        Field::new("classification", DataType::Utf8, true),
-        Field::new("mirror_cache_status", DataType::Utf8, true),
-        Field::new("tracestate", DataType::Utf8, true),
-    ]));
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(TimestampNanosecondArray::from(timestamp)),
-        Arc::new(trace_id),
-        Arc::new(UInt64Array::from(thread_id)),
-        Arc::new(UInt32Array::from(span_id)),
-        Arc::new(UInt64Array::from(parent_thread_id)),
-        Arc::new(UInt32Array::from(parent_span_id)),
-        Arc::new(entry_type),
-        Arc::new(message),
-        Arc::new(package_name),
-        Arc::new(package_file),
-        Arc::new(git_sha),
-        Arc::new(UInt32Array::from(vec![0; row_count])),
-        Arc::new(UInt64Array::from(sequence)),
-        Arc::new(UInt64Array::from(w3c_span_id)),
-        Arc::new(UInt64Array::from(w3c_parent_span_id)),
-        Arc::new(StringArray::from(workspace_id)),
-        Arc::new(StringArray::from(repo_id)),
-        Arc::new(UInt64Array::from(revision)),
-        Arc::new(StringArray::from(endpoint)),
-        Arc::new(StringArray::from(kind)),
-        Arc::new(StringArray::from(host)),
-        Arc::new(StringArray::from(method)),
-        Arc::new(StringArray::from(path)),
-        Arc::new(StringArray::from(decision)),
-        Arc::new(UInt16Array::from(http_status)),
-        Arc::new(UInt64Array::from(bytes)),
-        Arc::new(StringArray::from(grant_hint)),
-        Arc::new(StringArray::from(classification)),
-        Arc::new(StringArray::from(mirror_cache_status)),
-        Arc::new(StringArray::from(tracestate)),
+        (
+            Field::new("w3c_span_id", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(w3c_span_id)),
+        ),
+        (
+            Field::new("w3c_parent_span_id", DataType::UInt64, true),
+            Arc::new(UInt64Array::from(w3c_parent_span_id)),
+        ),
+        (
+            Field::new("workspace_id", DataType::Utf8, false),
+            Arc::new(StringArray::from(workspace_id)),
+        ),
+        (
+            Field::new("repo_id", DataType::Utf8, false),
+            Arc::new(StringArray::from(repo_id)),
+        ),
+        (
+            Field::new("revision", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(revision)),
+        ),
+        (
+            Field::new("endpoint", DataType::Utf8, false),
+            Arc::new(StringArray::from(endpoint)),
+        ),
+        (
+            Field::new("kind", DataType::Utf8, false),
+            Arc::new(StringArray::from(kind)),
+        ),
+        (
+            Field::new("host", DataType::Utf8, true),
+            Arc::new(StringArray::from(host)),
+        ),
+        (
+            Field::new("method", DataType::Utf8, true),
+            Arc::new(StringArray::from(method)),
+        ),
+        (
+            Field::new("path", DataType::Utf8, true),
+            Arc::new(StringArray::from(path)),
+        ),
+        (
+            Field::new("decision", DataType::Utf8, false),
+            Arc::new(StringArray::from(decision)),
+        ),
+        (
+            Field::new("http_status", DataType::UInt16, true),
+            Arc::new(UInt16Array::from(http_status)),
+        ),
+        (
+            Field::new("bytes", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(bytes)),
+        ),
+        (
+            Field::new("grant_hint", DataType::Utf8, true),
+            Arc::new(StringArray::from(grant_hint)),
+        ),
+        (
+            Field::new("classification", DataType::Utf8, true),
+            Arc::new(StringArray::from(classification)),
+        ),
+        (
+            Field::new("mirror_cache_status", DataType::Utf8, true),
+            Arc::new(StringArray::from(mirror_cache_status)),
+        ),
+        (
+            Field::new("tracestate", DataType::Utf8, true),
+            Arc::new(StringArray::from(tracestate)),
+        ),
     ];
-    RecordBatch::try_new(schema, columns)
+    trace_batch(system, custom)
         .map_err(|error| AuditError(format!("building audit batch: {error}")))
-}
-
-const ENTRY_TYPE_NAMES: [&str; 25] = [
-    "",
-    "span-start",
-    "span-ok",
-    "span-err",
-    "span-exception",
-    "span-retry",
-    "trace",
-    "debug",
-    "info",
-    "warn",
-    "error",
-    "ff-access",
-    "ff-usage",
-    "period-start",
-    "op-invocations",
-    "op-errors",
-    "op-exceptions",
-    "op-duration-total",
-    "op-duration-ok",
-    "op-duration-err",
-    "op-duration-min",
-    "op-duration-max",
-    "buffer-writes",
-    "buffer-spans",
-    "buffer-capacity",
-];
-
-fn dict_type(key: DataType) -> DataType {
-    DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8))
-}
-
-fn dictionary_u32(
-    values: impl IntoIterator<Item = Option<String>>,
-) -> Result<DictionaryArray<UInt32Type>, AuditError> {
-    let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
-    for value in values {
-        match value {
-            Some(value) => {
-                builder
-                    .append(value)
-                    .map_err(|error| AuditError(format!("building audit dictionary: {error}")))?;
-            }
-            None => builder.append_null(),
-        }
-    }
-    Ok(builder.finish())
-}
-
-fn entry_type_key(value: &str) -> Result<u8, AuditError> {
-    match value {
-        "span-start" => Ok(1),
-        "span-ok" => Ok(2),
-        "span-err" => Ok(3),
-        "span-exception" => Ok(4),
-        _ => Err(AuditError(format!("unsupported audit entry type: {value}"))),
-    }
 }
 
 fn enum_name<T: serde::Serialize>(value: &T) -> Result<String, AuditError> {
@@ -887,18 +763,18 @@ fn enum_name<T: serde::Serialize>(value: &T) -> Result<String, AuditError> {
         .ok_or_else(|| AuditError("audit enum did not serialize as a string".to_owned()))
 }
 
-fn end_entry_type(status: AuditStatus) -> &'static str {
+fn end_entry_type(status: AuditStatus) -> EntryType {
     if matches!(status, AuditStatus::Allowed | AuditStatus::Completed) {
-        "span-ok"
+        EntryType::SpanOk
     } else if matches!(status, AuditStatus::Failed) {
-        "span-exception"
+        EntryType::SpanException
     } else {
-        "span-err"
+        EntryType::SpanErr
     }
 }
 
 fn sync_directory(path: &Path) -> Result<(), AuditError> {
-    File::open(path)
+    fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error("syncing telemetry directory"))
 }
@@ -909,10 +785,12 @@ fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> AuditError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs::File, sync::Arc};
 
-    use arrow_array::{Array as _, StringArray, UInt64Array};
+    use arrow_array::{Array as _, DictionaryArray, StringArray, UInt64Array, types::UInt8Type};
     use arrow_ipc::reader::StreamReader;
+    use arrow_schema::TimeUnit;
+    use cowshed_core::storage::trace_segment::dict_type;
 
     use super::*;
     use crate::{interfaces::AuditKind, mirror::MirrorCacheStatus};
@@ -1276,5 +1154,59 @@ mod tests {
                 .0
                 .contains("stopped")
         );
+    }
+
+    /// Three requests covering every column's shapes: an upstream leg and none, a minted and an
+    /// adopted trace id, every end entry type, and null and present optional columns.
+    fn fixture_events() -> Vec<AuditEvent> {
+        let mut denied = event(2, "beta", AuditStatus::Denied);
+        denied.trace_id = None;
+        denied.upstream_span_id = None;
+        denied.parent_span_id = None;
+        denied.tracestate = None;
+        denied.http_status = None;
+        denied.mirror_cache_status = None;
+        denied.grant_hint = Some("grant-hint".to_owned());
+        denied.classification = Some("classified".to_owned());
+        let mut failed = event(3, "alpha", AuditStatus::Failed);
+        failed.host = None;
+        failed.method = None;
+        failed.path = None;
+        vec![event(1, "alpha", AuditStatus::Completed), denied, failed]
+    }
+
+    /// The fixture is the segment the gateway's hand-written writer sealed for these events before
+    /// the schema moved to `cowshed_core::storage::trace_segment`: the shared writer must produce
+    /// it byte for byte, at the same partition and name.
+    #[test]
+    fn sealed_segment_is_byte_identical_to_the_pre_extraction_writer() {
+        let root = TestRoot::new("trace-fixture");
+        write_segment(&root.0, Uuid::nil(), &fixture_events()).expect("seal fixture segment");
+        let segments = root.segments();
+        assert_eq!(
+            segments,
+            [root.0.join(
+                "2023-11-14/gateway-00000000000000000001-00000000000000000003-\
+                 00000000-0000-0000-0000-000000000000.arrow"
+            )]
+        );
+        let sealed = fs::read(&segments[0]).expect("read sealed segment");
+        assert!(
+            sealed == include_bytes!("../tests/fixtures/gateway-trace-segment.arrow"),
+            "sealed gateway segment diverged from the pre-extraction bytes"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| {
+                fs::metadata(path)
+                    .expect("stat telemetry entry")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&segments[0]), 0o600);
+            assert_eq!(mode(&root.0.join("2023-11-14")), 0o700);
+        }
     }
 }

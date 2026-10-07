@@ -571,6 +571,107 @@ pub(crate) fn rename_noreplace(
     ))
 }
 
+/// Open the directory at `path` for directory-relative work, refusing a symlink or a
+/// non-directory at its last component. Earlier components resolve normally, so a root below a
+/// linked system prefix (macOS `/var` → `/private/var`) opens.
+pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Create the child directory `name` of `parent` with mode 0700, or open the one already there,
+/// refusing a symlink or a non-directory at `name`. `true` when this call created it: the parent
+/// then gained an entry its writer may have to make durable.
+pub(crate) fn open_or_create_child_directory(
+    parent: &File,
+    name: &CStr,
+) -> io::Result<(File, bool)> {
+    validate_directory_leaf(name)?;
+    // SAFETY: mkdirat resolves one leaf beneath the held parent fd; both outlive the call.
+    let created = if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        true
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        false
+    };
+    // SAFETY: the held parent fd and NUL-terminated leaf outlive the call. NOFOLLOW and
+    // DIRECTORY refuse a link or a non-directory planted at the name.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returned a new owned directory descriptor.
+    Ok((unsafe { File::from_raw_fd(fd) }, created))
+}
+
+/// Create the private file `name` beneath `directory`. `O_EXCL` and `O_NOFOLLOW` refuse any entry
+/// already there, a link included; the mode is set to 0600 after the open because the open's mode
+/// is masked by the umask. A file whose mode cannot be set is unlinked before the error returns.
+pub(crate) fn create_private_file_at(directory: &File, name: &CStr) -> io::Result<File> {
+    validate_directory_leaf(name)?;
+    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returned a new owned file descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let cleanup = TemporaryAt::new(directory, name);
+    file.set_permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600))?;
+    cleanup.disarm();
+    Ok(file)
+}
+
+/// Unlinks a directory-relative temporary when dropped armed: publication either renames the
+/// temporary to its sealed name and disarms this, or leaves nothing behind. The unlink is the
+/// last act of a path that already failed, so its own failure has nowhere to go.
+pub(crate) struct TemporaryAt<'a> {
+    directory: &'a File,
+    name: &'a CStr,
+    armed: bool,
+}
+
+impl<'a> TemporaryAt<'a> {
+    pub(crate) fn new(directory: &'a File, name: &'a CStr) -> Self {
+        Self {
+            directory,
+            name,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryAt<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: removes this directory's own temporary entry, never a link target.
+            unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+}
+
 /// How [`publish_private_file`] failed: an I/O step (with the path it was about), or the caller's
 /// own write closure. Typed so callers keep their structured errors instead of flattening
 /// serialization failures into `io::Error`.
