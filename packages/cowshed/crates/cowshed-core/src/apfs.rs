@@ -6538,9 +6538,11 @@ mod tests {
 
         // Each fixture run is a run of its own, as the next `cargo nextest run` is: without the
         // parent's `NEXTEST_RUN_ID`, its scratch root's sweep is never one the parent's run
-        // already recorded.
-        let run = |ending: &str| -> Child {
-            Command::new(std::env::current_exe().expect("test binary"))
+        // already recorded. Its stderr is forwarded line by line, so a hung run still shows its
+        // open step, and answers whether the run printed a panic: the run's output is this test's
+        // own, and a panic in it reads as this test's assertion failure behind any timeout.
+        let run = |ending: &str| -> (Child, std::thread::JoinHandle<bool>) {
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
                     "apfs::tests::real_apfs_fixture_run_ended_by_its_parent",
@@ -6551,12 +6553,22 @@ mod tests {
                 .env_remove("NEXTEST_RUN_ID")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn_locked()
-                .expect("spawn a fixture run")
+                .expect("spawn a fixture run");
+            let stderr = BufReader::new(child.stderr.take().expect("run stderr"));
+            let forwarded = std::thread::spawn(move || {
+                stderr.lines().fold(false, |panicked, line| {
+                    let line = line.expect("run stderr");
+                    eprintln!("{line}");
+                    panicked || line.contains("panicked at")
+                })
+            });
+            (child, forwarded)
         };
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         for ending in ["panic", "kill"] {
-            let mut child = run(ending);
+            let (mut child, forwarded) = run(ending);
             let mut lines = BufReader::new(child.stdout.take().expect("run stdout"))
                 .lines()
                 .map(|line| line.expect("run stdout"));
@@ -6582,11 +6594,20 @@ mod tests {
             }
             lines.for_each(drop);
             let status = child.wait().expect("reap the run");
+            assert!(
+                !forwarded.join().expect("forward the run's stderr"),
+                "the {ending} run's deliberate failure printed a panic"
+            );
             match ending {
-                "panic" => assert_eq!(status.code(), Some(101), "the run panicked"),
+                "panic" => assert_eq!(status.code(), Some(101), "the run failed"),
                 _ => {
                     assert_eq!(status.signal(), Some(libc::SIGKILL), "the run was killed");
-                    let next = run("sweep").wait().expect("the next run");
+                    let (mut next, forwarded) = run("sweep");
+                    let next = next.wait().expect("the next run");
+                    assert!(
+                        !forwarded.join().expect("forward the next run's stderr"),
+                        "the sweep run printed a panic"
+                    );
                     assert!(next.success(), "the next run swept: {next}");
                 }
             }
@@ -6608,7 +6629,7 @@ mod tests {
         }
     }
 
-    /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it panics or waits to be
+    /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it fails or waits to be
     /// killed once its images are attached and its worker started, or (`sweep`) only opens and
     /// drops a scratch root, whose teardown waits for its run's sweep of dead runs. Its images
     /// are the root's to release, as a CLI fixture's are.
@@ -6654,7 +6675,9 @@ mod tests {
         .expect("start a worker in the root");
         println!("{FIXTURE_WORKER}{} {}", worker.id(), root.path().display());
         if ending == "panic" {
-            panic!("the fixture's run fails with its images attached");
+            // Unwinds through the scratch root's teardown as a failed assertion does, without the
+            // panic hook: its `panicked at` would read as the parent's own assertion failure.
+            std::panic::resume_unwind(Box::new("the fixture's run fails with its images attached"));
         }
         // Killed here; the parent's stdin closes only if it failed first.
         let _ = io::stdin().read_line(&mut String::new());
