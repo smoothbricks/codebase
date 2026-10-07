@@ -61,16 +61,22 @@ export async function processTable(): Promise<ProcessEntry[]> {
     });
 }
 
-/** The listed processes among `pids`, and every process descending from one. */
+/**
+ * The listed processes among `pids`, and every process descending from one, each once: a pid that
+ * descends from another in `pids` is not listed twice.
+ */
 export function withDescendants(table: readonly ProcessEntry[], pids: readonly number[]): ProcessEntry[] {
-  const found: ProcessEntry[] = [];
+  const found = new Map<number, ProcessEntry>();
   const pending = table.filter((entry) => pids.includes(entry.pid));
   for (let entry = pending.pop(); entry !== undefined; entry = pending.pop()) {
-    found.push(entry);
+    if (found.has(entry.pid)) {
+      continue;
+    }
+    found.set(entry.pid, entry);
     const parent = entry.pid;
     pending.push(...table.filter((child) => child.ppid === parent));
   }
-  return found;
+  return [...found.values()];
 }
 
 function errorCode(error: unknown): unknown {

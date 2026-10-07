@@ -2,7 +2,14 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { awaitExit, pidsWorkingIn, processTable, terminate, withDescendants } from '../../testing.js';
+import {
+  awaitExit,
+  type ProcessEntry,
+  pidsWorkingIn,
+  processTable,
+  terminate,
+  withDescendants,
+} from '../../testing.js';
 import { diskClassOf, takeDiskLease } from './disk-lease.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 
@@ -119,8 +126,19 @@ export interface LeaseProcesses {
   stopWorkingIn(directory: string): Promise<string[]>;
 }
 
+/** What `stopWorkingIn` reads of the host. A seam so a test can start a process between two reads. */
+export interface ProcessReader {
+  /** The processes whose working directory is `directory` or lies beneath it. */
+  workingIn(directory: string): Promise<number[]>;
+  /** Every process on the host. */
+  table(): Promise<ProcessEntry[]>;
+}
+
+/** A `ps` state in which a process starts nothing: stopped (`T`, `t` when traced) or exited (`Z`). */
+const STARTS_NOTHING = /^[TtZ]/;
+
 /**
- * The host's processes. A lease belongs to one task and its command is gone by the time the
+ * The processes `host` reads. A lease belongs to one task and its command is gone by the time the
  * lease ends, so what still works in it is what the command left behind. A fixture's Nx daemon is
  * the usual one: Nx detaches it into a session of its own, so the process-group kill that ends a
  * timed-out command never reaches it, and a test process that is killed runs no teardown of its
@@ -128,28 +146,72 @@ export interface LeaseProcesses {
  * notices within a second when it is idle and not at all while it is wedged; a signal does not
  * depend on the daemon noticing, and a process left on the volume is what keeps it from
  * detaching.
+ *
+ * A leftover keeps running while it is looked for, and a child it starts after the process table
+ * was read is in no table that was. So each one found is held with SIGSTOP and the table is read
+ * again, until a read names nothing that the read before did not already show stopped: a stopped
+ * process starts nothing, and whatever it started before it stopped is in every table read after.
+ * Only then does each get SIGTERM, and SIGCONT to act on it. A child whose parent exited before it
+ * could be held has lost its ancestry, so every round also asks again what works in the lease.
  */
-export const hostLeaseProcesses: LeaseProcesses = {
-  async stopWorkingIn(directory) {
-    const working = (await pidsWorkingIn(directory)).filter((pid) => pid !== process.pid);
-    if (working.length === 0) {
-      return [];
-    }
-    const leftovers = withDescendants(await processTable(), working).filter((entry) => entry.pid !== process.pid);
-    for (const entry of leftovers) {
-      terminate(entry.pid);
-    }
-    try {
-      await awaitExit(leftovers, `processes working in ${directory}`, LEFTOVER_GRACE_MS);
-    } catch {
-      for (const entry of leftovers) {
-        terminate(entry.pid, 'SIGKILL');
+export function leaseProcessesOn(host: ProcessReader): LeaseProcesses {
+  return {
+    async stopWorkingIn(directory) {
+      let working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
+      if (working.length === 0) {
+        return [];
       }
-      await awaitExit(leftovers, `processes working in ${directory} after SIGKILL`, LEFTOVER_GRACE_MS);
-    }
-    return leftovers.map((entry) => `${entry.pid} (${entry.command.slice(0, 160)})`);
-  },
-};
+      const deadline = Date.now() + LEFTOVER_GRACE_MS;
+      const known = new Map<number, ProcessEntry>();
+      let held = new Set<number>();
+      try {
+        for (;;) {
+          const roots = [...working, ...known.keys()];
+          const current = withDescendants(await host.table(), roots).filter((entry) => entry.pid !== process.pid);
+          for (const entry of current) {
+            known.set(entry.pid, entry);
+          }
+          working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
+          if (
+            current.every((entry) => held.has(entry.pid) && STARTS_NOTHING.test(entry.stat)) &&
+            working.every((pid) => held.has(pid))
+          ) {
+            break;
+          }
+          if (Date.now() > deadline) {
+            throw new Error(
+              `processes working in ${directory}: ${current.map((entry) => `${entry.pid} (${entry.command})`).join(', ')} did not stop spawning within ${LEFTOVER_GRACE_MS}ms`,
+            );
+          }
+          for (const entry of current) {
+            terminate(entry.pid, 'SIGSTOP');
+          }
+          held = new Set(current.filter((entry) => STARTS_NOTHING.test(entry.stat)).map((entry) => entry.pid));
+        }
+        for (const entry of known.values()) {
+          terminate(entry.pid);
+        }
+      } finally {
+        // SIGTERM is pending while stopped. Also release the hold if a host read or signal failed.
+        for (const entry of known.values()) {
+          terminate(entry.pid, 'SIGCONT');
+        }
+      }
+      const leftovers = [...known.values()];
+      try {
+        await awaitExit(leftovers, `processes working in ${directory}`, LEFTOVER_GRACE_MS);
+      } catch {
+        for (const entry of leftovers) {
+          terminate(entry.pid, 'SIGKILL');
+        }
+        await awaitExit(leftovers, `processes working in ${directory} after SIGKILL`, LEFTOVER_GRACE_MS);
+      }
+      return leftovers.map((entry) => `${entry.pid} (${entry.command.slice(0, 160)})`);
+    },
+  };
+}
+
+export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({ workingIn: pidsWorkingIn, table: processTable });
 
 export interface RamTempPaths {
   /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */

@@ -750,10 +750,13 @@ Whatever still works in a lease when its task ends is a leak, and is stopped bef
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
 never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
 deleting its record, which an idle daemon notices within a second and a wedged one never does, and a process left on the
-volume keeps it from detaching. So the task's own release, and the next task's reclaim of a dead lease, send SIGTERM to
-every process whose working directory is in the lease and to what those started, SIGKILL to what has not exited five
-seconds later, and name each on stderr (`stopped <pid> (<command>), which the command left working in its lease`). A
-lease with nothing in it costs no scan. The line is the leak check: a suite that prints it has a fixture to fix.
+volume keeps it from detaching. So the task's own release, and the next task's reclaim of a dead lease, first hold
+discovered processes with SIGSTOP and rescan their descendants and lease working directories until a stopped census is
+stable. A process can fork after a table read but before its signal; only a table read after it is stopped closes that
+gap. Discovery failures resume held processes and name the failure. The settled census gets SIGTERM then SIGCONT,
+SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
+(`stopped <pid> (<command>), which the command left working in its lease`). A lease with nothing in it costs no scan.
+The line is the leak check: a suite that prints it has a fixture to fix.
 
 The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: asking for any other mountpoint escalates
 to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
