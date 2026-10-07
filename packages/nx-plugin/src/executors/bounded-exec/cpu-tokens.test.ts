@@ -15,9 +15,9 @@ afterEach(() => {
   }
 });
 
-/** A gateway stand-in on a socket under /private/tmp (sun_path is 104 bytes) that runs `serve` per client. */
+/** A gateway stand-in on a socket under /tmp (sun_path is 104 bytes; macOS links it to /private/tmp) that runs `serve` per client. */
 async function gateway(serve: (client: Socket) => void): Promise<string> {
-  const socket = `/private/tmp/smoo-cpu-${process.pid}-${sockets.length}.sock`;
+  const socket = `/tmp/smoo-cpu-${process.pid}-${sockets.length}.sock`;
   rmSync(socket, { force: true });
   const server = createServer({ allowHalfOpen: true }, serve);
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -96,7 +96,9 @@ describe('cowshed CPU budget client', () => {
         requested(chunk.toString('utf8'));
         client.write('{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted","tokens":6}\n');
       });
-      client.on('close', () => close());
+      // The gateway takes a lease back when it reads EOF. With allowHalfOpen the socket stays open
+      // after the peer closes until the server ends it, so 'close' is not that signal on Linux.
+      client.on('end', () => close());
     });
     const grant = await gatewayCpuBudget(socket).take(18, '/w/one', 'cargo nextest run');
     expect(JSON.parse(await request)).toEqual({
@@ -113,7 +115,7 @@ describe('cowshed CPU budget client', () => {
   });
 
   it('runs unbudgeted, said as absent, when no gateway listens', async () => {
-    const grant = await gatewayCpuBudget(`/private/tmp/smoo-cpu-${process.pid}-none.sock`).take(4, '/w', 'x');
+    const grant = await gatewayCpuBudget(`/tmp/smoo-cpu-${process.pid}-none.sock`).take(4, '/w', 'x');
     expect(grant.granted === false && grant.cause).toBe('absent');
   });
 
@@ -152,7 +154,7 @@ describe('cowshed CPU budget client', () => {
         client.write('{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted","tokens":2}\n');
         grant();
       });
-      client.on('close', () => close());
+      client.on('end', () => close());
     });
     // The holder is its own process so SIGKILL is a real death. Its script imports the module by
     // path because `bun -e` has no module of its own to import from statically; the held lease's

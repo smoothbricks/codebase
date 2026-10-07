@@ -277,7 +277,7 @@ describe('RAM temp volume on this host', () => {
   it('asks a gateway that predates disk leases once, not before every disk command', async () => {
     // Such a gateway answers only after 2 s of silence; asking it before each of a volume's
     // dozen hdiutil and diskutil calls once pushed a test shard past its 120 s bound.
-    const socket = `/private/tmp/smoo-rt-${process.pid}.sock`;
+    const socket = `/tmp/smoo-rt-${process.pid}.sock`;
     rmSync(socket, { force: true });
     let asked = 0;
     const server = createServer({ allowHalfOpen: true }, (client) => {
@@ -308,7 +308,7 @@ describe('RAM temp volume on this host', () => {
  * process uses, since the size and the user are what identify a RAM disk as this volume's.
  */
 function scratchVolume(index: number): { parent: string; paths: RamTempPaths; capacity: number } {
-  const parent = mkdtempSync(join(process.env.TMPDIR ?? '/private/tmp', 'rt-'));
+  const parent = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'rt-'));
   const name = `smoo-ram-test-${process.pid}-${index}`;
   return {
     parent,
@@ -324,7 +324,16 @@ function scratchVolume(index: number): { parent: string; paths: RamTempPaths; ca
 }
 
 function attachedDisks(paths: RamTempPaths, capacity: number): RamDisk[] {
-  const info = execFileSync('/usr/bin/hdiutil', ['info'], { encoding: 'utf8' });
+  let info: string;
+  try {
+    info = execFileSync('/usr/bin/hdiutil', ['info'], { encoding: 'utf8' });
+  } catch (error) {
+    // A host without hdiutil has no RAM disk attached.
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
   return ramDisksIn(info).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
 }
 

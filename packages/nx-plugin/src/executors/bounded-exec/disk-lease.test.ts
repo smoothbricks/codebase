@@ -21,9 +21,9 @@ afterEach(() => {
   }
 });
 
-/** A gateway stand-in on a socket under /private/tmp (sun_path is 104 bytes) that runs `serve` per client. */
+/** A gateway stand-in on a socket under /tmp (sun_path is 104 bytes; macOS links it to /private/tmp) that runs `serve` per client. */
 async function gateway(serve: (client: Socket) => void): Promise<string> {
-  const socket = `/private/tmp/smoo-dl-${process.pid}-${sockets.length}.sock`;
+  const socket = `/tmp/smoo-dl-${process.pid}-${sockets.length}.sock`;
   rmSync(socket, { force: true });
   const server = createServer({ allowHalfOpen: true }, serve);
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -51,7 +51,9 @@ describe('cowshed disk-lifecycle lease client', () => {
         requested(chunk.toString('utf8'));
         client.write('{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted"}\n');
       });
-      client.on('close', () => close());
+      // The gateway takes a lease back when it reads EOF. With allowHalfOpen the socket stays open
+      // after the peer closes until the server ends it, so 'close' is not that signal on Linux.
+      client.on('end', () => close());
     });
     const lease = await takeDiskLease(socket, 'storage', '/usr/bin/hdiutil detach /dev/disk9', QUICK);
     expect(await request).toBe(
@@ -81,7 +83,7 @@ describe('cowshed disk-lifecycle lease client', () => {
   });
 
   it('runs unleased, said as absent, when no gateway listens', async () => {
-    const lease = await takeDiskLease(`/private/tmp/smoo-dl-${process.pid}-none.sock`, 'storage', 'x', QUICK);
+    const lease = await takeDiskLease(`/tmp/smoo-dl-${process.pid}-none.sock`, 'storage', 'x', QUICK);
     expect(lease.granted === false && lease.cause).toBe('absent');
   });
 
