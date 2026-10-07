@@ -342,6 +342,11 @@ class JobHandleImpl implements JobHandle {
     return callNativeAsync(() => N.jobLogs(this.#native, args));
   }
 
+  async tail(cursor: Api.JobJournalCursor | undefined, limits: Api.JobTailLimits): Promise<Api.JobTail> {
+    // An undefined cursor is omitted from the request's JSON: the latest tail, never `null`.
+    return callNativeAsync(() => N.jobTail(this.#native, { cursor, limits }));
+  }
+
   async detach(): Promise<void> {
     await callNativeAsync(() => N.jobDetach(this.#native, {}));
   }
