@@ -77,8 +77,9 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   supervisor start, and queues a new name whenever land or adopt changes the checkout that owns it. Seeds are never
   mounted and are never named: mounting one merely to rename it would write its image and advance the seed-freshness
   clock (Targets and seeds). Resize may attach a seed without mounting it; no label operation accompanies that attach.
-  Quiescence drains the checkout's queued renames before its volume changes owner, so an old background rename cannot
-  overwrite the adopted volume's new name. Provisioning does not wait for those renames.
+  Provisioning, quiescence and retirement never wait for a rename. Before naming a build volume, the background task
+  checks its sidecar-backed checkout grant, not merely its link; an old owner cannot authorize the adopted volume.
+  Labels are cosmetic, never authority. A supervisor start reconciles a name changed in the check-to-rename window.
 - **Capacity**: 100 GiB by default for a build volume created from nothing; `.cowshed.toml`
   `[build] capacity = "<size>"` overrides it per project. A sparse image costs only its written blocks, so the capacity
   is not an allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with

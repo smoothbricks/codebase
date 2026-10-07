@@ -2660,7 +2660,7 @@ struct SupervisorActor {
     nx_daemon: Option<NxDaemonKeeper>,
     /// The build volume this supervisor last asked to be named for its checkout.
     labelled_build: Option<PathBuf>,
-    /// Background renames must finish before quiescence hands this checkout's volume away.
+    /// Background renames, reaped without delaying provisioning or lifecycle commands.
     labelling: tokio::task::JoinSet<()>,
 }
 
@@ -2742,9 +2742,9 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
-            self.finish_lifecycle_waiters().await;
+            self.finish_lifecycle_waiters();
         }
-        self.drain_labels().await;
+        self.labelling.abort_all();
     }
 
     async fn handle_command(&mut self, command: Command) {
@@ -2891,7 +2891,22 @@ impl SupervisorActor {
                 build_volume,
                 reply,
             } => {
-                let named = self.validate_authority(&authority);
+                let named = self.validate_authority(&authority).and_then(|()| {
+                    if let Some(mount) = build_volume.as_deref()
+                        && !self.build_volume_layout.as_ref().is_some_and(|layout| {
+                            layout.volume_at(mount).is_some()
+                        })
+                    {
+                        return Err(CowshedError::integrity(
+                            format!(
+                                "build volume label request names {}, outside this project's build volumes",
+                                mount.display()
+                            ),
+                            "cowshed doctor --json",
+                        ));
+                    }
+                    Ok(())
+                });
                 if named.is_ok() {
                     self.relabel(false, build_volume.as_deref());
                 }
@@ -3130,6 +3145,10 @@ impl SupervisorActor {
         }
         if let Some(build) = build
             && self.labelled_build.as_deref() != Some(build)
+            && self
+                .build_volume_layout
+                .as_ref()
+                .is_some_and(|layout| layout.volume_at(build).is_some())
         {
             self.labelled_build = Some(build.to_owned());
             volumes.push(("build volume", build.to_owned(), labels.build.clone()));
@@ -3140,14 +3159,26 @@ impl SupervisorActor {
         let labeller = Arc::clone(&labels.labeller);
         let name = self.authority.workspace.clone();
         let checkout = self.workspace_root.clone();
+        let layout = self.build_volume_layout.clone();
         self.labelling.spawn_blocking(move || {
             for (what, mount, label) in volumes {
-                // A land may have moved the link off this build volume since the rename was
-                // asked for; the volume is then another checkout's to name, never this one's.
-                if what == "build volume"
-                    && !matches!(crate::build_volume::link::linked(&checkout), Ok(Some(linked)) if linked == mount)
-                {
-                    continue;
+                // Links are not authority. After a land, this checkout may still link the
+                // adopted volume, but its sidecar belongs to the target, so it cannot name it.
+                if what == "build volume" {
+                    let Some(layout) = &layout else {
+                        continue;
+                    };
+                    match layout.grant(&name, &checkout) {
+                        Ok(Some(granted)) if granted == mount => {}
+                        Ok(_) => continue,
+                        Err(error) => {
+                            eprintln!(
+                                "cowshed: could not authorize workspace {name}'s build volume label at {}: {error}",
+                                mount.display()
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let started = Instant::now();
                 match labeller.ensure_label(&mount, &label) {
@@ -4152,30 +4183,20 @@ impl SupervisorActor {
         }
     }
 
-    async fn finish_lifecycle_waiters(&mut self) {
+    fn finish_lifecycle_waiters(&mut self) {
         if self.has_running_jobs() {
             return;
-        }
-        if !self.quiesce_waiters.is_empty() || !self.retire_waiters.is_empty() {
-            self.drain_labels().await;
         }
         for waiter in self.quiesce_waiters.drain(..) {
             let _ = waiter.send(Ok(()));
         }
         if self.lifecycle == ActorLifecycle::Retiring {
+            self.labelling.abort_all();
             self.lifecycle = ActorLifecycle::Retired;
         }
         if self.lifecycle == ActorLifecycle::Retired {
             for waiter in self.retire_waiters.drain(..) {
                 let _ = waiter.send(Ok(()));
-            }
-        }
-    }
-
-    async fn drain_labels(&mut self) {
-        while let Some(labelled) = self.labelling.join_next().await {
-            if let Err(error) = labelled {
-                eprintln!("cowshed: volume label task failed: {error}");
             }
         }
     }

@@ -2043,7 +2043,7 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
 }
 
 #[tokio::test]
-async fn quiesce_drains_background_volume_labels_before_handing_ownership_away() {
+async fn quiesce_does_not_wait_for_background_volume_labels() {
     struct BlockedLabeller {
         entered: mpsc::UnboundedSender<()>,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -2076,15 +2076,61 @@ async fn quiesce_drains_background_volume_labels_before_handing_ownership_away()
         .recv()
         .await
         .expect("the background rename entered its gate");
-    let handle = h.handle.clone();
-    let quiesce = tokio::spawn(async move { handle.quiesce().await });
-    tokio::task::yield_now().await;
-    assert!(
-        !quiesce.is_finished(),
-        "ownership cannot move past a queued rename"
-    );
+    // The rename is still blocked: quiescence must answer without Disk Arbitration latency.
+    h.handle.quiesce().await.unwrap();
     release.send(()).expect("release the rename");
-    quiesce.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layout() {
+    use cowshed_core::build_volume::{BuildVolumeLayout, link};
+    use cowshed_core::repository::ProjectPaths;
+
+    struct RecordingLabeller(mpsc::UnboundedSender<PathBuf>);
+    impl VolumeLabeller for RecordingLabeller {
+        fn ensure_label(&self, mount: &Path, _label: &str) -> std::io::Result<Labelled> {
+            self.0
+                .send(mount.to_owned())
+                .map_err(std::io::Error::other)?;
+            Ok(Labelled::Renamed)
+        }
+    }
+    let root = workspace_root("volume-label-authority");
+    let mut supervisor = config(&root);
+    let project = ProjectPaths::with_mount_root(
+        root.join("store"),
+        &supervisor.sandbox.mount_root,
+        &supervisor.authority.repo_id,
+    )
+    .unwrap();
+    supervisor.build_volume_layout = Some(BuildVolumeLayout::new(&project).unwrap());
+    let checkout = supervisor.workspace_root.clone();
+    let host_mount = root.join("host-mount");
+    std::fs::create_dir_all(&host_mount).unwrap();
+    link::point(&checkout, &host_mount).unwrap();
+    let (named, mut labels) = mpsc::unbounded_channel();
+    supervisor.volume_labels = Some(VolumeLabels {
+        workspace: "[cowshed] acme · widget — main".into(),
+        build: "[cowshed] acme · widget — build main".into(),
+        labeller: std::sync::Arc::new(RecordingLabeller(named)),
+    });
+    let h = harness_with_config(supervisor, 1, 1024, false, false);
+    assert_eq!(
+        labels.recv().await.unwrap(),
+        checkout,
+        "the initial workspace label runs"
+    );
+    let refused = h
+        .handle
+        .name_build_volume(Some(host_mount))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Integrity);
+    assert!(
+        labels.try_recv().is_err(),
+        "even a matching checkout link cannot authorize naming a host volume"
+    );
+    h.handle.quiesce().await.unwrap();
 }
 
 #[tokio::test]
