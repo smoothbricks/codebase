@@ -1,3 +1,64 @@
+diff --git a/dist/bin/nx.js b/dist/bin/nx.js
+index 5a59f76..7a3a0ca 100755
+--- a/dist/bin/nx.js
++++ b/dist/bin/nx.js
+@@ -12,6 +12,7 @@ if (process.env.FORCE_COLOR === '0') {
+ // Must be the first import — see enable-compile-cache.ts.
+ require("../src/utils/enable-compile-cache");
+ const find_workspace_root_1 = require("../src/utils/find-workspace-root");
++const workspace_root_1 = require("../src/utils/workspace-root");
+ const pc = tslib_1.__importStar(require("picocolors"));
+ const output_1 = require("../src/utils/output");
+ const installation_directory_1 = require("../src/utils/installation-directory");
+@@ -35,6 +36,10 @@ async function main() {
+     // user's command line.
+     if (process.env.NX_COMPLETE) {
+         try {
++            // A shell set up for another workspace gets no suggestions: they
++            // would come from that workspace's graph.
++            if ((0, workspace_root_1.foreignWorkspaceEnvironment)(process.cwd(), process.env) !== null)
++                return;
+             perf_hooks_1.performance.mark('init-local');
+             const { tryValueCompletion } = await import('nx/src/command-line/completion/value-completions');
+             if (tryValueCompletion())
+@@ -51,6 +56,13 @@ async function main() {
+         }
+         return;
+     }
++    // Before anything below can reach the daemon, sockets or files of a
++    // workspace the environment names instead of the current directory's.
++    const foreign = (0, workspace_root_1.foreignWorkspaceEnvironment)(process.cwd(), process.env);
++    if (foreign !== null) {
++        handleForeignWorkspaceEnvironment(foreign);
++        return;
++    }
+     if (process.argv[2] !== 'report' &&
+         process.argv[2] !== '--version' &&
+         process.argv[2] !== '--help' &&
+@@ -154,6 +166,23 @@ async function main() {
+         }
+     }
+ }
++/**
++ * Refuse to run: the environment belongs to another workspace than the
++ * current directory's (see `foreignWorkspaceEnvironment`). `exitCode` rather
++ * than `process.exit`, so the message is not cut off on a piped stderr.
++ */
++function handleForeignWorkspaceEnvironment({ workspace, variables }) {
++    output_1.output.error({
++        title: `The environment belongs to another Nx workspace than ${workspace}, the one the current directory is in.`,
++        bodyLines: [
++            ...variables.map(({ name, value, workspace: other }) => `${name}=${value} belongs to workspace ${other}`),
++            '',
++            `Nx stopped before reaching that workspace's daemon, cache or files. Run the command under ${workspace}'s own environment, for example \`direnv exec ${workspace} nx ...\`, or unset the variables above.`,
++            'A cache or data directory several checkouts share on purpose has to lie outside every workspace.',
++        ],
++    });
++    process.exitCode = 1;
++}
+ function handleNoWorkspace(globalNxVersion) {
+     output_1.output.log({
+         title: `The current directory isn't part of an Nx workspace.`,
 diff --git a/dist/src/command-line/release/version/version-actions.js b/dist/src/command-line/release/version/version-actions.js
 index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d5160b97bc32 100644
 --- a/dist/src/command-line/release/version/version-actions.js
@@ -1535,3 +1596,156 @@ index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab990287
  async function getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, useDaemonProcess = true) {
      if (!useDaemonProcess || (0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
          ensureContextAvailable(workspaceRoot);
+diff --git a/dist/src/utils/workspace-root.d.ts b/dist/src/utils/workspace-root.d.ts
+index 74bf8f9..8034019 100644
+--- a/dist/src/utils/workspace-root.d.ts
++++ b/dist/src/utils/workspace-root.d.ts
+@@ -4,3 +4,17 @@
+ export declare let workspaceRoot: string;
+ export declare function setWorkspaceRoot(root: string): void;
+ export declare function workspaceRootInner(dir: string, candidateRoot: string | null): string;
++export declare function workspaceRootFromMarkers(dir: string, candidateRoot: string | null): string | null;
++/** A variable naming a workspace other than the current directory's. */
++export interface ForeignWorkspaceVariable {
++    readonly name: string;
++    readonly value: string;
++    /** The workspace the value names, symlinks resolved. */
++    readonly workspace: string;
++}
++export interface ForeignWorkspaceEnvironment {
++    /** The workspace the current directory is in, symlinks resolved. */
++    readonly workspace: string;
++    readonly variables: readonly ForeignWorkspaceVariable[];
++}
++export declare function foreignWorkspaceEnvironment(cwd: string, env: NodeJS.ProcessEnv): ForeignWorkspaceEnvironment | null;
+diff --git a/dist/src/utils/workspace-root.js b/dist/src/utils/workspace-root.js
+index 74f0682..8987475 100644
+--- a/dist/src/utils/workspace-root.js
++++ b/dist/src/utils/workspace-root.js
+@@ -3,7 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.workspaceRoot = void 0;
+ exports.setWorkspaceRoot = setWorkspaceRoot;
+ exports.workspaceRootInner = workspaceRootInner;
++exports.workspaceRootFromMarkers = workspaceRootFromMarkers;
++exports.foreignWorkspaceEnvironment = foreignWorkspaceEnvironment;
+ const tslib_1 = require("tslib");
++const fs_1 = require("fs");
+ const path = tslib_1.__importStar(require("path"));
+ const fileutils_1 = require("./fileutils");
+ /**
+@@ -17,6 +20,15 @@ function setWorkspaceRoot(root) {
+ function workspaceRootInner(dir, candidateRoot) {
+     if (process.env.NX_WORKSPACE_ROOT_PATH)
+         return process.env.NX_WORKSPACE_ROOT_PATH;
++    return workspaceRootFromMarkers(dir, candidateRoot);
++}
++/**
++ * The workspace `dir` is in, by the files on disk alone: the nearest directory
++ * at or above `dir` holding `nx.json`, `nx` or `nx.bat`, else the topmost one
++ * holding `node_modules/nx`, else `candidateRoot`. `workspaceRootInner` without
++ * the `NX_WORKSPACE_ROOT_PATH` override.
++ */
++function workspaceRootFromMarkers(dir, candidateRoot) {
+     if (path.dirname(dir) === dir)
+         return candidateRoot;
+     const matches = [
+@@ -32,9 +44,97 @@ function workspaceRootInner(dir, candidateRoot) {
+         // thus located in //packages/my-lib/node_modules/nx/package.json
+     }
+     else if ((0, fileutils_1.fileExists)(path.join(dir, 'node_modules', 'nx', 'package.json'))) {
+-        return workspaceRootInner(path.dirname(dir), dir);
++        return workspaceRootFromMarkers(path.dirname(dir), dir);
+     }
+     else {
+-        return workspaceRootInner(path.dirname(dir), candidateRoot);
++        return workspaceRootFromMarkers(path.dirname(dir), candidateRoot);
++    }
++}
++/**
++ * The variables that relocate one workspace's daemon socket, daemon record,
++ * task database and cache, each with the directory Nx resolves a relative
++ * value against.
++ */
++const WORKSPACE_STATE_ENV = [
++    ['NX_WORKSPACE_DATA_DIRECTORY', 'root'],
++    ['NX_PROJECT_GRAPH_CACHE_DIRECTORY', 'root'],
++    ['NX_CACHE_DIRECTORY', 'root'],
++    ['NX_SOCKET_DIR', 'cwd'],
++    ['NX_DAEMON_SOCKET_DIR', 'cwd'],
++];
++/**
++ * The variables of `env` that name a workspace other than the one `cwd` is in,
++ * or null when there are none.
++ *
++ * A shell keeps the environment of the workspace it was set up for when it
++ * moves into another checkout. Nx takes `NX_WORKSPACE_ROOT_PATH` verbatim as
++ * its root, and the state variables as the locations of its daemon socket,
++ * daemon record, task database and cache, so an `nx` run there acts on the
++ * first workspace: `nx daemon --stop` stops that workspace's daemon, and
++ * `nx reset` deletes that workspace's cache.
++ *
++ * Which workspace a variable names:
++ * - `cwd`'s workspace is found by the markers alone (`workspaceRootFromMarkers`).
++ *   A `cwd` inside no workspace has nothing to contradict, so nothing is
++ *   reported.
++ * - `NX_WORKSPACE_ROOT_PATH` names the directory it holds.
++ * - A data, cache or socket directory belongs to the workspace whose root
++ *   contains it, found by the same marker walk from the directory.
++ * - A directory outside every workspace, such as a socket directory under
++ *   /tmp, cannot be attributed by its path and is not reported. Nothing on disk
++ *   says which workspace owns it short of asking the daemon behind it, and
++ *   that daemon is what must not be reached.
++ * Paths are compared after resolving symlinks, so an alias of `cwd`'s own
++ * workspace is that workspace.
++ */
++function foreignWorkspaceEnvironment(cwd, env) {
++    const found = workspaceRootFromMarkers(cwd, null);
++    if (found === null)
++        return null;
++    const workspace = realLocation(found);
++    const variables = [];
++    const rootPath = env.NX_WORKSPACE_ROOT_PATH;
++    if (rootPath) {
++        const named = realLocation(path.resolve(cwd, rootPath));
++        if (named !== workspace) {
++            variables.push({ name: 'NX_WORKSPACE_ROOT_PATH', value: rootPath, workspace: named });
++        }
++    }
++    const nxRoot = rootPath ? path.resolve(cwd, rootPath) : found;
++    for (const [name, base] of WORKSPACE_STATE_ENV) {
++        const value = env[name];
++        if (!value)
++            continue;
++        const location = realLocation(path.resolve(base === 'root' ? nxRoot : cwd, value));
++        const owner = workspaceRootFromMarkers(location, null);
++        if (owner === null)
++            continue;
++        const ownerWorkspace = realLocation(owner);
++        if (ownerWorkspace !== workspace) {
++            variables.push({ name, value, workspace: ownerWorkspace });
++        }
++    }
++    return variables.length === 0 ? null : { workspace, variables };
++}
++/**
++ * `location` with every symlink resolved. A directory Nx has not created yet
++ * resolves through its nearest existing ancestor: what it will be created
++ * under is what decides where it lies.
++ */
++function realLocation(location) {
++    const missing = [];
++    let existing = location;
++    for (;;) {
++        try {
++            return path.join(fs_1.realpathSync.native(existing), ...missing);
++        }
++        catch {
++            // Unresolvable (missing, or unreadable): resolve its parent instead.
++            const parent = path.dirname(existing);
++            if (parent === existing)
++                return location;
++            missing.unshift(path.basename(existing));
++            existing = parent;
++        }
+     }
+ }

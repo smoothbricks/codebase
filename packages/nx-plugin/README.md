@@ -667,6 +667,21 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   stopped one, so the patch prints success only when every task was reported. Otherwise the summary says the run did not
   complete and names the unreported tasks: under "Tasks not run" after a failure, as before, and under "Tasks the run
   ended without finishing" when none failed. Nx `master` prints the same summary. Not yet proposed upstream.
+- **Nx refuses an environment set up for another workspace.** A shell that moves into another checkout keeps the
+  `NX_WORKSPACE_ROOT_PATH`, `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` and `NX_SOCKET_DIR` of the workspace it
+  was set up for, and Nx takes `NX_WORKSPACE_ROOT_PATH` verbatim as its root: `nx daemon --stop` run in the second
+  checkout stopped the first one's daemon and deleted its socket directory. The `nx` CLI now finds the current
+  directory's workspace by its `nx.json`, `nx` or `nx.bat` alone, ignoring the override, and refuses any command, before
+  it reaches a daemon, socket or file, when one of those variables, `NX_DAEMON_SOCKET_DIR` or
+  `NX_PROJECT_GRAPH_CACHE_DIRECTORY` names another workspace. The error names each such variable with its value and both
+  workspaces, and says to run under the current workspace's own environment (`direnv exec <workspace> nx ...`).
+  `NX_WORKSPACE_ROOT_PATH` names the directory it holds; a data, cache or socket directory belongs to the workspace
+  whose root contains it; paths are compared with symlinks resolved. A current directory inside no workspace is not
+  refused. A directory outside every workspace, such as a socket directory under `/tmp`, is left unchecked: only the
+  daemon behind it could say whose it is, and reaching that daemon is what the check prevents. The daemon, plugin
+  workers and tasks do not start through the CLI and are not checked; an `nx` a task runs from a project directory
+  resolves to the task's own workspace and passes. A cache or data directory that several checkouts share on purpose has
+  to lie outside every workspace, or it is refused. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -675,11 +690,11 @@ replace the registry dependency with a local link or hide a failure by resetting
 
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
-cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim
-and incomplete-run summary regressions pass; preserve any repair not yet released. The restore-time regression fails
-without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime), so run it on
-macOS before dropping the hunk. When every hunk is upstream, drop the override, the patch, `tooling/patched-nx.ts` and
-the workflow together.
+cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim,
+incomplete-run summary and foreign-environment regressions pass; preserve any repair not yet released. The restore-time
+regression fails without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime),
+so run it on macOS before dropping the hunk. When every hunk is upstream, drop the override, the patch,
+`tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator
 

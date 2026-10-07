@@ -108,16 +108,16 @@ async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
  * Stop the Nx daemon a fixture's own `nx` runs started, through Nx's supported
  * `nx daemon --stop`, and wait until it and every process it ran have exited.
  * The daemon is told the same root and data directory that started it
- * (`fixtureNxEnv`), so it can only be this fixture's: no other workspace's
- * daemon is reached, and nothing is reset.
+ * (`fixtureNxEnv`, or the `env` a test started it under), so it can only be
+ * this fixture's: no other workspace's daemon is reached, and nothing is reset.
  */
-export function stopFixtureNxDaemon(workspace: string): Promise<void> {
+export function stopFixtureNxDaemon(workspace: string, env = fixtureNxEnv(workspace)): Promise<void> {
   return stopNxDaemon(workspace, async () => {
     let stdout = '';
     let stderr = '';
     const child = spawn('bun', [join(repositoryRoot, 'node_modules/.bin/nx'), 'daemon', '--stop'], {
       cwd: workspace,
-      env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' },
+      env: { ...env, NX_DAEMON: 'true' },
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });

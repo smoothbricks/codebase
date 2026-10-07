@@ -56,6 +56,10 @@ const NOT_YET_UPSTREAM = [
     'start at most one daemon per workspace, and never close a socket another daemon bound (`startServer`)',
   ],
   [
+    'foreign environment',
+    'refuse any command whose `NX_*` root, data, cache or socket directory names another workspace than the cwd\u2019s',
+  ],
+  [
     'run summary',
     'report success only when every task ended, and name the tasks a run that threw never finished (`endCommand`)',
   ],
