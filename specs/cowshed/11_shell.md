@@ -8,10 +8,10 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
 > journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
 > termination. Core job resource samples and terminal persistence are implemented; periodic progress subscriptions are
-> not yet complete. Controller and N-API operation bindings derive from one API declaration. Group-owned TCP-listener
-> queries and attachment stdin EOF remain unbuilt; Rust attachment writes exist. The process-group ownership ledger
-> identifies groups for sampling and termination. Complete fork/exec tree observation, per-process usage and blocker
-> samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
+> not yet complete. Controller and N-API operation bindings derive from one API declaration, group-owned TCP-listener
+> queries among them. Attachment stdin EOF remains unbuilt; Rust attachment writes exist. The process-group ownership
+> ledger identifies groups for sampling and termination. Complete fork/exec tree observation, per-process usage and
+> blocker samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
 > Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead measurement and
 > unattributed-usage reconciliation are unbuilt too.
 
