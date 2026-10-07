@@ -7097,11 +7097,7 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn land_moves_only_the_branch_main_has_checked_out() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-land-target-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).expect("create fixture repository");
+        let root = crate::temp_root::TempRoot::new("cowshed-land-target");
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -7145,16 +7141,11 @@ mod rebase_recovery_tests {
             error.fence_source(),
             Some(&FenceRefusal::TargetNotCheckedOut { checked_out: None })
         );
-        std::fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     #[tokio::test]
     async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-rebase-recovery-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).expect("create fixture repository");
+        let root = crate::temp_root::TempRoot::new("cowshed-rebase-recovery");
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -7204,16 +7195,11 @@ mod rebase_recovery_tests {
         run_git_rebase_atomically(&root, source_head.as_str(), &source_head)
             .await
             .expect("a following cowshed rebase can start");
-        std::fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     #[tokio::test]
     async fn a_dirty_tree_refuses_even_under_autostash_instead_of_succeeding_over_conflicts() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-rebase-autostash-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).expect("create fixture repository");
+        let root = crate::temp_root::TempRoot::new("cowshed-rebase-autostash");
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -7254,23 +7240,19 @@ mod rebase_recovery_tests {
         );
         assert_eq!(git_oid(&root).await.expect("unmoved head"), source_head);
         assert!(git(&root, &["stash", "list"]).stdout.is_empty());
-        std::fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     /// A lane: main, a lane base cloned from it on `cowshed/<lane>`, and unit clones of the lane
     /// base on `cowshed/<unit>`, each its own repository exactly as cowshed's clones are.
     struct Lane {
-        base: PathBuf,
+        base: crate::temp_root::TempRoot,
         main: PathBuf,
         lane: PathBuf,
     }
 
     impl Lane {
         fn new(label: &str) -> Self {
-            let base = std::env::temp_dir().join(format!(
-                "cowshed-lane-{label}-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
+            let base = crate::temp_root::TempRoot::new(&format!("cowshed-lane-{label}"));
             let main = base.join("main");
             std::fs::create_dir_all(&main).expect("create main");
             run_git(&main, &["init", "--initial-branch=main"]);
@@ -7305,12 +7287,6 @@ mod rebase_recovery_tests {
 
         fn name(name: &str) -> WorkspaceName {
             WorkspaceName::new(name).expect("workspace name")
-        }
-    }
-
-    impl Drop for Lane {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
@@ -13427,17 +13403,8 @@ mod grant_unit_tests {
     };
     use std::os::unix::fs::PermissionsExt;
 
-    fn unique_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "cowshed-grant-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::canonicalize(&path).unwrap()
+    fn unique_root(name: &str) -> crate::temp_root::TempRoot {
+        crate::temp_root::TempRoot::new(&format!("cowshed-grant-{name}"))
     }
 
     fn canonical_dir(path: &Path) -> PathBuf {
@@ -13501,7 +13468,6 @@ mod grant_unit_tests {
 
         assert_eq!(grants.read, [a, z]);
         assert_eq!(grants.write, [output.clone(), output.join("reports")]);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -13688,7 +13654,6 @@ mod grant_unit_tests {
         };
         let error = normalize_grant_delta(&mut delta);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
         let error = error.expect_err("permission denied is not a lexical fallback");
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(
@@ -13730,7 +13695,6 @@ mod grant_unit_tests {
                 "expected intersection deny"
             );
         }
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

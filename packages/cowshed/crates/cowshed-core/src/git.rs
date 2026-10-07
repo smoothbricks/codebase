@@ -2890,8 +2890,6 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Output};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
@@ -2899,7 +2897,6 @@ mod tests {
         git_message, held_by_repository_blocking, ignored_by, ignored_by_blocking,
         is_git_repository, parse_lines, workspace_remote_name,
     };
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -2976,11 +2973,11 @@ mod tests {
 
     /// A committed Git repository inside a private scratch directory. Every tree a test derives
     /// beside it (`with_extension`) lands inside that scratch too, and dropping the fixture
-    /// removes the scratch on every exit path: a failed assertion unwinds through this `Drop`
-    /// exactly as a passing test does.
+    /// removes the scratch on every exit path: a failed assertion unwinds through `TempRoot`'s
+    /// `Drop` exactly as a passing test does.
     struct Repository {
-        scratch: PathBuf,
         root: PathBuf,
+        _scratch: crate::temp_root::TempRoot,
     }
 
     impl std::ops::Deref for Repository {
@@ -3003,30 +3000,11 @@ mod tests {
         }
     }
 
-    impl Drop for Repository {
-        fn drop(&mut self) {
-            if let Err(error) = fs::remove_dir_all(&self.scratch) {
-                eprintln!(
-                    "git test fixture {} was not removed: {error}",
-                    self.scratch.display()
-                );
-            }
-        }
-    }
-
     fn repository() -> Repository {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let scratch = std::env::temp_dir().join(format!(
-            "cowshed-git-test-{}-{suffix}-{id}",
-            std::process::id()
-        ));
+        let scratch = crate::temp_root::TempRoot::new("cowshed-git-test");
         let fixture = Repository {
             root: scratch.join("repository"),
-            scratch,
+            _scratch: scratch,
         };
         fs::create_dir_all(&fixture.root).expect("create test repository");
         let root = &fixture.root;
