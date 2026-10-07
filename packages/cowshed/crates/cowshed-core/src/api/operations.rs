@@ -680,6 +680,8 @@ pub struct TailRequest {
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
+    /// Absent for the latest tail; omitted from the wire, never `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<JobJournalCursor>,
     pub limits: JobTailLimits,
 }
@@ -732,6 +734,21 @@ mod tests {
             "corpus requests that do not encode back to themselves, as encoded:\n{}",
             serde_json::to_string_pretty(&drifted).expect("JSON")
         );
+    }
+
+    /// The latest tail names no cursor: the field is omitted, never `null`, both ways.
+    #[test]
+    fn a_latest_tail_omits_its_cursor() {
+        let mut params = corpus()
+            .remove("job.tail")
+            .expect("job.tail corpus request");
+        params.as_object_mut().expect("an object").remove("cursor");
+        let request = OperationRequest::decode("job.tail", &params).expect("decode");
+        let OperationRequest::JobTailRead(tail) = &request else {
+            panic!("decoded {request:?}");
+        };
+        assert_eq!(tail.cursor, None);
+        assert_eq!(request.params().expect("encode"), params);
     }
 
     #[test]

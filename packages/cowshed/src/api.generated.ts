@@ -1639,7 +1639,10 @@ export type TailRequest = {
   readonly workspace: WorkspaceName;
   readonly workspaceIncarnation: WorkspaceIncarnation;
   readonly jobId: JobId;
-  readonly cursor: JobJournalCursor | null;
+  /**
+   * Absent for the latest tail; omitted from the wire, never `null`.
+   */
+  readonly cursor?: JobJournalCursor;
   readonly limits: JobTailLimits;
 };
 

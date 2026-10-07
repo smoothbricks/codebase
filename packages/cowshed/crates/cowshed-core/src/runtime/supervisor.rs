@@ -4430,7 +4430,9 @@ fn make_log_chunk(
     }))
 }
 
-/// The admitted bytes `range` names of a live stream, out of the chunks the actor retains.
+/// The admitted bytes `range` names of a live stream, out of the chunks the actor retains. The
+/// chunks hold every admitted byte, so a range they fall short of is an internal fault, never a
+/// shorter answer a caller would take for the whole range.
 fn read_live_range(chunks: &VecDeque<Bytes>, range: Range<u64>) -> Result<Vec<u8>> {
     let want = usize::try_from(range.end - range.start)
         .map_err(|_| CowshedError::internal("log range exceeds platform range"))?;
@@ -4451,6 +4453,13 @@ fn read_live_range(chunks: &VecDeque<Bytes>, range: Range<u64>) -> Result<Vec<u8
         let take = (want - output.len()).min(chunk.len() - start);
         output.extend_from_slice(&chunk[start..start + take]);
     }
+    if output.len() != want {
+        return Err(CowshedError::internal(format!(
+            "retained output holds {} of the {want} admitted bytes from offset {}",
+            output.len(),
+            range.start
+        )));
+    }
     Ok(output)
 }
 
@@ -4463,6 +4472,61 @@ enum TailAnchor {
     End,
 }
 
+/// One stream's tail before it is read: the admitted window to read, and where it sits.
+struct TailWindow {
+    anchor: TailAnchor,
+    len: u64,
+    range: Range<u64>,
+}
+
+impl TailWindow {
+    /// The window of at most `max` admitted bytes a tail of `stream` reads: after the anchor's
+    /// cursor, or ending at the stream's `len` admitted bytes. A cursor past them is a usage
+    /// error.
+    fn new(stream: StreamKind, len: u64, anchor: TailAnchor, max: u64) -> Result<Self> {
+        let range = match anchor {
+            TailAnchor::After(cursor) if cursor > len => {
+                let name = match stream {
+                    StreamKind::Stdout => "stdout",
+                    StreamKind::Stderr => "stderr",
+                };
+                return Err(CowshedError::usage(
+                    format!("tail cursor {cursor} is past the {len} admitted {name} bytes"),
+                    "resume from a cursor a tail of this job returned",
+                ));
+            }
+            TailAnchor::After(cursor) => cursor..len.min(cursor.saturating_add(max)),
+            TailAnchor::End => len.saturating_sub(max)..len,
+        };
+        Ok(Self { anchor, len, range })
+    }
+
+    /// The window's `bytes` cut to `lines` lines: the first ones after a cursor, the last ones
+    /// at the end. Lines cut the byte window, so the slice never exceeds the byte limit.
+    fn cut(self, mut bytes: Vec<u8>, lines: u32) -> StreamTail {
+        match self.anchor {
+            TailAnchor::After(cursor) => {
+                bytes.truncate(first_lines_len(&bytes, lines));
+                let next = cursor + byte_count(bytes.len());
+                StreamTail {
+                    bytes,
+                    next,
+                    truncated: next < self.len,
+                }
+            }
+            TailAnchor::End => {
+                let skip = last_lines_start(&bytes, lines);
+                bytes.drain(..skip);
+                StreamTail {
+                    bytes,
+                    next: self.len,
+                    truncated: self.range.start + byte_count(skip) > 0,
+                }
+            }
+        }
+    }
+}
+
 /// One stream's slice of a tail.
 struct StreamTail {
     bytes: Vec<u8>,
@@ -4471,28 +4535,33 @@ struct StreamTail {
 }
 
 /// A tail of both streams, whose admitted lengths are `lengths` and whose admitted bytes `read`
-/// returns by range. The two streams are cut independently, each under the same limits.
+/// returns exactly, by range. Both cursors are checked before either stream is read, so a
+/// refused tail reads nothing; the two streams are then cut independently under the same limits.
 fn job_tail(
     cursor: Option<JobJournalCursor>,
     limits: JobTailLimits,
     lengths: (u64, u64),
     mut read: impl FnMut(StreamKind, Range<u64>) -> Result<Vec<u8>>,
 ) -> Result<JobTail> {
+    let max = u64::from(limits.bytes_per_stream.get());
+    let lines = limits.lines_per_stream.get();
     let anchor = |position: Option<u64>| position.map_or(TailAnchor::End, TailAnchor::After);
-    let stdout = stream_tail(
+    let stdout = TailWindow::new(
         StreamKind::Stdout,
         lengths.0,
         anchor(cursor.map(|cursor| cursor.stdout)),
-        limits,
-        |range| read(StreamKind::Stdout, range),
+        max,
     )?;
-    let stderr = stream_tail(
+    let stderr = TailWindow::new(
         StreamKind::Stderr,
         lengths.1,
         anchor(cursor.map(|cursor| cursor.stderr)),
-        limits,
-        |range| read(StreamKind::Stderr, range),
+        max,
     )?;
+    let stdout_bytes = read(StreamKind::Stdout, stdout.range.clone())?;
+    let stderr_bytes = read(StreamKind::Stderr, stderr.range.clone())?;
+    let stdout = stdout.cut(stdout_bytes, lines);
+    let stderr = stderr.cut(stderr_bytes, lines);
     let data = |bytes: Vec<u8>| {
         BinaryData::new(bytes)
             .map_err(|error| CowshedError::internal(format!("tail slice is unbounded: {error}")))
@@ -4507,53 +4576,6 @@ fn job_tail(
         stdout: data(stdout.bytes)?,
         stderr: data(stderr.bytes)?,
     })
-}
-
-/// One stream's slice: at most `limits` bytes and lines, after the anchor's cursor or ending
-/// at the stream's admitted end. The byte window is read first and the line limit cuts it, so a
-/// tail never reads more than its byte limit.
-fn stream_tail(
-    stream: StreamKind,
-    len: u64,
-    anchor: TailAnchor,
-    limits: JobTailLimits,
-    read: impl FnOnce(Range<u64>) -> Result<Vec<u8>>,
-) -> Result<StreamTail> {
-    let max = u64::from(limits.bytes_per_stream.get());
-    let lines = limits.lines_per_stream.get();
-    match anchor {
-        TailAnchor::After(cursor) => {
-            if cursor > len {
-                let name = match stream {
-                    StreamKind::Stdout => "stdout",
-                    StreamKind::Stderr => "stderr",
-                };
-                return Err(CowshedError::usage(
-                    format!("tail cursor {cursor} is past the {len} admitted {name} bytes"),
-                    "resume from a cursor a tail of this job returned",
-                ));
-            }
-            let mut bytes = read(cursor..len.min(cursor.saturating_add(max)))?;
-            bytes.truncate(first_lines_len(&bytes, lines));
-            let next = cursor + byte_count(bytes.len());
-            Ok(StreamTail {
-                bytes,
-                next,
-                truncated: next < len,
-            })
-        }
-        TailAnchor::End => {
-            let start = len.saturating_sub(max);
-            let mut bytes = read(start..len)?;
-            let skip = last_lines_start(&bytes, lines);
-            bytes.drain(..skip);
-            Ok(StreamTail {
-                bytes,
-                next: len,
-                truncated: start + byte_count(skip) > 0,
-            })
-        }
-    }
 }
 
 /// The length of the first `lines` lines of `bytes`; all of it when it holds no more.
@@ -4681,22 +4703,25 @@ fn read_sealed_range(
     }
     let mut reader = crate::storage::job_artifact::open_stream_reader(workspace_root, stream)
         .map_err(map_artifact_error)?;
-    let mut discard = vec![0_u8; PROCESS_IO_CHUNK];
-    let mut skipped = 0_u64;
-    while skipped < range.start {
-        let want = usize::try_from(range.start - skipped)
-            .unwrap_or(PROCESS_IO_CHUNK)
-            .min(PROCESS_IO_CHUNK);
-        let read = reader
-            .read_chunk(&mut discard[..want])
-            .map_err(map_artifact_error)?;
-        if read == 0 {
-            return Err(CowshedError::integrity(
-                "sealed stream ended before the requested log offset",
-                "cowshed doctor --json",
-            ));
+    if range.start > 0 {
+        // The skipped prefix is verified and dropped through a fixed scratch on the stack.
+        let mut discard = [0_u8; 16 * 1024];
+        let mut skipped = 0_u64;
+        while skipped < range.start {
+            let want = usize::try_from(range.start - skipped)
+                .unwrap_or(discard.len())
+                .min(discard.len());
+            let read = reader
+                .read_chunk(&mut discard[..want])
+                .map_err(map_artifact_error)?;
+            if read == 0 {
+                return Err(CowshedError::integrity(
+                    "sealed stream ended before the requested log offset",
+                    "cowshed doctor --json",
+                ));
+            }
+            skipped += byte_count(read);
         }
-        skipped += byte_count(read);
     }
     let want = usize::try_from(range.end - range.start)
         .map_err(|_| CowshedError::internal("log range exceeds platform range"))?;
@@ -6458,18 +6483,16 @@ mod tail_tests {
 
     /// `journal`'s slice under `anchor` and `limits`, as `(bytes, next, truncated)`.
     fn slice(journal: &[u8], anchor: TailAnchor, limits: JobTailLimits) -> (Vec<u8>, u64, bool) {
-        let tail = stream_tail(
+        let window = TailWindow::new(
             StreamKind::Stdout,
             byte_count(journal.len()),
             anchor,
-            limits,
-            |range| {
-                let start = usize::try_from(range.start).unwrap();
-                let end = usize::try_from(range.end).unwrap();
-                Ok(journal[start..end].to_vec())
-            },
+            u64::from(limits.bytes_per_stream.get()),
         )
         .unwrap();
+        let start = usize::try_from(window.range.start).unwrap();
+        let end = usize::try_from(window.range.end).unwrap();
+        let tail = window.cut(journal[start..end].to_vec(), limits.lines_per_stream.get());
         (tail.bytes, tail.next, tail.truncated)
     }
 
@@ -6517,16 +6540,33 @@ mod tail_tests {
     }
 
     #[test]
-    fn a_cursor_past_the_admitted_bytes_is_a_usage_error() {
-        let error = stream_tail(
-            StreamKind::Stderr,
-            5,
-            TailAnchor::After(6),
-            limits(64, 1),
-            |_| unreachable!("a refused cursor reads nothing"),
-        )
+    fn a_bad_second_cursor_is_refused_before_either_stream_is_read() {
+        let cursor = JobJournalCursor {
+            stdout: 0,
+            stderr: 6,
+        };
+        let error = job_tail(Some(cursor), limits(64, 1), (5, 5), |_, _| {
+            unreachable!("a refused tail reads no stream")
+        })
         .err()
         .unwrap();
+        assert_eq!(error.code, crate::error::ErrorCode::Usage);
+        assert!(error.message.contains("stderr"), "{}", error.message);
+    }
+
+    #[test]
+    fn retained_chunks_short_of_the_admitted_range_are_an_error_not_a_short_slice() {
+        let chunks = VecDeque::from([Bytes::from_static(b"abc"), Bytes::from_static(b"de")]);
+        assert_eq!(read_live_range(&chunks, 1..4).unwrap(), b"bcd");
+        let error = read_live_range(&chunks, 3..8).err().unwrap();
+        assert_eq!(error.code, crate::error::ErrorCode::Internal);
+    }
+
+    #[test]
+    fn a_cursor_past_the_admitted_bytes_is_a_usage_error() {
+        let error = TailWindow::new(StreamKind::Stderr, 5, TailAnchor::After(6), 64)
+            .err()
+            .unwrap();
         assert_eq!(error.code, crate::error::ErrorCode::Usage);
         assert!(error.message.contains("stderr"), "{}", error.message);
     }
