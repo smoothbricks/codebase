@@ -513,18 +513,27 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
         )
     };
     // The command name is parenthesized and may hold anything; field 3 follows the last ')'.
-    let fields: Vec<&str> = stat
+    // Walk only the required fields, once, without allocating a vector of every field.
+    let mut fields = stat
         .rfind(')')
-        .map(|closing| stat[closing + 1..].split_whitespace().collect())
+        .map(|closing| stat[closing + 1..].split_whitespace())
         .ok_or_else(|| invalid("has no command delimiter"))?;
-    let field = |number: usize| -> io::Result<u64> {
-        fields
-            .get(number - 3)
+    let field = |value: Option<&str>| -> io::Result<u64> {
+        value
             .ok_or_else(|| invalid("is too short"))?
             .parse()
             .map_err(|_| invalid("holds a field that is no count"))
     };
-    let state = *fields.first().ok_or_else(|| invalid("has no state"))?;
+    let state = fields.next().ok_or_else(|| invalid("has no state"))?;
+    let user_ticks = field(fields.nth(10))?; // Field 14, after the consumed state (field 3).
+    let sys_ticks = field(fields.next())?; // Field 15.
+    let started = field(fields.nth(6))?; // Field 22, after field 15.
+    let exited = matches!(state, "Z" | "X");
+    let resident_pages = if exited {
+        0
+    } else {
+        field(fields.nth(1))? // Field 24, after field 22.
+    };
     // SAFETY: sysconf takes a plain integer and touches no memory of ours.
     let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let hertz = u32::try_from(hertz)
@@ -536,11 +545,10 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let page = u64::try_from(page)
         .map_err(|_| io::Error::other(format!("the page size {page} is no size")))?;
     let cpu = |ticks| CpuMicros::of_ticks(ticks, 1_000_000_000, hertz).map_err(unit);
-    let exited = matches!(state, "Z" | "X");
     let resident = if exited {
         ResidentBytes::ZERO
     } else {
-        let bytes = field(24)?
+        let bytes = resident_pages
             .checked_mul(page)
             .ok_or_else(|| invalid("holds more resident bytes than a u64 counts"))?;
         ResidentBytes::new(bytes).map_err(unit)?
@@ -549,9 +557,9 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
         return Ok(None);
     };
     Ok(Some(OwnCounters {
-        started: StartStamp(field(22)?),
-        cpu_user: cpu(field(14)?)?,
-        cpu_sys: cpu(field(15)?)?,
+        started: StartStamp(started),
+        cpu_user: cpu(user_ticks)?,
+        cpu_sys: cpu(sys_ticks)?,
         resident,
         io,
         exited,
