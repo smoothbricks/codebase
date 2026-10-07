@@ -389,7 +389,7 @@ impl RealFixture {
 fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
     SystemKernelMountSource
         .mounts()
-        .expect("getmntinfo")
+        .expect("getfsstat")
         .into_iter()
         .find(|mount| mount.mount_point == mount_point)
 }
@@ -4491,7 +4491,7 @@ fn restore_recovery_rejects_fact_without_canonical_image() {
 
 #[test]
 fn system_mount_source_observes_the_live_root_mount() {
-    let mounts = SystemKernelMountSource.mounts().expect("getmntinfo");
+    let mounts = SystemKernelMountSource.mounts().expect("getfsstat");
     assert!(!mounts.is_empty());
     let root = mounts
         .iter()

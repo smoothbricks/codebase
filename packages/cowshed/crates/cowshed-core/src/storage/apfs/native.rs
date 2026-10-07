@@ -83,15 +83,15 @@ fn fd_failed(fd: libc::c_int) -> bool {
     fd == -1
 }
 
-/// Darwin `getmntinfo` returns the mount count, or `-1` on error with `errno` set.
+/// The mount count Darwin `getfsstat` answered, which is `-1` on error with `errno` set.
 /// Treating a negative count as a slice length would be memory-unsafe; `0` is
 /// not a legitimate Darwin mount table either (at least `/` is mounted).
 ///
 /// Only `system_kernel_mounts`' Darwin arm calls this, so the non-macOS lib must
 /// not compile it; `test` keeps the predicate's own unit test on every platform.
 #[cfg(any(target_os = "macos", test))]
-fn getmntinfo_failed(count: libc::c_int) -> bool {
-    count <= 0
+fn mount_count(count: libc::c_int) -> Option<usize> {
+    usize::try_from(count).ok().filter(|&count| count > 0)
 }
 
 fn flock_succeeded(result: libc::c_int) -> bool {
@@ -834,29 +834,47 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
     {
         use std::hash::{Hash, Hasher};
 
-        let mut mounts = std::ptr::null_mut();
-        // SAFETY: `getmntinfo(MNT_NOWAIT)` writes a process-static `statfs` array
-        // and returns the count, or `-1` on error. The buffer is valid until the
-        // next `getmntinfo`/`getfsstat` in this process; we copy mount-point and
-        // device strings out before returning so we never retain it.
-        let count = unsafe { libc::getmntinfo(&mut mounts, libc::MNT_NOWAIT) };
-        if getmntinfo_failed(count) {
-            return Err(ApfsStorageError::Host(format!(
-                "getmntinfo failed: {}",
-                io::Error::last_os_error()
-            )));
+        let failed =
+            || ApfsStorageError::Host(format!("getfsstat failed: {}", io::Error::last_os_error()));
+        // Into a buffer this call owns. `getmntinfo` answers a process-static array that the
+        // next `getmntinfo` on any thread overwrites, and mount reads run on several threads at
+        // once: a `new` mounts its checkout and its build volume together, and a scratch root
+        // releases its images together.
+        // SAFETY: a null buffer asks `getfsstat` only for the number of mounts.
+        let listed = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        // Room for mounts that appear between the two calls.
+        let mut room = mount_count(listed).ok_or_else(failed)? + 8;
+        let mut entries: Vec<libc::statfs> = Vec::new();
+        loop {
+            let bytes = room
+                .checked_mul(std::mem::size_of::<libc::statfs>())
+                .and_then(|bytes| libc::c_int::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    ApfsStorageError::Host(format!("room for {room} mounts overflows getfsstat"))
+                })?;
+            // `entries` is empty, so this leaves room for `room` records.
+            entries.reserve_exact(room);
+            // SAFETY: `entries` has room for `room` records, `bytes` long, of which `getfsstat`
+            // writes at most `bytes`, and it answers how many records it wrote, or `-1`.
+            let count = unsafe { libc::getfsstat(entries.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+            let count = mount_count(count).ok_or_else(failed)?;
+            if count < room {
+                // SAFETY: `getfsstat` initialized the first `count` records.
+                unsafe { entries.set_len(count) };
+                break;
+            }
+            // A full buffer may have cut mounts off: read the table again into twice the room.
+            room = room.checked_mul(2).ok_or_else(|| {
+                ApfsStorageError::Host(format!("room for {room} mounts overflows getfsstat"))
+            })?;
         }
-        // SAFETY: `getmntinfo_failed` rejected a non-positive count, so `mounts`
-        // points at `count` initialized `statfs` records in the process-static buffer.
-        let entries = unsafe { std::slice::from_raw_parts(mounts, count as usize) };
         entries
             .iter()
             .map(|entry| {
                 // SAFETY: Darwin NUL-terminates `f_mntonname`/`f_mntfromname`
-                // (`char[MAXPATHLEN]`). The pointers are into the `statfs` we
-                // borrowed for this iteration; we copy the bytes out immediately.
+                // (`char[MAXPATHLEN]`), in a record `entries` owns.
                 let bytes = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes();
-                // SAFETY: same NUL-termination and buffer-lifetime invariant as `f_mntonname`.
+                // SAFETY: same NUL-termination and ownership as `f_mntonname`.
                 let source_device = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) }
                     .to_string_lossy()
                     .into_owned();
@@ -6386,8 +6404,8 @@ mod tests {
             assert_eq!(fd_failed(fd), failed, "fd={fd}");
             assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
         }
-        for (count, failed) in [(-1, true), (0, true), (1, false)] {
-            assert_eq!(getmntinfo_failed(count), failed, "getmntinfo count={count}");
+        for (count, mounts) in [(-1, None), (0, None), (1, Some(1))] {
+            assert_eq!(mount_count(count), mounts, "getfsstat count={count}");
         }
         for (mode, kind, busy) in [
             (LockMode::Try, io::ErrorKind::WouldBlock, true),
