@@ -55,7 +55,7 @@
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "cargoToolchain",
           {
-            "runtime": "rustc -vV"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
           }
         ],
         "outputs": [
@@ -83,7 +83,7 @@
           "{workspaceRoot}/biome.json",
           "cargoToolchain",
           {
-            "runtime": "rustc -vV"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
           }
         ],
         "outputs": [
@@ -114,7 +114,7 @@
           "{projectRoot}/src/validators.generated.ts",
           "cargoToolchain",
           {
-            "runtime": "rustc -vV"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
           }
         ],
         "options": {
