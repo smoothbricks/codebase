@@ -7,16 +7,16 @@ with identical semantics and error taxonomy.
 > **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
 > duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
 > and complete-group termination. Core job resource samples and terminal persistence are implemented, and `progress`
-> streams them over the controller; the N-API projection of stream-lane calls and keyed admission/lookup are not yet
-> complete. Controller request/result codecs, TypeScript types and validators, and N-API operation bindings derive from
-> one Rust API declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
-> `job.listeningPorts`; async stream backpressure, attachment stdin EOF, and abort plumbing remain separate
-> implementation work. Core attachment stdin writes exist, but `JobStdin` has no close operation on main yet. Complete
-> fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work
-> identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies groups
-> for safe termination; it does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux
-> fork/exec event-source selection, macOS exit observation and rusage reconciliation, charged-memory counters, and
-> explicit unattributed-usage rows are also unbuilt.
+> streams them over the controller and through N-API as an `AsyncIterable`; keyed admission/lookup is not yet complete.
+> Controller request/result codecs, TypeScript types and validators, and N-API operation bindings derive from one Rust
+> API declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
+> `job.listeningPorts`; backpressured byte-stream iterables for logs and attachments, attachment stdin EOF, and abort
+> plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no close
+> operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process
+> event streams, leaf-work identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The
+> ownership ledger identifies groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2
+> accounting, measured Linux fork/exec event-source selection, macOS exit observation and rusage reconciliation,
+> charged-memory counters, and explicit unattributed-usage rows are also unbuilt.
 
 ## Authority model (frozen)
 
@@ -1461,7 +1461,9 @@ One boundary answer, no ambiguity:
   crosses the call's end is no error; a second demand while one is unanswered, or a demand naming no open stream, ends
   the connection. Stream-lane calls do not count against the 64 open calls: a connection holds at most 64 open streams
   and refuses one past that, and always reads demands. The Rust client exposes a call as `EventStream<O>`; dropping it
-  before its end sends the close.
+  before its end sends the close. N-API projects it as an `AsyncIterable` generated from the same row: each step of a
+  loop sends one demand, and leaving the loop early (`return`) sends the close, which ends the subscription and never
+  the job it observes.
 - **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.
