@@ -81,6 +81,11 @@ jobs:
       - name: 🌐 Browser Tests
         run: smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 9
 
+      - name: Measure delegated ext4 accounting
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        working-directory: .
+        run: bun nx run cowshed:cargo-test-cowshed-core-shard7 --output-style=static -- --success-output=immediate a_job_owns_its_cgroup_from_before_its_first_instruction
+
       # Step 10
       - name: 🩺 Check monorepo policies and managed-file drift
         id: managed-drift
