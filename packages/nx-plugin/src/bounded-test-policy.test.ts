@@ -189,6 +189,73 @@ describe('bounded test target policy', () => {
     expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject })).toBe(true);
   });
 
+  it('checks bounded test legs without treating build prerequisites as tests', () => {
+    const dependencies = ['^build', 'build', 'typecheck-tests', '*-test'];
+    const packageJson: BoundedTestPolicyPackageJson = {
+      nx: { targets: { test: { executor: 'nx:noop', dependsOn: dependencies } } },
+    };
+    const project = resolvedAggregateProject();
+    const resolvedProject: ResolvedProjectTargets = {
+      ...project,
+      targets: new Set([
+        ...project.targets,
+        'typecheck-tests',
+        'cargo-test-compile',
+        'cargo-test-archive',
+        'test-shards',
+      ]),
+      targetDependencies: new Map([
+        ['test', ['^build', 'build', 'typecheck-tests', 'cargo-test-compile', 'cargo-test-archive', 'test-shards']],
+        ['test-shards', dependencies],
+      ]),
+    };
+    expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject })).toBe(true);
+
+    // Prerequisites alone cannot turn an empty test aggregate green. Missing
+    // or unbounded test legs still fail, even alongside a valid bounded leg.
+    for (const legs of [[], ['test-missing'], ['*-missing-test'], ['napi-test', 'test-unbounded']]) {
+      const invalid: ResolvedProjectTargets = {
+        ...resolvedProject,
+        targets: new Set([...resolvedProject.targets, 'test-unbounded']),
+        targetDependencies: new Map([['test', ['^test-upstream', '^build', 'build', 'typecheck-tests', ...legs]]]),
+      };
+      expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject: invalid })).toBe(
+        false,
+      );
+    }
+  });
+
+  it('accepts explicit Bun per-test timeouts up to each bounded leg deadline', () => {
+    const packageJson: BoundedTestPolicyPackageJson = {
+      nx: { targets: { test: { executor: 'nx:noop', dependsOn: ['napi-test'] } } },
+    };
+    const check = (command: string, timeoutMs = 600_000) => {
+      const resolvedProject = resolvedAggregateProject();
+      resolvedProject.targetOptions = new Map([
+        ['napi-test', { command, cwd: '{projectRoot}', timeoutMs, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
+      ]);
+      return checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject });
+    };
+    expect(check('bun test --timeout=600000')).toBe(true);
+    expect(check('bun test --timeout 600000')).toBe(true);
+    expect(check('bun test --timeout=1')).toBe(true);
+    expect(check('bun test --timeout=30000', 30_000)).toBe(true);
+    for (const command of [
+      'bun test',
+      'bun test --timeout',
+      'bun test --timeout=0',
+      'bun test --timeout=-1',
+      'bun test --timeout=1.5',
+      'bun test --timeout=bad',
+      'bun test --timeout=9007199254740992',
+      'bun test --timeout=600001',
+      'bun test --timeout=30000 --timeout=600001',
+    ]) {
+      expect(check(command)).toBe(false);
+    }
+    expect(check('bun test --timeout=600000', BOUNDED_TEST_TIMEOUT_MS)).toBe(false);
+  });
+
   it('bounds where `bun test` starts but not where other bounded legs run', () => {
     const packageJson: BoundedTestPolicyPackageJson = {
       nx: { targets: { test: { dependsOn: ['napi-test'] } } },
@@ -352,6 +419,41 @@ describe('bounded test target policy', () => {
       expect(native.nx.targets.test).toEqual(cargoTarget);
       // Still reported: apply refusing to flatten does not silently bless them.
       expect(checkWorkspaceBoundedTestTargetPolicy(root).length).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves noop shard aggregates unchanged without a resolved graph', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      const test = { executor: 'nx:noop', dependsOn: ['^build', 'build', 'test-shard1', 'test-shard2'] };
+      const shard = {
+        executor: BOUNDED_TEST_EXECUTOR,
+        options: {
+          command: 'bun test --timeout=600000 --shard=1/2',
+          cwd: '{projectRoot}',
+          timeoutMs: 600_000,
+          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+        },
+      };
+      const packagePath = join(root, 'packages/sharded/package.json');
+      const projectPath = join(root, 'packages/project/project.json');
+      await writeJson(packagePath, {
+        name: 'sharded',
+        scripts: { test: boundedTestScriptAlias('sharded') },
+        nx: { targets: { test, 'test-shard1': shard, 'test-shard2': shard } },
+      });
+      await writeJson(join(root, 'packages/project/package.json'), { name: 'project' });
+      await writeJson(projectPath, { targets: { test, 'test-shard1': shard, 'test-shard2': shard } });
+      const beforePackage = await readFile(packagePath, 'utf8');
+      const beforeProject = await readFile(projectPath, 'utf8');
+
+      expect(applyWorkspaceBoundedTestTargetPolicy(root)).toBe(false);
+      expect(await readFile(packagePath, 'utf8')).toBe(beforePackage);
+      expect(await readFile(projectPath, 'utf8')).toBe(beforeProject);
+      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toHaveLength(2);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

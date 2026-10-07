@@ -1,8 +1,15 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { CARGO_TEST_TARGET, listCargoWorkspacePackages, packageNameFromCargoTestTarget } from './cargo-workspace.js';
+import {
+  CARGO_TEST_ARCHIVE_TARGET,
+  CARGO_TEST_COMPILE_TARGET,
+  CARGO_TEST_TARGET,
+  listCargoWorkspacePackages,
+  packageNameFromCargoTestTarget,
+} from './cargo-workspace.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
+import { isTestRunnerTargetName } from './workspace-config-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
 export const BOUNDED_TEST_TIMEOUT_MS = 120_000;
@@ -361,8 +368,10 @@ export function checkBoundedTestTargetPolicy(
  * bounded `bun test` command. A `commands` array (a multi-runner gate) would
  * be flattened to the default command — deleting the very checks the target
  * exists to run — and a non-bun runner (cargo, go) would inherit wall-clock
- * bounds scaled for bun suites. Those targets are left in place for the check
- * to report, so restructuring them stays a human decision.
+ * bounds scaled for bun suites. A no-op aggregate already delegates execution
+ * to its legs; adding a runner would execute the suite a second time. Those
+ * targets are left in place for the check to report, so restructuring them
+ * stays a human decision.
  */
 function boundableTestTarget(
   packageJson: BoundedTestPolicyPackageJson,
@@ -373,7 +382,7 @@ function boundableTestTarget(
     return true;
   }
   if (isNoopAggregateTarget(target)) {
-    return true;
+    return false;
   }
   const targetOptions = isRecord(target.options) ? target.options : undefined;
   if (targetOptions && Array.isArray(targetOptions.commands)) {
@@ -406,15 +415,44 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     typeof command === 'string' &&
     command.length > 0 &&
     isPackageTestScriptRunnerCommand(command) === false &&
-    command === ensureBunTestTimeoutFlag(command) &&
+    isPositiveSafeInteger(rawOptions.timeoutMs) &&
+    bunTestTimeoutIsBounded(command, rawOptions.timeoutMs) &&
     typeof rawOptions.cwd === 'string' &&
     // `bun test` walks its working directory looking for test files, so it must start where that walk is cheap: the
     // project root or its `src/`. Any other command names what it runs and has no walk to bound. A cargo workspace's
     // per-crate nextest legs run from the workspace root, which no member project owns, and a gate may run a script
     // that lives in another project; both are bounded by their timeouts alone.
     (!BUN_TEST_PREFIX.test(command) || allowedCwds.has(rawOptions.cwd)) &&
-    isPositiveSafeInteger(rawOptions.timeoutMs) &&
     isPositiveSafeInteger(rawOptions.killAfterMs)
+  );
+}
+
+function bunTestTimeoutIsBounded(command: string, timeoutMs: number): boolean {
+  if (!BUN_TEST_PREFIX.test(command)) {
+    return true;
+  }
+  let found = false;
+  for (const match of command.matchAll(/(^|\s)--timeout(?:=|\s+)(\S+)/g)) {
+    const value = match[2];
+    const perTestTimeoutMs = Number(value);
+    if (
+      value === undefined ||
+      !/^\d+$/.test(value) ||
+      !isPositiveSafeInteger(perTestTimeoutMs) ||
+      perTestTimeoutMs > timeoutMs
+    ) {
+      return false;
+    }
+    found = true;
+  }
+  return found;
+}
+
+function isTestLegTargetName(name: string): boolean {
+  return (
+    name !== CARGO_TEST_COMPILE_TARGET &&
+    name !== CARGO_TEST_ARCHIVE_TARGET &&
+    (isTestRunnerTargetName(name) || name.endsWith('-test'))
   );
 }
 
@@ -443,12 +481,27 @@ function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefi
       valid = isBoundedExecutionTarget(executor, project.targetOptions?.get(targetName), allowedCwds);
     } else {
       const dependencies = project.targetDependencies?.get(targetName) ?? [];
-      valid =
-        dependencies.length > 0 &&
-        dependencies.every((dependency) => {
-          const matches = matchingResolvedTargets(dependency, project.targets);
-          return matches.length > 0 && matches.every(visit);
-        });
+      let hasTestLeg = false;
+      valid = true;
+      for (const dependency of dependencies) {
+        if (dependency.startsWith('^')) {
+          continue;
+        }
+        const matches = matchingResolvedTargets(dependency, project.targets).filter(isTestLegTargetName);
+        if (matches.length === 0) {
+          if (isTestLegTargetName(dependency)) {
+            valid = false;
+            break;
+          }
+          continue;
+        }
+        hasTestLeg = true;
+        if (!matches.every(visit)) {
+          valid = false;
+          break;
+        }
+      }
+      valid = valid && hasTestLeg;
     }
     visiting.delete(targetName);
     verified.set(targetName, valid);

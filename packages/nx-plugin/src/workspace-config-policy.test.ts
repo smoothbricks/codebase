@@ -239,6 +239,28 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
   });
 
+  it('preserves lint input extensions that retain inferred inputs and dependency declarations', () => {
+    const inputs = ['...', '^production', '{workspaceRoot}/tooling/lint-extra/**/*'];
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: { ...validTargetDefaults(), lint: { cache: true, inputs } },
+    };
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(nxJson.targetDefaults.lint.inputs).toEqual(inputs);
+    for (const invalidInputs of [['^production'], ['...', 'default'], ['default', '^production']]) {
+      const invalid = {
+        ...validNxJson(),
+        targetDefaults: { ...validTargetDefaults(), lint: { cache: true, inputs: invalidInputs } },
+      };
+      expect(checkWorkspaceConfig(invalid).some((issue) => issue.message.includes('targetDefaults.lint.inputs'))).toBe(
+        true,
+      );
+      expect(applyWorkspaceConfig(invalid)).toBe(true);
+      expect(Object.keys(invalid.targetDefaults.lint)).toEqual(['cache']);
+    }
+  });
+
   it('returns false for already-valid config', () => {
     const nxJson = validNxJson();
     expect(applyWorkspaceConfig(nxJson)).toBe(false);

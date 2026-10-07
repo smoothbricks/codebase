@@ -364,11 +364,15 @@ function applyTestTargetDefault(nxJson: Record<string, unknown>): boolean {
 
 const inferredLintProperties = ['executor', 'options', 'dependsOn', 'outputs', 'inputs'] as const;
 
+function preservesInferredLintInputs(inputs: unknown): boolean {
+  return Array.isArray(inputs) && inputs.includes('...') && inputs.includes('^production');
+}
+
 function validateLintTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: string, issues: NxPolicyIssue[]): void {
   const defaults = recordProperty(nxJson, 'targetDefaults');
   const lint = defaults ? recordProperty(defaults, 'lint') : null;
   for (const property of inferredLintProperties) {
-    if (lint !== null && property in lint) {
+    if (lint !== null && property in lint && !(property === 'inputs' && preservesInferredLintInputs(lint.inputs))) {
       issues.push({
         path: nxJsonPath,
         message: `targetDefaults.lint.${property} must not be set; @smoothbricks/nx-plugin infers lint from project sources`,
@@ -383,7 +387,7 @@ function applyLintTargetDefault(nxJson: Record<string, unknown>): boolean {
   if (lint === null) return false;
   let changed = false;
   for (const property of inferredLintProperties) {
-    if (property in lint) {
+    if (property in lint && !(property === 'inputs' && preservesInferredLintInputs(lint.inputs))) {
       delete lint[property];
       changed = true;
     }

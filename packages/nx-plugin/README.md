@@ -34,9 +34,12 @@ flat configuration enables ESLint only for existing JavaScript/TypeScript files 
 source trees therefore keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript
 inputs. Adding JavaScript or TypeScript sources adds their lint coverage automatically.
 
-Keep `targetDefaults.lint` limited to shared cache policy. Smoo's workspace policy removes static lint executors,
-commands, dependencies, inputs and outputs because they override source-aware inference for every project. Project-local
-`nx.targets.lint` declarations retain normal Nx override precedence.
+Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
+`^production` unless the workspace opts into the versionless production input described below. Keep
+`targetDefaults.lint` limited to shared cache policy or additive inputs such as `["...", "^production"]`. Smoo's
+workspace policy removes static lint executors, commands, dependencies, outputs and replacement input lists because they
+override source-aware inference for every project. Project-local `nx.targets.lint` declarations retain normal Nx
+override precedence.
 
 The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
 `--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
@@ -44,6 +47,12 @@ every test file (including newly added files) exactly once. A failed shard fails
 standard 120-second target deadline stay unchanged. Refresh the portable timing manifest from this package directory
 with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data, not a test
 allowlist.
+
+Workspace updates preserve no-op test aggregates rather than adding a second test runner. The bounded-test check
+requires at least one local test execution leg and verifies every such leg through nested no-op aggregates; upstream and
+non-test prerequisites such as `^build`, `build`, and `typecheck-tests` are not test legs. Each bounded Bun leg must
+declare a positive per-test `--timeout` no greater than its own `timeoutMs`; the migration's 30-second default is not a
+limit on explicitly bounded lanes.
 
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
 Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own

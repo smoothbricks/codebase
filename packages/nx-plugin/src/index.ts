@@ -1776,6 +1776,7 @@ async function createProjectTargets(
       outputs: [],
       inputs: [
         selfDefault,
+        dependencyProduction,
         ...checkInputs,
         ...[...BIOME_CONFIG_FILES, ...ESLINT_CONFIG_FILES].flatMap((name) => [
           `{workspaceRoot}/${name}`,

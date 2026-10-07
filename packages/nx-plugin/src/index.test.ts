@@ -236,6 +236,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets.lint?.cache).toBe(true);
       expect(targets.lint?.dependsOn).toEqual(['typecheck-tests']);
+      expect(targets.lint?.inputs).toContain('^production');
     } finally {
       await workspace.cleanup();
     }
@@ -289,6 +290,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(targets.lint?.inputs).toEqual([
         'versionlessDefault',
+        { input: 'versionlessProduction', dependencies: true },
         ...checkToolchain,
         ...[
           'biome.json',
