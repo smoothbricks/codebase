@@ -15,7 +15,7 @@ use arrow_array::{
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -52,26 +52,40 @@ pub(super) const PROTECTED_DIRECTORY: &str = ".cowshed";
 const JOB_DIRECTORY: &str = "job";
 const RECORDS_FILE: &str = "records.arrow";
 const RECORD_SEQUENCE_FILE: &str = "records.sequence";
-const RECORD_SEQUENCE_MAGIC: &[u8; 8] = b"CSSEQ001";
-const RECORD_SEQUENCE_BYTES: usize = 24;
 const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
-const CHECKPOINT_BARRIER_MAGIC: &[u8; 8] = b"CSBAR001";
-const CHECKPOINT_BARRIER_BYTES: usize = 24;
-/// The layout every new record is written in: version 5 drops the two range columns version 4
-/// carried between `failure` and the exit columns.
+/// The job id every store set aside so far had allocated up to: the empty store that replaces
+/// one allocates above it, so no id an earlier store handed out is handed out again.
+const JOB_FLOOR_FILE: &str = "records.job-floor";
+
+/// A checked counter file beside the records: an 8-byte magic, the value and its complement, all
+/// little-endian, 24 bytes.
+struct CounterFile {
+    magic: &'static [u8; 8],
+    /// What the counter is, as its errors name it.
+    what: &'static str,
+}
+
+const COUNTER_BYTES: usize = 24;
+const RECORD_SEQUENCE: CounterFile = CounterFile {
+    magic: b"CSSEQ001",
+    what: "record sequence counter",
+};
+const CHECKPOINT_BARRIER: CounterFile = CounterFile {
+    magic: b"CSBAR001",
+    what: "checkpoint barrier counter",
+};
+const JOB_FLOOR: CounterFile = CounterFile {
+    magic: b"CSJOB001",
+    what: "job id floor",
+};
+/// The one layout records are written and read in. A store holding a record in an earlier layout
+/// is set aside whole ([`SetAsideStore`]), never read.
 const RECORD_SCHEMA_VERSION: u64 = 5;
-/// Version 4: the current layout with [`VERSION_4_RANGE_COLUMNS`] ahead of [`EXIT_COLUMN`]. The
-/// range a since-removed build step recorded in them is skipped on read. Read, never written.
-const VERSION_4: u64 = 4;
-/// The columns only version 4 has, in order, between `failure` and `exit_code`.
-const VERSION_4_RANGE_COLUMNS: [&str; 2] = ["warm_base", "warm_head"];
+/// Where a store in an earlier record layout is moved, beside the records it no longer is.
+const SET_ASIDE_DIRECTORY: &str = "set-aside";
 /// The current layout's first exit column: `exit_code`, `exit_signal`, `exit_core_dumped`, then
 /// `duration_ms`.
 const EXIT_COLUMN: usize = 34;
-/// The layouts before version 4, newest first, as the version and how many trailing columns of
-/// the current layout each lacks: version 3 has no exit or duration columns, and version 2 no
-/// `failure` either. Read, never written.
-const EARLIER_RECORD_LAYOUTS: [(u64, usize); 2] = [(3, 4), (2, 5)];
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -508,10 +522,7 @@ pub struct CheckpointManifestRecord {
 
 impl CheckpointManifestRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
-        let known = record_layouts()
-            .iter()
-            .any(|&(version, _)| u64::from(self.version) == version);
-        if !known || self.barrier_id == 0 {
+        if u64::from(self.version) != RECORD_SCHEMA_VERSION || self.barrier_id == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
                 message: "invalid checkpoint manifest version or barrier".into(),
@@ -581,11 +592,23 @@ pub struct RecoveredFrame {
     pub batch_sha256: Sha256Digest,
 }
 
+/// A store whose records an earlier cowshed wrote in an earlier layout, moved whole -- records,
+/// sequence and barrier counters, and with the records every checkpoint manifest -- so an empty
+/// store starts in its place.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetAsideStore {
+    /// The layout version of the first record that was not in the current layout.
+    pub layout: u64,
+    /// The directory the store's files now live in.
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReport {
     pub frames: Vec<RecoveredFrame>,
     pub truncated_bytes: u64,
     pub next_job_id: JobId,
+    pub set_aside: Option<SetAsideStore>,
 }
 
 pub struct ArtifactStore {
@@ -720,7 +743,8 @@ impl ArtifactStore {
             })
             .max()
             .unwrap_or(0);
-        let maximum = directory_max.max(record_max);
+        let floor = read_counter(&job_floor_path(&lock)?, &JOB_FLOOR)?.unwrap_or(0);
+        let maximum = directory_max.max(record_max).max(floor);
         let next_job_id = maximum
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
@@ -2292,6 +2316,14 @@ fn record_sequence_path(lock: &RecordsLock<'_>) -> Result<PathBuf, ArtifactError
     Ok(job_root.join(RECORD_SEQUENCE_FILE))
 }
 
+fn job_floor_path(lock: &RecordsLock<'_>) -> Result<PathBuf, ArtifactError> {
+    let job_root = lock
+        .records
+        .parent()
+        .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+    Ok(job_root.join(JOB_FLOOR_FILE))
+}
+
 fn highest_record_sequence(recovery: &RecoveryReport) -> u64 {
     recovery
         .frames
@@ -2305,41 +2337,7 @@ fn highest_record_sequence(recovery: &RecoveryReport) -> u64 {
 }
 
 fn read_record_sequence_counter(lock: &RecordsLock<'_>) -> Result<Option<u64>, ArtifactError> {
-    let path = record_sequence_path(lock)?;
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(&path, error)),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(integrity(
-            0,
-            "record sequence counter is not a regular protected file",
-        ));
-    }
-    reject_hardlink(&path, &metadata)?;
-    verify_private_file_mode(&path, &metadata, false)?;
-    let bytes = fs::read(&path).map_err(|error| io_error(&path, error))?;
-    if bytes.len() != RECORD_SEQUENCE_BYTES || &bytes[..8] != RECORD_SEQUENCE_MAGIC {
-        return Err(integrity(0, "record sequence counter encoding is invalid"));
-    }
-    let current = u64::from_le_bytes(
-        bytes[8..16]
-            .try_into()
-            .expect("validated record sequence counter has eight value bytes"),
-    );
-    let complement = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .expect("validated record sequence counter has eight complement bytes"),
-    );
-    if complement != !current {
-        return Err(integrity(
-            0,
-            "record sequence counter complement is invalid",
-        ));
-    }
-    Ok(Some(current))
+    read_counter(&record_sequence_path(lock)?, &RECORD_SEQUENCE)
 }
 
 fn publish_record_sequence_counter(
@@ -2347,17 +2345,63 @@ fn publish_record_sequence_counter(
     current: u64,
     durability: Durability,
 ) -> Result<(), ArtifactError> {
-    let path = record_sequence_path(lock)?;
-    let mut bytes = [0_u8; RECORD_SEQUENCE_BYTES];
-    bytes[..8].copy_from_slice(RECORD_SEQUENCE_MAGIC);
+    publish_counter(
+        &record_sequence_path(lock)?,
+        &RECORD_SEQUENCE,
+        current,
+        durability,
+    )
+}
+
+/// The value of the `counter` file at `path`; `None` when there is none.
+fn read_counter(path: &Path, counter: &CounterFile) -> Result<Option<u64>, ArtifactError> {
+    let what = counter.what;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(path, error)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(integrity(
+            0,
+            &format!("{what} is not a regular protected file"),
+        ));
+    }
+    reject_hardlink(path, &metadata)?;
+    verify_private_file_mode(path, &metadata, false)?;
+    let bytes = fs::read(path).map_err(|error| io_error(path, error))?;
+    let encoded: [u8; COUNTER_BYTES] = bytes
+        .try_into()
+        .map_err(|_| integrity(0, &format!("{what} encoding is invalid")))?;
+    let [magic, value, complement] = [&encoded[..8], &encoded[8..16], &encoded[16..]];
+    if magic != counter.magic {
+        return Err(integrity(0, &format!("{what} encoding is invalid")));
+    }
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight counter bytes"));
+    let current = word(value);
+    if word(complement) != !current {
+        return Err(integrity(0, &format!("{what} complement is invalid")));
+    }
+    Ok(Some(current))
+}
+
+/// Publish `current` as the `counter` file at `path`, whole or not at all.
+fn publish_counter(
+    path: &Path,
+    counter: &CounterFile,
+    current: u64,
+    durability: Durability,
+) -> Result<(), ArtifactError> {
+    let mut bytes = [0_u8; COUNTER_BYTES];
+    bytes[..8].copy_from_slice(counter.magic);
     bytes[8..16].copy_from_slice(&current.to_le_bytes());
     bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
-    crate::fsio::publish_private_file_with::<io::Error>(&path, durability, |writer| {
+    crate::fsio::publish_private_file_with::<io::Error>(path, durability, |writer| {
         writer.write_all(&bytes)
     })
     .map_err(|error| match error {
         crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
-        crate::fsio::PublishError::Write(source) => io_error(&path, source),
+        crate::fsio::PublishError::Write(source) => io_error(path, source),
     })
 }
 
@@ -2455,44 +2499,10 @@ fn read_checkpoint_barrier_counter(
     lock: &RecordsLock<'_>,
     incarnation: &WorkspaceIncarnation,
 ) -> Result<Option<u64>, ArtifactError> {
-    let path = checkpoint_barrier_path(lock, incarnation)?;
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(&path, error)),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(integrity(
-            0,
-            "checkpoint barrier counter is not a regular protected file",
-        ));
-    }
-    reject_hardlink(&path, &metadata)?;
-    verify_private_file_mode(&path, &metadata, false)?;
-    let bytes = fs::read(&path).map_err(|error| io_error(&path, error))?;
-    if bytes.len() != CHECKPOINT_BARRIER_BYTES || &bytes[..8] != CHECKPOINT_BARRIER_MAGIC {
-        return Err(integrity(
-            0,
-            "checkpoint barrier counter encoding is invalid",
-        ));
-    }
-    let current = u64::from_le_bytes(
-        bytes[8..16]
-            .try_into()
-            .expect("validated checkpoint barrier counter has eight value bytes"),
-    );
-    let complement = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .expect("validated checkpoint barrier counter has eight complement bytes"),
-    );
-    if complement != !current {
-        return Err(integrity(
-            0,
-            "checkpoint barrier counter complement is invalid",
-        ));
-    }
-    Ok(Some(current))
+    read_counter(
+        &checkpoint_barrier_path(lock, incarnation)?,
+        &CHECKPOINT_BARRIER,
+    )
 }
 
 fn publish_checkpoint_barrier_counter(
@@ -2500,16 +2510,12 @@ fn publish_checkpoint_barrier_counter(
     incarnation: &WorkspaceIncarnation,
     current: u64,
 ) -> Result<(), ArtifactError> {
-    let path = checkpoint_barrier_path(lock, incarnation)?;
-    let mut bytes = [0_u8; CHECKPOINT_BARRIER_BYTES];
-    bytes[..8].copy_from_slice(CHECKPOINT_BARRIER_MAGIC);
-    bytes[8..16].copy_from_slice(&current.to_le_bytes());
-    bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
-    crate::fsio::publish_private_file::<io::Error>(&path, |writer| writer.write_all(&bytes))
-        .map_err(|error| match error {
-            crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
-            crate::fsio::PublishError::Write(source) => io_error(&path, source),
-        })
+    publish_counter(
+        &checkpoint_barrier_path(lock, incarnation)?,
+        &CHECKPOINT_BARRIER,
+        current,
+        Durability::PowerLoss,
+    )
 }
 
 fn ensure_checkpoint_barrier_counter(
@@ -2624,19 +2630,7 @@ fn ensure_private_directory(path: &Path, durability: Durability) -> Result<(), A
             let parent = path
                 .parent()
                 .ok_or_else(|| integrity(0, "protected directory has no parent"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-                let mut builder = fs::DirBuilder::new();
-                builder.mode(0o700);
-                builder
-                    .create(path)
-                    .map_err(|error| io_error(path, error))?;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                    .map_err(|error| io_error(path, error))?;
-            }
-            #[cfg(not(unix))]
-            fs::create_dir(path).map_err(|error| io_error(path, error))?;
+            create_private_directory(path).map_err(|error| io_error(path, error))?;
             durability
                 .sync_new_entry(parent)
                 .map_err(|error| io_error(parent, error))?;
@@ -2923,6 +2917,7 @@ fn recover_records_with_budget_under_lock(
                 frames: Vec::new(),
                 truncated_bytes: 0,
                 next_job_id: JobId::new(1).expect("one is a valid job id"),
+                set_aside: None,
             });
         }
         Err(error) => return Err(io_error(path, error)),
@@ -2959,6 +2954,7 @@ fn recover_records_with_budget_under_lock(
                 frames: Vec::new(),
                 truncated_bytes: original_len,
                 next_job_id: JobId::new(1).expect("one is a valid job id"),
+                set_aside: None,
             });
         }
         return Err(integrity(0, "invalid records file magic"));
@@ -2977,6 +2973,9 @@ fn recover_records_with_budget_under_lock(
     prefix_hasher.update(RECORD_MAGIC);
     let mut previous_job: Option<JobArtifactRecord> = None;
     let mut terminal_jobs = BTreeSet::new();
+    // Once a record in an earlier layout is met: that layout, and the highest job id the store
+    // handed out, read from each frame's leading `job_id` column and nothing else.
+    let mut aside: Option<(u64, u64)> = None;
     while (offset as u64) < original_len {
         let frame_start = offset;
         let remaining = usize::try_from(original_len - offset as u64).map_err(|_| {
@@ -2993,7 +2992,10 @@ fn recover_records_with_budget_under_lock(
             .map_err(|message| integrity(frame_start, message))?
         {
             FrameExtent::Incomplete => {
-                truncate_incomplete(&mut file, path, frame_start)?;
+                // A store being set aside moves as it is; only a store that stays is cut.
+                if aside.is_none() {
+                    truncate_incomplete(&mut file, path, frame_start)?;
+                }
                 break;
             }
             FrameExtent::Complete {
@@ -3043,6 +3045,38 @@ fn recover_records_with_budget_under_lock(
                 newest: RECORD_SCHEMA_VERSION,
                 newest_columns: protected_record_schema().fields().len(),
             });
+        }
+        if let Some((_, floor)) = aside.as_mut() {
+            if earlier_layout(&batch).is_none() && !is_current_layout(&batch) {
+                return Err(integrity(
+                    frame_start,
+                    &format!(
+                        "a protected batch of {} columns is in no record layout",
+                        batch.num_columns()
+                    ),
+                ));
+            }
+            *floor = (*floor).max(leading_job_id(&batch));
+            retained = required;
+            offset = offset
+                .checked_add(frame_len)
+                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+            continue;
+        }
+        if let Some(layout) = earlier_layout(&batch) {
+            let floor = records
+                .iter()
+                .filter_map(|frame: &RecoveredFrame| match &frame.record {
+                    ProtectedRecord::Job(record) => Some(record.job_id.get()),
+                    ProtectedRecord::CheckpointManifest(_) => None,
+                })
+                .fold(leading_job_id(&batch), u64::max);
+            aside = Some((layout, floor));
+            retained = required;
+            offset = offset
+                .checked_add(frame_len)
+                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+            continue;
         }
         let record = batch_to_protected_record(&batch)
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
@@ -3098,6 +3132,18 @@ fn recover_records_with_budget_under_lock(
             .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
     }
 
+    if let Some((layout, floor)) = aside {
+        drop(file);
+        let next = floor
+            .checked_add(1)
+            .ok_or_else(|| integrity(0, "job id allocation exhausted"))?;
+        return Ok(RecoveryReport {
+            frames: Vec::new(),
+            truncated_bytes: 0,
+            next_job_id: JobId::new(next)?,
+            set_aside: Some(set_aside_records(lock, layout, floor)?),
+        });
+    }
     let next = records
         .iter()
         .filter_map(|frame| match &frame.record {
@@ -3112,7 +3158,125 @@ fn recover_records_with_budget_under_lock(
         frames: records,
         truncated_bytes: original_len.saturating_sub(offset as u64),
         next_job_id: JobId::new(next)?,
+        set_aside: None,
     })
+}
+
+/// The `job_id` an intact frame of any layout leads with -- every layout keeps it at the same
+/// place -- or 0 when the frame holds no job. Nothing else of an earlier layout is read.
+fn leading_job_id(batch: &RecordBatch) -> u64 {
+    let current = protected_record_schema();
+    if batch.num_rows() != 1
+        || batch.num_columns() <= 4
+        || batch.schema().fields()[4] != current.fields()[4]
+    {
+        return 0;
+    }
+    uint64(batch, 4).map_or(0, |column| {
+        if column.is_valid(0) {
+            column.value(0)
+        } else {
+            0
+        }
+    })
+}
+
+/// Move the store `lock` guards -- its records, its sequence counter and every incarnation's
+/// barrier counter -- into a directory under `set-aside/` named for the earlier `layout` its first
+/// unreadable record is in, and say so on stderr.
+///
+/// First the job id floor rises to `floor`, the highest id the store handed out: the job
+/// directories stay, but an inline job left none, so the empty store that starts allocates above
+/// both. The records move last: until they do, every open finds the same earlier layout and
+/// resumes into the same directory, the first of its names that holds no records yet.
+fn set_aside_records(
+    lock: &RecordsLock<'_>,
+    layout: u64,
+    floor: u64,
+) -> Result<SetAsideStore, ArtifactError> {
+    let job_root = lock
+        .records
+        .parent()
+        .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+    let floor_path = job_floor_path(lock)?;
+    let previous = read_counter(&floor_path, &JOB_FLOOR)?.unwrap_or(0);
+    if floor > previous {
+        publish_counter(&floor_path, &JOB_FLOOR, floor, Durability::PowerLoss)?;
+    }
+    let parent = job_root.join(SET_ASIDE_DIRECTORY);
+    ensure_private_directory(&parent, Durability::PowerLoss)?;
+    let mut destination = None;
+    for attempt in 1_u32.. {
+        let candidate = match attempt {
+            1 => parent.join(format!("layout-{layout}")),
+            attempt => parent.join(format!("layout-{layout}.{attempt}")),
+        };
+        match create_private_directory(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                ensure_private_directory(&candidate, Durability::PowerLoss)?;
+                if candidate.join(RECORDS_FILE).exists() {
+                    continue;
+                }
+            }
+            Err(error) => return Err(io_error(&candidate, error)),
+        }
+        destination = Some(candidate);
+        break;
+    }
+    let destination = destination
+        .ok_or_else(|| integrity(0, "every set-aside directory name for this layout is taken"))?;
+    let mut counters = vec![RECORD_SEQUENCE_FILE.to_owned()];
+    for entry in fs::read_dir(job_root).map_err(|error| io_error(job_root, error))? {
+        let name = entry
+            .map_err(|error| io_error(job_root, error))?
+            .file_name();
+        if let Some(name) = name.to_str()
+            && name.starts_with(CHECKPOINT_BARRIER_FILE_PREFIX)
+        {
+            counters.push(name.to_owned());
+        }
+    }
+    for name in counters {
+        let source = job_root.join(&name);
+        match fs::rename(&source, destination.join(&name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&source, error)),
+        }
+    }
+    sync_directory(&destination)?;
+    sync_directory(&parent)?;
+    sync_directory(job_root)?;
+    fs::rename(lock.records, destination.join(RECORDS_FILE))
+        .map_err(|error| io_error(lock.records, error))?;
+    sync_directory(&destination)?;
+    sync_directory(job_root)?;
+    eprintln!(
+        "cowshed: set aside the job records in {} -- written in record layout {layout}, before \
+         layout {RECORD_SCHEMA_VERSION}, the only one this cowshed reads -- into {}, with the \
+         checkpoint manifests among them; a new empty store starts in their place, allocating \
+         job ids above {floor}",
+        job_root.display(),
+        destination.display()
+    );
+    Ok(SetAsideStore {
+        layout,
+        path: destination,
+    })
+}
+
+/// Create `path` as a new private directory; `AlreadyExists` when anything holds the name.
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new().mode(0o700).create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(path)?;
+    Ok(())
 }
 
 /// How much of a frame the bytes left at a frame's start hold.
@@ -3286,46 +3450,28 @@ fn build_protected_record_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Every layout a record may be read in, newest first: the current one, version 4, then each of
-/// [`EARLIER_RECORD_LAYOUTS`] as the current layout without its trailing columns.
-fn record_layouts() -> &'static [(u64, Arc<Schema>)] {
-    static LAYOUTS: LazyLock<Vec<(u64, Arc<Schema>)>> = LazyLock::new(|| {
-        let current = protected_record_schema();
-        let fields = current.fields();
-        let (through_failure, exit_and_duration) = fields.split_at(EXIT_COLUMN);
-        let version_4: Vec<FieldRef> = through_failure
-            .iter()
-            .cloned()
-            .chain(
-                VERSION_4_RANGE_COLUMNS
-                    .map(|name| Arc::new(field(name, DataType::Utf8, true)) as FieldRef),
-            )
-            .chain(exit_and_duration.iter().cloned())
-            .collect();
-        let earlier = EARLIER_RECORD_LAYOUTS.iter().map(|&(version, missing)| {
-            (
-                version,
-                Arc::new(Schema::new(fields[..fields.len() - missing].to_vec())),
-            )
-        });
-        [
-            (RECORD_SCHEMA_VERSION, Arc::clone(&current)),
-            (VERSION_4, Arc::new(Schema::new(version_4))),
-        ]
-        .into_iter()
-        .chain(earlier)
-        .collect()
-    });
-    &LAYOUTS
+/// Whether a batch is in the one layout this build reads.
+fn is_current_layout(batch: &RecordBatch) -> bool {
+    batch.schema() == protected_record_schema()
 }
 
-/// The record version a batch's layout belongs to.
-fn batch_layout_version(batch: &RecordBatch) -> Option<u64> {
+/// The layout version of an intact record an earlier cowshed wrote: one row in another layout
+/// whose leading `record_kind` and `record_version` columns -- every layout's -- declare a version
+/// below [`RECORD_SCHEMA_VERSION`]. Nothing of it is read; its store is set aside whole.
+fn earlier_layout(batch: &RecordBatch) -> Option<u64> {
+    let current = protected_record_schema();
     let schema = batch.schema();
-    record_layouts()
-        .iter()
-        .find(|(_, layout)| *layout == schema)
-        .map(|&(version, _)| version)
+    let fields = schema.fields();
+    if batch.num_rows() != 1
+        || schema == current
+        || fields.len() < 2
+        || fields[..2] != current.fields()[..2]
+    {
+        return None;
+    }
+    let version = uint64(batch, 1).ok()?;
+    (version.is_valid(0) && (1..RECORD_SCHEMA_VERSION).contains(&version.value(0)))
+        .then(|| version.value(0))
 }
 
 /// The layout of a batch a newer cowshed wrote, when it is one. Layouts after this one grow by
@@ -3606,7 +3752,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         return Err(ArtifactError::Arrow("protected record is not a job".into()));
     }
     let version = uint64(batch, 1)?.value(0);
-    if Some(version) != batch_layout_version(batch) {
+    if !is_current_layout(batch) || version != RECORD_SCHEMA_VERSION {
         return Err(ArtifactError::Arrow(format!(
             "unsupported job record version {version} for its layout"
         )));
@@ -3635,27 +3781,14 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         }
     };
     let command = decode_command(batch, 32)?;
-    // Every layout from version 3 holds `failure`; from version 4 the exit and duration columns,
-    // which version 4 alone places after its range columns.
-    let failure = if version >= 3 && !batch.column(33).is_null(0) {
-        Some(parse_failure(string(batch, 33)?.value(0))?)
-    } else {
-        None
-    };
-    let (exit, duration_ms) = if version >= VERSION_4 {
-        let exit_column = if version == VERSION_4 {
-            EXIT_COLUMN + VERSION_4_RANGE_COLUMNS.len()
-        } else {
-            EXIT_COLUMN
-        };
-        let duration_column = exit_column + 3;
-        let duration_ms = (!batch.column(duration_column).is_null(0))
-            .then(|| uint64(batch, duration_column).map(|column| column.value(0)))
-            .transpose()?;
-        (decode_exit(batch, exit_column)?, duration_ms)
-    } else {
-        (None, None)
-    };
+    let failure = (!batch.column(33).is_null(0))
+        .then(|| string(batch, 33).and_then(|column| parse_failure(column.value(0))))
+        .transpose()?;
+    let duration_column = EXIT_COLUMN + 3;
+    let duration_ms = (!batch.column(duration_column).is_null(0))
+        .then(|| uint64(batch, duration_column).map(|column| column.value(0)))
+        .transpose()?;
+    let exit = decode_exit(batch, EXIT_COLUMN)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -3815,7 +3948,7 @@ fn batch_to_protected_record(batch: &RecordBatch) -> Result<ProtectedRecord, Art
             batch.num_rows()
         )));
     }
-    if batch_layout_version(batch).is_none() {
+    if !is_current_layout(batch) {
         return Err(ArtifactError::Arrow(format!(
             "a protected batch of {} columns is in no record layout",
             batch.num_columns()
@@ -4780,80 +4913,170 @@ mod tests {
         }
     }
 
-    #[test]
-    fn earlier_layouts_read_without_their_later_columns() {
-        // A workspace's records.arrow outlives the cowshed that wrote it: version-2 batches,
-        // without `failure`, and version-3 batches, without the exit and duration columns, read
-        // as they always did.
-        let record = valid_job_record(4);
-        let current = job_record_to_batch(&record).unwrap();
-        for &(version, missing) in &EARLIER_RECORD_LAYOUTS {
-            let layout = record_layouts()
-                .iter()
-                .find(|(layout_version, _)| *layout_version == version)
-                .map(|(_, layout)| Arc::clone(layout))
-                .unwrap();
-            let columns = &current.columns()[..current.num_columns() - missing];
-            let earlier = RecordBatch::try_new(
-                Arc::clone(&layout),
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(index, column)| {
-                        if index == 1 {
-                            Arc::new(UInt64Array::from(vec![version])) as ArrayRef
-                        } else {
-                            Arc::clone(column)
-                        }
-                    })
-                    .collect(),
-            )
-            .unwrap();
-            let ProtectedRecord::Job(read) = batch_to_protected_record(&earlier).unwrap() else {
-                panic!("a job record");
-            };
-            assert_eq!(read, record, "version {version}");
-
-            // An earlier layout claiming the current version is neither.
-            let mislabeled = RecordBatch::try_new(layout, columns.to_vec()).unwrap();
-            assert!(batch_to_protected_record(&mislabeled).is_err());
-        }
+    /// `record` in the layout an earlier cowshed wrote: the current one without its `missing`
+    /// trailing columns, declaring `version`.
+    fn earlier_batch(record: &JobArtifactRecord, missing: usize, version: u64) -> RecordBatch {
+        let current = job_record_to_batch(record).unwrap();
+        let kept = current.num_columns() - missing;
+        let mut columns = current.columns()[..kept].to_vec();
+        columns[1] = Arc::new(UInt64Array::from(vec![version]));
+        RecordBatch::try_new(
+            Arc::new(Schema::new(current.schema().fields()[..kept].to_vec())),
+            columns,
+        )
+        .unwrap()
     }
 
+    /// A store an earlier cowshed wrote is set aside whole the first time this one opens it --
+    /// records, sequence and barrier counters -- and an empty store starts. Its jobs here were all
+    /// inline and left no directory, so only the job id floor keeps the empty store from handing
+    /// their ids out again, on this open and every later one; a job directory above the floor
+    /// still wins. A second store in the same layout gets a directory of its own.
     #[test]
-    fn version_4_reads_past_its_range_columns() {
-        // Version 4 held a landed range between `failure` and the exit columns; a record written
-        // then reads as the same job, its exit and duration intact, the range skipped.
-        let record = JobArtifactRecord {
-            exit: Some(ExitStatus::Exited { code: 3 }),
-            duration_ms: Some(42),
-            ..valid_job_record(4)
-        };
-        let current = job_record_to_batch(&record).unwrap();
-        let layout = record_layouts()
-            .iter()
-            .find(|(version, _)| *version == VERSION_4)
-            .map(|(_, layout)| Arc::clone(layout))
-            .unwrap();
-        let oid = |digit: char| Some(digit.to_string().repeat(40));
-        let (through_failure, exit_and_duration) = current.columns().split_at(EXIT_COLUMN);
-        let columns = |version: u64| -> Vec<ArrayRef> {
-            let mut columns = through_failure.to_vec();
-            columns[1] = Arc::new(UInt64Array::from(vec![version]));
-            columns.push(Arc::new(StringArray::from(vec![oid('a')])));
-            columns.push(Arc::new(StringArray::from(vec![oid('b')])));
-            columns.extend(exit_and_duration.iter().cloned());
-            columns
-        };
-        let version_4 = RecordBatch::try_new(Arc::clone(&layout), columns(VERSION_4)).unwrap();
-        let ProtectedRecord::Job(read) = batch_to_protected_record(&version_4).unwrap() else {
-            panic!("a job record");
-        };
-        assert_eq!(read, record);
+    fn a_store_in_an_earlier_layout_is_set_aside_whole_and_its_job_ids_stay_taken() {
+        let root = temp_root("earlier-layout");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_batch(&root, &earlier_batch(&valid_job_record(2), 4, 3));
+        append_batch(&root, &earlier_batch(&valid_job_record(5), 3, 4));
+        let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
+        let old_records = fs::read(records_path(&root)).unwrap();
+        let barrier = format!("{CHECKPOINT_BARRIER_FILE_PREFIX}{}", incarnation().as_str());
+        assert!(job_root.join(&barrier).exists(), "the store has a barrier");
+        assert_eq!(scan_job_directories(&root).unwrap(), 0, "inline jobs only");
 
-        // Version 4's layout claiming the current version is neither.
-        let mislabeled = RecordBatch::try_new(layout, columns(RECORD_SCHEMA_VERSION)).unwrap();
-        assert!(batch_to_protected_record(&mislabeled).is_err());
+        let store = store_at(&root, ArtifactConfig::default());
+        let set_aside = job_root.join(SET_ASIDE_DIRECTORY).join("layout-3");
+        assert_eq!(
+            store.recovery().set_aside,
+            Some(SetAsideStore {
+                layout: 3,
+                path: set_aside.clone(),
+            })
+        );
+        assert!(
+            store.recovery().frames.is_empty(),
+            "nothing earlier is read"
+        );
+        assert_eq!(store.next_job_id().unwrap().get(), 6);
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        assert!(set_aside.join(RECORD_SEQUENCE_FILE).exists());
+        assert!(set_aside.join(&barrier).exists());
+        drop(store);
+
+        let reopened = store_at(&root, ArtifactConfig::default());
+        assert_eq!(reopened.recovery().set_aside, None);
+        assert_eq!(
+            reopened.next_job_id().unwrap().get(),
+            6,
+            "the floor outlives the open that set the store aside"
+        );
+        drop(reopened);
+        create_private_directory(&job_root.join("7")).unwrap();
+        assert_eq!(
+            store_at(&root, ArtifactConfig::default())
+                .next_job_id()
+                .unwrap()
+                .get(),
+            8
+        );
+
+        append_batch(&root, &earlier_batch(&valid_job_record(9), 4, 3));
+        let again = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            again.recovery().set_aside.as_ref().map(|store| &store.path),
+            Some(&job_root.join(SET_ASIDE_DIRECTORY).join("layout-3.2"))
+        );
+        assert_eq!(again.next_job_id().unwrap().get(), 10);
+        drop(again);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A set-aside stopped after its counters moved and before its records did: the next open
+    /// still finds the earlier layout and finishes the move into the same directory.
+    #[test]
+    fn a_set_aside_stopped_halfway_finishes_into_the_same_directory() {
+        let root = temp_root("earlier-layout-resumed");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_batch(&root, &earlier_batch(&valid_job_record(4), 4, 3));
+        let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
+        let set_aside = job_root.join(SET_ASIDE_DIRECTORY).join("layout-3");
+        create_private_directory(&job_root.join(SET_ASIDE_DIRECTORY)).unwrap();
+        create_private_directory(&set_aside).unwrap();
+        fs::rename(
+            job_root.join(RECORD_SEQUENCE_FILE),
+            set_aside.join(RECORD_SEQUENCE_FILE),
+        )
+        .unwrap();
+        let old_records = fs::read(records_path(&root)).unwrap();
+
+        let store = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            store.recovery().set_aside.as_ref().map(|store| &store.path),
+            Some(&set_aside)
+        );
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        assert!(set_aside.join(RECORD_SEQUENCE_FILE).exists());
+        assert_eq!(store.next_job_id().unwrap().get(), 5);
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A store holding an earlier record and, after it, a record a newer cowshed wrote is the
+    /// newer cowshed's: refused as newer, nothing moved.
+    #[test]
+    fn a_newer_record_after_an_earlier_one_is_refused_before_anything_moves() {
+        let root = temp_root("earlier-then-newer");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_batch(&root, &earlier_batch(&valid_job_record(1), 4, 3));
+        let current = job_record_to_batch(&valid_job_record(2)).unwrap();
+        let mut fields = current.schema().fields().to_vec();
+        fields.push(Arc::new(field("from_the_future", DataType::Utf8, true)));
+        let mut columns = current.columns().to_vec();
+        columns[1] = Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION + 1]));
+        columns.push(Arc::new(StringArray::from(vec![Some("later")])));
+        append_batch(
+            &root,
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+        );
+        let records = fs::read(records_path(&root)).unwrap();
+        assert!(matches!(
+            recover_records(&records_path(&root)),
+            Err(ArtifactError::NewerLayout { .. })
+        ));
+        assert_eq!(fs::read(records_path(&root)).unwrap(), records);
+        let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
+        assert!(!job_root.join(SET_ASIDE_DIRECTORY).exists());
+        assert!(!job_root.join(JOB_FLOOR_FILE).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Only an intact earlier layout sets a store aside: the current layout claiming an earlier
+    /// version, or an earlier layout claiming the current one, is damage, and the store stays.
+    #[test]
+    fn a_mislabeled_layout_is_damage_never_set_aside() {
+        let mut current = job_record_to_batch(&valid_job_record(1)).unwrap();
+        let mut columns = current.columns().to_vec();
+        columns[1] = Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION - 1]));
+        current = RecordBatch::try_new(current.schema(), columns).unwrap();
+        let claims_current = earlier_batch(&valid_job_record(1), 4, RECORD_SCHEMA_VERSION);
+        for batch in [current, claims_current] {
+            let root = temp_root("mislabeled-layout");
+            drop(store_at(&root, ArtifactConfig::default()));
+            append_batch(&root, &batch);
+            assert!(matches!(
+                recover_records(&records_path(&root)),
+                Err(ArtifactError::Integrity { .. })
+            ));
+            assert!(
+                !root
+                    .join(PROTECTED_DIRECTORY)
+                    .join(JOB_DIRECTORY)
+                    .join(SET_ASIDE_DIRECTORY)
+                    .exists()
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     #[test]
