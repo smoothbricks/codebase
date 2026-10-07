@@ -864,11 +864,11 @@ impl RouterHandle {
 /// Requests arrive in id order and are answered as each completes, not in arrival order: a
 /// request that waits on a job (its end, its next output) must not hold the answers to the
 /// requests behind it. Each answer, with its binary frame, is written whole under the writer
-/// lock. At most [`MAX_IN_FLIGHT_REQUESTS`] calls that are not streams are open at once; past
-/// that the connection reads no further frame until one completes. A stream-lane call is open
-/// until its caller ends it, so it counts against [`MAX_OPEN_STREAMS`] instead, and a stream
-/// request past that is refused: a caller's demands are always read, and no stream waits on a
-/// demand the connection does not read.
+/// lock. Frames are read for as long as the connection is open, so a demand on an open stream is
+/// always read. At most [`MAX_IN_FLIGHT_REQUESTS`] calls that are not streams are open at once;
+/// a call past that waits, unrouted, until one completes, at most [`MAX_WAITING_REQUESTS`] of
+/// them, and a call past both is refused. A stream-lane call is open until its caller ends it, so
+/// it counts against [`MAX_OPEN_STREAMS`] instead, and a stream request past that is refused.
 ///
 /// Dropping this future owns only connection state: its unanswered requests are abandoned, its
 /// streams end, and routed jobs remain owned by the router actor.
@@ -918,6 +918,8 @@ pub async fn serve_controller_connection(
     // Where each open stream-lane call's demands go, by call id: a subset of `answers`, entered
     // when its answer starts and removed when that answer ends.
     let mut streams = std::collections::HashMap::<u64, mpsc::UnboundedSender<Demand>>::new();
+    // Ordinary calls admitted past the open-call cap, started in order as open ones complete.
+    let mut waiting = std::collections::VecDeque::<Admitted>::new();
     let mut incoming = std::pin::pin!(next_frame(reader));
     // Set once a request ends the connection: no further request is read, and the loop ends
     // with the answer that reports it.
@@ -925,9 +927,7 @@ pub async fn serve_controller_connection(
     let mut next_id = 1_u64;
     loop {
         tokio::select! {
-            (reader, frame) = incoming.as_mut(),
-                if !closing && answers.len() - streams.len() < MAX_IN_FLIGHT_REQUESTS =>
-            {
+            (reader, frame) = incoming.as_mut(), if !closing => {
                 let Some(frame) = frame? else {
                     return Ok(());
                 };
@@ -972,33 +972,46 @@ pub async fn serve_controller_connection(
                         continue;
                     }
                 };
-                let demands = if lane == Lane::Stream {
-                    if streams.len() >= MAX_OPEN_STREAMS {
-                        let error = CowshedError::conflict(
-                            format!(
-                                "this connection already has {MAX_OPEN_STREAMS} open streams"
-                            ),
-                            "end a stream before opening another",
-                        );
-                        answers.spawn(refuse(Arc::clone(&writer), id, error, false));
-                        continue;
-                    }
-                    let (demand, demands) = mpsc::unbounded_channel();
-                    streams.insert(id, demand);
-                    Some(demands)
-                } else {
-                    None
-                };
-                answers.spawn(answer(
-                    Arc::clone(&writer),
-                    router.clone(),
-                    authority.clone(),
+                let mut call = Admitted {
                     id,
-                    request.steps(),
+                    steps: request.steps(),
                     operation,
                     upload,
-                    demands,
-                ));
+                    demands: None,
+                };
+                let open = answers.len() - streams.len();
+                let refusal = if lane == Lane::Stream {
+                    if streams.len() < MAX_OPEN_STREAMS {
+                        let (demand, demands) = mpsc::unbounded_channel();
+                        streams.insert(id, demand);
+                        call.demands = Some(demands);
+                        None
+                    } else {
+                        Some(CowshedError::conflict(
+                            format!("this connection already has {MAX_OPEN_STREAMS} open streams"),
+                            "end a stream before opening another",
+                        ))
+                    }
+                } else if open < MAX_IN_FLIGHT_REQUESTS {
+                    None
+                } else if waiting.len() < MAX_WAITING_REQUESTS {
+                    waiting.push_back(call);
+                    continue;
+                } else {
+                    Some(CowshedError::conflict(
+                        format!(
+                            "this connection already has {MAX_IN_FLIGHT_REQUESTS} open calls and \
+                             {MAX_WAITING_REQUESTS} waiting"
+                        ),
+                        "wait for an open call to complete before sending another",
+                    ))
+                };
+                match refusal {
+                    Some(error) => {
+                        answers.spawn(refuse(Arc::clone(&writer), id, error, false));
+                    }
+                    None => start(&mut answers, &writer, &router, &authority, call),
+                }
             }
             Some(outcome) = answers.join_next() => {
                 let (id, outcome) = outcome.map_err(|error| {
@@ -1006,8 +1019,14 @@ pub async fn serve_controller_connection(
                 })?;
                 streams.remove(&id);
                 outcome?;
+                while answers.len() - streams.len() < MAX_IN_FLIGHT_REQUESTS
+                    && let Some(call) = waiting.pop_front()
+                {
+                    start(&mut answers, &writer, &router, &authority, call);
+                }
             }
-            // Reading stops only while an answer is open, so one is always pending here.
+            // Reading stops only once the connection is closing, which leaves the answer that
+            // reports why pending.
             else => {
                 return Err(CowshedError::internal(
                     "controller connection has no request to read and none to answer",
@@ -1017,8 +1036,41 @@ pub async fn serve_controller_connection(
     }
 }
 
+/// A validated call, ready to route: its id, whether it asked for its steps, its decoded request
+/// and upload frame, and, for a stream-lane call, where its demands arrive.
+struct Admitted {
+    id: u64,
+    steps: bool,
+    operation: OperationRequest,
+    upload: Option<Bytes>,
+    demands: Option<mpsc::UnboundedReceiver<Demand>>,
+}
+
+/// Routes `call` and writes its answer on a task of its own.
+fn start(
+    answers: &mut tokio::task::JoinSet<(u64, Result<()>)>,
+    writer: &ConnectionWriter,
+    router: &RouterHandle,
+    authority: &ConnectionAuthority,
+    call: Admitted,
+) {
+    answers.spawn(answer(
+        Arc::clone(writer),
+        router.clone(),
+        authority.clone(),
+        call.id,
+        call.steps,
+        call.operation,
+        call.upload,
+        call.demands,
+    ));
+}
+
 /// Calls other than streams one connection may have open at once.
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
+/// Calls other than streams one connection may have waiting for an open one to complete.
+const MAX_WAITING_REQUESTS: usize = 64;
 
 /// Stream-lane calls one connection may have open at once.
 const MAX_OPEN_STREAMS: usize = 64;
