@@ -12,6 +12,7 @@
 //! is refused.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::api::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
 use crate::api::process::{
@@ -82,14 +83,34 @@ pub struct ProcessNode<'a> {
     pub identity: ProcessIdentity,
     /// `None` for a root.
     pub parent: Option<ProcessIdentity>,
-    pub sample: &'a JobProcessSample,
+    pub ppid: u32,
+    pub image: &'a ProcessImage,
+    pub born_at: &'a UtcTimestamp,
+    pub exit: Option<&'a ProcessExit>,
 }
 
 #[derive(Debug)]
 struct Life {
     identity: ProcessIdentity,
     parent: Option<usize>,
-    sample: JobProcessSample,
+    ppid: u32,
+    /// Shared with the parent until this life execs: a fork copies no argv.
+    image: Arc<ProcessImage>,
+    born_at: UtcTimestamp,
+    exit: Option<ProcessExit>,
+}
+
+impl Life {
+    fn sample(&self) -> JobProcessSample {
+        JobProcessSample {
+            pid: self.identity.pid,
+            ppid: self.ppid,
+            program: self.image.program.clone(),
+            argv: self.image.argv.clone(),
+            born_at: self.born_at.clone(),
+            exit: self.exit.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,7 +142,7 @@ impl ProcessTreeFold {
                 ppid,
                 at,
                 image,
-            } => self.born(process, None, ppid, at, image),
+            } => self.born(process, None, ppid, at, Arc::new(image)),
             ProcessObservation::Forked {
                 process,
                 parent,
@@ -131,22 +152,18 @@ impl ProcessTreeFold {
                     self.gap(ProcessCoverageGap::UnobservedBirth { pid: parent.pid });
                     return Ok(());
                 };
-                let parent_sample = &self.lives[index].sample;
-                if parent_sample.exit.is_some() {
+                let parent_life = &self.lives[index];
+                if parent_life.exit.is_some() {
                     return Err(ProcessFoldError::AfterExit { pid: parent.pid });
                 }
-                let image = ProcessImage {
-                    program: parent_sample.program.clone(),
-                    argv: parent_sample.argv.clone(),
-                };
+                let image = Arc::clone(&parent_life.image);
                 self.born(process, Some(index), parent.pid, at, image)
             }
             ProcessObservation::Exec { process, image } => {
-                let Some(sample) = self.running_sample(process)? else {
+                let Some(life) = self.running_life(process)? else {
                     return Ok(());
                 };
-                sample.program = image.program;
-                sample.argv = image.argv;
+                life.image = Arc::new(image);
                 Ok(())
             }
             ProcessObservation::Exited {
@@ -154,10 +171,10 @@ impl ProcessTreeFold {
                 status,
                 at,
             } => {
-                let Some(sample) = self.running_sample(process)? else {
+                let Some(life) = self.running_life(process)? else {
                     return Ok(());
                 };
-                sample.exit = Some(ProcessExit {
+                life.exit = Some(ProcessExit {
                     status,
                     exited_at: at,
                 });
@@ -180,7 +197,10 @@ impl ProcessTreeFold {
         self.lives.iter().map(|life| ProcessNode {
             identity: life.identity,
             parent: life.parent.map(|index| self.lives[index].identity),
-            sample: &life.sample,
+            ppid: life.ppid,
+            image: &life.image,
+            born_at: &life.born_at,
+            exit: life.exit.as_ref(),
         })
     }
 
@@ -200,7 +220,7 @@ impl ProcessTreeFold {
         JobProcessTree {
             job_id,
             sampled_at,
-            processes: self.lives.iter().map(|life| life.sample.clone()).collect(),
+            processes: self.lives.iter().map(Life::sample).collect(),
             coverage: self.coverage.clone(),
         }
     }
@@ -211,7 +231,7 @@ impl ProcessTreeFold {
         parent: Option<usize>,
         ppid: u32,
         at: UtcTimestamp,
-        image: ProcessImage,
+        image: Arc<ProcessImage>,
     ) -> Result<(), ProcessFoldError> {
         if self.by_identity.contains_key(&identity) {
             return Err(ProcessFoldError::BornTwice { pid: identity.pid });
@@ -224,33 +244,29 @@ impl ProcessTreeFold {
         self.lives.push(Life {
             identity,
             parent,
-            sample: JobProcessSample {
-                pid: identity.pid,
-                ppid,
-                program: image.program,
-                argv: image.argv,
-                born_at: at,
-                exit: None,
-            },
+            ppid,
+            image,
+            born_at: at,
+            exit: None,
         });
         Ok(())
     }
 
-    /// The sample of a life with no observed exit; `None`, recorded as a gap, for a life whose
-    /// birth was never observed.
-    fn running_sample(
+    /// A life with no observed exit; `None`, recorded as a gap, for a life whose birth was never
+    /// observed.
+    fn running_life(
         &mut self,
         process: ProcessIdentity,
-    ) -> Result<Option<&mut JobProcessSample>, ProcessFoldError> {
+    ) -> Result<Option<&mut Life>, ProcessFoldError> {
         let Some(&index) = self.by_identity.get(&process) else {
             self.gap(ProcessCoverageGap::UnobservedBirth { pid: process.pid });
             return Ok(None);
         };
-        let sample = &mut self.lives[index].sample;
-        if sample.exit.is_some() {
+        let life = &mut self.lives[index];
+        if life.exit.is_some() {
             return Err(ProcessFoldError::AfterExit { pid: process.pid });
         }
-        Ok(Some(sample))
+        Ok(Some(life))
     }
 
     fn gap(&mut self, reason: ProcessCoverageGap) {
@@ -344,7 +360,7 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].identity, shell);
         assert_eq!(nodes[0].parent, None);
-        assert_eq!(nodes[0].sample.exit, None);
+        assert_eq!(nodes[0].exit, None);
         assert_eq!(nodes[1].parent, Some(shell));
 
         let tree = fold.tree(job(), at(3));
@@ -381,6 +397,19 @@ mod tests {
         let tree = fold.tree(job(), at(2));
         assert_eq!(tree.processes[1].program, "/bin/sh");
         assert_eq!(tree.processes[1].argv, tree.processes[0].argv);
+        fold.apply(ProcessObservation::Exec {
+            process: subshell,
+            image: image("/usr/bin/make", &[b"make"]),
+        })
+        .unwrap();
+        fork(&mut fold, id(103, 4), shell, 2);
+        let tree = fold.tree(job(), at(3));
+        assert_eq!(tree.processes[1].program, "/usr/bin/make");
+        // The child's exec leaves the image it shared with its parent, which the parent's next
+        // child shares in turn.
+        assert_eq!(tree.processes[0].program, "/bin/sh");
+        assert_eq!(tree.processes[2].program, "/bin/sh");
+        assert_eq!(tree.processes[2].argv, tree.processes[0].argv);
     }
 
     /// Joining by numeric pid fails this: it folds both lives of pid 200 into one record and
