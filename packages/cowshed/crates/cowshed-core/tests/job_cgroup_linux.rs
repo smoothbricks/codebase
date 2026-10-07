@@ -35,6 +35,7 @@ const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";
 const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
+const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
 
 /// CPU a placed process can spend outside its job: from its fork to its placement write, in the
 /// spawning library's child setup. Measured deficits are printed beside every comparison.
@@ -62,6 +63,8 @@ struct Workload {
     burn_after_ms: u64,
     /// Started one after another once the burns are done, each waited for.
     children: Vec<Workload>,
+    /// Once every child was reaped, report [`HELD`] and wait for one byte on stdin.
+    hold: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -200,6 +203,12 @@ fn work(workload: &Workload) {
             report_in(&String::from_utf8_lossy(&output.stdout))
         })
         .collect();
+    if workload.hold {
+        println!("{HELD}");
+        std::io::stdout().flush().expect("flush");
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).expect("release");
+    }
     let report = WorkloadReport {
         pid: std::process::id(),
         first_cgroup,
@@ -235,6 +244,7 @@ fn control() {
     concurrent_jobs_stay_apart(&jobs);
     a_spawners_earlier_work_is_not_charged(&jobs);
     late_migration_misses_initial_cpu(&jobs);
+    burst_cpu_outlives_its_processes(&jobs);
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
 
@@ -370,6 +380,59 @@ fn late_migration_misses_initial_cpu(jobs: &IncarnationCgroups) {
     );
 }
 
+/// Children that burn CPU and are reaped between two looks at the job leave no live process to
+/// sum, yet the job's `cpu.stat` keeps every microsecond of theirs; a concurrent unrelated job's
+/// CPU never enters it.
+fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
+    let burst = jobs.admit(job_id(8)).expect("admit");
+    let unrelated = jobs.admit(job_id(9)).expect("admit");
+    let before = burst.cpu().expect("cpu before");
+    let child = Workload {
+        burn_before_ms: 40,
+        ..Workload::default()
+    };
+    let neighbour = Spawned::placed(
+        &unrelated,
+        &Workload {
+            burn_before_ms: 400,
+            ..Workload::default()
+        },
+    );
+    let mut running = Spawned::placed(
+        &burst,
+        &Workload {
+            children: vec![child; 8],
+            hold: true,
+            ..Workload::default()
+        },
+    );
+    running.await_marker(HELD);
+    // The poll after the burst: only the parent is left, and it burned next to nothing itself.
+    let live = live_members_cpu_us(&burst);
+    let during = burst.cpu().expect("cpu after the burst");
+    println!(
+        "burst: cgroup {} us before, {} us after; live members hold {live} us",
+        before.usage_us.get(),
+        during.usage_us.get()
+    );
+    assert!(
+        live + 250_000 < during.usage_us.get(),
+        "a live-members-only sum must miss the reaped children's 320 ms: live {live} us, cgroup \
+         {} us",
+        during.usage_us.get()
+    );
+    running.release();
+    let report = running.finish();
+    let neighbour_report = neighbour.finish();
+    assert!(
+        report.children_cpu_us >= 8 * 40_000,
+        "the children burned what they were told: {} us",
+        report.children_cpu_us
+    );
+    assert_accounted(&burst, &report, "burst");
+    assert_accounted(&unrelated, &neighbour_report, "burst neighbour");
+}
+
 fn retirement_waits_for_the_last_process(jobs: &IncarnationCgroups) {
     let job = jobs.admit(job_id(6)).expect("admit");
     let identity = job.identity().clone();
@@ -392,7 +455,12 @@ fn retirement_waits_for_the_last_process(jobs: &IncarnationCgroups) {
     running.finish();
     let terminal = job.terminal().expect("its last process was reaped");
     let path = terminal.path().to_path_buf();
-    terminal.retire().expect("retire");
+    let final_cpu = terminal.cpu().expect("final cpu");
+    let totals = terminal.retire().expect("retire");
+    assert_eq!(
+        totals.cpu, final_cpu,
+        "retirement collects the final counters"
+    );
     assert!(!path.exists(), "{} was retired", path.display());
     assert!(matches!(
         jobs.lookup(&identity),
@@ -417,7 +485,7 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
         .iter()
         .map(|identity| identity.job_id().get())
         .collect();
-    assert_eq!(outstanding, [1, 2, 3, 4, 5, 7], "job 6 was retired");
+    assert_eq!(outstanding, [1, 2, 3, 4, 5, 7, 8, 9], "job 6 was retired");
 
     let other = authority.incarnation(&incarnation(2)).expect("incarnation");
     assert!(matches!(
@@ -472,12 +540,16 @@ impl Spawned {
     }
 
     fn await_pause(&mut self) {
+        self.await_marker(PAUSED);
+    }
+
+    fn await_marker(&mut self, marker: &str) {
         let mut line = String::new();
         loop {
             line.clear();
             let read = self.stdout.read_line(&mut line).expect("workload output");
-            assert_ne!(read, 0, "the workload ended before it paused");
-            if line.trim_end() == PAUSED {
+            assert_ne!(read, 0, "the workload ended before it reported {marker}");
+            if line.trim_end() == marker {
                 return;
             }
         }
@@ -485,6 +557,10 @@ impl Spawned {
 
     fn resume(&mut self) {
         self.stdin.write_all(b"r").expect("resume the workload");
+    }
+
+    fn release(&mut self) {
+        self.stdin.write_all(b"r").expect("release the workload");
     }
 
     fn finish(mut self) -> WorkloadReport {
@@ -519,12 +595,29 @@ fn report_in(output: &str) -> WorkloadReport {
 // Kernel reads
 
 /// The job's cgroup accounts at least the workload's own CPU, less the fork-to-placement window,
-/// and at most that CPU: nothing outside the workload's tree is charged to it.
+/// and at most that CPU: nothing outside the workload's tree is charged to it. The reader agrees
+/// with an independent read of the same final counters, and its user and system split the usage.
 fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
+    let cpu = job.cpu().expect("the job's cpu.stat");
     let usage = usage_us(job);
+    assert_eq!(
+        cpu.usage_us.get(),
+        usage,
+        "{scenario}: the reader and an independent read of final counters differ"
+    );
+    let split = cpu.user_us.get() + cpu.system_us.get();
+    assert!(
+        split.abs_diff(usage) <= 2,
+        "{scenario}: user {} us + system {} us does not split usage {usage} us",
+        cpu.user_us.get(),
+        cpu.system_us.get()
+    );
     let total = report.total_cpu_us();
     println!(
-        "{scenario}: cgroup {usage} us, workload's own {total} us, deficit {} us",
+        "{scenario}: cgroup {usage} us (user {} us, system {} us), workload's own {total} us, \
+         deficit {} us",
+        cpu.user_us.get(),
+        cpu.system_us.get(),
         i128::from(total) - i128::from(usage)
     );
     assert!(
@@ -536,6 +629,27 @@ fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
         "{scenario}: the job's cgroup holds CPU its workload never spent: cgroup {usage} us, own \
          {total} us"
     );
+}
+
+/// What a census of the job's live members finds: each one's own user + system CPU from
+/// `/proc/<pid>/stat`, summed. Reaped processes are in no census.
+fn live_members_cpu_us(job: &JobCgroup) -> u64 {
+    // SAFETY: sysconf takes a constant.
+    let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).expect("clock ticks");
+    let procs = job.path().join("cgroup.procs");
+    std::fs::read_to_string(&procs)
+        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
+        .lines()
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let after = &stat[stat.rfind(')')? + 2..];
+            let fields: Vec<&str> = after.split_whitespace().collect();
+            // utime and stime are fields 14 and 15 of stat(5); `after` starts at field 3.
+            let utime: u64 = fields[11].parse().expect("utime");
+            let stime: u64 = fields[12].parse().expect("stime");
+            Some((utime + stime) * 1_000_000 / ticks)
+        })
+        .sum()
 }
 
 /// `usage_usec` of the job's `cpu.stat`, read directly.
