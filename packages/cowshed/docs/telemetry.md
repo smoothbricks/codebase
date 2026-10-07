@@ -5,12 +5,28 @@ operation, every job, and every gateway request is a span; spans carry a W3C tra
 they flush as Arrow segments under `/private/cowshed/store/telemetry/`. There is one storage format (lmao's Arrow trace
 schema), no NDJSON files on disk, and no telemetry daemon. (Spec: `specs/cowshed/13_telemetry.md`.)
 
+> **Implementation status — process monitoring:** per-process tree observation, resource/blocker events, and the compact
+> process/job spans described below are unbuilt. Existing gateway and continuity segments are not that tree.
+
 ## Why not a logfile
 
 Text logs record _that_ things happened. Columns make cowshed's behavior a **dataset** — the same artifact answers
 debugging (span waterfalls), security (audit joins), and fleet ops. "What did this workspace try to reach, and what was
 denied?" is one query over the gateway's audit columns, not a grep across rotated files, and columnar audit is an order
 of magnitude smaller than the equivalent NDJSON.
+
+## Compact process observations
+
+The supervisor observes the complete owned process tree and exposes typed snapshots/events through the generated
+controller and Node-API declarations. Each process has one `process.run` span with birth/exit boundaries and process
+tree parentage. Fourteen shared custom columns hold PID, dictionary-encoded program, one start-row argv display, CPU
+user/sys microseconds, RSS/current peak, I/O read/write bytes, exit code/signal, and blocker kind/path/holder PID. The
+exact declaration is [Process-tree spans](../../../specs/cowshed/13_telemetry.md#process-tree-spans).
+
+Rows record state/blocker changes, RSS 2× steps, and busy/idle transitions, plus a coarse heartbeat per progress tick.
+Only changed columns are set; the terminal row carries final usage. Host start/end load and cores and the signed
+workspace/build-volume deltas stay on the job span. There are no JSON string columns or new columns per process, metric,
+or sample. Missing blocker evidence is not a claim that a process is unblocked.
 
 ## Reading it
 

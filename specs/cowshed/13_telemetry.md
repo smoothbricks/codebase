@@ -19,6 +19,10 @@ bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lma
 without its `lmao-core` runtime; nothing in cowshed queries traces with `lmao-query`, and no golden trace fixture
 exists.
 
+> **Implementation status — process monitoring:** fork/exec tree observation, per-process resource/blocker events,
+> `process.run` spans, their on-change/heartbeat rows, and job-span host/volume columns below are unbuilt. Existing
+> gateway trace segments and controller commitments do not implement that process tree.
+
 ## Trace context propagation
 
 cowshed uses W3C trace context (`traceparent`). Every entry point **mints or adopts**:
@@ -68,6 +72,51 @@ traffic from tier-2 to tier-1 attribution (below).
 - **The escalation loop as one trace.** The exit-6 negotiation (12_mcp.md) — denial span (with the EPERM evidence,
   04_sandbox.md) → worker→coordinator report → `grant` span (revision bump) → retry exec — is a single trace instead of
   four disconnected log lines across three files.
+
+## Process-tree spans
+
+The workspace supervisor records one `process.run` LMAO span for every process owned by a job, even a short-lived
+descendant. Span start/end are its observed birth/exit. Within the job's tree the parent span is the observed ppid edge;
+a root process hangs from the job's trace context. No extra parent column restates span parentage. The same
+identity-fenced process records reach the controller protocol and N-API through the single declaration in 07_api.md.
+
+Every process span and its rows share exactly this small fixed custom column set:
+
+| Column               | Type         | Meaning                                                                |
+| -------------------- | ------------ | ---------------------------------------------------------------------- |
+| `proc_pid`           | `u32`        | Observed process PID, fenced by its retained birth identity.           |
+| `proc_program`       | `S.category` | Program; repeated values are dictionary-encoded.                       |
+| `proc_argv`          | `S.text`     | Deterministic argv display written once, on the span's start row only. |
+| `cpu_user_us`        | `u64`        | Cumulative own-process user CPU microseconds.                          |
+| `cpu_sys_us`         | `u64`        | Cumulative own-process system CPU microseconds.                        |
+| `rss_bytes`          | `u64`        | Current resident bytes.                                                |
+| `rss_peak_bytes`     | `u64`        | Peak observed resident bytes.                                          |
+| `io_read_bytes`      | `u64`        | Process I/O read bytes.                                                |
+| `io_write_bytes`     | `u64`        | Process I/O write bytes.                                               |
+| `exit_code`          | `i32`        | Ordinary exit code, set on the terminal row when applicable.           |
+| `exit_signal`        | `S.enum`     | Exact terminating signal, set only for a signaled exit.                |
+| `blocked_on`         | `S.enum`     | Observed `none                                                         | lock | socket | pipe | child | stdin | disk`; unobserved is null. |
+| `blocked_path`       | `S.category` | Observed blocker path, when the blocker has one.                       |
+| `blocked_holder_pid` | `u32`        | Evidence-backed lock-holder PID, when known.                           |
+
+Samples become log rows only on a state/blocker transition, an RSS crossing of a 2× step, or a busy/idle CPU flip, plus
+one coarse heartbeat row per progress tick. A row sets only the columns that changed; unchanged columns are null, not
+repeated payload. The terminal row carries the final usage and exact exit. A blocker transition with no other changed
+value still creates a row. Program changes at exec use `proc_program`; argv remains a single start-row display, while
+the typed process event retains the exact command arguments. Display escaping is deterministic and does not turn
+arbitrary Unix argv bytes into lossy UTF-8 or a JSON string column. A CPU busy/idle flip uses a fixed standard row
+kind/template, not a fifteenth custom column. Sparse API deltas distinguish unchanged, SET, and CLEAR; the row's
+transition kind preserves clearing semantics without carrying a JSON payload or adding columns.
+
+The job span, not each process span, carries signed `disk_ws_delta_bytes` and optional `disk_build_delta_bytes`,
+`load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. Host load converts once to nearest
+milliload with the declared checked conversion; non-finite, negative, or overflowing load and an overflowing core count
+are typed errors, never truncation. A missing build volume leaves its delta null. Process I/O and volume allocation
+remain different facts.
+
+One generated column declaration owns these names, types, enum values, and event-to-row projections. No writer
+hand-copies the schema. The tree is span parentage, never JSON; no process name, metric name, or sample number creates a
+new column. Program/path categories share dictionaries across repeated observations.
 
 ## Attribution tiers
 

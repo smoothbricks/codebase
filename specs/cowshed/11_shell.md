@@ -10,7 +10,8 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > terminal persistence, periodic progress subscriptions, bounded cursor tails, and generation of controller and N-API
 > monitoring bindings from one API declaration are unbuilt. Group-owned TCP-listener queries and attachment stdin EOF
 > are also unbuilt; Rust attachment writes exist, while N-API exposes no attachment stdio. The process-group ownership
-> ledger is implemented; it is not a resource-sampling API.
+> ledger is implemented; it is not a resource-sampling API. Fork/exec tree observation, per-process usage and blocker
+> samples, process event streams, CPU-winning leaf identity, and process/job resource spans are unbuilt as well.
 
 ## Shell activation and process reuse
 
@@ -400,6 +401,25 @@ boundary is the first job-owned process: the activation group on a cold host, ot
 real progress while it runs, and a failure preserves its cost. When the command starts, current leader/membership move
 to its group, but wall time, host-start, and volume baselines stay at that first spawn; CPU accumulates activation and
 command, never idle time inherited from a reused warm host.
+
+### Complete process tree, compact observations
+
+The supervisor observes each fork and exec in the job's owned process tree and samples its members at the poll cadence:
+kqueue `NOTE_FORK`/`NOTE_EXEC` on macOS, pidfd-backed process identities and proc children on Linux. Identity-fenced
+records retain exited descendants and their final usage, so a compiler that starts and exits between coarse progress
+ticks remains part of the job's cost and leaf-work identity. Missing observations are errors, not a shortened tree
+presented as complete.
+
+`JobHandle.processes` and `process_events` expose the canonical records in 07_api.md through both controller and N-API,
+generated from the same declaration. The records carry per-process CPU user/sys microseconds, current/peak RSS,
+read/write I/O, busy/idle state, observed blocker kind and evidence, and exact exit state. A lock can name its holder
+PID and job; absence of blocker evidence never means `none`. No shell flavor or argv classification sets an expectation
+for these observations.
+
+The supervisor emits one `process.run` span per process under the job's trace, with parentage following the process tree
+and birth/exit as its boundaries. Changed-state rows and coarse heartbeat rows use the fixed shared columns in
+13_telemetry.md; job-level host load and volume deltas stay on the job span. There is no per-process, per-metric, or
+per-sample column proliferation, and no JSON string payload.
 
 Workspace and build-volume used-byte deltas are separate volume statistics, never a tree scan or a claim about
 per-process write syscalls. They compare usage at spawn with usage at the sample or terminal boundary and may be

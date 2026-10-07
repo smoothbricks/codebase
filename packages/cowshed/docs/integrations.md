@@ -248,7 +248,8 @@ Job resource samples, progress events, cursor-addressed bounded tails, resumable
 stdio/EOF, identity-fenced group-listener queries, and `AbortSignal` plumbing are unbuilt. The Rust core already
 supports offset-addressed raw log reads, numeric-job reattachment, and attachment stdin writes; its `JobStdin` has no
 explicit close operation. The addon does not yet expose that full surface. One-use worker descriptor connection is also
-unbuilt.
+unbuilt. Fork/exec tree observations, per-process CPU/RSS/I/O and blocker facts, typed process event streams,
+CPU-winning leaf identity, and their `process.run`/job spans are also unbuilt.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
@@ -261,6 +262,12 @@ shell's activation; progress and terminal accounting include that activation, bu
 previously warm host. Readiness uses `listeningPorts()` from the owned group rather than a host-wide probe. Attachment
 `write()` and `end()` preserve binary input, backpressure, and exactly-once EOF without implicitly cancelling the
 command.
+
+`processes()` returns the identity-fenced tree, including exited descendants and their final usage;
+`processEvents(everyMs)` streams birth/exec/change/heartbeat/exit records. Both derive from the same API declaration as
+the controller. Low CPU never supplies a guessed blocker; `none` means observed unblocked state, and missing evidence
+remains explicit. The span projection uses the compact fixed column set in the telemetry specification, not JSON
+payloads or one column per process. No command flavor or argv-derived expectation is required.
 
 The CLI remains the integration point for shell-only consumers. Rust, N-API, CLI, and MCP frontends must agree on
 lifecycle, grant propagation, numeric jobs, tiered artifact storage, bounded summaries and control responses, raw

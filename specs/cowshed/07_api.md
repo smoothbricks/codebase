@@ -11,7 +11,10 @@ with identical semantics and error taxonomy.
 > sessions, numeric job lookup, status/wait/kill, attach/detach, and buffered output reads from byte zero; resumable raw
 > streams, attachment stdio, attachment stdin EOF, group-listener queries, and abort plumbing are unbuilt. Core
 > attachment stdin writes exist, but `JobStdin` has no close operation. Its request DTO and TypeScript types are
-> hand-maintained; the shared wire corpus checks agreement, not generated parity.
+> hand-maintained; the shared wire corpus checks agreement, not generated parity. Complete fork/exec process-tree
+> observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work identity, and the compact
+> process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies groups for safe termination; it
+> does not yet provide these observations.
 
 ## Authority model (frozen)
 
@@ -336,6 +339,8 @@ impl JobHandle {
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
     pub async fn resources(&self) -> Result<JobResourceSample, CowshedError>;
     pub async fn listening_ports(&self) -> Result<JobListeningPorts, CowshedError>;
+    pub async fn processes(&self) -> Result<JobProcessTree, CowshedError>;
+    pub async fn process_events(&self, every_ms: u64) -> Result<JobProcessStream, CowshedError>;
     pub async fn progress(&self, every_ms: u64) -> Result<JobProgressStream, CowshedError>;
     pub async fn tail(&self, cursor: Option<JobJournalCursor>, limits: JobTailLimits)
         -> Result<JobTail, CowshedError>;
@@ -670,6 +675,7 @@ pub struct JobResourceSample {
     pub wall_ms: u64,
     pub leader_pid: u32,              // observed leader; this sample exists only after spawn
     pub members: Vec<u32>,            // complete current membership of the owned job process group
+    pub leaf: JobProcessLeaf,          // retained CPU-winning leaf identity, including exited work
     pub cpu_user_ms: u64,
     pub cpu_sys_ms: u64,
     pub cpu_pct: f64,
@@ -748,6 +754,76 @@ Attachment stdin is the same bounded, backpressured raw-byte lane as exec stdin,
 idempotent. Writes after EOF are a typed conflict. The N-API attachment projects these as `write()` and `end()`, without
 buffering the whole input. Detaching the attachment or closing its output iterator does not kill the job; explicit input
 EOF and job cancellation remain different operations.
+
+### Process-tree observations
+
+`processes()` returns `JobProcessTree { jobId, sampledAt, processes }`, retaining the final record of exited descendants
+as well as current members. The supervisor owns the observation of every fork/exec in its job's tree: macOS uses kqueue
+`NOTE_FORK`/`NOTE_EXEC` on members, Linux uses pidfd-backed identities and proc children, and both sample members at the
+supervisor's poll cadence. This is one generated controller and N-API declaration, not an adapter's `ps` scan. A lost
+observation or failed identity read is a typed error, never a silently incomplete tree or a PID reused as if it were the
+original process.
+
+The canonical records are:
+
+```rust
+pub struct JobProcessTree {
+    pub job_id: JobId,
+    pub sampled_at: UtcTimestamp,
+    pub processes: Vec<JobProcessSample>,
+}
+pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<CommandArg> }
+pub enum ProcessBlockedOn { None, Lock, Socket, Pipe, Child, Stdin, Disk }
+pub struct JobProcessSample {
+    pub pid: u32,
+    pub ppid: u32,
+    pub program: String,
+    pub argv: Vec<CommandArg>,
+    pub born_at: UtcTimestamp,
+    pub cpu_user_us: u64,
+    pub cpu_sys_us: u64,
+    pub rss_bytes: u64,
+    pub rss_peak_bytes: u64,
+    pub io_read_bytes: u64,
+    pub io_write_bytes: u64,
+    pub busy: bool,
+    pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
+    pub blocked_path: Option<String>,
+    pub blocked_holder_pid: Option<u32>,
+    pub blocked_holder_job: Option<JobId>,
+    pub exit: Option<ExitStatus>,
+    pub exited_at: Option<UtcTimestamp>,
+}
+pub enum JobProcessEvent {
+    Born(JobProcessSample),
+    Exec(JobProcessSample),
+    Changed(JobProcessDelta),          // generated non-empty sparse projection of changed fields
+    Heartbeat(JobProcessTree),
+    Exited(JobProcessSample),          // final own-process usage, exit and exitedAt
+}
+pub struct JobProcessStream { /* bounded stream of Result<JobProcessEvent, CowshedError> */ }
+```
+
+Birth and parent identity are kernel observations retained internally, not fresh trust in numeric PID values.
+Per-process CPU counters are that process's own usage; group totals accumulate each member once, including exited
+members. Microsecond process counters convert to the job's millisecond counters through one named conversion after
+aggregation. I/O counters distinguish process reads/writes from volume-wide used-byte deltas. Exit and `exitedAt` are
+present together only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal result.
+Blocker detail fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation
+error, never an assertion that the process is unblocked. A lock observation identifies its path and, when kernel
+evidence resolves it, the holder PID and that holder's job; no program-name guess supplies it.
+
+`processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one coarse heartbeat per
+progress tick, and each process's final usage on exit. State or blocker transitions, an RSS crossing of a 2× step, and a
+busy/idle CPU flip produce change records; an unchanged ordinary sample does not. Closing a reader never kills the
+process. The `leaf` in `JobResourceSample` selects the deepest CPU-winning process from the retained tree, not only live
+members; CPU usage, depth, then birth identity/PID provide deterministic tie-breaking. Consumers use these observed
+facts without declaring or deriving an expectation from a command's argv. The generated sparse delta distinguishes
+unchanged, SET, and CLEAR; clearing a blocker path or holder never leaves the preceding lock's detail in the current
+snapshot. Its constructor rejects an empty change event.
+
+The corresponding span layout and event-to-row projection are defined once in 13_telemetry.md, "Process-tree spans". API
+records remain typed; no JSON string column carries a process tree or metric payload.
 
 ### Keyed admission and restart attachment
 
@@ -1064,6 +1140,8 @@ export interface JobHandle {
   status(): Promise<JobInfo>;
   resources(): Promise<JobResourceSample>;
   listeningPorts(): Promise<JobListeningPorts>;
+  processes(): Promise<JobProcessTree>;
+  processEvents(everyMs: number): AsyncIterable<JobProcessEvent>;
   progress(everyMs: number): AsyncIterable<JobResourceSample>;
   tail(cursor: JobJournalCursor | undefined, limits: JobTailLimits): Promise<JobTail>;
   logs(
