@@ -62,8 +62,10 @@ pub fn finish(checkout: &Path, mut report: impl FnMut(&Path)) -> io::Result<()> 
     Ok(())
 }
 
-/// Delete `checkout`'s pending discards on a background thread, unless one in this process
-/// already is. Never blocks the caller. The thread says what it deletes and any failure on
+/// Delete `checkout`'s pending discards on a background thread. Never blocks the caller. The
+/// thread waits out any reaper or [`finish`] of this checkout already deleting in this process,
+/// then lists what is still pending: what that one listed before this refresh moved its own
+/// build state aside is not what it deletes. The thread says what it deletes and any failure on
 /// stderr; a failure leaves the discard pending for the next refresh or `gc`.
 pub fn reap(checkout: &Path) {
     match pending(checkout) {
@@ -83,10 +85,9 @@ pub fn reap(checkout: &Path) {
         .name("cowshed-discard".to_owned())
         .spawn(move || {
             let checkout = reaped;
-            // Another reaper of this checkout is deleting; it takes what this one would.
-            let Ok(_held) = lock.try_lock() else {
-                return;
-            };
+            let _held = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 let pending = match pending(&checkout) {
                     Ok(pending) => pending,

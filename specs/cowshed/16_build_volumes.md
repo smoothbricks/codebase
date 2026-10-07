@@ -153,10 +153,12 @@ changing it, and names `cowshed exec <ws> -- true`, whose refresh relinks it.
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
 excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
 without waiting for the delete, which runs in the background. A target directory can be tens of GiB, and no job waits on
-deleting it. A process that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout
-resumes the delete, and `cowshed gc` finishes it, naming each directory it deletes. A discovery job that has not
-answered within 10 seconds says on stderr every 10 seconds what it is waiting on: the processes holding the host Cargo
-home's package-cache locks, or none, in which case it is the shell's activation or Cargo itself.
+deleting it. A background delete that finds another delete of the checkout running (a refresh's or `gc`'s) waits it out
+and then takes whatever is still pending, so what its own refresh moved aside never waits for a later one. A process
+that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout resumes the delete, and
+`cowshed gc` finishes it, naming each directory it deletes. A discovery job that has not answered within 10 seconds says
+on stderr every 10 seconds what it is waiting on: the processes holding the host Cargo home's package-cache locks, or
+none, in which case it is the shell's activation or Cargo itself.
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and

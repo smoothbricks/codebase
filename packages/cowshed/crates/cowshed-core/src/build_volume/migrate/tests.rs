@@ -501,20 +501,42 @@ fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
 }
 
 /// A refresh returns once the link is in place; the delete of what it moved aside runs behind
-/// it. 100k files stand in for a real target directory.
+/// it. A delete that cannot proceed stands in for a target directory of any size: a `gc` of the
+/// checkout is deleting what an earlier refresh left, and holds there until the test lets it
+/// go. The refresh returns all the same, with its own discard pending. Once that `gc` is done,
+/// the refresh's own background delete takes what the refresh moved aside, which the `gc` never
+/// listed.
 #[test]
-fn a_large_moved_aside_directory_does_not_hold_the_refresh() {
+fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
     let scratch = Scratch::new();
     let checkout = scratch.checkout();
     git(&checkout, &["init", "--quiet"]);
-    for chunk in 0..100 {
-        let directory = checkout.join(format!("target/debug/deps/{chunk}"));
-        fs::create_dir_all(&directory).unwrap();
-        for file in 0..1_000 {
-            fs::write(directory.join(file.to_string()), b"").unwrap();
-        }
-    }
+    write(&checkout, "target/debug/unit", "old build state");
+    write(
+        &checkout,
+        "earlier/unit",
+        "what an earlier refresh moved aside",
+    );
     link::point(&checkout, &scratch.volume()).unwrap();
+    let earlier = discard::move_aside(&checkout, Path::new("earlier")).unwrap();
+
+    let (holding, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let collecting = std::thread::spawn({
+        let checkout = checkout.clone();
+        move || {
+            discard::finish(&checkout, |discard| {
+                holding.send(discard.to_owned()).unwrap();
+                released.recv().unwrap();
+            })
+        }
+    });
+    assert_eq!(
+        held.recv().unwrap(),
+        earlier,
+        "gc holds the earlier discard"
+    );
+
     let displaced = adopt_paths(&checkout, &scratch.volume(), &target_only())
         .unwrap()
         .unwrap();
@@ -524,14 +546,19 @@ fn a_large_moved_aside_directory_does_not_hold_the_refresh() {
             .unwrap()
             .is_symlink()
     );
+    let pending = discard::pending(&checkout).unwrap();
     assert_eq!(
-        discard::pending(&checkout).unwrap().len(),
-        1,
-        "the refresh returned only after deleting 100k files"
+        pending.len(),
+        2,
+        "the refresh returned while every delete of the checkout waited: {pending:?}"
     );
+
+    release.send(()).unwrap();
+    collecting.join().unwrap().unwrap();
     assert!(
-        discards_drain(&checkout, std::time::Duration::from_secs(25)),
-        "the background delete did not finish"
+        discards_drain(&checkout, std::time::Duration::from_secs(20)),
+        "the refresh's background delete left {:?} pending",
+        discard::pending(&checkout).unwrap()
     );
     assert_eq!(status(&checkout), "", "{}", status(&checkout));
 }
