@@ -161,7 +161,11 @@ impl ProcessTreeFold {
                     status,
                     exited_at: at,
                 });
-                self.running.remove(&process.pid);
+                // A late exit of a pid's earlier life must not end the life now holding it.
+                let index = self.by_identity[&process];
+                if self.running.get(&process.pid) == Some(&index) {
+                    self.running.remove(&process.pid);
+                }
                 Ok(())
             }
             ProcessObservation::Lost(reason) => {
@@ -182,6 +186,14 @@ impl ProcessTreeFold {
 
     pub fn coverage(&self) -> &ProcessCoverage {
         &self.coverage
+    }
+
+    /// The life of `pid` with no observed exit: a kernel event that names only a pid (kqueue's
+    /// `NOTE_EXEC`/`NOTE_EXIT`) belongs to it.
+    pub fn live(&self, pid: u32) -> Option<ProcessIdentity> {
+        self.running
+            .get(&pid)
+            .map(|&index| self.lives[index].identity)
     }
 
     pub fn tree(&self, job_id: JobId, sampled_at: UtcTimestamp) -> JobProcessTree {
@@ -469,6 +481,30 @@ mod tests {
             ProcessCoverage::Gap {
                 reason: ProcessCoverageGap::UnobservedExit { pid: 300 }
             }
+        );
+    }
+
+    /// Removing the pid from the live map on any exit fails this: the late exit of the first
+    /// life would leave the second life, still running, unreachable by its pid.
+    #[test]
+    fn a_late_exit_of_an_earlier_life_leaves_the_current_life_live() {
+        let mut fold = ProcessTreeFold::default();
+        let shell = id(100, 1);
+        let first = id(300, 20);
+        let second = id(300, 21);
+        root(&mut fold, shell);
+        fork(&mut fold, first, shell, 1);
+        fork(&mut fold, second, shell, 2);
+        exit(&mut fold, first, 0, 3);
+        assert_eq!(fold.live(300), Some(second));
+        exit(&mut fold, second, 4, 4);
+        assert_eq!(fold.live(300), None);
+
+        let tree = fold.tree(job(), at(5));
+        assert_eq!(tree.processes[1].exit.as_ref().unwrap().exited_at, at(3));
+        assert_eq!(
+            tree.processes[2].exit.as_ref().unwrap().status,
+            ExitStatus::Exited { code: 4 }
         );
     }
 
