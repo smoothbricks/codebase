@@ -4,6 +4,7 @@ import { exec } from './exec.js';
 import { packageRootFromModule, runLauncher } from './launcher.js';
 import * as N from './native.generated.js';
 import {
+  type EventIterator,
   loadNativeModule,
   type NativeCoordinatorHandle,
   type NativeJobHandle,
@@ -70,13 +71,17 @@ async function callNativeAsync<T>(call: () => Promise<T>): Promise<T> {
   }
 }
 
-/** A native stream's events, its rejections normalized as `callNativeAsync` normalizes a call's. */
-async function* callNativeEvents<T>(events: AsyncIterable<T>): AsyncGenerator<T, void, undefined> {
-  try {
-    yield* events;
-  } catch (error) {
-    throw normalizeNativeError(error);
-  }
+/**
+ * A native stream's events, its rejections normalized as `callNativeAsync` normalizes a call's.
+ * `return` reaches the native iterator at once, never behind a `next` in flight.
+ */
+function callNativeEvents<T>(events: EventIterator<T>): EventIterator<T> {
+  const iterator: EventIterator<T> = {
+    next: () => callNativeAsync(() => events.next()),
+    return: () => callNativeAsync(() => events.return()),
+    [Symbol.asyncIterator]: () => iterator,
+  };
+  return iterator;
 }
 
 class ProjectImpl implements Project {
