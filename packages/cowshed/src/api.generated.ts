@@ -978,6 +978,9 @@ export type ProcessCoverageGap =
     })
   | ({ readonly kind: 'unreadImage' } & {
       readonly pid: number & tags.Type<'uint32'>;
+    })
+  | ({ readonly kind: 'unreadFinalUsage' } & {
+      readonly pid: number & tags.Type<'uint32'>;
     });
 
 /**

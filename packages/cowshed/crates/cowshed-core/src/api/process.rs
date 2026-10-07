@@ -135,4 +135,7 @@ pub enum ProcessCoverageGap {
     /// A member exec'd and its new image was not read: it exited before the read, or the read
     /// failed, in which case the observer also returns that failure with its call and errno.
     UnreadImage { pid: u32 },
+    /// A member exited with no read of its counters after its exit: its usage is the last one
+    /// observed, not its final usage.
+    UnreadFinalUsage { pid: u32 },
 }

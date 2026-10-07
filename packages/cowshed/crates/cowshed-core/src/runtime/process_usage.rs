@@ -7,9 +7,11 @@
 //! can neither reset the window nor see a different answer from the first. The kernel reads are
 //! the thin shell below the fold; each is fenced to the one life it names.
 //!
-//! A life's counters are kept from its last reading once it exits. A life whose counters were
-//! never read -- it was reaped before the sampler reached it -- has no usage, not zeroes: the
-//! job's accounting source still counts what it cost.
+//! A life's usage is final only when it was read after the life exited (an exited, unreaped
+//! process still answers). An exit with no such read keeps the last usage observed and makes
+//! the usage coverage a gap ([`ProcessCoverageGap::UnreadFinalUsage`]). A life whose counters
+//! were never read -- it was reaped before the sampler reached it -- has no usage, not zeroes:
+//! the job's accounting source still counts what it cost.
 
 use std::collections::HashMap;
 use std::io;
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::api::process::ProcessIoUnavailable;
-use crate::api::process::{BUSY_CPU_PERMILLE, ProcessStorageIo, ProcessUsage};
+use crate::api::process::{BUSY_CPU_PERMILLE, ProcessCoverageGap, ProcessStorageIo, ProcessUsage};
 use crate::api::resources::{CpuMicros, ResidentBytes, ResourceUnitError, StorageIoBytes};
 use crate::runtime::process_tree::ProcessIdentity;
 
@@ -41,6 +43,8 @@ pub struct UsageReading {
     /// What it holds resident now: nothing once it has exited.
     pub resident: ResidentBytes,
     pub io: ProcessStorageIo,
+    /// Whether the kernel had already seen the life exit when it was read.
+    pub exited: bool,
 }
 
 impl UsageReading {
@@ -57,7 +61,7 @@ pub enum UsageObservation {
         process: ProcessIdentity,
         reading: UsageReading,
     },
-    /// The life exited: its last reading is final.
+    /// The life exited: its last reading is final if it was read after the exit.
     Exited { process: ProcessIdentity },
 }
 
@@ -81,6 +85,8 @@ pub enum UsageFoldError {
     Backwards { pid: u32 },
     #[error("process {pid} was read or ended again after its exit")]
     AfterExit { pid: u32 },
+    #[error("process {pid} was read running after a read that found it exited")]
+    Revived { pid: u32 },
 }
 
 #[derive(Debug)]
@@ -103,6 +109,8 @@ struct Life {
 #[derive(Debug, Default)]
 pub struct ProcessUsageFold {
     lives: HashMap<ProcessIdentity, Life>,
+    /// The first exit whose usage was not read after it.
+    gap: Option<ProcessCoverageGap>,
 }
 
 impl ProcessUsageFold {
@@ -133,6 +141,13 @@ impl ProcessUsageFold {
                     return Err(UsageFoldError::AfterExit { pid: process.pid });
                 }
                 life.exited = true;
+                let read_after_exit = life
+                    .counted
+                    .as_ref()
+                    .is_some_and(|counted| counted.latest.exited);
+                if !read_after_exit && self.gap.is_none() {
+                    self.gap = Some(ProcessCoverageGap::UnreadFinalUsage { pid: process.pid });
+                }
                 Ok(())
             }
         }
@@ -160,11 +175,19 @@ impl ProcessUsageFold {
     pub fn exited(&self, process: ProcessIdentity) -> bool {
         self.lives.get(&process).is_some_and(|life| life.exited)
     }
+
+    /// The first exit whose final usage was not read; `None` while every exit's was.
+    pub fn gap(&self) -> Option<ProcessCoverageGap> {
+        self.gap
+    }
 }
 
 impl Counted {
     fn read(&self, pid: u32, reading: UsageReading) -> Result<Self, UsageFoldError> {
         let latest = self.latest;
+        if latest.exited && !reading.exited {
+            return Err(UsageFoldError::Revived { pid });
+        }
         if reading.started != latest.started {
             return Err(UsageFoldError::OtherLife {
                 pid,
@@ -339,6 +362,7 @@ fn fold_counters(
             cpu_sys: counters.cpu_sys,
             resident: counters.resident,
             io: counters.io,
+            exited: counters.exited,
         },
     })?;
     Ok(Sampled::Read)
@@ -380,6 +404,7 @@ struct OwnCounters {
     /// nothing now, on either platform.
     resident: ResidentBytes,
     io: ProcessStorageIo,
+    exited: bool,
 }
 
 fn unit(error: ResourceUnitError) -> io::Error {
@@ -425,6 +450,7 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
             read_bytes: StorageIoBytes::new(info.ri_diskio_bytesread).map_err(unit)?,
             write_bytes: StorageIoBytes::new(info.ri_diskio_byteswritten).map_err(unit)?,
         },
+        exited,
     }))
 }
 
@@ -510,7 +536,8 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     let page = u64::try_from(page)
         .map_err(|_| io::Error::other(format!("the page size {page} is no size")))?;
     let cpu = |ticks| CpuMicros::of_ticks(ticks, 1_000_000_000, hertz).map_err(unit);
-    let resident = if matches!(state, "Z" | "X") {
+    let exited = matches!(state, "Z" | "X");
+    let resident = if exited {
         ResidentBytes::ZERO
     } else {
         let bytes = field(24)?
@@ -527,6 +554,7 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
         cpu_sys: cpu(field(15)?)?,
         resident,
         io,
+        exited,
     }))
 }
 
@@ -587,7 +615,9 @@ mod tests {
         OwnCounters, ProcessUsageFold, Sampled, StartStamp, UsageFoldError, UsageObservation,
         UsageReading, own_counters, sample,
     };
-    use crate::api::process::{ProcessIoUnavailable, ProcessStorageIo, ProcessUsage};
+    use crate::api::process::{
+        ProcessCoverageGap, ProcessIoUnavailable, ProcessStorageIo, ProcessUsage,
+    };
     use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
     use crate::fork_lock::Spawn as _;
     use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
@@ -628,6 +658,7 @@ mod tests {
             cpu_sys: cpu(sys_us),
             resident: resident(1 << 20),
             io: moved(0, 0),
+            exited: false,
         }
     }
 
@@ -844,12 +875,49 @@ mod tests {
             "unchanged by the refusals"
         );
 
-        // A life reaped before it was ever read has no usage at all, not zeroes.
+        // It was last read running: its usage is the last observed, not known final.
+        assert_eq!(
+            fold.gap(),
+            Some(ProcessCoverageGap::UnreadFinalUsage { pid: 43 })
+        );
+
+        // A life reaped before it was ever read has no usage at all, not zeroes; the first
+        // gap stays the one named.
         let unread = identity(44);
         fold.apply(UsageObservation::Exited { process: unread })
             .unwrap();
         assert_eq!(fold.usage(unread), None);
         assert!(fold.exited(unread));
+        assert_eq!(
+            fold.gap(),
+            Some(ProcessCoverageGap::UnreadFinalUsage { pid: 43 })
+        );
+    }
+
+    #[test]
+    fn usage_read_after_the_exit_is_final_and_no_read_runs_it_again() {
+        let process = identity(48);
+        let start = Instant::now();
+        let mut fold = ProcessUsageFold::default();
+        fold.apply(read(process, reading(start, 1_000, 0))).unwrap();
+        let at_exit = UsageReading {
+            exited: true,
+            ..holding(0, reading(start + Duration::from_secs(1), 2_000, 0))
+        };
+        fold.apply(read(process, at_exit)).unwrap();
+        assert_eq!(
+            fold.apply(read(
+                process,
+                reading(start + Duration::from_secs(2), 2_000, 0)
+            )),
+            Err(UsageFoldError::Revived { pid: 48 })
+        );
+        fold.apply(UsageObservation::Exited { process }).unwrap();
+        assert_eq!(fold.gap(), None, "its final usage was read");
+        assert_eq!(
+            fold.usage(process).map(|usage| usage.cpu_user_us),
+            Some(cpu(2_000))
+        );
     }
 
     #[test]
@@ -1203,7 +1271,12 @@ mod tests {
         assert_eq!(
             fold.usage(burner.identity),
             Some(usage),
-            "its final counters are kept"
+            "its last observed counters are kept"
+        );
+        assert_eq!(
+            fold.gap(),
+            Some(ProcessCoverageGap::UnreadFinalUsage { pid: burner_pid }),
+            "reaped before a read after its exit, its usage is not known final"
         );
 
         assert_eq!(tick(&mut fold, &parent_life), Sampled::Read);
@@ -1263,6 +1336,11 @@ mod tests {
             Sampled::Read,
             "a zombie's last counters"
         );
+        fold.apply(UsageObservation::Exited {
+            process: life.identity,
+        })
+        .expect("its exit");
+        assert_eq!(fold.gap(), None, "its final counters were read");
         child.wait().expect("reap");
         assert_eq!(tick(&mut fold, &life), Sampled::Gone);
     }
@@ -1304,6 +1382,12 @@ mod tests {
         })
         .expect("its exit");
         assert_eq!(fold.usage(life.identity), None);
+        assert_eq!(
+            fold.gap(),
+            Some(ProcessCoverageGap::UnreadFinalUsage {
+                pid: life.identity.pid
+            })
+        );
     }
 
     /// A re-executed fixture role, held by its stdin and reporting on its stdout.
