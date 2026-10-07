@@ -37,7 +37,7 @@
   "nx": {
     "name": "cowshed",
     "targets": {
-      "api-generate": {
+      "api-generator": {
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -47,6 +47,30 @@
               "@smoothbricks/codebase"
             ]
           }
+        ],
+        "inputs": [
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/crates/cowshed-api-gen/**/*",
+          "cargoToolchain",
+          {
+            "runtime": "rustc -vV"
+          }
+        ],
+        "outputs": [
+          "{workspaceRoot}/target/debug/cowshed-api-gen"
+        ],
+        "options": {
+          "command": "cargo build --frozen -p cowshed-api-gen",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "api-generate": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          "api-generator"
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
@@ -64,11 +88,10 @@
         ],
         "outputs": [
           "{projectRoot}/src/api.generated.ts",
-          "{projectRoot}/src/validators.generated.ts",
-          "{workspaceRoot}/target/debug/cowshed-api-gen"
+          "{projectRoot}/src/validators.generated.ts"
         ],
         "options": {
-          "command": "cargo run --frozen -p cowshed-api-gen -- write packages/cowshed",
+          "command": "target/debug/cowshed-api-gen write packages/cowshed",
           "cwd": "{workspaceRoot}"
         }
       },
@@ -76,7 +99,23 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
-          "api-generate"
+          "api-generator"
+        ],
+        "inputs": [
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/crates/cowshed-api-gen/**/*",
+          "{projectRoot}/crates/cowshed-core/**/*.rs",
+          "{projectRoot}/crates/cowshed-gateway-types/**/*.rs",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/biome.json",
+          "{projectRoot}/src/api.generated.ts",
+          "{projectRoot}/src/validators.generated.ts",
+          "cargoToolchain",
+          {
+            "runtime": "rustc -vV"
+          }
         ],
         "options": {
           "command": "target/debug/cowshed-api-gen check packages/cowshed",

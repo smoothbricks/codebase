@@ -1241,6 +1241,7 @@ mod error_code_ssot {
             .strip_prefix("export type ErrorCode =")
             .expect("the generated taxonomy declaration")
             .split('|')
+            .filter(|member| !member.trim().is_empty())
             .map(|member| {
                 member
                     .trim()

@@ -265,9 +265,11 @@ impl Emitter<'_> {
 
     fn field(&mut self, field: &Field, default: bool) -> Result<(bool, String), String> {
         let omitted = field.serde.skip_serializing_if.is_some();
+        // Record defaults admit omitted request fields, not serialized omission. Field-level
+        // defaults alone leave output fields required; only skip_serializing_if removes null.
         let optional = default || omitted;
         let ty = if let Some(inner) = option_inner(&field.ty) {
-            if optional {
+            if omitted {
                 self.ty(inner)?
             } else {
                 format!("{} | null", self.ty(inner)?)
@@ -587,5 +589,25 @@ mod tests {
                 .types
                 .contains("export type Empty = Readonly<Record<string, never>>;")
         );
+    }
+
+    #[test]
+    fn defaults_do_not_remove_serialized_null() {
+        let output = render(
+            r#"
+            #[derive(Serialize, Deserialize)] #[serde(default)]
+            pub struct Options {
+                pub nullable: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub omitted: Option<String>,
+            }
+            #[derive(Serialize, Deserialize)] pub struct Answer {
+                #[serde(default)] pub nullable: Option<String>,
+            }
+        "#,
+        );
+        assert!(output.types.contains("readonly 'nullable'?: string | null"));
+        assert!(output.types.contains("readonly 'omitted'?: string;"));
+        assert!(output.types.contains("readonly 'nullable': string | null"));
     }
 }

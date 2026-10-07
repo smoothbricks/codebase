@@ -218,6 +218,15 @@ describe('canonical DTO generation', () => {
       expect(readFileSync(join(scratch, 'src/api.generated.ts'), 'utf8')).toMatch(
         /readonly ['"]?generationProbe['"]?: boolean/,
       );
+      const generatedPath = join(scratch, 'src/api.generated.ts');
+      const canonical = readFileSync(generatedPath, 'utf8');
+      const drifted = `${canonical}\n// deliberately drifted output\n`;
+      writeFileSync(generatedPath, drifted);
+      const checked = spawnSync(generator, ['check', scratch], { encoding: 'utf8' });
+      expect(checked.status).toBe(1);
+      expect(checked.stderr).toContain('is stale');
+      expect(readFileSync(generatedPath, 'utf8')).toBe(drifted);
+      writeFileSync(generatedPath, canonical);
       const module: unknown = await import(pathToFileURL(join(scratch, 'src/validators.generated.ts')).href);
       const changedValidators = assertGeneratedModule(module);
       const baseline = seamTypes.WorkspaceInfo.assertOne(
