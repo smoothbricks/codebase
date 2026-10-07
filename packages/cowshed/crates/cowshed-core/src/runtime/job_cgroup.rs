@@ -41,7 +41,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::JobId;
-use crate::api::resources::{CpuMicros, ResourceUnitError};
+use crate::api::resources::{ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, ResourceUnitError};
 use crate::metadata::WorkspaceIncarnation;
 
 /// Where the unified cgroup hierarchy is mounted.
@@ -136,6 +136,8 @@ pub enum CgroupError {
     Populated { path: PathBuf },
     #[error("{path}: {detail}")]
     Malformed { path: PathBuf, detail: String },
+    #[error("{path} does not exist: this kernel or this cgroup's controllers do not provide it")]
+    CounterUnavailable { path: PathBuf },
     #[error("{path} has no {counter} counter")]
     MissingCounter {
         path: PathBuf,
@@ -558,6 +560,11 @@ impl JobCgroup {
         read_cpu(&self.directory, &self.path)
     }
 
+    /// What the job is charged now and the most it was ever charged.
+    pub fn charged_memory(&self) -> Result<ChargedMemoryUsage> {
+        read_charged_memory(&self.directory, &self.path)
+    }
+
     /// The means for one process to enter this cgroup before it executes anything.
     pub fn placement(&self) -> Result<Placement> {
         // SAFETY: F_DUPFD_CLOEXEC on a live descriptor; a non-negative answer is a new one.
@@ -652,11 +659,20 @@ impl TerminalJobCgroup {
         read_cpu(&self.directory, &self.path)
     }
 
+    /// What the job is charged after its last process ended -- the cache it filled stays
+    /// charged -- and the most it was ever charged.
+    pub fn charged_memory(&self) -> Result<ChargedMemoryUsage> {
+        read_charged_memory(&self.directory, &self.path)
+    }
+
     /// Collect the job's final counters, then remove the cgroup while its name still holds the
     /// cgroup admission created. A counter that cannot be read leaves the cgroup in place: once
     /// it is gone, nothing could ever read it again.
     pub fn retire(self) -> Result<JobCgroupTotals> {
-        let totals = JobCgroupTotals { cpu: self.cpu()? };
+        let totals = JobCgroupTotals {
+            cpu: self.cpu()?,
+            charged_memory: self.charged_memory()?,
+        };
         let current = open_directory(&self.path)?;
         let found = cgroup_id(&current).map_err(failed("fstat", &self.path))?;
         if found != self.identity.cgroup_id {
@@ -676,6 +692,7 @@ impl TerminalJobCgroup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobCgroupTotals {
     pub cpu: CgroupCpu,
+    pub charged_memory: ChargedMemoryUsage,
 }
 
 /// A job cgroup's CPU as its `cpu.stat` counts it: every process that ran in the cgroup or
@@ -692,6 +709,58 @@ fn read_cpu(directory: &OwnedFd, cgroup: &Path) -> Result<CgroupCpu> {
     let path = cgroup.join("cpu.stat");
     let text = read_at(directory, c"cpu.stat").map_err(failed("read", &path))?;
     parse_cpu_stat(&path, &text)
+}
+
+/// `memory.current`, then `memory.peak`: read in that order the peak, a high watermark that only
+/// rises, holds at least the current charge. Both are opened read-only, since a write to a
+/// `memory.peak` descriptor resets the watermark that descriptor reports.
+fn read_charged_memory(directory: &OwnedFd, cgroup: &Path) -> Result<ChargedMemoryUsage> {
+    let current = single_value(directory, cgroup, c"memory.current")?;
+    let peak = single_value(directory, cgroup, c"memory.peak")?;
+    if peak < current {
+        return Err(CgroupError::Malformed {
+            path: cgroup.join("memory.peak"),
+            detail: format!("peak {peak} lies below the current charge {current} read before it"),
+        });
+    }
+    let bytes = |name: &'static str, value: u64| {
+        ChargedMemoryBytes::new(value).map_err(|source| CgroupError::OutOfRange {
+            path: cgroup.join(name),
+            counter: name,
+            source,
+        })
+    };
+    Ok(ChargedMemoryUsage {
+        current_bytes: bytes("memory.current", current)?,
+        peak_bytes: bytes("memory.peak", peak)?,
+    })
+}
+
+/// A cgroup file that holds one count. One the kernel does not provide is unavailable, never
+/// zero.
+fn single_value(directory: &OwnedFd, cgroup: &Path, name: &CStr) -> Result<u64> {
+    let path = cgroup.join(OsStr::from_bytes(name.to_bytes()));
+    let text = read_at(directory, name).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            CgroupError::CounterUnavailable { path: path.clone() }
+        } else {
+            CgroupError::Io {
+                call: "read",
+                path: path.clone(),
+                source,
+            }
+        }
+    })?;
+    parse_single_value(&path, &text)
+}
+
+fn parse_single_value(path: &Path, text: &str) -> Result<u64> {
+    text.trim_end_matches('\n')
+        .parse()
+        .map_err(|_| CgroupError::Malformed {
+            path: path.to_path_buf(),
+            detail: format!("{text:?} is not a count"),
+        })
 }
 
 fn parse_cpu_stat(path: &Path, text: &str) -> Result<CgroupCpu> {
@@ -781,6 +850,46 @@ mod tests {
             populated(path, "populated 2\n"),
             Err(CgroupError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn a_charge_is_one_count_and_nothing_else() {
+        let path = Path::new("/sys/fs/cgroup/x/memory.current");
+        assert_eq!(
+            parse_single_value(path, "7329304576\n").expect("a count"),
+            7_329_304_576
+        );
+        for text in ["", "\n", "max\n", "-1\n", "1 2\n"] {
+            assert!(
+                matches!(
+                    parse_single_value(path, text),
+                    Err(CgroupError::Malformed { .. })
+                ),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A directory without the memory controller's files -- here an ordinary one -- reports the
+    /// counter unavailable by name rather than a zero charge.
+    #[test]
+    fn a_missing_memory_counter_is_unavailable_not_zero() {
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-job-cgroup-no-memory-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("scratch directory");
+        let opened = open_directory(&directory).expect("open");
+        let missing = read_charged_memory(&opened, &directory);
+        fs::remove_dir(&directory).expect("remove scratch directory");
+        assert!(
+            matches!(
+                missing,
+                Err(CgroupError::CounterUnavailable { ref path })
+                    if path == &directory.join("memory.current")
+            ),
+            "{missing:?}"
+        );
     }
 
     #[test]
