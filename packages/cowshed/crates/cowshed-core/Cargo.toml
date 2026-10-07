@@ -4,10 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+# Earlier hosted-CI sizing measured a 3-core macOS runner ~1.85x slower, with three Nx tasks
+# competing for its cores and ~13s of archive extraction per batch. Three shards ran out
+# 101.9s in with 35 tests left; five were chosen for that workload.
 # The same full test set runs in bounded hash partitions, never serialized and with no raised
-# timeout. Five shards exhausted the 120s target bound on a loaded host: first at 258/264 tests
-# after a 139.8s CPU-token wait, then at 212/264 on a later gate. Eight reduce each batch's share
-# of the serial work while membership remains derived from nextest's hash of every test name.
+# timeout. Five shards later exhausted the 120s execution bound on a loaded local host:
+# first at 258/264 tests after a 139.8s CPU-token wait outside that bound, then at 212/264.
+# Eight reduce each batch's serial work; membership stays derived from nextest's test-name hash.
 [package.metadata.smoothbricks.test]
 shards = 8
 
