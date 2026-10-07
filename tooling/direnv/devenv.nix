@@ -58,6 +58,7 @@ in {
       # ZFS storage reaches neither memory.current's page cache nor io.stat.
       pkgs.e2fsprogs
       pkgs.util-linux # loop mounting, probing, and unprivileged controller execution
+      pkgs.kmod # load the host's loop driver before deciding that devices are unavailable
     ];
 
   # Nix's setup hooks replace generic CC/CXX after `env` is applied, leaving

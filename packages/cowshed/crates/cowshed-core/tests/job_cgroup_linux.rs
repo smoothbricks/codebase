@@ -657,9 +657,10 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
         "storage I/O: read {read} B, written {written} B; io.stat {raw:?} sums to read \
          {raw_read} B, written {raw_written} B; live members {live} B; allocated {allocated_bytes} B"
     );
-    assert!(
-        read <= raw_read && written <= raw_written,
-        "aggregation only ever leaves stacked devices out"
+    assert_eq!(
+        (read, written),
+        (raw_read, raw_written),
+        "the test-owned loop ext4 totals equal an independent io.stat read"
     );
     assert!(
         written >= 24 * MIB && read >= 12 * MIB,
@@ -1040,15 +1041,51 @@ impl Scratch {
     fn make(uid: u32, gid: u32) -> Self {
         let name = format!("cowshed-job-cgroup-{}", std::process::id());
         let loop_control = Path::new("/dev/loop-control");
-        let unavailable = match std::fs::metadata(loop_control) {
-            Ok(_) => run(Command::new(find_program("losetup")).arg("--find")).err(),
+        // Absence of a device node is not absence of kernel support: NixOS runners can leave
+        // the loop driver unloaded. Ask the host to load it before measuring availability.
+        let loaded = match std::fs::metadata(loop_control) {
+            Ok(_) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(format!("{}: {error}", loop_control.display()))
+                run(Command::new(find_program("modprobe")).arg("loop"))
             }
             Err(error) => panic!("inspect {}: {error}", loop_control.display()),
         };
+        let unavailable = loaded
+            .and_then(|()| {
+                std::fs::metadata(loop_control)
+                    .map_err(|error| format!("{}: {error}", loop_control.display()))?;
+                run(Command::new(find_program("losetup")).arg("--find"))
+            })
+            .err();
         if let Some(reason) = unavailable {
             println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
+            let status = std::fs::read_to_string("/proc/self/status").expect("root status");
+            for line in status
+                .lines()
+                .filter(|line| line.starts_with("CapEff:") || line.starts_with("NoNewPrivs:"))
+            {
+                println!("scratch availability: {line}");
+            }
+            println!(
+                "scratch availability: loop module present {}, kernel {}",
+                Path::new("/sys/module/loop").exists(),
+                std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .expect("kernel release")
+                    .trim()
+            );
+            let devices = std::fs::read_to_string("/proc/devices").expect("registered devices");
+            println!(
+                "scratch availability: loop device registered {}",
+                devices
+                    .lines()
+                    .any(|line| line.split_whitespace().eq(["7", "loop"]))
+            );
+            for entry in std::fs::read_dir("/sys/block").expect("kernel block devices") {
+                let entry = entry.expect("block device entry");
+                if entry.file_name().as_encoded_bytes().starts_with(b"loop") {
+                    println!("scratch availability: {}", entry.path().display());
+                }
+            }
             return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
         }
         Self::loop_ext4(std::env::temp_dir().join(name), uid, gid)
