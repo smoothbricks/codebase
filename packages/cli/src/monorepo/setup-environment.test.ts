@@ -490,7 +490,7 @@ describe('what shell entry installs', () => {
   });
 });
 
-describe('what a CI install that finds a stale lockfile reports', () => {
+describe('what a CI install reports and records', () => {
   const MEMBER = 'packages/member/package.json';
   // A CI runner runs no provider command: the job's secret store injects every declared secret.
   const CI_SECRETS = { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' };
@@ -549,6 +549,8 @@ describe('what a CI install that finds a stale lockfile reports', () => {
       expect(exitCode).toBe(1);
       expect(stderr).toContain('git diff after install:');
       expect(stderr).toContain('+        "dep2": "file:../../vendor/dep2",');
+      // The failed install records nothing, so devenv's task has no stamp to find current.
+      expect(existsSync(join(root, 'node_modules', '.smoo-install'))).toBe(false);
     });
   });
 
@@ -592,6 +594,24 @@ describe('what a CI install that finds a stale lockfile reports', () => {
 
       expect(exitCode).toBe(0);
       expect(stderr).not.toContain('git diff after install:');
+    });
+  });
+
+  it('stamps node_modules, the file devenv’s smoo:install task watches, so a checkout without one installs again', async () => {
+    // A host runner keeps devenv's task state on a shared bind and its checkout does not outlive the job:
+    // with no stamp the next job's checkout, same lockfile, was found current, installed nothing and
+    // had no `ttsc`. The stamp is what devenv sees go missing with node_modules.
+    await withManagedRepository({ workspaces: ['packages/*'], files: FILES }, async ({ root, enterShell: enter }) => {
+      await stageLockedCheckout(root);
+      await rm(join(root, 'node_modules'), { recursive: true, force: true });
+      const { exitCode } = await enter({ ciSecrets: CI_SECRETS });
+
+      expect(exitCode).toBe(0);
+      const stamp = JSON.parse(readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8'));
+      expect(stamp).toEqual({ inputs: expect.stringMatching(/^[0-9a-f]{64}$/) });
+      expect(readFileSync(join(MANAGED, 'tooling', 'direnv', 'devenv.smoo.nix'), 'utf8')).toContain(
+        '"../../node_modules/.smoo-install"',
+      );
     });
   });
 });

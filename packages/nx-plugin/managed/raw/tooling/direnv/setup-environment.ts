@@ -227,6 +227,12 @@ try {
         }
         process.exit(1);
       }
+      // devenv's smoo:install task skips this script while the digests of its inputs match the ones it
+      // recorded, and a runner's .devenv outlives its checkout (a host runner keeps it on a shared bind, an
+      // ephemeral one restores it from the Actions cache). node_modules/.smoo-install is the one input that
+      // goes with node_modules: without it a fresh checkout of the same lockfile found the task current,
+      // installed nothing, and the shell's `ttsc` was not there.
+      bunInstallStamp(bunInputs).record();
       if (uv !== null) {
         await uv.install({ quiet: false });
       }
@@ -399,6 +405,21 @@ interface InstallStamp {
 }
 
 /**
+ * What every successful install of node_modules leaves in it, a CI runner's frozen install as well as a
+ * developer's: the digest of what it ran on, in `node_modules/.smoo-install`. A developer entry skips the
+ * install while the stamp matches, and devenv's smoo:install task lists the file among its inputs, so a
+ * checkout without node_modules reads as changed there.
+ */
+function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; record(): void } {
+  const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
+  const identity = ['bun install', Bun.version, Bun.revision];
+  return {
+    isCurrent: () => readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs),
+    record: () => writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) }),
+  };
+}
+
+/**
  * `bun install`. Its result is location-independent: the isolated linker
  * links packages from the install cache by absolute path and workspace
  * members by relative path, so a copy of this checkout at another path — a
@@ -408,17 +429,14 @@ interface InstallStamp {
  * was pruned out from under node_modules.
  */
 function bunInstaller(inputs: readonly string[]): Installer {
-  const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
-  const identity = ['bun install', Bun.version, Bun.revision];
+  const stamp = bunInstallStamp(inputs);
   return {
-    isCurrent: () =>
-      readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs) &&
-      findInstalledTypeScriptApiPackage(projectRoot) !== null,
+    isCurrent: () => stamp.isCurrent() && findInstalledTypeScriptApiPackage(projectRoot) !== null,
     install: async ({ quiet }) => {
       await keepDeveloperLinks(projectRoot, () =>
         runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
       );
-      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) });
+      stamp.record();
     },
   };
 }
