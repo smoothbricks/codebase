@@ -365,10 +365,17 @@ same for main and for an integration workspace; "the target" is whichever one it
       real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
    4. query again; any holder at all, including a daemon a host client started in between, means skip;
    5. **commit the carry**: index what was staged, and copy what the target indexed since;
-   6. clone the landing build volume's image as the target's new seed and delete the target's previous seed. Nothing
-      writes the volume while it is cloned, so the seed is consistent, and the next fork of this target starts from at
-      least what is landing and what the target held. What the target itself runs on the adopted volume afterwards
-      reaches the seed by a reseed (Targets and seeds).
+   6. take the target's image lock, then clone the landing build volume's image as the target's new seed and delete the
+      target's previous seed. Nothing writes the volume while it is cloned, so the seed is consistent, and the next fork
+      of this target starts from at least what is landing and what the target held. What the target itself runs on the
+      adopted volume afterwards reaches the seed by a reseed (Targets and seeds).
+
+   The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
+   fresh clone of the new seed. Every fork of the target holds the same lock from before it reads the target's seed and
+   link until it links its own (Fork steps 1 to 3), and so does every reseed, so neither reads a seed or a volume the
+   land deletes. Without it, a land that froze main's seed and released main's previous volume while a `cowshed new` of
+   main forked deleted the seed the new had read, and the new failed (`sync source image …: No such file or directory`).
+   A land that finds the lock held says so on stderr and waits for it.
 
    A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap.
 
@@ -387,7 +394,9 @@ same for main and for an integration workspace; "the target" is whichever one it
       `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless a
       running job's hold still owns it. This applies with `--no-retire` too. Nothing links it any more, so its release
       runs beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption
-      check of step 7), so the release's unmount, detach and delete can overlap them.
+      check of step 7), so the release's unmount, detach and delete can overlap them. It needs no image lock: a fork or
+      reseed that takes the lock after the rename reads the adopted volume, and none that held it before the land took
+      it still runs.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until

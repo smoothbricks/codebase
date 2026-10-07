@@ -3692,10 +3692,30 @@ impl NativeProjectRuntimeHost {
                 Err(reason)
             }
         };
+        // The target's image lock from the seed's freeze until the target's link names the
+        // adopted volume: every fork of the target holds it from its read of the target's seed
+        // and link until its own link is written, and every reseed of the target while it
+        // replaces the seed, so neither reads a seed or volume this land deletes.
+        let lock = self
+            .layout
+            .canonical_image(&into.name)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let locked = match volumes.try_lock_target(owner, lock).await? {
+            Ok(locked) => locked,
+            Err(contended) => {
+                eprintln!(
+                    "cowshed: another cowshed operation on {} holds its image lock (a new, fork, reseed or checkpoint of it); the land freezes {}'s seed and moves its build link once that ends",
+                    into.name, into.name
+                );
+                timed_async("land", "target-lock", contended.wait()).await?
+            }
+        };
         timed_async(
             "land",
             "freeze-seed",
-            volumes.freeze_seed(&quiet, owner.clone(), tree.clone()),
+            volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
         .await?;
         let (closed, carried) = match carried {
@@ -3710,7 +3730,7 @@ impl NativeProjectRuntimeHost {
         let adoption = match timed_async(
             "land",
             "adopt",
-            volumes.adopt(&quiet, closed, into.name.clone(), into.mount.clone(), tree),
+            volumes.adopt(&locked, &quiet, closed, into.mount.clone(), tree),
         )
         .await?
         {
@@ -3728,6 +3748,14 @@ impl NativeProjectRuntimeHost {
                     volumes.release_previous(previous),
                 );
                 let in_target = async {
+                    // A kept workspace's fresh clone of the target's new seed is the last step
+                    // under the target's image lock.
+                    if !retire {
+                        volumes
+                            .refork(&locked, workspace.clone(), landing.to_owned())
+                            .await?;
+                    }
+                    drop(locked);
                     // Each moved link's volume carries the label of the checkout that built it:
                     // the target's supervisor names the adopted one now, in the background, and a
                     // kept workspace's supervisor, started on its fresh clone, names that one as
@@ -3737,9 +3765,6 @@ impl NativeProjectRuntimeHost {
                         .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
                         .await?;
                     if !retire {
-                        volumes
-                            .refork(owner, workspace.clone(), landing.to_owned())
-                            .await?;
                         self.ensure_supervisor(workspace).await?;
                     }
                     timed_async(

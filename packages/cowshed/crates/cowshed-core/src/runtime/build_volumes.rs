@@ -27,10 +27,11 @@ use crate::build_volume::{
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
-use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
-    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
+    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, ImageLockGuard,
+    MacOsApfsExecutionHost,
 };
+use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, LockMode};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 
@@ -99,6 +100,52 @@ pub(crate) struct Closed {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
+}
+
+/// The target's image lock, held by its land from before it freezes the target's seed until the
+/// target's link names the adopted volume and a kept workspace has its clone of the new seed
+/// (Land steps 5.6 to 6.4): every fork of the target holds the same lock from before it reads
+/// the target's seed and link until it has linked its own (Fork steps 1 to 3), and so does every
+/// reseed of the target, so neither reads a seed or a volume the land deletes. The steps that
+/// need it take it by reference; only [`BuildVolumes::try_lock_target`] and [`Contended::wait`]
+/// make one.
+#[must_use = "the target's image lock is let go when this is dropped"]
+pub(crate) struct TargetLock {
+    target: Owner,
+    _guard: ImageLockGuard,
+}
+
+/// The target's image lock, held by another cowshed operation on the target when the land asked
+/// for it.
+#[must_use = "wait takes the target's image lock"]
+pub(crate) struct Contended {
+    volumes: BuildVolumes,
+    target: Owner,
+    lock: PathBuf,
+}
+
+impl Contended {
+    /// Wait until whatever holds the target's image lock lets go of it, and take it.
+    pub async fn wait(self) -> Result<TargetLock> {
+        let Self {
+            volumes,
+            target,
+            lock,
+        } = self;
+        let guard = volumes
+            .blocking(move |host, _| {
+                host.lock_images(&[lock], LockMode::Wait)
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        CowshedError::internal("a blocking image lock answered that it was held")
+                    })
+            })
+            .await?;
+        Ok(TargetLock {
+            target,
+            _guard: guard,
+        })
+    }
 }
 
 /// What [`BuildVolumes::adopt`] did: how long the move took, and the target's previous volume.
@@ -375,6 +422,31 @@ impl BuildVolumes {
         crate::storage::lifecycle::dispatch_blocking(move || work(&host, &layout))
             .await
             .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
+    }
+
+    /// `target`'s image lock at `lock`, for its land's steps that delete what a fork or reseed
+    /// of `target` reads ([`TargetLock`]); [`Contended`] when another operation on `target` holds
+    /// it now, for the caller to say so before it waits.
+    pub async fn try_lock_target(
+        &self,
+        target: Owner,
+        lock: PathBuf,
+    ) -> Result<std::result::Result<TargetLock, Contended>> {
+        let path = lock.clone();
+        let guard = self
+            .blocking(move |host, _| host.lock_images(&[path], LockMode::Try).map_err(storage))
+            .await?;
+        Ok(match guard {
+            Some(guard) => Ok(TargetLock {
+                target,
+                _guard: guard,
+            }),
+            None => Err(Contended {
+                volumes: self.clone(),
+                target,
+                lock,
+            }),
+        })
     }
 
     /// The published volume `checkout` links and the state written at its root, or `None` when
@@ -825,10 +897,16 @@ impl BuildVolumes {
         .await
     }
 
-    /// Land step 5: `target`'s new seed is a clone of the quiet landing volume, and every older
-    /// seed of `target` is deleted.
-    pub async fn freeze_seed(&self, quiet: &Quiet, target: Owner, tree: GitOid) -> Result<()> {
+    /// Land step 5.6, under the target's image lock: the target's new seed is a clone of the
+    /// quiet landing volume, and every older seed of the target is deleted.
+    pub async fn freeze_seed(
+        &self,
+        locked: &TargetLock,
+        quiet: &Quiet,
+        tree: GitOid,
+    ) -> Result<()> {
         let source = quiet.id.clone();
+        let target = locked.target.clone();
         self.blocking(move |host, layout| {
             let previous = seeds_of(layout, &target)?;
             host.clone_build_volume(
@@ -956,11 +1034,11 @@ impl BuildVolumes {
         .await
     }
 
-    /// Land step 6: when nothing opened the closed target's task database since
-    /// [`Self::close_target`], give the landing volume the target's daemon records in place of
-    /// its own and rename the target's build link onto it. The target's previous volume is
-    /// recorded Unlinked and answered, for [`Self::release_previous`] beside what the land does
-    /// in the target next. Answers how long the move took.
+    /// Land step 6, under the target's image lock: when nothing opened the closed target's task
+    /// database since [`Self::close_target`], give the landing volume the target's daemon records
+    /// in place of its own and rename the target's build link onto it. The target's previous
+    /// volume is recorded Unlinked and answered, for [`Self::release_previous`] beside what the
+    /// land does in the target next. Answers how long the move took.
     ///
     /// The look and the rename happen under Nx's own open locks on the target's databases
     /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:
@@ -972,12 +1050,13 @@ impl BuildVolumes {
     /// ([`nx::hand_over_daemon_records`]), so the client that waited finds it still serving.
     pub async fn adopt(
         &self,
+        locked: &TargetLock,
         quiet: &Quiet,
         previous: Closed,
-        target: WorkspaceName,
         target_checkout: PathBuf,
         tree: GitOid,
     ) -> Result<std::result::Result<Adopted, AdoptionSkip>> {
+        let target = locked.target.name.clone();
         let linked = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |_, layout| {
@@ -1040,7 +1119,8 @@ impl BuildVolumes {
 
     /// Release a target's previous volume after its adoption: nothing links it, so only a job
     /// admitted on it before the move keeps it, and the collection after that job ends
-    /// reclaims it.
+    /// reclaims it. It needs no target lock: no fork or reseed of the target that took the lock
+    /// after the move reads it, and none that held it before the land took it still runs.
     pub async fn release_previous(&self, previous: Unlinked) -> Result<()> {
         self.blocking(move |host, layout| {
             let Unlinked { id, target } = previous;
@@ -1053,12 +1133,14 @@ impl BuildVolumes {
 
     /// A workspace whose volume a target adopted and that keeps working (`land --no-retire`)
     /// takes a fresh clone of that target's new seed, so it never writes the target's volume.
+    /// Under the target's image lock, so no reseed of the target deletes the seed it clones.
     pub async fn refork(
         &self,
-        seed_of: Owner,
+        locked: &TargetLock,
         workspace: WorkspaceName,
         checkout: PathBuf,
     ) -> Result<()> {
+        let seed_of = locked.target.clone();
         self.blocking(move |host, layout| {
             let (seed, record) = layout
                 .seed_of(&seed_of.name, &seed_of.incarnation)?
@@ -2531,6 +2613,33 @@ mod tests {
                 .expect("the landing checkout links a volume")
         }
 
+        /// Where `name`'s image lock is: the one its forks, reseeds and lands take.
+        fn image_lock(&self, name: &WorkspaceName) -> PathBuf {
+            crate::storage::StorageLayout::with_mount_root(
+                self.root.path().join("store"),
+                self.root.path().join("mnt"),
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap()
+            .canonical_image(name)
+            .unwrap()
+            .lock()
+            .to_owned()
+        }
+
+        /// `target`'s image lock, taken as its land takes it, when nothing else holds it.
+        async fn lock(&self, target: &Owner) -> TargetLock {
+            match self
+                .volumes
+                .try_lock_target(target.clone(), self.image_lock(&target.name))
+                .await
+                .unwrap()
+            {
+                Ok(locked) => locked,
+                Err(_) => panic!("nothing else holds {}'s image lock", target.name),
+            }
+        }
+
         fn release_all(&self) {
             for id in self.layout.list().unwrap() {
                 let release = self.host.release_build_volume(&self.layout, &id).unwrap();
@@ -2656,9 +2765,10 @@ mod tests {
             .expect("nothing holds the landing volume");
         assert!(capacity(&topic) >= ImageCapacity::from_gibibytes(2));
         let tree = GitOid::new("a".repeat(40)).unwrap();
+        let locked = scratch.lock(&owner("main", '0')).await;
         scratch
             .volumes
-            .freeze_seed(&quiet, owner("main", '0'), tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone())
             .await
             .unwrap();
         let (seed, _) = scratch
@@ -2675,13 +2785,7 @@ mod tests {
             .expect("nothing holds the target's volume");
         let adopted = scratch
             .volumes
-            .adopt(
-                &quiet,
-                closed,
-                WorkspaceName::main(),
-                main_checkout.clone(),
-                tree,
-            )
+            .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
             .await
             .unwrap()
             .expect("nothing opened the target's volume since");
@@ -3150,9 +3254,10 @@ mod tests {
             during.deferred
         );
         let tree = GitOid::new("a".repeat(40)).unwrap();
+        let locked = scratch.lock(&main).await;
         scratch
             .volumes
-            .freeze_seed(&quiet, main.clone(), tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone())
             .await
             .unwrap();
         let closed = scratch
@@ -3163,13 +3268,7 @@ mod tests {
             .expect("nothing holds the target's volume");
         let adopted = scratch
             .volumes
-            .adopt(
-                &quiet,
-                closed,
-                WorkspaceName::main(),
-                main_checkout.clone(),
-                tree,
-            )
+            .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
             .await
             .unwrap()
             .expect("nothing opened the target's volume since");
@@ -3251,6 +3350,159 @@ mod tests {
             fs::metadata(remount.parent().unwrap()).unwrap().dev(),
             "main's reforked volume is mounted"
         );
+        scratch.release_all();
+    }
+
+    /// A land into main while a `cowshed new` of main forks: the new reads main's seed and link
+    /// under main's image lock, and clones that seed after. A land that froze main's seed and
+    /// released main's previous volume in between deleted both under the new, which failed on
+    /// the seed it read ('sync source image …: No such file or directory'). The land waits for
+    /// main's image lock before it freezes main's seed, so the new always succeeds, and the land
+    /// goes on once the new has linked its fork.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_new_of_the_target_succeeds_whatever_a_concurrent_land_does() {
+        let scratch = Scratch::new("build-land-new");
+        let main = owner("main", '0');
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
+        let first_seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &first_seed,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                ),
+            )
+            .expect("seed main");
+        let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
+        let quiet = scratch
+            .volumes
+            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        let closed = scratch
+            .volumes
+            .close_target(main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the target's volume");
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+
+        // The new: main's image lock, as its create takes it, then main's seed and link.
+        let new_holds = scratch
+            .host
+            .lock_images(&[scratch.image_lock(&main.name)], LockMode::Wait)
+            .unwrap()
+            .expect("a blocking lock");
+        assert!(matches!(
+            scratch
+                .volumes
+                .reseed(main.clone(), main_checkout.clone())
+                .await
+                .unwrap(),
+            Reseed::Fresh
+        ));
+        let (seed, record) = scratch
+            .layout
+            .seed_of(&main.name, &main.incarnation)
+            .unwrap()
+            .expect("main has a seed");
+        assert_eq!(seed, first_seed);
+
+        // The land reaches main's seed and link here, and waits for the new.
+        let contended = match scratch
+            .volumes
+            .try_lock_target(main.clone(), scratch.image_lock(&main.name))
+            .await
+            .unwrap()
+        {
+            Ok(_) => panic!("the land took main's image lock while a new of main held it"),
+            Err(contended) => contended,
+        };
+        let land = {
+            let volumes = scratch.volumes.clone();
+            let main_checkout = main_checkout.clone();
+            tokio::spawn(async move {
+                let locked = contended.wait().await?;
+                volumes.freeze_seed(&locked, &quiet, tree.clone()).await?;
+                let adopted = volumes
+                    .adopt(&locked, &quiet, closed, main_checkout, tree)
+                    .await?
+                    .expect("nothing opened the target's volume since");
+                drop(quiet);
+                drop(locked);
+                volumes.release_previous(adopted.previous).await
+            })
+        };
+
+        // The rest of the new's fork, from what it read under main's lock.
+        let lane = owner("lane", '1');
+        let staged = scratch.root.path().join("staged-lane");
+        fs::create_dir_all(staged.join(".cowshed")).unwrap();
+        let started = Instant::now();
+        let (live, mount) = scratch
+            .host
+            .fork_build_volume(
+                &scratch.layout,
+                &seed,
+                &BuildVolumeRecord::new(record.tree.clone(), linked("lane")),
+            )
+            .expect("the new clones the seed it read under main's image lock");
+        assert!(
+            scratch.layout.image(&main_live).exists(),
+            "a land released the volume main linked while a new of main held main's image lock"
+        );
+        let forked = scratch
+            .volumes
+            .finish_fork(
+                Some(PreparedFork {
+                    seed: seed.clone(),
+                    tree: record.tree,
+                    live: live.clone(),
+                    mount,
+                    started,
+                }),
+                lane.clone(),
+                staged.clone(),
+            )
+            .await
+            .expect("the new finishes its fork");
+        assert_eq!(forked, Some(live.clone()));
+        assert!(
+            !land.is_finished(),
+            "the land went on while a new of main held main's image lock"
+        );
+        drop(new_holds);
+        land.await
+            .unwrap()
+            .expect("the land, once the new let go of main");
+
+        assert_eq!(scratch.layout.linked(&staged).unwrap(), Some(live));
+        assert!(
+            scratch
+                .layout
+                .seed_of(&lane.name, &lane.incarnation)
+                .unwrap()
+                .is_some(),
+            "the new seeded its workspace"
+        );
+        assert_eq!(scratch.layout.linked(&main_checkout).unwrap(), Some(topic));
+        let (main_seed, _) = scratch
+            .layout
+            .seed_of(&main.name, &main.incarnation)
+            .unwrap()
+            .expect("the land froze main's seed");
+        assert_ne!(main_seed, first_seed);
+        assert!(!scratch.layout.image(&first_seed).exists());
+        assert!(!scratch.layout.image(&main_live).exists());
         scratch.release_all();
     }
 
