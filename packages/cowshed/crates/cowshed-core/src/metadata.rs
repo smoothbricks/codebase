@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const MARKER_VERSION: u32 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
@@ -274,8 +275,10 @@ impl fmt::Display for ImageCapacity {
     }
 }
 
+/// Shared, immutable text: every request a handle sends carries its workspace, so a clone is a
+/// reference count, not a copy.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct WorkspaceName(String);
+pub struct WorkspaceName(Arc<str>);
 
 impl WorkspaceName {
     /// User-facing grammar `WorkspaceName::new` enforces: 1..=64 of `[a-z0-9][a-z0-9-]*`.
@@ -290,7 +293,7 @@ impl WorkspaceName {
                 .iter()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
         if valid {
-            Ok(Self(value))
+            Ok(Self(value.into()))
         } else {
             Err(MetadataError::InvalidWorkspaceName(value))
         }
@@ -307,7 +310,7 @@ impl WorkspaceName {
 
     /// The fixed name of the always-mounted main workspace.
     pub fn main() -> Self {
-        Self("main".to_owned())
+        Self(Arc::from("main"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -315,7 +318,7 @@ impl WorkspaceName {
     }
 
     pub fn is_main(&self) -> bool {
-        self.0 == "main"
+        &*self.0 == "main"
     }
 }
 
@@ -344,8 +347,9 @@ impl<'de> Deserialize<'de> for WorkspaceName {
     }
 }
 
+/// Shared, immutable text, cloned into every request a worker handle sends.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct WorkspaceIncarnation(String);
+pub struct WorkspaceIncarnation(Arc<str>);
 
 impl WorkspaceIncarnation {
     pub fn new(value: impl Into<String>) -> Result<Self, MetadataError> {
@@ -355,7 +359,7 @@ impl WorkspaceIncarnation {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            Ok(Self(value))
+            Ok(Self(value.into()))
         } else {
             Err(MetadataError::InvalidWorkspaceIncarnation(value))
         }

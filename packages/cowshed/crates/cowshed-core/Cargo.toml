@@ -39,7 +39,7 @@ libc = "0.2"
 miniz_oxide = "0.8"
 plist = "1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2"

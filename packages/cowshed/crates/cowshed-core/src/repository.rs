@@ -28,10 +28,11 @@ const RESERVED_LAYOUT_OWNERS: &[&str] = &[
     ".cowshed-volume.json",
 ];
 
-/// A canonical, machine-independent repository identity in `owner/repo` form.
+/// A canonical, machine-independent repository identity in `owner/repo` form. Shared, immutable
+/// text: every controller request carries it, so a clone is a reference count, not a copy.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub struct RepoId(String);
+pub struct RepoId(Arc<str>);
 
 impl RepoId {
     pub fn parse(value: &str) -> Result<Self, RepoIdError> {
@@ -58,7 +59,7 @@ impl RepoId {
                 };
             RepoIdError::InvalidComponent { component }
         })?;
-        Ok(Self(format!("{owner}/{repo}")))
+        Ok(Self(Arc::from(format!("{owner}/{repo}"))))
     }
 
     pub fn from_remote_url(value: &str) -> Result<Self, RemoteUrlError> {
