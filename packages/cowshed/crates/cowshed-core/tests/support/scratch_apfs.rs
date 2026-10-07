@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, Once, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::{
@@ -24,16 +24,16 @@ use super::{
 /// abandoned one without any shared state of its own.
 pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
 
-/// Held while a run sweeps. Every test process sweeps once, and nextest gives every test its own
-/// process, so a run opens dozens of sweeps at once. Unserialized, each of them raced the others
-/// for the same abandoned images: every sweeper waited on the image lease another held for its
-/// detach (11.5 s measured), then found the volume already unmounted under it and failed. One
-/// sweep at a time does the work once. The file records when the last finished sweep started,
-/// and a sweep that started after a process asked to sweep has already seen every run that was
-/// dead when it asked, so the queue behind a sweep returns without sweeping again. Its name
-/// spells no pid, so no sweep ever reclaims it. Every build's tests share it, old and new side by
-/// side on one host, so a record this build cannot read is no sweep ([`swept_since`]).
+/// Held while a sweep runs. Unserialized, concurrent sweeps raced each other for the same
+/// abandoned images: every sweeper waited on the image lease another held for its detach (11.5 s
+/// measured), then found the volume already unmounted under it and failed. Its name spells no
+/// pid, so no sweep ever reclaims it. Other checkouts' sweeps share it and write their own
+/// records into it, so it records nothing of this one's.
 const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
+
+/// The run whose sweep last finished ([`run_id`]), written under [`SWEEP_LOCK`]: every run
+/// sweeps its dead predecessors once, not once per test process. Its name spells no pid either.
+const SWEEP_RECORD: &str = "/private/tmp/cowshed-itest-sweep.run";
 
 /// How long the processes left working under a scratch root get to exit on `SIGTERM` before
 /// they are sent `SIGKILL`: the grace `nx daemon --stop` gives a daemon (`build_volume::nx`),
@@ -43,17 +43,39 @@ const EXIT_GRACE: Duration = Duration::from_secs(10);
 /// One test's disposable root: `/private/tmp/cowshed-itest-<pid>-<n>-<label>`.
 ///
 /// Dropping it ends every process working in its tree, detaches every image attached from below
-/// it, then removes the tree. A run that could not drop it (a SIGKILL, a harness timeout) leaves
-/// it to the next run's sweep.
+/// it, then removes the tree, then waits for its process's sweep of dead runs if that is still
+/// going, and says on stderr how long each took: both run inside the test's own time bound. A
+/// run that could not drop it (a SIGKILL, a harness timeout) leaves it to the next run's sweep.
 pub struct ScratchRoot {
     path: PathBuf,
 }
+
+/// The process's sweep of dead runs, until a scratch root's teardown has waited for it.
+static SWEEPING: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
         static SWEEP: Once = Once::new();
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        SWEEP.call_once(sweep_dead_runs);
+        // The sweep reclaims what dead runs left, and nothing of this test needs it first: its
+        // roots spell a live pid, which no sweep selects. Run before the test, it was charged to
+        // the test's time bound in full, 2 s on a quiet run and 13 s after a run whose tests timed
+        // out, and every other test process of the run queued behind it on the lock. Beside the
+        // test, only what is left of it when the test's first root is dropped is charged.
+        SWEEP.call_once(|| {
+            match std::thread::Builder::new()
+                .name("scratch-sweep".to_owned())
+                .spawn(sweep_dead_runs)
+            {
+                Ok(sweep) => {
+                    *SWEEPING.lock().unwrap_or_else(PoisonError::into_inner) = Some(sweep);
+                }
+                Err(error) => {
+                    eprintln!("scratch root: no sweep thread ({error}); sweeping dead runs now");
+                    sweep_dead_runs();
+                }
+            }
+        });
         let path = PathBuf::from(format!(
             "{ROOT_PREFIX}{}-{}-{label}",
             std::process::id(),
@@ -66,10 +88,8 @@ impl ScratchRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl Drop for ScratchRoot {
-    fn drop(&mut self) {
+    fn tear_down(&self) {
         // A failed test unwinds with the processes it started still working in the tree. An Nx
         // daemon detaches from whatever started it, so nothing else ever ends it: it outlived
         // every failed test in a deleted directory, watching files for good. Ended first, no
@@ -96,9 +116,38 @@ impl Drop for ScratchRoot {
     }
 }
 
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        let started = Instant::now();
+        self.tear_down();
+        let torn_down = started.elapsed();
+        // A test process never ends with its sweep unfinished: a sweep cut off by the process's
+        // exit records nothing, and a run of short processes would never finish one. The lock is
+        // held through the join, so a root dropped beside this one waits for the sweep too.
+        let swept = Instant::now();
+        let mut sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sweep) = sweeping.take()
+            && sweep.join().is_err()
+        {
+            eprintln!(
+                "scratch root: the sweep of dead runs panicked before recording it; the next run sweeps"
+            );
+        }
+        drop(sweeping);
+        eprintln!(
+            "scratch root {}: torn down in {torn_down:?}, then waited {:?} for the sweep of dead runs",
+            self.path.display(),
+            swept.elapsed()
+        );
+    }
+}
+
 /// Reclaim what runs that can no longer clean up after themselves left behind. Nothing runs after
 /// a SIGKILL — a harness timeout, a bounded-exec force-kill, a `cargo test` killed mid-mount — so
-/// the only protocol that always converges is that every run sweeps its dead predecessors.
+/// the only protocol that always converges is that every run sweeps its dead predecessors. One
+/// process of a run sweeps while the others wait on the lock, then find the run's sweep recorded
+/// and return. A sweep killed with its process records nothing, so the next process to take the
+/// lock, of this run or the next, sweeps.
 ///
 /// The sweep is driven off the process and attachment tables rather than the directory listing,
 /// because the residues outlive each other independently: a root directory can be deleted (by
@@ -107,23 +156,18 @@ impl Drop for ScratchRoot {
 /// detaching therefore select on the path the kernel still holds, not on what is on disk now.
 /// Processes go first: one working in a dead run's volume would hold that volume attached.
 fn sweep_dead_runs() {
-    let asked = since_epoch();
-    let sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
+    let run = run_id();
+    let _sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}");
             return;
         }
     };
-    // One byte past a record, so a longer one reads as no record; a short read sweeps.
-    let mut recorded = [0; 17];
-    if sweeping
-        .read_at(&mut recorded, 0)
-        .is_ok_and(|read| swept_since(&recorded[..read], asked, since_epoch()))
-    {
+    if fs::read(SWEEP_RECORD).is_ok_and(|recorded| recorded == run.as_bytes()) {
         return;
     }
-    let started = since_epoch();
+    let started = Instant::now();
     let dead = |path: &Path| owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone);
     if let Err(error) = end_processes_in(dead) {
         eprintln!("abandoned scratch roots: {error}");
@@ -146,32 +190,23 @@ fn sweep_dead_runs() {
             );
         }
     }
-    // Truncated first: a longer record another build left would otherwise keep its tail, and the
-    // file would never again be exactly this build's record.
-    if let Err(error) = sweeping
-        .set_len(0)
-        .and_then(|()| sweeping.write_all_at(&started.to_be_bytes(), 0))
-    {
-        eprintln!("the next run sweeps again: record the sweep in {SWEEP_LOCK}: {error}");
+    if let Err(error) = fs::write(SWEEP_RECORD, run.as_bytes()) {
+        eprintln!("this run sweeps again: record its sweep in {SWEEP_RECORD}: {error}");
     }
+    eprintln!("scratch root: swept dead runs in {:?}", started.elapsed());
 }
 
-/// Whether `record`, what [`SWEEP_LOCK`] holds, names a sweep that started once this process had
-/// asked to sweep (`asked`) and no later than `now`, so it has already seen every run dead when
-/// this one asked. Only exactly this build's record does: sixteen big-endian bytes of
-/// nanoseconds. Anything else -- no record, a partial one, an instant from the future, or what
-/// another build's sweep writes into the same file -- is no sweep, and the asking process sweeps.
-/// Sparing a sweep only saves time; trusting a record wrongly leaves dead runs' images attached.
-fn swept_since(record: &[u8], asked: u128, now: u128) -> bool {
-    <[u8; 16]>::try_from(record)
-        .is_ok_and(|record| (asked..=now).contains(&u128::from_be_bytes(record)))
-}
-
-/// Nanoseconds since the Unix epoch, which orders sweeps across processes.
-fn since_epoch() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos())
+/// This run's identity, as [`SWEEP_RECORD`] records it: nextest gives every test process of one
+/// run the same `NEXTEST_RUN_ID`; `cargo test` runs a binary's tests in one process, which sweeps
+/// once, so its pid and the instant it swept name its run, where a pid alone could name an
+/// earlier run that had the pid before.
+fn run_id() -> String {
+    std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        format!("pid {} at {now}", std::process::id())
+    })
 }
 
 /// `path` opened (created if absent) and `flock`ed exclusively, waiting for any holder: the lock
@@ -218,33 +253,63 @@ fn process_is_gone(pid: i32) -> bool {
 /// protocol. Never act on cached diskN, and never select from `hdiutil info`, which omits attached
 /// images while another image attaches or detaches. A path the kernel holds twice is one image
 /// with two attachments: it is released once, both detached, never refused as ambiguous.
+///
+/// The images are released concurrently, one thread each. Every release is an unmount under the
+/// host's namespace lease and then a detach under its storage lease, and the two classes exclude
+/// each other while a phase admits up to eight of one class (05_gateway.md, "Disk-lifecycle
+/// lease"). One after another, every unmount and every detach of a root waited for a phase of its
+/// own class on a loaded host; released together, their unmounts can share a namespace phase and
+/// their detaches a storage phase. Each image still has exactly one holder.
 fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
     let attached = SystemCommandRunner.attached_disk_images()?;
     let root = Path::new("/private/tmp");
     let host =
         MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(root, root))
             .map_err(std::io::Error::other)?;
-    let mut first_error = None;
     let images = attached
         .iter()
         .filter_map(|attached| match &attached.source {
             DiskImageSource::File(path) => Some(path.as_path()),
             DiskImageSource::Url(_) => None,
         })
+        .filter(|image| select(image))
         .collect::<std::collections::BTreeSet<_>>();
-    for image in images {
-        if select(image)
-            && let Err(error) = host.detach_existing_image(image, DetachIntent::Release)
-        {
-            eprintln!(
-                "scratch image {} could not be released: {error}",
-                image.display()
-            );
-            if first_error.is_none() {
-                first_error = Some(std::io::Error::other(error));
+    let release = |image: &Path| host.detach_existing_image(image, DetachIntent::Release);
+    let mut first_error = None;
+    let mut report = |image: &Path, released: std::thread::Result<Result<(), _>>| {
+        let error = match released {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => std::io::Error::other(error),
+            Err(_) => std::io::Error::other("its release thread panicked"),
+        };
+        eprintln!(
+            "scratch image {} could not be released: {error}",
+            image.display()
+        );
+        first_error.get_or_insert(error);
+    };
+    std::thread::scope(|scope| {
+        let mut releasing = Vec::with_capacity(images.len());
+        for image in images {
+            match std::thread::Builder::new()
+                .name("scratch-release".to_owned())
+                .spawn_scoped(scope, move || release(image))
+            {
+                Ok(thread) => releasing.push((image, thread)),
+                Err(error) => {
+                    eprintln!(
+                        "scratch image {}: no thread to release it beside the others ({error}); \
+                         releasing it in turn",
+                        image.display()
+                    );
+                    report(image, Ok(release(image)));
+                }
             }
         }
-    }
+        for (image, thread) in releasing {
+            report(image, thread.join());
+        }
+    });
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -446,34 +511,5 @@ fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
             return Ok(pids);
         }
         capacity = count;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::swept_since;
-
-    /// Only this build's record of a sweep that started after the asking process asked, and not
-    /// later than now, spares that process its sweep. Another build's sweep shares the lock file
-    /// and wrote its nextest run id there; read as an instant, its first sixteen bytes lie far in
-    /// the future, and trusting them silenced every later sweep while the images of 37 dead runs
-    /// stayed attached.
-    #[test]
-    fn a_record_this_build_did_not_write_is_no_sweep() {
-        let asked: u128 = 1_791_000_000_000_000_000;
-        let now = asked + 5_000_000;
-        assert!(swept_since(&(asked + 1).to_be_bytes(), asked, now));
-        assert!(swept_since(&now.to_be_bytes(), asked, now));
-        assert!(!swept_since(&(asked - 1).to_be_bytes(), asked, now));
-        assert!(!swept_since(&(now + 1).to_be_bytes(), asked, now));
-        assert!(!swept_since(
-            b"ff0f447a-0fc0-4b31-b5c7-32e43b0b7b41",
-            asked,
-            now
-        ));
-        assert!(!swept_since(b"", asked, now));
-        let mut longer = (asked + 1).to_be_bytes().to_vec();
-        longer.push(0);
-        assert!(!swept_since(&longer, asked, now));
     }
 }

@@ -6510,7 +6510,7 @@ mod tests {
     /// How [`real_apfs_fixture_run_ended_by_its_parent`] ends: `panic`, `kill` or `sweep`.
     #[cfg(target_os = "macos")]
     const FIXTURE_ENDING: &str = "COWSHED_TEST_FIXTURE_ENDING";
-    /// The line a fixture run prints once its image is attached and tracked.
+    /// The line a fixture run prints once each of its images is attached.
     #[cfg(target_os = "macos")]
     const FIXTURE_IMAGE: &str = "cowshed-test-fixture-image=";
     /// The line a fixture run prints once a process it started works in its root: that pid and
@@ -6519,14 +6519,15 @@ mod tests {
     const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 
     /// A real-image fixture leaves nothing attached and nothing running however its run ends. A
-    /// panic unwinds through the fixture's own teardown. A kill — nextest's `terminate-after`, a
-    /// host-wide stop — runs no teardown at all, so only the next run's sweep can end the run's
-    /// processes and release its image, and the sweep finds only those working in or staged
-    /// under a scratch root that names the dead run's pid. Fixtures staged under `$TMPDIR` stayed
-    /// attached until reboot after every timed-out run, and the stock Nx daemon a timed-out test
-    /// started kept running in its deleted root. The run's worker stands in for that daemon: a
-    /// process the run started that outlives it, selected, as the daemon is, by its working
-    /// directory alone.
+    /// panic unwinds through the scratch root's own teardown. A kill — nextest's
+    /// `terminate-after`, a host-wide stop — runs no teardown at all, so only the next run's sweep
+    /// can end the run's processes and release its images, and the sweep finds only those working
+    /// in or staged under a scratch root that names the dead run's pid. Fixtures staged under
+    /// `$TMPDIR` stayed attached until reboot after every timed-out run, and the stock Nx daemon a
+    /// timed-out test started kept running in its deleted root. The run's worker stands in for
+    /// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
+    /// working directory alone. The run attaches two images, as a CLI fixture leaves at least a
+    /// main and a build volume, so both teardown and sweep release several at once.
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
@@ -6535,6 +6536,9 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Child, Command, Stdio};
 
+        // Each fixture run is a run of its own, as the next `cargo nextest run` is: without the
+        // parent's `NEXTEST_RUN_ID`, its scratch root's sweep is never one the parent's run
+        // already recorded.
         let run = |ending: &str| -> Child {
             Command::new(std::env::current_exe().expect("test binary"))
                 .args([
@@ -6544,6 +6548,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(FIXTURE_ENDING, ending)
+                .env_remove("NEXTEST_RUN_ID")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn_locked()
@@ -6555,11 +6560,17 @@ mod tests {
             let mut lines = BufReader::new(child.stdout.take().expect("run stdout"))
                 .lines()
                 .map(|line| line.expect("run stdout"));
-            let image = lines
-                .find_map(|line| line.strip_prefix(FIXTURE_IMAGE).map(PathBuf::from))
-                .unwrap_or_else(|| panic!("the {ending} run never attached its fixture"));
-            // A red run must not leak the image it proves leaked.
-            let _leak = RealImageCleanup::new(&backend, image.clone());
+            let images: Vec<PathBuf> = lines
+                .by_ref()
+                .filter_map(|line| line.strip_prefix(FIXTURE_IMAGE).map(PathBuf::from))
+                .take(2)
+                .collect();
+            // A red run must not leak the images it proves leaked.
+            let _leaks: Vec<_> = images
+                .iter()
+                .map(|image| RealImageCleanup::new(&backend, image.clone()))
+                .collect();
+            assert_eq!(images.len(), 2, "the {ending} run attached {images:?}");
             let (worker, root) = lines
                 .find_map(|line| {
                     let (pid, root) = line.strip_prefix(FIXTURE_WORKER)?.split_once(' ')?;
@@ -6579,15 +6590,17 @@ mod tests {
                     assert!(next.success(), "the next run swept: {next}");
                 }
             }
-            assert!(
-                backend
-                    .recovered_image_attachment(&image)
-                    .expect("attachment inventory")
-                    .is_none(),
-                "{ending}: {} is still attached",
-                image.display()
-            );
-            assert!(!image.exists(), "{ending}: {} remains", image.display());
+            for image in &images {
+                assert!(
+                    backend
+                        .recovered_image_attachment(image)
+                        .expect("attachment inventory")
+                        .is_none(),
+                    "{ending}: {} is still attached",
+                    image.display()
+                );
+                assert!(!image.exists(), "{ending}: {} remains", image.display());
+            }
             let left = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&root))
                 .expect("list the processes working under the run's root");
             assert_eq!(left, [], "{ending}: worker {worker} outlived its run");
@@ -6596,8 +6609,9 @@ mod tests {
     }
 
     /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it panics or waits to be
-    /// killed once its image is attached and its worker started, or (`sweep`) only opens a root,
-    /// which sweeps dead runs.
+    /// killed once its images are attached and its worker started, or (`sweep`) only opens and
+    /// drops a scratch root, whose teardown waits for its run's sweep of dead runs. Its images
+    /// are the root's to release, as a CLI fixture's are.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "spawned by real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end"]
@@ -6609,16 +6623,20 @@ mod tests {
         if ending == "sweep" {
             return;
         }
-        let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let mut cleanup = RealImageCleanup::new(&backend, image.clone());
-        crate::blank_image::blank_image(&image);
-        cleanup.track(
-            backend
+        for name in ["first", "second"] {
+            let image = root.path().join(name).with_extension(IMAGE_EXTENSION);
+            crate::blank_image::blank_image(&image);
+            let attachment = backend
                 .attach_verified(&image)
-                .expect("attach the fixture image"),
-        );
-        println!("{FIXTURE_IMAGE}{}", image.display());
+                .expect("attach a fixture image");
+            let mount = root.path().join(format!("{name}-volume"));
+            fs::create_dir(&mount).expect("a fixture mountpoint");
+            backend
+                .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+                .expect("mount a fixture image");
+            println!("{FIXTURE_IMAGE}{}", image.display());
+        }
         // Bounded, so a worker no teardown or sweep ends still ends; a passing run ends it within
         // seconds.
         #[expect(
@@ -6636,11 +6654,10 @@ mod tests {
         .expect("start a worker in the root");
         println!("{FIXTURE_WORKER}{} {}", worker.id(), root.path().display());
         if ending == "panic" {
-            panic!("the fixture's run fails with its image attached");
+            panic!("the fixture's run fails with its images attached");
         }
         // Killed here; the parent's stdin closes only if it failed first.
         let _ = io::stdin().read_line(&mut String::new());
-        finish_real_image_test(Ok(()), cleanup);
     }
 
     #[test]

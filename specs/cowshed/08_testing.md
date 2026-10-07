@@ -201,7 +201,16 @@ declared shard count.
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes costs one AppleDiskImages2 attach slot
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades"), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until the next run's
-sweep, which `real_apfs_fixture_images_are_released_however_their_run_ends` proves for both panic and kill.
+sweep, which `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves for both panic and kill.
+A scratch root's teardown and the sweep release a root's images concurrently, one holder per image: each release is an
+unmount under the host's namespace lease and then a detach under its storage lease, and those classes exclude each other
+(05_gateway.md, "Disk-lifecycle lease"), so releasing a CLI fixture's main, build and workspace images one after another
+waited for a phase change at every step on a loaded host. A run sweeps its dead predecessors once, on a thread beside
+each test process's first test: one process sweeps while the others wait on the lock and then find the run's sweep
+recorded, and every scratch root's teardown waits for its process's sweep, so no test process ends with it unfinished. A
+test is charged only what is left of the sweep once its body is done: nothing a test does depends on the sweep, since no
+sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet run
+and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
@@ -226,8 +235,10 @@ attachment inventories and detach requests that previously appeared only as gaps
 reports binding and inventory checks, identity ownership, intent publication, secret scanning, grant reservation, staged
 copy and credentials, inherited-state cleanup, Git environment wiring, and supervisor startup. Controller startup
 reports runtime creation and protocol connection/open separately. Checked land reports binding, source/target
-inspection, dirty checks, supervisor readiness, check dispatch/completion, and Git delivery. The real fixture also
-reports Git verb durations and elapsed phase boundaries; these diagnostics do not expose command payloads.
+inspection, dirty checks, supervisor readiness, check dispatch/completion, and Git delivery. `gc` reports its build
+volume collection, its discard deletes and its substrate pass (`gc build-volumes`, `gc discard`, `gc substrate`). The
+real fixture also reports Git verb durations and elapsed phase boundaries, and each scratch root its teardown and a
+run's sweep of dead runs; these diagnostics do not expose command payloads.
 
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a
