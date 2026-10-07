@@ -37,7 +37,7 @@
       "type": "number",
       "minimum": 0,
       "default": 10000,
-      "description": "Milliseconds to wait after graceful termination before force-killing the process tree."
+      "description": "Most milliseconds a timed-out command gets after graceful termination before its process group is force-killed. The grace ends early when the command exits; whatever it leaves in its process group is force-killed then."
     },
     "parallelism": {
       "type": "integer",

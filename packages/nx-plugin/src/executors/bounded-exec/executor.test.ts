@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { access, mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CpuBudget } from './cpu-tokens.js';
@@ -386,6 +387,45 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(await exists(marker)).toBe(false);
   });
 
+  it('force-kills what outlives a timed-out command in its process group', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const workspace = await createWorkspace();
+    const fifo = join(workspace.root, 'straggler.fifo');
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    // The leader exits on SIGTERM. The subshell beside it ignores SIGTERM, a disposition its
+    // `sleep` inherits, and announces itself only once it holds the FIFO: from then on the
+    // graceful signal cannot end it. A process forked while that signal goes out is the same
+    // case, without the trap.
+    await workspace.write(
+      'straggle.sh',
+      [
+        '( trap "" TERM; exec 3>"$1"; echo ready; sleep 10; echo survived >&3 ) | {',
+        '  read -r line; echo "$line"; exec sleep 30',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    // The straggler is the FIFO's only writer, so the read ends when it is gone: with nothing
+    // written if it was killed, with "survived" if it lived to finish its sleep.
+    const straggler = readToEnd(fifo);
+
+    const result = await runBoundedExec(
+      { command: `sh straggle.sh ${fifo}`, timeoutMs: 5_000, killAfterMs: 30_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      null,
+    );
+
+    expect(result.terminalOutput).toContain('ready');
+    expect(await straggler).toBe('');
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Force-killing what the timed-out command left in its process group');
+  }, 60_000);
+
   it('runs the command with its RAM lease as TMPDIR, names held dead leases, and ends the lease after it exits', async () => {
     const workspace = await createWorkspace();
     const directory = join(workspace.root, 'lease');
@@ -586,6 +626,16 @@ interface WorkspaceFixture {
   root: string;
   context: BoundedExecContext;
   write(filePath: string, contents: string): Promise<void>;
+}
+
+/** Everything written to the FIFO at `path` until its last writer closes it. */
+async function readToEnd(path: string): Promise<string> {
+  const handle = await open(path, 'r');
+  try {
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
 }
 
 async function createWorkspace(): Promise<WorkspaceFixture> {

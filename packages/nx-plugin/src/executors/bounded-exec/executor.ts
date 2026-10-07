@@ -307,6 +307,7 @@ export async function runBoundedExec(
   // the report always names which bound did it. A bare "timed out" would leave
   // the reader unable to tell a wedged toolchain from a loaded machine — the
   // two have opposite fixes.
+  let termination: Promise<void> = Promise.resolve();
   const expire = (bound: ExpiredBound): void => {
     if (state.settled || state.expiry !== null) {
       return;
@@ -320,27 +321,42 @@ export async function runBoundedExec(
         ? `\nCommand made no progress: no output for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime (cwd=${cwd}): ${command}\n`
         : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
     );
-    void (async () => {
-      await ignoreKillError(killChildTree(false));
-      if (!state.settled && killAfterMs > 0) {
-        await delay(killAfterMs);
-      }
-      if (!state.settled) {
+    termination = terminate();
+  };
+
+  // A timed-out run ends with its whole process group, not with its leader.
+  // The graceful signal reaches every member that exists when it is sent, but
+  // a member that ignores SIGTERM, or one forked while the signal goes out
+  // (macOS does not hold a fork back for a group signal in flight), outlives
+  // a leader that exits on it. The grace ends when the leader exits or
+  // killAfterMs passes, whichever comes first; whatever is left then is killed.
+  const terminate = async (): Promise<void> => {
+    await ignoreKillError(killChildTree(false));
+    if (!state.settled && killAfterMs > 0) {
+      await settledWithin(exitPromise, killAfterMs);
+    }
+    if (state.settled) {
+      if (child.pid !== undefined && processGroupHasMembers(child.pid)) {
         state.forceKillNeeded = true;
-        appendStderr(`Force-killing timed out command after killAfterMs=${killAfterMs}: ${command}\n`);
+        appendStderr(`Force-killing what the timed-out command left in its process group: ${command}\n`);
         await ignoreKillError(killChildTree(true));
-        await delay(REAP_AFTER_FORCE_KILL_MS);
       }
-      if (!state.settled) {
-        resolveExit({ code: 1, signal: 'SIGKILL' });
-      }
-    })();
+      return;
+    }
+    state.forceKillNeeded = true;
+    appendStderr(`Force-killing timed out command after killAfterMs=${killAfterMs}: ${command}\n`);
+    await ignoreKillError(killChildTree(true));
+    await settledWithin(exitPromise, REAP_AFTER_FORCE_KILL_MS);
+    if (!state.settled) {
+      resolveExit({ code: 1, signal: 'SIGKILL' });
+    }
   };
 
   const totalTimer = setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
 
   const { code: exitCode, signal: exitSignal } = await exitPromise;
+  await termination;
   clearTimeout(totalTimer);
   clearTimeout(idleTimer);
   removeSignalHandlers();
@@ -396,21 +412,35 @@ export function createProcessTreeKiller(): ProcessTreeKiller {
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
   try {
-    // Send signal to the entire process group (negative PID).
-    // The executor spawns with detached: true on POSIX, which creates a
-    // dedicated process group. Signaling -pid is atomic and catches all
-    // descendants, including grandchildren that tree-walk libraries miss
-    // when parents die and children get reparented to init.
-    process.kill(-pid, signal);
+    // On POSIX the executor spawns with detached: true, so the child leads a
+    // process group of its own and -pid signals all of it at once, including
+    // grandchildren that tree-walk libraries miss when parents die and
+    // children get reparented to init. Only the group is named: the leader may
+    // already be reaped, and its pid reused by an unrelated process, while the
+    // group lives on in its other members. Windows has no process groups.
+    process.kill(process.platform === 'win32' ? pid : -pid, signal);
   } catch {
-    // ESRCH: process group already exited, or this pid is not a group leader.
-  }
-  try {
-    process.kill(pid, signal);
-  } catch {
-    // Already reaped.
+    // ESRCH: the group (or the Windows process) has already exited.
   }
   return Promise.resolve();
+}
+
+/**
+ * Whether any process is left in the group `pgid` leads. A group outlives its
+ * reaped leader for as long as one member does, and no process can take its id
+ * meanwhile. Windows has no process groups, so there is nothing left to name.
+ */
+function processGroupHasMembers(pgid: number): boolean {
+  if (process.platform === 'win32') {
+    return false;
+  }
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: a member exists but runs as another user.
+    return error instanceof Error && 'code' in error && error.code === 'EPERM';
+  }
 }
 
 function resolveCwd(cwd: string | undefined, root: string): string {
@@ -456,6 +486,12 @@ async function ignoreKillError(promise: Promise<void>): Promise<void> {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Resolves when `promise` settles or `ms` passes, whichever is first, leaving no timer behind. */
+async function settledWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([promise, new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
