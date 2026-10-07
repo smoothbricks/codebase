@@ -4431,15 +4431,8 @@ mod workspace_toolchain_tests {
         }
     }
 
-    fn scratch(test: &str) -> PathBuf {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .expect("temp dir")
-            .join(format!(
-                "cowshed-toolchain-{test}-{}",
-                Uuid::new_v4().simple()
-            ));
-        std::fs::create_dir_all(&root).expect("scratch root");
-        root
+    fn scratch(test: &str) -> crate::temp_root::TempRoot {
+        crate::temp_root::TempRoot::new(&format!("cowshed-toolchain-{test}"))
     }
 
     /// A workspace whose project uses cargo, Go, uv, Nix and Bun gets each tool's wiring from
@@ -4636,7 +4629,6 @@ mod workspace_toolchain_tests {
             !private.join("home/.netrc").exists(),
             "the netrc a previous wiring left, token and all, is gone"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A plain repository gets the core contract and nothing tool-specific: no tool's variables,
@@ -4683,7 +4675,6 @@ mod workspace_toolchain_tests {
         for core in ["GIT_SSL_CAINFO", "SSL_CERT_FILE"] {
             assert_eq!(child.get(OsStr::new(core)), Some(&bundle), "{core}");
         }
-        std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
@@ -4757,7 +4748,6 @@ mod workspace_toolchain_tests {
 
         std::fs::remove_dir_all(&store_path).expect("collect the store path");
         assert_eq!(wiring().await, unwrapped, "a collected store path");
-        std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
@@ -4929,7 +4919,6 @@ mod workspace_toolchain_tests {
         );
         let sandbox = sandbox_at(&mount);
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Every spawn of a live workspace finds its link already in place, so it must not scan the
@@ -4965,7 +4954,6 @@ mod workspace_toolchain_tests {
             dangling.symlink_metadata().is_err(),
             "taking a link sweeps the dangling one"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Stores hand out port blocks independently, so two live workspaces can hold one base.
@@ -5000,7 +4988,6 @@ mod workspace_toolchain_tests {
             );
             std::fs::remove_file(sandbox_runtime_link(sandbox)).ok();
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The nearest workspace-contained `.envrc` above the command's cwd selects the shell, a
@@ -5036,7 +5023,6 @@ mod workspace_toolchain_tests {
         std::fs::write(mount.join(".envrc"), "").expect("workspace envrc");
         assert_eq!(selected(&nested), Some(nested.clone()), "the nearest wins");
         assert_eq!(selected(&mount), Some(mount.clone()));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A detected tool reaches PATH as its own command name in the mode's private `tools/bin`,
@@ -5109,7 +5095,6 @@ mod workspace_toolchain_tests {
                 "{mode:?}: a tool no longer detected leaves PATH"
             );
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A spawn re-detects the conventions its command sees: unchanged ones reuse the rendered
@@ -5148,7 +5133,6 @@ mod workspace_toolchain_tests {
         std::fs::remove_file(nested.join(".envrc")).expect("remove envrc");
         let deactivated = activated.for_cwd(&nested).expect("refresh");
         assert_eq!(shell_directory(deactivated.ceiling()), None);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Every job shares the checkout's one Nx state and daemon. Read-only applies to source
@@ -5206,7 +5190,6 @@ mod workspace_toolchain_tests {
             state(read_only, "NX_DAEMON"),
             Some(crate::capabilities::EnvAction::Unset)
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 }
 
