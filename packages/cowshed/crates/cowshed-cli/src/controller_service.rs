@@ -19,13 +19,15 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use cowshed_core::api::EmptyResult;
+use cowshed_core::api::operations::{self, OperationRequest, SlotRequest};
 use cowshed_core::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, serve_controller_connection,
 };
+use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -153,22 +155,22 @@ struct RouterPortSlotAssigner<'a> {
 #[async_trait::async_trait]
 impl gateway_service::PortSlotAssigner for RouterPortSlotAssigner<'_> {
     async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
+        let workspace = WorkspaceName::new(workspace).map_err(|error| {
+            CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
+        })?;
         self.router
-            .route(
+            .call::<operations::CoordinatorAssignSlot>(
                 ConnectionAuthority::Coordinator {
                     repo_id: self.repo_id.clone(),
                 },
-                "coordinator.assignSlot".to_owned(),
-                serde_json::json!({
-                    "repoId": self.repo_id,
-                    "workspace": workspace,
-                    "slot": slot,
-                }),
-                None,
-                None,
+                SlotRequest {
+                    repo_id: self.repo_id.clone(),
+                    workspace,
+                    slot,
+                },
             )
             .await
-            .map(|_| ())
+            .map(|EmptyResult {}| ())
     }
 }
 
@@ -180,15 +182,15 @@ async fn answer(
 ) {
     let (request, reply) = call.into_parts();
     let response = async {
-        if needs_gateway(request.method(), request.params()) {
+        if needs_gateway(request.operation()) {
             let assigner = RouterPortSlotAssigner {
                 router: &router,
                 repo_id: &repo_id,
             };
             gateway_service::reconcile_native_project(&repo_id, &storage, &assigner).await?;
         }
-        let (authority, method, params, upload, steps) = request.into_parts();
-        router.route(authority, method, params, upload, steps).await
+        let (authority, operation, upload, steps) = request.into_parts();
+        router.route(authority, operation, upload, steps).await
     }
     .await;
     // A peer that has gone away no longer wants the answer; its connection already dropped it.
@@ -197,13 +199,13 @@ async fn answer(
 
 /// The calls that start work in a workspace: an exec, a shell, and a land that runs checks. A land
 /// without checks runs nothing in the workspace, as `cowshed land` without `--check` does not.
-fn needs_gateway(method: &str, params: &Value) -> bool {
-    match method {
-        "worker.exec" | "worker.shell" => true,
-        "coordinator.land" => params
-            .get("options")
-            .and_then(|options| options.get("check"))
-            .and_then(Value::as_array)
+fn needs_gateway(operation: &OperationRequest) -> bool {
+    match operation {
+        OperationRequest::WorkerExec(_) | OperationRequest::WorkerShell(_) => true,
+        OperationRequest::CoordinatorLand(request) => request
+            .options
+            .check
+            .as_ref()
             .is_some_and(|checks| !checks.is_empty()),
         _ => false,
     }

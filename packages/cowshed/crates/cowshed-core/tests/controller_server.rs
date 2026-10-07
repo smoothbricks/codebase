@@ -1,16 +1,17 @@
 #![cfg(unix)]
 
 use bytes::Bytes;
+use cowshed_core::api::operations::{Lane, OPERATIONS, OperationRequest, Scope};
 use cowshed_core::api::server::{
-    CAPABILITY_METHODS, ConnectionAuthority, HANDSHAKE_VERSION, MAX_BINARY_FRAME_BYTES,
-    MAX_JSON_FRAME_BYTES, RouterHandle, RouterResponse, WORKER_METHODS,
-    serve_controller_connection,
+    ConnectionAuthority, HANDSHAKE_VERSION, MAX_BINARY_FRAME_BYTES, MAX_JSON_FRAME_BYTES,
+    RouterHandle, RouterResponse, serve_controller_connection,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,10 +20,16 @@ use tokio::task::JoinHandle;
 
 const NONCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+/// One canonical request per declared operation, fenced to [`worker_authority`].
+const CORPUS: &str = include_str!("../src/api/operations.corpus.json");
+
+/// The session name that asks the recording router for an unsolicited raw-byte lane.
+const UNSOLICITED_BINARY_SESSION: &str = "unsolicited-binary";
+
 #[derive(Debug)]
 struct RecordedRequest {
     authority: ConnectionAuthority,
-    method: String,
+    method: &'static str,
     params: Value,
     upload: Option<Bytes>,
 }
@@ -200,29 +207,33 @@ fn worker_authority() -> ConnectionAuthority {
     }
 }
 
-fn coordinator_params(method: &str) -> Value {
-    if method == "project.open" {
-        json!({ "path": "/trusted/acme/widget" })
-    } else if method == "job.logs" {
-        json!({ "repoId": repo(), "offset": 0 })
-    } else {
-        json!({ "repoId": repo() })
-    }
+/// The corpus request of `method`.
+fn params(method: &str) -> Value {
+    let mut corpus: BTreeMap<String, Value> =
+        serde_json::from_str(CORPUS).expect("the corpus is a JSON object of requests");
+    corpus
+        .remove(method)
+        .unwrap_or_else(|| panic!("{method} has no corpus request"))
 }
 
-fn worker_params(method: &str) -> Value {
-    let mut params = json!({
-        "repoId": repo(),
-        "workspace": workspace(),
-        "workspaceIncarnation": incarnation(),
-    });
-    if method == "job.logs" {
-        params
-            .as_object_mut()
-            .expect("worker params object")
-            .insert("offset".into(), json!(0));
-    }
-    params
+/// Methods a connection may name: every declared operation that is not internal.
+fn connection_methods() -> impl Iterator<Item = &'static str> {
+    OPERATIONS
+        .iter()
+        .filter(|operation| operation.scope != Scope::Internal)
+        .map(|operation| operation.method)
+}
+
+fn is_worker_method(method: &str) -> bool {
+    OPERATIONS
+        .iter()
+        .any(|operation| operation.method == method && operation.scope == Scope::Worker)
+}
+
+fn is_upload_method(method: &str) -> bool {
+    OPERATIONS
+        .iter()
+        .any(|operation| operation.method == method && operation.lane == Lane::Upload)
 }
 
 fn recording_router() -> (
@@ -236,30 +247,36 @@ fn recording_router() -> (
     let actor = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             let (request, reply) = command.into_parts();
-            let (authority, method, params, upload, _steps) = request.into_parts();
-            let response = if method == "job.logs" {
-                let offset = params
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .expect("validated log offset");
-                let bytes = Bytes::from_static(b"chunk");
-                let next_offset = offset
-                    .checked_add(u64::try_from(bytes.len()).expect("chunk length"))
-                    .expect("log offset");
-                RouterResponse::binary(json!({ "eof": true, "nextOffset": next_offset }), bytes)
-            } else if params.get("routerBinary") == Some(&Value::Bool(true)) {
-                RouterResponse::binary(
-                    json!({ "eof": true, "nextOffset": 1 }),
-                    Bytes::from_static(b"x"),
-                )
-            } else {
-                Ok(RouterResponse::json(json!({ "method": method })))
+            let (authority, operation, upload, _steps) = request.into_parts();
+            let method = operation.method();
+            let response = match &operation {
+                OperationRequest::WorkerExec(exec)
+                    if exec.session.as_deref() == Some(UNSOLICITED_BINARY_SESSION) =>
+                {
+                    RouterResponse::binary(
+                        json!({ "eof": true, "nextOffset": 1 }),
+                        Bytes::from_static(b"x"),
+                    )
+                }
+                operation => match operation.download_offset() {
+                    Some(offset) => {
+                        let bytes = Bytes::from_static(b"chunk");
+                        let next_offset = offset
+                            .checked_add(u64::try_from(bytes.len()).expect("chunk length"))
+                            .expect("log offset");
+                        RouterResponse::binary(
+                            json!({ "eof": true, "nextOffset": next_offset }),
+                            bytes,
+                        )
+                    }
+                    None => Ok(RouterResponse::json(json!({ "method": method }))),
+                },
             };
             record
                 .send(RecordedRequest {
                     authority,
                     method,
-                    params,
+                    params: operation.params().expect("a decoded request encodes"),
                     upload,
                 })
                 .expect("record request");
@@ -290,11 +307,11 @@ async fn a_workspace_authority_cannot_reach_any_identity_verb() {
     const IDENTITY_VERBS: &[&str] = &["coordinator.changeRepoId", "coordinator.adopt"];
     for verb in IDENTITY_VERBS {
         assert!(
-            CAPABILITY_METHODS.contains(verb),
+            connection_methods().any(|method| method == *verb),
             "{verb} must be a real capability method for this test to mean anything"
         );
         assert!(
-            !WORKER_METHODS.contains(verb),
+            !is_worker_method(verb),
             "{verb} is an identity operation and must never be reachable by a workspace authority"
         );
     }
@@ -302,7 +319,7 @@ async fn a_workspace_authority_cannot_reach_any_identity_verb() {
     let (router, mut records, _actor) = recording_router();
     let (mut worker, worker_server) = TestClient::connect(worker_authority(), router).await;
     for verb in IDENTITY_VERBS {
-        let response = worker.request(verb, worker_params(verb), None).await;
+        let response = worker.request(verb, params(verb), None).await;
         assert!(
             !response.envelope.ok,
             "a workspace authority reached {verb}"
@@ -320,22 +337,18 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
     let (mut coordinator, coordinator_server) =
         TestClient::connect(coordinator_authority(), router.clone()).await;
 
-    for method in CAPABILITY_METHODS {
-        let upload = ["worker.exec", "worker.stdinChunk", "job.attachWrite"]
-            .contains(method)
-            .then_some(&b"input"[..]);
-        let response = coordinator
-            .request(method, coordinator_params(method), upload)
-            .await;
+    for method in connection_methods() {
+        let upload = is_upload_method(method).then_some(&b"input"[..]);
+        let response = coordinator.request(method, params(method), upload).await;
         assert!(response.envelope.ok, "coordinator rejected {method}");
         assert_eq!(response.envelope.id + 1, coordinator.next_id);
         assert!(response.envelope.error.is_none());
         let recorded = records.recv().await.expect("coordinator request recorded");
         assert_eq!(recorded.authority, coordinator_authority());
-        assert_eq!(recorded.method, *method);
-        assert_eq!(recorded.params, coordinator_params(method));
+        assert_eq!(recorded.method, method);
+        assert_eq!(recorded.params, params(method));
         assert_eq!(recorded.upload.as_deref(), upload);
-        if *method == "job.logs" {
+        if method == "job.logs" {
             assert_eq!(response.binary.as_deref(), Some(&b"chunk"[..]));
             assert_eq!(
                 response.envelope.result,
@@ -349,12 +362,10 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
     assert_clean_disconnect(coordinator, coordinator_server).await;
 
     let (mut worker, worker_server) = TestClient::connect(worker_authority(), router).await;
-    for method in CAPABILITY_METHODS {
-        let allowed = WORKER_METHODS.contains(method);
-        let upload = (allowed
-            && ["worker.exec", "worker.stdinChunk", "job.attachWrite"].contains(method))
-        .then_some(&b"input"[..]);
-        let response = worker.request(method, worker_params(method), upload).await;
+    for method in connection_methods() {
+        let allowed = is_worker_method(method);
+        let upload = (allowed && is_upload_method(method)).then_some(&b"input"[..]);
+        let response = worker.request(method, params(method), upload).await;
         assert_eq!(
             response.envelope.ok, allowed,
             "worker decision for {method}"
@@ -362,9 +373,9 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
         if allowed {
             let recorded = records.recv().await.expect("worker request recorded");
             assert_eq!(recorded.authority, worker_authority());
-            assert_eq!(recorded.method, *method);
-            assert_eq!(recorded.params, worker_params(method));
-            if *method == "job.logs" {
+            assert_eq!(recorded.method, method);
+            assert_eq!(recorded.params, params(method));
+            if method == "job.logs" {
                 assert_eq!(
                     response.envelope.result,
                     Some(json!({ "eof": true, "nextOffset": 5 }))
@@ -382,6 +393,55 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
         }
     }
     assert_clean_disconnect(worker, worker_server).await;
+}
+
+#[tokio::test]
+async fn internal_operations_are_refused_over_a_connection() {
+    let internal: Vec<&str> = OPERATIONS
+        .iter()
+        .filter(|operation| operation.scope == Scope::Internal)
+        .map(|operation| operation.method)
+        .collect();
+    assert!(!internal.is_empty());
+    let (router, mut records, _actor) = recording_router();
+    let (mut coordinator, server) = TestClient::connect(coordinator_authority(), router).await;
+    for method in internal {
+        let response = coordinator.request(method, params(method), None).await;
+        assert!(!response.envelope.ok, "a connection reached {method}");
+        assert_eq!(
+            response.envelope.error.expect("typed authority error").code,
+            ErrorCode::Conflict
+        );
+    }
+    assert!(records.try_recv().is_err());
+    assert_clean_disconnect(coordinator, server).await;
+}
+
+#[tokio::test]
+async fn a_request_its_declaration_refuses_never_reaches_the_router() {
+    let (router, mut records, _actor) = recording_router();
+    let (mut coordinator, server) = TestClient::connect(coordinator_authority(), router).await;
+    let mut mutated = params("job.kill");
+    let job = mutated
+        .as_object_mut()
+        .expect("job.kill params")
+        .remove("jobId")
+        .expect("jobId");
+    mutated
+        .as_object_mut()
+        .expect("job.kill params")
+        .insert("job".into(), job);
+    let response = coordinator.request("job.kill", mutated, None).await;
+    assert!(!response.envelope.ok);
+    let error = response.envelope.error.expect("typed decode error");
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(
+        error.message.contains("invalid job.kill parameters"),
+        "{}",
+        error.message
+    );
+    assert!(records.try_recv().is_err());
+    assert_clean_disconnect(coordinator, server).await;
 }
 
 #[tokio::test]
@@ -417,7 +477,7 @@ async fn worker_fence_rejects_wrong_repo_workspace_and_incarnation_before_router
     }
 
     let response = client
-        .request("job.status", worker_params("job.status"), None)
+        .request("job.status", params("job.status"), None)
         .await;
     assert!(response.envelope.ok);
     assert_eq!(
@@ -432,11 +492,7 @@ async fn worker_cannot_call_coordinator_method() {
     let (router, mut records, _actor) = recording_router();
     let (mut client, server) = TestClient::connect(worker_authority(), router).await;
     let response = client
-        .request(
-            "coordinator.destroy",
-            worker_params("coordinator.destroy"),
-            None,
-        )
+        .request("coordinator.destroy", params("coordinator.destroy"), None)
         .await;
     assert!(!response.envelope.ok);
     assert_eq!(
@@ -483,7 +539,7 @@ async fn malformed_and_oversized_json_frames_stop_only_the_connection() {
     let (mut valid, valid_server) = TestClient::connect(coordinator_authority(), router).await;
     assert!(
         valid
-            .request("project.list", coordinator_params("project.list"), None)
+            .request("project.list", params("project.list"), None)
             .await
             .envelope
             .ok
@@ -506,7 +562,7 @@ async fn oversized_binary_and_second_raw_lane_are_rejected_before_router_effects
         .write_json(&json!({
             "id": 1,
             "method": "worker.stdinChunk",
-            "params": worker_params("worker.stdinChunk"),
+            "params": params("worker.stdinChunk"),
             "binaryLength": declared,
         }))
         .await;
@@ -531,7 +587,7 @@ async fn oversized_binary_and_second_raw_lane_are_rejected_before_router_effects
     let (mut second_lane, second_lane_server) =
         TestClient::connect(worker_authority(), router).await;
     let response = second_lane
-        .request("job.logs", worker_params("job.logs"), Some(b"upload"))
+        .request("job.logs", params("job.logs"), Some(b"upload"))
         .await;
     assert!(!response.envelope.ok);
     assert_eq!(
@@ -554,12 +610,11 @@ async fn oversized_binary_and_second_raw_lane_are_rejected_before_router_effects
 async fn router_cannot_return_an_unsolicited_second_raw_lane() {
     let (router, mut records, _actor) = recording_router();
     let (mut client, server) = TestClient::connect(worker_authority(), router).await;
-    let mut params = worker_params("worker.exec");
-    params
-        .as_object_mut()
-        .expect("worker params")
-        .insert("routerBinary".into(), Value::Bool(true));
-    let response = client.request("worker.exec", params, Some(b"stdin")).await;
+    let mut exec = params("worker.exec");
+    exec.as_object_mut()
+        .expect("worker.exec params")
+        .insert("session".into(), json!(UNSOLICITED_BINARY_SESSION));
+    let response = client.request("worker.exec", exec, Some(b"stdin")).await;
     assert!(!response.envelope.ok);
     assert_eq!(
         response.envelope.error.expect("second lane error").code,
@@ -603,7 +658,7 @@ async fn disconnect_cancels_only_the_connection_while_routed_work_continues() {
         .write_json(&json!({
             "id": 1,
             "method": "job.status",
-            "params": coordinator_params("job.status"),
+            "params": params("job.status"),
             "binaryLength": null,
         }))
         .await;
@@ -641,7 +696,7 @@ async fn malformed_connection_does_not_poison_a_concurrent_connection() {
     );
 
     let response = good
-        .request("project.list", coordinator_params("project.list"), None)
+        .request("project.list", params("project.list"), None)
         .await;
     assert!(response.envelope.ok);
     assert_eq!(
@@ -688,7 +743,7 @@ async fn invalid_version_nonce_replay_and_non_socket_peer_fail_before_router_eff
         TestClient::connect(coordinator_authority(), router.clone()).await;
     assert!(
         replay
-            .request_with_id(1, "project.list", coordinator_params("project.list"), None)
+            .request_with_id(1, "project.list", params("project.list"), None)
             .await
             .envelope
             .ok
@@ -698,7 +753,7 @@ async fn invalid_version_nonce_replay_and_non_socket_peer_fail_before_router_eff
         "project.list"
     );
     let repeated = replay
-        .request_with_id(1, "project.list", coordinator_params("project.list"), None)
+        .request_with_id(1, "project.list", params("project.list"), None)
         .await;
     assert!(!repeated.envelope.ok);
     assert_eq!(

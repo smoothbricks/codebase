@@ -1,13 +1,22 @@
 use super::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
-    CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
-    GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
+    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
+    DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
+    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, SealedJob, StdinSource, StepReport, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspaceTarget,
+    ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceTarget,
 };
 use super::frame;
+use super::operations::{
+    self, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest, CreateRequest, DestroyRequest,
+    ExecParams, ExecStdin, GcRequest, GrantRequest, JobRequest, JobStream, LandRequest, LogsChunk,
+    LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation, ProjectGrantRequest,
+    ProjectOpenRequest, PushRequest, QuotaRequest, RebaseRequest, RemoveProjectRequest,
+    RepoRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
+    SourceDestinationRequest, WorkerScope, WorkspaceAtRequest, WorkspaceAttachRequest,
+    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
+};
 use super::peer_credentials::PeerCredentialsError;
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
@@ -19,9 +28,7 @@ use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fmt;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -52,6 +59,32 @@ impl WorkspaceAuthority {
             repo_id: info.repo_id.clone(),
             workspace: info.workspace.clone(),
             workspace_incarnation: info.workspace_incarnation.clone(),
+        }
+    }
+
+    fn scope(&self) -> WorkerScope {
+        WorkerScope {
+            repo_id: self.repo_id.clone(),
+            workspace: self.workspace.clone(),
+            workspace_incarnation: self.workspace_incarnation.clone(),
+        }
+    }
+
+    fn job(&self, job_id: JobId) -> JobRequest {
+        JobRequest {
+            repo_id: self.repo_id.clone(),
+            workspace: self.workspace.clone(),
+            workspace_incarnation: self.workspace_incarnation.clone(),
+            job_id,
+        }
+    }
+
+    fn session(&self, session: Option<String>) -> SessionRequest {
+        SessionRequest {
+            repo_id: self.repo_id.clone(),
+            workspace: self.workspace.clone(),
+            workspace_incarnation: self.workspace_incarnation.clone(),
+            session,
         }
     }
 }
@@ -244,54 +277,39 @@ impl ControllerRuntime for ActorRuntime {
             stdout_copy,
             stderr_copy,
         } = request;
-        let mode = match mode {
-            RunSandboxMode::ReadWrite => "readWrite",
-            RunSandboxMode::ReadOnly => "readOnly",
+        let (stdin, inline, mut stream) = match stdin {
+            StdinSource::Empty => (ExecStdin::Empty, None, None),
+            StdinSource::Inline(bytes) => (ExecStdin::Inline, Some(bytes), None),
+            StdinSource::WorkspaceFile(workspace_path) => {
+                (ExecStdin::WorkspaceFile { workspace_path }, None, None)
+            }
+            StdinSource::Stream(stream) => (ExecStdin::Stream, None, Some(stream)),
         };
-        let (stdin_metadata, inline, mut stream) = match stdin {
-            StdinSource::Empty => (json!({ "kind": "empty" }), None, None),
-            StdinSource::Inline(bytes) => (json!({ "kind": "inline" }), Some(bytes), None),
-            StdinSource::WorkspaceFile(path) => (
-                json!({ "kind": "workspaceFile", "workspacePath": path }),
-                None,
-                None,
-            ),
-            StdinSource::Stream(stream) => (json!({ "kind": "stream" }), None, Some(stream)),
+        let (argv, script) = match command {
+            crate::api::dto::ExecCommand::Argv(argv) => (Some(argv), None),
+            crate::api::dto::ExecCommand::Script(script) => (None, Some(script)),
         };
-        let mut params = json!({
-            "repoId": authority.repo_id,
-            "workspace": authority.workspace,
-            "workspaceIncarnation": authority.workspace_incarnation,
-            "session": session,
-            "cwd": cwd,
-            "mode": mode,
-            "env": env,
-            "trace": trace,
-            "stdin": stdin_metadata,
-            "stdoutCopy": stdout_copy,
-            "stderrCopy": stderr_copy,
-        });
-        // Exactly one of the two keys, as the wire carries a command.
-        let (key, value) = match &command {
-            crate::api::dto::ExecCommand::Argv(argv) => ("argv", json!(argv)),
-            crate::api::dto::ExecCommand::Script(script) => ("script", json!(script)),
+        let params = ExecParams {
+            repo_id: authority.repo_id.clone(),
+            workspace: authority.workspace.clone(),
+            workspace_incarnation: authority.workspace_incarnation.clone(),
+            session: session.map(str::to_owned),
+            argv,
+            script,
+            cwd,
+            mode,
+            env,
+            trace,
+            stdin,
+            stdout_copy,
+            stderr_copy,
         };
-        params
-            .as_object_mut()
-            .expect("a JSON object literal is an object")
-            .insert(key.to_owned(), value);
-        let result = match inline {
-            Some(bytes) => self.upload("worker.exec", params, bytes).await?,
-            None => self.call("worker.exec", params).await?,
+        let job_id = match inline {
+            Some(bytes) => invoke_upload::<operations::WorkerExec>(self, &params, bytes).await?,
+            None => invoke::<operations::WorkerExec>(self, &params).await?,
         };
-        let job_id: JobId = serde_json::from_value(result).map_err(|error| {
-            CowshedError::new(
-                ErrorCode::Internal,
-                format!("controller returned an invalid worker.exec response: {error}"),
-                "cowshed doctor --json",
-            )
-        })?;
         if let Some(reader) = stream.as_mut() {
+            let job = authority.job(job_id);
             let mut buffer = [0_u8; MAX_BINARY_FRAME_BYTES];
             loop {
                 let count = reader.read(&mut buffer).await.map_err(|error| {
@@ -304,30 +322,14 @@ impl ControllerRuntime for ActorRuntime {
                 if count == 0 {
                     break;
                 }
-                self.upload(
-                    "worker.stdinChunk",
-                    json!({
-                        "repoId": authority.repo_id,
-                        "workspace": authority.workspace,
-                        "workspaceIncarnation": authority.workspace_incarnation,
-                        "jobId": job_id,
-                    }),
+                let EmptyResult {} = invoke_upload::<operations::WorkerStdinChunk>(
+                    self,
+                    &job,
                     Bytes::copy_from_slice(&buffer[..count]),
                 )
-                .await
-                .and_then(decode_empty)?;
+                .await?;
             }
-            self.call(
-                "worker.stdinClose",
-                json!({
-                    "repoId": authority.repo_id,
-                    "workspace": authority.workspace,
-                    "workspaceIncarnation": authority.workspace_incarnation,
-                    "jobId": job_id,
-                }),
-            )
-            .await
-            .and_then(decode_empty)?;
+            let EmptyResult {} = invoke::<operations::WorkerStdinClose>(self, &job).await?;
         }
         Ok(job_id)
     }
@@ -373,17 +375,9 @@ impl ControllerRuntime for ActorRuntime {
     }
 
     async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()> {
-        self.call(
-            "job.kill",
-            json!({
-                "repoId": authority.repo_id,
-                "workspace": authority.workspace,
-                "workspaceIncarnation": authority.workspace_incarnation,
-                "jobId": id,
-            }),
-        )
-        .await
-        .and_then(decode_empty)
+        invoke::<operations::JobKill>(self, &authority.job(id))
+            .await
+            .map(|EmptyResult {}| ())
     }
 }
 
@@ -418,21 +412,18 @@ fn poll_job_stream(
     let (sender, receiver) = mpsc::channel(8);
     tokio::spawn(async move {
         loop {
+            let request = LogsRequest {
+                repo_id: authority.repo_id.clone(),
+                workspace: authority.workspace.clone(),
+                workspace_incarnation: authority.workspace_incarnation.clone(),
+                job_id: id,
+                stream,
+                follow,
+                offset,
+            };
             let chunk = tokio::select! {
                 _ = sender.closed() => break,
-                value = runtime.download(
-                    "job.logs",
-                    json!({
-                        "repoId": authority.repo_id,
-                        "workspace": authority.workspace,
-                        "workspaceIncarnation": authority.workspace_incarnation,
-                        "jobId": id,
-                        "stream": stream,
-                        "follow": follow,
-                        "offset": offset,
-                    }),
-                    offset,
-                ) => value,
+                value = invoke_download::<operations::JobLogs>(&*runtime, &request, offset) => value,
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -471,23 +462,10 @@ fn poll_job_stream(
                 if !follow {
                     break;
                 }
-                let status: Result<JobInfo> = tokio::select! {
+                let job = authority.job(id);
+                let status = tokio::select! {
                     _ = sender.closed() => break,
-                    value = runtime.call(
-                        "job.status",
-                        json!({
-                            "repoId": authority.repo_id,
-                            "workspace": authority.workspace,
-                            "workspaceIncarnation": authority.workspace_incarnation,
-                            "jobId": id,
-                        }),
-                    ) => value.and_then(|value| {
-                        serde_json::from_value(value).map_err(|error| {
-                            CowshedError::internal(format!(
-                                "controller returned an invalid job.status response: {error}"
-                            ))
-                        })
-                    }),
+                    value = invoke::<operations::JobStatus>(&*runtime, &job) => value,
                 };
                 match status {
                     Ok(info) if info.state.is_terminal() => break,
@@ -512,39 +490,43 @@ fn poll_job_stream(
     RawByteStream { receiver }
 }
 
-async fn call_typed<T: DeserializeOwned>(
-    runtime: &Arc<dyn ControllerRuntime>,
-    method: &'static str,
-    params: Value,
-) -> Result<T> {
-    decode_typed(method, runtime.call(method, params).await?)
+/// Calls a declared operation and decodes its declared result.
+async fn invoke<O: Operation>(
+    runtime: &(impl ControllerRuntime + ?Sized),
+    request: &O::Request,
+) -> Result<O::Result> {
+    let params = encode_request::<O>(request)?;
+    decode_result::<O>(runtime.call(O::METHOD, params).await?)
 }
 
-fn decode_typed<T: DeserializeOwned>(method: &'static str, value: Value) -> Result<T> {
-    serde_json::from_value(value).map_err(|error| {
-        CowshedError::new(
-            ErrorCode::Internal,
-            format!("controller returned an invalid {method} response: {error}"),
-            "cowshed doctor --json",
-        )
-    })
+/// [`invoke`], with the call's lifecycle steps sent to `steps` as the controller reports them.
+async fn invoke_reporting<O: Operation>(
+    runtime: &(impl ControllerRuntime + ?Sized),
+    request: &O::Request,
+    steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
+) -> Result<O::Result> {
+    let params = encode_request::<O>(request)?;
+    decode_result::<O>(runtime.call_reporting(O::METHOD, params, steps).await?)
 }
 
-fn decode_empty(value: Value) -> Result<()> {
-    serde_json::from_value::<EmptyResult>(value)
-        .map(|_| ())
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "controller returned an invalid empty result: {error}"
-            ))
-        })
+/// [`invoke`] for an upload operation, with `bytes` as its raw-byte frame.
+async fn invoke_upload<O: Operation>(
+    runtime: &(impl ControllerRuntime + ?Sized),
+    request: &O::Request,
+    bytes: Bytes,
+) -> Result<O::Result> {
+    let params = encode_request::<O>(request)?;
+    decode_result::<O>(runtime.upload(O::METHOD, params, bytes).await?)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum JobStream {
-    Stdout,
-    Stderr,
+/// Calls a download operation whose raw-byte frame starts at `offset`.
+async fn invoke_download<O: Operation>(
+    runtime: &(impl ControllerRuntime + ?Sized),
+    request: &O::Request,
+    offset: u64,
+) -> Result<BinaryDownload> {
+    let params = encode_request::<O>(request)?;
+    runtime.download(O::METHOD, params, offset).await
 }
 
 pub struct RawByteStream {
@@ -565,19 +547,13 @@ pub struct JobStdin {
 
 impl JobStdin {
     pub async fn write(&self, bytes: Bytes) -> Result<()> {
-        self.runtime
-            .upload(
-                "job.attachWrite",
-                json!({
-                    "repoId": self.authority.repo_id,
-                    "workspace": self.authority.workspace,
-                    "workspaceIncarnation": self.authority.workspace_incarnation,
-                    "jobId": self.id,
-                }),
-                bytes,
-            )
-            .await
-            .and_then(decode_empty)
+        invoke_upload::<operations::JobAttachWrite>(
+            &*self.runtime,
+            &self.authority.job(self.id),
+            bytes,
+        )
+        .await
+        .map(|EmptyResult {}| ())
     }
 }
 
@@ -606,19 +582,9 @@ impl JobAttachment {
     }
 
     pub async fn detach(self) -> Result<()> {
-        let value = self
-            .runtime
-            .call(
-                "job.detach",
-                json!({
-                    "repoId": self.authority.repo_id,
-                    "workspace": self.authority.workspace,
-                    "workspaceIncarnation": self.authority.workspace_incarnation,
-                    "jobId": self.id,
-                }),
-            )
-            .await?;
-        decode_empty(value)
+        invoke::<operations::JobDetach>(&*self.runtime, &self.authority.job(self.id))
+            .await
+            .map(|EmptyResult {}| ())
     }
 }
 
@@ -632,36 +598,10 @@ impl fmt::Debug for JobAttachment {
     }
 }
 
-fn encode_value<T: Serialize>(kind: &'static str, value: &T) -> Result<Value> {
-    serde_json::to_value(value).map_err(|error| {
-        CowshedError::new(
-            ErrorCode::Usage,
-            format!("{kind} is not representable as JSON: {error}"),
-            "use UTF-8 paths and validated cowshed option values",
-        )
+fn workspace_name(name: &str) -> Result<WorkspaceName> {
+    WorkspaceName::new(name).map_err(|error| {
+        CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
     })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProjectWire {
-    repo_id: RepoId,
-    binding: RepositoryBinding,
-    git_root: PathBuf,
-    store_root: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkspaceWire {
-    info: WorkspaceInfo,
-    grants: GrantSet,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BuildVolumeWire {
-    volume: Option<PathBuf>,
 }
 
 /// Explicit cowshed client. Its sealed runtime delegates to a single-owner controller actor.
@@ -678,8 +618,13 @@ impl Cowshed {
                 "use a UTF-8 project path",
             )
         })?;
-        let wire: ProjectWire =
-            call_typed(&self.runtime, "project.open", json!({ "path": path })).await?;
+        let wire = invoke::<operations::ProjectOpen>(
+            &*self.runtime,
+            &ProjectOpenRequest {
+                path: path.to_owned(),
+            },
+        )
+        .await?;
         let paths = crate::storage::StorageLayout::new(&wire.store_root, &wire.repo_id)
             .map(|layout| layout.project().clone())
             .map_err(|error| {
@@ -761,39 +706,38 @@ impl Project {
     }
 
     pub async fn workspace(&self, name: &str) -> Result<WorkspaceRef> {
-        let name = WorkspaceName::new(name).map_err(|error| {
-            CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
-        })?;
-        let wire: WorkspaceWire = call_typed(
-            &self.runtime,
-            "project.workspace",
-            json!({ "repoId": self.repo_id, "workspace": name }),
-        )
-        .await?;
-        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+        let request = WorkspaceRequest {
+            repo_id: self.repo_id.clone(),
+            workspace: workspace_name(name)?,
+        };
+        let view = invoke::<operations::ProjectWorkspace>(&*self.runtime, &request).await?;
+        Ok(WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
     }
 
     /// Resolves an existing path through the controller's authoritative storage and mount facts.
     pub async fn workspace_at(&self, path: impl AsRef<Path>) -> Result<WorkspaceRef> {
-        let wire: WorkspaceWire = call_typed(
-            &self.runtime,
-            "project.workspaceAt",
-            json!({ "repoId": self.repo_id, "path": path.as_ref() }),
-        )
-        .await?;
-        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+        let path = path.as_ref().to_str().ok_or_else(|| {
+            CowshedError::usage(
+                "workspace path is not valid UTF-8",
+                "use a UTF-8 workspace path",
+            )
+        })?;
+        let request = WorkspaceAtRequest {
+            repo_id: self.repo_id.clone(),
+            path: path.to_owned(),
+        };
+        let view = invoke::<operations::ProjectWorkspaceAt>(&*self.runtime, &request).await?;
+        Ok(WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
     }
 
     pub async fn list(&self) -> Result<Vec<WorkspaceRef>> {
-        let wires: Vec<WorkspaceWire> = call_typed(
-            &self.runtime,
-            "project.list",
-            json!({ "repoId": self.repo_id }),
-        )
-        .await?;
-        Ok(wires
+        let request = RepoRequest {
+            repo_id: self.repo_id.clone(),
+        };
+        let views = invoke::<operations::ProjectList>(&*self.runtime, &request).await?;
+        Ok(views
             .into_iter()
-            .map(|wire| WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+            .map(|view| WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
             .collect())
     }
 }
@@ -819,11 +763,18 @@ pub struct WorkspaceRef {
 }
 
 impl WorkspaceRef {
-    fn from_wire(wire: WorkspaceWire, runtime: Arc<dyn ControllerRuntime>) -> Self {
+    fn from_view(view: WorkspaceView, runtime: Arc<dyn ControllerRuntime>) -> Self {
         Self {
-            info: wire.info,
-            grants: wire.grants,
+            info: view.info,
+            grants: view.grants,
             runtime,
+        }
+    }
+
+    fn request(&self) -> WorkspaceRequest {
+        WorkspaceRequest {
+            repo_id: self.info.repo_id.clone(),
+            workspace: self.info.workspace.clone(),
         }
     }
 
@@ -868,32 +819,28 @@ impl WorkspaceRef {
 
     /// Refreshes workspace information from the controller without changing this snapshot.
     pub async fn refresh_info(&self) -> Result<WorkspaceInfo> {
-        call_typed(
-            &self.runtime,
-            "workspace.info",
-            json!({ "repoId": self.info.repo_id, "workspace": self.info.workspace }),
-        )
-        .await
+        invoke::<operations::WorkspaceInfoRead>(&*self.runtime, &self.request()).await
     }
 
     pub async fn attach(&self, options: AttachOptions) -> Result<()> {
-        let _: EmptyResult = call_typed(
-            &self.runtime,
-            "workspace.attach",
-            json!({ "repoId": self.info.repo_id, "workspace": self.info.workspace, "options": options }),
-        )
-        .await?;
-        Ok(())
+        let request = WorkspaceAttachRequest {
+            repo_id: self.info.repo_id.clone(),
+            workspace: self.info.workspace.clone(),
+            options,
+        };
+        invoke::<operations::WorkspaceAttach>(&*self.runtime, &request)
+            .await
+            .map(|EmptyResult {}| ())
     }
 
     /// Refreshes grants from the controller without changing this snapshot.
     pub async fn refresh_grants(&self) -> Result<GrantSet> {
-        call_typed(
-            &self.runtime,
-            "workspace.grants",
-            json!({ "repoId": self.info.repo_id, "workspace": self.info.workspace }),
-        )
-        .await
+        let request = WorkspaceGrantsRequest {
+            repo_id: self.info.repo_id.clone(),
+            workspace: self.info.workspace.clone(),
+            workspace_incarnation: None,
+        };
+        invoke::<operations::WorkspaceGrants>(&*self.runtime, &request).await
     }
 
     /// The build volume a job of this workspace incarnation would be granted now
@@ -902,17 +849,14 @@ impl WorkspaceRef {
     /// follows the link compares what it names against this. Refuses a detached workspace and a
     /// name recreated since this reference was resolved.
     pub async fn build_volume(&self) -> Result<Option<PathBuf>> {
-        let wire: BuildVolumeWire = call_typed(
-            &self.runtime,
-            "workspace.buildVolume",
-            json!({
-                "repoId": self.info.repo_id,
-                "workspace": self.info.workspace,
-                "workspaceIncarnation": self.info.workspace_incarnation,
-            }),
-        )
-        .await?;
-        Ok(wire.volume)
+        let request = WorkerScope {
+            repo_id: self.info.repo_id.clone(),
+            workspace: self.info.workspace.clone(),
+            workspace_incarnation: self.info.workspace_incarnation.clone(),
+        };
+        invoke::<operations::WorkspaceBuildVolume>(&*self.runtime, &request)
+            .await
+            .map(|answer| answer.volume)
     }
 }
 
@@ -1003,14 +947,6 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
         |error| handshake_error(format!("coordinator handshake read failed: {error}")),
     )
     .await
-}
-
-#[cfg(unix)]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RpcBinaryResult {
-    eof: bool,
-    next_offset: u64,
 }
 
 #[cfg(unix)]
@@ -1290,7 +1226,7 @@ async fn read_answer(
             "controller RPC binary response exceeds the 64 KiB frame limit",
         ));
     }
-    let metadata: RpcBinaryResult = serde_json::from_value(result).map_err(|error| {
+    let metadata: LogsChunk = serde_json::from_value(result).map_err(|error| {
         CowshedError::internal(format!(
             "controller RPC download metadata is invalid: {error}"
         ))
@@ -1489,18 +1425,29 @@ impl Coordinator {
         self.other_build.clone()
     }
 
-    async fn workspace_result(&self, method: &'static str, params: Value) -> Result<WorkspaceRef> {
-        let wire: WorkspaceWire = call_typed(&self.runtime, method, params).await?;
-        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+    fn repo_id(&self) -> RepoId {
+        self.project.repo_id.clone()
+    }
+
+    fn workspace_request(&self, workspace: &str) -> Result<WorkspaceRequest> {
+        Ok(WorkspaceRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+        })
+    }
+
+    fn workspace_ref(&self, view: WorkspaceView) -> WorkspaceRef {
+        WorkspaceRef::from_view(view, Arc::clone(&self.runtime))
     }
 
     pub async fn adopt(&self, options: AdoptOptions) -> Result<WorkspaceRef> {
-        let options = encode_value("adopt options", &options)?;
-        self.workspace_result(
-            "coordinator.adopt",
-            json!({ "repoId": self.project.repo_id, "options": options }),
-        )
-        .await
+        let request = AdoptRequest {
+            repo_id: self.repo_id(),
+            options,
+        };
+        invoke::<operations::CoordinatorAdopt>(&*self.runtime, &request)
+            .await
+            .map(|view| self.workspace_ref(view))
     }
 
     pub async fn create(&self, name: &str, options: CreateOptions) -> Result<WorkspaceRef> {
@@ -1526,18 +1473,22 @@ impl Coordinator {
         options: CreateOptions,
         steps: Option<tokio::sync::mpsc::UnboundedSender<StepReport>>,
     ) -> Result<WorkspaceRef> {
-        const METHOD: &str = "coordinator.create";
-        let name = WorkspaceName::session(name).map_err(|error| {
+        let workspace = WorkspaceName::session(name).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid non-main workspace name")
         })?;
-        let params =
-            json!({ "repoId": self.project.repo_id, "workspace": name, "options": options });
-        let value = match steps {
-            Some(steps) => self.runtime.call_reporting(METHOD, params, steps).await?,
-            None => self.runtime.call(METHOD, params).await?,
+        let request = CreateRequest {
+            repo_id: self.repo_id(),
+            workspace,
+            options,
         };
-        let wire: WorkspaceWire = decode_typed(METHOD, value)?;
-        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+        let view = match steps {
+            Some(steps) => {
+                invoke_reporting::<operations::CoordinatorCreate>(&*self.runtime, &request, steps)
+                    .await?
+            }
+            None => invoke::<operations::CoordinatorCreate>(&*self.runtime, &request).await?,
+        };
+        Ok(self.workspace_ref(view))
     }
 
     pub async fn rename(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
@@ -1550,28 +1501,36 @@ impl Coordinator {
         let destination = WorkspaceName::session(destination).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid non-main destination name")
         })?;
-        self.workspace_result(
-            "coordinator.rename",
-            json!({ "repoId": self.project.repo_id, "source": source, "destination": destination }),
-        )
-        .await
+        let request = SourceDestinationRequest {
+            repo_id: self.repo_id(),
+            source,
+            destination,
+        };
+        invoke::<operations::CoordinatorRename>(&*self.runtime, &request)
+            .await
+            .map(|view| self.workspace_ref(view))
     }
 
     /// Move the project's checkout — `cowshed mv main <path>`.
     pub async fn move_checkout(&self, destination: &std::path::Path) -> Result<WorkspaceRef> {
-        self.workspace_result(
-            "coordinator.moveCheckout",
-            json!({ "repoId": self.project.repo_id, "destination": destination }),
-        )
-        .await
+        let request = MoveCheckoutRequest {
+            repo_id: self.repo_id(),
+            destination: destination.to_path_buf(),
+        };
+        invoke::<operations::CoordinatorMoveCheckout>(&*self.runtime, &request)
+            .await
+            .map(|view| self.workspace_ref(view))
     }
+
     /// Change the adopted project's repository identity — `cowshed mv main --repo-id`.
     pub async fn change_repo_id(&self, repo_id: &RepoId) -> Result<WorkspaceRef> {
-        self.workspace_result(
-            "coordinator.changeRepoId",
-            json!({ "repoId": self.project.repo_id, "newRepoId": repo_id }),
-        )
-        .await
+        let request = ChangeRepoIdRequest {
+            repo_id: self.repo_id(),
+            new_repo_id: repo_id.clone(),
+        };
+        invoke::<operations::CoordinatorChangeRepoId>(&*self.runtime, &request)
+            .await
+            .map(|view| self.workspace_ref(view))
     }
 
     pub async fn fork(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
@@ -1581,70 +1540,57 @@ impl Coordinator {
         let destination = WorkspaceName::session(destination).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid non-main destination name")
         })?;
-        self.workspace_result(
-            "coordinator.fork",
-            json!({ "repoId": self.project.repo_id, "source": source, "destination": destination }),
-        )
-        .await
+        let request = SourceDestinationRequest {
+            repo_id: self.repo_id(),
+            source,
+            destination,
+        };
+        invoke::<operations::CoordinatorFork>(&*self.runtime, &request)
+            .await
+            .map(|view| self.workspace_ref(view))
     }
 
     pub async fn grant(&self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
-        self.grant_call("coordinator.grant", workspace, delta).await
+        let request = self.grant_request(workspace, delta)?;
+        invoke::<operations::CoordinatorGrant>(&*self.runtime, &request).await
     }
 
     pub async fn revoke(&self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
-        self.grant_call("coordinator.revoke", workspace, delta)
-            .await
+        let request = self.grant_request(workspace, delta)?;
+        invoke::<operations::CoordinatorRevoke>(&*self.runtime, &request).await
+    }
+
+    fn grant_request(&self, workspace: &str, delta: GrantDelta) -> Result<GrantRequest> {
+        Ok(GrantRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            delta,
+        })
     }
 
     /// The project's standing grants: what every workspace of this project runs under in
     /// addition to its own.
     pub async fn project_grants(&self) -> Result<ProjectGrants> {
-        call_typed(
-            &self.runtime,
-            "coordinator.projectGrants",
-            json!({ "repoId": self.project.repo_id }),
-        )
-        .await
+        let request = RepoRequest {
+            repo_id: self.repo_id(),
+        };
+        invoke::<operations::CoordinatorProjectGrants>(&*self.runtime, &request).await
     }
 
     pub async fn grant_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
-        self.project_grant_call("coordinator.grantProject", delta)
-            .await
+        let request = ProjectGrantRequest {
+            repo_id: self.repo_id(),
+            delta,
+        };
+        invoke::<operations::CoordinatorGrantProject>(&*self.runtime, &request).await
     }
 
     pub async fn revoke_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
-        self.project_grant_call("coordinator.revokeProject", delta)
-            .await
-    }
-
-    async fn project_grant_call(
-        &self,
-        method: &'static str,
-        delta: ProjectGrantDelta,
-    ) -> Result<ProjectGrants> {
-        let delta = encode_value("project grant delta", &delta)?;
-        call_typed(
-            &self.runtime,
-            method,
-            json!({ "repoId": self.project.repo_id, "delta": delta }),
-        )
-        .await
-    }
-
-    async fn grant_call(
-        &self,
-        method: &'static str,
-        workspace: &str,
-        delta: GrantDelta,
-    ) -> Result<GrantSet> {
-        let delta = encode_value("grant delta", &delta)?;
-        call_typed(
-            &self.runtime,
-            method,
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "delta": delta }),
-        )
-        .await
+        let request = ProjectGrantRequest {
+            repo_id: self.repo_id(),
+            delta,
+        };
+        invoke::<operations::CoordinatorRevokeProject>(&*self.runtime, &request).await
     }
 
     /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's `main`
@@ -1656,12 +1602,13 @@ impl Coordinator {
         into: Option<&WorkspaceRef>,
         options: RebaseOptions,
     ) -> Result<RebaseReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.rebase",
-            self.landing_params(workspace, into, json!(options)),
-        )
-        .await
+        let request = RebaseRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            into: into.map(WorkspaceRef::target),
+            options,
+        };
+        invoke::<operations::CoordinatorRebase>(&*self.runtime, &request).await
     }
 
     /// Land `workspace` into `into` — fast-forward the branch `into` has checked out and retire
@@ -1672,48 +1619,29 @@ impl Coordinator {
         into: Option<&WorkspaceRef>,
         options: LandOptions,
     ) -> Result<LandReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.land",
-            self.landing_params(workspace, into, json!(options)),
-        )
-        .await
-    }
-
-    /// `coordinator.land`/`coordinator.rebase` params. `into` is omitted for main, the default,
-    /// as the options omit theirs.
-    fn landing_params(
-        &self,
-        workspace: &str,
-        into: Option<&WorkspaceRef>,
-        options: Value,
-    ) -> Value {
-        let mut params = json!({
-            "repoId": self.project.repo_id,
-            "workspace": workspace,
-            "options": options,
-        });
-        if let Some(into) = into {
-            params["into"] = json!(into.target());
-        }
-        params
+        let request = LandRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            into: into.map(WorkspaceRef::target),
+            options,
+        };
+        invoke::<operations::CoordinatorLand>(&*self.runtime, &request).await
     }
 
     pub async fn restore(&self, workspace: &str, label: &str) -> Result<()> {
-        self.empty_call(
-            "coordinator.restore",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "label": label }),
-        )
-        .await
+        let request = RestoreRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            label: label.to_owned(),
+        };
+        invoke::<operations::CoordinatorRestore>(&*self.runtime, &request)
+            .await
+            .map(|EmptyResult {}| ())
     }
 
     pub async fn detach(&self, workspace: &str) -> Result<EmptyResult> {
-        call_typed(
-            &self.runtime,
-            "coordinator.detach",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
-        )
-        .await
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorDetach>(&*self.runtime, &request).await
     }
 
     /// Grow a workspace's image, or its build volume and seed. Capacity only ever goes up; a
@@ -1724,65 +1652,55 @@ impl Coordinator {
         capacity: &str,
         volume: ResizeVolume,
     ) -> Result<ResizeResult> {
-        call_typed(
-            &self.runtime,
-            "coordinator.resize",
-            json!({
-                "repoId": self.project.repo_id,
-                "workspace": workspace,
-                "capacity": capacity,
-                "volume": volume,
-            }),
-        )
-        .await
+        let request = ResizeRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            capacity: capacity.to_owned(),
+            volume,
+        };
+        invoke::<operations::CoordinatorResize>(&*self.runtime, &request).await
     }
 
     /// Rewrite a workspace's image contiguously, so a clone of it stops paying for its extents on
     /// the first write. A busy workspace refuses before its image is touched.
     pub async fn defragment(&self, workspace: &str) -> Result<DefragmentResult> {
-        call_typed(
-            &self.runtime,
-            "coordinator.defragment",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
-        )
-        .await
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorDefragment>(&*self.runtime, &request).await
     }
 
     /// Refreeze a target's seed from its live build volume when the seed is behind it and the
     /// volume has no writer; a writer leaves the seed as it is and is named.
     pub async fn reseed(&self, workspace: &str) -> Result<ReseedResult> {
-        call_typed(
-            &self.runtime,
-            "coordinator.reseed",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
-        )
-        .await
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
     }
 
     pub async fn assign_slot(&self, workspace: &str, slot: u32) -> Result<()> {
-        self.empty_call(
-            "coordinator.assignSlot",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "slot": slot }),
-        )
-        .await
+        let request = SlotRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            slot,
+        };
+        invoke::<operations::CoordinatorAssignSlot>(&*self.runtime, &request)
+            .await
+            .map(|EmptyResult {}| ())
     }
 
     pub async fn destroy(&self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.destroy",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "options": options }),
-        )
-        .await
+        let request = DestroyRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            options,
+        };
+        invoke::<operations::CoordinatorDestroy>(&*self.runtime, &request).await
     }
 
     pub async fn gc(&self, options: GcOptions) -> Result<GcReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.gc",
-            json!({ "repoId": self.project.repo_id, "options": options }),
-        )
-        .await
+        let request = GcRequest {
+            repo_id: self.repo_id(),
+            options,
+        };
+        invoke::<operations::CoordinatorGc>(&*self.runtime, &request).await
     }
 
     /// Remove the adopted project end to end: every session workspace, the collection of their
@@ -1793,21 +1711,20 @@ impl Coordinator {
         &self,
         options: RemoveProjectOptions,
     ) -> Result<RemoveProjectReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.removeProject",
-            json!({ "repoId": self.project.repo_id, "options": options }),
-        )
-        .await
+        let request = RemoveProjectRequest {
+            repo_id: self.repo_id(),
+            options,
+        };
+        invoke::<operations::CoordinatorRemoveProject>(&*self.runtime, &request).await
     }
 
     pub async fn repo_mirror(&self, workspace: &str, url: &Url) -> Result<MirrorInfo> {
-        call_typed(
-            &self.runtime,
-            "coordinator.repoMirror",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "url": url.as_str() }),
-        )
-        .await
+        let request = MirrorRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            url: url.as_str().to_owned(),
+        };
+        invoke::<operations::CoordinatorRepoMirror>(&*self.runtime, &request).await
     }
 
     pub async fn set_checkpoint_quota(
@@ -1815,36 +1732,30 @@ impl Coordinator {
         workspace: &str,
         quota: CheckpointQuota,
     ) -> Result<()> {
-        self.empty_call(
-            "coordinator.setCheckpointQuota",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "quota": quota }),
-        )
-        .await
+        let request = QuotaRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            quota,
+        };
+        invoke::<operations::CoordinatorSetCheckpointQuota>(&*self.runtime, &request)
+            .await
+            .map(|EmptyResult {}| ())
     }
 
     pub async fn doctor(&self) -> Result<DoctorReport> {
-        call_typed(
-            &self.runtime,
-            "coordinator.doctor",
-            json!({ "repoId": self.project.repo_id }),
-        )
-        .await
+        let request = RepoRequest {
+            repo_id: self.repo_id(),
+        };
+        invoke::<operations::CoordinatorDoctor>(&*self.runtime, &request).await
     }
 
     pub async fn worker(&self, workspace: &str) -> Result<WorkspaceHandle> {
-        let wire: WorkspaceWire = call_typed(
-            &self.runtime,
-            "coordinator.worker",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
-        )
-        .await?;
-        let workspace = WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime));
-        Ok(WorkspaceHandle::new(workspace, Arc::clone(&self.runtime)))
-    }
-
-    async fn empty_call(&self, method: &'static str, params: Value) -> Result<()> {
-        let _: EmptyResult = call_typed(&self.runtime, method, params).await?;
-        Ok(())
+        let request = self.workspace_request(workspace)?;
+        let view = invoke::<operations::CoordinatorWorker>(&*self.runtime, &request).await?;
+        Ok(WorkspaceHandle::new(
+            self.workspace_ref(view),
+            Arc::clone(&self.runtime),
+        ))
     }
 }
 
@@ -1893,54 +1804,27 @@ impl WorkspaceHandle {
     }
 
     pub async fn shell(&self, session: Option<&str>) -> Result<Session> {
-        let _: EmptyResult = call_typed(
-            &self.runtime,
-            "worker.shell",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "session": session,
-            }),
+        let name = session.map(str::to_owned);
+        let EmptyResult {} = invoke::<operations::WorkerShell>(
+            &*self.runtime,
+            &self.authority.session(name.clone()),
         )
         .await?;
         Ok(Session {
             authority: Arc::clone(&self.authority),
-            name: session.map(str::to_owned),
+            name,
             runtime: Arc::clone(&self.runtime),
         })
     }
 
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>> {
-        call_typed(
-            &self.runtime,
-            "worker.listJobs",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-            }),
-        )
-        .await
+        invoke::<operations::WorkerListJobs>(&*self.runtime, &self.authority.scope()).await
     }
 
     pub async fn job(&self, id: JobId) -> Result<JobHandle> {
-        let _: JobInfo = call_typed(
-            &self.runtime,
-            "worker.job",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "jobId": id,
-            }),
-        )
-        .await?;
-        Ok(JobHandle {
-            authority: Arc::clone(&self.authority),
-            id,
-            runtime: Arc::clone(&self.runtime),
-        })
+        let _: JobInfo =
+            invoke::<operations::WorkerJob>(&*self.runtime, &self.authority.job(id)).await?;
+        Ok(self.job_handle(id))
     }
 
     /// A job's terminal record from the workspace's durable records, and a handle whose
@@ -1949,65 +1833,63 @@ impl WorkspaceHandle {
     /// [`Self::job`] and [`JobHandle::status`] answer only while that supervisor serves: a drained
     /// supervisor of another build retires the moment its last job ends.
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle)> {
-        let sealed: SealedJob = call_typed(
-            &self.runtime,
-            "job.sealed",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "jobId": id,
-            }),
-        )
-        .await?;
-        let handle = JobHandle {
+        let sealed =
+            invoke::<operations::JobSealed>(&*self.runtime, &self.authority.job(id)).await?;
+        Ok((sealed, self.job_handle(id)))
+    }
+
+    fn job_handle(&self, id: JobId) -> JobHandle {
+        JobHandle {
             authority: Arc::clone(&self.authority),
             id,
             runtime: Arc::clone(&self.runtime),
-        };
-        Ok((sealed, handle))
+        }
     }
 
     pub async fn checkpoint(&self, options: CheckpointOptions) -> Result<String> {
-        let result: CheckpointResult = call_typed(
-            &self.runtime,
-            "worker.checkpoint",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "options": options,
-            }),
-        )
-        .await?;
-        Ok(result.label)
+        let WorkerScope {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+        } = self.authority.scope();
+        let request = CheckpointRequest {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+            options,
+        };
+        invoke::<operations::WorkerCheckpoint>(&*self.runtime, &request)
+            .await
+            .map(|result| result.label)
     }
 
     pub async fn push(&self, options: PushOptions) -> Result<PushReport> {
-        call_typed(
-            &self.runtime,
-            "worker.push",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "options": options,
-            }),
-        )
-        .await
+        let WorkerScope {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+        } = self.authority.scope();
+        let request = PushRequest {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+            options,
+        };
+        invoke::<operations::WorkerPush>(&*self.runtime, &request).await
     }
 
     pub async fn grants(&self) -> Result<GrantSet> {
-        call_typed(
-            &self.runtime,
-            "workspace.grants",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-            }),
-        )
-        .await
+        let WorkerScope {
+            repo_id,
+            workspace,
+            workspace_incarnation,
+        } = self.authority.scope();
+        let request = WorkspaceGrantsRequest {
+            repo_id,
+            workspace,
+            workspace_incarnation: Some(workspace_incarnation),
+        };
+        invoke::<operations::WorkspaceGrants>(&*self.runtime, &request).await
     }
 }
 
@@ -2046,17 +1928,7 @@ impl JobHandle {
     }
 
     pub async fn status(&self) -> Result<JobInfo> {
-        call_typed(
-            &self.runtime,
-            "job.status",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "jobId": self.id,
-            }),
-        )
-        .await
+        invoke::<operations::JobStatus>(&*self.runtime, &self.authority.job(self.id)).await
     }
 
     /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already
@@ -2079,40 +1951,17 @@ impl JobHandle {
     }
 
     pub async fn detach(&self) -> Result<()> {
-        self.empty_call("job.detach").await
+        invoke::<operations::JobDetach>(&*self.runtime, &self.authority.job(self.id))
+            .await
+            .map(|EmptyResult {}| ())
     }
 
     pub async fn wait(&self) -> Result<JobInfo> {
-        call_typed(
-            &self.runtime,
-            "job.wait",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "jobId": self.id,
-            }),
-        )
-        .await
+        invoke::<operations::JobWait>(&*self.runtime, &self.authority.job(self.id)).await
     }
 
     pub async fn kill(&self) -> Result<()> {
         self.runtime.kill(&self.authority, self.id).await
-    }
-
-    async fn empty_call(&self, method: &'static str) -> Result<()> {
-        let _: EmptyResult = call_typed(
-            &self.runtime,
-            method,
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "jobId": self.id,
-            }),
-        )
-        .await?;
-        Ok(())
     }
 }
 
@@ -2148,18 +1997,9 @@ impl Session {
     }
 
     pub async fn close(self) -> Result<()> {
-        let _: EmptyResult = call_typed(
-            &self.runtime,
-            "session.close",
-            json!({
-                "repoId": self.authority.repo_id,
-                "workspace": self.authority.workspace,
-                "workspaceIncarnation": self.authority.workspace_incarnation,
-                "session": self.name,
-            }),
-        )
-        .await?;
-        Ok(())
+        invoke::<operations::SessionClose>(&*self.runtime, &self.authority.session(self.name))
+            .await
+            .map(|EmptyResult {}| ())
     }
 }
 
@@ -2176,6 +2016,8 @@ impl fmt::Debug for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::dto::RunSandboxMode;
+    use serde_json::json;
     use std::future;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 

@@ -16,14 +16,15 @@ use cowshed_core::api::dto::{
     RemoveReport, Reseed, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, StdinSource,
     StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
+use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::runtime::{
-    JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream,
-    RuntimeLogChunk, WorkspaceSnapshot,
+    JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeLogChunk,
+    WorkspaceSnapshot,
 };
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::timing::{timed, timed_async};
@@ -202,10 +203,10 @@ impl HeldJob {
     }
 
     /// What a read at `offset` of `stream` returns now, or `None` when a follow read waits.
-    fn chunk(&self, stream: RuntimeJobStream, offset: u64) -> Option<RuntimeLogChunk> {
+    fn chunk(&self, stream: JobStream, offset: u64) -> Option<RuntimeLogChunk> {
         let bytes: &[u8] = match stream {
-            RuntimeJobStream::Stdout => Self::FIRST,
-            RuntimeJobStream::Stderr => b"",
+            JobStream::Stdout => Self::FIRST,
+            JobStream::Stderr => b"",
         };
         let start = usize::try_from(offset).expect("a test offset");
         let rest = &bytes[start.min(bytes.len())..];
@@ -1330,7 +1331,7 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-        stream: RuntimeJobStream,
+        stream: JobStream,
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>> {
@@ -1384,7 +1385,12 @@ async fn route(
     params: Value,
 ) -> Result<Value> {
     let response = router
-        .route(authority, method.to_owned(), params, None, None)
+        .route(
+            authority,
+            OperationRequest::decode(method, &params)?,
+            None,
+            None,
+        )
         .await?;
     let (value, binary) = response.into_parts();
     assert!(binary.is_none());
@@ -1548,15 +1554,14 @@ async fn log_binary_metadata_carries_the_exact_next_offset() {
                 workspace: WorkspaceName::new("main").expect("main"),
                 workspace_incarnation: incarnation.clone(),
             },
-            "job.logs".to_owned(),
-            json!({
-                "repoId": repo,
-                "workspace": "main",
-                "workspaceIncarnation": incarnation,
-                "jobId": 1,
-                "stream": "stdout",
-                "follow": false,
-                "offset": 7
+            JobLogs::request(LogsRequest {
+                repo_id: repo.clone(),
+                workspace: WorkspaceName::new("main").expect("main"),
+                workspace_incarnation: incarnation.clone(),
+                job_id: JobId::try_from(1).expect("job id"),
+                stream: JobStream::Stdout,
+                follow: false,
+                offset: 7,
             }),
             None,
             None,

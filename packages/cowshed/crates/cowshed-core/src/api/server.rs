@@ -1,11 +1,15 @@
 use super::dto::StepReport;
 use super::frame;
+use super::operations::{
+    self, Lane, LogsChunk, Operation, OperationRequest, ProjectOpen, Scope, decode_result,
+};
 use super::peer_credentials::PeerCredentialsError;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
 use crate::timing::StepSink;
 use bytes::Bytes;
+use serde::Deserialize;
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
@@ -215,15 +219,6 @@ pub(crate) mod codec {
         pub(crate) const fn steps(&self) -> bool {
             self.0.steps
         }
-
-        pub(crate) fn into_parts(self) -> (u64, String, Value, Option<u32>) {
-            (
-                self.0.id,
-                self.0.method.into_owned(),
-                self.0.params.into_owned(),
-                self.0.binary_length,
-            )
-        }
     }
 
     #[derive(Debug)]
@@ -416,8 +411,13 @@ pub(crate) mod codec {
             let decoded = decode_rpc_request(&request).expect("decode request");
             assert!(!decoded.steps());
             assert_eq!(
-                decoded.into_parts(),
-                (7, "project.list".into(), params, None)
+                (
+                    decoded.id(),
+                    decoded.method(),
+                    decoded.params(),
+                    decoded.binary_length()
+                ),
+                (7, "project.list", &params, None)
             );
 
             let result = json!({"healthy": true});
@@ -515,79 +515,6 @@ pub(crate) mod codec {
 
 const ROUTER_CLOSED_HINT: &str = "restart the trusted cowshed controller";
 
-/// Methods emitted by the capability API. Coordinator connections may call every one of them.
-/// Worker-callable methods are marked `worker` so the two allowlists cannot drift.
-macro_rules! capability_methods {
-    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*]) => {
-        pub const CAPABILITY_METHODS: &[&str] = &[$($all),*];
-        pub const WORKER_METHODS: &[&str] = &[$($worker),*];
-    };
-    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*] worker $name:literal $($rest:tt)*) => {
-        capability_methods!(@acc_all [$($all)* $name] @acc_worker [$($worker)* $name] $($rest)*);
-    };
-    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*] $name:literal $($rest:tt)*) => {
-        capability_methods!(@acc_all [$($all)* $name] @acc_worker [$($worker)*] $($rest)*);
-    };
-    ($($rest:tt)*) => {
-        capability_methods!(@acc_all [] @acc_worker [] $($rest)*);
-    };
-}
-
-capability_methods! {
-    "project.open"
-    "project.workspace"
-    "project.workspaceAt"
-    "project.list"
-    "workspace.info"
-    "workspace.attach"
-    worker "workspace.grants"
-    "workspace.buildVolume"
-    "coordinator.rename"
-    "coordinator.adopt"
-    "coordinator.create"
-    "coordinator.fork"
-    "coordinator.moveCheckout"
-    "coordinator.changeRepoId"
-    "coordinator.grant"
-    "coordinator.revoke"
-    "coordinator.projectGrants"
-    "coordinator.grantProject"
-    "coordinator.revokeProject"
-    "coordinator.rebase"
-    "coordinator.land"
-    "coordinator.restore"
-    "coordinator.resize"
-    "coordinator.defragment"
-    "coordinator.reseed"
-    "coordinator.detach"
-    "coordinator.assignSlot"
-    "coordinator.destroy"
-    "coordinator.gc"
-    "coordinator.removeProject"
-    "coordinator.repoMirror"
-    "coordinator.setCheckpointQuota"
-    "coordinator.doctor"
-    "coordinator.worker"
-    worker "worker.exec"
-    worker "worker.stdinChunk"
-    worker "worker.stdinClose"
-    worker "worker.shell"
-    worker "worker.listJobs"
-    worker "worker.job"
-    worker "worker.checkpoint"
-    worker "worker.push"
-    worker "job.status"
-    worker "job.sealed"
-    worker "job.logs"
-    worker "job.attachWrite"
-    worker "job.detach"
-    worker "job.wait"
-    worker "job.kill"
-    worker "session.close"
-}
-
-const UPLOAD_METHODS: &[&str] = &["worker.exec", "worker.stdinChunk", "job.attachWrite"];
-
 /// Authority fixed when the trusted controller accepts a connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionAuthority {
@@ -609,12 +536,12 @@ impl ConnectionAuthority {
     }
 }
 
-/// A request already authenticated and fenced to its immutable connection authority.
+/// A request already authenticated, fenced to its immutable connection authority, and decoded as
+/// its declared operation.
 #[derive(Debug)]
 pub struct RouterRequest {
     authority: ConnectionAuthority,
-    method: String,
-    params: Value,
+    operation: OperationRequest,
     upload: Option<Bytes>,
     steps: Option<StepSink>,
 }
@@ -624,12 +551,12 @@ impl RouterRequest {
         &self.authority
     }
 
-    pub fn method(&self) -> &str {
-        &self.method
+    pub fn method(&self) -> &'static str {
+        self.operation.method()
     }
 
-    pub fn params(&self) -> &Value {
-        &self.params
+    pub fn operation(&self) -> &OperationRequest {
+        &self.operation
     }
 
     pub fn upload(&self) -> Option<&Bytes> {
@@ -645,18 +572,11 @@ impl RouterRequest {
         self,
     ) -> (
         ConnectionAuthority,
-        String,
-        Value,
+        OperationRequest,
         Option<Bytes>,
         Option<StepSink>,
     ) {
-        (
-            self.authority,
-            self.method,
-            self.params,
-            self.upload,
-            self.steps,
-        )
+        (self.authority, self.operation, self.upload, self.steps)
     }
 }
 
@@ -737,8 +657,7 @@ impl RouterHandle {
     pub async fn route(
         &self,
         authority: ConnectionAuthority,
-        method: String,
-        params: Value,
+        operation: OperationRequest,
         upload: Option<Bytes>,
         steps: Option<StepSink>,
     ) -> Result<RouterResponse> {
@@ -747,8 +666,7 @@ impl RouterHandle {
             .send(RouterCommand {
                 request: RouterRequest {
                     authority,
-                    method,
-                    params,
+                    operation,
                     upload,
                     steps,
                 },
@@ -759,6 +677,20 @@ impl RouterHandle {
         response
             .await
             .map_err(|_| router_closed("controller router actor stopped before replying"))?
+    }
+
+    /// Route one call of a declared operation from inside the controller process and decode its
+    /// declared result.
+    pub async fn call<O: Operation>(
+        &self,
+        authority: ConnectionAuthority,
+        request: O::Request,
+    ) -> Result<O::Result> {
+        let (result, _) = self
+            .route(authority, O::request(request), None, None)
+            .await?
+            .into_parts();
+        decode_result::<O>(result)
     }
 }
 
@@ -840,17 +772,22 @@ pub async fn serve_controller_connection(
                 next_id = next_id
                     .checked_add(1)
                     .ok_or_else(|| protocol_error("controller RPC request id overflowed"))?;
-                if let Err(error) = validate_request(&authority, &request) {
-                    let fatal = error.code == ErrorCode::Integrity;
-                    closing |= fatal;
-                    answers.spawn(refuse(Arc::clone(&writer), request.id(), error, fatal));
-                    continue;
-                }
+                let operation = match validate_request(&authority, &request) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        let fatal = error.code == ErrorCode::Integrity;
+                        closing |= fatal;
+                        answers.spawn(refuse(Arc::clone(&writer), request.id(), error, fatal));
+                        continue;
+                    }
+                };
                 answers.spawn(answer(
                     Arc::clone(&writer),
                     router.clone(),
                     authority.clone(),
-                    request,
+                    request.id(),
+                    request.steps(),
+                    operation,
                     upload,
                 ));
             }
@@ -916,31 +853,16 @@ async fn answer(
     writer: ConnectionWriter,
     router: RouterHandle,
     authority: ConnectionAuthority,
-    request: codec::DecodedRpcRequest,
+    request_id: u64,
+    steps: bool,
+    operation: OperationRequest,
     upload: Option<Bytes>,
 ) -> Result<()> {
-    let download_offset = request
-        .params()
-        .get("offset")
-        .and_then(Value::as_u64)
-        .filter(|_| request.method() == "job.logs");
-    let steps = request.steps();
-    let (request_id, request_method, request_params, _) = request.into_parts();
+    let download_offset = operation.download_offset();
     let response = if steps {
-        route_reporting_steps(
-            &writer,
-            &router,
-            authority,
-            request_id,
-            request_method,
-            request_params,
-            upload,
-        )
-        .await?
+        route_reporting_steps(&writer, &router, authority, request_id, operation, upload).await?
     } else {
-        router
-            .route(authority, request_method, request_params, upload, None)
-            .await
+        router.route(authority, operation, upload, None).await
     };
     let mut writer = writer.lock().await;
     let writer = &mut *writer;
@@ -979,18 +901,11 @@ async fn route_reporting_steps(
     router: &RouterHandle,
     authority: ConnectionAuthority,
     request_id: u64,
-    method: String,
-    params: Value,
+    operation: OperationRequest,
     upload: Option<Bytes>,
 ) -> Result<Result<RouterResponse>> {
     let (sender, mut reports) = mpsc::unbounded_channel();
-    let routed = router.route(
-        authority,
-        method,
-        params,
-        upload,
-        Some(StepSink::new(sender)),
-    );
+    let routed = router.route(authority, operation, upload, Some(StepSink::new(sender)));
     let mut routed = std::pin::pin!(routed);
     loop {
         tokio::select! {
@@ -1021,16 +936,20 @@ fn validate_hello(version: u32, nonce: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks a request against its declared operation and the connection's authority, then decodes
+/// it. Fence and lane checks read the raw params, so a refused request is never decoded.
 fn validate_request(
     authority: &ConnectionAuthority,
     request: &codec::DecodedRpcRequest,
-) -> Result<()> {
-    if !CAPABILITY_METHODS.contains(&request.method()) {
-        return Err(authority_error(format!(
-            "controller method is not in the capability allowlist: {}",
-            request.method()
-        )));
-    }
+) -> Result<OperationRequest> {
+    let operation = operations::operation(request.method())
+        .filter(|operation| operation.scope != Scope::Internal)
+        .ok_or_else(|| {
+            authority_error(format!(
+                "controller method is not in the capability allowlist: {}",
+                request.method()
+            ))
+        })?;
     let params = request.params().as_object().ok_or_else(|| {
         CowshedError::usage(
             "controller RPC params must be a JSON object",
@@ -1040,7 +959,7 @@ fn validate_request(
 
     match authority {
         ConnectionAuthority::Coordinator { repo_id } => {
-            if request.method() != "project.open" {
+            if operation.method != ProjectOpen::METHOD {
                 require_string(params, "repoId", repo_id.as_str())?;
             }
         }
@@ -1049,10 +968,10 @@ fn validate_request(
             workspace,
             workspace_incarnation,
         } => {
-            if !WORKER_METHODS.contains(&request.method()) {
+            if operation.scope != Scope::Worker {
                 return Err(authority_error(format!(
                     "worker authority cannot call coordinator method {}",
-                    request.method()
+                    operation.method
                 )));
             }
             require_string(params, "repoId", repo_id.as_str())?;
@@ -1065,48 +984,36 @@ fn validate_request(
         }
     }
 
-    if request.method() == "job.logs" && params.get("offset").and_then(Value::as_u64).is_none() {
-        return Err(CowshedError::usage(
-            "job.logs offset must be an unsigned integer",
-            "send the offset returned by the preceding raw-byte frame",
-        ));
-    }
-
     match request.binary_length() {
         Some(length) if usize::try_from(length).unwrap_or(usize::MAX) > MAX_BINARY_FRAME_BYTES => {
-            Err(protocol_error(
+            return Err(protocol_error(
                 "controller RPC binary request exceeds the 64 KiB frame limit",
-            ))
+            ));
         }
-        Some(_) if !UPLOAD_METHODS.contains(&request.method()) => Err(protocol_error(
-            "controller RPC method does not accept a raw-byte upload lane",
-        )),
-        None => Ok(()),
-        Some(_) => Ok(()),
+        Some(_) if operation.lane != Lane::Upload => {
+            return Err(protocol_error(
+                "controller RPC method does not accept a raw-byte upload lane",
+            ));
+        }
+        Some(_) | None => {}
     }
+    OperationRequest::decode(operation.method, request.params())
 }
 
+/// A download's JSON half must be its declared envelope, and its `nextOffset` exactly the
+/// request's offset plus the bytes framed after it.
 fn validate_raw_response(result: &Value, offset: u64, length: usize) -> Result<()> {
-    let object = result.as_object().ok_or_else(|| {
-        protocol_error("controller router raw-byte metadata must be a JSON object")
+    let chunk = LogsChunk::deserialize(result).map_err(|error| {
+        protocol_error(format!(
+            "controller router raw-byte metadata has an invalid envelope: {error}"
+        ))
     })?;
-    if object.len() != 2 || object.get("eof").and_then(Value::as_bool).is_none() {
-        return Err(protocol_error(
-            "controller router raw-byte metadata has an invalid envelope",
-        ));
-    }
-    let next_offset = object
-        .get("nextOffset")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            protocol_error("controller router raw-byte metadata has an invalid nextOffset")
-        })?;
     let length = u64::try_from(length)
         .map_err(|_| protocol_error("controller router raw-byte response length overflowed"))?;
     let expected = offset
         .checked_add(length)
         .ok_or_else(|| protocol_error("controller router raw-byte response offset overflowed"))?;
-    if next_offset != expected {
+    if chunk.next_offset != expected {
         return Err(protocol_error(
             "controller router raw-byte response nextOffset was not exact",
         ));

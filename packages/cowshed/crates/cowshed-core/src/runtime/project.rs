@@ -6,9 +6,6 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
@@ -26,6 +23,12 @@ use crate::api::dto::{
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, RunSandboxMode,
     SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+};
+use crate::api::operations::{
+    self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
+    LogsChunk, LogsRequest, Operation, OperationRequest, ProjectOpenRequest, ProjectOpened,
+    RepoRequest, Scope, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest,
+    WorkspaceView, encode_result,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -67,27 +70,6 @@ pub struct ProjectDescriptor {
     pub binding: RepositoryBinding,
     pub git_root: PathBuf,
     pub storage: crate::storage::bootstrap::ValidatedHostStorage,
-}
-
-/// Which captured stream a log read walks.
-///
-/// Deserialized straight off the wire and converted once, at the supervisor boundary, into the
-/// storage layer's [`crate::storage::job_artifact::StreamKind`]. A second wire spelling could
-/// not be caught by any test, because both would be structurally identical.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum RuntimeJobStream {
-    Stdout,
-    Stderr,
-}
-
-impl From<RuntimeJobStream> for crate::storage::job_artifact::StreamKind {
-    fn from(stream: RuntimeJobStream) -> Self {
-        match stream {
-            RuntimeJobStream::Stdout => Self::Stdout,
-            RuntimeJobStream::Stderr => Self::Stderr,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,7 +309,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-        stream: RuntimeJobStream,
+        stream: JobStream,
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>>;
@@ -714,20 +696,12 @@ impl ProjectRuntime {
     /// `cowshed __workspace-supervisor` process.
     pub async fn serve_supervisor(&self, workspace: &WorkspaceName) -> Result<()> {
         self.router
-            .route(
-                ConnectionAuthority::Coordinator {
-                    repo_id: self.descriptor.repo_id.clone(),
-                },
-                "coordinator.serveSupervisor".to_owned(),
-                json!({
-                    "repoId": self.descriptor.repo_id,
-                    "workspace": workspace,
-                }),
-                None,
-                None,
+            .call::<operations::CoordinatorServeSupervisor>(
+                self.coordinator(),
+                self.workspace_request(workspace),
             )
             .await
-            .map(|_| ())
+            .map(|EmptyResult {}| ())
     }
 
     /// Refresh the mounted `workspace`'s build state ([`ProjectRuntimeHost::refresh_build_state`]):
@@ -736,25 +710,25 @@ impl ProjectRuntime {
         &self,
         workspace: &WorkspaceName,
     ) -> Result<crate::build_volume::BuildStateRefresh> {
-        let (result, _) = self
-            .router
-            .route(
-                ConnectionAuthority::Coordinator {
-                    repo_id: self.descriptor.repo_id.clone(),
-                },
-                "coordinator.refreshBuildState".to_owned(),
-                json!({
-                    "repoId": self.descriptor.repo_id,
-                    "workspace": workspace,
-                }),
-                None,
-                None,
+        self.router
+            .call::<operations::CoordinatorRefreshBuildState>(
+                self.coordinator(),
+                self.workspace_request(workspace),
             )
-            .await?
-            .into_parts();
-        serde_json::from_value(result).map_err(|error| {
-            CowshedError::internal(format!("decode the build-state refresh: {error}"))
-        })
+            .await
+    }
+
+    fn coordinator(&self) -> ConnectionAuthority {
+        ConnectionAuthority::Coordinator {
+            repo_id: self.descriptor.repo_id.clone(),
+        }
+    }
+
+    fn workspace_request(&self, workspace: &WorkspaceName) -> WorkspaceRequest {
+        WorkspaceRequest {
+            repo_id: self.descriptor.repo_id.clone(),
+            workspace: workspace.clone(),
+        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -827,69 +801,325 @@ impl ProjectActor {
 
     async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
         self.validate_connection_authority(request.authority())?;
-        let _span = crate::timing::span_named("route", || request.method().to_owned());
-        match request.method() {
-            "job.logs" => self.job_logs(request).await.map(Routed::Later),
-            "job.wait" => self.job_wait(request).await.map(Routed::Later),
-            "job.kill" => self.job_kill(request).await.map(Routed::Later),
-            _ => self.route_now(request).await.map(Routed::Now),
+        let method = request.method();
+        let _span = crate::timing::span_named("route", || method.to_owned());
+        let (authority, operation, upload, _) = request.into_parts();
+        let scope = operations::operation(method)
+            .map(|info| info.scope)
+            .ok_or_else(|| CowshedError::internal(format!("{method} has no declaration")))?;
+        if scope != Scope::Worker {
+            require_coordinator(&authority)?;
         }
-    }
-
-    async fn route_now(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        match request.method() {
-            "project.open" => self.project_open(request).await,
-            "project.workspace" => self.project_workspace(request).await,
-            "project.workspaceAt" => self.project_workspace_at(request).await,
-            "project.list" => self.project_list(request).await,
-            "workspace.info" => self.workspace_info(request).await,
-            "workspace.attach" => self.workspace_attach(request).await,
-            "workspace.grants" => self.workspace_grants(request).await,
-            "workspace.buildVolume" => self.workspace_build_volume(request).await,
-            "coordinator.adopt" => self.coordinator_adopt(request).await,
-            "coordinator.create" => self.coordinator_create(request).await,
-            "coordinator.fork" => self.coordinator_fork(request).await,
-            "coordinator.rename" => self.coordinator_rename(request).await,
-            "coordinator.moveCheckout" => self.coordinator_move_checkout(request).await,
-            "coordinator.changeRepoId" => self.coordinator_change_repo_id(request).await,
-            "coordinator.grant" => self.coordinator_grant(request, false).await,
-            "coordinator.revoke" => self.coordinator_grant(request, true).await,
-            "coordinator.projectGrants" => self.coordinator_project_grants(request).await,
-            "coordinator.grantProject" => self.coordinator_grant_project(request, false).await,
-            "coordinator.revokeProject" => self.coordinator_grant_project(request, true).await,
-            "coordinator.rebase" => self.coordinator_rebase(request).await,
-            "coordinator.land" => self.coordinator_land(request).await,
-            "coordinator.restore" => self.coordinator_restore(request).await,
-            "coordinator.resize" => self.coordinator_resize(request).await,
-            "coordinator.defragment" => self.coordinator_defragment(request).await,
-            "coordinator.reseed" => self.coordinator_reseed(request).await,
-            "coordinator.detach" => self.coordinator_detach(request).await,
-            "coordinator.refreshBuildState" => self.coordinator_refresh_build_state(request).await,
-            "coordinator.serveSupervisor" => self.coordinator_serve_supervisor(request).await,
-            "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
-            "coordinator.destroy" => self.coordinator_destroy(request).await,
-            "coordinator.gc" => self.coordinator_gc(request).await,
-            "coordinator.removeProject" => self.coordinator_remove_project(request).await,
-            "coordinator.repoMirror" => self.coordinator_repo_mirror(request).await,
-            "coordinator.setCheckpointQuota" => self.coordinator_checkpoint_quota(request).await,
-            "coordinator.doctor" => self.coordinator_doctor(request).await,
-            "coordinator.worker" => self.coordinator_worker(request).await,
-            "worker.exec" => self.worker_exec(request).await,
-            "worker.stdinChunk" | "job.attachWrite" => self.worker_stdin_chunk(request).await,
-            "worker.stdinClose" => self.worker_stdin_close(request).await,
-            "worker.shell" => self.worker_shell(request).await,
-            "worker.listJobs" => self.worker_list_jobs(request).await,
-            "worker.job" | "job.status" => self.worker_job_info(request).await,
-            "job.sealed" => self.job_sealed(request).await,
-            "worker.checkpoint" => self.worker_checkpoint(request).await,
-            "worker.push" => self.worker_push(request).await,
-            "job.detach" => self.job_detach(request).await,
-            "session.close" => self.session_close(request).await,
-            method => Err(CowshedError::usage(
-                format!("unknown controller method {method}"),
-                "upgrade the client and controller together",
-            )),
-        }
+        use OperationRequest as Op;
+        let response = match operation {
+            Op::JobLogs(params) => {
+                return self.job_logs(&authority, params).await.map(Routed::Later);
+            }
+            Op::JobWait(params) => {
+                return self.job_wait(&authority, params).await.map(Routed::Later);
+            }
+            Op::JobKill(params) => {
+                return self.job_kill(&authority, params).await.map(Routed::Later);
+            }
+            Op::ProjectOpen(params) => {
+                respond::<operations::ProjectOpen>(&self.project_open(params).await?)
+            }
+            Op::ProjectWorkspace(params) => respond::<operations::ProjectWorkspace>(
+                &self.project_workspace(&authority, params).await?,
+            ),
+            Op::ProjectWorkspaceAt(params) => respond::<operations::ProjectWorkspaceAt>(
+                &self.project_workspace_at(&authority, params).await?,
+            ),
+            Op::ProjectList(params) => {
+                respond::<operations::ProjectList>(&self.project_list(params).await?)
+            }
+            Op::WorkspaceInfoRead(params) => respond::<operations::WorkspaceInfoRead>(
+                &self.workspace_info(&authority, params).await?,
+            ),
+            Op::WorkspaceAttach(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                self.host.attach(params.workspace, params.options).await?;
+                respond::<operations::WorkspaceAttach>(&EmptyResult {})
+            }
+            Op::WorkspaceGrants(params) => respond::<operations::WorkspaceGrants>(
+                &self.workspace_grants(&authority, params).await?,
+            ),
+            Op::WorkspaceBuildVolume(params) => respond::<operations::WorkspaceBuildVolume>(
+                &self.workspace_build_volume(params).await?,
+            ),
+            Op::CoordinatorAdopt(params) => {
+                respond::<operations::CoordinatorAdopt>(&self.coordinator_adopt(params).await?)
+            }
+            Op::CoordinatorCreate(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.create(params.workspace, params.options).await?;
+                respond::<operations::CoordinatorCreate>(&workspace_view(snapshot))
+            }
+            Op::CoordinatorFork(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.fork(params.source, params.destination).await?;
+                respond::<operations::CoordinatorFork>(&workspace_view(snapshot))
+            }
+            Op::CoordinatorRename(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.rename(params.source, params.destination).await?;
+                respond::<operations::CoordinatorRename>(&workspace_view(snapshot))
+            }
+            Op::CoordinatorMoveCheckout(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.move_checkout(params.destination).await?;
+                respond::<operations::CoordinatorMoveCheckout>(&workspace_view(snapshot))
+            }
+            Op::CoordinatorChangeRepoId(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.change_repo_id(params.new_repo_id).await?;
+                respond::<operations::CoordinatorChangeRepoId>(&workspace_view(snapshot))
+            }
+            Op::CoordinatorGrant(params) => respond::<operations::CoordinatorGrant>(
+                &self.coordinator_grant(params, false).await?,
+            ),
+            Op::CoordinatorRevoke(params) => respond::<operations::CoordinatorRevoke>(
+                &self.coordinator_grant(params, true).await?,
+            ),
+            Op::CoordinatorProjectGrants(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorProjectGrants>(&self.host.project_grants().await?)
+            }
+            Op::CoordinatorGrantProject(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorGrantProject>(
+                    &self.host.grant_project(params.delta, false).await?,
+                )
+            }
+            Op::CoordinatorRevokeProject(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorRevokeProject>(
+                    &self.host.grant_project(params.delta, true).await?,
+                )
+            }
+            Op::CoordinatorRebase(params) => {
+                self.require_repo(&params.repo_id)?;
+                let report = self
+                    .host
+                    .rebase(params.workspace, params.into, params.options)
+                    .await?;
+                respond::<operations::CoordinatorRebase>(&report)
+            }
+            Op::CoordinatorLand(params) => {
+                self.require_repo(&params.repo_id)?;
+                let report = self
+                    .host
+                    .land(params.workspace, params.into, params.options)
+                    .await?;
+                respond::<operations::CoordinatorLand>(&report)
+            }
+            Op::CoordinatorRestore(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host.restore(params.workspace, params.label).await?;
+                respond::<operations::CoordinatorRestore>(&EmptyResult {})
+            }
+            Op::CoordinatorResize(params) => {
+                self.require_repo(&params.repo_id)?;
+                let result = self
+                    .host
+                    .resize(params.workspace, params.capacity, params.volume)
+                    .await?;
+                respond::<operations::CoordinatorResize>(&result)
+            }
+            Op::CoordinatorDefragment(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorDefragment>(
+                    &self.host.defragment(params.workspace).await?,
+                )
+            }
+            Op::CoordinatorReseed(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorReseed>(&self.host.reseed(params.workspace).await?)
+            }
+            Op::CoordinatorDetach(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host.detach(params.workspace).await?;
+                respond::<operations::CoordinatorDetach>(&EmptyResult {})
+            }
+            Op::CoordinatorServeSupervisor(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host.serve_supervisor(params.workspace).await?;
+                respond::<operations::CoordinatorServeSupervisor>(&EmptyResult {})
+            }
+            Op::CoordinatorRefreshBuildState(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorRefreshBuildState>(
+                    &self.host.refresh_build_state(params.workspace).await?,
+                )
+            }
+            Op::CoordinatorAssignSlot(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host.assign_slot(params.workspace, params.slot).await?;
+                respond::<operations::CoordinatorAssignSlot>(&EmptyResult {})
+            }
+            Op::CoordinatorDestroy(params) => {
+                self.require_repo(&params.repo_id)?;
+                let report = self.host.remove(params.workspace, params.options).await?;
+                respond::<operations::CoordinatorDestroy>(&report)
+            }
+            Op::CoordinatorGc(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorGc>(&self.host.gc(params.options).await?)
+            }
+            Op::CoordinatorRemoveProject(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorRemoveProject>(
+                    &remove_project(self.host.as_mut(), params.options).await?,
+                )
+            }
+            Op::CoordinatorRepoMirror(params) => {
+                self.require_repo(&params.repo_id)?;
+                let url = Url::parse(&params.url).map_err(|error| {
+                    CowshedError::usage(
+                        format!("invalid repository mirror URL: {error}"),
+                        "use an absolute supported repository URL",
+                    )
+                })?;
+                respond::<operations::CoordinatorRepoMirror>(
+                    &self.host.repo_mirror(params.workspace, url).await?,
+                )
+            }
+            Op::CoordinatorSetCheckpointQuota(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host
+                    .set_checkpoint_quota(params.workspace, params.quota)
+                    .await?;
+                respond::<operations::CoordinatorSetCheckpointQuota>(&EmptyResult {})
+            }
+            Op::CoordinatorDoctor(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorDoctor>(&self.host.doctor().await?)
+            }
+            Op::CoordinatorWorker(params) => {
+                self.require_repo(&params.repo_id)?;
+                let snapshot = self.host.open_worker(params.workspace).await?;
+                respond::<operations::CoordinatorWorker>(&workspace_view(snapshot))
+            }
+            Op::WorkerExec(params) => respond::<operations::WorkerExec>(
+                &self.worker_exec(&authority, params, upload).await?,
+            ),
+            Op::WorkerStdinChunk(params) => {
+                self.stdin_chunk(&authority, params, upload).await?;
+                respond::<operations::WorkerStdinChunk>(&EmptyResult {})
+            }
+            Op::JobAttachWrite(params) => {
+                self.stdin_chunk(&authority, params, upload).await?;
+                respond::<operations::JobAttachWrite>(&EmptyResult {})
+            }
+            Op::WorkerStdinClose(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                self.host
+                    .stdin_close(
+                        params.workspace,
+                        params.workspace_incarnation,
+                        params.job_id,
+                    )
+                    .await?;
+                respond::<operations::WorkerStdinClose>(&EmptyResult {})
+            }
+            Op::WorkerShell(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                self.host
+                    .open_session(
+                        params.workspace,
+                        params.workspace_incarnation,
+                        params.session,
+                    )
+                    .await?;
+                respond::<operations::WorkerShell>(&EmptyResult {})
+            }
+            Op::WorkerListJobs(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                respond::<operations::WorkerListJobs>(
+                    &self
+                        .host
+                        .list_jobs(params.workspace, params.workspace_incarnation)
+                        .await?,
+                )
+            }
+            Op::WorkerJob(params) => {
+                respond::<operations::WorkerJob>(&self.job_info(&authority, params).await?)
+            }
+            Op::JobStatus(params) => {
+                respond::<operations::JobStatus>(&self.job_info(&authority, params).await?)
+            }
+            Op::JobSealed(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                respond::<operations::JobSealed>(
+                    &self
+                        .host
+                        .sealed_job(
+                            params.workspace,
+                            params.workspace_incarnation,
+                            params.job_id,
+                        )
+                        .await?,
+                )
+            }
+            Op::WorkerCheckpoint(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                respond::<operations::WorkerCheckpoint>(
+                    &self
+                        .host
+                        .checkpoint(
+                            params.workspace,
+                            Some(params.workspace_incarnation),
+                            params.options,
+                        )
+                        .await?,
+                )
+            }
+            Op::WorkerPush(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                respond::<operations::WorkerPush>(
+                    &self
+                        .host
+                        .push(
+                            params.workspace,
+                            params.workspace_incarnation,
+                            params.options,
+                        )
+                        .await?,
+                )
+            }
+            Op::JobDetach(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                self.host
+                    .detach_job(
+                        params.workspace,
+                        params.workspace_incarnation,
+                        params.job_id,
+                    )
+                    .await?;
+                respond::<operations::JobDetach>(&EmptyResult {})
+            }
+            Op::SessionClose(params) => {
+                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
+                    .await?;
+                self.host
+                    .close_session(
+                        params.workspace,
+                        params.workspace_incarnation,
+                        params.session,
+                    )
+                    .await?;
+                respond::<operations::SessionClose>(&EmptyResult {})
+            }
+        };
+        response.map(Routed::Now)
     }
 
     fn validate_connection_authority(&self, authority: &ConnectionAuthority) -> Result<()> {
@@ -902,9 +1132,7 @@ impl ProjectActor {
         Ok(())
     }
 
-    async fn project_open(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: ProjectOpenParams = decode_params(request.params(), request.method())?;
+    async fn project_open(&mut self, params: ProjectOpenRequest) -> Result<ProjectOpened> {
         let requested = canonical_input_path(&params.path)?;
         // The caller names where it is; the descriptor names the project. They are the same
         // directory when the caller stands in main's checkout, and different ones whenever it
@@ -929,82 +1157,85 @@ impl ProjectActor {
             ));
         }
         let descriptor = self.host.descriptor();
-        json_response(json!({
-            "repoId": descriptor.repo_id,
-            "binding": descriptor.binding,
-            "gitRoot": descriptor.git_root,
-            "storeRoot": descriptor.storage.store(),
-        }))
+        Ok(ProjectOpened {
+            repo_id: descriptor.repo_id.clone(),
+            binding: descriptor.binding.clone(),
+            git_root: descriptor.git_root.clone(),
+            store_root: descriptor.storage.store().to_path_buf(),
+        })
     }
 
-    async fn project_workspace(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, &params.workspace)?;
-        self.validate_worker_snapshot(request.authority(), snapshot)?;
-        workspace_response(snapshot)
+    /// The named workspace, proven to be the one a worker connection is fenced to.
+    async fn scoped_snapshot(
+        &mut self,
+        authority: &ConnectionAuthority,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<WorkspaceSnapshot> {
+        self.require_repo(repo_id)?;
+        let snapshot = take_workspace(self.host.snapshots().await?, workspace)?;
+        self.validate_worker_snapshot(authority, &snapshot)?;
+        Ok(snapshot)
     }
 
-    async fn project_workspace_at(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceAtParams = decode_params(request.params(), request.method())?;
+    async fn project_workspace(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: WorkspaceRequest,
+    ) -> Result<WorkspaceView> {
+        self.scoped_snapshot(authority, &params.repo_id, &params.workspace)
+            .await
+            .map(workspace_view)
+    }
+
+    async fn project_workspace_at(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: WorkspaceAtRequest,
+    ) -> Result<WorkspaceView> {
         self.require_repo(&params.repo_id)?;
         let path = canonical_input_path(&params.path)?;
         let snapshot = self.host.workspace_at(path).await?;
-        self.validate_worker_snapshot(request.authority(), &snapshot)?;
-        workspace_response(&snapshot)
+        self.validate_worker_snapshot(authority, &snapshot)?;
+        Ok(workspace_view(snapshot))
     }
 
-    async fn project_list(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: RepoParams = decode_params(request.params(), request.method())?;
+    async fn project_list(&mut self, params: RepoRequest) -> Result<Vec<WorkspaceView>> {
         self.require_repo(&params.repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let wires: Vec<_> = snapshots
-            .iter()
-            .map(workspace_wire)
-            .collect::<Result<Vec<_>>>()?;
-        json_response(wires)
+        Ok(self
+            .host
+            .snapshots()
+            .await?
+            .into_iter()
+            .map(workspace_view)
+            .collect())
     }
 
-    async fn workspace_info(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, &params.workspace)?;
-        self.validate_worker_snapshot(request.authority(), snapshot)?;
-        json_response(&snapshot.info)
+    async fn workspace_info(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: WorkspaceRequest,
+    ) -> Result<WorkspaceInfo> {
+        self.scoped_snapshot(authority, &params.repo_id, &params.workspace)
+            .await
+            .map(|snapshot| snapshot.info)
     }
 
-    async fn workspace_attach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceOptionsParams<AttachOptions> =
-            decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        self.host.attach(params.workspace, params.options).await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn workspace_grants(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, &params.workspace)?;
-        self.validate_worker_snapshot(request.authority(), snapshot)?;
-        json_response(&snapshot.grants)
+    async fn workspace_grants(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: WorkspaceGrantsRequest,
+    ) -> Result<GrantSet> {
+        self.scoped_snapshot(authority, &params.repo_id, &params.workspace)
+            .await
+            .map(|snapshot| snapshot.grants)
     }
 
     /// The build volume a job of the workspace would be granted now: what a coordinator that
     /// confines its own reads to a workspace follows the checkout's build link into
     /// (16_build_volumes.md, "Process lifetime across a swap"). Coordinator-only, and fenced on
     /// the incarnation, so a name recreated meanwhile never answers for the one the caller holds.
-    async fn workspace_build_volume(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkerScope = decode_params(request.params(), request.method())?;
+    async fn workspace_build_volume(&mut self, params: WorkerScope) -> Result<BuildVolume> {
         self.require_repo(&params.repo_id)?;
         let snapshots = self.host.snapshots().await?;
         let snapshot = find_workspace(&snapshots, &params.workspace)?;
@@ -1027,15 +1258,11 @@ impl ProjectActor {
                 format!("cowshed attach {}, then retry", params.workspace),
             ));
         }
-        // An object, never a bare `null`: an RPC envelope carries no result for a null one.
         let volume = self.host.build_volume(params.workspace).await?;
-        json_response(json!({ "volume": volume }))
+        Ok(BuildVolume { volume })
     }
 
-    async fn coordinator_adopt(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: OptionsParams<AdoptOptions> =
-            decode_params(request.params(), request.method())?;
+    async fn coordinator_adopt(&mut self, params: AdoptRequest) -> Result<WorkspaceView> {
         self.require_repo(&params.repo_id)?;
         if params
             .options
@@ -1048,272 +1275,40 @@ impl ProjectActor {
                 "retry with the repository identity selected while opening the project",
             ));
         }
-        let snapshot = self.host.adopt(params.options).await?;
-        workspace_response(&snapshot)
+        self.host.adopt(params.options).await.map(workspace_view)
     }
 
-    async fn coordinator_create(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceOptionsParams<CreateOptions> =
-            decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.create(params.workspace, params.options).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn coordinator_fork(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: SourceDestinationParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.fork(params.source, params.destination).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn coordinator_rename(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: SourceDestinationParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.rename(params.source, params.destination).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn coordinator_move_checkout(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: MoveCheckoutParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.move_checkout(params.destination).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn coordinator_change_repo_id(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: ChangeRepoIdParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.change_repo_id(params.new_repo_id).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn coordinator_grant(
-        &mut self,
-        request: RouterRequest,
-        revoke: bool,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: GrantParams = decode_params(request.params(), request.method())?;
+    async fn coordinator_grant(&mut self, params: GrantRequest, revoke: bool) -> Result<GrantSet> {
         self.require_repo(&params.repo_id)?;
         requested_port_block_size(&params.delta, revoke)?;
-        let grants = self
-            .host
-            .grant(params.workspace, params.delta, revoke)
-            .await?;
-        json_response(grants)
-    }
-
-    async fn coordinator_project_grants(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: RepoParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(self.host.project_grants().await?)
-    }
-
-    async fn coordinator_grant_project(
-        &mut self,
-        request: RouterRequest,
-        revoke: bool,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: ProjectGrantParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(self.host.grant_project(params.delta, revoke).await?)
-    }
-
-    async fn coordinator_rebase(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: IntoParams<RebaseOptions> = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let report = self
-            .host
-            .rebase(params.workspace, params.into, params.options)
-            .await?;
-        json_response(report)
-    }
-
-    async fn coordinator_land(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: IntoParams<LandOptions> = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let report = self
-            .host
-            .land(params.workspace, params.into, params.options)
-            .await?;
-        json_response(report)
-    }
-
-    async fn coordinator_restore(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: RestoreParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        self.host.restore(params.workspace, params.label).await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn coordinator_detach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        self.host.detach(params.workspace).await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn coordinator_serve_supervisor(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        self.host.serve_supervisor(params.workspace).await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn coordinator_refresh_build_state(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(self.host.refresh_build_state(params.workspace).await?)
-    }
-
-    async fn coordinator_resize(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: ResizeParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let result = self
-            .host
-            .resize(params.workspace, params.capacity, params.volume)
-            .await?;
-        json_response(result)
-    }
-
-    async fn coordinator_defragment(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let result = self.host.defragment(params.workspace).await?;
-        json_response(result)
-    }
-
-    async fn coordinator_reseed(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let result = self.host.reseed(params.workspace).await?;
-        json_response(result)
-    }
-
-    async fn coordinator_assign_slot(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: SlotParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        self.host.assign_slot(params.workspace, params.slot).await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn coordinator_destroy(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceOptionsParams<RemoveOptions> =
-            decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let report = self.host.remove(params.workspace, params.options).await?;
-        json_response(report)
-    }
-
-    async fn coordinator_gc(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: OptionsParams<GcOptions> = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(self.host.gc(params.options).await?)
-    }
-
-    async fn coordinator_remove_project(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: OptionsParams<RemoveProjectOptions> =
-            decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(remove_project(self.host.as_mut(), params.options).await?)
-    }
-
-    async fn coordinator_repo_mirror(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: MirrorParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let url = Url::parse(&params.url).map_err(|error| {
-            CowshedError::usage(
-                format!("invalid repository mirror URL: {error}"),
-                "use an absolute supported repository URL",
-            )
-        })?;
-        json_response(self.host.repo_mirror(params.workspace, url).await?)
-    }
-
-    async fn coordinator_checkpoint_quota(
-        &mut self,
-        request: RouterRequest,
-    ) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: QuotaParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
         self.host
-            .set_checkpoint_quota(params.workspace, params.quota)
+            .grant(params.workspace, params.delta, revoke)
+            .await
+    }
+
+    async fn worker_exec(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: ExecParams,
+        upload: Option<Bytes>,
+    ) -> Result<JobId> {
+        let (scope, session, exec) = exec_request(params, upload)?;
+        self.require_scoped_workspace(authority, &scope.repo_id, &scope.workspace)
             .await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn coordinator_doctor(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: RepoParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        json_response(self.host.doctor().await?)
-    }
-
-    async fn coordinator_worker(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_repo(&params.repo_id)?;
-        let snapshot = self.host.open_worker(params.workspace).await?;
-        workspace_response(&snapshot)
-    }
-
-    async fn worker_exec(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let (scope, session, exec) = decode_exec_request(&request)?;
-        self.require_scoped_workspace(request.authority(), &scope.repo_id, &scope.workspace)
-            .await?;
-        let id = self
-            .host
+        self.host
             .exec(scope.workspace, scope.workspace_incarnation, session, exec)
-            .await?;
-        json_response(id)
+            .await
     }
 
-    async fn worker_stdin_chunk(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+    async fn stdin_chunk(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+        upload: Option<Bytes>,
+    ) -> Result<()> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
-        let bytes = request.upload().cloned().ok_or_else(|| {
+        let bytes = upload.ok_or_else(|| {
             CowshedError::usage(
                 "stdin chunk is missing binary data",
                 "retry the stdin write",
@@ -1326,112 +1321,31 @@ impl ProjectActor {
                 params.job_id,
                 bytes,
             )
-            .await?;
-        json_response(EmptyResult {})
+            .await
     }
 
-    async fn worker_stdin_close(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+    async fn job_info(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobInfo> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
         self.host
-            .stdin_close(
+            .job_info(
                 params.workspace,
                 params.workspace_incarnation,
                 params.job_id,
             )
-            .await?;
-        json_response(EmptyResult {})
+            .await
     }
 
-    async fn worker_shell(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: SessionParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        self.host
-            .open_session(
-                params.workspace,
-                params.workspace_incarnation,
-                params.session,
-            )
-            .await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn worker_list_jobs(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: WorkerScope = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        json_response(
-            self.host
-                .list_jobs(params.workspace, params.workspace_incarnation)
-                .await?,
-        )
-    }
-
-    async fn worker_job_info(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        json_response(
-            self.host
-                .job_info(
-                    params.workspace,
-                    params.workspace_incarnation,
-                    params.job_id,
-                )
-                .await?,
-        )
-    }
-
-    async fn job_sealed(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        json_response(
-            self.host
-                .sealed_job(
-                    params.workspace,
-                    params.workspace_incarnation,
-                    params.job_id,
-                )
-                .await?,
-        )
-    }
-
-    async fn worker_checkpoint(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: WorkerCheckpointParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        json_response(
-            self.host
-                .checkpoint(
-                    params.workspace,
-                    Some(params.workspace_incarnation),
-                    params.options,
-                )
-                .await?,
-        )
-    }
-
-    async fn worker_push(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: WorkerPushParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        json_response(
-            self.host
-                .push(
-                    params.workspace,
-                    params.workspace_incarnation,
-                    params.options,
-                )
-                .await?,
-        )
-    }
-
-    async fn job_logs(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
-        let params: LogsParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+    async fn job_logs(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: LogsRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
         let chunk = self
             .host
@@ -1452,29 +1366,21 @@ impl ProjectActor {
                 ));
             }
             RouterResponse::binary(
-                json!({ "eof": chunk.eof, "nextOffset": chunk.next_offset }),
+                encode_result::<operations::JobLogs>(&LogsChunk {
+                    eof: chunk.eof,
+                    next_offset: chunk.next_offset,
+                })?,
                 chunk.bytes,
             )
         }))
     }
 
-    async fn job_detach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        self.host
-            .detach_job(
-                params.workspace,
-                params.workspace_incarnation,
-                params.job_id,
-            )
-            .await?;
-        json_response(EmptyResult {})
-    }
-
-    async fn job_wait(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+    async fn job_wait(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
         let info = self
             .host
@@ -1484,12 +1390,17 @@ impl ProjectActor {
                 params.job_id,
             )
             .await?;
-        Ok(Box::pin(async move { json_response(info.await?) }))
+        Ok(Box::pin(async move {
+            respond::<operations::JobWait>(&info.await?)
+        }))
     }
 
-    async fn job_kill(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
-        let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+    async fn job_kill(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
             .await?;
         let ended = self
             .host
@@ -1501,22 +1412,8 @@ impl ProjectActor {
             .await?;
         Ok(Box::pin(async move {
             ended.await?;
-            json_response(EmptyResult {})
+            respond::<operations::JobKill>(&EmptyResult {})
         }))
-    }
-
-    async fn session_close(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        let params: SessionParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
-            .await?;
-        self.host
-            .close_session(
-                params.workspace,
-                params.workspace_incarnation,
-                params.session,
-            )
-            .await?;
-        json_response(EmptyResult {})
     }
 
     fn require_repo(&self, repo_id: &RepoId) -> Result<()> {
@@ -1647,31 +1544,32 @@ fn find_workspace<'a>(
         })
 }
 
-fn workspace_wire(snapshot: &WorkspaceSnapshot) -> Result<Value> {
-    serde_json::to_value(json!({ "info": snapshot.info, "grants": snapshot.grants }))
-        .map_err(|error| CowshedError::internal(format!("serialize workspace snapshot: {error}")))
+/// The named workspace's snapshot, taken out of the listing it was found in.
+fn take_workspace(
+    snapshots: Vec<WorkspaceSnapshot>,
+    workspace: &WorkspaceName,
+) -> Result<WorkspaceSnapshot> {
+    snapshots
+        .into_iter()
+        .find(|snapshot| &snapshot.info.workspace == workspace)
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!("workspace {workspace} does not exist"),
+                "list workspaces and retry with a published name",
+            )
+        })
 }
 
-fn workspace_response(snapshot: &WorkspaceSnapshot) -> Result<RouterResponse> {
-    json_response(workspace_wire(snapshot)?)
+fn workspace_view(snapshot: WorkspaceSnapshot) -> WorkspaceView {
+    WorkspaceView {
+        info: snapshot.info,
+        grants: snapshot.grants,
+    }
 }
 
-fn json_response(value: impl Serialize) -> Result<RouterResponse> {
-    serde_json::to_value(value)
-        .map(RouterResponse::json)
-        .map_err(|error| CowshedError::internal(format!("serialize router response: {error}")))
-}
-
-/// Deserialize borrowed from the router's `Value`. `from_value` needs ownership, so it cloned
-/// the whole params object on every RPC -- including exec's `env` map and argv, which are the
-/// cases that are not small.
-fn decode_params<T: DeserializeOwned>(params: &Value, method: &str) -> Result<T> {
-    T::deserialize(params).map_err(|error| {
-        CowshedError::usage(
-            format!("invalid {method} parameters: {error}"),
-            "upgrade the client and controller together",
-        )
-    })
+/// Answers a call with its operation's declared result.
+fn respond<O: Operation>(result: &O::Result) -> Result<RouterResponse> {
+    encode_result::<O>(result).map(RouterResponse::json)
 }
 
 fn canonical_input_path(path: &str) -> Result<PathBuf> {
@@ -1692,222 +1590,6 @@ fn canonical_input_path(path: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProjectOpenParams {
-    path: String,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RepoParams {
-    repo_id: RepoId,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkspaceParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkspaceAtParams {
-    repo_id: RepoId,
-    path: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OptionsParams<T> {
-    repo_id: RepoId,
-    options: T,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkspaceOptionsParams<T> {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    options: T,
-}
-
-/// A unit's land or rebase: the unit, what it lands into (main when absent), and its options.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct IntoParams<T> {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    #[serde(default)]
-    into: Option<WorkspaceTarget>,
-    options: T,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SourceDestinationParams {
-    repo_id: RepoId,
-    source: WorkspaceName,
-    destination: WorkspaceName,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MoveCheckoutParams {
-    repo_id: RepoId,
-    destination: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ChangeRepoIdParams {
-    repo_id: RepoId,
-    new_repo_id: RepoId,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    label: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResizeParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    capacity: String,
-    volume: crate::api::dto::ResizeVolume,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GrantParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    delta: GrantDelta,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProjectGrantParams {
-    repo_id: RepoId,
-    delta: ProjectGrantDelta,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SlotParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    slot: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QuotaParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    quota: CheckpointQuota,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MirrorParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    url: String,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkerScope {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    session: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct JobParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    job_id: JobId,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkerCheckpointParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    options: CheckpointOptions,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkerPushParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    options: PushOptions,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LogsParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    job_id: JobId,
-    stream: RuntimeJobStream,
-    follow: bool,
-    offset: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ExecWire {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    workspace_incarnation: WorkspaceIncarnation,
-    session: Option<String>,
-    #[serde(default)]
-    argv: Option<Vec<CommandArg>>,
-    #[serde(default)]
-    script: Option<crate::api::dto::ScriptCommand>,
-    cwd: Option<crate::api::dto::WorkspacePath>,
-    mode: RunSandboxMode,
-    env: std::collections::HashMap<String, String>,
-    trace: Option<crate::api::dto::TraceContext>,
-    stdin: StdinWire,
-    stdout_copy: Option<crate::api::dto::OutputPublication>,
-    stderr_copy: Option<crate::api::dto::OutputPublication>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-enum StdinWire {
-    Empty,
-    Inline,
-    Stream,
-    WorkspaceFile {
-        workspace_path: crate::api::dto::WorkspacePath,
-    },
-}
-
 /// The one command an exec request carries, validated before anything is admitted.
 fn exec_command(
     argv: Option<Vec<CommandArg>>,
@@ -1921,14 +1603,16 @@ fn exec_command(
     Ok(command)
 }
 
-fn decode_exec_request(
-    request: &RouterRequest,
+/// The admission an exec request carries: its fence, its session, and the validated request,
+/// with inline stdin taken from the call's upload frame.
+fn exec_request(
+    params: ExecParams,
+    upload: Option<Bytes>,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
-    let wire: ExecWire = decode_params(request.params(), request.method())?;
-    let command = exec_command(wire.argv, wire.script)?;
-    let stdin = match wire.stdin {
-        StdinWire::Empty => {
-            if request.upload().is_some() {
+    let command = exec_command(params.argv, params.script)?;
+    let stdin = match params.stdin {
+        ExecStdin::Empty => {
+            if upload.is_some() {
                 return Err(CowshedError::usage(
                     "empty stdin request unexpectedly included binary data",
                     "retry without an upload frame",
@@ -1936,14 +1620,14 @@ fn decode_exec_request(
             }
             StdinSource::Empty
         }
-        StdinWire::Inline => StdinSource::Inline(request.upload().cloned().ok_or_else(|| {
+        ExecStdin::Inline => StdinSource::Inline(upload.ok_or_else(|| {
             CowshedError::usage(
                 "inline stdin request is missing binary data",
                 "retry with the declared upload frame",
             )
         })?),
-        StdinWire::Stream => {
-            if request.upload().is_some() {
+        ExecStdin::Stream => {
+            if upload.is_some() {
                 return Err(CowshedError::usage(
                     "stream stdin admission unexpectedly included binary data",
                     "send stream chunks after job admission",
@@ -1954,8 +1638,8 @@ fn decode_exec_request(
                 "retry through WorkspaceHandle::exec",
             ));
         }
-        StdinWire::WorkspaceFile { workspace_path } => {
-            if request.upload().is_some() {
+        ExecStdin::WorkspaceFile { workspace_path } => {
+            if upload.is_some() {
                 return Err(CowshedError::usage(
                     "workspace-file stdin unexpectedly included binary data",
                     "retry without an upload frame",
@@ -1964,24 +1648,23 @@ fn decode_exec_request(
             StdinSource::WorkspaceFile(workspace_path)
         }
     };
-    let mode = wire.mode;
     let scope = WorkerScope {
-        repo_id: wire.repo_id,
-        workspace: wire.workspace,
-        workspace_incarnation: wire.workspace_incarnation,
+        repo_id: params.repo_id,
+        workspace: params.workspace,
+        workspace_incarnation: params.workspace_incarnation,
     };
     Ok((
         scope,
-        wire.session,
+        params.session,
         ExecRequest {
             command,
-            cwd: wire.cwd,
-            mode,
-            env: wire.env,
-            trace: wire.trace,
+            cwd: params.cwd,
+            mode: params.mode,
+            env: params.env,
+            trace: params.trace,
             stdin,
-            stdout_copy: wire.stdout_copy,
-            stderr_copy: wire.stderr_copy,
+            stdout_copy: params.stdout_copy,
+            stderr_copy: params.stderr_copy,
         },
     ))
 }
@@ -11028,7 +10711,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-        stream: RuntimeJobStream,
+        stream: JobStream,
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>> {
@@ -18753,11 +18436,12 @@ mod adopt_secret_policy_tests {
 
 #[cfg(test)]
 mod exec_admission_tests {
-    use super::{ExecWire, exec_command};
+    use super::exec_command;
     use crate::api::dto::ExecCommand;
+    use crate::api::operations::ExecParams;
     use crate::error::ErrorCode;
 
-    fn request(command: serde_json::Value) -> ExecWire {
+    fn request(command: serde_json::Value) -> ExecParams {
         let mut wire = serde_json::json!({
             "repoId": "acme/widget",
             "workspace": "widget",

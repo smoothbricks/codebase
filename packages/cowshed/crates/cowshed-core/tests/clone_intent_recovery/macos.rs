@@ -7,6 +7,7 @@ use cowshed_core::apfs::{
     SystemCommandRunner,
 };
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
+use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{
@@ -149,8 +150,7 @@ impl Fixture {
                 ConnectionAuthority::Coordinator {
                     repo_id: self.repo.clone(),
                 },
-                method.to_owned(),
-                params,
+                OperationRequest::decode(method, &params)?,
                 None,
                 None,
             )

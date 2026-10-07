@@ -14,7 +14,7 @@ pub mod supervisor_socket;
 
 pub use project::{
     JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,
-    RuntimeJobStream, RuntimeLogChunk, WorkspaceSnapshot,
+    RuntimeLogChunk, WorkspaceSnapshot,
 };
 pub use supervisor::{
     CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,

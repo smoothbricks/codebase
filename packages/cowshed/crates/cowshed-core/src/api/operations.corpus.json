@@ -1,0 +1,173 @@
+{
+  "project.open": { "path": "/trusted/acme/widget" },
+  "project.workspace": { "repoId": "acme/widget", "workspace": "feature" },
+  "project.workspaceAt": { "repoId": "acme/widget", "path": "/trusted/acme/widget" },
+  "project.list": { "repoId": "acme/widget" },
+  "workspace.info": { "repoId": "acme/widget", "workspace": "feature" },
+  "workspace.attach": { "repoId": "acme/widget", "workspace": "feature", "options": { "browse": false } },
+  "workspace.grants": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+  },
+  "workspace.buildVolume": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+  },
+  "coordinator.rename": { "repoId": "acme/widget", "source": "feature", "destination": "renamed" },
+  "coordinator.adopt": { "repoId": "acme/widget", "options": { "quarantine": false } },
+  "coordinator.create": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "options": { "browse": false, "gitWorktree": false, "register": false }
+  },
+  "coordinator.fork": { "repoId": "acme/widget", "source": "main", "destination": "feature" },
+  "coordinator.moveCheckout": { "repoId": "acme/widget", "destination": "/trusted/acme/moved" },
+  "coordinator.changeRepoId": { "repoId": "acme/widget", "newRepoId": "acme/gadget" },
+  "coordinator.grant": { "repoId": "acme/widget", "workspace": "feature", "delta": {} },
+  "coordinator.revoke": { "repoId": "acme/widget", "workspace": "feature", "delta": {} },
+  "coordinator.projectGrants": { "repoId": "acme/widget" },
+  "coordinator.grantProject": { "repoId": "acme/widget", "delta": {} },
+  "coordinator.revokeProject": { "repoId": "acme/widget", "delta": {} },
+  "coordinator.rebase": { "repoId": "acme/widget", "workspace": "feature", "options": {} },
+  "coordinator.land": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "into": { "workspace": "main", "incarnation": "fedcba9876543210fedcba9876543210" },
+    "options": { "retire": true, "pushOnly": false }
+  },
+  "coordinator.restore": { "repoId": "acme/widget", "workspace": "feature", "label": "before" },
+  "coordinator.resize": { "repoId": "acme/widget", "workspace": "feature", "capacity": "64G", "volume": "build" },
+  "coordinator.defragment": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.reseed": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.detach": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.assignSlot": { "repoId": "acme/widget", "workspace": "feature", "slot": 3 },
+  "coordinator.destroy": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "options": { "force": false, "restore": false, "abandon": false }
+  },
+  "coordinator.gc": { "repoId": "acme/widget", "options": { "dryRun": false } },
+  "coordinator.removeProject": { "repoId": "acme/widget", "options": { "force": false, "abandon": false } },
+  "coordinator.repoMirror": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "url": "https://example.com/acme/widget.git"
+  },
+  "coordinator.setCheckpointQuota": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "quota": { "maxCount": 5, "maxBytes": 1073741824 }
+  },
+  "coordinator.doctor": { "repoId": "acme/widget" },
+  "coordinator.worker": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.serveSupervisor": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.refreshBuildState": { "repoId": "acme/widget", "workspace": "feature" },
+  "worker.exec": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "session": null,
+    "argv": [{ "encoding": "utf8", "data": "true" }],
+    "cwd": null,
+    "mode": "readWrite",
+    "env": {},
+    "trace": null,
+    "stdin": { "kind": "inline" },
+    "stdoutCopy": null,
+    "stderrCopy": null
+  },
+  "worker.stdinChunk": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "worker.stdinClose": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "worker.shell": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "session": "build"
+  },
+  "worker.listJobs": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+  },
+  "worker.job": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "worker.checkpoint": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "options": { "keep": false }
+  },
+  "worker.push": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "options": {}
+  },
+  "job.status": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "job.sealed": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "job.logs": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7,
+    "stream": "stdout",
+    "follow": false,
+    "offset": 0
+  },
+  "job.attachWrite": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "job.detach": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "job.wait": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "job.kill": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
+  "session.close": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "session": "build"
+  }
+}
