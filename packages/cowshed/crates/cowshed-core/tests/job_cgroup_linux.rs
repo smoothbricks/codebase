@@ -36,6 +36,8 @@ const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
 const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
+/// A writable directory on block storage ([`block_storage_directory`]).
+const STORAGE: &str = "COWSHED_JOB_CGROUP_STORAGE";
 
 /// CPU a placed process can spend outside its job: from its fork to its placement write, in the
 /// spawning library's child setup. Measured deficits are printed beside every comparison.
@@ -111,10 +113,14 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
     let delegate = serde_json::to_string(&Role::Delegate { uid, gid }).expect("role");
     let mut assignment = OsString::from(format!("{ROLE}="));
     assignment.push(delegate);
+    // Chosen here, in the invoking user's own environment, which sudo does not pass on.
+    let mut storage = OsString::from(format!("{STORAGE}="));
+    storage.push(block_storage_directory());
     let output = Command::new(find_program("sudo"))
         .arg("-n")
         .arg(find_program("env"))
         .arg(assignment)
+        .arg(storage)
         .arg(find_program("systemd-run"))
         .args([
             "--scope",
@@ -473,7 +479,7 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
     let job = jobs.admit(job_id(10)).expect("admit");
-    let file = beside_test_binary("page-cache");
+    let file = on_block_storage("page-cache");
     let mut running = Spawned::placed(
         &job,
         &Workload {
@@ -541,30 +547,30 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
     let job = jobs.admit(job_id(11)).expect("admit");
     let neighbour_job = jobs.admit(job_id(12)).expect("admit");
-    let scratch = beside_test_binary("probe");
+    let scratch = on_block_storage("probe");
     println!(
         "storage I/O scratch {} on filesystem type {:#x}",
         scratch.display(),
-        filesystem_type(scratch.parent().expect("a directory"))
+        filesystem_type(scratch.parent().expect("a directory")).expect("statfs")
     );
     // Cached by the controller, outside every job: the job's read of it is served from memory.
-    let cached = beside_test_binary("cached");
+    let cached = on_block_storage("cached");
     fill_page_cache(&cached, 32);
     std::fs::File::open(&cached)
         .and_then(|file| file.sync_all())
         .expect("flush the cached file");
     read_through_cache(&cached);
-    let allocated = beside_test_binary("allocated");
+    let allocated = on_block_storage("allocated");
     let children = (0..3)
         .map(|index| Workload {
-            direct_io: Some((beside_test_binary(&format!("direct-{index}")), 8, 4)),
+            direct_io: Some((on_block_storage(&format!("direct-{index}")), 8, 4)),
             ..Workload::default()
         })
         .collect();
     let neighbour = Spawned::placed(
         &neighbour_job,
         &Workload {
-            direct_io: Some((beside_test_binary("neighbour"), 16, 0)),
+            direct_io: Some((on_block_storage("neighbour"), 16, 0)),
             ..Workload::default()
         },
     );
@@ -951,13 +957,87 @@ fn fill_page_cache(path: &Path, mebibytes: u64) {
     }
 }
 
-/// A scratch path beside this test binary: on the build's own storage, never a memory-backed
-/// temporary directory.
-fn beside_test_binary(name: &str) -> PathBuf {
-    test_binary()
-        .parent()
-        .expect("the test binary's directory")
+/// Filesystems whose file pages the memory controller charges to the cgroup that faults them in
+/// and whose writeback and direct I/O reach a block device as that cgroup's own bios, so
+/// `memory.current` and `io.stat` see them. ZFS is not one: its ARC is no page cache, and its
+/// own threads issue its I/O.
+const BLOCK_FILESYSTEMS: [(libc::c_long, &str); 3] = [
+    (0xEF53, "ext4"),
+    (0x5846_5342, "xfs"),
+    (0x9123_683E, "btrfs"),
+];
+
+/// A scratch path in the block-storage directory the harness chose.
+fn on_block_storage(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(STORAGE).expect("the harness's storage directory"))
         .join(format!("job-cgroup-{}-{name}", std::process::id()))
+}
+
+/// The first writable directory among the build's and the user's usual scratch places that lies
+/// on a [`BLOCK_FILESYSTEMS`] filesystem. None is a failure that lists what each candidate is and
+/// every mount, never a skipped scenario.
+fn block_storage_directory() -> PathBuf {
+    let mut candidates = vec![
+        test_binary()
+            .parent()
+            .expect("the test binary's directory")
+            .to_path_buf(),
+    ];
+    candidates.extend(
+        ["TMPDIR", "RUNNER_TEMP", "HOME"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from),
+    );
+    candidates.extend(["/var/tmp", "/tmp"].map(PathBuf::from));
+    let mut measured = Vec::new();
+    for candidate in candidates {
+        let f_type = filesystem_type(&candidate);
+        let writable = writable_directory(&candidate);
+        let block = f_type.as_ref().ok().and_then(|f_type| {
+            BLOCK_FILESYSTEMS
+                .iter()
+                .find(|(magic, _)| magic == f_type)
+                .map(|(_, name)| *name)
+        });
+        if let (Some(name), true) = (block, writable) {
+            println!("block storage: {} on {name}", candidate.display());
+            return candidate;
+        }
+        measured.push(format!(
+            "{}: f_type {f_type:x?}, writable {writable}",
+            candidate.display()
+        ));
+    }
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_else(|error| format!("unreadable: {error}"))
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let mount = before.split_whitespace().nth(4)?;
+            let mut after = after.split_whitespace();
+            Some(format!(
+                "{mount} {} {}",
+                after.next()?,
+                after.next().unwrap_or("")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    panic!(
+        "no writable scratch directory on ext4, xfs or btrfs:\n{}\nmounts:\n{mounts}",
+        measured.join("\n")
+    );
+}
+
+fn writable_directory(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path and plain flags.
+    unsafe { libc::access(name.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// Write `write` MiB to a new file at `path`, flushed to storage, then read `read` MiB of it
@@ -1050,20 +1130,17 @@ fn allocate(path: &Path, mebibytes: u64) {
 }
 
 /// `statfs(2)`'s `f_type` of the filesystem holding `path`.
-fn filesystem_type(path: &Path) -> libc::c_long {
+fn filesystem_type(path: &Path) -> std::io::Result<libc::c_long> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: an all-zero statfs is a valid output buffer.
     let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: a NUL-terminated path and a buffer of the right type.
-    assert_eq!(
-        unsafe { libc::statfs(name.as_ptr(), &mut statfs) },
-        0,
-        "statfs: {}",
-        last_error()
-    );
-    statfs.f_type
+    if unsafe { libc::statfs(name.as_ptr(), &mut statfs) } != 0 {
+        return Err(last_error());
+    }
+    Ok(statfs.f_type)
 }
 
 /// Every device line's `rbytes` and `wbytes` of `io.stat`, summed without regard to stacking.
