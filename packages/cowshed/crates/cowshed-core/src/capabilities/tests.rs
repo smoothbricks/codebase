@@ -231,6 +231,170 @@ fn normalization_coalesces_grants_without_broadening_literals() {
     );
 }
 
+/// A Nix profile link resolves through generation links beneath HOME before it leaves for the
+/// store, and the sandboxed search refuses the whole lookup unless every one is named. Each link
+/// a bootstrap candidate follows beneath HOME is granted as a literal, and so is where a lookup
+/// ends beneath HOME; nothing the lookup only passes through, and nothing past HOME.
+#[test]
+fn a_bootstrap_candidate_grants_each_home_link_its_lookup_follows() {
+    let fixture = Fixture::new();
+    let home = &fixture.home;
+    let profiles = home.join(".local/state/nix/profiles");
+    let store = fixture.root.join("store/profile");
+    fs::create_dir_all(&profiles).unwrap();
+    fs::create_dir_all(store.join("bin")).unwrap();
+    let program = store.join("bin/direnv");
+    fs::write(&program, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = |link: &Path, target: &Path| std::os::unix::fs::symlink(target, link).unwrap();
+    link(&home.join(".nix-profile"), &profiles.join("profile"));
+    link(&profiles.join("profile"), Path::new("profile-1-link"));
+    link(&profiles.join("profile-1-link"), &store);
+    // A second profile whose generation is gone ends its lookup beneath HOME.
+    link(
+        &home.join(".local/state/nix/profile"),
+        Path::new("profiles/missing"),
+    );
+    let directories = [
+        home.join(".nix-profile/bin"),
+        home.join(".local/state/nix/profile/bin"),
+    ];
+
+    let mut contribution = CapabilityContribution::default();
+    add_bootstrap(
+        &mut contribution,
+        &fixture.context(),
+        "direnv",
+        &directories,
+    )
+    .unwrap();
+
+    let granted: std::collections::BTreeSet<_> = contribution
+        .grants
+        .iter()
+        .inspect(|grant| {
+            assert_eq!(
+                (grant.scope, grant.access),
+                (GrantScope::Literal, GrantAccess::Read),
+                "{grant:?}"
+            );
+        })
+        .map(|grant| grant.path.clone())
+        .collect();
+    assert_eq!(
+        granted,
+        [
+            home.join(".nix-profile/bin/direnv"),
+            home.join(".nix-profile"),
+            profiles.join("profile"),
+            profiles.join("profile-1-link"),
+            home.join(".local/state/nix/profile/bin/direnv"),
+            home.join(".local/state/nix/profile"),
+            profiles.join("missing"),
+            program.clone(),
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        contribution.bootstrap_programs,
+        [BootstrapProgram {
+            name: "direnv",
+            target: program,
+        }]
+    );
+}
+
+/// A lookup that leaves HOME is resolved on outside it, since a link or directory there may lead
+/// back beneath HOME: each HOME link it re-enters through is recorded, and so is where it ends
+/// when that is beneath HOME. Nothing outside HOME is recorded.
+#[test]
+fn a_lookup_that_leaves_home_records_the_home_links_it_reenters_through() {
+    let fixture = Fixture::new();
+    let home = &fixture.home;
+    let outside = fixture.root.join("outside");
+    let store = fixture.root.join("store/profile");
+    let profiles = home.join(".local/state/nix/profiles");
+    for directory in [outside.join("tree"), profiles.clone(), store.join("bin")] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(store.join("bin/direnv"), "").unwrap();
+    let link = |link: &Path, target: &Path| std::os::unix::fs::symlink(target, link).unwrap();
+    // Out through a link, back in through another.
+    link(&home.join(".nix-profile"), &outside.join("profile"));
+    link(&outside.join("profile"), &profiles.join("profile-2-link"));
+    link(&profiles.join("profile-2-link"), &store);
+    // Out to a directory, back in through a link inside it.
+    link(&home.join(".tools"), &outside.join("tree"));
+    link(&outside.join("tree/bin"), &home.join(".local/bin-link"));
+    link(&home.join(".local/bin-link"), &store.join("bin"));
+    // Out, back in, and ending beneath HOME at a generation that is gone.
+    link(&home.join(".gone"), &outside.join("gone"));
+    link(&outside.join("gone"), &profiles.join("profile-3-link"));
+
+    for (candidate, expected) in [
+        (
+            home.join(".nix-profile/bin/direnv"),
+            vec![home.join(".nix-profile"), profiles.join("profile-2-link")],
+        ),
+        (
+            home.join(".tools/bin/direnv"),
+            vec![home.join(".tools"), home.join(".local/bin-link")],
+        ),
+        (
+            home.join(".gone/bin/direnv"),
+            vec![home.join(".gone"), profiles.join("profile-3-link")],
+        ),
+    ] {
+        assert_eq!(
+            home_lookup_trail(home, &candidate).unwrap(),
+            expected,
+            "{}",
+            candidate.display()
+        );
+    }
+}
+
+/// The walk refuses a lookup exactly where the kernel does: a chain of the platform's bound of
+/// links resolves in both, and one link more is `ELOOP` in both.
+#[test]
+fn the_lookup_walk_follows_as_many_links_as_the_kernel() {
+    let fixture = Fixture::new();
+    for length in [MAX_FOLLOWED_LINKS, MAX_FOLLOWED_LINKS + 1] {
+        let directory = fixture.home.join(format!("chain-{length}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("program"), "").unwrap();
+        for index in 0..length {
+            let target = if index + 1 == length {
+                PathBuf::from("program")
+            } else {
+                PathBuf::from((index + 1).to_string())
+            };
+            std::os::unix::fs::symlink(target, directory.join(index.to_string())).unwrap();
+        }
+        let start = directory.join("0");
+        let kernel = fs::metadata(&start)
+            .map(|_| ())
+            .map_err(|error| error.raw_os_error());
+        let walked = home_lookup_trail(&fixture.home, &start);
+        if length == MAX_FOLLOWED_LINKS {
+            assert_eq!(kernel, Ok(()), "the kernel follows {length} links");
+            assert_eq!(
+                walked.unwrap().len(),
+                length + 1,
+                "every link and the program"
+            );
+        } else {
+            assert_eq!(
+                kernel,
+                Err(Some(libc::ELOOP)),
+                "the kernel refuses {length} links"
+            );
+            assert!(walked.is_err(), "the walk refuses {length} links");
+        }
+    }
+}
+
 #[test]
 fn overlapping_build_state_contributions_are_refused_and_identical_ones_coalesce() {
     let path = |checkout, volume| BuildStatePath::new(checkout, volume).unwrap();

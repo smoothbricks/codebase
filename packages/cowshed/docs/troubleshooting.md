@@ -92,9 +92,9 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
 - **A tool reads something under `$HOME` and gets "Operation not permitted"**: reads under `$HOME` deny by default.
   System paths (`/usr`, `/System`, `/Applications`, `/nix/store`, `/opt`) stay readable; under `$HOME` a sandbox reads
   only its own workspace, the shared tool caches (`~/.cargo` registry/git, `~/.bun/install/cache`, `~/.cache/uv`), the
-  Nix profile links (`~/.nix-profile`, `~/.local/state/nix/profile`), the sccache GC root, and what `--read`/`--write`
-  grants name. Point the tool's config at a path inside the workspace, or grant exactly the file it needs
-  (`--read ~/.toolrc`, never `--read ~`).
+  Nix profile links (`~/.nix-profile`, `~/.local/state/nix/profile`) with each generation link they resolve through
+  under `~/.local/state/nix/profiles`, the sccache GC root, and what `--read`/`--write` grants name. Point the tool's
+  config at a path inside the workspace, or grant exactly the file it needs (`--read ~/.toolrc`, never `--read ~`).
 - **A workspace cannot read main's checkout**: by design. Main mounts at your original checkout path, and every other
   workspace denies it exactly as it denies a sibling workspace; jobs in main itself still read it. Land or fetch what
   you need instead of reading main's files.

@@ -828,29 +828,115 @@ pub fn bootstrap_program(name: &str, candidates: &[PathBuf]) -> Result<Option<Pa
     Ok(None)
 }
 
+/// The kernel's bound on symbolic links one lookup follows; the next one is `ELOOP`. Linux:
+/// `MAXSYMLINKS` in `include/linux/namei.h`, "up to 40 symbolic links" in path_resolution(7).
+#[cfg(target_os = "linux")]
+const MAX_FOLLOWED_LINKS: usize = 40;
+/// The kernel's bound on symbolic links one lookup follows; the next one is `ELOOP`. macOS:
+/// XNU's `MAXSYMLINKS` in `bsd/sys/param.h`. `libc` exports this constant for neither kernel.
+#[cfg(not(target_os = "linux"))]
+const MAX_FOLLOWED_LINKS: usize = 32;
+
+/// What a lookup of `path` visits beneath `home` that its own ancestors do not name: each
+/// symbolic link it follows there, and — once it has followed one — where it ends there, the
+/// file it resolves to or the first component that does not exist. The walk resolves as the
+/// kernel does (a relative target against the link's directory, `..` against the physical
+/// parent) and keeps resolving outside HOME, recording nothing there, so a link outside that
+/// leads back beneath HOME has its HOME links recorded on re-entry.
+///
+/// Seatbelt checks every link a lookup follows against the link's own path, so a link beneath
+/// HOME the profile does not name refuses the whole lookup with `EPERM`: `~/.nix-profile` alone
+/// does not resolve while `~/.local/state/nix/profiles/profile` and its generation link behind
+/// it stay denied.
+fn home_lookup_trail(home: &Path, path: &Path) -> Result<Vec<PathBuf>> {
+    let mut trail = Vec::new();
+    let mut resolved = PathBuf::new();
+    let mut pending = path.to_path_buf();
+    let mut followed = 0;
+    loop {
+        let mut components = pending.components();
+        let Some(component) = components.next() else {
+            break;
+        };
+        let rest = components.as_path().to_path_buf();
+        match component {
+            Component::RootDir => resolved = PathBuf::from("/"),
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Prefix(_) | Component::CurDir => {}
+            Component::Normal(name) => {
+                let next = resolved.join(name);
+                match fs::symlink_metadata(&next) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        followed += 1;
+                        if followed > MAX_FOLLOWED_LINKS {
+                            return Err(detection_error(
+                                path,
+                                io::Error::from_raw_os_error(libc::ELOOP),
+                            ));
+                        }
+                        let target =
+                            fs::read_link(&next).map_err(|error| detection_error(&next, error))?;
+                        if next.starts_with(home) {
+                            trail.push(next);
+                        }
+                        pending = target.join(rest);
+                        continue;
+                    }
+                    Ok(_) => resolved = next,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        resolved = next;
+                        break;
+                    }
+                    Err(error) => return Err(detection_error(&next, error)),
+                }
+            }
+        }
+        pending = rest;
+    }
+    if followed > 0 && resolved.starts_with(home) && resolved != home {
+        trail.push(resolved);
+    }
+    Ok(trail)
+}
+
 /// Bootstrap `name` from the first of `directories` that installs it.
 ///
 /// The supervisor repeats this search inside its own sandbox, beneath the HOME-wide read deny,
-/// so every candidate beneath HOME is granted as the literal program path it probes: the
-/// sandboxed search then sees exactly what the host's saw — the program, a link it resolves
-/// through, or its absence — and no HOME directory becomes listable.
+/// so every candidate beneath HOME is granted as the literal program path it probes, with the
+/// trail its lookup follows there ([`home_lookup_trail`]): each link, as a literal, and where
+/// the lookup ends. The sandboxed search then sees exactly what the host's saw — the program,
+/// the links it resolves through, or its absence — and no HOME directory becomes listable.
 pub fn add_bootstrap(
     contribution: &mut CapabilityContribution,
     context: &DetectionContext<'_>,
     name: &'static str,
     directories: &[PathBuf],
 ) -> Result<()> {
-    contribution.grants.extend(
-        directories
-            .iter()
-            .map(|directory| directory.join(name))
-            .filter(|candidate| candidate.starts_with(context.home))
-            .map(|path| CapabilityGrant {
-                path,
-                scope: GrantScope::Literal,
-                access: GrantAccess::Read,
-            }),
-    );
+    for candidate in directories
+        .iter()
+        .map(|directory| directory.join(name))
+        .filter(|candidate| candidate.starts_with(context.home))
+    {
+        let trail = home_lookup_trail(context.home, &candidate)?;
+        contribution
+            .grants
+            .extend(
+                std::iter::once(candidate)
+                    .chain(trail)
+                    .map(|path| CapabilityGrant {
+                        path,
+                        scope: GrantScope::Literal,
+                        access: GrantAccess::Read,
+                    }),
+            );
+    }
     if let Some(target) = bootstrap_program(name, directories)? {
         contribution.grants.push(CapabilityGrant {
             path: target.clone(),
