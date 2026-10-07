@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import typia from 'typia';
 import type {
   NativeCoordinatorOperations,
+  NativeEvents,
   NativeJobHandleOperations,
   NativeProjectOperations,
   NativeWorkspaceHandleOperations,
@@ -38,6 +39,59 @@ export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
 
 export interface NativeJobHandle extends NativeJobHandleOperations {
   readonly id: number;
+}
+
+/**
+ * A stream-lane call's events as an async iterator. Unlike an async generator, whose `return`
+ * waits behind a `next` in flight, `return` here closes the call at once.
+ */
+export interface EventIterator<T> {
+  next(): Promise<IteratorResult<T, undefined>>;
+  return(): Promise<IteratorResult<T, undefined>>;
+  [Symbol.asyncIterator](): EventIterator<T>;
+}
+
+/**
+ * Iterates the call `open` starts, each event parsed by `parse`. The first `next` opens the call
+ * and each `next` sends one demand; `return` closes the call -- even while a `next` waits for its
+ * event, which then resolves done -- and opens none that was never opened. A `next` whose event
+ * fails to parse closes the call before it rejects.
+ */
+export function eventIterator<T>(open: () => Promise<NativeEvents>, parse: (json: string) => T): EventIterator<T> {
+  const done: IteratorResult<T, undefined> = { done: true, value: undefined };
+  let events: Promise<NativeEvents> | undefined;
+  let returned = false;
+  const iterator: EventIterator<T> = {
+    async next() {
+      if (returned) {
+        return done;
+      }
+      events ??= open();
+      const opened = await events;
+      const event = await opened.next();
+      if (event === null) {
+        return done;
+      }
+      try {
+        return { done: false, value: parse(event) };
+      } catch (error) {
+        await opened.close();
+        throw error;
+      }
+    },
+    async return() {
+      returned = true;
+      // A call that failed to open has no close to send; its failure rejected the `next` that
+      // opened it.
+      await events?.then(
+        (opened) => opened.close(),
+        () => undefined,
+      );
+      return done;
+    },
+    [Symbol.asyncIterator]: () => iterator,
+  };
+  return iterator;
 }
 
 interface NativeModule {

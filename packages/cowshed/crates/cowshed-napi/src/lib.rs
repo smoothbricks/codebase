@@ -31,7 +31,10 @@ use cowshed_core::{
 use napi::{
     Env, JsObject,
     bindgen_prelude::{Buffer, ToNapiValue},
-    tokio::sync::Mutex,
+    tokio::{
+        self,
+        sync::{Mutex, watch},
+    },
 };
 use napi_derive::napi;
 use serde::Serialize;
@@ -253,6 +256,7 @@ where
         let events = call::call_stream::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
         Ok(Events {
             open: Arc::new(Mutex::new(Some(Box::new(events)))),
+            closed: Arc::new(watch::Sender::new(false)),
         })
     })
 }
@@ -279,13 +283,17 @@ impl<O: StreamOperation> JsonEvents for EventStream<O> {
 
 /// One stream-lane call's events. `next` sends one demand and resolves to the event that
 /// answers it, or to `null` once the call has ended; `close` ends the call — the subscription,
-/// never what it observes. A stream that ended or failed is dropped at once, so its close sends
+/// never what it observes — at once, even while a `next` waits for its event, which then
+/// resolves to `null`. A stream that ended or failed is dropped at once, so its close sends
 /// nothing; one JavaScript collects while it is still open is closed as it is dropped.
 #[napi]
 pub struct Events {
     /// The call while it is open. A demand holds the lock until its answer, so a second waits
-    /// its turn instead of sending a demand while one is unanswered, and a close waits for it.
+    /// its turn instead of sending a demand while one is unanswered.
     open: Arc<Mutex<Option<Box<dyn JsonEvents>>>>,
+    /// Set once by `close`: a demand waiting for its event gives it up and drops the call,
+    /// which sends its close, and no later demand is sent.
+    closed: Arc<watch::Sender<bool>>,
 }
 
 #[napi]
@@ -293,18 +301,27 @@ impl Events {
     #[napi]
     pub fn next(&self, env: Env) -> napi::Result<JsObject> {
         let open = Arc::clone(&self.open);
+        let mut closed = self.closed.subscribe();
         spawn_promise(env, async move {
             let mut open = open.lock().await;
-            let Some(events) = open.as_mut() else {
-                return Ok(None);
+            let step = match open.as_mut() {
+                None => return Ok(None),
+                Some(_) if *closed.borrow() => None,
+                Some(events) => tokio::select! {
+                    biased;
+                    _ = closed.wait_for(|closed| *closed) => None,
+                    step = events.next() => Some(step),
+                },
             };
-            match events.next().await {
-                Some(Ok(event)) => Ok(Some(event)),
-                Some(Err(failure)) => {
+            match step {
+                Some(Some(Ok(event))) => Ok(Some(event)),
+                Some(Some(Err(failure))) => {
                     *open = None;
                     Err(failure)
                 }
-                None => {
+                // Ended, or closed while this demand waited: dropping a call still open sends
+                // its close.
+                Some(None) | None => {
                     *open = None;
                     Ok(None)
                 }
@@ -315,7 +332,10 @@ impl Events {
     #[napi]
     pub fn close(&self, env: Env) -> napi::Result<JsObject> {
         let open = Arc::clone(&self.open);
+        self.closed.send_replace(true);
         spawn_promise(env, async move {
+            // A waiting demand releases the lock as soon as it sees the close, having dropped
+            // the call; otherwise the call is dropped here.
             open.lock().await.take();
             Ok(())
         })
