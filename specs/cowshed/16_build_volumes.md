@@ -475,6 +475,11 @@ hashes are not copied merely because main still indexes them. Each Nx root is se
 failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. The target's
 volume is the source and the workspace's is the destination.
 
+Selection covers cacheable, non-continuous tasks in each root, with no configuration and with each declared
+configuration, using Nx's own task graph, per-task environment and hasher. CLI overrides are not guessed: an invocation
+whose forwarded arguments produce another hash misses normally. The requested hashes form the outer SQLite loop and
+probe the source cache's primary key, so selection does not scan the source's historical cache.
+
 1. **Select and stage** while both sides run: a temporary SQLite table indexes the current hashes, joined to the
    target's missing rows. Only these entries are copied into the workspace volume's `.carry/`, as at Land 5.1. The hash
    probe establishes the destination's own Nx task database. If it is absent, the carry stops rather than copying the
@@ -487,13 +492,17 @@ volume is the source and the workspace's is the destination.
    Nx process that starts meanwhile waits on the lock.
 4. **Commit**, as Land 5.5, retaining the same hash selection for entries indexed after stage, then let go of the locks.
 
-One budget spans both phases and every Nx state: at most as many entries as selected task hashes, at most a tenth of the
-destination filesystem's capacity in recorded entry bytes and in block-rounded copied bytes, and a tenth of its capacity
-kept free. The byte allowance is reduced to the currently available space above that reserve. Every filesystem object is
-charged and free space checked before its write; a cache row understating a file's size cannot hide an unbounded copy.
-Files are walked once, not sized in a preliminary second traversal, and directory metadata is restored after children.
-Hitting a bound stops with `carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves
-the rebase successful. Moving staged entries at commit consumes no second copy allowance.
+One budget spans both phases and every Nx state. The row count is a defensive cap of the selected hash count across
+database pairs, including multiple machine databases that might index the same hash. Recorded entry bytes and
+block-rounded copied bytes are capped at a tenth of both the destination image's capacity and its backing store's. Both
+filesystems retain a tenth of their capacity free, and the allowance is reduced to the currently available space above
+either reserve. An ASIF image's virtual free space does not prove its backing store has space. Every filesystem object
+is charged and both free-space values checked before its write. A failed store-space query stops the carry, never falls
+back to image space alone. A cache row understating a file's size cannot hide an unbounded data copy. Files are walked
+once, not sized in a preliminary second traversal; regular-file reads are pinned and length-limited, growth or shrinkage
+refuses the partial entry, and directory metadata is restored after children. Hitting a bound stops with
+`carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves the rebase successful.
+Moving staged entries at commit consumes no second copy allowance.
 
 A skip deletes what was staged and names the side, the database and each process with its pid and command; the rebase
 itself has happened and stands. A copy that fails stops the carry and keeps what was carried until then, as at a land.
@@ -501,10 +510,15 @@ The report is `RebaseReport { oid, buildVolume }`, where `buildVolume` is `carri
 `skipped` with the reason. A rebase moves no seed: the workspace's seed catches up with its volume at its next fork
 (Targets and seeds).
 
+The hash-probe skip is `buildVolume: {kind:"skipped", reason:{kind:"taskHashes", state, reason}}`, where `state` is the
+checkout-relative Nx state directory (`<root>/.nx`) and `reason` explains the failed process or unreadable/invalid
+output. This is a successful Git rebase with no carried entries, not a refused rebase.
+
 - **Enforced by**: a real-APFS test in which a workspace forked before a land rebases after it, its report counts the
   land's entries carried, and its run of the landed check then hits every task; a carry regression with a historical
   cache larger than the rebased tree's selected entries that asserts only selected files are written; and row, recorded
-  byte, actual copied byte and late-entry selection tests that preserve the completed prefix without a partial entry.
+  byte, actual copied byte, backing-store reserve/query failure, indexed-query plan and late-entry selection tests that
+  preserve the completed prefix without a partial entry.
 
 ### Stacks and merge queues
 

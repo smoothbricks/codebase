@@ -62,9 +62,10 @@ const MISSING: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM previous
      WHERE p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
        AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
      ORDER BY p.accessed_at DESC";
+// CROSS JOIN fixes the loop order: wanted hashes probe p's primary key, never scan its history.
 const SELECTED: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM temp.wanted w \
-     JOIN previous.cache_outputs p ON p.hash = w.hash \
-     WHERE p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
+     CROSS JOIN previous.cache_outputs p \
+     WHERE p.hash = w.hash AND p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
        AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
      ORDER BY p.accessed_at DESC";
 
@@ -142,13 +143,14 @@ pub fn stage_rebase(
     into: &Path,
     into_state: &BuildVolumeState,
     selections: &BTreeMap<PathBuf, BTreeSet<String>>,
+    backing_store: &Path,
 ) -> Staged {
     let rows = selections
         .values()
         .try_fold(0_usize, |sum, hashes| sum.checked_add(hashes.len()));
     let budget = rows
         .ok_or_else(|| io::Error::other("rebase carry task-hash count overflow"))
-        .and_then(|rows| Budget::new(into, rows));
+        .and_then(|rows| Budget::new(into, backing_store, rows));
     let budget = match budget {
         Ok(budget) => budget,
         Err(error) => {
@@ -639,30 +641,32 @@ fn index(connection: &Connection, placed: &BTreeSet<&str>) -> io::Result<()> {
     connection.execute("COMMIT", &[])
 }
 
-/// Rebase's bound is shared by both phases and all Nx states. Reserve a tenth of the volume
-/// and carry at most another tenth (Nx's default cache-size fraction), never more than the
-/// available space above that reserve. Recorded entry sizes and actual filesystem writes have
-/// separate counters: an inaccurate row cannot turn a small-looking entry into an unbounded copy.
+/// Rebase's bound is shared by both phases and all Nx states. Both the destination image and
+/// its backing store keep a tenth of their capacity free; the carry admits no more than a tenth
+/// of either capacity or the available space above either reserve. An image's virtual free
+/// space alone says nothing about whether its sparse backing store can accept these writes.
 #[derive(Debug)]
 struct Budget {
-    volume: std::ffi::CString,
-    reserve: u64,
+    roots: [BudgetRoot; 2],
     block_size: u64,
+    /// Defensive cap across database pairs, even when multiple databases index the same hash.
     rows: usize,
     recorded_bytes: u64,
     copy_bytes: u64,
 }
 
 impl Budget {
-    fn new(volume: &Path, rows: usize) -> io::Result<Self> {
-        let volume = super::sqlite::c_path(volume)?;
-        let space = Space::read(&volume)?;
-        let reserve = space.capacity / 10;
-        let bytes = reserve.min(space.available.saturating_sub(reserve));
+    fn new(volume: &Path, backing_store: &Path, rows: usize) -> io::Result<Self> {
+        let (volume, volume_space) = BudgetRoot::new(volume, "build volume")?;
+        let (store, store_space) = BudgetRoot::new(backing_store, "backing store")?;
+        let bytes = volume
+            .reserve
+            .min(volume_space.available.saturating_sub(volume.reserve))
+            .min(store.reserve)
+            .min(store_space.available.saturating_sub(store.reserve));
         Ok(Self {
-            volume,
-            reserve,
-            block_size: space.block_size,
+            roots: [volume, store],
+            block_size: volume_space.block_size.max(store_space.block_size),
             rows,
             recorded_bytes: bytes,
             copy_bytes: bytes,
@@ -694,14 +698,20 @@ impl Budget {
             .checked_add(1)
             .and_then(|blocks| blocks.checked_mul(self.block_size))
             .ok_or_else(|| io::Error::other("rebase carry copy-size overflow"))?;
-        let available = Space::read(&self.volume)?
-            .available
-            .saturating_sub(self.reserve);
-        if charged > self.copy_bytes || charged > available {
+        if charged > self.copy_bytes {
             return Err(io::Error::other(format!(
-                "rebase carry bound: next object needs {charged} bytes; {} copy bytes and {available} bytes above the {}-byte free-space reserve remain",
-                self.copy_bytes, self.reserve
+                "rebase carry bound: next object needs {charged} bytes; {} copy bytes remain",
+                self.copy_bytes
             )));
+        }
+        for root in &self.roots {
+            let available = root.space()?.available.saturating_sub(root.reserve);
+            if charged > available {
+                return Err(io::Error::other(format!(
+                    "rebase carry bound: {} has {available} bytes above its {}-byte free-space reserve; next object needs {charged} bytes",
+                    root.label, root.reserve
+                )));
+            }
         }
         self.copy_bytes -= charged;
         Ok(())
@@ -776,6 +786,32 @@ fn copy_data(input: &mut fs::File, output: &mut fs::File, bytes: u64) -> io::Res
     Ok(())
 }
 
+#[derive(Debug)]
+struct BudgetRoot {
+    path: std::ffi::CString,
+    reserve: u64,
+    label: &'static str,
+}
+
+impl BudgetRoot {
+    fn new(path: &Path, label: &'static str) -> io::Result<(Self, Space)> {
+        let path = super::sqlite::c_path(path)?;
+        let space = Space::read(&path, label)?;
+        Ok((
+            Self {
+                path,
+                reserve: space.capacity / 10,
+                label,
+            },
+            space,
+        ))
+    }
+
+    fn space(&self) -> io::Result<Space> {
+        Space::read(&self.path, self.label)
+    }
+}
+
 struct Space {
     capacity: u64,
     available: u64,
@@ -783,11 +819,15 @@ struct Space {
 }
 
 impl Space {
-    fn read(volume: &std::ffi::CStr) -> io::Result<Self> {
+    fn read(volume: &std::ffi::CStr, label: &str) -> io::Result<Self> {
         let mut space = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: volume is NUL-terminated and statfs initializes the output on success.
         if unsafe { libc::statfs(volume.as_ptr(), space.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("inspect {label} at {}: {error}", volume.to_string_lossy()),
+            ));
         }
         // SAFETY: the successful statfs call initialized every field read below.
         let space = unsafe { space.assume_init() };
@@ -1049,6 +1089,10 @@ mod tests {
             )])
         }
 
+        fn backing_store(&self) -> &Path {
+            &self.root
+        }
+
         fn stage(&self, hashes: &[&str]) -> Staged {
             stage_rebase(
                 &self.from,
@@ -1056,11 +1100,12 @@ mod tests {
                 &self.into,
                 &self.state,
                 &Self::selections(hashes),
+                self.backing_store(),
             )
         }
 
         fn limited(&self, hashes: &[&str], adjust: impl FnOnce(&mut Budget)) -> Staged {
-            let mut budget = Budget::new(&self.into, hashes.len()).unwrap();
+            let mut budget = Budget::new(&self.into, self.backing_store(), hashes.len()).unwrap();
             adjust(&mut budget);
             stage_with(
                 &self.from,
@@ -1241,7 +1286,7 @@ mod tests {
     fn rebase_free_space_reserve_stops_before_writing_an_entry() {
         let fixture = Fixture::new();
         fixture.entry("1", 4, b"warm");
-        let staged = fixture.limited(&["1"], |budget| budget.reserve = u64::MAX);
+        let staged = fixture.limited(&["1"], |budget| budget.roots[0].reserve = u64::MAX);
         assert!(staged.databases[0].rows.is_empty());
         assert!(
             staged
@@ -1254,6 +1299,76 @@ mod tests {
         let carried = commit(staged, &fixture.into);
         assert_eq!(carried.entries, 0);
         assert!(fixture.carried_hashes().is_empty());
+    }
+
+    #[test]
+    fn rebase_backing_store_reserve_stops_even_when_the_image_has_free_space() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let staged = fixture.limited(&["1"], |budget| budget.roots[1].reserve = u64::MAX);
+        assert!(staged.databases[0].rows.is_empty());
+        assert!(staged.stopped.as_ref().unwrap().contains("backing store"));
+        assert!(!fixture.into.join(STAGING).join("0/1").exists());
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(fixture.carried_hashes().is_empty());
+    }
+
+    #[test]
+    fn rebase_backing_store_statfs_failure_never_falls_back_to_image_space() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let store = fixture.root.join("store");
+        fs::create_dir(&store).unwrap();
+        let budget = Budget::new(&fixture.into, &store, 1).unwrap();
+        fs::remove_dir(&store).unwrap();
+        let staged = stage_with(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            Some(&Fixture::selections(&["1"])),
+            Staged {
+                budget: Some(budget),
+                ..Staged::default()
+            },
+        );
+        assert!(staged.databases[0].rows.is_empty());
+        assert!(
+            staged
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("inspect backing store")
+        );
+        assert!(!fixture.into.join(STAGING).join("0/1").exists());
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(fixture.carried_hashes().is_empty());
+    }
+
+    #[test]
+    fn rebase_missing_backing_store_stops_before_any_entry_is_staged() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let staged = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &Fixture::selections(&["1"]),
+            &fixture.root.join("missing-store"),
+        );
+        assert!(staged.databases.is_empty());
+        assert!(
+            staged
+                .stopped
+                .as_ref()
+                .unwrap()
+                .contains("inspect backing store")
+        );
+        assert!(!fixture.into.join(STAGING).exists());
+        assert!(!fixture.into.join("nx/cache/1").exists());
     }
 
     #[test]
@@ -1310,6 +1425,7 @@ mod tests {
             &fixture.into,
             &fixture.state,
             &BTreeMap::new(),
+            fixture.backing_store(),
         );
         assert!(missing.databases.is_empty());
         assert!(
@@ -1353,6 +1469,7 @@ mod tests {
             &fixture.into,
             &fixture.state,
             &selections,
+            fixture.backing_store(),
         );
         let carried = commit(staged, &fixture.into);
         assert_eq!(carried.entries, 2);
@@ -1363,6 +1480,54 @@ mod tests {
             b"nest"
         );
         assert!(!fixture.into.join("nx/cache/2").exists());
+    }
+
+    #[test]
+    fn selected_hashes_probe_the_source_index_without_scanning_historical_rows() {
+        let fixture = Fixture::new();
+        let source = Connection::open(&fixture.from.join("nx/workspace-data/task.db")).unwrap();
+        source
+            .execute(
+                "WITH RECURSIVE hashes(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM hashes WHERE n < 10000) \
+                 INSERT INTO task_details SELECT CAST(n AS TEXT), 'a', 'build', NULL FROM hashes",
+                &[],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO cache_outputs (hash, code, size) SELECT hash, 0, 1024 FROM task_details",
+                &[],
+            )
+            .unwrap();
+        source.execute("ANALYZE", &[]).unwrap();
+        drop(source);
+        let connection = attached(
+            &fixture.into.join("nx/workspace-data/task.db"),
+            &fixture.from.join("nx/workspace-data/task.db"),
+        )
+        .unwrap();
+        let selected = BTreeSet::from(["1".to_owned()]);
+        assert_eq!(
+            rows(&connection, Selection::Only(&selected)).unwrap().len(),
+            1
+        );
+        let mut explain = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SELECTED}"))
+            .unwrap();
+        let mut plan = Vec::new();
+        while explain.step().unwrap() {
+            plan.push(explain.text(3));
+        }
+        assert!(
+            plan.iter().any(|detail| {
+                detail.starts_with("SEARCH p USING ") && detail.contains("(hash=?)")
+            }),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.starts_with("SCAN p")),
+            "{plan:?}"
+        );
     }
 
     #[test]

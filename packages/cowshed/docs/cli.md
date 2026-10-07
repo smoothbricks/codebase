@@ -949,11 +949,14 @@ naming the conflicted paths.
 
 After a rebase that did not conflict, stock Nx computes hashes at the rebased tree. The workspace's build volume takes
 only missing target cache entries with those current hashes, not the target's historical cache. Hash selection is
-independent for each Nx root; a failed computation carries nothing and names the root and reason. A shared row and byte
-budget caps the carry and reserves free volume space. A bound or failed copy reports `carried.stopped`, keeps completed
-entries and removes the partial entry; the rebase stands. The new head prints on stdout and what was carried on stderr;
-`--json` gives `RebaseReport { oid, buildVolume }`. The carry stops the idle Nx daemon of each side, which restarts on
-its next client. A side whose task database another process holds carries nothing and names that process.
+independent for each Nx root, covering cacheable non-continuous tasks with default and declared configurations, without
+guessing CLI overrides. A failed computation carries nothing and reports `{kind:"taskHashes", state, reason}` as the
+skip reason. A shared row and byte budget caps the carry and reserves free space in both the image and its backing
+store. Neither a failed store-space query nor a failed hash probe falls back to an unbounded copy. A bound or failed
+copy reports `carried.stopped`, keeps completed entries and removes the partial entry; the rebase stands. The new head
+prints on stdout and what was carried on stderr; `--json` gives `RebaseReport { oid, buildVolume }`. The carry stops the
+idle Nx daemon of each side, which restarts on its next client. A side whose task database another process holds carries
+nothing and names that process.
 
 ### `cowshed land <name> [--into <lane>] [--check <cmd>]`
 
