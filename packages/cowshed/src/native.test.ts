@@ -33,12 +33,18 @@ function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
 
 const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
 
+/** What the scripted job wrote to stdout; `job.logs` and `job.tail` serve it. */
+const scriptedStdout = 'prefix\nrest\n';
+
 /** What a client run against `scriptedController` printed, and what its controller heard. */
 interface ScriptedRun {
   exitCode: number;
   stdout: string;
   stderr: string;
-  /** The frames of every `job.progress` call, in arrival order, and any `job.kill`. */
+  /**
+   * The frames of every `job.progress` call, the offset of every `job.logs` read and the cursor of
+   * every `job.tail` read, in arrival order, and any `job.kill`.
+   */
   heard: string[];
 }
 
@@ -50,12 +56,15 @@ interface ScriptedRun {
  * `job.progress` call answers. `job.wait` answers once the job is released; `job.status` once no
  * progress call is open. Each progress demand is answered with one frame: a running sample while
  * the job is held, then the terminal sample the sealed job reports, then the call's end; a close
- * ends the call at once. The controller prints what it heard as its last stdout line.
+ * ends the call at once. `job.logs` answers the scripted stdout from the requested offset as a
+ * download frame; `job.tail` the bounded slice after the cursor, or the latest bounded tail when
+ * the request names none. The controller prints what it heard as its last stdout line.
  */
 async function scriptedController(client: string): Promise<ScriptedRun> {
   const controller = `
     import { spawn } from 'node:child_process';
     const incarnation = '0198f2c0b7e34dc795f17b238b331c80';
+    const stdout = Buffer.from(${JSON.stringify(scriptedStdout)});
     const emptyStream = {
       storage: { kind: 'captured', artifact: { kind: 'inline', data: { encoding: 'utf8', data: '' } } },
       bytes: 0,
@@ -121,12 +130,12 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
       stdio: ['ignore', 'inherit', 'inherit', 'pipe'],
     });
     const socket = node.stdio[3];
-    const send = (value) => {
-      const body = Buffer.from(JSON.stringify(value));
+    const framed = (body) => {
       const head = Buffer.alloc(4);
       head.writeUInt32BE(body.length);
-      socket.write(Buffer.concat([head, body]));
+      return Buffer.concat([head, body]);
     };
+    const send = (value) => socket.write(framed(Buffer.from(JSON.stringify(value))));
     const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
     const heard = [];
     let released = false;
@@ -196,6 +205,26 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
         waits.push(message.id);
       } else if (message.method === 'job.wait') {
         answer(message.id, job(true));
+      } else if (message.method === 'job.logs' && message.params.stream === 'stdout') {
+        const { offset } = message.params;
+        heard.push('logs from ' + offset);
+        const bytes = stdout.subarray(offset);
+        const result = { eof: true, nextOffset: offset + bytes.length };
+        send({ id: message.id, ok: true, result, error: null, binaryLength: bytes.length });
+        socket.write(framed(bytes));
+      } else if (message.method === 'job.tail') {
+        const { limits } = message.params;
+        const latest = !('cursor' in message.params);
+        heard.push(latest ? 'tail latest' : 'tail after ' + JSON.stringify(message.params.cursor));
+        const start = latest ? Math.max(0, stdout.length - limits.bytesPerStream) : message.params.cursor.stdout;
+        const end = latest ? stdout.length : Math.min(stdout.length, start + limits.bytesPerStream);
+        answer(message.id, {
+          stdout: { encoding: 'utf8', data: stdout.subarray(start, end).toString() },
+          stderr: { encoding: 'utf8', data: '' },
+          next: { stdout: end, stderr: 0 },
+          stdoutTruncated: latest ? start > 0 : end < stdout.length,
+          stderrTruncated: false,
+        });
       } else {
         if (message.method === 'job.kill') heard.push('job.kill');
         const error = { code: 'internal', message: 'unscripted ' + message.method, hint: 'script it' };
@@ -627,6 +656,42 @@ describe('Cowshed Node-API bindings', () => {
       stdout: JSON.stringify({ returned: true, next: true, state: 'running' }),
       stderr: '',
       heard: ['open every 999', 'next', 'close'],
+    });
+  }, 30_000);
+
+  /**
+   * A reader that already holds a stream's first bytes continues from there, never from zero; a
+   * tail without a cursor sends none, never `null`, and reads the latest bounded tail, and one
+   * with a cursor reads what follows it.
+   */
+  it('reads job logs from an offset and tails after a cursor', async () => {
+    const offset = scriptedStdout.indexOf('rest');
+    const client = `
+      import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker('main');
+      const job = await worker.exec({ argv: ['build'] });
+      const chunk = await job.logs({ stream: 'stdout', offset: ${offset}, follow: false });
+      const latest = await job.tail(undefined, { bytesPerStream: 5, linesPerStream: 10 });
+      const after = await job.tail({ stdout: ${offset}, stderr: 0 }, { bytesPerStream: 64, linesPerStream: 10 });
+      const slice = (tail) => ({ stdout: tail.stdout.data, next: tail.next.stdout, truncated: tail.stdoutTruncated });
+      console.log(JSON.stringify({
+        logs: { text: Buffer.from(chunk.bytes).toString(), nextOffset: chunk.nextOffset, eof: chunk.eof },
+        latest: slice(latest),
+        after: slice(after),
+      }));
+      process.exit(0);
+    `;
+    const end = scriptedStdout.length;
+    expect(await scriptedController(client)).toEqual({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        logs: { text: 'rest\n', nextOffset: end, eof: true },
+        latest: { stdout: 'rest\n', next: end, truncated: true },
+        after: { stdout: 'rest\n', next: end, truncated: false },
+      }),
+      stderr: '',
+      heard: [`logs from ${offset}`, 'tail latest', `tail after {"stdout":${offset},"stderr":0}`],
     });
   }, 30_000);
 });
