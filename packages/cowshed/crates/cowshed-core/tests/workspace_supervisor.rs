@@ -3271,9 +3271,10 @@ fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
 }
 
 /// A group this test owns whose one process is its leader, held unreaped until [`end_group`].
+/// Resolve `sleep` through the toolchain PATH; NixOS has no `/bin/sleep`.
 fn lone_group() -> std::process::Child {
     use std::os::unix::process::CommandExt as _;
-    std::process::Command::new("/bin/sleep")
+    std::process::Command::new("sleep")
         .arg("300")
         .stdin(std::process::Stdio::null())
         .process_group(0)
