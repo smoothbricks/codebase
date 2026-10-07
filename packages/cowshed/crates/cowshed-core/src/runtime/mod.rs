@@ -3,6 +3,7 @@ pub(crate) mod build_volumes;
 pub mod commitment_feed;
 pub mod job_groups;
 pub(crate) mod nx_daemon;
+pub mod process_tree;
 pub mod project;
 pub mod shell_host;
 mod shell_job;

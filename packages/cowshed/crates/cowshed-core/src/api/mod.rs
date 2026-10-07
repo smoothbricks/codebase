@@ -3,6 +3,7 @@ pub mod dto;
 pub(crate) mod frame;
 pub mod operations;
 pub(crate) mod peer_credentials;
+pub mod process;
 pub mod server;
 
 pub use capability::{
@@ -11,3 +12,4 @@ pub use capability::{
 };
 pub use dto::*;
 pub use operations::JobStream;
+pub use process::*;

@@ -682,6 +682,45 @@ export type JobInfoRef = {
   | { readonly script: ScriptCommand; readonly argv?: never }
 );
 
+/**
+ * One life of one process: the image it runs now (or ran last), its parent, and how it ended.
+ */
+export type JobProcessSample = {
+  readonly pid: number & tags.Type<'uint32'>;
+  /**
+   * The parent's pid when this process was born: within the tree, the retained parent record;
+   * for a root, the process outside the job that started it.
+   */
+  readonly ppid: number & tags.Type<'uint32'>;
+  /**
+   * The executable of the last observed exec; a child that has not exec'd runs its parent's.
+   */
+  readonly program: string;
+  /**
+   * The byte-exact argv of that exec.
+   */
+  readonly argv: ReadonlyArray<CommandArg>;
+  readonly bornAt: UtcTimestamp;
+  /**
+   * Absent until the exit is observed.
+   */
+  readonly exit?: ProcessExit;
+};
+
+/**
+ * Every process a job owned that its observer saw, the exited ones included, and whether the
+ * observer saw all of them.
+ */
+export type JobProcessTree = {
+  readonly jobId: JobId;
+  readonly sampledAt: UtcTimestamp;
+  /**
+   * In the order their births were observed.
+   */
+  readonly processes: ReadonlyArray<JobProcessSample>;
+  readonly coverage: ProcessCoverage;
+};
+
 export type JobRequest = {
   readonly repoId: RepoId;
   readonly workspace: WorkspaceName;
@@ -905,6 +944,36 @@ export type OutputSummary = {
 export type PortBlock = {
   readonly base: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly size: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+};
+
+/**
+ * Whether the tree holds every process the job owned. A gap is absorbing: once an observation
+ * was missed, no later one makes the tree complete again.
+ */
+export type ProcessCoverage =
+  | { readonly kind: 'complete' }
+  | ({ readonly kind: 'gap' } & {
+      readonly reason: ProcessCoverageGap;
+    });
+
+/**
+ * The first observation the tree is known to lack.
+ */
+export type ProcessCoverageGap =
+  | { readonly kind: 'eventsLost' }
+  | ({ readonly kind: 'unobservedBirth' } & {
+      readonly pid: number & tags.Type<'uint32'>;
+    })
+  | ({ readonly kind: 'unobservedExit' } & {
+      readonly pid: number & tags.Type<'uint32'>;
+    });
+
+/**
+ * How and when a process ended: the two are observed together, so neither exists alone.
+ */
+export type ProcessExit = {
+  readonly status: ExitStatus;
+  readonly exitedAt: UtcTimestamp;
 };
 
 /**
