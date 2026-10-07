@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::api::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
 use crate::api::process::{
-    JobProcessSample, JobProcessTree, ProcessCoverage, ProcessCoverageGap, ProcessExit,
+    JobProcessSample, JobProcessTree, ProcessBlockedOn, ProcessCoverage, ProcessCoverageGap,
+    ProcessExit, ProcessUsage,
 };
 
 /// A value the kernel never gives two lives of the same pid: macOS's `p_uniqueid`
@@ -103,16 +104,29 @@ struct Life {
 }
 
 impl Life {
-    fn sample(&self) -> JobProcessSample {
+    fn sample(
+        &self,
+        usage: Option<ProcessUsage>,
+        blocked_on: Option<ProcessBlockedOn>,
+    ) -> JobProcessSample {
         JobProcessSample {
             pid: self.identity.pid,
             ppid: self.ppid,
             program: self.image.program.clone(),
             argv: self.image.argv.clone(),
             born_at: self.born_at.clone(),
+            usage,
+            blocked_on,
             exit: self.exit.clone(),
         }
     }
+}
+
+/// What the tree does not observe itself about one life: its usage and its blocker, as the
+/// sampler last read them.
+pub trait LifeReadings {
+    fn usage(&self, process: ProcessIdentity) -> Option<ProcessUsage>;
+    fn blocked_on(&self, process: ProcessIdentity) -> Option<ProcessBlockedOn>;
 }
 
 #[derive(Debug)]
@@ -213,6 +227,22 @@ impl ProcessTreeFold {
             .map(|&index| &*self.lives[index].image)
     }
 
+    /// `process`'s position in birth-observation order: the index of its record in
+    /// [`JobProcessTree::processes`].
+    pub fn index(&self, process: ProcessIdentity) -> Option<usize> {
+        self.by_identity.get(&process).copied()
+    }
+
+    /// The record of the life at `index`, an index this fold answered, with what `readings`
+    /// holds for it.
+    pub fn sample(&self, index: usize, readings: &impl LifeReadings) -> JobProcessSample {
+        let life = &self.lives[index];
+        life.sample(
+            readings.usage(life.identity),
+            readings.blocked_on(life.identity),
+        )
+    }
+
     /// Whether `process` is a life the fold retains, running or exited.
     pub fn holds(&self, process: ProcessIdentity) -> bool {
         self.by_identity.contains_key(&process)
@@ -230,11 +260,25 @@ impl ProcessTreeFold {
             .map(|&index| self.lives[index].identity)
     }
 
-    pub fn tree(&self, job_id: JobId, sampled_at: UtcTimestamp) -> JobProcessTree {
+    pub fn tree(
+        &self,
+        job_id: JobId,
+        sampled_at: UtcTimestamp,
+        readings: &impl LifeReadings,
+    ) -> JobProcessTree {
         JobProcessTree {
             job_id,
             sampled_at,
-            processes: self.lives.iter().map(Life::sample).collect(),
+            processes: self
+                .lives
+                .iter()
+                .map(|life| {
+                    life.sample(
+                        readings.usage(life.identity),
+                        readings.blocked_on(life.identity),
+                    )
+                })
+                .collect(),
             coverage: self.coverage.clone(),
         }
     }
@@ -355,6 +399,23 @@ mod tests {
         JobId::new(7).unwrap()
     }
 
+    /// A sampler that has read nothing.
+    struct Unread;
+
+    impl LifeReadings for Unread {
+        fn usage(&self, _: ProcessIdentity) -> Option<ProcessUsage> {
+            None
+        }
+
+        fn blocked_on(&self, _: ProcessIdentity) -> Option<ProcessBlockedOn> {
+            None
+        }
+    }
+
+    fn tree(fold: &ProcessTreeFold, second: u32) -> JobProcessTree {
+        fold.tree(job(), at(second), &Unread)
+    }
+
     #[test]
     fn retains_exited_lives_with_parentage_and_byte_exact_argv() {
         let mut fold = ProcessTreeFold::default();
@@ -377,7 +438,7 @@ mod tests {
         assert_eq!(nodes[0].exit, None);
         assert_eq!(nodes[1].parent, Some(shell));
 
-        let tree = fold.tree(job(), at(3));
+        let tree = tree(&fold, 3);
         assert_eq!(tree.coverage, ProcessCoverage::Complete);
         let child = &tree.processes[1];
         assert_eq!((child.pid, child.ppid), (101, 100));
@@ -408,7 +469,7 @@ mod tests {
         let subshell = id(102, 3);
         root(&mut fold, shell);
         fork(&mut fold, subshell, shell, 1);
-        let tree = fold.tree(job(), at(2));
+        let tree = tree(&fold, 2);
         assert_eq!(tree.processes[1].program, "/bin/sh");
         assert_eq!(tree.processes[1].argv, tree.processes[0].argv);
         fold.apply(ProcessObservation::Exec {
@@ -417,7 +478,7 @@ mod tests {
         })
         .unwrap();
         fork(&mut fold, id(103, 4), shell, 2);
-        let tree = fold.tree(job(), at(3));
+        let tree = self::tree(&fold, 3);
         assert_eq!(tree.processes[1].program, "/usr/bin/make");
         // The child's exec leaves the image it shared with its parent, which the parent's next
         // child shares in turn.
@@ -453,7 +514,7 @@ mod tests {
         );
         exit(&mut fold, second, 7, 4);
 
-        let tree = fold.tree(job(), at(5));
+        let tree = tree(&fold, 5);
         assert_eq!(tree.coverage, ProcessCoverage::Complete);
         let lives: Vec<_> = tree.processes.iter().filter(|p| p.pid == 200).collect();
         assert_eq!(lives.len(), 2);
@@ -485,7 +546,7 @@ mod tests {
         fork(&mut fold, id(101, 2), shell, 1);
         exit(&mut fold, id(101, 2), 0, 2);
         assert_eq!(
-            fold.tree(job(), at(3)).coverage,
+            tree(&fold, 3).coverage,
             ProcessCoverage::Gap {
                 reason: ProcessCoverageGap::EventsLost
             }
@@ -499,7 +560,7 @@ mod tests {
         root(&mut fold, shell);
         exit(&mut fold, id(150, 9), 0, 1);
         fork(&mut fold, id(151, 10), id(150, 9), 1);
-        let tree = fold.tree(job(), at(2));
+        let tree = tree(&fold, 2);
         assert_eq!(tree.processes.len(), 1);
         assert_eq!(
             tree.coverage,
@@ -516,7 +577,7 @@ mod tests {
         root(&mut fold, shell);
         fork(&mut fold, id(300, 20), shell, 1);
         fork(&mut fold, id(300, 21), shell, 2);
-        let tree = fold.tree(job(), at(3));
+        let tree = tree(&fold, 3);
         assert_eq!(tree.processes.len(), 3);
         assert_eq!(tree.processes[1].exit, None);
         assert_eq!(
@@ -543,7 +604,7 @@ mod tests {
         exit(&mut fold, second, 4, 4);
         assert_eq!(fold.live(300), None);
 
-        let tree = fold.tree(job(), at(5));
+        let tree = tree(&fold, 5);
         assert_eq!(tree.processes[1].exit.as_ref().unwrap().exited_at, at(3));
         assert_eq!(
             tree.processes[2].exit.as_ref().unwrap().status,
@@ -604,7 +665,7 @@ mod tests {
             ProcessCoverageGap::UnobservedBirth { pid: 5 },
         ))
         .unwrap();
-        let tree = fold.tree(job(), at(3));
+        let tree = tree(&fold, 3);
         let json = serde_json::to_value(&tree).unwrap();
         assert_eq!(
             json,

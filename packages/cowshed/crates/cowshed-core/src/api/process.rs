@@ -6,6 +6,8 @@
 //! describes was decided when it was folded, by the kernel birth identity the observer retained
 //! (`runtime::process_tree`); a reused pid is a second record, never the first one updated.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
@@ -36,9 +38,142 @@ pub struct JobProcessSample {
     /// The byte-exact argv of that exec.
     pub argv: Vec<CommandArg>,
     pub born_at: UtcTimestamp,
+    /// Absent until its counters are first read; never zeroes in their place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProcessUsage>,
+    /// What it was last observed waiting on; absent while no blocker was observed, never a
+    /// fabricated [`ProcessBlockedOn::None`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<ProcessBlockedOn>,
     /// Absent until the exit is observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ProcessExit>,
+}
+
+/// What a process was observed waiting on. A lock's detail exists only on a lock, so no other
+/// blocker can carry a stale path or holder.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProcessBlockedOn {
+    /// Observed waiting on nothing: running or runnable.
+    None,
+    /// Waiting for a file lock on `path`, held by `holder` when kernel evidence names it.
+    Lock {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<LockHolder>,
+    },
+    Socket,
+    Pipe,
+    Child,
+    Stdin,
+    Disk,
+}
+
+/// The process holding a lock another one waits for.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LockHolder {
+    pub pid: u32,
+    /// The cowshed job that owns the holder, when one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobId>,
+}
+
+/// How long a live process goes without a record restating its usage before a heartbeat
+/// restates it: one minute per process, whatever the sampling or subscriber interval.
+pub const PROCESS_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// One change to a job's process tree, in the order the supervisor folded it. `index` is the
+/// process's position in [`JobProcessTree::processes`]: the order births were observed, which
+/// never changes, so it names one life where a pid could name two.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobProcessEvent {
+    Born {
+        index: u32,
+        process: JobProcessSample,
+    },
+    Exec {
+        index: u32,
+        process: JobProcessSample,
+    },
+    /// A blocker transition, a busy/idle flip, a resident-memory crossing of a power of two, or
+    /// a first usage read; an ordinary sample with none of these is not a change.
+    Changed(JobProcessDelta),
+    /// The whole record of one live process that went [`PROCESS_HEARTBEAT`] without a record
+    /// restating its usage.
+    Heartbeat {
+        index: u32,
+        process: JobProcessSample,
+    },
+    /// The exit, with the usage as last read: final when read after the exit, otherwise the
+    /// tree's coverage says so ([`ProcessCoverageGap::UnreadFinalUsage`]). Nothing follows it
+    /// for this process.
+    Exited {
+        index: u32,
+        process: JobProcessSample,
+    },
+}
+
+/// The one field of one process that changed; every other field is unchanged. A usage read and
+/// a blocker read are separate observations, so a change names exactly one of them, and a
+/// change of nothing can be neither built nor decoded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum JobProcessDelta {
+    Usage {
+        index: u32,
+        /// Usage only ever becomes known or moves on; it is never cleared.
+        usage: ProcessUsage,
+    },
+    Blocker {
+        index: u32,
+        blocked_on: BlockerChange,
+    },
+}
+
+/// A changed [`JobProcessSample::blocked_on`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum BlockerChange {
+    /// A blocker, `none` included, was observed and differs from the last one.
+    Set(ProcessBlockedOn),
+    /// No blocker is observed any longer: the field becomes absent.
+    Clear,
+}
+
+impl JobProcessDelta {
+    pub fn index(&self) -> u32 {
+        match self {
+            Self::Usage { index, .. } | Self::Blocker { index, .. } => *index,
+        }
+    }
+
+    /// Apply this change to the process it names.
+    pub fn apply(&self, process: &mut JobProcessSample) {
+        match self {
+            Self::Usage { usage, .. } => process.usage = Some(*usage),
+            Self::Blocker {
+                blocked_on: BlockerChange::Set(blocked_on),
+                ..
+            } => process.blocked_on = Some(blocked_on.clone()),
+            Self::Blocker {
+                blocked_on: BlockerChange::Clear,
+                ..
+            } => process.blocked_on = None,
+        }
+    }
 }
 
 /// How and when a process ended: the two are observed together, so neither exists alone.
