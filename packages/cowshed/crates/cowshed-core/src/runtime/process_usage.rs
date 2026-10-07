@@ -1540,6 +1540,8 @@ mod tests {
     #[test]
     fn each_process_counts_the_storage_io_it_did_itself() {
         const MIB: u64 = 1 << 20;
+        #[cfg(target_os = "linux")]
+        probe_direct_io_accounting();
         // Beside this test binary: on the build's own storage, never a memory-backed /tmp.
         let directory = std::env::current_exe()
             .expect("test binary")
@@ -1584,5 +1586,142 @@ mod tests {
         for file in [first, second] {
             std::fs::remove_file(file).expect("remove the fixture file");
         }
+    }
+
+    /// PROBE ONLY (never lands): where a Linux CI filesystem's `/proc/<tid>/io` counts O_DIRECT
+    /// writes and reads, chunk by chunk, and what the directory's filesystem is.
+    #[cfg(target_os = "linux")]
+    fn probe_direct_io_accounting() {
+        use std::fmt::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        fn io() -> (u64, u64) {
+            let text = std::fs::read_to_string("/proc/thread-self/io").expect("io");
+            let field = |name: &str| -> u64 {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .expect(name)
+                    .trim()
+                    .parse()
+                    .expect("count")
+            };
+            (field("read_bytes:"), field("write_bytes:"))
+        }
+        let mut log = String::new();
+        let directory = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("dir")
+            .to_path_buf();
+        for dir in [directory, std::env::temp_dir()] {
+            let name = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).expect("c");
+            // SAFETY: zeroed statfs is a valid out value.
+            let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: valid path and out pointer.
+            let rc = unsafe { libc::statfs(name.as_ptr(), &mut fs) };
+            writeln!(
+                log,
+                "dir {} statfs rc {rc} f_type {:#x} f_bsize {} f_frsize {}",
+                dir.display(),
+                fs.f_type,
+                fs.f_bsize,
+                fs.f_frsize
+            )
+            .unwrap();
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+            for line in mounts.lines().filter(|line| {
+                line.split(' ')
+                    .nth(4)
+                    .is_some_and(|mount| dir.starts_with(mount) && mount.len() > 1)
+            }) {
+                writeln!(log, "  mount {line}").unwrap();
+            }
+            let path = dir.join(format!("probe-io-{}", std::process::id()));
+            let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("c");
+            const CHUNK: usize = 1 << 20;
+            // SAFETY: fresh anonymous mapping.
+            let buffer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    CHUNK,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(buffer, libc::MAP_FAILED);
+            // SAFETY: whole mapping.
+            unsafe { std::ptr::write_bytes(buffer.cast::<u8>(), 0x5a, CHUNK) };
+            let open = |flags: libc::c_int| -> Option<OwnedFd> {
+                // SAFETY: valid path.
+                let fd = unsafe {
+                    libc::open(
+                        cpath.as_ptr(),
+                        flags | libc::O_DIRECT | libc::O_CLOEXEC,
+                        0o600,
+                    )
+                };
+                // SAFETY: fresh descriptor.
+                (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+            };
+            let Some(file) = open(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) else {
+                writeln!(log, "  open: {}", std::io::Error::last_os_error()).unwrap();
+                continue;
+            };
+            for chunk in 0..8 {
+                let before = io();
+                // SAFETY: CHUNK readable bytes.
+                let n = unsafe { libc::write(file.as_raw_fd(), buffer, CHUNK) };
+                let after = io();
+                // SAFETY: zeroed stat.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: live fd.
+                unsafe { libc::fstat(file.as_raw_fd(), &mut st) };
+                writeln!(
+                    log,
+                    "  write {chunk} -> {n}: read +{} write +{} st_blksize {} st_blocks {}",
+                    after.0 - before.0,
+                    after.1 - before.1,
+                    st.st_blksize,
+                    st.st_blocks
+                )
+                .unwrap();
+            }
+            let before = io();
+            // SAFETY: live fd.
+            let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+            let after = io();
+            writeln!(
+                log,
+                "  fsync {rc}: read +{} write +{}",
+                after.0 - before.0,
+                after.1 - before.1
+            )
+            .unwrap();
+            drop(file);
+            let read_pass = |log: &mut String, label: &str, size: usize, count: usize| {
+                let file = open(libc::O_RDONLY).expect("reopen");
+                let mut deltas = Vec::new();
+                for _ in 0..count {
+                    let before = io();
+                    // SAFETY: size <= CHUNK writable bytes.
+                    let n = unsafe { libc::read(file.as_raw_fd(), buffer, size) };
+                    let after = io();
+                    deltas.push((n, after.0 - before.0, after.1 - before.1));
+                }
+                writeln!(log, "  {label} (n, read+, write+): {deltas:?}").unwrap();
+            };
+            read_pass(&mut log, "read 1MiB x8", CHUNK, 8);
+            read_pass(&mut log, "reread 1MiB x8", CHUNK, 8);
+            read_pass(&mut log, "read 4KiB x40", 4096, 40);
+            // SAFETY: plain call.
+            unsafe { libc::sync() };
+            read_pass(&mut log, "after sync 1MiB x8", CHUNK, 8);
+            // SAFETY: whole mapping.
+            unsafe { libc::munmap(buffer, CHUNK) };
+            let _ = std::fs::remove_file(&path);
+        }
+        panic!("PROBE OUTPUT\n{log}");
     }
 }
