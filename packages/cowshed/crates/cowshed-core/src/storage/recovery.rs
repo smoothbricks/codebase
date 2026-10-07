@@ -15,6 +15,8 @@ use crate::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
+/// Same-parent, hidden mountpoint names retaining root-owned system debris; never workspaces.
+pub const ROOT_HELD_MOUNT_PREFIX: &str = ".root-held-";
 pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";
 const LIFECYCLE_INTENT_VERSION: u32 = 1;
 /// Suffix of the per-workspace lease file beside a project's session images.

@@ -385,6 +385,18 @@ impl RealFixture {
     }
 }
 
+fn unmount(mount: &Path) {
+    let unmounted = SystemCommandRunner
+        .run(&CommandRequest::new("/sbin/umount", [mount]))
+        .expect("umount");
+    assert!(
+        unmounted.succeeded(),
+        "umount {}: {}",
+        mount.display(),
+        String::from_utf8_lossy(&unmounted.stderr)
+    );
+}
+
 /// What the kernel mounts at `mount_point` right now, if anything.
 fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
     SystemKernelMountSource
@@ -4557,17 +4569,6 @@ fn real_apfs_mount_opts_volumes_out_of_the_event_log_and_retires_an_inherited_on
             "{label}: the opt-out marker is an empty regular file: {marker:?}"
         );
     };
-    let unmount = |mount: &Path| {
-        let unmounted = SystemCommandRunner
-            .run(&CommandRequest::new("/sbin/umount", [mount]))
-            .expect("umount");
-        assert!(
-            unmounted.succeeded(),
-            "umount {}: {}",
-            mount.display(),
-            String::from_utf8_lossy(&unmounted.stderr)
-        );
-    };
     let assert_canonical_flags = |mount: &Path, label: &str| {
         let path = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).expect("C path");
         // SAFETY: `path` is NUL-terminated and `statfs` writes only the zeroed buffer.
@@ -4647,6 +4648,195 @@ fn real_apfs_mount_opts_volumes_out_of_the_event_log_and_retires_an_inherited_on
         unmount(&logged);
         mounts.wait_for(&logged, Unmounted);
     }
+}
+
+/// Real root-owned event-log debris, without sudo or an unmount-write race: move the kernel's
+/// log within one image while ownership is ignored, then honor ownership again. Its containing
+/// directory is an ordinary bare mountpoint on that filesystem, not a mounted volume.
+#[test]
+fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
+    use fsevents::Transition::{Mounted, Unmounted};
+
+    const INCARNATION: &str = "00000000000000000000000000000003";
+    let fixture = RealFixture::new("root-held-event-debris");
+    let backing_image = fixture.root().join("bare-host.asif");
+    let backing = fixture.root().join("bare-host");
+    fixture.blank_image(&backing_image);
+    let mut mounts = fsevents::Watch::start(fixture.root());
+    let attachment = fixture.mount_left_behind(&backing_image, &backing, "owners");
+    mounts.wait_for(&backing, Mounted);
+    drop(fsevents::Watch::start(&backing));
+    assert!(
+        fsevents::keeps_event_log(&backing),
+        "the kernel created its log"
+    );
+    unmount(&backing);
+    mounts.wait_for(&backing, Unmounted);
+    fixture.remount(&attachment, &backing, "nobrowse,noowners");
+    mounts.wait_for(&backing, Mounted);
+
+    let mount_root = backing.join("mnt");
+    let change =
+        cowshed_core::storage::host_config::plan_mount_root_change(fixture.root(), &mount_root, [])
+            .expect("plan fixture mount root");
+    cowshed_core::storage::host_config::execute_mount_root_change(&change)
+        .expect("place fixture mount root on the backing filesystem");
+    let layout = fixture.layout();
+    let name = WorkspaceName::session("retired").expect("workspace");
+    let bare = layout.workspace_mount(&name).expect("bare mountpoint");
+    std::fs::create_dir_all(&bare).expect("user-owned bare mountpoint");
+    std::fs::rename(backing.join(".fseventsd"), bare.join(".fseventsd"))
+        .expect("retain the kernel's ownership within the same filesystem");
+    // No logger flush may leave privileged debris on the real host during fixture teardown.
+    std::fs::create_dir(backing.join(".fseventsd")).expect("user event-log directory");
+    std::fs::write(backing.join(".fseventsd/no_log"), b"").expect("opt fixture volume out");
+    unmount(&backing);
+    mounts.wait_for(&backing, Unmounted);
+    fixture.remount(&attachment, &backing, "nobrowse,owners");
+    mounts.wait_for(&backing, Mounted);
+    assert!(!fsevents::keeps_event_log(&backing));
+    let log = std::fs::symlink_metadata(bare.join(".fseventsd")).expect("root-owned log");
+    assert_eq!((log.uid(), log.mode() & 0o777), (0, 0o700));
+    assert_eq!(
+        std::fs::read_dir(bare.join(".fseventsd"))
+            .expect_err("the log is unreadable without root")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        kernel_mount_at(&bare).is_none(),
+        "only its parent filesystem is mounted"
+    );
+
+    let canonical = layout.session_image(&name).expect("retired image");
+    fixture.published_image(canonical.image());
+    write_session_metadata(canonical.image(), "retired", INCARNATION);
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/retired-{INCARNATION}.asif"));
+    let host = fixture.host();
+    host.retire_image(canonical.image(), &trash)
+        .expect("retire image");
+    for other in [".late-data", "work.rs"] {
+        let work = bare.join(other);
+        std::fs::write(&work, b"unique late work").expect("late work");
+        let error = host
+            .preview_gc(&fixture.config(), &repo())
+            .expect_err("mixed entries are not root-held-only");
+        assert!(
+            error.to_string().contains("mixed with other entries"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&work).expect("preserved work"),
+            b"unique late work"
+        );
+        assert!(bare.exists(), "mixed debris is never renamed");
+        std::fs::remove_file(work).expect("remove this test's late work");
+    }
+    let foreign_image = fixture.root().join("foreign.asif");
+    fixture.blank_image(&foreign_image);
+    let foreign = host
+        .backend()
+        .attach_verified(&foreign_image)
+        .expect("foreign volume");
+    host.backend()
+        .mount(&foreign, &bare, MountAccess::ReadWrite, false)
+        .expect("mount foreign volume");
+    mounts.wait_for(&bare, Mounted);
+    let error = host
+        .preview_gc(&fixture.config(), &repo())
+        .expect_err("a mounted filesystem is never retained aside");
+    assert!(error.to_string().contains("mounted filesystem"), "{error}");
+    assert!(
+        kernel_mount_at(&bare).is_some(),
+        "the mounted volume was not detached or renamed"
+    );
+    unmount(&bare);
+    mounts.wait_for(&bare, Unmounted);
+    let plan = host
+        .preview_gc(&fixture.config(), &repo())
+        .expect("root-held event debris must not block a read-only GC preview");
+    assert!(bare.exists(), "preview must not rename the bare mountpoint");
+    assert_eq!(
+        plan.root_held_mountpoints(),
+        &[cowshed_core::storage::lifecycle::RootHeldMountpoint::Pending(bare.clone())]
+    );
+    host.backend()
+        .mount(&foreign, &bare, MountAccess::ReadWrite, false)
+        .expect("mount after preview");
+    mounts.wait_for(&bare, Mounted);
+    let error = host
+        .execute_gc(&fixture.config(), plan)
+        .expect_err("a mount after preview invalidates collection");
+    assert!(error.to_string().contains("mounted filesystem"), "{error}");
+    assert!(
+        trash.exists(),
+        "no image is reclaimed after the mount changed"
+    );
+    assert!(
+        kernel_mount_at(&bare).is_some(),
+        "no mounted filesystem is renamed"
+    );
+    unmount(&bare);
+    mounts.wait_for(&bare, Unmounted);
+    let plan = host
+        .preview_gc(&fixture.config(), &repo())
+        .expect("fresh unmounted plan");
+    let report = host
+        .execute_gc(&fixture.config(), plan)
+        .expect("collect retired image");
+    assert_eq!(report.reclaimed, 1);
+    assert!(report.deferred.is_empty(), "{report:?}");
+    assert!(
+        !trash.exists(),
+        "the unrelated retired image is still reclaimed"
+    );
+    assert!(
+        !bare.exists(),
+        "the name is free after its mountpoint is renamed aside"
+    );
+    let [cowshed_core::storage::lifecycle::RootHeldMountpoint::Retained(retained)] =
+        report.root_held_mountpoints.as_slice()
+    else {
+        panic!("one retained event-log mountpoint: {report:?}");
+    };
+    assert_eq!(
+        retained.parent(),
+        bare.parent(),
+        "the rename is within one held parent"
+    );
+    assert!(
+        retained
+            .file_name()
+            .unwrap()
+            .as_encoded_bytes()
+            .starts_with(b".root-held-")
+    );
+    let retained_log =
+        std::fs::symlink_metadata(retained.join(".fseventsd")).expect("retained root log");
+    assert_eq!(
+        (retained_log.uid(), retained_log.mode() & 0o777),
+        (0, 0o700)
+    );
+    assert_eq!(
+        retained_log.ino(),
+        log.ino(),
+        "the log was renamed with its parent, never copied"
+    );
+    let late = retained.join("later-work.rs");
+    std::fs::write(&late, b"preserve work added after retention")
+        .expect("late retained-parent writer");
+    let again =
+        execute_gc(&host, &fixture.config()).expect("idempotent retained-debris collection");
+    assert_eq!(again.reclaimed, 0);
+    assert!(again.deferred.is_empty(), "{again:?}");
+    assert_eq!(again.root_held_mountpoints, report.root_held_mountpoints);
+    assert_eq!(
+        std::fs::read(late).expect("retained late work"),
+        b"preserve work added after retention"
+    );
 }
 
 #[test]

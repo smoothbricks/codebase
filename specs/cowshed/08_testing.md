@@ -325,7 +325,9 @@ Covered flows:
   canonical-flag remount, 01_storage.md), stub `.envrc`;
 - lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
-- gc: trash drain, checkpoint pruning, orphan mountpoint removal;
+- gc: trash drain, checkpoint pruning, orphan mountpoint removal; real root-owned `0700` event-log debris on an
+  unmounted directory is retained by a no-replace, same-parent rename, never blocks image reclamation or healthy doctor
+  info, and mixed work, symlink substitutions, collisions and mounted filesystems remain protected;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
 - **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,

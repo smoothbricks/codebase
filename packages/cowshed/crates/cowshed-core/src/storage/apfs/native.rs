@@ -22,6 +22,7 @@ use crate::apfs::{
     MountAccess, RecoveredImageAttachment,
 };
 use crate::copy::copy_until_quiescent_blocking;
+use crate::fsio::AnchoredDirectory;
 use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, IMAGE_EXTENSION, ImageCapacity,
     MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
@@ -41,9 +42,9 @@ use super::super::bootstrap::is_reserved_store_namespace;
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
-    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate,
-    StorageGcDeferred, StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained,
-    SubstrateStats,
+    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, RootHeldMountpoint, StorageFact,
+    StorageGcCandidate, StorageGcDeferred, StorageGcPlan, StorageGcReason, StorageGcReport,
+    StorageGcRetained, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -1137,7 +1138,31 @@ struct RetiredCheckpointArtifacts {
 struct RetiredCleanupArtifacts {
     checkpoint_images: Vec<PathBuf>,
     paths: Vec<PathBuf>,
-    mount_point: Option<PathBuf>,
+    mount_point: Option<RetiredMountpoint>,
+}
+
+enum RetiredMountpoint {
+    Empty(PathBuf),
+    RootHeld(RootHeldDirectory),
+}
+
+struct RootHeldDirectory {
+    path: PathBuf,
+    parent: AnchoredDirectory,
+    directory: AnchoredDirectory,
+    name: CString,
+    identity: (libc::dev_t, libc::ino_t),
+}
+
+enum StrayCleanup {
+    Empty,
+    Work(Vec<PathBuf>),
+    RootHeld,
+}
+
+enum RootHeldInspection {
+    OnlyLog,
+    RetainedLog,
 }
 
 /// Whether a retirement may collect the artifacts keyed on its workspace name rather than on its
@@ -2207,7 +2232,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// hidden (a `.` component) or gitignored by the project's own rules, and is deleted; a
     /// visible file the rules do not ignore is someone's work landing in the wrong place and
     /// the reclaim refuses by naming it.
-    fn retired_mount_point(&self, retired: &RetiredRef) -> Result<PathBuf, ApfsStorageError> {
+    fn retired_mount_point(
+        &self,
+        retired: &RetiredRef,
+    ) -> Result<RetiredMountpoint, ApfsStorageError> {
         let mount_point = layout(&self.config, retired.workspace().repo())?
             .project()
             .mount_root
@@ -2224,17 +2252,24 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         mount_point.display()
                     )));
                 }
-                let kept = remove_stray_junk(&mount_point, &self.config.checkout_path)?;
-                if !kept.is_empty() {
-                    return Err(ApfsStorageError::Host(format!(
-                        "retired mountpoint {} holds files written after its volume was retired that \
-                         are neither hidden nor ignored by the project: {}; move or delete them",
-                        mount_point.display(),
-                        kept.iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
+                match remove_stray_junk(&mount_point, &self.config.checkout_path)? {
+                    StrayCleanup::Empty => {}
+                    StrayCleanup::RootHeld => {
+                        return self
+                            .hold_root_held_mountpoint(&mount_point)
+                            .map(RetiredMountpoint::RootHeld);
+                    }
+                    StrayCleanup::Work(kept) => {
+                        return Err(ApfsStorageError::Host(format!(
+                            "retired mountpoint {} holds files written after its volume was retired that \
+                             are neither hidden nor ignored by the project: {}; move or delete them",
+                            mount_point.display(),
+                            kept.iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
                 }
             }
             Ok(_) => {
@@ -2246,7 +2281,165 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect retired mountpoint", &mount_point, error)),
         }
-        Ok(mount_point)
+        Ok(RetiredMountpoint::Empty(mount_point))
+    }
+
+    /// Hold the actual bare directory and its parent, without following a mutable path component.
+    /// The kernel mount table, fd-relative metadata and sole-entry check are the retention proof.
+    fn hold_root_held_mountpoint(
+        &self,
+        path: &Path,
+    ) -> Result<RootHeldDirectory, ApfsStorageError> {
+        self.inspect_root_held_mountpoint(path, RootHeldInspection::OnlyLog)?
+            .ok_or(ApfsStorageError::GcPlanStale)
+    }
+
+    fn inspect_root_held_mountpoint(
+        &self,
+        path: &Path,
+        inspection: RootHeldInspection,
+    ) -> Result<Option<RootHeldDirectory>, ApfsStorageError> {
+        let parent_path = path.parent().ok_or(ApfsStorageError::InvalidPlan(
+            "root-held mountpoint has no parent",
+        ))?;
+        let name = CString::new(
+            path.file_name()
+                .ok_or(ApfsStorageError::InvalidPlan(
+                    "root-held mountpoint has no name",
+                ))?
+                .as_bytes(),
+        )
+        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let parent = match AnchoredDirectory::open(parent_path) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(io_error(
+                    "hold root-held mountpoint parent",
+                    parent_path,
+                    error,
+                ));
+            }
+        };
+        let directory = match parent.existing_child(&name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error("hold root-held mountpoint", path, error)),
+        };
+        if !directory
+            .stat_child(c".fseventsd")
+            .map_err(|error| io_error("inspect held event-log metadata", path, error))?
+            .as_ref()
+            .is_some_and(root_owned_event_log)
+            || (matches!(inspection, RootHeldInspection::OnlyLog)
+                && !directory
+                    .contains_only(c".fseventsd")
+                    .map_err(|error| io_error("inspect held mountpoint entries", path, error))?)
+        {
+            return Ok(None);
+        }
+        let metadata = directory
+            .metadata()
+            .map_err(|error| io_error("inspect held mountpoint", path, error))?;
+        let parent_metadata = parent
+            .metadata()
+            .map_err(|error| io_error("inspect held mountpoint parent", parent_path, error))?;
+        if metadata.dev() != parent_metadata.dev()
+            || self
+                .mount_source
+                .mounts()?
+                .iter()
+                .any(|mount| mount.mount_point.starts_with(path))
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "root-held mountpoint still carries a mounted filesystem: {}",
+                path.display()
+            )));
+        }
+        let entry = parent
+            .stat_child(&name)
+            .map_err(|error| io_error("inspect held mountpoint name", path, error))?
+            .ok_or(ApfsStorageError::GcPlanStale)?;
+        if entry.st_ino != metadata.ino() || entry.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(ApfsStorageError::GcPlanStale);
+        }
+        Ok(Some(RootHeldDirectory {
+            path: path.to_owned(),
+            parent,
+            directory,
+            name,
+            identity: (entry.st_dev, entry.st_ino),
+        }))
+    }
+
+    fn retain_root_held_mountpoint(
+        &self,
+        held: RootHeldDirectory,
+    ) -> Result<RootHeldMountpoint, ApfsStorageError> {
+        // Cleanup may have removed other artifacts since the directory was first held. Look at
+        // this directory, and the name that still refers to it, before changing the namespace.
+        let current = held.parent.stat_child(&held.name).map_err(|error| {
+            io_error("inspect root-held name before retention", &held.path, error)
+        })?;
+        if current.as_ref().map(|entry| (entry.st_dev, entry.st_ino)) != Some(held.identity)
+            || !held
+                .directory
+                .contains_only(c".fseventsd")
+                .map_err(|error| {
+                    io_error(
+                        "inspect root-held entries before retention",
+                        &held.path,
+                        error,
+                    )
+                })?
+            || !held
+                .directory
+                .stat_child(c".fseventsd")
+                .map_err(|error| {
+                    io_error("inspect root-held log before retention", &held.path, error)
+                })?
+                .as_ref()
+                .is_some_and(root_owned_event_log)
+        {
+            return Err(ApfsStorageError::GcPlanStale);
+        }
+        if self
+            .mount_source
+            .mounts()?
+            .iter()
+            .any(|mount| mount.mount_point.starts_with(&held.path))
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "root-held mountpoint became mounted before retention: {}",
+                held.path.display()
+            )));
+        }
+        let destination_name = format!(
+            "{}{}",
+            crate::storage::recovery::ROOT_HELD_MOUNT_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let destination = CString::new(destination_name.as_bytes())
+            .expect("a fixed prefix and UUID contain no NUL");
+        held.parent
+            .rename_child_noreplace(&held.name, &destination)
+            .map_err(|error| {
+                io_error(
+                    "retain root-held mountpoint without replacement",
+                    &held.path,
+                    error,
+                )
+            })?;
+        let path = held.path.with_file_name(destination_name);
+        let retained = RootHeldMountpoint::Retained(path);
+        let (_, cleanup) = retained.cleanup_guidance();
+        eprintln!(
+            "cowshed: retained root-owned event-log debris from {} at {}; privileged cleanup: {}",
+            held.path.display(),
+            retained.mount_point().display(),
+            cleanup
+        );
+        Ok(retained)
     }
 
     fn reclaim_retired_authority(
@@ -2255,7 +2448,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         repo: &RepoId,
         trash_image: &Path,
         expected: Option<&RetiredRef>,
-    ) -> Result<(), ApfsStorageError>
+    ) -> Result<Option<RootHeldMountpoint>, ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
     {
@@ -2273,7 +2466,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             // The caller's own retirement names the trash path, so it still authorizes the
             // workspace-scoped cleanup the missing record would have.
             (None, Some(expected)) => expected.clone(),
-            (None, None) => return self.reclaim_recordless_bytes(trash_image),
+            (None, None) => return self.reclaim_recordless_bytes(trash_image).map(|()| None),
         };
         // Recomputed per entry instead of carried in the plan, because `reclaim_retired` runs this
         // with no plan at all. A scope only ever widens as siblings are collected, so an entry that
@@ -2347,26 +2540,34 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 }
             }
         }
-        if let Some(mount_point) = &cleanup.mount_point {
-            match fs::remove_dir(mount_point) {
-                Ok(()) => {
-                    deletion_log::log_deletion(
-                        project,
-                        DeletionOp::ReclaimRetiredArtifact,
-                        DeletionKind::Other,
-                        authority.workspace().name().as_str(),
-                        Some(trash_image),
-                        mount_point,
-                    );
-                    sync_parent_path(mount_point)?
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error("remove retired mountpoint", mount_point, error));
-                }
+        let retained = match cleanup.mount_point {
+            Some(RetiredMountpoint::RootHeld(held)) => {
+                Some(self.retain_root_held_mountpoint(held)?)
             }
-        }
-        self.reclaim_image(trash_image)
+            Some(RetiredMountpoint::Empty(mount_point)) => {
+                match fs::remove_dir(&mount_point) {
+                    Ok(()) => {
+                        deletion_log::log_deletion(
+                            project,
+                            DeletionOp::ReclaimRetiredArtifact,
+                            DeletionKind::Other,
+                            authority.workspace().name().as_str(),
+                            Some(trash_image),
+                            &mount_point,
+                        );
+                        sync_parent_path(&mount_point)?
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(io_error("remove retired mountpoint", &mount_point, error));
+                    }
+                }
+                None
+            }
+            None => None,
+        };
+        self.reclaim_image(trash_image)?;
+        Ok(retained)
     }
 
     fn retired_trash_images(&self, trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -2557,6 +2758,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut retained_pinned = 0_usize;
         let mut retained_recent = 0_usize;
         let mut retained_active = 0_usize;
+        let mut root_held_mountpoints = Vec::new();
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
         let trash_images = self.retired_trash_images(&trash)?;
@@ -2604,9 +2806,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if scope == NameScope::Owned {
                 claimed_checkpoint_names.insert(retired.workspace().name().clone());
             }
-            let artifacts = self
-                .retired_cleanup_artifacts(project, &retired, &path, scope)?
-                .paths;
+            let cleanup = self.retired_cleanup_artifacts(project, &retired, &path, scope)?;
+            if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
+                root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
+            }
+            let artifacts = cleanup.paths;
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
@@ -2950,6 +3154,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                     continue;
                 };
+                if name.starts_with(crate::storage::recovery::ROOT_HELD_MOUNT_PREFIX) {
+                    if let Some(held) =
+                        self.inspect_root_held_mountpoint(&path, RootHeldInspection::RetainedLog)?
+                    {
+                        root_held_mountpoints.push(RootHeldMountpoint::Retained(held.path));
+                    }
+                    continue;
+                }
                 if name.starts_with('.') || named_mountpoints.contains(name) {
                     continue;
                 }
@@ -2958,6 +3170,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 };
                 if !metadata.file_type().is_dir() || metadata.dev() != root_metadata.dev() {
                     continue;
+                }
+                if let Some(held) =
+                    self.inspect_root_held_mountpoint(&path, RootHeldInspection::OnlyLog)?
+                {
+                    root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path));
                 }
                 examined = examined
                     .checked_add(1)
@@ -2972,6 +3189,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         lock_paths.sort();
         lock_paths.dedup();
+        root_held_mountpoints.sort_by(|left, right| left.mount_point().cmp(right.mount_point()));
         Ok(StorageGcPlan::new(
             repo.clone(),
             observed_at,
@@ -2983,6 +3201,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 recent: retained_recent,
                 active: retained_active,
             },
+            root_held_mountpoints,
         ))
     }
     fn orphan_session_image_mount_blocker(
@@ -3056,18 +3275,28 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             retained_pinned: plan.retained_pinned(),
             retained_recent: plan.retained_recent(),
             retained_active: plan.retained_active(),
+            root_held_mountpoints: plan
+                .root_held_mountpoints()
+                .iter()
+                .filter_map(|held| match held {
+                    RootHeldMountpoint::Retained(_) => Some(held.clone()),
+                    RootHeldMountpoint::Pending(_) => None,
+                })
+                .collect(),
             ..StorageGcReport::default()
         };
         for candidate in plan.candidates() {
             let result = (|| -> Result<(), ApfsStorageError> {
                 match candidate.reason() {
                     StorageGcReason::RetiredWorkspace => {
-                        self.reclaim_retired_authority(
+                        if let Some(retained) = self.reclaim_retired_authority(
                             project,
                             plan.repo(),
                             candidate.path(),
                             None,
-                        )?;
+                        )? {
+                            report.root_held_mountpoints.push(retained);
+                        }
                         report.freed_bytes =
                             report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
@@ -3293,17 +3522,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                                 "orphan mountpoint became mounted after GC planning".to_owned(),
                             ));
                         }
-                        let kept = remove_stray_junk(candidate.path(), &self.config.checkout_path)?;
-                        if !kept.is_empty() {
-                            return Err(ApfsStorageError::Host(format!(
-                                "orphan mountpoint {} holds files that are neither hidden nor ignored \
-                             by the project: {}; move or delete them",
-                                candidate.path().display(),
-                                kept.iter()
-                                    .map(|path| path.display().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )));
+                        match remove_stray_junk(candidate.path(), &self.config.checkout_path)? {
+                            StrayCleanup::Empty => {}
+                            StrayCleanup::RootHeld => {
+                                let held = self.hold_root_held_mountpoint(candidate.path())?;
+                                report
+                                    .root_held_mountpoints
+                                    .push(self.retain_root_held_mountpoint(held)?);
+                                return Ok(());
+                            }
+                            StrayCleanup::Work(kept) => {
+                                return Err(ApfsStorageError::Host(format!(
+                                    "orphan mountpoint {} holds files that are neither hidden nor ignored \
+                                     by the project: {}; move or delete them",
+                                    candidate.path().display(),
+                                    kept.iter()
+                                        .map(|path| path.display().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )));
+                            }
                         }
                         match fs::remove_dir(candidate.path()) {
                             Ok(()) => {
@@ -5022,6 +5260,7 @@ where
             return Ok(());
         }
         self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
+            .map(|_| ())
     }
 
     fn reclaim_unrecorded_retired(
@@ -5057,6 +5296,7 @@ where
         // Under the name's lock the trash says what it is: a sidecar that appeared was a
         // retirement finishing its renames, and its record now authorizes the full reclaim.
         self.reclaim_retired_authority(&project, repo, image, None)
+            .map(|_| ())
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -5903,6 +6143,12 @@ fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
+fn root_owned_event_log(metadata: &libc::stat) -> bool {
+    metadata.st_uid == 0
+        && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && metadata.st_mode & 0o777 == 0o700
+}
+
 /// Deletes every stray under an unmounted mountpoint that is junk - hidden, ignored by the
 /// project's gitignore rules judged from its checkout, or a regular file whose exact bytes the
 /// project's repository already holds as a blob - and returns the paths that were kept because
@@ -5916,12 +6162,13 @@ fn metadata_workspace_ref(
 fn remove_stray_junk(
     mount_point: &Path,
     checkout: &Path,
-) -> Result<Vec<PathBuf>, ApfsStorageError> {
+) -> Result<StrayCleanup, ApfsStorageError> {
     // (absolute path, relative form for check-ignore, is directory, is regular file)
     let mut strays: Vec<(PathBuf, Vec<u8>, bool, bool)> = Vec::new();
     let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
+    let mut root_held = false;
     while let Some(dir) = stack.pop() {
         visited.push(dir.clone());
         for entry in fs::read_dir(&dir)
@@ -5934,6 +6181,15 @@ fn remove_stray_junk(
             let file_type = entry
                 .file_type()
                 .map_err(|error| io_error("inspect stray", &path, error))?;
+            if relative == Path::new(".fseventsd") && file_type.is_dir() {
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    io_error("inspect root-held event-log candidate", &path, error)
+                })?;
+                if metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700 {
+                    root_held = true;
+                    continue;
+                }
+            }
             if crate::git::is_hidden_path(relative.as_os_str().as_bytes()) {
                 hidden.push((path, file_type.is_dir()));
                 continue;
@@ -5946,6 +6202,15 @@ fn remove_stray_junk(
                 stack.push(path.clone());
             }
             strays.push((path, judged, file_type.is_dir(), file_type.is_file()));
+        }
+        if root_held {
+            if strays.is_empty() && hidden.is_empty() {
+                return Ok(StrayCleanup::RootHeld);
+            }
+            return Err(ApfsStorageError::Host(format!(
+                "bare mountpoint {} holds a root-owned event log mixed with other entries; inspect it before removing anything",
+                mount_point.display()
+            )));
         }
     }
     let judged: Vec<&[u8]> = strays
@@ -6005,7 +6270,11 @@ fn remove_stray_junk(
             }
         }
     }
-    Ok(kept)
+    Ok(if kept.is_empty() {
+        StrayCleanup::Empty
+    } else {
+        StrayCleanup::Work(kept)
+    })
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
@@ -6184,7 +6453,9 @@ mod tests {
         }
         fs::write(mount.join("packages/wire/src/held.rs"), "fn held() {}\n").expect("held copy");
 
-        let kept = remove_stray_junk(&mount, &checkout).expect("sweep");
+        let StrayCleanup::Work(kept) = remove_stray_junk(&mount, &checkout).expect("sweep") else {
+            panic!("unique visible work must remain");
+        };
         assert_eq!(kept, vec![mount.join("packages/wire/src/lib.rs")]);
         assert!(!mount.join("packages/wire/src/held.rs").exists());
         assert!(!mount.join(".nx").exists());
@@ -6194,11 +6465,10 @@ mod tests {
         assert!(mount.join("packages/wire/src/lib.rs").exists());
 
         fs::remove_file(mount.join("packages/wire/src/lib.rs")).expect("clear work");
-        assert!(
-            remove_stray_junk(&mount, &checkout)
-                .expect("sweep")
-                .is_empty()
-        );
+        assert!(matches!(
+            remove_stray_junk(&mount, &checkout).expect("sweep"),
+            StrayCleanup::Empty
+        ));
         assert!(
             fs::read_dir(&mount).expect("mount").next().is_none(),
             "emptied bottom-up"

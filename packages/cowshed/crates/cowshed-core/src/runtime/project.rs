@@ -9276,7 +9276,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 freed_bytes: freed_bytes.saturating_add(build.freed_bytes),
                 dry_run: true,
-                deferred: build.deferred.into_iter().map(Into::into).collect(),
+                deferred: build
+                    .deferred
+                    .into_iter()
+                    .map(Into::into)
+                    .chain(plan.root_held_mountpoints().iter().map(root_held_deferred))
+                    .collect(),
                 candidates: candidates.into_iter().chain(build.candidates).collect(),
             });
         }
@@ -9358,6 +9363,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     diagnostic: deferred.diagnostic,
                 })
                 .chain(build.deferred.into_iter().map(Into::into))
+                .chain(report.root_held_mountpoints.iter().map(root_held_deferred))
                 .collect(),
         })
     }
@@ -10584,6 +10590,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // leaves the operator with no next move.
         match self.substrate.preview_gc(&self.descriptor.repo_id).await {
             Ok(plan) => {
+                findings.extend(plan.root_held_mountpoints().iter().map(root_held_finding));
                 let orphaned = plan
                     .candidates()
                     .iter()
@@ -15787,6 +15794,40 @@ fn unfinished_intent_finding(
 }
 
 #[cfg(target_os = "macos")]
+fn root_held_finding(
+    held: &crate::storage::lifecycle::RootHeldMountpoint,
+) -> crate::api::dto::Finding {
+    let (path, hint) = held.cleanup_guidance();
+    crate::api::dto::Finding {
+        code: "root-held-event-debris".into(),
+        severity: crate::api::dto::FindingSeverity::Info,
+        message: match held {
+            crate::storage::lifecycle::RootHeldMountpoint::Pending(_) => {
+                "a bare mountpoint holds only root's event log; gc retains its directory aside instead of deleting privileged debris"
+            }
+            crate::storage::lifecycle::RootHeldMountpoint::Retained(_) => {
+                "root's event-log debris is retained outside workspace names; it does not block garbage collection"
+            }
+        }.into(),
+        hint,
+        path: Some(path),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn root_held_deferred(
+    held: &crate::storage::lifecycle::RootHeldMountpoint,
+) -> crate::api::dto::GcDeferred {
+    let (path, hint) = held.cleanup_guidance();
+    crate::api::dto::GcDeferred {
+        path,
+        diagnostic: format!(
+            "root-owned event-log debris is retained, not a collection failure; privileged cleanup: {hint}"
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn orphan_session_image_findings(
     candidates: &[crate::storage::lifecycle::StorageGcCandidate],
 ) -> impl Iterator<Item = crate::api::dto::Finding> + '_ {
@@ -16099,6 +16140,43 @@ mod doctor_hint_tests {
                 PathBuf::from("/mnt/raven"),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn root_held_event_debris_is_informational_before_and_after_retention() {
+        use crate::storage::lifecycle::RootHeldMountpoint;
+
+        for held in [
+            RootHeldMountpoint::Pending(PathBuf::from("/mnt/retired")),
+            RootHeldMountpoint::Retained(PathBuf::from("/mnt/.root-held-proof")),
+        ] {
+            let finding = root_held_finding(&held);
+            assert_eq!(finding.code, "root-held-event-debris");
+            assert_eq!(finding.severity, crate::api::dto::FindingSeverity::Info);
+            assert_eq!(finding.path, Some(held.mount_point().join(".fseventsd")));
+            assert!(finding.hint.contains("sudo rm -rf --"));
+            let deferred = root_held_deferred(&held);
+            assert_eq!(deferred.path, held.mount_point().join(".fseventsd"));
+            assert!(deferred.diagnostic.contains("not a collection failure"));
+        }
+    }
+
+    #[test]
+    fn retained_event_log_cleanup_quotes_the_exact_log_and_preserves_late_work() {
+        use crate::storage::lifecycle::RootHeldMountpoint;
+
+        let held = RootHeldMountpoint::Retained(PathBuf::from("/mnt/it's $HOME"));
+        let (path, hint) = held.cleanup_guidance();
+        assert_eq!(path, PathBuf::from("/mnt/it's $HOME/.fseventsd"));
+        assert_eq!(
+            hint,
+            "sudo rm -rf -- '/mnt/it'\\''s $HOME/.fseventsd' && rmdir -- '/mnt/it'\\''s $HOME'"
+        );
+        let pending = RootHeldMountpoint::Pending(PathBuf::from("/mnt/retired"));
+        assert_eq!(
+            pending.cleanup_guidance().1,
+            "sudo rm -rf -- '/mnt/retired/.fseventsd'"
         );
     }
 

@@ -15,12 +15,23 @@ use std::path::{Path, PathBuf};
 
 /// A held directory capability. Child preparation never re-resolves a mutable
 /// parent path after it has been opened.
+#[derive(Debug)]
 pub(crate) struct AnchoredDirectory(File);
 
 impl AnchoredDirectory {
     /// Open/create a canonical absolute chain without following any symlink.
     /// One path buffer supplies all NUL-terminated components to openat.
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        Self::open_chain(path, true)
+    }
+
+    /// Hold an existing canonical chain without creating a component or following a link.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_chain(path, false)
+    }
+
+    fn open_chain(path: &Path, create: bool) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -47,12 +58,21 @@ impl AnchoredDirectory {
             }
             let component = CStr::from_bytes_with_nul(component)
                 .expect("split components have exactly one trailing NUL");
-            directory = directory.child(component)?;
+            directory = directory.child_with(component, create)?;
         }
         Ok(directory)
     }
 
     pub(crate) fn child(&self, name: &CStr) -> io::Result<Self> {
+        self.child_with(name, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn existing_child(&self, name: &CStr) -> io::Result<Self> {
+        self.child_with(name, false)
+    }
+
+    fn child_with(&self, name: &CStr, create: bool) -> io::Result<Self> {
         validate_directory_leaf(name)?;
         let open = || {
             // SAFETY: the held parent fd and NUL-terminated name outlive the call.
@@ -68,7 +88,7 @@ impl AnchoredDirectory {
         let mut fd = open();
         if fd < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
+            if !create || error.kind() != io::ErrorKind::NotFound {
                 return Err(error);
             }
             // SAFETY: mkdirat resolves one leaf beneath the held parent, never a path.
@@ -85,6 +105,113 @@ impl AnchoredDirectory {
         }
         // SAFETY: a successful openat returned a new owned directory descriptor.
         Ok(Self(unsafe { File::from_raw_fd(fd) }))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+
+    /// The entry itself, never a symlink's target. No permission on the child is needed.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn stat_child(&self, name: &CStr) -> io::Result<Option<libc::stat>> {
+        validate_directory_leaf(name)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the directory/name are held, and fstatat initializes the output on success.
+        if unsafe {
+            libc::fstatat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            // SAFETY: fstatat initialized the stat above.
+            return Ok(Some(unsafe { metadata.assume_init() }));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+
+    /// Enumerate the held directory, not its path. A new open has its own directory offset;
+    /// dup would share an offset and make a second check see the first check's EOF.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
+        validate_directory_leaf(expected)?;
+        // SAFETY: "." is a constant leaf below the live held directory.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is a new directory descriptor. On success fdopendir owns it.
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so the descriptor still belongs to this call.
+            drop(unsafe { File::from_raw_fd(fd) });
+            return Err(error);
+        }
+        let mut found = false;
+        let result = loop {
+            // SAFETY: errno is thread-local; readdir uses zero to distinguish EOF from error.
+            unsafe { *libc::__error() = 0 };
+            // SAFETY: directory is held until closed below.
+            let entry = unsafe { libc::readdir(directory) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                break if error.raw_os_error() == Some(0) {
+                    Ok(found)
+                } else {
+                    Err(error)
+                };
+            }
+            // SAFETY: POSIX readdir returns a NUL-terminated name, live until the next call.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name == c"." || name == c".." {
+                continue;
+            }
+            if name != expected || found {
+                break Ok(false);
+            }
+            found = true;
+        };
+        // SAFETY: this call owns directory; closedir also closes its descriptor.
+        if unsafe { libc::closedir(directory) } == 0 {
+            result
+        } else {
+            let close = io::Error::last_os_error();
+            match result {
+                Ok(_) => Err(close),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; closing directory: {close}"),
+                )),
+            }
+        }
+    }
+
+    /// Both names resolve against this held parent; an existing destination is never replaced.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn rename_child_noreplace(
+        &self,
+        source: &CStr,
+        destination: &CStr,
+    ) -> io::Result<()> {
+        validate_directory_leaf(source)?;
+        validate_directory_leaf(destination)?;
+        rename_noreplace(self.0.as_raw_fd(), source, destination)?;
+        self.0.sync_all()
     }
 
     /// Keep real private cache entries, preserve matching links, and replace stale links and empty
@@ -863,6 +990,101 @@ impl Drop for TempCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_directory_capability_never_creates_or_follows_a_link() {
+        let temporary =
+            std::env::temp_dir().join(format!("fsio-read-anchor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let directory = AnchoredDirectory::open(&root).unwrap();
+        assert_eq!(
+            directory.existing_child(c"missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!root.join("missing").exists());
+        assert!(AnchoredDirectory::open(&root.join("absent/child")).is_err());
+        assert!(!root.join("absent").exists());
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        let metadata = directory.stat_child(c"link").unwrap().unwrap();
+        assert_eq!(metadata.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        assert!(directory.existing_child(c"link").is_err());
+        assert!(AnchoredDirectory::open(&root.join("link")).is_err());
+        assert!(fs::read_dir(target).unwrap().next().is_none());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_directory_sole_entry_checks_do_not_share_a_directory_offset() {
+        let temporary =
+            std::env::temp_dir().join(format!("fsio-only-entry-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let directory = AnchoredDirectory::open(&root).unwrap();
+        assert!(!directory.contains_only(c".fseventsd").unwrap());
+        fs::create_dir(root.join(".fseventsd")).unwrap();
+        assert!(directory.contains_only(c".fseventsd").unwrap());
+        assert!(
+            directory.contains_only(c".fseventsd").unwrap(),
+            "a second check must not see EOF"
+        );
+        fs::write(root.join(".other"), b"preserve hidden work").unwrap();
+        assert!(!directory.contains_only(c".fseventsd").unwrap());
+        assert_eq!(
+            fs::read(root.join(".other")).unwrap(),
+            b"preserve hidden work"
+        );
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_parent_rename_never_overwrites_or_follows_a_replaced_parent_path() {
+        let temporary =
+            std::env::temp_dir().join(format!("fsio-held-rename-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let parent = root.join("parent");
+        let outside = root.join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        for (name, bytes) in [
+            ("from", b"source".as_slice()),
+            ("to", b"destination".as_slice()),
+        ] {
+            fs::create_dir(parent.join(name)).unwrap();
+            fs::write(parent.join(name).join("proof"), bytes).unwrap();
+        }
+        let directory = AnchoredDirectory::open(&parent).unwrap();
+        assert_eq!(
+            directory
+                .rename_child_noreplace(c"from", c"to")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(parent.join("from/proof")).unwrap(), b"source");
+        assert_eq!(fs::read(parent.join("to/proof")).unwrap(), b"destination");
+        let moved = root.join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        directory
+            .rename_child_noreplace(c"from", c".root-held-test")
+            .unwrap();
+        assert_eq!(
+            fs::read(moved.join(".root-held-test/proof")).unwrap(),
+            b"source"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "the replacement was never followed"
+        );
+        fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn directory_capability_survives_parent_rename_without_following_its_replacement() {

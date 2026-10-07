@@ -1262,6 +1262,15 @@ reports it, and `gc` can reclaim it as an orphan after mount and lock checks. `g
 candidate cannot be reclaimed, names it as deferred on stderr and in the `deferred` JSON array, and reports only space
 actually freed by successful candidates.
 
+An older logged volume can leave root's `0700` `.fseventsd` on its bare mountpoint after unmount. If that is the only
+entry, gc renames the user-owned mountpoint aside to a hidden, same-parent `.root-held-<uuid>` name instead of trying to
+remove privileged debris. It does not overwrite another name or move a mounted filesystem. Other entries, hidden
+included, are preserved and require inspection. The retired image can still be reclaimed. Doctor reports this as
+`root-held-event-debris` information, not an unhealthy host; dry run and doctor never rename it. The named cleanup hint
+uses `sudo rm -rf` only for the exact, quoted event-log directory, then `rmdir` for its retained parent, so work written
+there later is not recursively deleted. Retained event logs are also named in gc's `deferred` output without making
+collection fail.
+
 ### `cowshed doctor`
 
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, the gateway is reachable,

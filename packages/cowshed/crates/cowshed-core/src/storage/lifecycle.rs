@@ -605,6 +605,46 @@ pub struct StorageGcPlan {
     lock_paths: Vec<PathBuf>,
     examined: usize,
     retained: StorageGcRetained,
+    root_held_mountpoints: Vec<RootHeldMountpoint>,
+}
+
+/// A bare directory holding only the kernel's root-owned event log. Collection may move its
+/// user-owned parent aside, but never deletes the privileged directory or asks the operator to
+/// recursively delete unrelated work that a late writer could add to the retained parent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootHeldMountpoint {
+    Pending(PathBuf),
+    Retained(PathBuf),
+}
+
+impl RootHeldMountpoint {
+    pub fn mount_point(&self) -> &std::path::Path {
+        match self {
+            Self::Pending(path) | Self::Retained(path) => path,
+        }
+    }
+
+    pub fn cleanup_guidance(&self) -> (PathBuf, String) {
+        let event_log = self.mount_point().join(".fseventsd");
+        let mut hint = String::from("sudo rm -rf -- ");
+        let quote = |output: &mut String, path: &std::path::Path| {
+            output.push('\'');
+            for character in path.to_string_lossy().chars() {
+                if character == '\'' {
+                    output.push_str("'\\''");
+                } else {
+                    output.push(character);
+                }
+            }
+            output.push('\'');
+        };
+        quote(&mut hint, &event_log);
+        if let Self::Retained(path) = self {
+            hint.push_str(" && rmdir -- ");
+            quote(&mut hint, path);
+        }
+        (event_log, hint)
+    }
 }
 
 /// What a sweep examined and deliberately left alone, by the rule that spared it.
@@ -627,6 +667,7 @@ impl StorageGcPlan {
         lock_paths: Vec<PathBuf>,
         examined: usize,
         retained: StorageGcRetained,
+        root_held_mountpoints: Vec<RootHeldMountpoint>,
     ) -> Self {
         Self {
             repo,
@@ -635,6 +676,7 @@ impl StorageGcPlan {
             lock_paths,
             examined,
             retained,
+            root_held_mountpoints,
         }
     }
 
@@ -646,6 +688,7 @@ impl StorageGcPlan {
             Vec::new(),
             0,
             StorageGcRetained::default(),
+            Vec::new(),
         )
     }
 
@@ -659,6 +702,10 @@ impl StorageGcPlan {
 
     pub fn candidates(&self) -> &[StorageGcCandidate] {
         &self.candidates
+    }
+
+    pub fn root_held_mountpoints(&self) -> &[RootHeldMountpoint] {
+        &self.root_held_mountpoints
     }
 
     pub(crate) fn lock_paths(&self) -> &[PathBuf] {
@@ -701,6 +748,8 @@ pub struct StorageGcReport {
     pub freed_bytes: u64,
     /// Candidate-local failures; the sweep continues with the remaining candidates.
     pub deferred: Vec<StorageGcDeferred>,
+    /// Privileged event-log debris retained outside workspace names, not a collection failure.
+    pub root_held_mountpoints: Vec<RootHeldMountpoint>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

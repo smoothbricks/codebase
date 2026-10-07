@@ -886,6 +886,20 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   facts, and every associated artifact under the workspace lock; any change makes the plan stale before mutation.
   Cleanup deletes the retirement trash metadata last so an interrupted pass retains authority for the next idempotent GC
   pass. A missing canonical image or orphan checkpoint fact alone never authorizes deletion.
+- A logged volume's final `fseventsd` flush can land on the bare host mountpoint after unmount and leave a root-owned
+  `0700` `.fseventsd`. When it is the directory's **only** entry, gc does not try to delete it: it holds the parent and
+  directory without following symlinks, checks fd-relative metadata and the kernel mount table, then atomically renames
+  the user-owned mountpoint to a same-parent `.root-held-<uuid>` name without replacing an existing destination. A
+  changed name, another entry (hidden included), or a newly mounted filesystem refuses the move and preserves the data.
+  Preview and doctor never rename. They report `root-held-event-debris` as **info**, not an unhealthy invariant; gc
+  reports the retained log through its named `deferred` information while reclaiming the retired image and other
+  candidates. Subsequent sweeps leave the retained name in place. Privileged cleanup names only the exact, shell-quoted
+  `.fseventsd` directory (`sudo rm -rf -- '<path>/.fseventsd'`), followed by ordinary `rmdir` of its retained parent: a
+  late writer's added work can make `rmdir` refuse but cannot be recursively deleted by that guidance. **Enforced by**:
+  a real kernel-owned `0700` log moved within an ownership-ignoring scratch image and remounted with ownership honored;
+  read-only preview, same-parent/inode-preserving retention, successful image reclamation, idempotence, mixed
+  hidden/visible work preservation and mounted-volume refusal, plus descriptor/rename collision and
+  informational-diagnostic tests.
 - `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
