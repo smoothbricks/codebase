@@ -6378,8 +6378,7 @@ mod sandbox_environment_tests {
             ..Default::default()
         };
         let error = prepare_private_environment(&environment, None, &escaping)
-            .err()
-            .expect("an escaping cache link is refused");
+            .expect_err("an escaping cache link is refused");
         assert_eq!(error.code, crate::error::ErrorCode::Integrity);
         assert!(!root.join("outside").exists());
         std::fs::remove_dir_all(root).unwrap();
