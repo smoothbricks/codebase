@@ -117,15 +117,13 @@ where
         let _creating = layout
             .hold_new(destination)
             .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
-        if let Err(error) =
-            self.backend
-                .sync_and_clone(&from, mounted.then_some(mount.as_path()), &to)
+        if let Err(error) = self.capture_image(&from, mounted.then_some(mount.as_path()), &to, None)
         {
             // No image, so nothing will ever release this hold file.
             if !to.exists() {
                 remove_if_present(&hold)?;
             }
-            return Err(error.into());
+            return Err(error);
         }
         let written = written_at(&to)?;
         // The clone's own extent map, paid here rather than by its first write inside a mount.
@@ -218,7 +216,7 @@ where
     }
 
     /// The kernel mount at `mount`, if a volume is mounted exactly there.
-    fn mounted_at(&self, mount: &Path) -> Result<Option<String>, ApfsStorageError> {
+    pub(super) fn mounted_at(&self, mount: &Path) -> Result<Option<String>, ApfsStorageError> {
         let mount = MountPoint::new(mount);
         Ok(self
             .mount_source

@@ -475,6 +475,12 @@ mod asif {
     }
 }
 
+/// Whether a detached ASIF image's map describes a whole image: what [`ApfsBackend::clone_image`]
+/// proves of its source, under the same held descriptor it clones from, before anything is
+/// cloned.
+#[cfg(any(target_os = "macos", test))]
+mod asif_consistency;
+
 /// The lock file of one image identity:
 /// `/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256(identity bytes)>.lock`.
 ///
@@ -994,6 +1000,18 @@ pub enum CloneFileError {
         destination: PathBuf,
     },
     UnsupportedPlatform,
+    /// The source's backing file is locked by an attachment: the image driver holds an attached
+    /// image's file under an exclusive lock, and a clone of it would copy whatever mix of map
+    /// generations its write-back has reached. Refused, never captured.
+    SourceAttached {
+        source: PathBuf,
+    },
+    /// The detached source's ASIF map does not describe a whole image (`error` names how), so
+    /// a clone of it would publish the tear.
+    SourceInconsistent {
+        source: PathBuf,
+        error: io::Error,
+    },
     Io {
         source_path: PathBuf,
         destination_path: PathBuf,
@@ -1024,6 +1042,16 @@ impl fmt::Display for CloneFileError {
                 destination.display()
             ),
             Self::UnsupportedPlatform => write!(f, "clonefile is available only on macOS"),
+            Self::SourceAttached { source } => write!(
+                f,
+                "{} is attached, and an attached image is never cloned: detach it first",
+                source.display()
+            ),
+            Self::SourceInconsistent { source, error } => write!(
+                f,
+                "{} is not a consistent ASIF image, so it was not cloned: {error}",
+                source.display()
+            ),
             Self::Io {
                 source_path,
                 destination_path,
@@ -1043,6 +1071,7 @@ impl std::error::Error for CloneFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::SourceInconsistent { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -1136,6 +1165,17 @@ pub enum ApfsError {
     ImageNotAttached(PathBuf),
     /// The kernel's disk-image inventory could not be read.
     KernelInventory(io::Error),
+    /// A clone needed its mounted source detached, and the kernel refused the unforced release:
+    /// something still has the volume at `mount_point` open. Nothing is forced; `holders` names
+    /// each process of this user that had it open when it was refused (empty when none of them
+    /// is visible: the kernel or another user's process holds it), and `refusal` is the refused
+    /// unmount or detach itself.
+    CaptureSourceBusy {
+        image: PathBuf,
+        mount_point: PathBuf,
+        holders: Vec<crate::build_volume::nx::Holder>,
+        refusal: Box<ApfsError>,
+    },
 }
 
 /// The framework's failure, not the request's: it was seen striking a burst of concurrent
@@ -1268,6 +1308,32 @@ impl fmt::Display for ApfsError {
             Self::KernelInventory(source) => {
                 write!(f, "read the kernel disk-image inventory: {source}")
             }
+            Self::CaptureSourceBusy {
+                image,
+                mount_point,
+                holders,
+                refusal,
+            } => {
+                write!(
+                    f,
+                    "{} must be detached to be cloned, and its volume at {} is in use",
+                    image.display(),
+                    mount_point.display()
+                )?;
+                match holders.as_slice() {
+                    [] => f.write_str(" by nothing this user can see")?,
+                    [first, rest @ ..] => {
+                        write!(f, " by {first}")?;
+                        for holder in rest {
+                            write!(f, ", {holder}")?;
+                        }
+                    }
+                }
+                write!(
+                    f,
+                    "; nothing was forced: close what holds it and run the command again (release refused: {refusal})"
+                )
+            }
         }
     }
 }
@@ -1282,6 +1348,7 @@ impl std::error::Error for ApfsError {
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
             Self::AsifCreationAndCleanupFailed { primary, .. } => Some(primary),
             Self::AttachmentCleanupFailed { primary, .. } => Some(primary),
+            Self::CaptureSourceBusy { refusal, .. } => Some(refusal),
             _ => None,
         }
     }
@@ -1313,25 +1380,30 @@ pub trait ApfsBackend {
         image: &Path,
         request: &CreateImageRequest,
     ) -> Result<AttachedImage, ApfsError>;
-    /// Make the source's latest writes part of the image a clone is about to be cut from:
-    /// its volume when `mount_point` is mounted, then the image file itself.
+    /// Push the latest writes of a source still in use into its image file: its volume when
+    /// `mount_point` is mounted, then the image file itself. What the flushed file's modification
+    /// time then says is current; the file is still attached, and an attached image is never a
+    /// clone source ([`Self::clone_image`] refuses it).
     ///
-    /// Freshness, not consistency (specs/cowshed/02_workspaces.md, `cowshed new` step 1): a live
-    /// clone is always crash-consistent, but without this it can miss the source's last writes.
     /// Only the source is flushed. The host-wide `sync(8)` this replaces also waited for every
     /// other mounted volume's dirty data — measured at 16 s, and at 39 s inside a fork under a
     /// host with dozens of workspaces building, against 3–676 ms for the source volume alone.
     fn sync_for_freshness(&self, image: &Path, mount_point: Option<&Path>)
     -> Result<(), ApfsError>;
+    /// Clone the detached image `source` to `destination`, which must not exist. Every image
+    /// clone goes through here.
+    ///
+    /// The source is opened once, without following a symlink, under a non-blocking shared lock.
+    /// The image driver holds an attached image's file under an exclusive lock, so that open is
+    /// the detached precondition: an attached source is refused as
+    /// [`CloneFileError::SourceAttached`] — a clone of a file the driver is still writing back
+    /// can capture a map from one generation over tables and chunks from another — and while
+    /// the lock is held no attach can begin. Shared, not exclusive, so captures of one source
+    /// (mints of one template, forks of one seed) never refuse each other. Through that one
+    /// descriptor the source is flushed, its ASIF map validated
+    /// ([`CloneFileError::SourceInconsistent`]) and cloned (`fclonefileat`): no path is
+    /// resolved again, so nothing swapped in after the open can be what is cloned.
     fn clone_image(&self, source: &Path, destination: &Path) -> Result<(), CloneFileError>;
-    /// Clone `source` to `destination` after [`Self::sync_for_freshness`]; `source_mount` is the
-    /// source's mount point when it is a live workspace, `None` for an image nothing mounts.
-    fn sync_and_clone(
-        &self,
-        source: &Path,
-        source_mount: Option<&Path>,
-        destination: &Path,
-    ) -> Result<(), ApfsError>;
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError>;
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError>;
     fn mount(
@@ -2292,26 +2364,19 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn clone_image(&self, source: &Path, destination: &Path) -> Result<(), CloneFileError> {
         validate_clone_path(source)?;
         validate_clone_path(destination)?;
-        clonefile_native(source, destination)
-    }
-
-    fn sync_and_clone(
-        &self,
-        source: &Path,
-        source_mount: Option<&Path>,
-        destination: &Path,
-    ) -> Result<(), ApfsError> {
-        validate_clone_path(source).map_err(ApfsError::from)?;
-        validate_clone_path(destination).map_err(ApfsError::from)?;
-        let leg = apfs_step_leg(destination);
-        timed_apfs_step(leg, "sync", || {
-            self.sync_for_freshness(source, source_mount)
-        })?;
-        timed_apfs_step(leg, "clonefile", || {
-            self.clone_image(source, destination)
-                .map_err(ApfsError::from)
-        })?;
-        Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            let leg = apfs_step_leg(destination);
+            let held = timed_apfs_step(leg, "hold-source", || {
+                DetachedImage::hold(source, destination)
+            })?;
+            timed_apfs_step(leg, "validate-source", || held.validate())?;
+            timed_apfs_step(leg, "clonefile", || held.clone_to(destination))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(CloneFileError::UnsupportedPlatform)
+        }
     }
 
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError> {
@@ -3219,55 +3284,82 @@ fn raw_device_from(device: &str) -> String {
     }
 }
 
-fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileError> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+/// An image file nothing has attached, for as long as this value lives: one descriptor, opened
+/// without following a symlink, under a non-blocking shared lock the image driver's exclusive
+/// attach lock refuses and excludes ([`ApfsBackend::clone_image`]). [`Self::hold`] is the only
+/// way to make one, so nothing is validated or cloned that was not held first.
+#[cfg(target_os = "macos")]
+struct DetachedImage<'a> {
+    file: File,
+    path: &'a Path,
+}
 
-        // SAFETY: `clonefile(2)` is Darwin libc; the signature matches
-        // `<sys/clonefile.h>` (`src`, `dst` as NUL-terminated paths, `flags` as
-        // `uint32_t`). We only call it with `CString` pointers that outlive the
-        // invocation.
-        unsafe extern "C" {
-            fn clonefile(
-                src: *const std::ffi::c_char,
-                dst: *const std::ffi::c_char,
-                flags: u32,
-            ) -> std::ffi::c_int;
-        }
-        let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
-            source_path: source.to_owned(),
+#[cfg(target_os = "macos")]
+impl<'a> DetachedImage<'a> {
+    /// Hold `path`, or refuse it as [`CloneFileError::SourceAttached`] when an attachment holds
+    /// it. The held file is flushed: a clone shares the file's on-disk extents, so the pages the
+    /// driver's write-back left in the cache go to disk before anything reads or clones them.
+    /// `destination` only names the clone this hold is for in an I/O failure.
+    fn hold(path: &'a Path, destination: &Path) -> Result<Self, CloneFileError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let failed = |error: io::Error| CloneFileError::Io {
+            source_path: path.to_owned(),
             destination_path: destination.to_owned(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"),
-        })?;
-        let dst =
-            CString::new(destination.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
-                source_path: source.to_owned(),
+            source: error,
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_SHLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::WouldBlock => CloneFileError::SourceAttached {
+                    source: path.to_owned(),
+                },
+                _ => failed(error),
+            })?;
+        // SAFETY: `file` owns a live descriptor for the duration of the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(failed(io::Error::last_os_error()));
+        }
+        Ok(Self { file, path })
+    }
+
+    /// The held file's ASIF map describes a whole image, or [`CloneFileError::SourceInconsistent`]
+    /// names how it does not.
+    fn validate(&self) -> Result<(), CloneFileError> {
+        asif_consistency::validate(&self.file).map_err(|error| CloneFileError::SourceInconsistent {
+            source: self.path.to_owned(),
+            error,
+        })
+    }
+
+    /// Clone the held file, by its descriptor, to `destination`, which must not exist.
+    fn clone_to(&self, destination: &Path) -> Result<(), CloneFileError> {
+        use std::os::unix::ffi::OsStrExt;
+        let target = std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            CloneFileError::Io {
+                source_path: self.path.to_owned(),
                 destination_path: destination.to_owned(),
                 source: io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "destination path contains NUL",
                 ),
-            })?;
-        // SAFETY: `src`/`dst` are `CString`s, so both pointers are valid
-        // NUL-terminated paths for the duration of the call. flags `0` is
-        // Darwin's default clonefile (follow symlinks, copy ownership).
-        let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-        if result == 0 {
+            }
+        })?;
+        // SAFETY: `self.file` owns a live descriptor and `target` is a NUL-terminated path, both
+        // outliving the call. Flags `0` is Darwin's default clone, ownership copied, as the
+        // path-based `clonefile` this replaces made it.
+        let cloned = unsafe {
+            libc::fclonefileat(self.file.as_raw_fd(), libc::AT_FDCWD, target.as_ptr(), 0)
+        };
+        if cloned == 0 {
             return Ok(());
         }
         Err(classify_clone_error(
-            source,
+            self.path,
             destination,
             io::Error::last_os_error(),
         ))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (source, destination);
-        Err(CloneFileError::UnsupportedPlatform)
     }
 }
 
@@ -5766,26 +5858,6 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_clone_is_refused_before_anything_is_flushed() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::default());
-        let error = backend
-            .sync_and_clone(
-                Path::new("main.asif"),
-                None,
-                Path::new("session.sparseimage"),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApfsError::Clone(CloneFileError::InvalidImagePath { .. })
-        ));
-        assert!(
-            backend.runner().requests().is_empty(),
-            "the freshness flush is two syscalls on the source, never a host-wide sync child"
-        );
-    }
-
-    #[test]
     fn only_a_mounted_volume_root_is_a_mount_root() {
         let base = std::env::temp_dir().join(format!("cowshed-mount-root-{}", std::process::id()));
         fs::create_dir_all(&base).unwrap();
@@ -7380,10 +7452,12 @@ mod tests {
     }
 
     #[test]
-    fn clonefile_reports_a_missing_source_without_creating_destination() {
+    fn clone_reports_a_missing_source_without_creating_destination() {
         let source = temp_path("missing-clone-source", IMAGE_EXTENSION);
         let destination = temp_path("missing-clone-destination", IMAGE_EXTENSION);
-        let error = clonefile_native(&source, &destination).unwrap_err();
+        let error = MacOsApfsBackend::new(RecordingRunner::default())
+            .clone_image(&source, &destination)
+            .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
         #[cfg(not(target_os = "macos"))]
@@ -7401,22 +7475,125 @@ mod tests {
         assert!(matches!(error, CloneFileError::CrossVolume { .. }));
     }
 
+    /// A fresh `.asif` path pair in the temporary directory, which shares one volume.
+    #[cfg(target_os = "macos")]
+    fn clone_pair(label: &str) -> (PathBuf, PathBuf) {
+        let nonce = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let directory = std::env::temp_dir();
+        (
+            directory.join(format!("cowshed-{label}-source-{nonce}.{IMAGE_EXTENSION}")),
+            directory.join(format!(
+                "cowshed-{label}-destination-{nonce}.{IMAGE_EXTENSION}"
+            )),
+        )
+    }
+
+    /// Open `image` the way the image driver holds an attached image's file.
+    #[cfg(target_os = "macos")]
+    fn lock_as_attached(image: &Path) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(image)
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn clonefile_creates_an_independent_same_volume_image_file() {
-        let nonce = format!("{}-{:?}", std::process::id(), std::thread::current().id());
-        let source = std::env::temp_dir().join(format!("cowshed-clone-source-{nonce}.asif"));
-        let destination =
-            std::env::temp_dir().join(format!("cowshed-clone-destination-{nonce}.asif"));
+    fn a_held_image_clones_by_descriptor_into_an_independent_file() {
+        let (source, destination) = clone_pair("held-clone");
         fs::write(&source, b"fresh image bytes").unwrap();
 
-        clonefile_native(&source, &destination).unwrap();
+        DetachedImage::hold(&source, &destination)
+            .unwrap()
+            .clone_to(&destination)
+            .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"fresh image bytes");
         fs::write(&destination, b"changed clone").unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"fresh image bytes");
 
         fs::remove_file(source).unwrap();
         fs::remove_file(destination).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_image_an_attachment_locks_is_refused_and_nothing_is_cloned() {
+        let (source, destination) = clone_pair("attached-clone");
+        fs::write(&source, b"attached image bytes").unwrap();
+        let attached = lock_as_attached(&source).unwrap();
+
+        let error = MacOsApfsBackend::new(RecordingRunner::default())
+            .clone_image(&source, &destination)
+            .unwrap_err();
+        assert!(
+            matches!(&error, CloneFileError::SourceAttached { source: refused } if *refused == source),
+            "{error}"
+        );
+        assert!(!destination.exists(), "an attached image is never cloned");
+
+        drop(attached);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_image_keeps_attachments_out_and_admits_other_captures() {
+        let (source, destination) = clone_pair("held-lock");
+        fs::write(&source, b"held image bytes").unwrap();
+
+        let held = DetachedImage::hold(&source, &destination).unwrap();
+        let concurrent = DetachedImage::hold(&source, &destination)
+            .expect("two captures of one source do not refuse each other");
+        assert_eq!(
+            lock_as_attached(&source).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no attach takes the image while a capture holds it"
+        );
+        drop((held, concurrent));
+        drop(lock_as_attached(&source).expect("released once every capture lets go"));
+
+        fs::remove_file(source).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_image_whose_map_does_not_validate_is_refused_and_nothing_is_cloned() {
+        let (source, destination) = clone_pair("inconsistent-clone");
+        fs::write(&source, b"not an ASIF image").unwrap();
+
+        let error = MacOsApfsBackend::new(RecordingRunner::default())
+            .clone_image(&source, &destination)
+            .unwrap_err();
+        assert!(
+            matches!(&error, CloneFileError::SourceInconsistent { source: refused, .. } if *refused == source),
+            "{error}"
+        );
+        assert!(!destination.exists(), "a torn image is never cloned");
+
+        fs::remove_file(source).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlinked_source_is_never_followed() {
+        let (target, destination) = clone_pair("symlink-target");
+        let (source, _) = clone_pair("symlink-source");
+        fs::write(&target, b"target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+
+        let error = MacOsApfsBackend::new(RecordingRunner::default())
+            .clone_image(&source, &destination)
+            .unwrap_err();
+        assert!(
+            matches!(&error, CloneFileError::Io { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),
+            "{error}"
+        );
+        assert!(!destination.exists());
+
+        fs::remove_file(source).unwrap();
+        fs::remove_file(target).unwrap();
     }
 
     const SYSTEM_UUID: &str = "A925F069-4430-489F-8206-41FC42B27763";

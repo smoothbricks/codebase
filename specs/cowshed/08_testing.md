@@ -313,10 +313,12 @@ Covered flows:
   rebinding. Repeat for both grant and revoke.
 - **attach `-nomount` → fsck device → mount** ordering on APFS (the clone is verified as a block device _before_ it is
   mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
-- **fork mid-write clone validity**: clone an image while a writer churns the volume, then verify the clone mounts and
-  fsck-passes. (Measured baseline to hold: 10/10 clonefiles taken under a continuous file-writer plus a streaming 128
-  MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and readable, on ASIF; a non-synced clone may miss
-  the last writes — freshness, not consistency. This tier keeps that regression-pinned.)
+- **sealed image capture, never an attached backing-file clone**: the raw clone primitive refuses an attached ASIF
+  before creating a destination; a usable live source is detached without force, cloned through its held inode, and
+  restored with identical access/visibility and an updated registry after both success and failure. Busy-source refusal
+  names visible holders and leaves source bytes and mounts intact. Synthetic mixed-generation allocation maps pointing
+  past EOF or aliasing a physical chunk are rejected; valid sparse/partial maps are accepted. The earlier ten-sample
+  live-clone smoke was an observation, not proof of image-driver consistency.
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount

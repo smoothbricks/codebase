@@ -1797,7 +1797,7 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
     {
         return skipped(reseed_skip(busy));
     }
-    let _builds = match cargo::hold(&mount, &state)
+    let builds = match cargo::hold(&mount, &state)
         .map_err(|error| io("take the target's Cargo build locks", &mount, &error))?
     {
         Ok(held) => held,
@@ -1812,6 +1812,11 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
     };
     let previous = seeds_of(layout, target)?;
     let seed = BuildVolumeId::mint();
+    // The capture now removes the source from the filesystem namespace without force and
+    // clones only its detached, inode-held image. Our own lock descriptors would keep that
+    // unmount busy. Release them before sealing: a Cargo that gets in first makes unmount
+    // refuse, and no filesystem writer can modify the image after its driver is detached.
+    drop(builds);
     host.clone_build_volume(
         layout,
         &age.live,

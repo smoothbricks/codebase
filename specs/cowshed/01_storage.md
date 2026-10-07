@@ -283,15 +283,23 @@ The detached-grow timings above measured Apple's content resize, before the nati
 
 ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
 (<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
-warning come from `man hdiutil`. Both hold a crash-consistent APFS, and cowshed runs `fsck_apfs -q` before every mount
-either way. ASIF's chunk table can mark a chunk unmapped, which fits it returning part of deleted space on its own;
-SPARSE returns nothing until `hdiutil compact`, and little then. `diskutil image create from` rewrites a detached ASIF
-image from its allocated chunks only: on the churned four-clone image it took 2.8 s against the plain copy's 2.4 s and
-left 217 extents and 7.95 GiB against 792 and 8.83 GiB, with the same content, case sensitivity, and owner. An ASIF
-capacity as large as the store volume measured no cost against 100 GiB: creation, attach, empty allocation, and the
-allocation after a fill and a churn round match within noise, the churned image held 932 extents against 455 (about 1.5
-ms more first write), and `df` inside the volume reports the store's own free space as available. SPARSE at that
-capacity attached slower (525 against 287 ms) and once refused its first detach with `EBUSY`.
+warning come from `man hdiutil`. APFS's journal does not make the enclosing image driver's mutable allocation map a
+snapshot: `sync_volume_np(WAIT)` followed by image `fsync` and `clonefile` can capture mixed ASIF map generations.
+Cowshed therefore captures only a detached image, holds its inode with a non-blocking shared no-follow lock that
+excludes the driver's exclusive attachment lock, validates the allocation map, and clones through that held descriptor.
+Concurrent sealed readers may clone the same immutable seed or blank; an attachment cannot start until they finish. A
+mounted source is unmounted and detached **without force**, then restored with its original access/visibility and
+verified mapping, even after a clone failure. A busy source refuses with its holders; it is never cloned as a fallback.
+An already-detached seed is never attached for capture. No destination is published from inconsistent allocation data.
+`fsck_apfs -q` still checks the inner filesystem before a mount, but cannot establish the outer ASIF map's consistency.
+ASIF's chunk table can mark a chunk unmapped, which fits it returning part of deleted space on its own; SPARSE returns
+nothing until `hdiutil compact`, and little then. `diskutil image create from` rewrites a detached ASIF image from its
+allocated chunks only: on the churned four-clone image it took 2.8 s against the plain copy's 2.4 s and left 217 extents
+and 7.95 GiB against 792 and 8.83 GiB, with the same content, case sensitivity, and owner. An ASIF capacity as large as
+the store volume measured no cost against 100 GiB: creation, attach, empty allocation, and the allocation after a fill
+and a churn round match within noise, the churned image held 932 extents against 455 (about 1.5 ms more first write),
+and `df` inside the volume reports the store's own free space as available. SPARSE at that capacity attached slower (525
+against 287 ms) and once refused its first detach with `EBUSY`.
 
 Case-sensitive ASIF therefore costs nothing that case-insensitive ASIF does not: the flag is set once at creation, no
 step recurs per `new`, and every measured difference between the two sits inside the noise. SPARSE loses on creation,

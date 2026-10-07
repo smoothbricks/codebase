@@ -985,9 +985,12 @@ resume after its source is repaired. This repair does not change the fork's inhe
 
 ### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
 
-Checkpoint clonefiles the workspace image (crash-consistent, fsck-verified) under a label — generated from the UTC
-timestamp when you don't give one. Before publication, a supervisor barrier seals complete Arrow batches and spill
-files; a manifest commits every checkpoint-resident job byte. Recovery may discard only incomplete trailing data.
+Checkpoint captures the workspace image only after its driver is detached, then descriptor-clones the held source under
+a label — generated from the UTC timestamp when you don't give one. Source access and visibility are restored even if
+capture fails; a busy source is named and refuses without force, never copied while attached. ASIF allocation validation
+protects the outer image map, and fsck protects the inner filesystem. Before publication, a supervisor barrier seals
+complete Arrow batches and spill files; a manifest commits every checkpoint-resident job byte. Recovery may discard only
+incomplete trailing data.
 
 Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
 incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker

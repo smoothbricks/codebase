@@ -252,13 +252,16 @@ observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
 
-Budget: ≤ 1 s cold. No pool, no pre-warming.
+No pool or pre-warming. The CoW copy itself is small; sealing and restoring a live source are real lifecycle work, not
+part of the former attached-image clone shortcut.
 
-1. `flock` main's image lock; `fsync`/`sync` the main volume. Measured: the sync is for **freshness, not consistency** —
-   a live clone is always crash-consistent, but without a sync it can miss the last writes (a just-written file was
-   absent from a non-synced clone).
-2. `clonefile(main.asif, sessions/<name>.asif)` — ~2 ms regardless of content size. Create the complete closed-baseline
-   sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
+1. `flock` main's image lock. Capture its image only after a non-forced unmount/detach has settled the image driver;
+   preserve and restore the source's access, visibility and verified attachment mapping. A holder that prevents sealing
+   is named and refuses the capture, never forced or bypassed. Volume sync provides freshness, not an allocation-map
+   snapshot.
+2. Hold the detached source inode with a shared no-follow image lock excluding attachments, validate its ASIF map, then
+   descriptor-clone it to `sessions/<name>.asif`. Concurrent sealed readers are permitted. Create the complete
+   closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
    clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>` — ~235–400 ms typical for a freshly
    written image. Before the attach, the `first-write` step rewrites the clone's first block with the bytes it holds,
@@ -266,10 +269,9 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
    `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
    unchecked.
-4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
-   continuous writer plus a streaming 128 MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and
-   readable, on ASIF — this path is a safety net that is expected to essentially never fire; the fork-mid-write
-   integration test pins it, 08_testing.md.)
+4. On fsck failure, delete the clone and retry once from a fresh **sealed** capture. The former ten-sample live-clone
+   smoke passed fsck and reads, but did not prove image-driver consistency; a later mixed-generation ASIF allocation
+   tear falsified that guarantee. An attached backing-file clone is not a filesystem snapshot.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the

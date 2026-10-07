@@ -778,6 +778,7 @@ fn restore_adopted_checkout_paths(
     remove_empty_mountpoint(pre_cowshed_checkout)
 }
 
+const MNT_RDONLY: u64 = 0x0000_0001;
 const MNT_DONTBROWSE: u64 = 0x0010_0000;
 const MNT_IGNORE_OWNERS: u64 = 0x0020_0000;
 
@@ -810,6 +811,20 @@ impl KernelMountSnapshot {
             source_device: source_device.into(),
             flags,
         }
+    }
+
+    /// The access this mount was made with: what mounting the volume again must ask for.
+    fn access(&self) -> MountAccess {
+        if self.flags & MNT_RDONLY == 0 {
+            MountAccess::ReadWrite
+        } else {
+            MountAccess::ReadOnly
+        }
+    }
+
+    /// Whether this mount shows in the Finder: what mounting the volume again must ask for.
+    fn browse(&self) -> bool {
+        self.flags & MNT_DONTBROWSE == 0
     }
 }
 
@@ -3777,6 +3792,211 @@ where
             },
         }
     }
+
+    /// Settle the source's image driver before taking its backing-file snapshot. A refusal is
+    /// never forced; a source we detached is restored even when validation or cloning fails.
+    fn capture_image(
+        &self,
+        source: &Path,
+        source_mount: Option<&Path>,
+        destination: &Path,
+        workspace: Option<&LifecycleWorkspace>,
+    ) -> Result<(), ApfsStorageError> {
+        let Some(mount_point) = source_mount else {
+            return self
+                .backend
+                .clone_image(source, destination)
+                .map_err(ApfsError::from)
+                .map_err(ApfsStorageError::from);
+        };
+        let Some(attachment) = self.backend.existing_attachment(source)? else {
+            return self
+                .backend
+                .clone_image(source, destination)
+                .map_err(ApfsError::from)
+                .map_err(ApfsStorageError::from);
+        };
+        let canonical = fs::canonicalize(mount_point)
+            .map_err(|error| io_error("resolve capture source mount", mount_point, error))?;
+        let mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .find(|mount| mount.mount_point == mount_point || mount.mount_point == canonical);
+        let Some(mounted) = mounted else {
+            // An attached-but-unmounted source remains the driver's; the raw clone refuses it.
+            return self
+                .backend
+                .clone_image(source, destination)
+                .map_err(ApfsError::from)
+                .map_err(ApfsStorageError::from);
+        };
+        if mounted.source_device != attachment.volume_device() {
+            return Err(ApfsStorageError::Host(format!(
+                "capture source {} is not the image's volume: {} instead of {}",
+                mount_point.display(),
+                mounted.source_device,
+                attachment.volume_device()
+            )));
+        }
+        let access = mounted.access();
+        let browse = mounted.browse();
+        let registration = if let Some(workspace) = workspace {
+            let key = (workspace.repo().clone(), workspace.name().clone());
+            self.mounted
+                .remove(key.clone())?
+                .map(|entry| (key, entry.mount_id))
+        } else {
+            None
+        };
+        let captured = self
+            .backend
+            .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            .and_then(|()| self.backend.detach(&attachment, DetachIntent::WhenIdle))
+            .map_err(|refusal| self.capture_refusal(source, mount_point, refusal))
+            .and_then(|()| {
+                self.backend
+                    .clone_image(source, destination)
+                    .map_err(ApfsError::from)
+                    .map_err(ApfsStorageError::from)
+            });
+        let restored = self.restore_capture_source(
+            source,
+            mount_point,
+            access,
+            browse,
+            workspace,
+            registration,
+        );
+        match (captured, restored) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Err(primary), Err(cleanup)) => Err(ApfsStorageError::Cleanup {
+                operation: "capture and restore source image",
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            }),
+            (Ok(()), Err(primary)) => {
+                match fs::remove_file(destination) {
+                    Ok(()) => {
+                        if let Err(cleanup) = sync_parent_path(destination) {
+                            return Err(ApfsStorageError::Cleanup {
+                                operation: "sync removed unpublished capture after source restoration failed",
+                                primary: Box::new(primary),
+                                cleanup: Box::new(cleanup),
+                            });
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ApfsStorageError::Cleanup {
+                            operation: "remove unpublished capture after source restoration failed",
+                            primary: Box::new(primary),
+                            cleanup: Box::new(io_error(
+                                "remove unpublished capture",
+                                destination,
+                                error,
+                            )),
+                        });
+                    }
+                }
+                Err(primary)
+            }
+        }
+    }
+
+    fn capture_refusal(
+        &self,
+        source: &Path,
+        mount_point: &Path,
+        refusal: ApfsError,
+    ) -> ApfsStorageError {
+        if !crate::apfs::detach_was_dissented(&refusal) {
+            return refusal.into();
+        }
+        let holders = match self.mounted_at(mount_point) {
+            Ok(Some(_)) => match crate::build_volume::nx::volume_holders(mount_point) {
+                Ok(holders) => holders,
+                Err(error) => {
+                    return ApfsStorageError::Cleanup {
+                        operation: "name capture source holders",
+                        primary: Box::new(refusal.into()),
+                        cleanup: Box::new(io_error(
+                            "list capture source holders",
+                            mount_point,
+                            error,
+                        )),
+                    };
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                return ApfsStorageError::Cleanup {
+                    operation: "inspect refused capture source",
+                    primary: Box::new(refusal.into()),
+                    cleanup: Box::new(error),
+                };
+            }
+        };
+        ApfsError::CaptureSourceBusy {
+            image: source.to_owned(),
+            mount_point: mount_point.to_owned(),
+            holders,
+            refusal: Box::new(refusal),
+        }
+        .into()
+    }
+
+    fn restore_capture_source(
+        &self,
+        source: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+        workspace: Option<&LifecycleWorkspace>,
+        registration: Option<(MountKey, u64)>,
+    ) -> Result<(), ApfsStorageError> {
+        let attachment = match self.backend.existing_attachment(source)? {
+            Some(attachment) => attachment,
+            None => self.backend.attach_verified(source)?,
+        };
+        match self.mounted_at(mount_point)? {
+            Some(device) if device == attachment.volume_device() => {}
+            Some(device) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "cannot restore capture source at {}: another volume from {device} is mounted there",
+                    mount_point.display()
+                )));
+            }
+            None => self
+                .backend
+                .mount(&attachment, mount_point, access, browse)?,
+        }
+        if let Some(workspace) = workspace {
+            self.validate_marker(
+                mount_point,
+                &MarkerExpectation::owned(&self.config, workspace),
+            )?;
+        }
+        if let Some((key, mount_id)) = registration
+            && self
+                .mounted
+                .restore(
+                    key,
+                    MountedAttachment {
+                        mount_id,
+                        attachment,
+                    },
+                )?
+                .is_err()
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "capture source registry was claimed before restoration at {}",
+                mount_point.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<R> ApfsExecutionHost for MacOsApfsExecutionHost<R>
@@ -3891,16 +4111,15 @@ where
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(source)?;
         self.verify_controller_path(destination)?;
-        DetachedWorkspaceMetadata::read_for_image(source)
+        let metadata = DetachedWorkspaceMetadata::read_for_image(source)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let workspace = metadata_workspace_ref(&metadata)?;
         for path in [source, destination] {
             crate::metadata::validate_image_path(path)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         }
         Self::ensure_parent(destination)?;
-        self.backend
-            .sync_and_clone(source, source_mount, destination)
-            .map_err(Into::into)
+        self.capture_image(source, source_mount, destination, Some(&workspace))
     }
 
     /// Rewrite the image's first block with the bytes it holds: content-neutral, and the write

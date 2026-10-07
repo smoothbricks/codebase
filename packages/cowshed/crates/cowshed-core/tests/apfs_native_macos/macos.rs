@@ -422,8 +422,8 @@ fn attached(image: &Path) -> bool {
     !kernel_attachments(image).is_empty()
 }
 
-/// The total size of the filesystem mounted at `mount_point`, from `statfs`.
-fn filesystem_bytes(mount_point: &Path) -> u64 {
+/// The kernel's filesystem attributes for a real mount.
+fn filesystem_stat(mount_point: &Path) -> libc::statfs {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes()).expect("C path");
     // SAFETY: statfs writes only into the zeroed struct it is handed; the path is NUL-terminated.
@@ -435,7 +435,164 @@ fn filesystem_bytes(mount_point: &Path) -> u64 {
         mount_point.display(),
         std::io::Error::last_os_error()
     );
+    stat
+}
+
+fn filesystem_bytes(mount_point: &Path) -> u64 {
+    let stat = filesystem_stat(mount_point);
     stat.f_blocks * u64::from(stat.f_bsize)
+}
+
+fn live_capture_source(
+    fixture: &RealFixture,
+    access: MountAccess,
+    browse: bool,
+) -> (
+    MacOsApfsExecutionHost<SystemCommandRunner>,
+    PathBuf,
+    PathBuf,
+) {
+    let source = fixture
+        .layout()
+        .main_image()
+        .expect("source image")
+        .image()
+        .to_owned();
+    fixture.published_image(&source);
+    let mount = fixture.main_mount();
+    let host = fixture.host();
+    let attachment = host
+        .backend()
+        .attach_verified(&source)
+        .expect("attach source");
+    host.backend()
+        .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("initialize source");
+    fixture.plant_marker(&mount, &workspace());
+    mint_credentials(&workspace(), &mount, &ca_key_path(&source)).expect("source credentials");
+    std::fs::write(mount.join("sealed-payload"), b"complete source bytes").expect("source payload");
+    if access == MountAccess::ReadOnly || browse {
+        unmount(&mount);
+        let options = match (access, browse) {
+            (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
+            (MountAccess::ReadWrite, true) => "owners,noatime",
+            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
+            (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
+        };
+        fixture.remount(&attachment, &mount, options);
+    }
+    host.retain_mounted(&workspace(), attachment)
+        .expect("registered source");
+    (host, source, mount)
+}
+
+#[test]
+fn real_apfs_sealed_capture_restores_source_flags_and_registry_on_success_and_failure() {
+    for (label, access, browse) in [
+        ("rw-hidden", MountAccess::ReadWrite, false),
+        ("ro-browse", MountAccess::ReadOnly, true),
+    ] {
+        let fixture = RealFixture::new(label);
+        let (host, source, mount) = live_capture_source(&fixture, access, browse);
+        let original_flags = filesystem_stat(&mount).f_flags;
+        let destination = fixture.root().join("snapshot.asif");
+        host.clone_image(&source, Some(&mount), &destination)
+            .expect("sealed capture");
+        assert!(kernel_mount_at(&mount).is_some(), "source restored");
+        assert_eq!(
+            filesystem_stat(&mount).f_flags,
+            original_flags,
+            "source options unchanged"
+        );
+        assert_eq!(
+            std::fs::read(mount.join("sealed-payload")).unwrap(),
+            b"complete source bytes"
+        );
+        assert!(!attached(&destination), "captured image stays detached");
+
+        // A failed capture must restore the source too, and never delete a pre-existing target.
+        let occupied = fixture.root().join("occupied.asif");
+        std::fs::write(&occupied, b"preserve destination").unwrap();
+        let error = host
+            .clone_image(&source, Some(&mount), &occupied)
+            .expect_err("occupied target");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"preserve destination");
+        assert_eq!(filesystem_stat(&mount).f_flags, original_flags);
+
+        let cloned = host
+            .backend()
+            .attach_verified(&destination)
+            .expect("verify captured image");
+        let clone_mount = fixture.root().join("snapshot");
+        host.backend()
+            .mount(&cloned, &clone_mount, MountAccess::ReadOnly, false)
+            .expect("mount capture");
+        assert_eq!(
+            std::fs::read(clone_mount.join("sealed-payload")).unwrap(),
+            b"complete source bytes"
+        );
+        // A cached old disk identity would fail here after detach/reattach during capture.
+        host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
+            .expect("restored registry mapping");
+        assert!(kernel_mount_at(&mount).is_none());
+    }
+}
+
+#[test]
+fn real_apfs_capture_refuses_a_busy_source_without_force_or_a_destination() {
+    let fixture = RealFixture::new("capture-busy-source");
+    let (host, source, mount) = live_capture_source(&fixture, MountAccess::ReadWrite, false);
+    let held = std::fs::File::open(mount.join("sealed-payload")).expect("hold source");
+    let destination = fixture.root().join("snapshot.asif");
+    let error = host
+        .clone_image(&source, Some(&mount), &destination)
+        .expect_err("busy source");
+    assert!(error.to_string().contains("in use"), "{error}");
+    assert!(
+        error.to_string().contains(&std::process::id().to_string()),
+        "visible holder named: {error}"
+    );
+    assert!(!destination.exists());
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "source was not forced away"
+    );
+    assert_eq!(
+        std::fs::read(mount.join("sealed-payload")).unwrap(),
+        b"complete source bytes"
+    );
+    drop(held);
+    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
+        .expect("source registry retained");
+}
+
+/// A backing-file clone is not an image-driver snapshot. Even an unmounted attachment owns the
+/// ASIF allocator, so the raw clone primitive must refuse it without creating a destination.
+#[test]
+fn real_apfs_direct_clone_refuses_an_attached_asif_before_copying_any_image_bytes() {
+    let fixture = RealFixture::new("clone-attached-asif");
+    let source = fixture.root().join("source.asif");
+    let destination = fixture.root().join("destination.asif");
+    fixture.blank_image(&source);
+    let host = fixture.host();
+    let backend = host.backend();
+    let attachment = backend.attach_verified(&source).expect("attach source");
+    assert!(
+        attached(&source),
+        "the kernel has the source image attached"
+    );
+    let cloned = backend.clone_image(&source, &destination);
+    assert!(
+        cloned.is_err(),
+        "an attached ASIF must never be cloned through its backing file: {cloned:?}"
+    );
+    assert!(!destination.exists(), "no unsealed image may be published");
+    assert!(
+        attached(&source),
+        "refusal leaves the source attachment alone"
+    );
+    drop(attachment);
 }
 
 fn repo() -> RepoId {
