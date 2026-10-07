@@ -6,14 +6,18 @@
     "declarationMap": false,
     "emitDeclarationOnly": false,
     "noEmit": true,
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "types": ["bun"]
   },
   "include": [
-    "src/**/*.test.ts",
-    "src/**/*.spec.ts",
-    "src/**/__tests__/**/*.ts",
-    "src/**/__tests__/**/*.tsx",
-    "src/test-suite-tracer.ts"
+    "direnv/**/*.test.ts",
+    "direnv/**/*.spec.ts",
+    "direnv/**/__tests__/**/*.ts",
+    "direnv/**/__tests__/**/*.tsx",
+    "*.test.ts",
+    "*.spec.ts"
   ],
   "references": [
     {

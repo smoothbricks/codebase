@@ -1496,6 +1496,12 @@ async function createWorkspace(input: {
       ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
       ...(pkg.nx ? { nx: pkg.nx } : {}),
     });
+    // A package that runs a test runner has a suite: the typecheck-test policy refuses a
+    // test program that selects no file, so a fixture without one is not a realistic package.
+    if (/\b(?:bun test|vitest)\b/.test(JSON.stringify({ scripts: pkg.scripts, nx: pkg.nx }))) {
+      await mkdir(join(root, `packages/${pkg.dir}/src`), { recursive: true });
+      await writeFile(join(root, `packages/${pkg.dir}/src/index.test.ts`), 'export {};\n');
+    }
   }
   for (const [relativePath, content] of Object.entries(input.files ?? {})) {
     const absolutePath = join(root, relativePath);

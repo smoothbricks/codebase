@@ -11,6 +11,11 @@ export interface ManagedFile {
   target: string;
   content: string | null;
   executable?: boolean;
+  /**
+   * Why a `null` content is null, when the generator chose not to write a target
+   * it would otherwise own. Reported on the `skipped` result; it blocks nothing.
+   */
+  skipReason?: string;
 }
 
 /** Only facts Tree cannot expose. File contents always come from Tree. */
@@ -64,7 +69,7 @@ export function stageManagedFiles(
   const seen = new Set<string>();
   const pending = new Map(tree.listChanges().map((change) => [change.path, change]));
   const targets = new Set(files.map((file) => file.target));
-  return files.map(({ target, content, executable = false }): FileResult => {
+  return files.map(({ target, content, executable = false, skipReason }): FileResult => {
     const conflict = (reason: string): FileResult => ({ target, action: 'drifted', reason });
     if (!isManagedTarget(target)) return conflict('expected a canonical workspace-relative path');
     if (seen.has(target)) return conflict('duplicate managed target');
@@ -73,7 +78,10 @@ export function stageManagedFiles(
     if (parts.some((_, i) => i > 0 && targets.has(parts.slice(0, i).join('/')))) {
       return conflict('a managed file is also declared as a parent directory');
     }
-    if (content === null) return { target, action: 'skipped' };
+    if (content === null)
+      return skipReason === undefined
+        ? { target, action: 'skipped' }
+        : { target, action: 'skipped', reason: skipReason };
     const path = paths.get(target);
     if (path?.error) return conflict(path.error);
     for (let i = 1; i < parts.length; i++) {
@@ -109,7 +117,7 @@ export function stageManagedFiles(
 }
 
 export function assertNoManagedConflicts(results: readonly FileResult[]): void {
-  const conflicts = results.filter((result) => result.reason !== undefined);
+  const conflicts = results.filter((result) => result.action === 'drifted' && result.reason !== undefined);
   if (conflicts.length > 0) {
     throw new ManagedContentConflict(
       `Managed-file update refused before writing:\n${conflicts.map(({ target, reason }) => `${target}: ${reason}`).join('\n')}`,

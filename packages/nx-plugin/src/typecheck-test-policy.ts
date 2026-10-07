@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, posix, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
@@ -6,7 +6,14 @@ import typia from 'typia';
 import { ManagedContentConflict } from './managed-files/managed-content.js';
 import { jsonFileText } from './managed-files/managed-format.js';
 import type { ManagedFile } from './managed-files/tree.js';
-
+import {
+  includeGlobsFor,
+  listTypeScriptSources,
+  type ProjectTree,
+  type TestProgram,
+  type TestProgramFault,
+  testProgramFault,
+} from './test-program.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
 export type TestRunner = 'bun' | 'vitest';
@@ -164,7 +171,9 @@ export function applyTypecheckTestDefaults(
     testExtends: string | string[];
     libCompilerOptions?: Record<string, unknown>;
     referencePaths: string[];
-    /** The file did not exist: a fresh program gets the src-test globs. */
+    /** Where the project's sources and tests are: the include is derived from it. */
+    program: TestProgram;
+    /** The file did not exist: a fresh program gets the globs of where the tests live. */
     isNew?: boolean;
   },
 ): boolean {
@@ -214,18 +223,17 @@ export function applyTypecheckTestDefaults(
   // A test program that declares no `include` inherits one from `extends`
   // (a package keeping its suites in `test/` alongside src, tooling and
   // scripts as one program). Minting `include` there REPLACES the inherited
-  // set with globs that match nothing, and a program of zero files passes the
-  // gate by compiling nothing. Only a program that already declares `include`,
-  // or a new file, gets the src-test globs merged in.
+  // set with globs that may match nothing, and a program of zero files passes
+  // the gate by compiling nothing. Only a program that already declares
+  // `include`, or a new file, gets globs merged in, and they come from where
+  // the project's tests live (`includeGlobsFor`), not from a fixed `src/`.
   if (options.isNew || Object.hasOwn(tsconfigTest, 'include')) {
     changed =
-      mergeStringListProperty(tsconfigTest, 'include', [
-        'src/**/*.test.ts',
-        'src/**/*.spec.ts',
-        'src/**/__tests__/**/*.ts',
-        'src/**/__tests__/**/*.tsx',
-        'src/test-suite-tracer.ts',
-      ]) || changed;
+      mergeStringListProperty(
+        tsconfigTest,
+        'include',
+        includeGlobsFor(options.program, tsconfigTest, options.isNew === true),
+      ) || changed;
   }
 
   for (const referencePath of options.referencePaths) {
@@ -281,6 +289,10 @@ export function checkTypecheckTestPolicyTree(tree: Tree): NxPolicyIssue[] {
     // Check tsconfig.test.json contents
     const tsconfigTest = readJson<Record<string, unknown>>(tree, tsconfigTestPath);
     issues.push(...checkTypecheckTestConfig(tsconfigTest, config.root));
+    const fault = testProgramFault(treeProgram(tree, config.root), tsconfigTest);
+    if (fault !== null) {
+      issues.push({ path: tsconfigTestPath, message: testProgramFaultMessage(config.root, testRunners, fault) });
+    }
 
     // Check tsconfig.json reference
     const tsconfigPath = `${config.root}/tsconfig.json`;
@@ -329,14 +341,28 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     // Collect reference paths
     const referencePaths = collectReferencePathsTree(tree, config.root, pkg, workspacePackages);
 
+    const program = treeProgram(tree, config.root);
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners,
       testExtends,
       libCompilerOptions: libCompilerOptions ?? undefined,
       referencePaths,
+      program,
       isNew,
     });
-    files.push(renderTsconfig(tree, tsconfigTestPath, tsconfigTest, changed || isNew));
+    // A program that would select none of the project's tests is not written: it would typecheck
+    // nothing and pass. It does not block the rest of the update either; `smoo monorepo check`
+    // reports the project, and the next update writes the file once a test exists to select.
+    const fault = testProgramFault(program, tsconfigTest);
+    files.push(
+      fault === null
+        ? renderTsconfig(tree, tsconfigTestPath, tsconfigTest, changed || isNew)
+        : {
+            target: tsconfigTestPath,
+            content: null,
+            skipReason: testProgramFaultMessage(config.root, testRunners, fault),
+          },
+    );
 
     // Remove test reference from tsconfig.json
     const tsconfigPath = `${config.root}/tsconfig.json`;
@@ -360,6 +386,48 @@ function renderTsconfig(tree: Tree, target: string, config: Record<string, unkno
     );
   }
   return { target, content: jsonFileText(join(tree.root, target), config) };
+}
+
+function treeProgram(tree: Tree, projectRoot: string): TestProgram {
+  return {
+    projectRoot,
+    files: listTypeScriptSources(tree, projectRoot),
+    readConfig: (path) => (tree.exists(path) ? readJson<Record<string, unknown>>(tree, path) : null),
+  };
+}
+
+function diskProgram(root: string, projectRoot: string): TestProgram {
+  const disk: ProjectTree = {
+    children: (directory) => readdirSync(join(root, directory)),
+    isFile: (path) => {
+      try {
+        return statSync(join(root, path)).isFile();
+      } catch {
+        return false;
+      }
+    },
+  };
+  return {
+    projectRoot,
+    files: listTypeScriptSources(disk, projectRoot),
+    readConfig: (path) => readJsonObject(join(root, path)),
+  };
+}
+
+function testProgramFaultMessage(
+  projectRoot: string,
+  testRunners: ReadonlySet<TestRunner>,
+  fault: TestProgramFault,
+): string {
+  const selection =
+    fault.kind === 'no-tests'
+      ? 'matches no file (the project has no test file)'
+      : `matches no file of its tests (for example ${fault.tests[0]})`;
+  return (
+    `${projectRoot}: tsconfig.test.json ${selection}, but the project has a ${formatTestRunnerList(testRunners)} target. ` +
+    'A test program that selects none of its tests typechecks nothing and still passes. ' +
+    'Tests are *.test.ts and *.spec.ts files (or files under __tests__/) under src/, or in a directory its include names.'
+  );
 }
 
 /**
@@ -406,6 +474,11 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
     if (tsconfig) {
       const absoluteIssues = checkTypecheckTestConfig(tsconfig, join(root, packagePath));
       issues.push(...absoluteIssues);
+      const program = diskProgram(root, packagePath);
+      const fault = testProgramFault(program, tsconfig);
+      if (fault !== null) {
+        issues.push({ path: tsconfigTestPath, message: testProgramFaultMessage(packagePath, testRunners, fault) });
+      }
       if (absoluteIssues.length === 0) {
         const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
         const testExtends = tsconfigExtends(libTsconfig) ?? posix.relative(packagePath, 'tsconfig.base.json');
@@ -418,6 +491,7 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
             testExtends,
             libCompilerOptions: libCompilerOptions ?? undefined,
             referencePaths,
+            program,
           })
         ) {
           issues.push({
@@ -566,6 +640,12 @@ function listWorkspacePackageJsonPaths(root: string): string[] {
     : [];
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
+    if (!pattern.includes('*')) {
+      // A workspace named by path (`tooling`) is a package like any `packages/*` member.
+      const packageJsonPath = join(root, pattern, 'package.json');
+      if (existsSync(packageJsonPath)) paths.push(packageJsonPath);
+      continue;
+    }
     if (!pattern.endsWith('/*')) {
       continue;
     }

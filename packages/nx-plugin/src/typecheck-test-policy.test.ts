@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -8,6 +8,7 @@ import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import { FsTree, flushChanges } from 'nx/src/generators/tree.js';
 import { inspectManagedPaths } from './managed-files/paths.js';
 import { assertNoManagedConflicts, stageManagedFiles } from './managed-files/tree.js';
+import type { TestProgram } from './test-program.js';
 
 import {
   applyTypecheckTestDefaults,
@@ -199,12 +200,15 @@ describe('checkTsconfigTestReference', () => {
 });
 
 describe('applyTypecheckTestDefaults', () => {
+  const program: TestProgram = { projectRoot: 'packages/app', files: ['src/app.test.ts'], readConfig: () => null };
+
   it('applies all defaults to empty object', () => {
     const tsconfigTest: Record<string, unknown> = {};
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: ['./tsconfig.lib.json'],
+      program,
       isNew: true,
     });
     expect(changed).toBe(true);
@@ -236,6 +240,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
     });
     expect(declared.extends).toBe('./tsconfig.json');
     expect(Object.hasOwn(declared, 'include')).toBe(false);
@@ -247,6 +252,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
     });
     expect(expectStringArray(explicit.include)).toEqual(expect.arrayContaining(['test/**/*.ts', 'src/**/*.test.ts']));
   });
@@ -263,6 +269,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
       libCompilerOptions: { lib: ['es2022'], module: 'preserve' },
     });
 
@@ -275,6 +282,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
       libCompilerOptions: { lib: ['es2022'] },
     });
     expect(expectRecord(silent.compilerOptions).lib).toEqual(['es2022']);
@@ -286,6 +294,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../tsconfig.custom.json',
       referencePaths: [],
+      program,
     });
     expect(tsconfigTest.extends).toBe('../tsconfig.custom.json');
   });
@@ -297,6 +306,7 @@ describe('applyTypecheckTestDefaults', () => {
       testExtends: '../../tsconfig.base.json',
       libCompilerOptions: { baseUrl: '.', module: 'esnext', jsx: 'react-jsx' },
       referencePaths: [],
+      program,
     });
     const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect(compilerOptions.baseUrl).toBe('.');
@@ -310,6 +320,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['vitest'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
     });
     const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect(compilerOptions.types).toBeUndefined();
@@ -323,6 +334,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['bun'] as const),
       testExtends: '../../tsconfig.base.json',
       referencePaths: [],
+      program,
     });
     expect(changed).toBe(true);
     const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
@@ -337,6 +349,7 @@ describe('applyTypecheckTestDefaults', () => {
       testExtends: '../../tsconfig.base.json',
       libCompilerOptions: { lib: ['es2024', 'webworker'] },
       referencePaths: ['./tsconfig.lib.json'],
+      program,
     };
     applyTypecheckTestDefaults(tsconfigTest, opts);
     const secondChanged = applyTypecheckTestDefaults(tsconfigTest, opts);
@@ -386,6 +399,7 @@ describe('typecheck test policy (Tree)', () => {
       compilerOptions: { composite: true, baseUrl: '.', rootDir: 'src', outDir: 'dist' },
     });
 
+    tree.write('packages/app/src/app.test.ts', 'export {};\n');
     const changed = applyTypecheckTestPolicyTree(tree);
     expect(changed).toBe(true);
 
@@ -418,6 +432,8 @@ describe('typecheck test policy (Tree)', () => {
       writeJson(tree, `${root}/package.json`, { name: `@scope/${name}`, scripts: { test: 'bun test' }, nx: { name } });
     }
 
+    tree.write('tooling/src/tooling.test.ts', 'export {};\n');
+    tree.write('packages/app/src/app.test.ts', 'export {};\n');
     applyTypecheckTestPolicyTree(tree);
     expect(readJson<Record<string, unknown>>(tree, 'tooling/tsconfig.test.json').extends).toBe('../tsconfig.base.json');
     expect(readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json').extends).toBe(
@@ -448,6 +464,9 @@ describe('typecheck test policy (Tree)', () => {
       });
     }
 
+    for (const name of ['app', 'lib', 'inherits']) {
+      tree.write(`packages/${name}/src/${name}.test.ts`, 'export {};\n');
+    }
     applyTypecheckTestPolicyTree(tree);
     const references = expectReferences(
       readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json').references,
@@ -557,6 +576,7 @@ describe('typecheck test policy (Tree)', () => {
       references: [{ path: './tsconfig.lib.json' }, { path: './tsconfig.test.json' }],
     });
 
+    tree.write('packages/app/src/app.test.ts', 'export {};\n');
     const changed = applyTypecheckTestPolicyTree(tree);
     expect(changed).toBe(true);
 
@@ -615,6 +635,7 @@ describe('typecheck test policy (Tree)', () => {
       compilerOptions: { composite: true },
     });
 
+    tree.write('packages/app/src/app.test.ts', 'export {};\n');
     expect(applyTypecheckTestPolicyTree(tree)).toBe(true);
 
     const tsconfig = readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json');
@@ -770,6 +791,7 @@ describe('typecheck test policy', () => {
         name: '@scope/bad',
         scripts: { test: 'bun test' },
       });
+      await writeSource(join(root, 'packages/bad/src/bad.test.ts'));
       await writeJsonFs(join(root, 'packages/bad/tsconfig.test.json'), {
         compilerOptions: {
           composite: true,
@@ -966,6 +988,327 @@ describe('typecheck test policy', () => {
       const issues = checkTypecheckTestPolicy(root);
       expect(issues.length).toBe(1);
       expect(issues[0]?.message).toContain('bun test');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The test program's include comes from where the tests live, and a program
+// that selects no file is refused
+// ---------------------------------------------------------------------------
+
+const SRC_GLOBS = [
+  'src/**/*.test.ts',
+  'src/**/*.spec.ts',
+  'src/**/__tests__/**/*.ts',
+  'src/**/__tests__/**/*.tsx',
+  'src/test-suite-tracer.ts',
+];
+
+function globsFor(directory: string): string[] {
+  return [
+    `${directory}/**/*.test.ts`,
+    `${directory}/**/*.spec.ts`,
+    `${directory}/**/__tests__/**/*.ts`,
+    `${directory}/**/__tests__/**/*.tsx`,
+  ];
+}
+
+async function writeSource(path: string, text = 'export {};\n'): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, text);
+}
+
+/** The shape of this repository's `tooling` project: tests beside the shell scripts, no src/. */
+async function toolingShapedWorkspace(root: string): Promise<void> {
+  await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*', 'tooling'] });
+  await writeJsonFs(join(root, 'tsconfig.base.json'), { compilerOptions: {} });
+  await writeJsonFs(join(root, 'tooling/package.json'), {
+    name: '@scope/tooling',
+    private: true,
+    nx: {
+      name: 'tooling',
+      targets: {
+        test: {
+          executor: '@smoothbricks/nx-plugin:bounded-exec',
+          options: { command: 'bun test --timeout=30000 direnv', cwd: '{projectRoot}' },
+        },
+      },
+    },
+  });
+  await writeSource(join(root, 'tooling/direnv/enter-shell.test.ts'));
+}
+
+describe('where the test program looks for tests', () => {
+  it('includes the directory a src-less project keeps its tests in, not src', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await toolingShapedWorkspace(root);
+
+      expect(applyTypecheckTestPolicy(root)).toBe(true);
+
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'tooling/tsconfig.test.json')));
+      expect(tsconfig.include).toEqual(globsFor('direnv'));
+      expect(applyTypecheckTestPolicy(root)).toBe(false);
+      expect(checkTypecheckTestPolicy(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the src convention for a package whose tests live in src', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });
+      await writeJsonFs(join(root, 'packages/app/package.json'), { name: '@scope/app', scripts: { test: 'bun test' } });
+      await writeSource(join(root, 'packages/app/src/app.test.ts'));
+      // A stray outside src stays the stray-test policy's to report; it must not widen the program.
+      await writeSource(join(root, 'packages/app/scripts/helper.test.ts'));
+
+      applyTypecheckTestPolicy(root);
+
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/app/tsconfig.test.json')));
+      expect(tsconfig.include).toEqual(SRC_GLOBS);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not add a glob for tests an include the project wrote already selects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await toolingShapedWorkspace(root);
+      await writeJsonFs(join(root, 'tooling/tsconfig.test.json'), {
+        extends: '../tsconfig.base.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: ['direnv/**/*'],
+      });
+
+      expect(applyTypecheckTestPolicy(root)).toBe(false);
+
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'tooling/tsconfig.test.json')));
+      expect(tsconfig.include).toEqual(['direnv/**/*']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('adds the directory to an include the project wrote that selects none of its tests', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await toolingShapedWorkspace(root);
+      await writeJsonFs(join(root, 'tooling/tsconfig.test.json'), {
+        extends: '../tsconfig.base.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: ['src/**/*.test.ts'],
+      });
+
+      expect(applyTypecheckTestPolicy(root)).toBe(true);
+
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'tooling/tsconfig.test.json')));
+      expect(tsconfig.include).toEqual(['src/**/*.test.ts', ...globsFor('direnv')]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a test program that selects none of its tests', () => {
+  async function packageWithoutTests(root: string): Promise<void> {
+    await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });
+    await writeJsonFs(join(root, 'tsconfig.base.json'), { compilerOptions: {} });
+    await writeJsonFs(join(root, 'packages/app/package.json'), { name: '@scope/app', scripts: { test: 'bun test' } });
+    await writeSource(join(root, 'packages/app/src/index.ts'));
+  }
+
+  it('is reported by the generator without writing the file, naming the project and why', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      const tree = new FsTree(root, false);
+
+      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+      const skipped = results.find((result) => result.target === 'packages/app/tsconfig.test.json');
+
+      expect(skipped?.action).toBe('skipped');
+      expect(skipped?.reason).toContain('matches no file');
+      expect(skipped?.reason).toContain('packages/app');
+      expect(tree.exists('packages/app/tsconfig.test.json')).toBe(false);
+      expect(() => assertNoManagedConflicts(results)).not.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is reported by the policy check', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      await writeJsonFs(join(root, 'packages/app/tsconfig.test.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: SRC_GLOBS,
+      });
+
+      const issues = checkTypecheckTestPolicy(root);
+
+      expect(issues.map((issue) => issue.path)).toEqual([join(root, 'packages/app/tsconfig.test.json')]);
+      expect(issues[0]?.message).toContain('matches no file');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is refused when its exclude removes every test', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      await writeSource(join(root, 'packages/app/src/app.test.ts'));
+      await writeJsonFs(join(root, 'packages/app/tsconfig.test.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: SRC_GLOBS,
+        exclude: ['src'],
+      });
+
+      const issues = checkTypecheckTestPolicy(root);
+
+      expect(issues.map((issue) => issue.message).join('\n')).toContain('matches no file');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is not refused while an inherited include the plugin cannot read may select files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      await writeJsonFs(join(root, 'packages/app/tsconfig.test.json'), {
+        extends: '@acme/tsconfig/bun.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+      });
+
+      expect(checkTypecheckTestPolicy(root).some((issue) => issue.message.includes('matches no file'))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is reported for a workspace member named by path, which the packages/* listing never walked', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await toolingShapedWorkspace(root);
+      await writeJsonFs(join(root, 'tooling/tsconfig.test.json'), {
+        extends: '../tsconfig.base.json',
+        compilerOptions: {
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: ['src/**/*.test.ts'],
+      });
+
+      const issues = checkTypecheckTestPolicy(root);
+
+      expect(issues.map((issue) => issue.path)).toEqual([
+        join(root, 'tooling/tsconfig.test.json'),
+        join(root, 'tooling/tsconfig.test.json'),
+      ]);
+      expect(issues[0]?.message).toContain('matches no file of its tests');
+      expect(issues[1]?.message).toContain('canonical');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is reported by the Tree check too', () => {
+    const tree = createTreeWithEmptyWorkspace();
+    addProjectConfiguration(tree, 'app', { root: 'packages/app', targets: {} });
+    writeJson(tree, 'packages/app/package.json', {
+      name: '@scope/app',
+      scripts: { test: 'bun test' },
+      nx: { name: 'app' },
+    });
+    writeJson(tree, 'tsconfig.base.json', { compilerOptions: {} });
+    tree.write('packages/app/src/index.ts', 'export {};\n');
+    writeJson(tree, 'packages/app/tsconfig.test.json', {
+      extends: '../../tsconfig.base.json',
+      compilerOptions: { noEmit: true, composite: false, declaration: false, declarationMap: false, types: ['bun'] },
+      include: SRC_GLOBS,
+    });
+
+    expect(checkTypecheckTestPolicyTree(tree).map((issue) => issue.message)).toEqual([
+      expect.stringContaining('matches no file (the project has no test file)'),
+    ]);
+  });
+
+  it('leaves an existing config it cannot honor as it was, and still repairs the project tsconfig.json', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      await writeJsonFs(join(root, 'packages/app/tsconfig.json'), {
+        references: [{ path: './tsconfig.lib.json' }, { path: './tsconfig.test.json' }],
+      });
+
+      const tree = new FsTree(root, false);
+      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+
+      expect(results.find((result) => result.target === 'packages/app/tsconfig.json')?.action).toBe('updated');
+      expect(results.find((result) => result.target === 'packages/app/tsconfig.test.json')?.action).toBe('skipped');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not stumble on a dangling link beside the sources', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await packageWithoutTests(root);
+      await writeSource(join(root, 'packages/app/src/app.test.ts'));
+      await symlink(join(root, 'nowhere'), join(root, 'packages/app/result'));
+
+      expect(applyTypecheckTestPolicy(root)).toBe(true);
+      expect(checkTypecheckTestPolicy(root)).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

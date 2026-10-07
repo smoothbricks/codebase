@@ -110,4 +110,53 @@ describe('managed test tsconfig reconciliation', () => {
     expect(readFileSync(join(tree.root, testConfigPath), 'utf8')).toBe(documented);
     expect(existsSync(join(tree.root, '.github/workflows/ci.yml'))).toBe(false);
   });
+
+  describe('a project whose test program would select no file', () => {
+    // Selection is only knowable through bases the plugin can read; the fixture's default lib
+    // program extends one outside the tree.
+    function withoutTests(): FsTree {
+      const tree = workspace();
+      writeJson(tree, 'packages/app/tsconfig.lib.json', {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src', outDir: 'dist' },
+      });
+      flushChanges(tree.root, tree.listChanges());
+      return tree;
+    }
+
+    it('is skipped with its reason by check, and nothing is written', async () => {
+      const tree = withoutTests();
+
+      const results = await reconcile(new FsTree(tree.root, false), 'check');
+
+      expect(results).toContainEqual({
+        target: testConfigPath,
+        action: 'skipped',
+        reason: expect.stringContaining('matches no file'),
+      });
+      expect(existsSync(join(tree.root, testConfigPath))).toBe(false);
+    });
+
+    it('is not written by update, which still writes every other managed file', async () => {
+      const tree = withoutTests();
+
+      const results = await reconcile(new FsTree(tree.root, false), 'update');
+
+      expect(results.find((result) => result.target === testConfigPath)?.action).toBe('skipped');
+      expect(existsSync(join(tree.root, testConfigPath))).toBe(false);
+      expect(existsSync(join(tree.root, '.github/workflows/ci.yml'))).toBe(true);
+    });
+
+    it('is written once the project has a test to select', async () => {
+      const tree = withoutTests();
+      tree.write('packages/app/src/app.test.ts', 'export {};\n');
+      flushChanges(tree.root, tree.listChanges());
+
+      await reconcile(new FsTree(tree.root, false), 'update');
+
+      expect(readJson(new FsTree(tree.root, false), testConfigPath)).toMatchObject({
+        include: expect.arrayContaining(['src/**/*.test.ts']),
+      });
+    });
+  });
 });
