@@ -726,4 +726,256 @@ mod tests {
         );
         assert_eq!(layout.list().unwrap(), []);
     }
+
+    const MIB: i64 = 1 << 20;
+    /// What a volume may move by beside a job's file data: the file's inode and extent records,
+    /// and what fseventsd journals on the volume meanwhile. Measured at 4 KiB for a 64 MiB write;
+    /// a container-wide reading moves by the sibling volume's whole 32 MiB, far outside it.
+    const METADATA: i64 = 256 << 10;
+
+    /// Run `script` under `/bin/sh` in `cwd`, as a job's command runs, and require it to succeed.
+    fn job(cwd: &Path, script: &str) {
+        use crate::fork_lock::Run as _;
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(cwd)
+            .status_locked()
+            .expect("spawn the job");
+        assert!(status.success(), "{script}: {status:?}");
+    }
+
+    /// A command writing `mebibytes` of incompressible bytes to `path`, fsynced before it exits.
+    fn write(path: &str, mebibytes: u32) -> String {
+        format!("/bin/dd if=/dev/urandom of={path} bs=1048576 count={mebibytes} conv=fsync")
+    }
+
+    #[track_caller]
+    fn near(observed: i64, expected: i64, what: &str) {
+        assert!(
+            (observed - expected).abs() <= METADATA,
+            "{what}: {observed} bytes, expected {expected} within {METADATA}"
+        );
+    }
+
+    fn diskutil(args: &[&str]) -> String {
+        use crate::fork_lock::Run as _;
+        let output = std::process::Command::new("/usr/sbin/diskutil")
+            .args(args)
+            .output_locked()
+            .expect("run diskutil");
+        assert!(
+            output.status.success(),
+            "diskutil {args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("diskutil answers UTF-8")
+    }
+
+    /// A volume the test added to a scratch image's container. The scratch sweep releases only
+    /// one-volume images, so it is deleted before the scratch root drops, on a panic too.
+    struct AddedVolume(Option<String>);
+
+    impl AddedVolume {
+        fn device(&self) -> &str {
+            self.0.as_deref().expect("the volume is not deleted yet")
+        }
+
+        fn delete(mut self) {
+            let device = self.0.take().expect("the volume is not deleted yet");
+            diskutil(&["apfs", "deleteVolume", &device]);
+        }
+    }
+
+    impl Drop for AddedVolume {
+        fn drop(&mut self) {
+            if let Some(device) = self.0.take() {
+                use crate::fork_lock::Run as _;
+                let deleted = std::process::Command::new("/usr/sbin/diskutil")
+                    .args(["apfs", "deleteVolume", &device])
+                    .output_locked();
+                eprintln!("deleting the added volume {device} after a failure: {deleted:?}");
+            }
+        }
+    }
+
+    /// The APFS volume stat a job's samples read: a job writes 64 MiB into its workspace and 32
+    /// MiB through a build-state link into the volume the workspace's build link names, then
+    /// deletes a 16 MiB file that predates it, then its own 64 MiB. Each sample is an owned
+    /// volume's own used bytes against the spawn baseline: the deletion drops the workspace
+    /// delta by 16 MiB and the last one takes it below zero. A write to a sibling volume in the
+    /// workspace's own container moves neither delta, which a container-wide reading would by the
+    /// sibling's whole 32 MiB. A mountpoint its volume has left is a typed failure, never the
+    /// parent volume's usage.
+    #[test]
+    fn real_apfs_volume_usage_reads_the_owned_volumes_and_nothing_else() {
+        use crate::api::resources::VolumeUsage;
+        use crate::build_volume::link;
+        use crate::capabilities::BuildStatePath;
+        use crate::runtime::volume_usage::{
+            VolumeAtSpawn, VolumeBaseline, VolumeStat as _, VolumeStatError,
+        };
+        use crate::storage::apfs::native::{ApfsVolume, ApfsVolumeStat};
+
+        let root = crate::scratch_apfs::ScratchRoot::new("volume-usage").expect("scratch root");
+        let (host, layout) = fixture(root.path());
+
+        // The workspace: an image of its own, mounted as the checkout.
+        let image = root.path().join("store/lane.asif");
+        crate::blank_image::blank_image(&image);
+        let attachment = host
+            .backend
+            .attach_verified(&image)
+            .expect("attach the workspace");
+        let checkout = root.path().join("lane");
+        fs::create_dir_all(&checkout).unwrap();
+        host.backend
+            .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
+            .expect("mount the workspace");
+        fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+
+        // Its build volume, recorded as the workspace's own and linked, with one build-state link.
+        let build_id = BuildVolumeId::mint();
+        crate::blank_image::blank_image(&layout.image(&build_id));
+        let build_mount = host
+            .mount_build_volume(&layout, &build_id)
+            .expect("mount the build volume");
+        layout.write_record(&build_id, &linked("lane")).unwrap();
+        link::point(&checkout, &build_mount).unwrap();
+        link::link_paths(
+            &checkout,
+            &build_mount,
+            &[BuildStatePath::new("target", "target").unwrap()],
+        )
+        .unwrap();
+        // The volume `WorkspaceRef::build_volume` names for this workspace.
+        let named = layout
+            .grant(&WorkspaceName::new("lane").unwrap(), &checkout)
+            .unwrap()
+            .expect("the workspace links a build volume");
+        assert_eq!(named, build_mount);
+
+        // A sibling volume in the workspace's own container, nothing to do with the job.
+        let container = attachment
+            .volume_device()
+            .rsplit_once('s')
+            .map(|(container, _)| container)
+            .expect("an APFS volume device is <container>s<n>");
+        let added = diskutil(&[
+            "apfs",
+            "addVolume",
+            container,
+            "APFS",
+            "sibling",
+            "-nomount",
+        ]);
+        let added = AddedVolume(Some(
+            added
+                .lines()
+                .find_map(|line| line.strip_prefix("Created new APFS Volume "))
+                .expect("diskutil names the volume it added")
+                .trim()
+                .to_owned(),
+        ));
+        let sibling = root.path().join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        diskutil(&[
+            "mount",
+            "-mountPoint",
+            sibling.to_str().unwrap(),
+            added.device(),
+        ]);
+
+        job(&checkout, &write("predates.bin", 16));
+        let captured = |mount: &Path, what: &str| {
+            VolumeAtSpawn::observed(Ok(ApfsVolume::capture(mount).expect(what)))
+        };
+        let baseline = VolumeBaseline {
+            workspace: captured(&checkout, "the workspace volume"),
+            build: Some(captured(&named, "the build volume")),
+        };
+        let delta = |usage: Option<VolumeUsage>| match usage {
+            Some(VolumeUsage::Read { delta_bytes }) => delta_bytes.get(),
+            other => panic!("each owned volume is read: {other:?}"),
+        };
+        let sample = || {
+            let sample = baseline.sample(&ApfsVolumeStat);
+            (delta(Some(sample.workspace)), delta(sample.build))
+        };
+
+        job(
+            &checkout,
+            &format!(
+                "{} && {}",
+                write("job.bin", 64),
+                write("target/job.bin", 32)
+            ),
+        );
+        let (workspace, build) = sample();
+        near(workspace, 64 * MIB, "workspace after the job's writes");
+        near(build, 32 * MIB, "build volume after the job's writes");
+
+        job(&sibling, &write("unrelated.bin", 32));
+        let (unmoved, unmoved_build) = sample();
+        near(
+            unmoved,
+            workspace,
+            "workspace after a sibling volume's write",
+        );
+        near(
+            unmoved_build,
+            build,
+            "build volume after a sibling volume's write",
+        );
+
+        job(&checkout, "rm predates.bin");
+        let (pruned, pruned_build) = sample();
+        near(
+            workspace - pruned,
+            16 * MIB,
+            "workspace drop for the file that predates the job",
+        );
+        near(
+            pruned_build,
+            build,
+            "build volume after a workspace deletion",
+        );
+
+        job(&checkout, "rm job.bin");
+        let (emptied, _) = sample();
+        assert!(
+            emptied < 0,
+            "the workspace is below its spawn usage: {emptied}"
+        );
+        near(
+            emptied,
+            -16 * MIB,
+            "workspace after the job removes its own file",
+        );
+
+        // A mountpoint whose volume has gone answers for its parent volume: refused, not read.
+        // Deleting the added volume unmounts it first; a separate unmount storagekitd may dissent.
+        let (left, _) = ApfsVolume::capture(&sibling).expect("the sibling volume");
+        added.delete();
+        assert!(matches!(
+            ApfsVolumeStat.used_bytes(&left),
+            Err(VolumeStatError::Read(_))
+        ));
+        assert!(
+            matches!(ApfsVolume::capture(&sibling), Err(VolumeStatError::Read(_))),
+            "a directory on its parent's volume is no volume"
+        );
+
+        host.backend
+            .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            .expect("unmount the workspace");
+        host.backend
+            .detach(&attachment, DetachIntent::Release)
+            .expect("detach the workspace");
+        assert_eq!(
+            host.release_build_volume(&layout, &build_id).unwrap(),
+            Release::Deleted { refused: None }
+        );
+    }
 }

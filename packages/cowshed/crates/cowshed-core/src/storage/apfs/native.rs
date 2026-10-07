@@ -6295,6 +6295,168 @@ fn remove_stray_junk(
     })
 }
 
+/// One mounted volume a job owns: the mountpoint it was found at and the filesystem id the
+/// kernel gave that mount. The id, not the volume UUID, is its identity: every image cloned from
+/// one template or seed carries the same volume UUID, and a mountpoint with nothing mounted on it
+/// answers for its parent's volume.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApfsVolume {
+    mount: PathBuf,
+    fsid: [i32; 2],
+}
+
+#[cfg(target_os = "macos")]
+impl ApfsVolume {
+    /// The volume mounted exactly at `mount` and the bytes it uses now, both from one read. A
+    /// directory on its parent's volume is refused.
+    pub fn capture(
+        mount: &Path,
+    ) -> Result<(Self, u64), crate::runtime::volume_usage::VolumeStatError> {
+        let own = volume_space(mount).map_err(usage_error)?;
+        let parent = mount.parent().ok_or_else(|| {
+            usage_error(ApfsStorageError::Host(format!(
+                "{} has no parent to be mounted on",
+                mount.display()
+            )))
+        })?;
+        if volume_space(parent).map_err(usage_error)?.fsid == own.fsid {
+            return Err(usage_error(ApfsStorageError::Host(format!(
+                "no volume is mounted at {}",
+                mount.display()
+            ))));
+        }
+        let volume = Self {
+            mount: mount.to_path_buf(),
+            fsid: own.fsid,
+        };
+        Ok((volume, own.used))
+    }
+
+    pub fn mount(&self) -> &Path {
+        &self.mount
+    }
+}
+
+/// The APFS volume stat: the bytes an owned volume itself uses, never its container's or a walk
+/// of its tree.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApfsVolumeStat;
+
+#[cfg(target_os = "macos")]
+impl crate::runtime::volume_usage::VolumeStat for ApfsVolumeStat {
+    type Volume = ApfsVolume;
+
+    /// A mount that is no longer the one found at spawn is an error, never its successor's usage.
+    fn used_bytes(
+        &self,
+        volume: &ApfsVolume,
+    ) -> Result<u64, crate::runtime::volume_usage::VolumeStatError> {
+        let space = volume_space(&volume.mount).map_err(usage_error)?;
+        if space.fsid != volume.fsid {
+            return Err(usage_error(ApfsStorageError::Host(format!(
+                "{} no longer holds the volume mounted there when the job spawned",
+                volume.mount.display()
+            ))));
+        }
+        Ok(space.used)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn usage_error(error: ApfsStorageError) -> crate::runtime::volume_usage::VolumeStatError {
+    crate::CowshedError::environment_missing(
+        format!("volume usage read failed: {error}"),
+        "cowshed doctor --json",
+    )
+    .into()
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq)]
+struct VolumeSpace {
+    fsid: [i32; 2],
+    used: u64,
+}
+
+/// The `getattrlist` answer [`volume_space`] asks for: its length (u32), the attributes it holds
+/// (attribute_set_t: five u32), the filesystem id (fsid_t: two i32), then the used bytes
+/// (off_t), packed on 4-byte boundaries in attribute-group order.
+#[cfg(target_os = "macos")]
+const VOLUME_SPACE_LENGTH: usize = 4 + 20 + 8 + 8;
+
+/// The filesystem id of the mount holding `path` and the bytes its volume uses, from one
+/// `getattrlist`. `statfs` is no substitute: on APFS its block counts are the container's, which
+/// every sibling volume moves.
+#[cfg(target_os = "macos")]
+fn volume_space(path: &Path) -> Result<VolumeSpace, ApfsStorageError> {
+    const OPERATION: &str = "read the volume attributes of";
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ApfsStorageError::Host(format!("{} contains NUL", path.display())))?;
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FSID,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_SPACEUSED,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    #[repr(C, align(4))]
+    struct Answer([u8; VOLUME_SPACE_LENGTH]);
+    let mut answer = Answer([0; VOLUME_SPACE_LENGTH]);
+    // SAFETY: `c_path` is NUL-terminated, `request` names only the attributes laid out in
+    // `VOLUME_SPACE_LENGTH`, and `answer` is writable for its full length, which is what the
+    // kernel is told.
+    let status = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&raw mut request).cast(),
+            answer.0.as_mut_ptr().cast(),
+            VOLUME_SPACE_LENGTH,
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return Err(io_error(OPERATION, path, io::Error::last_os_error()));
+    }
+    decode_volume_space(&answer.0).map_err(|error| io_error(OPERATION, path, error))
+}
+
+/// A file system that does not report a requested attribute omits it from the answer; a negative
+/// `off_t` is no byte count. Both are errors, never a zero.
+#[cfg(target_os = "macos")]
+fn decode_volume_space(bytes: &[u8; VOLUME_SPACE_LENGTH]) -> io::Result<VolumeSpace> {
+    let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+    if u32::from_ne_bytes(word(4)) & libc::ATTR_CMN_FSID == 0
+        || u32::from_ne_bytes(word(8)) & libc::ATTR_VOL_SPACEUSED == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the file system reports no filesystem id or used bytes",
+        ));
+    }
+    if usize::try_from(u32::from_ne_bytes(word(0))).ok() != Some(VOLUME_SPACE_LENGTH) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the volume attributes answer has an unexpected length",
+        ));
+    }
+    let used = i64::from_ne_bytes([
+        bytes[32], bytes[33], bytes[34], bytes[35], bytes[36], bytes[37], bytes[38], bytes[39],
+    ]);
+    Ok(VolumeSpace {
+        fsid: [i32::from_ne_bytes(word(24)), i32::from_ne_bytes(word(28))],
+        used: u64::try_from(used).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the volume reports {used} used bytes"),
+            )
+        })?,
+    })
+}
+
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
     ApfsStorageError::Io {
         operation,
@@ -6679,6 +6841,44 @@ mod tests {
             "a legacy source contributes only itself"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The answer is decoded at the offsets the kernel packs it (measured: the filesystem id at
+    /// 24, the used bytes at 32). An omitted attribute or a negative byte count is an error.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn volume_space_answers_decode_exactly_and_refuse_missing_or_negative_usage() {
+        let answer = |volattr: u32, used: i64| {
+            let mut bytes = [0_u8; VOLUME_SPACE_LENGTH];
+            bytes[..4].copy_from_slice(&40_u32.to_ne_bytes());
+            bytes[4..8].copy_from_slice(
+                &(libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FSID).to_ne_bytes(),
+            );
+            bytes[8..12].copy_from_slice(&volattr.to_ne_bytes());
+            bytes[24..28].copy_from_slice(&16_777_664_i32.to_ne_bytes());
+            bytes[28..32].copy_from_slice(&26_i32.to_ne_bytes());
+            bytes[32..40].copy_from_slice(&used.to_ne_bytes());
+            bytes
+        };
+        assert_eq!(
+            decode_volume_space(&answer(libc::ATTR_VOL_SPACEUSED, 2_189_246_464)).unwrap(),
+            VolumeSpace {
+                fsid: [16_777_664, 26],
+                used: 2_189_246_464
+            }
+        );
+        assert_eq!(
+            decode_volume_space(&answer(0, 2_189_246_464))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            decode_volume_space(&answer(libc::ATTR_VOL_SPACEUSED, -4096))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
