@@ -7,7 +7,7 @@ use cowshed_core::apfs::{
 };
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, LandReport, RebaseBuildVolume,
+    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, RebaseBuildVolume,
     RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
 use cowshed_core::build_volume::{
@@ -2325,6 +2325,28 @@ async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     assert_eq!(
         layout.read_record(&old).expect("previous record").role,
         BuildVolumeRole::Unlinked
+    );
+    let (stdout, stderr) = succeed(&mut service, ["--json", "gc", "--dry-run"]).await;
+    let preview: JsonEnvelope<GcReport> =
+        serde_json::from_slice(&stdout).expect("dry-run GC report");
+    let preview = preview.result().expect("successful dry-run");
+    assert!(
+        preview.deferred.iter().any(|deferred| {
+            deferred.path == layout.image(&old)
+                && deferred.diagnostic.contains("job admitted on it")
+        }),
+        "dry-run explains the job hold without claiming the volume: {preview:?}\n{stderr}"
+    );
+    assert!(
+        !preview
+            .candidates
+            .iter()
+            .any(|candidate| candidate.path == layout.image(&old)),
+        "a held build volume is not a reclaimable dry-run candidate: {preview:?}"
+    );
+    assert!(
+        layout.image(&old).exists(),
+        "dry-run never deletes the held image"
     );
     let (_, stderr) = succeed(&mut service, ["gc"]).await;
     assert!(
