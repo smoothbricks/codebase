@@ -429,8 +429,9 @@ Linux job totals come from the job's cgroup v2: CPU `cpu.stat`, charged memory `
 storage I/O `io.stat`; those totals include short-lived descendants the process observer missed. Charged memory includes
 cache/kernel charges and remains distinct from RSS. macOS reconciles against the leader's own/children rusage totals.
 Per-process rows and independent totals are compared in named units; differences produce explicit unattributed CPU/I/O
-rows on the job span. A coverage gap does not turn totals into a guessed live-process sum. An unknown or gap leaf
-remains absent and cannot seed a leaf-keyed baseline.
+rows on the job span. A coverage gap does not turn totals into a guessed live-process sum. The leaf is the observed
+process with the most own CPU, named only when the observed processes cover a declared fraction (initially 90%) of the
+job's exact CPU total; otherwise the sample says why none is named, and it cannot seed a leaf-keyed baseline.
 
 Workspace and build-volume used-byte deltas are separate volume statistics, never a tree scan or a claim about
 per-process write syscalls. They compare usage at spawn with usage at the sample or terminal boundary and may be

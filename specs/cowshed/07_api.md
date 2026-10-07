@@ -694,7 +694,7 @@ pub struct JobResourceSample {
     pub wall_us: WallMicros,          // retained precise duration; wallMs is its display projection
     pub leader_pid: u32,              // observed leader; this sample exists only after spawn
     pub members: Vec<u32>,            // complete current membership of the owned job process group
-    pub leaf: Option<JobProcessLeaf>, // absent when observation gaps make the CPU-winning leaf unknown
+    pub leaf: JobLeafAttribution,      // the observed CPU-dominant process, or why none is named
     pub cpu_user_ms: CpuMillis,       // derived once from the accounting source's microseconds
     pub cpu_sys_ms: CpuMillis,
     pub cpu_pct: OneCoreCpuPercent,
@@ -784,13 +784,16 @@ missed observation records a typed coverage gap and an unattributed-usage row; i
 trusts a reused PID.
 
 macOS per-process coverage is best-effort with a measured gap; its job totals are exact. kqueue `NOTE_FORK` on each
-member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused with `ENOTSUP`
-([xnu `filt_procattach`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1104-L1142),
-and the `NOTE_FORK` comment in `bsd/sys/event.h`). The supervisor therefore answers each `NOTE_FORK` by reading the
-member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
+member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused with `ENOTSUP` (xnu
+[`filt_procattach`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1094-L1131),
+[`filt_procevent`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1210-L1212),
+and the `NOTE_FORK` comment in `bsd/sys/event.h`; measured on Darwin 25.6: 64 children forked and reaped under a watched
+root delivered one `NOTE_FORK` and an empty child list). The supervisor therefore answers each `NOTE_FORK` by reading
+the member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
 (`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A child that forks,
-execs and is reaped before that read is missed: the leader/children rusage source (below) still counts its CPU, and
-reconciliation states it as unattributed usage with a coverage gap, never silently. An Endpoint Security observer is not
+execs and is reaped before that read is missed, and a coalesced `NOTE_FORK` cannot prove how many children it stood for,
+so a macOS tree in which a member forked never claims `Complete`. The leader/children rusage source (below) still counts
+the missed children's CPU, and reconciliation states it as unattributed usage. An Endpoint Security observer is not
 used: it needs an Apple entitlement. It is revisited only if the measured gap on real gates proves large.
 
 The canonical records are:
@@ -821,9 +824,9 @@ pub struct JobProcessSample {
     pub blocked_path: Option<String>,
     pub blocked_holder_pid: Option<u32>,
     pub blocked_holder_job: Option<JobId>,
-    pub exit: Option<ExitStatus>,
-    pub exited_at: Option<UtcTimestamp>,
+    pub exit: Option<ProcessExit>,
 }
+pub struct ProcessExit { pub status: ExitStatus, pub exited_at: UtcTimestamp }
 pub enum JobProcessEvent {
     Born(JobProcessSample),
     Exec(JobProcessSample),
@@ -832,7 +835,12 @@ pub enum JobProcessEvent {
     Exited(JobProcessSample),          // final own-process usage, exit and exitedAt
 }
 pub struct JobProcessStream { /* bounded stream of Result<JobProcessEvent, CowshedError> */ }
-pub enum ProcessCoverage { Complete, Gap { reason: CowshedError } }
+pub enum ProcessCoverage { Complete, Gap { reason: ProcessCoverageGap } }
+pub enum ProcessCoverageGap {      // the first observation the tree is known to lack
+    EventsLost,                     // the kernel event source reported dropped events
+    UnobservedBirth { pid: u32 },   // a fork, exec or exit named a process whose birth was not observed
+    UnobservedExit { pid: u32 },    // a pid was born again while its previous life had no observed exit
+}
 pub struct CpuTotals { pub user_us: CpuMicros, pub sys_us: CpuMicros }
 pub struct StorageIoTotals { pub read_bytes: StorageIoBytes, pub write_bytes: StorageIoBytes }
 pub struct ChargedMemoryUsage { pub current_bytes: ChargedMemoryBytes, pub peak_bytes: ChargedMemoryBytes }
@@ -853,22 +861,38 @@ Birth and parent identity are kernel observations retained internally, not fresh
 Per-process CPU counters are that process's own usage. Complete job counters have an independent, declared source and
 reconcile against the retained process counters; they are not a live-members-only sum. Microseconds convert to
 milliseconds once, after aggregation. Storage I/O byte counters follow the kernel source's semantics and never convert
-operation counts into invented byte totals or stand in for volume-allocation deltas. Exit and `exitedAt` are present
-together only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal result. Blocker
-detail fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation error,
-never an assertion that the process is unblocked. A lock observation identifies its path and, when kernel evidence
-resolves it, the holder PID and that holder's job; no program-name guess supplies it.
+operation counts into invented byte totals or stand in for volume-allocation deltas. An exit's status and time are one
+`ProcessExit`, present only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal
+result. A gap is absorbing and names the first missed observation. Blocker detail fields are valid only for their
+observed blocker kind; an unobserved blocker is absence or an observation error, never an assertion that the process is
+unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder PID and that
+holder's job; no program-name guess supplies it.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one coarse heartbeat per
 progress tick, and each process's final usage on exit. State or blocker transitions, an RSS crossing of a 2× step, and a
 busy/idle CPU flip produce change records; an unchanged ordinary sample does not. Closing a reader never kills the
-process. The `leaf` in `JobResourceSample` selects the deepest CPU-winning process from the retained tree, not only live
-members; CPU usage, depth, then birth identity/PID provide deterministic tie-breaking. Consumers use these observed
-facts without declaring or deriving an expectation from a command's argv. The generated sparse delta distinguishes
-unchanged, SET, and CLEAR; clearing a blocker path or holder never leaves the preceding lock's detail in the current
-snapshot. Its constructor rejects an empty change event. An unknown leaf or a coverage-gap leaf remains absent. A
-consumer must skip a leaf-keyed baseline update for that terminal and record why; it never picks a guessed observed
-process to stand in for work the tree missed.
+process. Consumers use these observed facts without declaring or deriving an expectation from a command's argv. The
+generated sparse delta distinguishes unchanged, SET, and CLEAR; clearing a blocker path or holder never leaves the
+preceding lock's detail in the current snapshot. Its constructor rejects an empty change event.
+
+The `leaf` in `JobResourceSample` is the observed process, live or exited, with the most own CPU (user+system
+microseconds), ties broken by birth identity then PID. It does not need a complete tree: it needs the observed processes
+to account for most of the job's exact CPU. It is named only when the observed processes' own CPU covers at least a
+declared fraction of the accounting source's CPU total; the fraction is supervisor configuration, initially 90%,
+measured on real cargo/Nx/Bun gate jobs and reported. Below it, or with no accounted CPU yet, the leaf is not named and
+the sample says why. The rule is the same on Linux and macOS; the unattributed remainder is still stated by
+reconciliation.
+
+```rust
+pub enum JobLeafAttribution {
+    Attributed { leaf: JobProcessLeaf, observed_cpu_permille: u16 },
+    Unattributed { observed_cpu_permille: u16, required_permille: u16 },
+    NoAccountedCpu,
+}
+```
+
+A consumer skips a leaf-keyed baseline update for a terminal without an attributed leaf and records the reason the
+terminal carries; it never picks a guessed observed process to stand in for work the tree missed.
 
 ### Complete job accounting and observation reconciliation
 
@@ -899,8 +923,8 @@ the leader's own and children rusage totals, including the activation interval, 
 Reconciliation retains the difference between independent job totals and attributed process rows in named units.
 Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,
 counter precision and sampling-window disagreement remain stated, not clamped away. A gap does not erase the independent
-job totals. Coverage and leaf identity remain honest so a partial tree cannot contaminate a baseline. The RED includes
-bursts of short-lived grandchildren that fork, exec and exit entirely between coarse polls.
+job totals. Coverage and leaf attribution remain honest so a partial tree cannot contaminate a baseline. The RED
+includes bursts of short-lived grandchildren that fork, exec and exit entirely between coarse polls.
 
 Counter semantics: [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html);
 [pidfd events](https://man7.org/linux/man-pages/man2/pidfd_open.2.html) report exit/reap, not fork/exec.
