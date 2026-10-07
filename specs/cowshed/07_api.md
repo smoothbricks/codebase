@@ -813,13 +813,7 @@ pub struct JobProcessSample {
     pub program: String,
     pub argv: Vec<CommandArg>,
     pub born_at: UtcTimestamp,
-    pub cpu_user_us: CpuMicros,
-    pub cpu_sys_us: CpuMicros,
-    pub rss_bytes: ResidentBytes,
-    pub rss_peak_bytes: ResidentBytes,
-    pub io_read_bytes: StorageIoBytes,
-    pub io_write_bytes: StorageIoBytes,
-    pub busy: bool,
+    pub usage: Option<ProcessUsage>,          // absent until its counters are first read, never zeroes
     pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
     pub blocked_path: Option<String>,
     pub blocked_holder_pid: Option<u32>,
@@ -827,6 +821,23 @@ pub struct JobProcessSample {
     pub exit: Option<ProcessExit>,
 }
 pub struct ProcessExit { pub status: ExitStatus, pub exited_at: UtcTimestamp }
+pub const BUSY_CPU_PERMILLE: u32 = 10;     // busy: own CPU over the last sample window ≥ 1 % of one core
+pub struct ProcessUsage {                  // the process's own counters, as last read
+    pub cpu_user_us: CpuMicros,
+    pub cpu_sys_us: CpuMicros,
+    pub busy: bool,
+    pub rss_bytes: ResidentBytes,          // zero once it has exited
+    pub rss_peak_bytes: ResidentBytes,
+    pub io: ProcessStorageIo,
+}
+pub enum ProcessStorageIo {
+    Read { read_bytes: StorageIoBytes, write_bytes: StorageIoBytes },
+    Unavailable { reason: ProcessIoUnavailable }, // never zero bytes in their place
+}
+pub enum ProcessIoUnavailable {
+    NotPermitted,                          // the kernel refused this observer the counters
+    NotAccounted,                          // the kernel keeps no per-process storage I/O counters
+}
 pub enum JobProcessEvent {
     Born(JobProcessSample),
     Exec(JobProcessSample),
@@ -842,6 +853,7 @@ pub enum ProcessCoverageGap {      // the first observation the tree is known to
     UnobservedExit { pid: u32 },    // a pid was born again while its previous life had no observed exit
     UncountedFork { pid: u32 },     // a member forked without the kernel naming or counting its children
     UnreadImage { pid: u32 },       // a member exec'd and its new image was not read (exited first, or the read failed)
+    UnreadFinalUsage { pid: u32 },  // a member exited with no read of its counters after its exit
 }
 pub struct CpuTotals { pub user_us: CpuMicros, pub sys_us: CpuMicros }
 pub struct StorageIoTotals { pub read_bytes: StorageIoBytes, pub write_bytes: StorageIoBytes }
@@ -873,6 +885,22 @@ error. Both gaps retain their evidence through the generated controller and N-AP
 valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never an assertion
 that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder
 PID and that holder's job; no program-name guess supplies it.
+
+`usage` is a process's own counters as last read. It is absent, never zero, for a process whose counters were never
+read: one reaped before the sampler reached it, or on macOS one that exited before its first read could be proven its
+own. Usage is final only when it was read after the process exited. An exit with no such read is the coverage gap
+`UnreadFinalUsage`, and the usage stays the last one observed, never zeroed or reset. Each read is fenced to the
+retained life. On macOS the first read is proven by the process's unique id read after it, and every later one by the
+start time the read itself carries. On Linux the held pidfd must still name an unreaped process after each read. `busy`
+holds when the process's own CPU over the supervisor's last sample window is at least `BUSY_CPU_PERMILLE` thousandths of
+one core; that constant is the one declaration consumers read through the generated surface. A first read and a
+zero-length window divide nothing and keep the prior judgment, initially idle. Reading usage or subscribing never moves
+the window. Storage I/O follows each platform's per-process source: macOS
+`ri_diskio_bytesread`/`ri_diskio_byteswritten`, the I/O the process issued to disk; Linux `/proc/<pid>/io`
+`read_bytes`/`write_bytes`, reads it caused to be fetched from storage and pages it dirtied for storage, counted when
+dirtied rather than at writeback. Reads served from the cache count on neither. `NotPermitted` is a kernel refusal
+(Linux: a process made non-dumpable, for example by a set-id exec); `NotAccounted` is a kernel that keeps no per-process
+counters.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one heartbeat per minute for
 each unchanged live process, and each process's final usage on exit. The sampling/subscriber interval `everyMs` does not
