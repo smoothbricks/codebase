@@ -5949,6 +5949,8 @@ impl NativeProjectRuntimeHost {
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
+            // Each job's span is sealed beside the controller's commitments.
+            telemetry_root: Some(self.telemetry_root.clone()),
             // Filled from the lost predecessor's ledger once this process holds the socket.
             inherited_groups: Vec::new(),
             volume_labels: Some(super::supervisor::VolumeLabels {

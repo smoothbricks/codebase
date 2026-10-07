@@ -41,6 +41,7 @@ use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling, StreamTally};
+use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
@@ -95,6 +96,9 @@ pub struct WorkspaceSupervisorConfig {
     /// Where the supervisor keeps the process groups of its running jobs for whoever finds it
     /// gone ([`super::job_groups`]); `None` keeps no ledger.
     pub group_ledger: Option<PathBuf>,
+    /// The host telemetry root the supervisor seals each job's span under
+    /// ([`super::job_spans`]); `None` writes no job spans.
+    pub telemetry_root: Option<PathBuf>,
     /// Groups a lost predecessor recorded that processes still hold although their leader is
     /// gone ([`super::job_groups::take_lost`]): never signalled, carried in every ledger this
     /// supervisor writes until nothing holds their ids.
@@ -215,6 +219,7 @@ impl Default for WorkspaceSupervisorConfig {
             shell_host: None,
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: None,
+            telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
         }
@@ -1999,6 +2004,9 @@ pub(super) async fn run_system_output<R>(
 pub struct WorkspaceSupervisorHandle {
     authority: WorkspaceAuthoritySnapshot,
     commands: mpsc::Sender<Command>,
+    /// The job-span writer of a supervisor this process runs; `None` for one it writes none
+    /// for, or one another process serves.
+    job_spans: Option<JobSpanPublisher>,
 }
 
 impl std::fmt::Debug for WorkspaceSupervisorHandle {
@@ -2018,6 +2026,7 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands,
+            job_spans: None,
         }
     }
 
@@ -2026,11 +2035,25 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands: self.commands.clone(),
+            job_spans: self.job_spans.clone(),
         }
     }
 
     pub fn snapshot(&self) -> &WorkspaceAuthoritySnapshot {
         &self.authority
+    }
+
+    /// How this supervisor's job-span writer has fared, once every span row queued before the
+    /// call is sealed or refused. Refused where the handle reaches no writer.
+    pub async fn trace_health(&self) -> Result<TraceHealth> {
+        match &self.job_spans {
+            Some(job_spans) => job_spans.health().await,
+            None => Err(CowshedError::environment_missing(
+                "this supervisor handle reaches no job-span writer: the supervisor writes no job \
+                 spans, or another process serves it",
+                "ask the process that serves the workspace's supervisor",
+            )),
+        }
     }
 
     pub async fn advance_authority(
@@ -2056,6 +2079,7 @@ impl WorkspaceSupervisorHandle {
         Ok(Self {
             authority,
             commands: self.commands.clone(),
+            job_spans: self.job_spans.clone(),
         })
     }
 
@@ -2397,9 +2421,11 @@ impl WorkspaceSupervisor {
         let next_job_id = artifacts.next_job_id()?;
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
+        let job_spans = config.telemetry_root.map(JobSpanPublisher::start);
         let handle = WorkspaceSupervisorHandle {
             authority: config.authority.clone(),
             commands,
+            job_spans: job_spans.clone(),
         };
         let nx_daemon =
             NxDaemonKeeper::for_role(WorkspaceRole::for_name(&config.authority.workspace));
@@ -2412,6 +2438,7 @@ impl WorkspaceSupervisor {
             volume_labels: config.volume_labels,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger,
+            job_spans,
             inherited_groups: config.inherited_groups,
             term_grace: config.term_grace,
             next_job_id,
@@ -2707,6 +2734,8 @@ impl JobStateRecord {
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
     group_ledger: Option<PathBuf>,
+    /// See [`WorkspaceSupervisorConfig::telemetry_root`].
+    job_spans: Option<JobSpanPublisher>,
     inherited_groups: Vec<super::job_groups::UnresolvedGroup>,
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
@@ -3462,6 +3491,9 @@ impl SupervisorActor {
             stdin: stdin_info,
             failure: None,
         };
+        if let Some(job_spans) = &self.job_spans {
+            job_spans.record(&info, JobSpanEdge::Start);
+        }
         let spawn_span = crate::timing::span("admit", "spawn");
         let spawn = self
             .spawner
@@ -4306,6 +4338,10 @@ impl SupervisorActor {
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
+        // The span ends before any waiter learns of the end, so a span read after a wait has it.
+        if let Some(job_spans) = &self.job_spans {
+            job_spans.record(&job.info, JobSpanEdge::end(state, job.exit.as_ref()));
+        }
         job.info.failure =
             (job.kill_reason == Some(KillReason::ScriptSyntax)).then_some(JobFailure::ScriptSyntax);
         job.info.stdin.complete = true;
@@ -6130,6 +6166,7 @@ mod lifecycle_commitment_tests {
             shell_host: None,
             shell_pool: defaults.shell_pool,
             group_ledger: None,
+            telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
         };

@@ -406,6 +406,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        telemetry_root: None,
         inherited_groups: Vec::new(),
         volume_labels: None,
     }
@@ -4193,4 +4194,308 @@ async fn main_leaves_its_nx_daemon_to_the_host() {
             .is_err(),
         "main's supervisor started a job of its own"
     );
+}
+
+/// One row of a sealed job-span segment, decoded from the columns a reader of lmao's trace
+/// schema sees.
+#[derive(Debug, Eq, PartialEq)]
+struct JobSpanRow {
+    trace_id: String,
+    thread_id: u64,
+    span_id: u32,
+    parent_span_id: Option<u32>,
+    entry_type: String,
+    message: String,
+    repo_id: String,
+    workspace_incarnation: String,
+    job_id: u64,
+    grant_revision: u64,
+    w3c_span_id: u64,
+    job_state: Option<String>,
+}
+
+/// Every job-span segment under `telemetry`, in the order its writer sealed them, as one row
+/// each.
+fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
+    use arrow_array::Array as _;
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
+
+    let mut segments = Vec::new();
+    for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
+        for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
+            let path = entry.expect("segment").path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            if name.starts_with("job-") && name.ends_with(".arrow") {
+                segments.push((name, path));
+            }
+        }
+    }
+    segments.sort();
+    segments
+        .into_iter()
+        .map(|(name, path)| {
+            let mut reader = arrow_ipc::reader::StreamReader::try_new(
+                std::fs::File::open(&path).expect("open job span segment"),
+                None,
+            )
+            .expect("Arrow stream");
+            let batch = reader.next().expect("one batch").expect("valid batch");
+            assert!(reader.next().is_none(), "{name} holds one batch");
+            assert_eq!(batch.num_rows(), 1, "{name} holds one row");
+            let column = |name: &str| batch.column_by_name(name).expect(name).clone();
+            let text = |name: &str| {
+                let column = column(name);
+                let dictionary = column.as_dictionary_opt::<UInt32Type>();
+                match dictionary {
+                    Some(dictionary) => {
+                        let key = usize::try_from(dictionary.keys().value(0)).unwrap();
+                        dictionary.values().as_string::<i32>().value(key).to_owned()
+                    }
+                    None => column.as_string::<i32>().value(0).to_owned(),
+                }
+            };
+            let number = |name: &str| column(name).as_primitive::<UInt64Type>().value(0);
+            let entry_types = column("entry_type");
+            let entry_types = entry_types.as_dictionary::<UInt8Type>();
+            let parent = column("parent_span_id");
+            let parent = parent.as_primitive::<UInt32Type>();
+            let state = column("job_state");
+            let state = state.as_string::<i32>();
+            let row = JobSpanRow {
+                trace_id: text("trace_id"),
+                thread_id: number("thread_id"),
+                span_id: column("span_id").as_primitive::<UInt32Type>().value(0),
+                parent_span_id: parent.is_valid(0).then(|| parent.value(0)),
+                entry_type: entry_types
+                    .values()
+                    .as_string::<i32>()
+                    .value(usize::from(entry_types.keys().value(0)))
+                    .to_owned(),
+                message: text("message"),
+                repo_id: text("repo_id"),
+                workspace_incarnation: text("workspace_incarnation"),
+                job_id: number("job_id"),
+                grant_revision: number("grant_revision"),
+                w3c_span_id: number("w3c_span_id"),
+                job_state: state.is_valid(0).then(|| state.value(0).to_owned()),
+            };
+            (name, row)
+        })
+        .collect()
+}
+
+/// The two rows of `job`'s span: its start, then its end as `entry_type` in `state`.
+fn expected_span(
+    job: &cowshed_core::api::JobInfo,
+    entry_type: &str,
+    state: &str,
+) -> [JobSpanRow; 2] {
+    let row = |entry_type: &str, job_state: Option<&str>| JobSpanRow {
+        trace_id: job.trace.trace_id.as_str().to_owned(),
+        thread_id: job.job_id.get(),
+        span_id: 1,
+        parent_span_id: None,
+        entry_type: entry_type.to_owned(),
+        message: "cowshed.job".to_owned(),
+        repo_id: job.repo_id.as_str().to_owned(),
+        workspace_incarnation: job.workspace_incarnation.as_str().to_owned(),
+        job_id: job.job_id.get(),
+        grant_revision: job.grant_revision,
+        w3c_span_id: u64::from_str_radix(job.trace.span_id.as_str(), 16).unwrap(),
+        job_state: job_state.map(str::to_owned),
+    };
+    [row("span-start", None), row(entry_type, Some(state))]
+}
+
+/// Asserts the segments under `telemetry` are exactly `spans`, two per job in sealing order,
+/// each named `job-<order>-<writer>.arrow` by one writer counting from 1.
+fn assert_job_spans(telemetry: &Path, spans: &[[JobSpanRow; 2]]) {
+    let sealed = job_spans(telemetry);
+    let names = sealed
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.len(),
+        spans.len() * 2,
+        "two sealed segments per job: {names:?}"
+    );
+    let writer = &names[0]["job-00000000000000000001-".len()..];
+    for (index, name) in names.iter().enumerate() {
+        assert_eq!(*name, format!("job-{:020}-{writer}", index + 1));
+    }
+    let rows = sealed.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    let expected = spans.iter().flatten().collect::<Vec<_>>();
+    assert_eq!(rows.iter().collect::<Vec<_>>(), expected);
+}
+
+fn adopted_trace() -> cowshed_core::api::TraceContext {
+    cowshed_core::api::TraceContext {
+        trace_id: cowshed_core::api::TraceId::new("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+        span_id: cowshed_core::api::SpanId::new("00f067aa0ba902b7").unwrap(),
+    }
+}
+
+/// A job's span is sealed at admission and at its terminal state under the trace context the
+/// controller handed the supervisor, or the one the supervisor minted: one span, ended ok only
+/// by a clean zero exit.
+#[tokio::test]
+async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_context() {
+    let root = workspace_root("job-span");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            telemetry_root: Some(telemetry.clone()),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+
+    let mut adopted = request(StdinSource::Empty);
+    adopted.trace = Some(adopted_trace());
+    let job = h.handle.exec(None, None, adopted).await.unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let clean = h.handle.wait(job).await.unwrap();
+    assert_eq!(clean.trace, adopted_trace());
+    let health = h.handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]);
+
+    let job = h
+        .handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 1 }).await;
+    let failed = h.handle.wait(job).await.unwrap();
+    assert_ne!(
+        failed.trace,
+        adopted_trace(),
+        "the supervisor minted this job's trace"
+    );
+    let health = h.handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (4, 0), "{health:?}");
+    assert_job_spans(
+        &telemetry,
+        &[
+            expected_span(&clean, "span-ok", "exited"),
+            expected_span(&failed, "span-err", "exited"),
+        ],
+    );
+}
+
+/// A span row the writer cannot seal is counted in the supervisor's trace health; the job it
+/// describes ends as it would have anyway.
+#[tokio::test]
+async fn a_refused_job_span_is_counted_and_never_fails_its_job() {
+    let root = workspace_root("job-span-refused");
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            telemetry_root: Some(root.join("absent-telemetry")),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let job = h
+        .handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let info = h.handle.wait(job).await.unwrap();
+    assert_eq!(info.state, JobState::Exited);
+    let health = h.handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (0, 2), "{health:?}");
+    assert!(
+        health
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("creating telemetry partition")),
+        "{health:?}"
+    );
+}
+
+/// The production supervisor's own spawn path, real `true` and `false` under seatbelt: each
+/// exec and its terminal leave one sealed job span carrying the trace context it was given.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_supervisor() {
+    let (mut supervisor_config, root) = isolated_config("job-span-exec");
+    supervisor_config.default_cwd = None;
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    supervisor_config.telemetry_root = Some(telemetry.clone());
+    let mount = supervisor_config.workspace_root.clone();
+    std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
+    std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
+    std::fs::create_dir_all(mount.join(".cowshed/bin")).unwrap();
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // A supervisor start publishes `.cowshed/env` from the image's private token.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(mount.join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH))
+            .unwrap()
+            .write_all(
+                cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                    .encode()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+    let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+        Box::new(cowshed_core::storage::audit::NullAuditSink),
+        8,
+    )
+    .unwrap();
+    let handle = WorkspaceSupervisor::start(supervisor_config, commitments).unwrap();
+
+    let run = |argv: &str, trace: Option<cowshed_core::api::TraceContext>| ExecRequest {
+        command: ExecCommand::Argv(vec![CommandArg::from(argv)]),
+        cwd: None,
+        trace,
+        ..request(StdinSource::Empty)
+    };
+    let job = handle
+        .exec(None, None, run("/usr/bin/true", Some(adopted_trace())))
+        .await
+        .unwrap();
+    let clean = handle.wait(job).await.unwrap();
+    assert_eq!(clean.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert_eq!(clean.trace, adopted_trace());
+    let health = handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]);
+
+    let job = handle
+        .exec(None, None, run("/usr/bin/false", None))
+        .await
+        .unwrap();
+    let failed = handle.wait(job).await.unwrap();
+    assert_eq!(failed.exit, Some(ExitStatus::Exited { code: 1 }));
+    let health = handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (4, 0), "{health:?}");
+    assert_job_spans(
+        &telemetry,
+        &[
+            expected_span(&clean, "span-ok", "exited"),
+            expected_span(&failed, "span-err", "exited"),
+        ],
+    );
+    handle.retire().await.unwrap();
 }

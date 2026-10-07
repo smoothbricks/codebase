@@ -1801,6 +1801,7 @@ fn supervisor_config(root: &Path) -> WorkspaceSupervisorConfig {
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        telemetry_root: None,
         inherited_groups: Vec::new(),
         volume_labels: None,
     }

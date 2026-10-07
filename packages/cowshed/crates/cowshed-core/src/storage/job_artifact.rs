@@ -4445,7 +4445,8 @@ fn struct_struct<'a>(
     downcast(column.as_ref(), name)
 }
 
-fn state_name(state: JobState) -> &'static str {
+/// A job state's wire name, the one spelling every Arrow record of it carries.
+pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Running => "running",
