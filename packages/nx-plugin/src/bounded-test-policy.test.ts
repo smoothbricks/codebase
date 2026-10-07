@@ -545,7 +545,7 @@ describe('bounded test target policy', () => {
       await writeJson(projectPath, { targets: { test, 'test-shard1': shard, 'test-shard2': shard } });
       const beforePackage = await readFile(packagePath, 'utf8');
       const beforeProject = await readFile(projectPath, 'utf8');
-      const emptyTargets = [{ executor: 'nx:noop', dependsOn: [] }, { executor: 'nx:noop' }];
+      const emptyTargets = [{ executor: 'nx:noop', dependsOn: [] }, { executor: 'nx:noop' }, { dependsOn: [] }];
       const unchanged = new Map<string, string>();
       for (const [index, emptyTest] of emptyTargets.entries()) {
         const emptyPackagePath = join(root, `packages/empty${index}/package.json`);
@@ -563,7 +563,7 @@ describe('bounded test target policy', () => {
       for (const [path, before] of unchanged) {
         expect(await readFile(path, 'utf8')).toBe(before);
       }
-      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toHaveLength(6);
+      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toHaveLength(8);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

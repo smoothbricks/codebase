@@ -403,7 +403,7 @@ function isNoopAggregateTarget(target: Record<string, unknown>): boolean {
   if (typeof target.command === 'string' || (isRecord(target.options) && typeof target.options.command === 'string')) {
     return false;
   }
-  return Array.isArray(target.dependsOn) && target.dependsOn.length > 0;
+  return Array.isArray(target.dependsOn);
 }
 
 function isPositiveSafeInteger(value: unknown): value is number {
