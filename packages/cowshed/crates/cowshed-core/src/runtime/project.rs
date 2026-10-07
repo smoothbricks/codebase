@@ -9065,10 +9065,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .collect::<Vec<_>>();
         let links = self.build_volume_links().await?;
-        let build = self
-            .build_volumes()?
-            .collect(links, options.dry_run)
-            .await?;
+        let build = timed_async(
+            "gc",
+            "build-volumes",
+            self.build_volumes()?.collect(links, options.dry_run),
+        )
+        .await?;
         if options.dry_run {
             let freed_bytes = candidates
                 .iter()
@@ -9100,11 +9102,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             let mount = self.workspace_mount_path(workspace.derived.workspace.name())?;
             let checkout = mount.clone();
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                crate::build_volume::discard::finish(&checkout, |discard| {
-                    eprintln!("cowshed: deleting old build state {}", discard.display());
-                })
-            })
+            timed_async(
+                "gc",
+                "discard",
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    crate::build_volume::discard::finish(&checkout, |discard| {
+                        eprintln!("cowshed: deleting old build state {}", discard.display());
+                    })
+                }),
+            )
             .await
             .map_err(|error| CowshedError::internal(format!("discard task failed: {error}")))?
             .map_err(|error| {
@@ -9138,9 +9144,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .await?;
             }
         }
-        let report = self
-            .substrate
-            .execute_gc(plan)
+        let report = timed_async("gc", "substrate", self.substrate.execute_gc(plan))
             .await
             .map_err(native_storage_error)?;
         Ok(GcReport {
