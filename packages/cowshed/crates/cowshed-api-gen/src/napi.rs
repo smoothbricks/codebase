@@ -115,6 +115,8 @@ enum Answer {
     Worker,
     /// A handle to the one job the result names.
     Job,
+    /// The call's events, each demanded by the caller, until its end.
+    Stream,
 }
 
 impl Answer {
@@ -122,6 +124,7 @@ impl Answer {
         let result = path_name(&operation.result);
         Ok(match (&operation.lane, result.as_deref(), class.rust) {
             (Lane::Download(_), _, _) => Self::Download,
+            (Lane::Stream, _, _) => Self::Stream,
             (_, Some("WorkspaceView"), _) => Self::Workspace,
             (_, Some("WorkerView"), "Coordinator") => Self::Worker,
             (_, Some("WorkerView"), _) => {
@@ -143,6 +146,7 @@ impl Answer {
             Self::Workspace => "NativeWorkspaceRefHandle",
             Self::Worker => "NativeWorkspaceHandle",
             Self::Job => "NativeJobHandle",
+            Self::Stream => "NativeEvents",
         }
     }
 }
@@ -455,13 +459,6 @@ fn function(operation: &Operation) -> String {
     format!("{}{}", operation.prefix(), capitalized(operation.name()))
 }
 
-/// Whether the addon gets an adapter for `operation`. A stream-lane operation gets none yet: core
-/// serves it, and its `AsyncIterable` projection is unbuilt (07_api.md, status), so the addon
-/// names no method it could only call wrongly.
-fn adapted(operation: &Operation) -> bool {
-    operation.lane != Lane::Stream
-}
-
 /// cowshed-core's `Serves` impls, generated as a child of the operation table's module so they
 /// name request records and field types as the table does; and, for tests, every pair visited.
 fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
@@ -630,11 +627,7 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
     );
     for (class, methods) in classes {
         writeln!(output, "\n#[napi]\nimpl {} {{", class.rust).unwrap();
-        for (index, method) in methods
-            .iter()
-            .filter(|method| adapted(method.operation))
-            .enumerate()
-        {
+        for (index, method) in methods.iter().enumerate() {
             if index > 0 {
                 output.push('\n');
             }
@@ -663,7 +656,8 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 (Answer::Worker, false) => "worker_call",
                 (Answer::Job, false) => "job_call",
                 (Answer::Job, true) => "job_upload_call",
-                (Answer::Download | Answer::Workspace | Answer::Worker, true) => {
+                (Answer::Stream, false) => "stream_call",
+                (Answer::Download | Answer::Workspace | Answer::Worker | Answer::Stream, true) => {
                     return Err(format!(
                         "{}: an upload answers JSON or a job",
                         operation.method
@@ -671,7 +665,7 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 }
             };
             let generics = match method.answer {
-                Answer::Json | Answer::Download | Answer::Workspace => {
+                Answer::Json | Answer::Download | Answer::Workspace | Answer::Stream => {
                     format!("operations::{}, _", operation.marker)
                 }
                 Answer::Worker | Answer::Job => format!("operations::{}", operation.marker),
@@ -699,15 +693,14 @@ fn typescript(
          import type {{ NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle }} from './native.js';\n\
          import * as V from './validators.generated.js';\n\n\
          /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */\n\
-         export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n"
+         export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n\n\
+         /**\n * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,\n\
+         \x20* as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes.\n */\n\
+         export interface NativeEvents {{\n  next(): Promise<string | null>;\n  close(): Promise<void>;\n}}\n"
     );
-    for (class, methods) in classes
-        .iter()
-        .filter(|(_, methods)| methods.iter().any(|method| adapted(method.operation)))
-    {
+    for (class, methods) in classes.iter().filter(|(_, methods)| !methods.is_empty()) {
         let extends = methods
             .iter()
-            .filter(|method| adapted(method.operation))
             .map(|method| format!("Native{}", capitalized(&function(method.operation))))
             .collect::<Vec<_>>()
             .join(", ");
@@ -729,7 +722,7 @@ fn typescript(
             .clone()
             .unwrap_or_else(|| rust.to_owned()))
     };
-    for method in served.values().filter(|method| adapted(method.operation)) {
+    for method in served.values() {
         let operation = method.operation;
         let function = function(operation);
         let interface = format!("Native{}", capitalized(&function));
@@ -782,27 +775,47 @@ fn typescript(
             "handle.{}(JSON.stringify(args){bytes_argument})",
             operation.name()
         );
-        let (returns, body) = match method.answer {
+        let (keyword, returns, body) = match method.answer {
             Answer::Json => {
                 let (ty, validator) = result_type(&operation.result, &record_name)?;
-                (ty, format!("return V.{validator}(await {call});"))
+                (
+                    "function",
+                    format!("Promise<{ty}>"),
+                    format!("return V.{validator}(await {call});"),
+                )
             }
             Answer::Download => {
                 let (ty, validator) = result_type(&operation.result, &record_name)?;
                 (
-                    format!("{ty} & {{ readonly bytes: Uint8Array }}"),
+                    "function",
+                    format!("Promise<{ty} & {{ readonly bytes: Uint8Array }}>"),
                     format!(
                         "const answer = await {call};\n  return {{ ...V.{validator}(answer.json), bytes: answer.bytes }};"
                     ),
                 )
             }
-            Answer::Workspace | Answer::Worker | Answer::Job => {
-                (method.answer.native().to_owned(), format!("return {call};"))
+            Answer::Workspace | Answer::Worker | Answer::Job => (
+                "function",
+                format!("Promise<{}>", method.answer.native()),
+                format!("return {call};"),
+            ),
+            // Each step of the loop is one demand, and leaving it early closes the call.
+            Answer::Stream => {
+                let (ty, validator) = result_type(&operation.result, &record_name)?;
+                (
+                    "function*",
+                    format!("AsyncGenerator<{ty}, void, undefined>"),
+                    format!(
+                        "const events = await {call};\n  try {{\n    \
+                         for (let event = await events.next(); event !== null; event = await events.next()) {{\n      \
+                         yield V.{validator}(event);\n    }}\n  }} finally {{\n    await events.close();\n  }}"
+                    ),
+                )
             }
         };
         writeln!(
             output,
-            "export async function {function}(handle: {interface}, args: {arguments}{bytes_parameter}): Promise<{returns}> {{\n  {body}\n}}"
+            "export async {keyword} {function}(handle: {interface}, args: {arguments}{bytes_parameter}): {returns} {{\n  {body}\n}}"
         )
         .unwrap();
     }
@@ -980,10 +993,10 @@ mod tests {
         );
     }
 
-    /// A stream-lane operation is served by its handle, and the addon gets no adapter for it:
-    /// no method its JavaScript callers could only call wrongly.
+    /// A stream-lane operation is served by its handle, and its adapter answers the call's events:
+    /// a generator whose every step is one demand, closing the call when it is left early.
     #[test]
-    fn a_stream_operation_is_served_without_an_addon_adapter() {
+    fn a_stream_operation_projects_to_a_generator_of_its_events() {
         let output = output(
             r#"operations! {
                 /// Reads one stream's bytes from an offset.
@@ -995,22 +1008,45 @@ mod tests {
         .expect("projection");
         served_impl(&output.served, "JobChunks", "JobHandle");
         assert!(
-            output
-                .served
-                .contains("    check.served::<JobChunks, _>(job_handle, &[]);"),
+            output.rust.contains(concat!(
+                "    /// Streams one job's chunks.\n",
+                "    #[napi(js_name = \"chunks\")]\n",
+                "    pub fn chunks(&self, env: Env, arguments: String) -> napi::Result<JsObject> {\n",
+                "        super::stream_call::<operations::JobChunks, _>(env, Arc::clone(&self.inner), arguments)\n",
+                "    }",
+            )),
             "{}",
-            output.served
+            output.rust
         );
-        assert!(!output.rust.contains("JobChunks"), "{}", output.rust);
         assert!(
-            !output.typescript.contains("chunks"),
+            output.typescript.contains(concat!(
+                "export interface NativeJobChunks {\n",
+                "  chunks(argumentsJson: string): Promise<NativeEvents>;\n",
+                "}",
+            )),
             "{}",
             output.typescript
         );
         assert!(
-            output
-                .typescript
-                .contains("export interface NativeJobHandleOperations extends NativeJobLogs {}"),
+            output.typescript.contains(concat!(
+                "export async function* jobChunks(handle: NativeJobChunks, args: JobChunksArguments): AsyncGenerator<Api.LogsChunk, void, undefined> {\n",
+                "  const events = await handle.chunks(JSON.stringify(args));\n",
+                "  try {\n",
+                "    for (let event = await events.next(); event !== null; event = await events.next()) {\n",
+                "      yield V.parseLogsChunk(event);\n",
+                "    }\n",
+                "  } finally {\n",
+                "    await events.close();\n",
+                "  }\n",
+                "}",
+            )),
+            "{}",
+            output.typescript
+        );
+        assert!(
+            output.typescript.contains(
+                "export interface NativeJobHandleOperations extends NativeJobLogs, NativeJobChunks {}"
+            ),
             "{}",
             output.typescript
         );

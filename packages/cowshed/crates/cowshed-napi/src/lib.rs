@@ -11,6 +11,7 @@ use std::{
     future::Future,
     io,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicI32, Ordering},
@@ -19,17 +20,18 @@ use std::{
 
 use bytes::Bytes;
 use cowshed_core::{
-    Coordinator as CoreCoordinator, Cowshed, CowshedError, JobHandle as CoreJobHandle,
+    Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream, JobHandle as CoreJobHandle,
     Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
-        operations::{LogsChunk, Operation, WorkerView, WorkspaceView},
+        operations::{LogsChunk, Operation, StreamOperation, WorkerView, WorkspaceView},
     },
 };
 use napi::{
     Env, JsObject,
     bindgen_prelude::{Buffer, ToNapiValue},
+    tokio::sync::Mutex,
 };
 use napi_derive::napi;
 use serde::Serialize;
@@ -239,6 +241,85 @@ where
             inner: Arc::new(job),
         })
     })
+}
+
+/// A stream-lane operation, as the events its caller demands one at a time.
+fn stream_call<O, H>(env: Env, handle: Arc<H>, json: String) -> napi::Result<JsObject>
+where
+    O: StreamOperation,
+    H: Serves<O> + Send + Sync + 'static,
+{
+    spawn_promise(env, async move {
+        let events = call::call_stream::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
+        Ok(Events {
+            open: Arc::new(Mutex::new(Some(Box::new(events)))),
+        })
+    })
+}
+
+/// The next event of one open stream-lane call, as its canonical JSON: [`EventStream`] with its
+/// operation erased, so one JavaScript class reads every stream operation's events.
+trait JsonEvents: Send {
+    /// Demands the next event: `None` after the call's end, an error as its last item.
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<AddonResult<String>>> + Send + '_>>;
+}
+
+impl<O: StreamOperation> JsonEvents for EventStream<O> {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<AddonResult<String>>> + Send + '_>> {
+        Box::pin(async move {
+            let event = EventStream::next(self).await?;
+            Some(
+                event
+                    .map_err(AddonFailure::from)
+                    .and_then(|event| canonical_json(O::METHOD, &event)),
+            )
+        })
+    }
+}
+
+/// One stream-lane call's events. `next` sends one demand and resolves to the event that
+/// answers it, or to `null` once the call has ended; `close` ends the call — the subscription,
+/// never what it observes. A stream that ended or failed is dropped at once, so its close sends
+/// nothing; one JavaScript collects while it is still open is closed as it is dropped.
+#[napi]
+pub struct Events {
+    /// The call while it is open. A demand holds the lock until its answer, so a second waits
+    /// its turn instead of sending a demand while one is unanswered, and a close waits for it.
+    open: Arc<Mutex<Option<Box<dyn JsonEvents>>>>,
+}
+
+#[napi]
+impl Events {
+    #[napi]
+    pub fn next(&self, env: Env) -> napi::Result<JsObject> {
+        let open = Arc::clone(&self.open);
+        spawn_promise(env, async move {
+            let mut open = open.lock().await;
+            let Some(events) = open.as_mut() else {
+                return Ok(None);
+            };
+            match events.next().await {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(failure)) => {
+                    *open = None;
+                    Err(failure)
+                }
+                None => {
+                    *open = None;
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    #[napi]
+    pub fn close(&self, env: Env) -> napi::Result<JsObject> {
+        let open = Arc::clone(&self.open);
+        spawn_promise(env, async move {
+            open.lock().await.take();
+            Ok(())
+        })
+    }
 }
 
 fn set_cloexec(descriptor: &OwnedFd) -> io::Result<()> {
