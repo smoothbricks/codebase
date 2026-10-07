@@ -294,7 +294,7 @@ where
         let events = call::call_stream::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
         Ok(Events {
             open: Arc::new(Mutex::new(Some(Box::new(events)))),
-            closed: Arc::new(watch::Sender::new(false)),
+            closed: watch::Sender::new(false),
         })
     })
 }
@@ -331,7 +331,7 @@ pub struct Events {
     open: Arc<Mutex<Option<Box<dyn JsonEvents>>>>,
     /// Set once by `close`: a demand waiting for its event gives it up and drops the call,
     /// which sends its close, and no later demand is sent.
-    closed: Arc<watch::Sender<bool>>,
+    closed: watch::Sender<bool>,
 }
 
 #[napi]
