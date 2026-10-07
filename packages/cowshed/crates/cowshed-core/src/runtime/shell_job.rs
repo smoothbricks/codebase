@@ -215,23 +215,51 @@ fn pipe_error(error: io::Error) -> CowshedError {
     )
 }
 
-/// A pipe whose ends are both close-on-exec: only an explicit `dup2` or `SCM_RIGHTS` hands an
-/// end to a process.
+/// A pipe whose ends are both close-on-exec from birth: only an explicit `dup2` or `SCM_RIGHTS`
+/// hands an end to a process. A spawn that inherited an end would hold the job's input or output
+/// open for its own lifetime, and the job's end of stream with it.
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    pipe_with(|| ())
+}
+
+/// [`pipe`], running `between` once the pair exists and before it is handed out. `pipe2` makes
+/// the pair close-on-exec in the one system call, so no spawn can come between.
+#[cfg(target_os = "linux")]
+fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut ends = [0; 2];
-    // SAFETY: `ends` has room for the two descriptors pipe(2) writes.
-    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+    // SAFETY: `ends` has room for the two descriptors pipe2(2) writes.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: both descriptors were just created and are owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-    for end in [&read, &write] {
-        // SAFETY: plain fcntl on an owned descriptor.
-        if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+    let ends = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    between();
+    Ok(ends)
+}
+
+/// [`pipe`], running `between` after creating the pair and before marking it close-on-exec.
+/// Darwin has no `pipe2`: the two steps run under the exclusive fork lock, so no spawn forks
+/// between them ([`crate::fork_lock::create`]).
+#[cfg(not(target_os = "linux"))]
+fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
+    crate::fork_lock::create(|| {
+        let mut ends = [0; 2];
+        // SAFETY: `ends` has room for the two descriptors pipe(2) writes.
+        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
-    }
-    Ok((read, write))
+        // SAFETY: both descriptors were just created and are owned here alone.
+        let (read, write) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        between();
+        for end in [&read, &write] {
+            // SAFETY: plain fcntl on an owned descriptor.
+            if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok((read, write))
+    })
 }
 
 fn null_device() -> io::Result<OwnedFd> {
@@ -1253,4 +1281,188 @@ fn stage_host_executable(mount: &Path, program: &ShellHostProgram) -> Result<Pat
         }
     }
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    use super::pipe_with;
+    use crate::fork_lock::{Spawn as _, held_exclusive};
+
+    /// The kernel's identity of pipe end `descriptor` in process `pid`: the pipe's inode, which
+    /// both ends share.
+    #[cfg(target_os = "linux")]
+    fn pipe_end(pid: u32, descriptor: RawFd) -> Option<u64> {
+        let link = std::fs::read_link(format!("/proc/{pid}/fd/{descriptor}")).ok()?;
+        link.to_str()?
+            .strip_prefix("pipe:[")?
+            .strip_suffix(']')?
+            .parse()
+            .ok()
+    }
+
+    /// Every descriptor of process `pid`, as the kernel lists it.
+    #[cfg(target_os = "linux")]
+    fn descriptors(pid: u32) -> Vec<RawFd> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// `struct pipe_fdinfo` of `<sys/proc_info.h>`, which the libc crate does not declare.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct PipeFdInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+        pipe_stat: libc::vinfo_stat,
+        pipe_handle: u64,
+        pipe_peerhandle: u64,
+        pipe_status: libc::c_int,
+        rfu_1: libc::c_int,
+    }
+
+    /// `PROC_PIDFDPIPEINFO` of `<sys/proc_info.h>`.
+    #[cfg(target_os = "macos")]
+    const PROC_PIDFDPIPEINFO: libc::c_int = 6;
+
+    /// The kernel's identity of pipe end `descriptor` in process `pid`: its pipe handle.
+    #[cfg(target_os = "macos")]
+    fn pipe_end(pid: u32, descriptor: RawFd) -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<PipeFdInfo>::uninit();
+        let size = libc::c_int::try_from(size_of::<PipeFdInfo>()).unwrap();
+        // SAFETY: `info` provides `size` writable bytes.
+        let written = unsafe {
+            libc::proc_pidfdinfo(
+                libc::pid_t::try_from(pid).unwrap(),
+                descriptor,
+                PROC_PIDFDPIPEINFO,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        // SAFETY: proc_pidfdinfo filled all `size` bytes.
+        (written == size).then(|| unsafe { info.assume_init() }.pipe_handle)
+    }
+
+    /// Every descriptor of process `pid`, as the kernel lists it.
+    #[cfg(target_os = "macos")]
+    fn descriptors(pid: u32) -> Vec<RawFd> {
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        let entry = size_of::<libc::proc_fdinfo>();
+        let mut listed = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            256
+        ];
+        let capacity = libc::c_int::try_from(listed.len() * entry).unwrap();
+        // SAFETY: `listed` provides `capacity` writable bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                listed.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        assert!(
+            written > 0 && written < capacity,
+            "list the descriptors of {pid}"
+        );
+        listed.truncate(usize::try_from(written).unwrap() / entry);
+        listed.into_iter().map(|listed| listed.proc_fd).collect()
+    }
+
+    /// Whether this process reads end of stream from `read` right now, without waiting.
+    fn at_end_of_stream(read: &OwnedFd) -> bool {
+        // SAFETY: plain fcntl on an owned descriptor.
+        let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: plain fcntl on an owned descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut byte = 0_u8;
+        // SAFETY: `byte` has room for the one byte asked for.
+        match unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) } {
+            0 => true,
+            _ => {
+                let error = io::Error::last_os_error();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+                false
+            }
+        }
+    }
+
+    /// A child spawned while [`pipe`](super::pipe) stands between creating a job's pair and
+    /// marking it close-on-exec inherits no end of it, so the job's stream ends the moment the
+    /// supervisor closes its writer, not when that unrelated child exits.
+    #[test]
+    fn a_child_spawned_while_a_job_pipe_is_born_inherits_no_end_of_it() {
+        let (spawned, spawn_returned) = mpsc::channel();
+        let mut spawn = None;
+        let (read, write) = pipe_with(|| {
+            // A fenced window makes the spawn wait for it; an open one lets it fork right here,
+            // and the test waits for that fork to exec before the pair is marked.
+            let fenced = held_exclusive();
+            spawn = Some(std::thread::spawn(move || {
+                // Blocks reading its stdin, which the test holds, until the test ends it.
+                let child = Command::new("/bin/sh")
+                    .args(["-c", "read -r line || :"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn_locked();
+                spawned.send(()).unwrap();
+                child
+            }));
+            if !fenced {
+                spawn_returned.recv().unwrap();
+            }
+        })
+        .unwrap();
+        let mut child = spawn.unwrap().join().unwrap().unwrap();
+        let ours = [
+            pipe_end(std::process::id(), read.as_raw_fd()).unwrap(),
+            pipe_end(std::process::id(), write.as_raw_fd()).unwrap(),
+        ];
+        let inherited: Vec<RawFd> = descriptors(child.id())
+            .into_iter()
+            .filter(|&descriptor| {
+                pipe_end(child.id(), descriptor).is_some_and(|end| ours.contains(&end))
+            })
+            .collect();
+        drop(write);
+        let ended = at_end_of_stream(&read);
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            inherited,
+            Vec::<RawFd>::new(),
+            "the unrelated child holds these ends of the job's pipe"
+        );
+        assert!(
+            ended,
+            "the job's stream ends once the supervisor closes its writer"
+        );
+    }
 }

@@ -20,6 +20,9 @@
 //!   Darwin, which has no `SOCK_CLOEXEC` -- is also created exclusive ([`Fenced::create`]). A
 //!   child forked between the `socket` and the `fcntl` that marks it would otherwise keep it past
 //!   `exec`, for the child's whole life, where no release can reach it.
+//! - So is every other descriptor this process makes in two steps, whatever its release
+//!   ([`create`]): a job's pipe on Darwin, which has no `pipe2`, would otherwise hold the job's
+//!   end of stream open for as long as an unrelated child that inherited its writer lives.
 //!
 //! cowshed-core's `clippy.toml` refuses the unlocked spawns of `std` and `tokio`, so a new call
 //! site cannot bypass the lock. The CLI and the gateway spawn through it too. Outside it: the warm
@@ -172,14 +175,31 @@ impl<T: AsFd> Fenced<T> {
         Self(ManuallyDrop::new(descriptor))
     }
 
-    /// A descriptor `create` makes in two steps, the second marking it close-on-exec: Darwin
+    /// A descriptor `make` creates in two steps, the second marking it close-on-exec: Darwin
     /// has no `SOCK_CLOEXEC`, so `std` and `tokio` create a socket and then set the flag. A child
     /// forked between the two would hold it past its `exec`, for its whole life; creating it
     /// under the exclusive lock leaves no spawn in flight to fork there.
-    pub fn create(create: impl FnOnce() -> io::Result<T>) -> io::Result<Self> {
-        let _creating = releasing();
-        create().map(Self::new)
+    pub fn create(make: impl FnOnce() -> io::Result<T>) -> io::Result<Self> {
+        create(make).map(Self::new)
     }
+}
+
+/// Make descriptors in two steps -- create, then mark close-on-exec -- under the exclusive lock,
+/// so no spawn forks between the steps and carries one past its `exec`. A descriptor whose release
+/// a peer observes is then held in a [`Fenced`] ([`Fenced::create`]).
+pub fn create<T>(make: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let _creating = releasing();
+    make()
+}
+
+/// Whether a release or a [`create`] holds the fork lock exclusive right now: a spawn asked for
+/// meanwhile waits for it.
+#[cfg(test)]
+pub(crate) fn held_exclusive() -> bool {
+    matches!(
+        FORK_LOCK.try_read(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
 }
 
 impl<T> Deref for Fenced<T> {
@@ -361,8 +381,7 @@ mod tests {
         }
         impl Drop for Witness {
             fn drop(&mut self) {
-                let exclusive = matches!(FORK_LOCK.try_read(), Err(TryLockError::WouldBlock));
-                self.exclusive.send(exclusive).unwrap();
+                self.exclusive.send(held_exclusive()).unwrap();
             }
         }
         let (exclusive, witnessed) = std::sync::mpsc::channel();
@@ -379,7 +398,7 @@ mod tests {
     fn a_fenced_descriptor_is_created_under_the_exclusive_lock() {
         let mut exclusive = false;
         let created = Fenced::create(|| {
-            exclusive = matches!(FORK_LOCK.try_read(), Err(TryLockError::WouldBlock));
+            exclusive = held_exclusive();
             std::io::pipe().map(|(reader, _writer)| reader)
         });
         drop(created.unwrap());
