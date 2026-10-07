@@ -687,6 +687,17 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   `nx` a task runs from a project directory resolves to the task's own workspace and passes. A cache or data directory
   that several checkouts share on purpose has to lie outside every workspace, or it is refused. Not yet proposed
   upstream.
+- **The daemon stops for an ignore file only when its watcher's rules may be stale.** Nx's native watcher reads its
+  ignore files once, in `watch()`, and the daemon stopped itself on every watcher event for a `.gitignore` or
+  `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports one, and so
+  does FSEvents for a write made shortly before the daemon's stream started, when fseventsd numbers it after that start.
+  The stop destroys every client socket at once, so a file-watcher client lost the notification of the batch that
+  carried the event, and a watcher waiting to judge an edit in that batch waited forever. The patch keeps the content
+  hash of each ignore file the workspace context read, but only where neither the file nor its directory changed since
+  just before the watcher's read (judged on the filesystem's own clock, by stamping a probe in the workspace data
+  directory): those are the bytes the watcher's rules came from. An event stops the daemon unless its file is one of
+  those and still hashes the same; a file changed between the watcher's read and the context's, or one the context never
+  held, stops it as before. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` does **not** change a consumer's Nx. A consumer needing these repairs
 sets the same `overrides.nx` URL in its root `package.json`, registers the same `@nx/js` patch in its
@@ -696,9 +707,9 @@ replace the registry dependency with a local link or hide a failure by resetting
 The patch is version-specific. A changed patch publishes a new release, and consumers move to its URL. On an Nx upgrade,
 remove each hunk only when the installed upstream release contains that repair and the task-history namespace,
 cache-bound, resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim,
-incomplete-run summary and foreign-environment regressions pass; preserve any repair not yet released. The restore-time
-regression fails without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a fresh mtime),
-so run it on macOS before dropping the hunk. When every hunk is upstream, drop the override, the patch,
+incomplete-run summary, foreign-environment and ignore-file regressions pass; preserve any repair not yet released. The
+restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a
+fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, drop the override, the patch,
 `tooling/patched-nx.ts` and the workflow together.
 
 ## Bun Test Tracing Generator

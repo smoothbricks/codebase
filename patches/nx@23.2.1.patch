@@ -659,6 +659,140 @@ index a449f2f..ecb6886 100644
          });
          if (watcherInstance) {
              await watcherInstance.stop();
+diff --git a/dist/src/daemon/server/watcher.js b/dist/src/daemon/server/watcher.js
+index cbc34a1..7ff8c38 100644
+--- a/dist/src/daemon/server/watcher.js
++++ b/dist/src/daemon/server/watcher.js
+@@ -6,20 +6,103 @@ exports.watchOutputFiles = watchOutputFiles;
+ exports.convertChangeEventsToLogMessage = convertChangeEventsToLogMessage;
+ const workspace_root_1 = require("../../utils/workspace-root");
+ const path_1 = require("path");
++const fs_1 = require("fs");
+ const shutdown_utils_1 = require("./shutdown-utils");
+ const path_2 = require("../../utils/path");
+ const cache_1 = require("../cache");
+ const server_1 = require("./server");
+ const handle_import_1 = require("../../utils/handle-import");
++const workspace_context_1 = require("../../utils/workspace-context");
++const cache_directory_1 = require("../../utils/cache-directory");
+ // Captured by watchWorkspace so flushPendingWorkspaceChanges can route
+ // force-flushed events through the same handling as the async callback.
+ // Definite-assignment: dispatchWorkspaceChanges only runs after
+-// watchWorkspace has set both, so reading them as non-nullable is safe.
++// watchWorkspace has set all four, so reading them as non-nullable is safe.
+ let activeServer;
+ let workspaceChangesCallback;
+-function dispatchWorkspaceChanges(events) {
++let hashFile;
++// The filesystem's own time, in nanoseconds, just before the watcher read
++// the ignore files its filter is built from.
++let filterReadFrom;
++function isIgnoreFile(path) {
++    return path.endsWith('.gitignore') || path === '.nxignore';
++}
++/** The later of a path's ctime and mtime, in the filesystem's nanoseconds. */
++function changedAt(path) {
++    const stat = (0, fs_1.statSync)(path, { bigint: true });
++    return stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;
++}
++/**
++ * The filesystem's clock now: the change time of a probe it stamps. File
++ * timestamps can lag the system clock by a tick (Linux stamps from a coarse
++ * clock) or be truncated to a coarse resolution, so a write made after this
++ * point is stamped at or after it only when both come from the same clock.
++ */
++function filesystemNow() {
++    (0, fs_1.mkdirSync)(cache_directory_1.workspaceDataDirectory, { recursive: true });
++    const probe = (0, path_1.join)(cache_directory_1.workspaceDataDirectory, `.watch-start-${process.pid}`);
++    (0, fs_1.writeFileSync)(probe, '');
++    try {
++        return changedAt(probe);
++    }
++    finally {
++        (0, fs_1.unlinkSync)(probe);
++    }
++}
++/** Whether `path` is unchanged since the filter's read; a path that is gone is not. */
++function unchangedSinceFilterRead(path) {
++    try {
++        return changedAt(path) < filterReadFrom;
++    }
++    catch (error) {
++        if (error.code === 'ENOENT')
++            return false;
++        throw error;
++    }
++}
++// The ignore files whose bytes the watcher's filter is known to hold: each
++// one's content hash, by workspace-relative path. The watcher reads its
++// ignore rules once, in watch(), before its event stream starts, and never
++// again, so only a change to those bytes makes its rules stale. A watcher
++// event alone does not: a rewrite with the same bytes (a checkout, a
++// formatter) reports one, and FSEvents reports writes made shortly before
++// the stream started, when fseventsd numbered them after its start.
++//
++// The hashes come from the workspace context, which startServer sets up
++// after watch() returned, so the context read each file after the filter
++// did. They are the same bytes only if neither the file nor the directory
++// entry naming it changed since just before the filter's read: then no
++// write, replacement, rename or deletion fell between the two reads. A file
++// changed in that gap is left out, as is one the context never held, and
++// any event for an ignore file left out stops the daemon, as Nx always did.
++// Taken once, in the turn after watchWorkspace returns; a dispatch that
++// comes first takes it then.
++let ignoreFilesAtStart;
++function ignoreFiles() {
++    ignoreFilesAtStart ??= (0, workspace_context_1.getAllFileDataInContext)(workspace_root_1.workspaceRoot).then((files) => {
++        const read = new Map();
++        for (const { file, hash } of files) {
++            const path = (0, path_1.join)(workspace_root_1.workspaceRoot, file);
++            if (isIgnoreFile(file) &&
++                unchangedSinceFilterRead(path) &&
++                unchangedSinceFilterRead((0, path_1.dirname)(path))) {
++                read.set(file, hash);
++            }
++        }
++        return read;
++    });
++    return ignoreFilesAtStart;
++}
++// Every dispatch awaits the snapshot, so batches still reach the callback in
++// the order the watcher delivered them.
++async function dispatchWorkspaceChanges(events) {
++    const filterRead = await ignoreFiles();
+     for (const event of events) {
+-        if (event.path.endsWith('.gitignore') || event.path === '.nxignore') {
++        // hashFile answers null for a file that is gone, which no read hash is.
++        if (isIgnoreFile(event.path) &&
++            (!filterRead.has(event.path) ||
++                hashFile((0, path_1.join)(workspace_root_1.workspaceRoot, event.path)) !==
++                    filterRead.get(event.path))) {
+             // If the ignore files themselves have changed we need to dynamically
+             // update our cached ignoreGlobs
+             (0, shutdown_utils_1.handleServerProcessTermination)({
+@@ -32,16 +115,20 @@ function dispatchWorkspaceChanges(events) {
+     return workspaceChangesCallback(null, events);
+ }
+ async function watchWorkspace(server, cb) {
+-    const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
++    const native = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
++    const { Watcher } = native;
+     activeServer = server;
+     workspaceChangesCallback = cb;
++    hashFile = native.hashFile;
++    filterReadFrom = filesystemNow();
+     const watcher = new Watcher(workspace_root_1.workspaceRoot);
+     watcher.watch((err, events) => {
+         if (err) {
+             return cb(err, null);
+         }
+-        dispatchWorkspaceChanges(events);
++        dispatchWorkspaceChanges(events).catch((error) => cb(error, null));
+     });
++    setImmediate(() => ignoreFiles().catch((error) => cb(error, null)));
+     return watcher;
+ }
+ /**
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
 index 52b621b..1c13e49 100644
 --- a/dist/src/daemon/socket-utils.d.ts

@@ -63,6 +63,7 @@ const NOT_YET_UPSTREAM = [
     'run summary',
     'report success only when every task ended, and name the tasks a run that threw never finished (`endCommand`)',
   ],
+  ['ignore files', 'stop the daemon for a `.gitignore` or `.nxignore` only when its watcher may hold other bytes'],
 ] as const;
 /** npm's own fixed tar mtime (1985-10-26T08:15:00Z), so the packed entries match `npm pack`'s. */
 const TAR_MTIME = 499162500;
