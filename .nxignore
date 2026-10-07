@@ -2,3 +2,8 @@ modules/
 # Workspace-owned runtime state is not source: watching the daemon's own log
 # and plugin sockets feeds each write back into project graph construction.
 .cowshed/
+# Nx's native watcher honors only this file and the root .gitignore, never a nested
+# .gitignore, so tooling/direnv/.gitignore does not keep devenv's state out of the
+# daemon's outputs watcher: every direnv entry rewrites it, in every shed.
+tooling/direnv/.devenv*/
+tooling/direnv/.direnv/
