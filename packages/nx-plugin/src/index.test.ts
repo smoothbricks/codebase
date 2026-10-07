@@ -956,6 +956,47 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('lints the declared test program outside src and keys its sources and inherited declaration', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/test-base.json',
+        JSON.stringify({
+          include: ['\u0024{configDir}/tests/**/*.ts'],
+          exclude: ['\u0024{configDir}/tests/excluded.ts'],
+          files: ['contract/schema.d.ts'],
+        }),
+      );
+      await workspace.write('packages/example/tsconfig.test.json', '{"extends":"../test-base.json"}\n');
+      await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
+      await workspace.write('packages/example/tests/check.test.ts', 'export const check = 1;\n');
+      await workspace.write('packages/example/tests/helper.ts', 'export const helper = 1;\n');
+      await workspace.write('packages/example/tests/excluded.ts', 'export const excluded = 1;\n');
+      await workspace.write('packages/example/other/stray.test.ts', 'export const stray = 1;\n');
+      await workspace.write('packages/contract/schema.d.ts', 'export interface Contract { value: number }\n');
+
+      const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+      expect(lint?.options?.commands).toEqual([
+        "eslint 'packages/contract/schema.d.ts' 'packages/example/src/index.ts' 'packages/example/tests/check.test.ts' 'packages/example/tests/helper.ts'",
+      ]);
+      expect(lint?.inputs).toEqual(
+        expect.arrayContaining([
+          '{projectRoot}/tsconfig.test.json',
+          '{workspaceRoot}/packages/test-base.json',
+          '{workspaceRoot}/packages/contract/schema.d.ts',
+          '{workspaceRoot}/packages/example/tests/check.test.ts',
+          '{workspaceRoot}/packages/example/tests/helper.ts',
+        ]),
+      );
+      expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/tests/excluded.ts');
+      expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/other/stray.test.ts');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('attributes one repository-root Cargo workspace across package projects', async () => {
     const workspace = await createWorkspace();
     try {

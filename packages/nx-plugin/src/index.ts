@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { readTsConfig } from '@nx/js';
 import {
   type CreateNodesContextV2,
   type CreateNodesResultV2,
@@ -320,20 +321,52 @@ async function javaScriptSourceFiles(directory: string): Promise<string[]> {
   return files.sort();
 }
 
-async function projectLintCommands(projectRoot: string, workspaceRoot: string): Promise<string[]> {
+async function projectLintCommands(
+  projectRoot: string,
+  workspaceRoot: string,
+): Promise<{ commands: string[]; inputs: string[] }> {
   const commands: string[] = [];
+  const inputs: string[] = [];
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
     commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
   }
   if (ESLINT_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
-    const sourceFiles = await javaScriptSourceFiles(join(absoluteProjectRoot, 'src'));
-    if (sourceFiles.length > 0) {
-      commands.push(`eslint ${sourceFiles.map((file) => quote(relative(workspaceRoot, file))).join(' ')}`);
+    const sourceFiles = new Set(await javaScriptSourceFiles(join(absoluteProjectRoot, 'src')));
+    const testConfig = join(absoluteProjectRoot, 'tsconfig.test.json');
+    if (existsSync(testConfig)) {
+      // A test program can live anywhere the declaration selects, not just src.
+      // Use the compiler's file set and the existing declaration-chain hasher,
+      // so inherited includes and files outside this project keep their keys.
+      const program = readTsConfig(testConfig);
+      const errors = program.errors.filter(({ code }) => code !== 18003);
+      if (errors.length > 0) {
+        throw new Error(
+          `${testConfig}: ${errors.map(({ code, messageText }) => `TS${code}: ${JSON.stringify(messageText)}`).join('; ')}`,
+        );
+      }
+      inputs.push('{projectRoot}/tsconfig.test.json', ...typescriptConfigChainInputs([testConfig], workspaceRoot));
+      for (const file of program.fileNames) {
+        const path = relative(workspaceRoot, file).split(sep).join('/');
+        if (path === '..' || path.startsWith('../') || isAbsolute(path)) {
+          throw new Error(`${testConfig}: test source ${file} is outside the workspace and cannot be hashed`);
+        }
+        if (!/\.[cm]?[jt]sx?$/.test(path) || path.split('/').some(isNonSourceDirectory)) continue;
+        sourceFiles.add(file);
+        inputs.push(`{workspaceRoot}/${path}`);
+      }
+    }
+    if (sourceFiles.size > 0) {
+      commands.push(
+        `eslint ${[...sourceFiles]
+          .sort()
+          .map((file) => quote(relative(workspaceRoot, file)))
+          .join(' ')}`,
+      );
     }
   }
-  return commands;
+  return { commands, inputs: [...new Set(inputs)] };
 }
 
 type NapiArchitecture = 'arm64' | 'x64';
@@ -1767,7 +1800,7 @@ async function createProjectTargets(
     }
   }
 
-  const lintCommands = await projectLintCommands(projectRoot, workspaceRoot);
+  const { commands: lintCommands, inputs: lintProgramInputs } = await projectLintCommands(projectRoot, workspaceRoot);
   if (validationTargets.length > 0 || lintCommands.length > 0) {
     targets.lint = {
       executor: lintCommands.length > 0 ? 'nx:run-commands' : 'nx:noop',
@@ -1778,6 +1811,7 @@ async function createProjectTargets(
         selfDefault,
         dependencyProduction,
         ...checkInputs,
+        ...lintProgramInputs,
         ...[...BIOME_CONFIG_FILES, ...ESLINT_CONFIG_FILES].flatMap((name) => [
           `{workspaceRoot}/${name}`,
           `{projectRoot}/${name}`,

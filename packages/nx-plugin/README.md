@@ -30,9 +30,11 @@ published package that really is deployed declares `deploy` itself. Whether CI d
 question, answered only by the deploy tags the CLI reads (`stage-deploy-target` and its three siblings).
 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
-flat configuration enables ESLint only for existing JavaScript/TypeScript files under that project's `src`. Rust-only
-source trees therefore keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript
-inputs. Adding JavaScript or TypeScript sources adds their lint coverage automatically.
+flat configuration enables ESLint for existing JavaScript/TypeScript files under that project's `src` and the files its
+`tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`; the
+same sources, the test declaration and its existing `extends` chain are explicit lint cache inputs. Rust-only source
+trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs. Adding
+JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically.
 
 Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
 `^production` unless the workspace opts into the versionless production input described below. Keep
