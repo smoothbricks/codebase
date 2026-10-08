@@ -325,7 +325,8 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
         // the declaration, even if the old producer used a different directory.
         // Genuine sibling declarations and unrelated developer choices stay theirs.
         const inherited = inheritedContainedBinding(anchor, relative, current);
-        if (current === target || (foreign && !inherited)) continue;
+        if (current === target && readlinkSync(at) === packageAliasTarget(root, at, target)) continue;
+        if (foreign && !inherited && current !== target) continue;
       }
       changes.push({ path: entry, target });
     }
@@ -458,7 +459,8 @@ export function activatePackageProduct(root: string, productDirectory: string, c
     }
   }
   const state = lstatSync(alias, { throwIfNoEntry: false });
-  if (state?.isSymbolicLink() && path.resolve(path.dirname(alias), readlinkSync(alias)) === packageRoot) return true;
+  if (state?.isSymbolicLink() && readlinkSync(alias) === packageAliasTarget(canonicalRoot, alias, packageRoot))
+    return true;
   if (check) return false;
   replacePackageAlias(canonicalRoot, alias, packageRoot);
   console.error(`activated portable package ${product.closure.packageName}: ${product.identity}`);
@@ -599,11 +601,16 @@ function replacePackageAlias(root: string, alias: string, target: string): void 
   const scratch = mkdtempSync(path.join(path.dirname(ownedAlias), '.activation-'));
   try {
     const temporary = path.join(scratch, 'link');
-    symlinkSync(target, temporary, 'dir');
+    symlinkSync(packageAliasTarget(root, alias, target), temporary, 'dir');
     renameSync(temporary, ownedAlias);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/** Owned namespace aliases relocate with a checkout; genuine host/sibling bindings do not. */
+function packageAliasTarget(root: string, alias: string, target: string): string {
+  return containsPath(path.resolve(root), path.resolve(target)) ? path.relative(path.dirname(alias), target) : target;
 }
 
 function verifyPackageIdentity(packageRoot: string, expected: string): void {

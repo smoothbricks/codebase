@@ -36,6 +36,10 @@ no-op publications; collisions refuse, and previous generations are retained for
 execution and cache restoration therefore cannot remove package files from beneath those processes. Neither a second
 hasher nor a registry names generations.
 
+Owned generation and project-contained declaration aliases are relative to their own namespace, so a source-image fork
+selects its own copied package without reading the donor. Activation checks and atomically normalizes older absolute
+owned aliases. Genuine sibling links and immutable-store host bindings retain their separate, host-local authority.
+
 Host-local package-name bindings are materialized before activation; stale foreign bindings fail `--check` and are
 rebound by the activation owner, never by a consumer repair. Sandbox hotlaunch consumers resolve the retained relative
 identities against the admitted current Bun store and verify the actual package names and versions. The provider

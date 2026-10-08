@@ -750,6 +750,11 @@ Producer execution and cache restoration never overwrite an installed generation
 prior generations remain available to their live CLI and daemon owners. No second hash, registry, caller retry or
 version-guard suppression substitutes for this lifetime boundary.
 
+An owned installed-generation alias and a project-contained developer alias are relative links within their checkout. A
+source-image fork therefore selects its own generation without borrowing its donor's tree; ordinary activation
+normalizes older absolute owned aliases. Genuine sibling links and immutable-store host bindings retain their distinct
+host-local authority.
+
 ### The adoption needs the target's Nx database closed
 
 A process that opened the target's task database before a swap keeps that file open but resolves cache paths through the

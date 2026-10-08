@@ -747,7 +747,7 @@ describe('what shell entry keeps linked', () => {
           symlinkSync(legacy, join(root, LINKED));
           expect((await enter({ links: true, check: true })).exitCode).toBe(1);
           expect((await enter({ links: true })).exitCode).toBe(0);
-          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
           expect(readFileSync(join(legacy, 'package.json'), 'utf8')).toContain('@fixture/lib');
           expect((await enter({ links: true, check: true })).exitCode).toBe(0);
           // A genuinely unrelated checkout remains the developer's independent choice.
@@ -1196,6 +1196,23 @@ describe('immutable portable package activation', () => {
       expect(realpathSync(join(root, 'first/.cache/product/node_modules', product.closure.packageName))).not.toBe(
         realpathSync(join(root, 'second/.cache/product/node_modules', product.closure.packageName)),
       );
+      const fork = join(root, 'fork');
+      await cp(join(root, 'first'), fork, { recursive: true, verbatimSymlinks: true });
+      const forkDirectory = join(fork, '.cache/product');
+      const forkAlias = join(forkDirectory, 'node_modules', product.closure.packageName);
+      const forkGeneration = join(
+        forkDirectory,
+        'generations',
+        product.identity,
+        'node_modules',
+        product.closure.packageName,
+      );
+      expect(realpathSync(forkAlias)).toBe(forkGeneration);
+      expect(activatePackageProduct(fork, forkDirectory, true)).toBe(true);
+      expect(createRequire(join(forkGeneration, 'package.json'))('./index.cjs')).toEqual({
+        payload: 'portable',
+        bound: true,
+      });
     });
   });
 
