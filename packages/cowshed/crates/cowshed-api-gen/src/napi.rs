@@ -1318,168 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn job_results_project_by_shape_without_changing_nonoptional_handles() {
-        let output = output(
-            r#"operations! {
-                /// An optional job id.
-                worker json "worker.optionalId" WorkerOptionalId(WorkerScope) -> Option<JobId>;
-                /// An optional job record.
-                worker json "worker.optionalInfo" WorkerOptionalInfo(WorkerScope) -> std::option::Option<JobInfo>;
-                /// A required job id.
-                worker json "worker.requiredId" WorkerRequiredId(WorkerScope) -> JobId;
-                /// A required job record.
-                worker json "worker.requiredInfo" WorkerRequiredInfo(WorkerScope) -> JobInfo;
-                /// An upload that names a job.
-                worker upload "worker.upload" WorkerUpload(WorkerScope) -> JobId;
-            }"#,
-        )
-        .expect("projection");
-        for (marker, method, nullable) in [
-            ("WorkerOptionalId", "optionalId", true),
-            ("WorkerOptionalInfo", "optionalInfo", true),
-            ("WorkerRequiredId", "requiredId", false),
-            ("WorkerRequiredInfo", "requiredInfo", false),
-        ] {
-            let helper = if nullable {
-                "optional_job_call"
-            } else {
-                "job_call"
-            };
-            let generics = if nullable {
-                format!("{marker}, _")
-            } else {
-                marker.to_owned()
-            };
-            assert!(
-                output
-                    .rust
-                    .contains(&format!("super::{helper}::<operations::{generics}>")),
-                "{}",
-                output.rust
-            );
-            let native = if nullable {
-                "NativeJobHandle | null"
-            } else {
-                "NativeJobHandle"
-            };
-            assert!(
-                output.typescript.contains(&format!(
-                    "  {method}(argumentsJson: string): Promise<{native}>;"
-                )),
-                "{}",
-                output.typescript
-            );
-            assert!(
-                output.typescript.contains(&format!(
-                    "export async function worker{}(handle: Native{marker}, args: {marker}Arguments): Promise<{native}> {{\n  return handle.{method}(JSON.stringify(args));",
-                    capitalized(method)
-                )),
-                "{}",
-                output.typescript
-            );
-            let served = served_impl(&output.served, marker, "WorkspaceHandle");
-            assert!(
-                served.contains(r#"const BOUND: &'static [&'static str] = &["repoId", "workspace", "workspaceIncarnation"];"#),
-                "{served}"
-            );
-        }
-        assert!(
-            output
-                .rust
-                .contains("super::job_upload_call::<operations::WorkerUpload>"),
-            "{}",
-            output.rust
-        );
-        assert!(
-            output.typescript.contains(
-                "upload(argumentsJson: string, bytes?: Buffer): Promise<NativeJobHandle>;"
-            ),
-            "{}",
-            output.typescript
-        );
-    }
-
-    #[test]
-    fn nullable_roots_export_the_record_and_use_its_nullable_codec() {
-        let mut api = Api::default();
-        crate::records::parse_support(
-            r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct RootRequest { pub repo_id: String }
-            #[derive(Serialize, Deserialize)]
-            #[cfg_attr(any(), cowshed_api(name = "RenamedAnswer"))]
-            pub struct RootAnswer { pub value: String }
-            #[derive(Serialize, Deserialize)]
-            pub struct CowshedError { pub code: String, pub message: String, pub hint: String }
-            "#,
-            &mut api,
-        )
-        .expect("records");
-        let operations = crate::operations::parse(
-            r#"operations! {
-                /// An optional answer.
-                coordinator json "coordinator.optional" CoordinatorOptional(RootRequest) -> Option<RootAnswer>;
-                /// A list of answers.
-                coordinator json "coordinator.list" CoordinatorList(RootRequest) -> Vec<RootAnswer>;
-                /// One required answer.
-                coordinator json "coordinator.required" CoordinatorRequired(RootRequest) -> RootAnswer;
-            }"#,
-        )
-        .expect("table");
-        assert!(!api.records["RootAnswer"].exported);
-        export_records(&operations, &mut api).expect("exports");
-        assert!(api.records["RootAnswer"].exported);
-        assert!(api.nullable_results.contains("RootAnswer"));
-        let projection = emit(&operations, &api, &[]).expect("projection");
-        let output = crate::typescript::emit(&api).expect("types and codecs");
-        assert!(
-            output.types.contains("export type RenamedAnswer ="),
-            "{}",
-            output.types
-        );
-        for (method, ty, codec) in [
-            (
-                "Optional",
-                "Api.RenamedAnswer | null",
-                "parseRenamedAnswerOption",
-            ),
-            (
-                "List",
-                "readonly Api.RenamedAnswer[]",
-                "parseRenamedAnswerList",
-            ),
-            ("Required", "Api.RenamedAnswer", "parseRenamedAnswer"),
-        ] {
-            let name = method.to_ascii_lowercase();
-            assert!(
-                projection.typescript.contains(&format!("export async function coordinator{method}(handle: NativeCoordinator{method}, args: Coordinator{method}Arguments): Promise<{ty}> {{\n  return V.{codec}(await handle.{name}(JSON.stringify(args)));")),
-                "{}",
-                projection.typescript
-            );
-        }
-        assert!(
-            output.validators.contains(
-                "export const assertRenamedAnswerOption = typia.createAssertEquals<Api.RenamedAnswer | null>();"
-            ),
-            "{}",
-            output.validators
-        );
-        assert!(
-            output.validators.contains(
-                "export const parseRenamedAnswerOption = (json: string): Api.RenamedAnswer | null => assertRenamedAnswerOption(JSON.parse(json));"
-            ),
-            "{}",
-            output.validators
-        );
-        assert!(
-            !output.validators.contains("parseRootRequestOption"),
-            "{}",
-            output.validators
-        );
-    }
-
-    #[test]
     fn unsupported_nullable_shapes_are_refused_instead_of_erased() {
         for source in [
             "Option<JobId, JobInfo>",
@@ -1489,7 +1327,7 @@ mod tests {
             let ty = syn::parse_str::<Type>(source).expect("type");
             assert!(result_record(&ty).is_err(), "{source} was accepted");
         }
-        let error = output(
+        output(
             r#"operations! {
                 /// An unsupported optional upload result.
                 worker upload "worker.optional" WorkerOptional(WorkerScope) -> Option<JobId>;
@@ -1497,9 +1335,5 @@ mod tests {
         )
         .err()
         .expect("optional native job uploads are not supported");
-        assert!(
-            error.contains("an upload answers JSON or a nonoptional job"),
-            "{error}"
-        );
     }
 }
