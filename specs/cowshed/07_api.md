@@ -1055,12 +1055,23 @@ setup parent consumes only runner-declared root-only loop-control and finite loo
 device numbers and mode, and binds its own sparse ext4 image atomically with `LOOP_CONFIGURE`/`AUTOCLEAR`. It selects
 the narrow classic ext4 mount operation with command-local `LIBMOUNT_FORCE_MOUNT2=always`. The controller receives the
 runner-owned mountpoint, not the device capability; a real denied loop-control open proves that separation. The parent
-holds the loop descriptor until unmount, then independently verifies its backing inode is detached. Cleanup observes the
-target's kernel mount ID and device/backing identity, including when mount reports failure after acquiring it; an
-unmount command's status is reconciled with that kernel state before the image can be removed. Explicit cleanup returns
-every release and diagnostic-write failure. Destructor fallback attempts the same safe steps without panicking, then
-attempts fallible stderr/stdout reporting; delivery is unavailable if both existing channels fail. Failure controls
-exercise refused commands before and after mounting, including a setup refusal after actual mount acquisition.
+holds the loop descriptor until kernel-proven unmount; closing it does not itself prove deferred device retirement. A
+fresh `IN_CLOSE_WRITE` watch is armed on the exact opened backing inode through `/proc/self/fd`, after mkfs and all
+earlier writable opens finish and before `LOOP_CONFIGURE`. The local backing descriptor is dropped after configuration;
+no later independent writable image open is allowed. Linux's loop teardown sets `Lo_unbound` before putting its retained
+backing file, whose final put emits the close notification
+([loop.c](https://github.com/torvalds/linux/blob/v6.18/drivers/block/loop.c),
+[file_table.c](https://github.com/torvalds/linux/blob/v6.18/fs/file_table.c)). After proven unmount and owned loop
+close, the fixture performs one blocking read of that watch: exactly one complete 16-byte nameless `inotify_event` must
+match this watch descriptor, an `IN_CLOSE_WRITE` mask and a zero cookie, then one independent device/backing
+verification runs. Overflow, watch loss, rename/unlink, a short or misframed record, or failed delivery is an error,
+never completion and never retried. The existing fixture guard is unchanged: no timed sleep, status retry or new
+deadline substitutes for the kernel event. Cleanup observes the target's kernel mount ID and device/backing identity,
+including when mount reports failure after acquiring it; an unmount command's status is reconciled with that kernel
+state before the image can be removed. Explicit cleanup returns every release and diagnostic-write failure. Destructor
+fallback attempts the same safe steps without panicking, then attempts fallible stderr/stdout reporting; delivery is
+unavailable if both existing channels fail. Failure controls exercise refused commands before and after mounting,
+including a setup refusal after actual mount acquisition.
 
 The fixture compares `memory.current`/`memory.peak` with direct reads and verifies regular-file cache separately from
 shmem using `memory.stat`'s `file - shmem`. Direct-I/O workloads require exact independent `io.stat` parity, excluding
