@@ -562,7 +562,7 @@ impl WorkspaceHandle {
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
     pub async fn job(&self, id: JobId) -> Result<JobHandle, CowshedError>;
-    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobHandle, CowshedError>;
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<Option<JobHandle>, CowshedError>;
     // An ended job's terminal record and a handle reading its sealed output, also for a job an
     // earlier supervisor of the incarnation ran (11_shell.md "Draining a supervisor of another build").
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle), CowshedError>;
@@ -1099,11 +1099,16 @@ A repeated exec with the same key and request answers the existing job and spawn
 carrying another reader returns typed `Usage`, `stdin already bound to job N; attach to write`, with
 `admission: { reason: "stdinBound", jobId }`. The refused reader is never polled.
 
-`WorkspaceHandle.jobByKey(key)` reads the admitted job id from durable records even after a lost reply or supervisor
-restart. A provably absent key is `NotFound`. A keyed store set aside while it may have served this incarnation makes
-unreadable keys unprovable, so lookup and exec return typed `Conflict`, `admission: { reason: "unprovable", setAside }`,
-never `NotFound` or a spawn. A missing archived incarnation marker leaves its history unprovable; a malformed marker is
-an integrity failure, never proof of absence. The key grants no authority and never crosses an incarnation.
+`WorkspaceHandle.job_by_key(key)` reads the admitted job id from durable records even after a lost reply or supervisor
+restart. It returns `Result<Option<JobHandle>, CowshedError>`; the TypeScript `jobByKey(key)` returns
+`Promise<JobHandle | null>`. Only `AdmissionLookup::Absent`, proven under the current incarnation and store authority,
+returns `None` / `null`. A missing workspace or job, stale incarnation or revision, transport failure, unreadable
+history, and storage or observation failure remain errors with their original causes, never absence. A keyed store set
+aside while it may have served this incarnation makes unreadable keys unprovable, so lookup and exec return typed
+`Conflict`, `admission: { reason: "unprovable", setAside }`, never absence or a spawn. A missing archived incarnation
+marker leaves its history unprovable; a malformed marker is an integrity failure, never proof of absence. The key grants
+no authority and never crosses an incarnation. A successful root JSON `null` is distinct from an omitted `result`, which
+remains an invalid response envelope.
 
 Record layout 8 preserves layout 7's resource, accounting and volume columns, then appends the fourteen admission
 columns. Native error causes are object projections generated from the canonical `CowshedError` declaration, not JSON
@@ -1476,7 +1481,7 @@ export interface WorkspaceHandle {
   background(request: ExecRequest): Promise<JobHandle>;
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
-  jobByKey(key: string): Promise<JobHandle>;
+  jobByKey(key: string): Promise<JobHandle | null>;
   checkpoint(opts?: CheckpointOptions): Promise<string>;
   push(opts?: PushOptions): Promise<PushReport>;
   grants(): Promise<GrantSet>; // read-only

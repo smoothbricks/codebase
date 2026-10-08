@@ -908,20 +908,20 @@ export async function workerJob(handle: NativeWorkerJob, args: WorkerJobArgument
 
 /** A handle that serves `worker.jobByKey`. */
 export interface NativeWorkerJobByKey {
-  jobByKey(argumentsJson: string): Promise<NativeJobHandle>;
+  jobByKey(argumentsJson: string): Promise<NativeJobHandle | null>;
 }
 
 /** The request fields a `worker.jobByKey` caller names; its handle binds the rest. */
 export type WorkerJobByKeyArguments = Pick<Api.AdmissionKeyRequest, 'admissionKey'>;
 
 /**
- * Names the job an admission key admitted in the workspace incarnation: the job whose exec
- * reply was lost.
+ * Names the job an admission key admitted in the workspace incarnation, or none when its
+ * durable records prove the key admitted no job.
  */
 export async function workerJobByKey(
   handle: NativeWorkerJobByKey,
   args: WorkerJobByKeyArguments,
-): Promise<NativeJobHandle> {
+): Promise<NativeJobHandle | null> {
   return handle.jobByKey(JSON.stringify(args));
 }
 

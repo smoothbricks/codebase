@@ -291,13 +291,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<SealedJob>;
-    /// The job `key` admitted in the workspace incarnation, from its durable records.
+    /// The job `key` admitted in the workspace incarnation, or proven absence in its durable records.
     async fn job_by_key(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         key: AdmissionKey,
-    ) -> Result<JobId>;
+    ) -> Result<Option<JobId>>;
     /// The job's terminal record, once it has one.
     async fn wait_job(
         &mut self,
@@ -11085,7 +11085,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         key: AdmissionKey,
-    ) -> Result<JobId> {
+    ) -> Result<Option<JobId>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         self.ensure_supervisor(&workspace)

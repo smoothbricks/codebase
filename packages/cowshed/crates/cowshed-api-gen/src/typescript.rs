@@ -16,6 +16,7 @@ pub fn emit(api: &Api) -> Result<Output, String> {
         api,
         visiting: BTreeSet::new(),
         declarations: BTreeMap::new(),
+        nullable_declarations: BTreeSet::new(),
     };
     for record in api.records.values().filter(|record| record.exported) {
         emitter.record(&record.name)?;
@@ -39,6 +40,14 @@ pub fn emit(api: &Api) -> Result<Output, String> {
         )
         .unwrap();
         writeln!(validators, "export const parse{name}List = (json: string): readonly Api.{name}[] => assert{name}List(JSON.parse(json));\n").unwrap();
+        if emitter.nullable_declarations.contains(&name) {
+            writeln!(
+                validators,
+                "export const assert{name}Option = typia.createAssertEquals<Api.{name} | null>();"
+            )
+            .unwrap();
+            writeln!(validators, "export const parse{name}Option = (json: string): Api.{name} | null => assert{name}Option(JSON.parse(json));\n").unwrap();
+        }
     }
     Ok(Output { types, validators })
 }
@@ -47,6 +56,7 @@ struct Emitter<'a> {
     api: &'a Api,
     visiting: BTreeSet<String>,
     declarations: BTreeMap<String, String>,
+    nullable_declarations: BTreeSet<String>,
 }
 
 impl Emitter<'_> {
@@ -62,6 +72,9 @@ impl Emitter<'_> {
             .as_deref()
             .unwrap_or(rust_name)
             .to_owned();
+        if self.api.nullable_results.contains(rust_name) {
+            self.nullable_declarations.insert(name.clone());
+        }
         if self.declarations.contains_key(&name) || !self.visiting.insert(rust_name.to_owned()) {
             return Ok(name);
         }

@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct Api {
     pub records: BTreeMap<String, Record>,
+    /// Canonical records named as Option roots by public operations.
+    pub nullable_results: BTreeSet<String>,
 }
 
 pub struct Record {

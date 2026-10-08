@@ -246,10 +246,13 @@ The addon exposes coordinator lifecycle operations, workspace exec and named ses
 `status()`, `resources()`, `wait()`, `kill()`, `detach()`, `logs({ stream, offset, follow })`, bounded
 `tail(cursor, limits)`, and `progress(everyMs)` as an `AsyncIterable`. An exec's optional `admissionKey` binds its
 authored request to one job of the immutable workspace incarnation before spawn; repeating it returns that job, and
-`worker.jobByKey(key)` recovers its handle after a lost reply. Dropping a job handle or detaching its view does not kill
-the job. `logs` answers one chunk of a stream from `offset` with its `nextOffset` and `eof`; reading again from
-`nextOffset` continues where the chunk ended, and `follow` waits for bytes or the stream's end. It is not a bounded
-running-command tail.
+`worker.jobByKey(key)` recovers its handle after a lost reply, or returns `null` only for a key proven absent under the
+current incarnation and store authority. Missing workspace/job, stale authority, transport, unreadable history and
+storage or observation failures reject with the complete typed cause; they never become `null` or authorize a second
+spawn. Rust exposes the same distinction as `Result<Option<JobHandle>, CowshedError>`. Dropping a job handle or
+detaching its view does not kill the job. `logs` answers one chunk of a stream from `offset` with its `nextOffset` and
+`eof`; reading again from `nextOffset` continues where the chunk ended, and `follow` waits for bytes or the stream's
+end. It is not a bounded running-command tail.
 
 `resources()` reads the canonical sample directly through the generated `job.resources` adapter, not by decoding a full
 status result. Before the job owns a process it reports the typed not-ready conflict; once the job ends it returns the

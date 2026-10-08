@@ -2283,9 +2283,9 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    /// The job `key` admitted in this workspace incarnation, from its durable records: answered
-    /// after the exec's reply was lost, and by a supervisor that did not run the job.
-    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobId> {
+    /// The job `key` admitted in this workspace incarnation, or proven absence in its durable
+    /// records: answered after the exec's reply was lost, even by a supervisor that did not run it.
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<Option<JobId>> {
         self.call(|reply| Command::JobByKey {
             authority: self.authority.clone(),
             key,
@@ -2672,7 +2672,7 @@ pub(super) enum Command {
     JobByKey {
         authority: WorkspaceAuthoritySnapshot,
         key: AdmissionKey,
-        reply: oneshot::Sender<Result<JobId>>,
+        reply: oneshot::Sender<Result<Option<JobId>>>,
     },
     Progress {
         authority: WorkspaceAuthoritySnapshot,
@@ -3264,11 +3264,8 @@ impl SupervisorActor {
             } => {
                 let result = self.validate_authority(&authority).and_then(|()| {
                     match self.artifacts.admitted(&key) {
-                        AdmissionLookup::Admitted { job_id, .. } => Ok(job_id),
-                        AdmissionLookup::Absent => Err(CowshedError::not_found(
-                            "the admission key admitted no job in this workspace incarnation",
-                            "exec the request under the key; nothing ran under it",
-                        )),
+                        AdmissionLookup::Admitted { job_id, .. } => Ok(Some(job_id)),
+                        AdmissionLookup::Absent => Ok(None),
                         AdmissionLookup::Unprovable { set_aside } => Err(
                             CowshedError::admission_refusal(AdmissionRefusal::Unprovable {
                                 set_aside: set_aside.to_path_buf(),

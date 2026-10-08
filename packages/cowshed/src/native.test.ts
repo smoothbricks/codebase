@@ -428,13 +428,14 @@ describe('Cowshed Node-API bindings', () => {
   }, 30_000);
 
   /**
-   * 07_api "Keyed admission": the addon carries an exec's admission key onto the controller wire
-   * as given, and a keyed refusal reaches JavaScript as a `CowshedError` whose `admission` is the
-   * controller's typed refusal, field for field: the conversion keeps the cause, not only the
-   * code, message and hint.
+   * 07_api "Keyed admission": the actual addon carries an exec's admission key onto the
+   * SCRIPTED controller wire as given. The admitted key resolves to a real native handle, while
+   * exec refusals retain the controller's typed cause field for field. This proves native/public
+   * projection, not the independent supervisor/store proof of admission or absence.
    */
   it('reaches the keyed job and preserves conflict and stream-binding causes', async () => {
     const client = `
+      import assert from 'node:assert/strict';
       import { connectCoordinator, coordinatorEndpoint, CowshedError } from ${JSON.stringify(moduleUrl)};
       const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
       const worker = await coordinator.worker('main');
@@ -455,6 +456,7 @@ describe('Cowshed Node-API bindings', () => {
       };
       const job = await worker.exec({ argv: ['build'], admissionKey: 'op-1' });
       const reached = await worker.jobByKey('op-1');
+      assert.ok(reached !== null, 'the scripted admitted key must resolve to its job');
       const bound = await refusal({ argv: ['stream'], admissionKey: 'op-stream' });
       const changed = await refusal({ argv: ['test'], admissionKey: 'op-1' });
       const unprovable = await refusal({ argv: ['build'], admissionKey: 'op-2' });

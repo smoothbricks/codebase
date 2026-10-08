@@ -116,27 +116,35 @@ enum Answer {
     Worker,
     /// A handle to the one job the result names.
     Job,
+    /// A handle to the job an optional result names, or null when it names none.
+    OptionalJob,
     /// The call's events, each demanded by the caller, until its end.
     Stream,
 }
 
 impl Answer {
     fn of(operation: &Operation, class: &Class) -> Result<Self, String> {
-        let result = path_name(&operation.result);
-        Ok(match (&operation.lane, result.as_deref(), class.rust) {
-            (Lane::Download(_), _, _) => Self::Download,
-            (Lane::Stream, _, _) => Self::Stream,
-            (_, Some("WorkspaceView"), _) => Self::Workspace,
-            (_, Some("WorkerView"), "Coordinator") => Self::Worker,
-            (_, Some("WorkerView"), _) => {
-                return Err(format!(
-                    "{}: only the coordinator mints a worker capability",
-                    operation.method
-                ));
-            }
-            (_, Some("JobId" | "JobInfo"), "WorkspaceHandle") => Self::Job,
-            _ => Self::Json,
-        })
+        let (result, shape) = result_record(&operation.result)
+            .map_err(|error| format!("{}: {error}", operation.method))?;
+        Ok(
+            match (&operation.lane, result.as_str(), shape, class.rust) {
+                (Lane::Download(_), _, _, _) => Self::Download,
+                (Lane::Stream, _, _, _) => Self::Stream,
+                (_, "WorkspaceView", ResultShape::Record, _) => Self::Workspace,
+                (_, "WorkerView", ResultShape::Record, "Coordinator") => Self::Worker,
+                (_, "WorkerView", ResultShape::Record, _) => {
+                    return Err(format!(
+                        "{}: only the coordinator mints a worker capability",
+                        operation.method
+                    ));
+                }
+                (_, "JobId" | "JobInfo", ResultShape::Record, "WorkspaceHandle") => Self::Job,
+                (_, "JobId" | "JobInfo", ResultShape::Optional, "WorkspaceHandle") => {
+                    Self::OptionalJob
+                }
+                _ => Self::Json,
+            },
+        )
     }
 
     /// The TypeScript type the addon method resolves to.
@@ -147,6 +155,7 @@ impl Answer {
             Self::Workspace => "NativeWorkspaceRefHandle",
             Self::Worker => "NativeWorkspaceHandle",
             Self::Job => "NativeJobHandle",
+            Self::OptionalJob => "NativeJobHandle | null",
             Self::Stream => "NativeEvents",
         }
     }
@@ -293,13 +302,16 @@ pub fn export_records(operations: &[Operation], api: &mut Api) -> Result<(), Str
     {
         let request = path_name(&operation.request)
             .ok_or_else(|| format!("{}: the request is not a named record", operation.method))?;
-        let (result, _) = result_record(&operation.result)
+        let (result, shape) = result_record(&operation.result)
             .map_err(|error| format!("{}: {error}", operation.method))?;
-        for name in [request, result] {
+        for name in [&request, &result] {
             api.records
-                .get_mut(&name)
+                .get_mut(name)
                 .ok_or_else(|| format!("{}: {name} has no declaration", operation.method))?
                 .exported = true;
+        }
+        if shape == ResultShape::Optional {
+            api.nullable_results.insert(result);
         }
     }
     Ok(())
@@ -662,16 +674,28 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 (Answer::Worker, false) => "worker_call",
                 (Answer::Job, false) => "job_call",
                 (Answer::Job, true) => "job_upload_call",
+                (Answer::OptionalJob, false) => "optional_job_call",
                 (Answer::Stream, false) => "stream_call",
-                (Answer::Download | Answer::Workspace | Answer::Worker | Answer::Stream, true) => {
+                (
+                    Answer::Download
+                    | Answer::Workspace
+                    | Answer::Worker
+                    | Answer::OptionalJob
+                    | Answer::Stream,
+                    true,
+                ) => {
                     return Err(format!(
-                        "{}: an upload answers JSON or a job",
+                        "{}: an upload answers JSON or a nonoptional job",
                         operation.method
                     ));
                 }
             };
             let generics = match method.answer {
-                Answer::Json | Answer::Download | Answer::Workspace | Answer::Stream => {
+                Answer::Json
+                | Answer::Download
+                | Answer::Workspace
+                | Answer::Stream
+                | Answer::OptionalJob => {
                     format!("operations::{}, _", operation.marker)
                 }
                 Answer::Worker | Answer::Job => format!("operations::{}", operation.marker),
@@ -825,7 +849,7 @@ fn typescript(
                     ),
                 )
             }
-            Answer::Workspace | Answer::Worker | Answer::Job => (
+            Answer::Workspace | Answer::Worker | Answer::Job | Answer::OptionalJob => (
                 "async function",
                 format!("Promise<{}>", method.answer.native()),
                 format!("return {call};"),
@@ -849,13 +873,21 @@ fn typescript(
     Ok(output)
 }
 
-/// A JSON result's record, and whether the result is a list of it.
-fn result_record(ty: &Type) -> Result<(String, bool), String> {
+/// The outer shape of a result whose element is one named API record.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResultShape {
+    Record,
+    List,
+    Optional,
+}
+
+/// A result's named record and its structural wrapper, shared by exports and adapters.
+fn result_record(ty: &Type) -> Result<(String, ResultShape), String> {
     if let Some(name) = path_name(ty) {
-        return Ok((name, false));
+        return Ok((name, ResultShape::Record));
     }
     let Type::Path(path) = ty else {
-        return Err("an operation result is a named record or a Vec of one".to_owned());
+        return Err("an operation result is a named record, Vec or Option of one".to_owned());
     };
     let segment = path
         .path
@@ -866,10 +898,17 @@ fn result_record(ty: &Type) -> Result<(String, bool), String> {
         return Err(format!("unsupported operation result {}", segment.ident));
     };
     match (segment.ident.to_string().as_str(), arguments.args.first()) {
-        ("Vec", Some(GenericArgument::Type(element))) if arguments.args.len() == 1 => {
+        (wrapper @ ("Vec" | "Option"), Some(GenericArgument::Type(element)))
+            if arguments.args.len() == 1 =>
+        {
             let element =
                 path_name(element).ok_or("an operation result's element is a named record")?;
-            Ok((element, true))
+            let shape = if wrapper == "Vec" {
+                ResultShape::List
+            } else {
+                ResultShape::Optional
+            };
+            Ok((element, shape))
         }
         (ident, _) => Err(format!("unsupported operation result {ident}")),
     }
@@ -880,12 +919,12 @@ fn result_type(
     ty: &Type,
     record_name: &impl Fn(&str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
-    let (record, list) = result_record(ty)?;
+    let (record, shape) = result_record(ty)?;
     let name = record_name(&record)?;
-    Ok(if list {
-        (format!("readonly Api.{name}[]"), format!("parse{name}List"))
-    } else {
-        (format!("Api.{name}"), format!("parse{name}"))
+    Ok(match shape {
+        ResultShape::Record => (format!("Api.{name}"), format!("parse{name}")),
+        ResultShape::List => (format!("readonly Api.{name}[]"), format!("parse{name}List")),
+        ResultShape::Optional => (format!("Api.{name} | null"), format!("parse{name}Option")),
     })
 }
 
@@ -1276,5 +1315,191 @@ mod tests {
         assert!(!output.served.contains("JobKill"));
         assert!(!output.rust.contains("JobKill"));
         assert!(!output.typescript.contains("jobKill"));
+    }
+
+    #[test]
+    fn job_results_project_by_shape_without_changing_nonoptional_handles() {
+        let output = output(
+            r#"operations! {
+                /// An optional job id.
+                worker json "worker.optionalId" WorkerOptionalId(WorkerScope) -> Option<JobId>;
+                /// An optional job record.
+                worker json "worker.optionalInfo" WorkerOptionalInfo(WorkerScope) -> std::option::Option<JobInfo>;
+                /// A required job id.
+                worker json "worker.requiredId" WorkerRequiredId(WorkerScope) -> JobId;
+                /// A required job record.
+                worker json "worker.requiredInfo" WorkerRequiredInfo(WorkerScope) -> JobInfo;
+                /// An upload that names a job.
+                worker upload "worker.upload" WorkerUpload(WorkerScope) -> JobId;
+            }"#,
+        )
+        .expect("projection");
+        for (marker, method, nullable) in [
+            ("WorkerOptionalId", "optionalId", true),
+            ("WorkerOptionalInfo", "optionalInfo", true),
+            ("WorkerRequiredId", "requiredId", false),
+            ("WorkerRequiredInfo", "requiredInfo", false),
+        ] {
+            let helper = if nullable {
+                "optional_job_call"
+            } else {
+                "job_call"
+            };
+            let generics = if nullable {
+                format!("{marker}, _")
+            } else {
+                marker.to_owned()
+            };
+            assert!(
+                output
+                    .rust
+                    .contains(&format!("super::{helper}::<operations::{generics}>")),
+                "{}",
+                output.rust
+            );
+            let native = if nullable {
+                "NativeJobHandle | null"
+            } else {
+                "NativeJobHandle"
+            };
+            assert!(
+                output.typescript.contains(&format!(
+                    "  {method}(argumentsJson: string): Promise<{native}>;"
+                )),
+                "{}",
+                output.typescript
+            );
+            assert!(
+                output.typescript.contains(&format!(
+                    "export async function worker{}(handle: Native{marker}, args: {marker}Arguments): Promise<{native}> {{\n  return handle.{method}(JSON.stringify(args));",
+                    capitalized(method)
+                )),
+                "{}",
+                output.typescript
+            );
+            let served = served_impl(&output.served, marker, "WorkspaceHandle");
+            assert!(
+                served.contains(r#"const BOUND: &'static [&'static str] = &["repoId", "workspace", "workspaceIncarnation"];"#),
+                "{served}"
+            );
+        }
+        assert!(
+            output
+                .rust
+                .contains("super::job_upload_call::<operations::WorkerUpload>"),
+            "{}",
+            output.rust
+        );
+        assert!(
+            output.typescript.contains(
+                "upload(argumentsJson: string, bytes?: Buffer): Promise<NativeJobHandle>;"
+            ),
+            "{}",
+            output.typescript
+        );
+    }
+
+    #[test]
+    fn nullable_roots_export_the_record_and_use_its_nullable_codec() {
+        let mut api = Api::default();
+        crate::records::parse_support(
+            r#"
+            #[derive(Serialize, Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            pub struct RootRequest { pub repo_id: String }
+            #[derive(Serialize, Deserialize)]
+            #[cfg_attr(any(), cowshed_api(name = "RenamedAnswer"))]
+            pub struct RootAnswer { pub value: String }
+            #[derive(Serialize, Deserialize)]
+            pub struct CowshedError { pub code: String, pub message: String, pub hint: String }
+            "#,
+            &mut api,
+        )
+        .expect("records");
+        let operations = crate::operations::parse(
+            r#"operations! {
+                /// An optional answer.
+                coordinator json "coordinator.optional" CoordinatorOptional(RootRequest) -> Option<RootAnswer>;
+                /// A list of answers.
+                coordinator json "coordinator.list" CoordinatorList(RootRequest) -> Vec<RootAnswer>;
+                /// One required answer.
+                coordinator json "coordinator.required" CoordinatorRequired(RootRequest) -> RootAnswer;
+            }"#,
+        )
+        .expect("table");
+        assert!(!api.records["RootAnswer"].exported);
+        export_records(&operations, &mut api).expect("exports");
+        assert!(api.records["RootAnswer"].exported);
+        assert!(api.nullable_results.contains("RootAnswer"));
+        let projection = emit(&operations, &api, &[]).expect("projection");
+        let output = crate::typescript::emit(&api).expect("types and codecs");
+        assert!(
+            output.types.contains("export type RenamedAnswer ="),
+            "{}",
+            output.types
+        );
+        for (method, ty, codec) in [
+            (
+                "Optional",
+                "Api.RenamedAnswer | null",
+                "parseRenamedAnswerOption",
+            ),
+            (
+                "List",
+                "readonly Api.RenamedAnswer[]",
+                "parseRenamedAnswerList",
+            ),
+            ("Required", "Api.RenamedAnswer", "parseRenamedAnswer"),
+        ] {
+            let name = method.to_ascii_lowercase();
+            assert!(
+                projection.typescript.contains(&format!("export async function coordinator{method}(handle: NativeCoordinator{method}, args: Coordinator{method}Arguments): Promise<{ty}> {{\n  return V.{codec}(await handle.{name}(JSON.stringify(args)));")),
+                "{}",
+                projection.typescript
+            );
+        }
+        assert!(
+            output.validators.contains(
+                "export const assertRenamedAnswerOption = typia.createAssertEquals<Api.RenamedAnswer | null>();"
+            ),
+            "{}",
+            output.validators
+        );
+        assert!(
+            output.validators.contains(
+                "export const parseRenamedAnswerOption = (json: string): Api.RenamedAnswer | null => assertRenamedAnswerOption(JSON.parse(json));"
+            ),
+            "{}",
+            output.validators
+        );
+        assert!(
+            !output.validators.contains("parseRootRequestOption"),
+            "{}",
+            output.validators
+        );
+    }
+
+    #[test]
+    fn unsupported_nullable_shapes_are_refused_instead_of_erased() {
+        for source in [
+            "Option<JobId, JobInfo>",
+            "Option<Vec<JobId>>",
+            "Vec<Option<JobId>>",
+        ] {
+            let ty = syn::parse_str::<Type>(source).expect("type");
+            assert!(result_record(&ty).is_err(), "{source} was accepted");
+        }
+        let error = output(
+            r#"operations! {
+                /// An unsupported optional upload result.
+                worker upload "worker.optional" WorkerOptional(WorkerScope) -> Option<JobId>;
+            }"#,
+        )
+        .err()
+        .expect("optional native job uploads are not supported");
+        assert!(
+            error.contains("an upload answers JSON or a nonoptional job"),
+            "{error}"
+        );
     }
 }

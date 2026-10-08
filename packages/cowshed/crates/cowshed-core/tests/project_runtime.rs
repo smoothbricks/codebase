@@ -1352,10 +1352,15 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         key: cowshed_core::api::AdmissionKey,
-    ) -> Result<JobId> {
+    ) -> Result<Option<JobId>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        self.events.send(Event::JobByKey(workspace, key)).ok();
-        JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
+        self.events
+            .send(Event::JobByKey(workspace.clone(), key.clone()))
+            .ok();
+        match self.supervisors.get(&workspace) {
+            Some(supervisor) => supervisor.job_by_key(key).await,
+            None => Err(Self::worker_unavailable()),
+        }
     }
 
     async fn wait_job(
@@ -1683,13 +1688,21 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
     }
 }
 
-/// The controller carries an exec's admission key to the host exactly as the caller named it,
-/// and routes `worker.jobByKey` to the host under the caller's incarnation fence; a malformed key
-/// reaches no host.
+/// The controller carries an exec's admission key into the real job store and routes lookup
+/// under the caller's incarnation fence. Only proven key absence is null; malformed keys,
+/// missing workspaces and stale incarnations remain errors.
 #[tokio::test]
 async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let supervisor = scripted_supervisor(&root, spawn_tx);
+    let (event_tx, mut events) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, event_tx, false, false, Vec::new());
+    host.supervisors
+        .insert(WorkspaceName::new("main").unwrap(), supervisor.clone());
+    let repo = host.descriptor.repo_id.clone();
+    let _runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = _runtime.router();
     let adopted = adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let incarnation = adopted["info"]["workspaceIncarnation"].clone();
@@ -1713,10 +1726,8 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         json!(1)
     );
     assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
-    let Some(Event::Exec { admission_key, .. }) = events.recv().await else {
-        panic!("missing exec event");
-    };
-    assert_eq!(admission_key, Some(key.clone()));
+    let process = spawned.recv().await.expect("the admitted job spawned once");
+    assert!(events.try_recv().is_err());
 
     let by_key = json!({
         "repoId": repo,
@@ -1744,6 +1755,62 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         ))
     );
 
+    let mut absent = by_key.clone();
+    absent["admissionKey"] = json!("op-2");
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.jobByKey",
+            absent
+        )
+        .await
+        .unwrap(),
+        Value::Null
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::JobByKey(
+            WorkspaceName::new("main").unwrap(),
+            cowshed_core::api::AdmissionKey::new("op-2").unwrap()
+        ))
+    );
+
+    let mut stale = by_key.clone();
+    stale["workspaceIncarnation"] = json!(self::incarnation(999));
+    assert_eq!(
+        route(&router, coordinator(repo.clone()), "worker.jobByKey", stale)
+            .await
+            .unwrap_err(),
+        CowshedError::conflict("stale workspace incarnation", "reacquire a worker handle")
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert!(
+        events.try_recv().is_err(),
+        "a stale lookup reached no store"
+    );
+
+    let mut missing = by_key.clone();
+    missing["workspace"] = json!("missing");
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.jobByKey",
+            missing
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert!(
+        events.try_recv().is_err(),
+        "a missing workspace reached no store"
+    );
+
     let mut empty = by_key;
     empty["admissionKey"] = json!("");
     let error = route(&router, coordinator(repo.clone()), "worker.jobByKey", empty)
@@ -1754,6 +1821,24 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         events.try_recv().is_err(),
         "a malformed key reached the host"
     );
+    assert!(spawned.try_recv().is_err(), "lookup spawned no second job");
+    process
+        .send(ProcessEvent::Exited {
+            job_id: JobId::new(1).unwrap(),
+            exit: cowshed_core::api::ExitStatus::Exited { code: 0 },
+        })
+        .await
+        .unwrap();
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        process
+            .send(ProcessEvent::OutputEof {
+                job_id: JobId::new(1).unwrap(),
+                stream,
+            })
+            .await
+            .unwrap();
+    }
+    supervisor.wait(JobId::new(1).unwrap()).await.unwrap();
 }
 
 #[tokio::test]
@@ -2162,6 +2247,126 @@ impl ScriptedJobs {
         let process = self.spawned.recv().await.expect("the job's process");
         (job, process)
     }
+}
+
+#[tokio::test]
+async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() {
+    use cowshed_core::api::{AdmissionKey, call::Arguments, operations::WorkerJobByKey};
+    let root = test_root();
+    let mut jobs = ScriptedJobs::start(&root).await;
+    let worker = &jobs.jobs.worker;
+    let key = AdmissionKey::new("op-lookup").unwrap();
+    let arguments = || {
+        serde_json::from_value::<Arguments>(json!({ "admissionKey": key }))
+            .expect("lookup arguments")
+    };
+    assert!(worker.job_by_key(key.clone()).await.unwrap().is_none());
+    assert!(
+        worker
+            .call_optional_job::<WorkerJobByKey, _>(arguments())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(jobs.spawned.try_recv().is_err(), "absence spawned nothing");
+
+    let request = || ExecRequest {
+        command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+        cwd: None,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: Some(key.clone()),
+    };
+    let job = worker.exec(request()).await.expect("admit the keyed job");
+    let process = jobs.spawned.recv().await.expect("one process");
+    let found = worker
+        .job_by_key(key.clone())
+        .await
+        .expect("lookup")
+        .expect("the key admitted a job");
+    let bound = worker
+        .call_optional_job::<WorkerJobByKey, _>(arguments())
+        .await
+        .expect("generic optional job call")
+        .expect("the key admitted a job");
+    for handle in [&found, &bound] {
+        assert_eq!(handle.id(), job.id());
+        assert_eq!(handle.status().await.unwrap().state, JobState::Running);
+    }
+    assert_eq!(worker.exec(request()).await.unwrap().id(), job.id());
+    assert!(
+        jobs.spawned.try_recv().is_err(),
+        "lookup and replay spawned nothing"
+    );
+    assert_eq!(
+        worker.job(JobId::new(2).unwrap()).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "a missing job is still an error"
+    );
+    end(&job, &process).await;
+}
+
+#[tokio::test]
+async fn an_unprovable_key_preserves_its_error_over_the_controller() {
+    use cowshed_core::api::{AdmissionKey, call::Arguments, operations::WorkerJobByKey};
+    use cowshed_core::error::AdmissionRefusal;
+    use cowshed_core::storage::job_artifact::FIRST_KEYED_LAYOUT;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let root = test_root();
+    let config = supervisor_config(&root);
+    let set_aside = config
+        .workspace_root
+        .join(".cowshed/job/set-aside")
+        .join(format!("layout-{FIRST_KEYED_LAYOUT}"));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&set_aside)
+        .unwrap();
+    let artifacts = ArtifactStoreSink::open(
+        config.workspace_root.clone(),
+        &config.owned_repo_ids,
+        &config.authority,
+        config.artifacts.clone(),
+    )
+    .expect("open unprovable store");
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let supervisor = WorkspaceSupervisor::start_with_sinks(
+        config,
+        Box::new(ScriptedSpawner { spawned: spawn_tx }),
+        Box::new(artifacts),
+        Box::new(AcceptedCommitments),
+    )
+    .unwrap();
+    let key = AdmissionKey::new("op-unprovable").unwrap();
+    let expected = supervisor.job_by_key(key.clone()).await.unwrap_err();
+    assert_eq!(
+        expected,
+        CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })
+    );
+    let jobs = SupervisedJobs::connect(&root, supervisor).await;
+    assert_eq!(
+        jobs.worker.job_by_key(key.clone()).await.unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        jobs.worker
+            .call_optional_job::<WorkerJobByKey, _>(
+                serde_json::from_value::<Arguments>(json!({ "admissionKey": key })).unwrap()
+            )
+            .await
+            .unwrap_err(),
+        expected
+    );
+    assert!(
+        spawned.try_recv().is_err(),
+        "unprovable lookup spawned nothing"
+    );
 }
 
 /// Returns once the job's `stream` holds `end` admitted bytes readable through the controller,

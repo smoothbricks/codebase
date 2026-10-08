@@ -107,7 +107,8 @@ export interface WorkspaceHandle {
   shell(session?: string): Promise<Session>;
   listJobs(): Promise<readonly Api.JobInfo[]>;
   job(id: number): Promise<JobHandle>;
-  jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle>;
+  /** Returns null only when the key is provably absent in this workspace incarnation; failures reject. */
+  jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle | null>;
   checkpoint(options?: Api.CheckpointOptions): Promise<string>;
   push(options?: Api.PushOptions): Promise<Api.PushReport>;
   grants(): Promise<Api.GrantSet>;

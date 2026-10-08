@@ -243,6 +243,17 @@ impl WorkspaceHandle {
         Ok(self.job_handle(result.job_id()))
     }
 
+    /// Calls a JSON-lane operation whose result optionally names one of this workspace's jobs.
+    pub async fn call_optional_job<O, T>(&self, arguments: Arguments) -> Result<Option<JobHandle>>
+    where
+        O: Operation<Result = Option<T>>,
+        T: NamesJob,
+        Self: Serves<O>,
+    {
+        let result = call::<O, Self>(self, arguments).await?;
+        Ok(result.map(|job| self.job_handle(job.job_id())))
+    }
+
     /// [`Self::call_job`] for an upload-lane operation, with `frame` as its raw-byte frame when
     /// there is one.
     pub async fn call_job_upload<O: Operation<Result: NamesJob>>(

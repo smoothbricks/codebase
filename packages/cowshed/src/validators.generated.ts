@@ -461,6 +461,9 @@ export const parseJobId = (json: string): Api.JobId => assertJobId(JSON.parse(js
 export const assertJobIdList = typia.createAssertEquals<readonly Api.JobId[]>();
 export const parseJobIdList = (json: string): readonly Api.JobId[] => assertJobIdList(JSON.parse(json));
 
+export const assertJobIdOption = typia.createAssertEquals<Api.JobId | null>();
+export const parseJobIdOption = (json: string): Api.JobId | null => assertJobIdOption(JSON.parse(json));
+
 export const assertJobInfo = typia.createAssertEquals<Api.JobInfo>();
 export const parseJobInfo = (json: string): Api.JobInfo => assertJobInfo(JSON.parse(json));
 export const assertJobInfoList = typia.createAssertEquals<readonly Api.JobInfo[]>();

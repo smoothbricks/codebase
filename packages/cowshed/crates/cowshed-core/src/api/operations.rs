@@ -329,9 +329,9 @@ operations! {
     worker json "worker.listJobs" WorkerListJobs(WorkerScope) -> Vec<JobInfo>;
     /// Resolves one job.
     worker json "worker.job" WorkerJob(JobRequest) -> JobInfo;
-    /// Names the job an admission key admitted in the workspace incarnation: the job whose exec
-    /// reply was lost.
-    worker json "worker.jobByKey" WorkerJobByKey(AdmissionKeyRequest) -> JobId;
+    /// Names the job an admission key admitted in the workspace incarnation, or none when its
+    /// durable records prove the key admitted no job.
+    worker json "worker.jobByKey" WorkerJobByKey(AdmissionKeyRequest) -> Option<JobId>;
     /// Takes a checkpoint.
     worker json "worker.checkpoint" WorkerCheckpoint(CheckpointRequest) -> CheckpointResult;
     /// Pushes the workspace's branch.

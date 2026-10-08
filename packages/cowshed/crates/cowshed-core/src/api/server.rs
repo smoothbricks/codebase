@@ -71,9 +71,27 @@ pub(crate) mod codec {
     struct RpcResponseFields<'a> {
         id: u64,
         ok: bool,
-        result: Option<Cow<'a, Value>>,
+        #[serde(default)]
+        result: PresentResult<Cow<'a, Value>>,
         error: Option<Cow<'a, CowshedError>>,
         binary_length: Option<u32>,
+    }
+
+    /// Unlike `Option`, a present JSON null stays present; only an omitted result is missing.
+    #[derive(Debug, Serialize)]
+    #[serde(transparent)]
+    struct PresentResult<T>(Option<T>);
+
+    impl<T> Default for PresentResult<T> {
+        fn default() -> Self {
+            Self(None)
+        }
+    }
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for PresentResult<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            T::deserialize(deserializer).map(|value| Self(Some(value)))
+        }
     }
 
     /// One step of a call that asked for its steps, sent before the call's answer. Only a request
@@ -261,7 +279,7 @@ pub(crate) mod codec {
             (
                 self.0.id,
                 self.0.ok,
-                self.0.result.map(Cow::into_owned),
+                self.0.result.0.map(Cow::into_owned),
                 self.0.error.map(Cow::into_owned),
                 self.0.binary_length,
             )
@@ -383,7 +401,7 @@ pub(crate) mod codec {
             &RpcResponseFields {
                 id,
                 ok: true,
-                result: Some(Cow::Borrowed(result)),
+                result: PresentResult(Some(Cow::Borrowed(result))),
                 error: None,
                 binary_length,
             },
@@ -399,7 +417,7 @@ pub(crate) mod codec {
             &RpcResponseFields {
                 id,
                 ok: false,
-                result: None,
+                result: PresentResult(None),
                 error: Some(Cow::Borrowed(error)),
                 binary_length: None,
             },
@@ -510,7 +528,20 @@ pub(crate) mod codec {
 
             let error = CowshedError::new(ErrorCode::Conflict, "stale", "retry");
             let failure = encode_rpc_error(8, &error).expect("encode failure");
-            assert_eq!(response(&failure), (8, false, None, Some(error), None));
+            assert_eq!(
+                response(&failure),
+                (8, false, Some(Value::Null), Some(error), None)
+            );
+        }
+
+        #[test]
+        fn a_present_null_result_is_not_a_missing_result() {
+            let success = encode_rpc_success(7, &Value::Null, None).expect("encode null success");
+            assert_eq!(response(&success), (7, true, Some(Value::Null), None, None));
+            assert_eq!(
+                response(br#"{"id":8,"ok":true,"error":null,"binaryLength":null}"#),
+                (8, true, None, None, None)
+            );
         }
 
         #[test]

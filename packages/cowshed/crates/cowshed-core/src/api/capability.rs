@@ -1449,7 +1449,7 @@ async fn read_answer(
         .remove(&id);
     let result = match (ok, result, error) {
         (true, Some(result), None) => result,
-        (false, None, Some(error)) => {
+        (false, None | Some(Value::Null), Some(error)) => {
             if binary_length.is_some() {
                 return Err(CowshedError::internal(
                     "controller RPC error response declared unsolicited binary data",
@@ -2269,8 +2269,8 @@ impl WorkspaceHandle {
     }
 
     /// The job `key` admitted in this workspace incarnation: reached when the exec's reply was
-    /// lost, without exec'ing again.
-    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<JobHandle> {
+    /// lost, without exec'ing again. None only when the durable records prove no job was admitted.
+    pub async fn job_by_key(&self, key: AdmissionKey) -> Result<Option<JobHandle>> {
         let WorkerScope {
             repo_id,
             workspace,
@@ -2283,7 +2283,7 @@ impl WorkspaceHandle {
             admission_key: key,
         };
         let id = invoke::<operations::WorkerJobByKey>(&*self.runtime, &request).await?;
-        Ok(self.job_handle(id))
+        Ok(id.map(|id| self.job_handle(id)))
     }
 
     /// A job's terminal record from the workspace's durable records, and a handle whose
@@ -2912,8 +2912,7 @@ mod tests {
         assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// The answer travels wrapped: a bare `null` for a checkout linking no volume would be an
-    /// envelope without a result, which the client refuses as invalid.
+    /// The build-volume result carries the workspace's optional link inside its declared object.
     #[cfg(unix)]
     #[tokio::test]
     async fn build_volume_is_fenced_and_answers_a_volume_or_none() {
@@ -3953,6 +3952,46 @@ mod tests {
         assert!(error.message.contains("response decoding failed"));
         assert!(error.message.contains("unknown field"));
         server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nullable_rpc_results_preserve_envelope_validation() {
+        let refusal = CowshedError::not_found("missing workspace", "list workspaces");
+        for (mut envelope, diagnostic) in [
+            (json!({ "ok": true, "error": null }), "invalid envelope"),
+            (
+                json!({ "ok": false, "result": null, "error": null }),
+                "invalid envelope",
+            ),
+            (
+                json!({ "ok": true, "result": null, "error": refusal }),
+                "invalid envelope",
+            ),
+            (
+                json!({ "ok": false, "result": 1, "error": refusal }),
+                "invalid envelope",
+            ),
+            (
+                json!({ "ok": true, "result": null, "error": null, "binaryLength": 0 }),
+                "unsolicited binary",
+            ),
+        ] {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                envelope["id"] = request["id"].clone();
+                let frame = serde_json::to_vec(&envelope).unwrap();
+                write_rpc_frame(&mut server, &frame).await.unwrap();
+            });
+            let error = runtime
+                .call("project.list", empty_params())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(error.message.contains(diagnostic), "{error:?}");
+            server_task.await.unwrap();
+        }
     }
 
     #[cfg(unix)]

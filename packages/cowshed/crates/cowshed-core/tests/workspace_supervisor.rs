@@ -2691,7 +2691,7 @@ async fn a_keyed_open_repeat_reaches_the_same_job_and_never_binds_a_reader() {
             .job_by_key(AdmissionKey::new("op-open").unwrap())
             .await
             .unwrap(),
-        job
+        Some(job)
     );
     let before = remote.info(job).await.unwrap().stdin;
     assert_eq!(
@@ -2910,6 +2910,49 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
     );
 }
 
+#[tokio::test]
+async fn an_absent_key_is_none_only_for_the_current_supervisor_authority() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (supervisor_config, _root) = isolated_config("keyed-absent");
+    let mut h = real_store_harness(supervisor_config);
+    let (remote, path) = served(&h.handle).await;
+    let key = AdmissionKey::new("op-absent").unwrap();
+    assert_eq!(h.handle.job_by_key(key.clone()).await.unwrap(), None);
+    assert_eq!(remote.job_by_key(key.clone()).await.unwrap(), None);
+
+    let current = h.handle.snapshot();
+    let mut stale_incarnation = current.clone();
+    stale_incarnation.workspace_incarnation =
+        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap();
+    let mut stale_grant = current.clone();
+    stale_grant.grant_revision += 1;
+    let mut stale_lifecycle = current.clone();
+    stale_lifecycle.lifecycle_revision += 1;
+    let expected = CowshedError::conflict(
+        "workspace supervisor authority is stale",
+        "reattach the workspace and retry with its current incarnation and revisions",
+    );
+    for authority in [stale_incarnation, stale_grant, stale_lifecycle] {
+        let stale = supervisor_socket::connect(path.clone(), authority);
+        assert_eq!(stale.job_by_key(key.clone()).await.unwrap_err(), expected);
+    }
+    assert_eq!(
+        remote.info(JobId::new(1).unwrap()).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "a missing job remains an error, not a missing admission key"
+    );
+    let unreachable = path.with_file_name("unavailable");
+    let unavailable = supervisor_socket::connect(unreachable.clone(), current.clone());
+    let error = unavailable.job_by_key(key).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert!(error.message.contains(&unreachable.display().to_string()));
+    assert_eq!(
+        error.hint,
+        "retry; cowshed restarts the workspace supervisor"
+    );
+    assert!(h.spawned.try_recv().is_err(), "lookup never spawned a job");
+}
+
 /// The reply is the killpoint: a caller sends a keyed exec over the supervisor socket and hangs up
 /// without reading a byte back, so the job's number reaches no one, and the supervisor that ran
 /// the job is gone before anyone asks again. The next supervisor answers the key from the records
@@ -2979,7 +3022,7 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
     let mut second = real_store_harness(supervisor_config);
     let (remote, _path) = served(&second.handle).await;
     let key = AdmissionKey::new("op-1").unwrap();
-    assert_eq!(remote.job_by_key(key.clone()).await.unwrap(), job);
+    assert_eq!(remote.job_by_key(key.clone()).await.unwrap(), Some(job));
     assert_eq!(
         remote
             .exec(None, None, keyed("op-1", payload()))
@@ -3020,9 +3063,8 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
         remote
             .job_by_key(AdmissionKey::new("op-2").unwrap())
             .await
-            .unwrap_err()
-            .code,
-        ErrorCode::NotFound
+            .unwrap(),
+        None
     );
     assert!(
         second.spawned.try_recv().is_err(),
@@ -3031,7 +3073,7 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
 }
 
 /// A job store set aside in a keyed layout for this incarnation may hold any key: a keyed exec
-/// is refused with that reason, never spawned, and `jobByKey` says the same, never `NotFound`.
+/// is refused with that reason, never spawned, and `jobByKey` says the same, never absence.
 #[tokio::test]
 async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -3063,6 +3105,66 @@ async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
         .unwrap_err();
     assert_eq!(lookup.admission_source(), Some(&unprovable));
     assert!(h.spawned.try_recv().is_err(), "nothing ran under the key");
+    let (remote, _path) = served(&h.handle).await;
+    assert_eq!(
+        remote
+            .job_by_key(AdmissionKey::new("op-1").unwrap())
+            .await
+            .unwrap_err(),
+        lookup,
+        "the supervisor socket preserves the complete unprovable error"
+    );
+}
+
+#[test]
+fn a_corrupt_or_unreadable_admission_history_refuses_the_supervisor_store() {
+    use cowshed_core::storage::job_artifact::ArtifactError;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    for unreadable in [false, true] {
+        let (config, _root) = isolated_config("keyed-refused-store");
+        let set_aside = config
+            .workspace_root
+            .join(".cowshed/job/set-aside")
+            .join(format!("layout-{FIRST_KEYED_LAYOUT}"));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&set_aside)
+            .unwrap();
+        let marker = set_aside.join("incarnation");
+        if unreadable {
+            std::fs::create_dir(&marker).unwrap();
+        } else {
+            std::fs::write(&marker, b"not-an-incarnation").unwrap();
+        }
+        let source = ArtifactStore::open(
+            &config.workspace_root,
+            config.owned_repo_ids.clone(),
+            config.authority.workspace_incarnation.clone(),
+            config.artifacts.clone(),
+        )
+        .err()
+        .expect("the store cannot prove admission authority");
+        if unreadable {
+            assert!(matches!(&source, ArtifactError::Io { path, .. } if path == &marker));
+        } else {
+            assert!(matches!(&source, ArtifactError::Integrity { .. }));
+        }
+        let error = ArtifactStoreSink::open(
+            config.workspace_root,
+            &config.owned_repo_ids,
+            &config.authority,
+            config.artifacts,
+        )
+        .err()
+        .expect("a supervisor cannot serve lookup from the refused store");
+        assert_eq!(
+            error,
+            CowshedError::integrity(source.to_string(), "cowshed doctor --json"),
+            "the original store failure survives the supervisor boundary"
+        );
+    }
 }
 
 /// A job admitted with open stdin keeps it open for its attachment, over the socket the

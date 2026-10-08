@@ -273,12 +273,13 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under
   the wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
   durable existing id and spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity.
-  `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; an unreadable
-  keyed history is an explicit unprovable refusal, never absence. `info`, `list`, `kill` and `wait` answer the
-  supervisor's own jobs; `sealed` answers a job's terminal record from the workspace's records — state, exit, failure,
-  duration, output limit and both streams — for any job of the incarnation that has one, including a job an earlier
-  supervisor ran and sealed, and `logRead` reads such a job's sealed streams from any offset as it reads its own
-  terminal jobs'.
+  `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; only proven
+  absence in that current authority returns `None` (wire `null`). Missing workspace/job, stale authority, transport,
+  storage and observation failures remain errors; unreadable keyed history is an explicit unprovable refusal, never
+  absence. `info`, `list`, `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's terminal record
+  from the workspace's records — state, exit, failure, duration, output limit and both streams — for any job of the
+  incarnation that has one, including a job an earlier supervisor ran and sealed, and `logRead` reads such a job's
+  sealed streams from any offset as it reads its own terminal jobs'.
 - **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file opened inside the
   sandbox, a reader-backed stream, or explicit `open` with no reader or automatic EOF. A reader's `streamChunk` calls
   enter its bounded source channel in order and `streamEnd` names clean EOF or the source error. Attachment `stdinWrite`

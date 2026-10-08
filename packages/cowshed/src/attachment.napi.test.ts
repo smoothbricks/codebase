@@ -44,6 +44,7 @@ describe('Cowshed attachment Node-API boundary', () => {
       const job = await worker.exec({ argv: ['attachment-oracle'], admissionKey: 'attachment-open', stdin: { kind: 'open' } });
       assert.equal(job.id, 1);
       const recovered = await worker.jobByKey('attachment-open');
+      assert.ok(recovered !== null, 'the scripted admitted key must resolve to its job');
       assert.equal(recovered.id, job.id);
       let attachment = await recovered.attach();
       let cursor = 0;

@@ -289,8 +289,9 @@ class WorkspaceHandleImpl implements WorkspaceHandle {
     return new JobHandleImpl(await callNativeAsync(() => N.workerJob(this.#native, { jobId: id })));
   }
 
-  async jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle> {
-    return new JobHandleImpl(await callNativeAsync(() => N.workerJobByKey(this.#native, { admissionKey })));
+  async jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle | null> {
+    const job = await callNativeAsync(() => N.workerJobByKey(this.#native, { admissionKey }));
+    return job === null ? null : new JobHandleImpl(job);
   }
 
   async checkpoint(options?: Api.CheckpointOptions): Promise<string> {

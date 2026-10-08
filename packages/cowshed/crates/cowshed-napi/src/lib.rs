@@ -269,6 +269,27 @@ where
     })
 }
 
+/// A JSON-lane operation whose optional result names a job, or no job, without masking errors.
+fn optional_job_call<O, T>(
+    env: Env,
+    workspace: Arc<CoreWorkspaceHandle>,
+    json: String,
+) -> napi::Result<JsObject>
+where
+    O: Operation<Result = Option<T>>,
+    T: NamesJob,
+    CoreWorkspaceHandle: Serves<O>,
+{
+    spawn_promise(env, async move {
+        let job = workspace
+            .call_optional_job::<O, T>(arguments(O::METHOD, &json)?)
+            .await?;
+        Ok(job.map(|job| JobHandle {
+            inner: Arc::new(job),
+        }))
+    })
+}
+
 /// A stream-lane operation, as the events its caller demands one at a time.
 fn stream_call<O, H>(env: Env, handle: Arc<H>, json: String) -> napi::Result<JsObject>
 where
