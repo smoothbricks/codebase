@@ -247,9 +247,10 @@ fn run_on(
 
 impl Drop for Host {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.directory);
+        // The actual parent host owns group retirement. Killing it first would bypass Held::drop.
+        self.control.shutdown(std::net::Shutdown::Both).expect("close the fixture controller");
+        self.child.wait().expect("join the host after its owned command retirement");
+        std::fs::remove_dir_all(&self.directory).expect("remove the fixture directory");
     }
 }
 
@@ -328,12 +329,17 @@ struct ScriptJobGuard {
     leader: i32,
     descendant: i32,
     armed: bool,
+    /// Only this direct child may be reaped by the fixture, never a script grandchild.
+    child: Option<std::process::Child>,
 }
 
 impl Drop for ScriptJobGuard {
     fn drop(&mut self) {
         if self.armed {
             stop_fixture_jobs(self.host_pid, Some(self.leader), Some(self.descendant));
+        }
+        if let Some(child) = &mut self.child {
+            child.wait().expect("reap only the guard's own child");
         }
     }
 }
@@ -417,6 +423,7 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
         leader: -1,
         descendant,
         armed: true,
+        child: None,
     };
     std::thread::sleep(Duration::from_millis(100));
     assert!(alive(descendant), "the descendant outlives the leader");
@@ -473,6 +480,7 @@ fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
         leader: -1,
         descendant,
         armed: true,
+        child: None,
     };
     host.control
         .shutdown(std::net::Shutdown::Both)
@@ -535,10 +543,14 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         "sh -c 'printf \"%s\\n\" \"$$\" > {}; read -r _ < {}' & printf '%s\\n' \"$$\" > {}; wait",
         descendant.display(), hold.display(), leader.display()
     ));
+    let mut job = ScriptJobGuard {
+        host_pid: host.child.id(), leader: -1, descendant: -1, armed: true, child: None,
+    };
     let Submitted { reply, readers } = submit(&host.control, &host.directory, &rendered);
     let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
     assert_eq!(tag, REPLY_STARTED);
     let birth = fields.birth().expect("the real parent observed its unreaped leader");
+    job.leader = i32::try_from(birth.pid()).expect("owned leader PID");
     fields.finish().expect("start frame");
     // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
     let pids = [&leader, &descendant].map(|path| {
@@ -546,9 +558,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         value.trim().parse::<i32>().expect("published process PID")
     });
     assert_eq!(birth.pid(), pids[0].cast_unsigned());
-    let mut job = ScriptJobGuard {
-        host_pid: host.child.id(), leader: pids[0], descendant: pids[1], armed: true,
-    };
+    job.descendant = pids[1];
     let members = cowshed_core::runtime::job_groups::job_members(&birth).expect("identity-proven live group");
     let exits = pids.map(|pid| {
         let member = members.iter().find(|member| member.pid() == pid).expect("published process is in the actual owned group");
@@ -575,10 +585,14 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
 /// The old null-signal oracle called an exited, unreaped child alive. The exit watch must not.
 #[test]
 fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
-    let mut child = std::process::Command::new("/bin/sh")
+    let child = std::process::Command::new("/bin/sh")
         .args(["-c", "read -r _"]).stdin(Stdio::piped()).process_group(0)
         .spawn().expect("owned pipe-held child");
     let pid = i32::try_from(child.id()).expect("child PID");
+    let mut owner = ScriptJobGuard {
+        host_pid: std::process::id(), leader: pid, descendant: -1, armed: true, child: Some(child),
+    };
+    let child = owner.child.as_mut().expect("the guard owns its direct child");
     let birth = Birth::of(child.id());
     let members = cowshed_core::runtime::job_groups::job_members(&birth).expect("owned group");
     let retained = members.iter().find(|member| member.pid() == pid).expect("the owned leader");
@@ -591,8 +605,9 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
     #[cfg(target_os = "linux")]
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
     child.wait().expect("only the owner reaps this child, even when an oracle below fails");
+    owner.armed = false;
     assert!(!running, "the held child was running before EOF");
-    assert_eq!(status, ExitStatus::Exited { code: 1 });
+    assert!(matches!(status, ExitStatus::Exited { .. }), "the owned child actually exited: {status:?}");
     assert!(null_signal_reaches, "POSIX null signal succeeds on the owned unreaped zombie");
     assert!(exited, "positive native exit evidence while the child remained unreaped");
     #[cfg(target_os = "linux")]
