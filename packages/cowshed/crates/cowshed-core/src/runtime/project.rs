@@ -33,7 +33,7 @@ use crate::api::operations::{
     ProjectOpened, RepoRequest, Scope, TailRequest, WorkerScope, WorkspaceAtRequest,
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
 };
-use crate::api::resources::SampleInterval;
+use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
@@ -342,6 +342,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobAnswer<JobListeningPorts>>;
+    /// The job's canonical resource sample: its sole reader observes live jobs and keeps terminal ones frozen.
+    async fn read_resources(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobResourceSample>>;
     /// The job's progress, sampled every `every`: its first read is the only wait.
     async fn progress_job(
         &mut self,
@@ -858,6 +865,12 @@ impl ProjectActor {
             Op::JobListeningPortsRead(params) => {
                 return self
                     .job_listening_ports(&authority, params)
+                    .await
+                    .map(Routed::Later);
+            }
+            Op::JobResourcesRead(params) => {
+                return self
+                    .job_resources(&authority, params)
                     .await
                     .map(Routed::Later);
             }
@@ -1499,6 +1512,26 @@ impl ProjectActor {
             .await?;
         Ok(Box::pin(async move {
             respond::<operations::JobListeningPortsRead>(&ports.await?)
+        }))
+    }
+
+    async fn job_resources(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let sample = self
+            .host
+            .read_resources(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            respond::<operations::JobResourcesRead>(&sample.await?)
         }))
     }
 
@@ -11103,6 +11136,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         Ok(Box::pin(
             async move { supervisor.listening_ports(job).await },
         ))
+    }
+
+    async fn read_resources(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobResourceSample>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move { supervisor.resources(job).await }))
     }
 
     async fn progress_job(

@@ -140,6 +140,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
     const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
     const heard = [];
     let released = false;
+    let resourceReads = 0;
     const waits = [];
     const statuses = [];
     const heldStatuses = [];
@@ -195,6 +196,25 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
           running: 0, terminal: false, held: message.params.everyMs === 999, blocked: false,
         });
         demand(message.id);
+      } else if (message.method === 'job.resources') {
+        const { repoId, workspace, workspaceIncarnation, jobId } = message.params;
+        if (repoId !== 'acme/widget' || workspace !== 'main' ||
+            workspaceIncarnation !== incarnation || jobId !== 1 || Object.keys(message.params).length !== 4) {
+          throw new Error('unexpected resource authority ' + JSON.stringify(message.params));
+        }
+        resourceReads += 1;
+        heard.push('resources ' + resourceReads);
+        if (resourceReads === 1) {
+          send({
+            id: message.id, ok: false, result: null, binaryLength: null,
+            error: { code: 'conflict', message: 'job owns no process', hint: 'read once it owns a process' },
+          });
+        } else if (resourceReads === 2) {
+          answer(message.id, sample(10, true));
+        } else {
+          release();
+          answer(message.id, terminal);
+        }
       } else if (message.method === 'job.status' && [...streams.values()].some((stream) => stream.held)) {
         if ([...streams.values()].some((stream) => stream.blocked)) answer(message.id, job(false));
         else heldStatuses.push(message.id);
@@ -531,6 +551,56 @@ describe('Cowshed Node-API bindings', () => {
         ]),
       ],
       stderr: '',
+    });
+  }, 30_000);
+
+  it('reads canonical resource samples directly and preserves the unowned refusal', async () => {
+    const client = `
+      import { isDeepStrictEqual } from 'node:util';
+      import { CowshedError, connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker('main');
+      const job = await worker.exec({ argv: ['build'] });
+      let refusal;
+      try {
+        await job.resources();
+      } catch (error) {
+        if (!(error instanceof CowshedError)) throw error;
+        refusal = {
+          code: error.code, message: error.message, hint: error.hint,
+          native: error.cause instanceof Error && error.cause.code === 'conflict',
+        };
+      }
+      const live = await job.resources();
+      const terminal = await job.resources();
+      const frozen = await job.resources();
+      const sealed = await job.wait();
+      console.log(JSON.stringify({
+        refusal, live: { jobId: live.jobId, leader: live.leaderPid, members: live.members },
+        terminal: { jobId: terminal.jobId, leader: terminal.leaderPid, members: terminal.members },
+        volumes: live.volumes,
+        frozen: isDeepStrictEqual(terminal, frozen),
+        sealed: isDeepStrictEqual(terminal, sealed.resources),
+      }));
+      process.exit(0);
+    `;
+    expect(await scriptedController(client)).toEqual({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        refusal: {
+          code: 'conflict',
+          message: 'job owns no process',
+          hint: 'read once it owns a process',
+          native: true,
+        },
+        live: { jobId: 1, leader: 4242, members: [4242] },
+        terminal: { jobId: 1, leader: 4242, members: [] },
+        volumes: { workspace: { kind: 'unavailable', reason: { kind: 'unconfigured' } } },
+        frozen: true,
+        sealed: true,
+      }),
+      stderr: '',
+      heard: ['resources 1', 'resources 2', 'resources 3', 'resources 4'],
     });
   }, 30_000);
 

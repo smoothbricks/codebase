@@ -20,7 +20,7 @@ use super::operations::{
     WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
-use super::resources::SampleInterval;
+use super::resources::{JobResourceSample, SampleInterval};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
@@ -2330,6 +2330,12 @@ impl JobHandle {
 
     pub async fn status(&self) -> Result<JobInfo> {
         invoke::<operations::JobStatus>(&*self.runtime, &self.authority.job(self.id)).await
+    }
+
+    /// The job's resource sample, observed by its supervisor once while it runs and frozen at
+    /// its terminal publication. Before the job owns a process, this is a not-ready conflict.
+    pub async fn resources(&self) -> Result<JobResourceSample> {
+        invoke::<operations::JobResourcesRead>(&*self.runtime, &self.authority.job(self.id)).await
     }
 
     /// A bounded slice of both streams: after `cursor` when it is named, else their latest

@@ -1001,6 +1001,27 @@ impl Serves<JobStatus> for JobHandle {
     }
 }
 
+impl Serves<JobResourcesRead> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<JobRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<JobResourcesRead, Caller>(arguments)?;
+        Ok(JobRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+        })
+    }
+}
+
 impl Serves<JobSealed> for JobHandle {
     const BOUND: &'static [&'static str] =
         &["repoId", "workspace", "workspaceIncarnation", "jobId"];
@@ -1274,6 +1295,7 @@ pub(crate) fn each_served(
     check.served::<WorkerPush, _>(workspace_handle, &[]);
     check.served::<SessionClose, _>(workspace_handle, &[]);
     check.served::<JobStatus, _>(job_handle, &[]);
+    check.served::<JobResourcesRead, _>(job_handle, &[]);
     check.served::<JobSealed, _>(job_handle, &[]);
     check.served::<JobLogs, _>(job_handle, &[]);
     check.served::<JobTailRead, _>(job_handle, &[]);

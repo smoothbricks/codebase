@@ -338,6 +338,8 @@ operations! {
     worker json "worker.push" WorkerPush(PushRequest) -> PushReport;
     /// Reads one job's status.
     worker json "job.status" JobStatus(JobRequest) -> JobInfo;
+    /// Reads the job's current resource sample, or its frozen terminal sample; unowned jobs refuse it.
+    worker json "job.resources" JobResourcesRead(JobRequest) -> JobResourceSample;
     /// Reads one ended job's sealed record.
     worker json "job.sealed" JobSealed(JobRequest) -> SealedJob;
     /// Reads one bounded raw chunk from an offset. Without follow, an empty chunk is the current

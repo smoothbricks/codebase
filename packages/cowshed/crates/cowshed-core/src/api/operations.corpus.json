@@ -132,6 +132,12 @@
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
     "jobId": 7
   },
+  "job.resources": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+    "jobId": 7
+  },
   "job.sealed": {
     "repoId": "acme/widget",
     "workspace": "feature",

@@ -83,6 +83,7 @@ export interface NativeWorkspaceHandleOperations
 /** The operations a `JobHandle` serves: exactly those its authority admits. */
 export interface NativeJobHandleOperations
   extends NativeJobStatus,
+    NativeJobResources,
     NativeJobSealed,
     NativeJobLogs,
     NativeJobTail,
@@ -667,6 +668,24 @@ export function jobProgress(
   args: JobProgressArguments,
 ): EventIterator<Api.JobResourceSample> {
   return eventIterator(() => handle.progress(JSON.stringify(args)), V.parseJobResourceSample);
+}
+
+/** A handle that serves `job.resources`. */
+export interface NativeJobResources {
+  resources(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `job.resources` caller names; its handle binds the rest. */
+export type JobResourcesArguments = Readonly<Record<string, never>>;
+
+/**
+ * Reads the job's current resource sample, or its frozen terminal sample; unowned jobs refuse it.
+ */
+export async function jobResources(
+  handle: NativeJobResources,
+  args: JobResourcesArguments,
+): Promise<Api.JobResourceSample> {
+  return V.parseJobResourceSample(await handle.resources(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.sealed`. */

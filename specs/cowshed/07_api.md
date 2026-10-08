@@ -7,9 +7,9 @@ with identical semantics and error taxonomy.
 > **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
 > duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
 > and complete-group termination. Core job resource samples, terminal persistence and keyed admission/lookup are
-> implemented, and `progress` streams samples over the controller and through N-API as an `AsyncIterable`.
-> Controller request/result codecs, TypeScript types and validators, and N-API operation bindings derive from one Rust
-> API declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
+> implemented, and `progress` streams samples over the controller and through N-API as an `AsyncIterable`. Controller
+> request/result codecs, TypeScript types and validators, and N-API operation bindings derive from one Rust API
+> declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
 > `job.listeningPorts`; backpressured byte-stream iterables for logs and attachments, attachment stdin EOF, and abort
 > plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no close
 > operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process
@@ -690,6 +690,11 @@ without waiting for exit and reports a typed not-ready conflict before spawn; `p
 sample once available, periodic samples even when neither stream advances, then the terminal sample exactly once before
 closing. The interval is positive and uses the declaration's bounded duration contract. A slow reader may coalesce
 intermediate samples; terminal evidence and journal bytes are never lost.
+
+`JobHandle::resources()` and the generated N-API `resources()` call use the declared `job.resources` operation directly,
+not a `status()` projection. The supervisor's existing reader takes one canonical sample for a live job and returns its
+frozen result after terminal publication; adapters neither resample it nor allocate/decode the unrelated `JobInfo`
+fields.
 
 ```rust
 pub struct WallMillis(u64);

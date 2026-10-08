@@ -1445,6 +1445,19 @@ impl ProjectRuntimeHost for FakeHost {
         ))
     }
 
+    async fn read_resources(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<cowshed_core::api::JobResourceSample>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let Some(supervisor) = self.supervisors.get(&workspace).cloned() else {
+            return Err(Self::worker_unavailable());
+        };
+        Ok(Box::pin(async move { supervisor.resources(job).await }))
+    }
+
     async fn progress_job(
         &mut self,
         workspace: WorkspaceName,
@@ -1838,25 +1851,25 @@ impl SpawnSink for ScriptedSpawner {
         self.spawned.send(events).expect("spawn observer");
         Ok(Box::new(ScriptedProcess {
             // Not a process: its pid names nothing this test owns, so no group is identified.
-            process: OwnedProcess {
+            process: Some(OwnedProcess {
                 birth: Birth::Unobserved {
                     pid: 10_000 + u32::try_from(request.job_id.get()).expect("test job id"),
                     reason: "a scripted process leads no group".into(),
                 },
                 spawned: Instant::now(),
                 host: cowshed_core::host_load::read_host_load(),
-            },
+            }),
         }))
     }
 }
 
 struct ScriptedProcess {
-    process: OwnedProcess,
+    process: Option<OwnedProcess>,
 }
 
 impl RunningProcess for ScriptedProcess {
     fn process(&self) -> Option<&OwnedProcess> {
-        Some(&self.process)
+        self.process.as_ref()
     }
 
     fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {
@@ -2799,7 +2812,12 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
 /// samples read the real group.
 struct GatedSpawner {
     gate: PathBuf,
-    spawned: mpsc::UnboundedSender<(mpsc::Sender<ProcessEvent>, std::process::Child)>,
+    spawned: mpsc::UnboundedSender<(
+        mpsc::Sender<ProcessEvent>,
+        std::process::Child,
+        OwnedProcess,
+    )>,
+    start_owned: bool,
 }
 
 #[async_trait]
@@ -2825,9 +2843,119 @@ impl SpawnSink for GatedSpawner {
             spawned: Instant::now(),
             host: cowshed_core::host_load::read_host_load(),
         };
-        self.spawned.send((events, child)).expect("spawn observer");
-        Ok(Box::new(ScriptedProcess { process }))
+        let initial = self.start_owned.then(|| process.clone());
+        self.spawned
+            .send((events, child, process))
+            .expect("spawn observer");
+        Ok(Box::new(ScriptedProcess { process: initial }))
     }
+}
+
+/// The direct resource operation follows a real owned group, not a status projection: before
+/// ownership it refuses the read, admitted output advances its next sample, and its sealed
+/// sample remains unchanged even after the parent reaps the child.
+#[tokio::test]
+async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample() {
+    use std::io::Write as _;
+
+    let root = test_root();
+    let gate = root.join("resource-gate");
+    let path =
+        std::ffi::CString::new(gate.as_os_str().as_bytes()).expect("a gate path without NUL");
+    // SAFETY: a NUL-terminated path under this test's root.
+    assert_eq!(
+        unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+        0,
+        "mkfifo: {}",
+        std::io::Error::last_os_error()
+    );
+    let (spawner, mut spawned) = mpsc::unbounded_channel();
+    let jobs = SupervisedJobs::connect(
+        &root,
+        supervisor_spawning(
+            &root,
+            Box::new(GatedSpawner {
+                gate: gate.clone(),
+                spawned: spawner,
+                start_owned: false,
+            }),
+        ),
+    )
+    .await;
+    let job = jobs
+        .exec(ExecCommand::Argv(vec![CommandArg::from("build")]))
+        .await;
+    let (events, mut child, owned) = spawned.recv().await.expect("the held child");
+    let leader = child.id();
+    let refusal = job.resources().await.expect_err("no process is owned yet");
+    assert_eq!(refusal.code, ErrorCode::Conflict);
+    assert_eq!(job.status().await.expect("unowned status").resources, None);
+
+    events
+        .send(ProcessEvent::Started {
+            job_id: job.id(),
+            process: owned,
+        })
+        .await
+        .expect("publish ownership");
+    // A journal read fences both earlier events, without waiting on wall-clock timing.
+    admit(&job, &events, JobStream::Stdout, 0, b"first\n").await;
+    let first = job.resources().await.expect("an owned sample");
+    assert_eq!((first.job_id, first.leader_pid), (job.id(), leader));
+    assert_eq!(first.members, vec![leader]);
+    assert_eq!(
+        job.status()
+            .await
+            .expect("sampled status")
+            .resources
+            .as_ref(),
+        Some(&first),
+        "the direct read returns the canonical sample the supervisor published"
+    );
+    admit(&job, &events, JobStream::Stdout, 6, b"next\n").await;
+    let next = job.resources().await.expect("a fresh resource read");
+    assert_eq!((first.stdout.bytes.get(), next.stdout.bytes.get()), (6, 11));
+    assert_eq!(next.stdout.lines.get(), 2);
+
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .expect("open the child gate")
+            .write_all(b"done")
+            .expect("release the child");
+    })
+    .await
+    .expect("release task");
+    // SAFETY: valid writable siginfo storage; wait for our child without reaping its identity.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                leader,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0,
+        "waitid: {}",
+        std::io::Error::last_os_error()
+    );
+    end(&job, &events).await;
+    let (sealed, _) = jobs.worker.sealed(job.id()).await.expect("sealed record");
+    let terminal = job.resources().await.expect("the frozen resource sample");
+    assert_eq!(sealed.resources.as_ref(), Some(&terminal));
+    assert_eq!(
+        (terminal.leader_pid, terminal.members.as_slice()),
+        (leader, &[][..])
+    );
+    assert!(child.wait().expect("reap the child").success());
+    assert_eq!(
+        job.resources().await.expect("the same sample after reap"),
+        terminal,
+        "terminal reads do not observe the now-departed child again"
+    );
 }
 
 /// Over the controller, `progress(everyMs)` sends a running job's latest sample at once and one
@@ -2859,6 +2987,7 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
             Box::new(GatedSpawner {
                 gate: gate.clone(),
                 spawned: spawner,
+                start_owned: true,
             }),
         ),
     )
@@ -2866,7 +2995,7 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
     let job = jobs
         .exec(ExecCommand::Argv(vec![CommandArg::from("build")]))
         .await;
-    let (process, mut child) = spawned.recv().await.expect("the job's process");
+    let (process, mut child, _owned) = spawned.recv().await.expect("the job's process");
     let leader = child.id();
     let every = cowshed_core::api::SampleInterval::new(50).expect("interval");
 

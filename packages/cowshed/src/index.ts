@@ -337,6 +337,10 @@ class JobHandleImpl implements JobHandle {
     return callNativeAsync(() => N.jobStatus(this.#native, {}));
   }
 
+  async resources(): Promise<Api.JobResourceSample> {
+    return callNativeAsync(() => N.jobResources(this.#native, {}));
+  }
+
   progress(everyMs: number): AsyncIterable<Api.JobResourceSample> {
     return callNativeEvents(N.jobProgress(this.#native, { everyMs }));
   }

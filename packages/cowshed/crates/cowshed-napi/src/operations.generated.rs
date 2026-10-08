@@ -416,6 +416,12 @@ impl JobHandle {
         super::json_call::<operations::JobStatus, _>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Reads the job's current resource sample, or its frozen terminal sample; unowned jobs refuse it.
+    #[napi(js_name = "resources")]
+    pub fn resources(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::JobResourcesRead, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Reads one ended job's sealed record.
     #[napi(js_name = "sealed")]
     pub fn sealed(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

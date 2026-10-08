@@ -123,6 +123,11 @@ export interface JobHandle {
   readonly id: number;
   status(): Promise<Api.JobInfo>;
   /**
+   * The supervisor's resource sample while the job runs, frozen once it ends. Before the job
+   * owns a process this rejects with the typed not-ready conflict, never a zero sample.
+   */
+  resources(): Promise<Api.JobResourceSample>;
+  /**
    * The job's resource samples: the latest once it owns a process, another every `everyMs` while
    * it runs, then its terminal sample once. Each step of the loop asks the controller for one
    * sample, so a slow reader gets the latest, never a backlog; leaving the loop ends the
