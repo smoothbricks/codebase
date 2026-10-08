@@ -239,9 +239,9 @@ export interface PackageSecretCommand {
 }
 
 /**
- * A local checkout's directory, relative to the project's main checkout: a
- * cowshed workspace resolves it from the main checkout its marker names, so
- * one declaration means one directory in every checkout of the project.
+ * A directory relative to the project's main checkout. Project-contained paths
+ * select that path in the current checkout, rejecting physical symlink escapes;
+ * genuine sibling paths stay anchored at the main checkout a cowshed marker names.
  */
 export type DeveloperLinkDirectory = string & typia.tags.MinLength<1> & typia.tags.Pattern<'^[^/]'>;
 

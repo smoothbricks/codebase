@@ -41,9 +41,9 @@
  *
  * A repository can also DECLARE such links, so every checkout of it on a
  * developer machine gets them without anyone running `bun link`: the root
- * package.json's `smoo.developerLinks` maps a package name to the directory
- * of its local checkout, relative to the project's main checkout (see
- * `linkAnchor`). `planDeclaredLinks` says what the trees lack and
+ * package.json's `smoo.developerLinks` maps a package name to a relative
+ * directory. Contained targets belong to this checkout; genuine sibling
+ * targets are anchored at the project's main checkout (see `linkAnchor`).
  * `applyDeclaredLinks` makes it so: in every node_modules tree that has the
  * package installed, the entry becomes a link to that directory, unless a
  * developer already pointed it at a checkout of their own. A declared
@@ -297,7 +297,7 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
   for (const [name, relative] of declared) {
-    const target = path.resolve(anchor, relative);
+    const target = declaredTarget(root, anchor, relative);
     const reason = unavailableReason(target);
     if (reason !== null) {
       unavailable.push({ name, target, reason });
@@ -313,9 +313,9 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
       if (stats.isSymbolicLink()) {
         const current = resolvedTarget(root, { path: entry, target: readlinkSync(at) });
         const inside = path.relative(root, current);
-        if (current === target || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
-          continue;
-        }
+        const foreign = inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside);
+        // A cloned declaration's former main anchor is not a developer's independent choice.
+        if (current === target || (foreign && current !== path.resolve(anchor, relative))) continue;
       }
       changes.push({ path: entry, target });
     }
@@ -397,7 +397,7 @@ export function materializePackageDependencies(root: string, product: string, ch
 
 export function materializeDeclaredPackages(root: string, check = false): boolean {
   const anchor = linkAnchor(root);
-  const targets = new Set(readDeclaredLinks(root).map(([, relative]) => path.resolve(anchor, relative)));
+  const targets = new Set(readDeclaredLinks(root).map(([, relative]) => declaredTarget(root, anchor, relative)));
   for (const target of targets) {
     if (unavailableReason(target) === null && !materializePackageDependencies(root, target, check)) return false;
   }
@@ -504,13 +504,35 @@ function readDeclaredLinks(root: string): [string, string][] {
   });
 }
 
+/** Project-contained source products follow their checkout; siblings retain the shared main anchor. */
+function declaredTarget(root: string, anchor: string, relative: string): string {
+  const shared = path.resolve(anchor, relative);
+  const inside = path.relative(anchor, shared);
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return shared;
+  const candidate = path.resolve(root, inside);
+  const canonicalRoot = realpathSync(root);
+  let existing = candidate;
+  while (true) {
+    try {
+      const physical = path.relative(canonicalRoot, realpathSync(existing));
+      if (physical === '..' || physical.startsWith(`..${path.sep}`) || path.isAbsolute(physical)) {
+        throw new Error(`contained developer product escapes its owning checkout: ${candidate}`);
+      }
+      return candidate;
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      const parent = path.dirname(existing);
+      if (parent === existing) throw error;
+      existing = parent;
+    }
+  }
+}
+
 /**
- * What declared directories are relative to: the project's main checkout.
- * That is `root` itself, unless `root` is a cowshed workspace, a clone of
- * the main checkout at another path whose marker (`.cowshed/workspace.json`)
- * names the main checkout as its `projectRoot`. Every checkout of one project
- * then resolves a declaration to the same directory, however deep its own
- * path lies.
+ * The stable anchor for genuine sibling directories is the project's main checkout.
+ * A cowshed marker names it without reading main's tree. Contained source products
+ * are projected into the current checkout by `declaredTarget`, with physical
+ * containment checked against symlink escapes.
  */
 function linkAnchor(root: string): string {
   let marker: unknown;

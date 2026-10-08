@@ -736,6 +736,13 @@ An Nx task hash must not change between checkouts of the same tree.
   re-keys it.
 - **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).
 
+A cached tool product carries portable package identities and payloads, not host-bound dependency symlinks. Its ordinary
+activation owner checks and materializes those bindings on the current host after a cache restore, before consumers run;
+stale foreign bindings fail the check rather than becoming inherited authority. A project-contained developer-link
+declaration selects the product in the current checkout and refuses physical symlink escapes, including an escaping
+existing ancestor of a not-yet-built product. Genuine sibling declarations retain their main-checkout anchor. Neither
+rule grants the main checkout or an ancestor dependency store to a cowshed sandbox.
+
 ### The adoption needs the target's Nx database closed
 
 A process that opened the target's task database before a swap keeps that file open but resolves cache paths through the

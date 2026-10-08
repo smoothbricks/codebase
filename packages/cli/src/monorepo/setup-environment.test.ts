@@ -721,6 +721,48 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
+    it('selects contained products in this checkout, not the main checkout', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '.cache/product' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const main = join(dirname(root), 'projects', 'main');
+          await checkout(join(main, '.cache', 'product'), '@fixture/lib');
+          await mkdir(join(root, '.cowshed'), { recursive: true });
+          await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
+
+          // A missing local product must not borrow the main checkout's product.
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+          const local = await checkout(join(root, '.cache', 'product'), '@fixture/lib');
+          // A clone may inherit the declaration's old main-anchored link; activation owns that migration.
+          await rm(join(root, LINKED));
+          symlinkSync(join(main, '.cache', 'product'), join(root, LINKED));
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+        },
+      );
+    });
+
+    it('refuses a contained declaration whose existing ancestor escapes through a symlink', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '.cache/product' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const foreign = join(dirname(root), 'foreign-products');
+          await mkdir(foreign);
+          symlinkSync(foreign, join(root, '.cache'));
+          // The final component does not exist: the existing ancestor still proves the escape.
+          const refused = await enter({ links: true });
+          expect(refused.exitCode).toBe(1);
+          expect(refused.stderr).toContain('escapes its owning checkout');
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+        },
+      );
+    });
+
     it("keeps a developer's own link, and the installed version where this machine lacks the checkout", async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib', util: '../declared-util' } },

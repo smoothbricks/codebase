@@ -19,6 +19,11 @@ beforehand. Then point `overrides.nx` at the new URL and run `bun install`, here
 `bun tooling/patched-nx.ts lock <integrity>` confirms the lock matches the served asset. The library packages
 (`@smoothbricks/*`) keep their `smoo.developerLinks` path before publication (packages/cli README, "Declared Links").
 
+Project-contained declarations resolve to the current checkout's generated product, including a cowshed checkout; they
+never borrow the main checkout's same-path product. Existing ancestors and final targets must remain physically inside
+that checkout, so symlink escapes are refused even before a product exists. Genuine sibling declarations retain their
+main-checkout anchor. This is the shared developer-link rule, not an Nx-only sandbox allowance.
+
 The product is installed under its own `node_modules/nx` namespace, which the real CLI's local/self resolver consumes;
 no checkout-ancestor lookup or external alias stands in for that package layout.
 
