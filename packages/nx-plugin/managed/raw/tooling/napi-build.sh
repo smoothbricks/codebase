@@ -10,6 +10,11 @@ fi
 target="$1"
 action="$2"
 shift 2
+if [ "$target" = host ] && [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+  echo "host NAPI build refuses CARGO_BUILD_TARGET=$CARGO_BUILD_TARGET; unset it or request an explicit platform target" >&2
+  exit 2
+fi
+
 host="$(uname -s):$(uname -m)"
 mode="${SMOO_NAPI_TOOLCHAIN_MODE:-unmanaged}"
 

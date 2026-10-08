@@ -58,12 +58,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
     const unmanagedEnv = { ...process.env };
     delete unmanagedEnv.SMOO_NAPI_TOOLCHAIN_MODE;
+    delete unmanagedEnv.CARGO_BUILD_TARGET;
     expect(execFileSync('sh', [entry, 'host', '--identity'], { encoding: 'utf8', env: unmanagedEnv })).toBe(
       `unmanaged:${host}\n`,
     );
     const refused = spawnSync('sh', [entry, 'host', 'uname'], { encoding: 'utf8', env: unmanagedEnv });
     expect(refused.status).toBe(2);
     expect(refused.stderr).toContain('native NAPI build needs the managed shell');
+    const redirected = spawnSync('sh', [entry, 'host', '--identity'], {
+      encoding: 'utf8',
+      env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'native', CARGO_BUILD_TARGET: 'x86_64-unknown-linux-gnu' },
+    });
+    expect(redirected.status).toBe(2);
+    expect(redirected.stderr).toContain('host NAPI build refuses CARGO_BUILD_TARGET=');
   });
 
   it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
@@ -1826,7 +1833,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
+            'sh ../../tooling/napi-build.sh host napi --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);

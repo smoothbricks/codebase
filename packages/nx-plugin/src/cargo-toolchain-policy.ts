@@ -6,9 +6,9 @@
 
 /**
  * The DECLARED pin, hashed as an ordinary file. devenv resolves this lock into
- * the rustc, cargo, linker, C toolchain and SDK that every cargo command
- * inherits, so a bump here is exactly the event that must invalidate a cached
- * artifact — and it is the only such event the workspace can state portably.
+ * the Nix-managed Rust, linker and C toolchains. A pin bump must invalidate
+ * their cached artifacts. Darwin's host Xcode/SDK is outside this lock and
+ * needs separate identity when a producer claims to key it.
  *
  * This replaces a runtime input that dumped the ambient cargo environment
  * (every `CARGO_`, `RUST`, `CC`, `CXX`, `AR`, `SDKROOT`, `LIBCLANG_PATH`,
