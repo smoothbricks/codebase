@@ -1735,6 +1735,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
       expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toBeUndefined();
       expect(linuxX64Targets['napi-debug']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
+      expect(linuxX64Targets['napi-debug']?.inputs).toContainEqual({
+        runtime:
+          'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c \'cd "$0" && rustc -vV\' packages/cowshed',
+      });
 
       const darwinArm64Targets = await inferProjectTargets(
         workspace,

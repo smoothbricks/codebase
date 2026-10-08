@@ -2031,8 +2031,12 @@ function createNapiTargets(
   const packageJsonPath = repoRooted ? posix.join(projectRoot, 'package.json') : 'package.json';
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage} --package-json-path ${packageJsonPath}`;
   const cargoInputs = napiInputs(projectRoot, repoRooted);
-  const hostInputs = [...cargoInputs, runtimeInput('sh tooling/napi-build.sh host --identity')];
   const cargoCwd = repoRooted ? '.' : projectRoot;
+  const hostInputs = [
+    ...cargoInputs,
+    runtimeInput('sh tooling/napi-build.sh host --identity'),
+    cargoRuntimeInput(cargoCwd, 'rustc -vV'),
+  ];
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
