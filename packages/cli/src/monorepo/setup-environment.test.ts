@@ -1156,6 +1156,11 @@ function fileIdentities(paths: readonly string[]) {
   });
 }
 
+/** Identities of the paths that exist: a removed file is part of the fingerprint through its absence. */
+function presentFileIdentities(paths: readonly string[]) {
+  return fileIdentities(paths.filter((path) => lstatSync(path, { throwIfNoEntry: false }) !== undefined));
+}
+
 describe('immutable portable package activation', () => {
   it('publishes the same portable product in two checkouts and leaves an identical generation and alias untouched', async () => {
     await withPortablePackageProduct(async ({ root, product, canonical, copyProduct }) => {
@@ -1167,10 +1172,10 @@ describe('immutable portable package activation', () => {
         const generationRoot = join(directory, 'generations', product.identity);
         const generation = join(generationRoot, 'node_modules', product.closure.packageName);
         const alias = join(directory, 'node_modules', product.closure.packageName);
-        expect(activatePackageProduct(checkout, directory, true)).toBe(false);
+        expect(await activatePackageProduct(checkout, directory, true)).toBe(false);
         expect(existsSync(alias)).toBe(false);
         expect(existsSync(generationRoot)).toBe(false);
-        expect(activatePackageProduct(checkout, directory)).toBe(true);
+        expect(await activatePackageProduct(checkout, directory)).toBe(true);
         expect(lstatSync(alias).isSymbolicLink()).toBe(true);
         expect(realpathSync(alias)).toBe(generation);
         expect(realpathSync(join(generation, 'node_modules/tslib'))).toBe(canonical);
@@ -1189,8 +1194,8 @@ describe('immutable portable package activation', () => {
           join(generation, 'node_modules/tslib'),
         ];
         const before = fileIdentities(paths);
-        expect(activatePackageProduct(checkout, directory, true)).toBe(true);
-        expect(activatePackageProduct(checkout, directory)).toBe(true);
+        expect(await activatePackageProduct(checkout, directory, true)).toBe(true);
+        expect(await activatePackageProduct(checkout, directory)).toBe(true);
         expect(fileIdentities(paths)).toEqual(before);
       }
       expect(realpathSync(join(root, 'first/.cache/product/node_modules', product.closure.packageName))).not.toBe(
@@ -1208,7 +1213,7 @@ describe('immutable portable package activation', () => {
         product.closure.packageName,
       );
       expect(realpathSync(forkAlias)).toBe(forkGeneration);
-      expect(activatePackageProduct(fork, forkDirectory, true)).toBe(true);
+      expect(await activatePackageProduct(fork, forkDirectory, true)).toBe(true);
       expect(createRequire(join(forkGeneration, 'package.json'))('./index.cjs')).toEqual({
         payload: 'portable',
         bound: true,
@@ -1258,7 +1263,7 @@ describe('immutable portable package activation', () => {
       const checkout = join(root, 'checkout');
       await copyProduct(directory);
       await writeFile(join(checkout, 'package.json'), JSON.stringify({ name: '@fixture/checkout', private: true }));
-      expect(activatePackageProduct(checkout, directory)).toBe(true);
+      expect(await activatePackageProduct(checkout, directory)).toBe(true);
       const alias = join(directory, 'node_modules', product.closure.packageName);
       const oldGeneration = realpathSync(alias);
       const paths = [
@@ -1331,20 +1336,20 @@ describe('immutable portable package activation', () => {
       ];
       for (const invalid of invalidProducts) {
         await writeFile(join(directory, 'product.json'), JSON.stringify(invalid));
-        expect(() => activatePackageProduct(checkout, directory)).toThrow();
+        await expect(activatePackageProduct(checkout, directory)).rejects.toThrow();
         expect(realpathSync(alias)).toBe(oldGeneration);
         expect(fileIdentities(paths)).toEqual(before);
       }
       await writeFile(join(directory, 'product.json'), '{not-json');
-      expect(() => activatePackageProduct(checkout, directory)).toThrow();
+      await expect(activatePackageProduct(checkout, directory)).rejects.toThrow();
       expect(fileIdentities(paths)).toEqual(before);
       expect(existsSync(join(directory, 'generations/bindings-1.0.0/missing-binding'))).toBe(false);
       expect(existsSync(join(root, 'outside.tgz'))).toBe(false);
       const next = { ...product, identity: 'bindings-1.0.0/second' };
       await writeFile(join(directory, 'product.json'), JSON.stringify(next));
-      expect(activatePackageProduct(checkout, directory, true)).toBe(false);
+      expect(await activatePackageProduct(checkout, directory, true)).toBe(false);
       expect(fileIdentities(paths)).toEqual(before);
-      expect(activatePackageProduct(checkout, directory)).toBe(true);
+      expect(await activatePackageProduct(checkout, directory)).toBe(true);
       const newGeneration = join(directory, 'generations', next.identity, 'node_modules', product.closure.packageName);
       expect(realpathSync(alias)).toBe(newGeneration);
       expect(realpathSync(join(newGeneration, 'node_modules/tslib'))).toBe(canonical);
@@ -1373,12 +1378,78 @@ describe('immutable portable package activation', () => {
       expect(unpacked.exitCode, new TextDecoder().decode(unpacked.stderr)).toBe(0);
       const paths = [alias, join(alias, 'package.json'), join(alias, 'index.cjs')];
       const before = fileIdentities(paths);
-      expect(() => activatePackageProduct(checkout, directory)).toThrow(
+      await expect(activatePackageProduct(checkout, directory)).rejects.toThrow(
         'its owning checkout must relocate this legacy payload',
       );
       expect(lstatSync(alias).isDirectory()).toBe(true);
       expect(fileIdentities(paths)).toEqual(before);
       expect(readFileSync(join(alias, 'index.cjs'), 'utf8')).toContain("payload: 'portable'");
+    });
+  });
+
+  it('refuses tampered, removed, redirected or extra payload without rebinding its generation', async () => {
+    await withPortablePackageProduct(async ({ root, product, copyProduct }) => {
+      type Corruption = (at: { readonly generation: string; readonly outside: string }) => Promise<void>;
+      const corruptions: readonly { readonly name: string; readonly corrupt: Corruption }[] = [
+        {
+          name: 'tampered-executable',
+          corrupt: ({ generation }) =>
+            writeFile(join(generation, 'index.cjs'), "module.exports = { payload: 'tampered' };\n"),
+        },
+        {
+          name: 'removed-executable',
+          corrupt: ({ generation }) => rm(join(generation, 'index.cjs')),
+        },
+        {
+          name: 'symlink-escape',
+          corrupt: async ({ generation, outside }) => {
+            await copyFile(join(generation, 'index.cjs'), outside);
+            await rm(join(generation, 'index.cjs'));
+            symlinkSync(outside, join(generation, 'index.cjs'));
+          },
+        },
+        {
+          name: 'extra-file',
+          corrupt: ({ generation }) =>
+            writeFile(join(generation, 'extra.cjs'), "module.exports = { payload: 'extra' };\n"),
+        },
+        {
+          name: 'extra-host-package',
+          corrupt: async ({ generation }) => {
+            await mkdir(join(generation, 'node_modules/evil'), { recursive: true });
+            await writeFile(join(generation, 'node_modules/evil/index.js'), 'module.exports = {};\n');
+          },
+        },
+      ];
+      for (const { name, corrupt } of corruptions) {
+        const checkout = join(root, name);
+        const directory = join(checkout, '.cache/product');
+        await copyProduct(directory);
+        await writeFile(join(checkout, 'package.json'), JSON.stringify({ name: `@fixture/${name}`, private: true }));
+        expect(await activatePackageProduct(checkout, directory)).toBe(true);
+        const alias = join(directory, 'node_modules', product.closure.packageName);
+        const generation = realpathSync(alias);
+        const outside = join(root, `${name}.outside.cjs`);
+        await corrupt({ generation, outside });
+        const paths = [
+          alias,
+          generation,
+          join(generation, 'package.json'),
+          join(generation, 'dependency-closure.json'),
+          join(generation, 'index.cjs'),
+          join(generation, 'extra.cjs'),
+          join(generation, 'node_modules/tslib'),
+          join(generation, 'node_modules/evil'),
+          join(generation, 'node_modules/evil/index.js'),
+          join(directory, 'generations', product.identity, 'product.json'),
+          outside,
+        ];
+        const before = presentFileIdentities(paths);
+        expect(await activatePackageProduct(checkout, directory, true), name).toBe(false);
+        await expect(activatePackageProduct(checkout, directory), name).rejects.toThrow('immutable package payload');
+        expect(presentFileIdentities(paths), name).toEqual(before);
+        expect(realpathSync(alias), name).toBe(generation);
+      }
     });
   });
 });

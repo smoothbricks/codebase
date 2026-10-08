@@ -361,7 +361,7 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
  * reads only: missing or stale assets, generations, aliases and bindings are false.
  * Package payload and description are immutable; host-local dependency aliases are activation-owned.
  */
-export function activatePackageProduct(root: string, productDirectory: string, check = false): boolean {
+export async function activatePackageProduct(root: string, productDirectory: string, check = false): Promise<boolean> {
   const canonicalRoot = realpathSync(root);
   const selected = path.resolve(root, productDirectory);
   if (!containsPath(path.resolve(root), selected))
@@ -415,11 +415,19 @@ export function activatePackageProduct(root: string, productDirectory: string, c
         `${generation}: immutable generation identity collision; produce a new identity, never overwrite it`,
       );
     }
-    if (!packagePayloadCurrent(packageRoot, product.closure)) {
+    // The retained archive is validated as a new publication is: names and kinds first, then its exact bytes.
+    validatePackageArchive(asset, assetPath);
+    const payload = await archivePayload(asset, assetPath);
+    if (
+      !packageMetadataCurrent(packageRoot, product.closure) ||
+      !(await packageArchiveCurrent(packageRoot, payload, bindings))
+    ) {
       if (check) return false;
-      throw new Error(`${generation}: immutable package payload or closure is stale; never overwrite it`);
+      throw new Error(
+        `${generation}: immutable package payload is not its verified archive and closure; never overwrite it`,
+      );
     }
-    if (!packageBindingsCurrent(packageRoot, product.closure, bindings)) {
+    if (!packageLinksCurrent(packageRoot, bindings)) {
       if (check) return false;
       for (const { name, target } of bindings) {
         replacePackageAlias(canonicalRoot, path.join(packageRoot, 'node_modules', name), target);
@@ -429,6 +437,7 @@ export function activatePackageProduct(root: string, productDirectory: string, c
     if (check) return false;
     refuseLegacyPackage(alias);
     validatePackageArchive(asset, assetPath);
+    const payload = await archivePayload(asset, assetPath);
     const staging = mkdtempSync(path.join(directory, '.generation-'));
     try {
       const stagedPackage = path.join(staging, 'node_modules', product.closure.packageName);
@@ -446,6 +455,9 @@ export function activatePackageProduct(root: string, productDirectory: string, c
         const link = path.join(stagedPackage, 'node_modules', name);
         mkdirSync(path.dirname(link), { recursive: true });
         symlinkSync(target, link, 'dir');
+      }
+      if (!(await packageArchiveCurrent(stagedPackage, payload, bindings))) {
+        throw new Error(`${assetPath}: extracted package differs from its verified archive; nothing was published`);
       }
       writeFileSync(path.join(staging, 'product.json'), JSON.stringify(product));
       mkdirSync(path.dirname(generation), { recursive: true });
@@ -478,7 +490,8 @@ export function materializePackageDependencies(root: string, product: string, ch
     throw new Error(`${metadataPath}: rebuild this declared product for ${process.platform}/${process.arch}`);
   }
   const bindings = dependencyBindings(root, metadata, metadataPath, check);
-  if (bindings !== null && packageBindingsCurrent(packageRoot, metadata, bindings)) return true;
+  if (bindings !== null && packageMetadataCurrent(packageRoot, metadata) && packageLinksCurrent(packageRoot, bindings))
+    return true;
   if (check) return false;
   throw new Error(
     `local product ${packageRoot} needs binding by its owning checkout; run its declared activation target`,
@@ -486,7 +499,7 @@ export function materializePackageDependencies(root: string, product: string, ch
 }
 
 /** Activate contained declared products before planning links, including an absent stable alias. */
-export function materializeDeclaredPackages(root: string, check = false): boolean {
+export async function materializeDeclaredPackages(root: string, check = false): Promise<boolean> {
   const anchor = linkAnchor(root);
   const canonicalRoot = realpathSync(root);
   const activated = new Set<string>();
@@ -506,7 +519,7 @@ export function materializeDeclaredPackages(root: string, check = false): boolea
             `smoo.developerLinks ${name}: declaration must select its product's stable node_modules package`,
           );
         if (!activated.has(directory)) {
-          if (!activatePackageProduct(root, directory, check)) return false;
+          if (!(await activatePackageProduct(root, directory, check))) return false;
           activated.add(directory);
         }
         continue;
@@ -625,7 +638,8 @@ function verifyPackageIdentity(packageRoot: string, expected: string): void {
     throw new Error(`${file}: package identity does not match its portable dependency closure`);
 }
 
-function packagePayloadCurrent(packageRoot: string, metadata: PackageDependencyClosure): boolean {
+/** The generation's own record: package.json names its identity, dependency-closure.json is the closure published. */
+function packageMetadataCurrent(packageRoot: string, metadata: PackageDependencyClosure): boolean {
   const manifest = path.join(packageRoot, 'package.json');
   const closure = path.join(packageRoot, 'dependency-closure.json');
   if (
@@ -637,12 +651,11 @@ function packagePayloadCurrent(packageRoot: string, metadata: PackageDependencyC
   return JSON.stringify(readDependencyClosure(closure)) === JSON.stringify(metadata);
 }
 
-function packageBindingsCurrent(
+/** Each host binding is a symlink to its exact store target; only activation repairs one. */
+function packageLinksCurrent(
   packageRoot: string,
-  metadata: PackageDependencyClosure,
   bindings: readonly { readonly name: string; readonly target: string }[],
 ): boolean {
-  if (!packagePayloadCurrent(packageRoot, metadata)) return false;
   for (const { name, target } of bindings) {
     const link = path.join(packageRoot, 'node_modules', name);
     const state = lstatSync(link, { throwIfNoEntry: false });
@@ -654,6 +667,70 @@ function packageBindingsCurrent(
       return false;
   }
   return true;
+}
+
+/**
+ * The canonical tar's regular files by package-relative path, read in memory by Bun.Archive. They are compared with
+ * the generation and never unpacked to check it; only validated names become lookup paths.
+ */
+async function archivePayload(asset: Uint8Array, source: string): Promise<ReadonlyMap<string, File>> {
+  const payload = new Map<string, File>();
+  for (const [name, file] of await new Bun.Archive(asset).files()) {
+    if (!name.startsWith('package/') || !safeArchiveName(name))
+      throw new Error(`${source}: unsafe archive path ${JSON.stringify(name)}`);
+    payload.set(name.slice('package/'.length), file);
+  }
+  return payload;
+}
+
+/** What a generation may hold beyond its directories: the archive's files, and the owner's host bindings and scopes. */
+interface OwnedEntries {
+  readonly payload: ReadonlyMap<string, File>;
+  readonly links: ReadonlySet<string>;
+  readonly scopes: ReadonlySet<string>;
+}
+
+/**
+ * A generation is exactly the archive's regular files, each a real file in this namespace holding the archive's bytes,
+ * plus the owner's records: dependency-closure.json and, under node_modules, the host bindings the closure names
+ * (symlinks) with their scope directories. Missing, redirected, changed or extra entries refuse; nothing is rewritten.
+ */
+async function packageArchiveCurrent(
+  packageRoot: string,
+  payload: ReadonlyMap<string, File>,
+  bindings: readonly { readonly name: string }[],
+): Promise<boolean> {
+  for (const [relative, file] of payload) {
+    const target = path.join(packageRoot, relative);
+    // lstat never follows the leaf, and the realpath must be the path itself: no link on the path leaves the namespace.
+    const regular = lstatSync(target, { throwIfNoEntry: false })?.isFile() === true && realpathSync(target) === target;
+    if (!regular || !readFileSync(target).equals(await file.bytes())) return false;
+  }
+  const links = new Set(bindings.map(({ name }) => name));
+  const scopes = new Set(
+    [...links].filter((name) => name.startsWith('@')).map((name) => name.slice(0, name.indexOf('/'))),
+  );
+  return onlyOwnedEntries(packageRoot, '', { payload, links, scopes });
+}
+
+/** Every entry under `directory`, found without following links, must be owned; '' is the package root. */
+function onlyOwnedEntries(packageRoot: string, directory: string, owned: OwnedEntries): boolean {
+  for (const entry of directoryEntries(path.join(packageRoot, directory))) {
+    const relative = directory === '' ? entry.name : `${directory}/${entry.name}`;
+    if (!ownedEntry(relative, entry, owned)) return false;
+    if (entry.isDirectory() && !onlyOwnedEntries(packageRoot, relative, owned)) return false;
+  }
+  return true;
+}
+
+function ownedEntry(relative: string, entry: Dirent, owned: OwnedEntries): boolean {
+  if (relative === 'dependency-closure.json') return entry.isFile();
+  if (relative === 'node_modules') return entry.isDirectory();
+  if (relative.startsWith('node_modules/')) {
+    const name = relative.slice('node_modules/'.length);
+    return entry.isSymbolicLink() ? owned.links.has(name) : entry.isDirectory() && owned.scopes.has(name);
+  }
+  return entry.isDirectory() || (entry.isFile() && owned.payload.has(relative));
 }
 
 function dependencyBindings(
@@ -716,20 +793,7 @@ function validatePackageArchive(asset: Uint8Array, source: string): void {
   if (names.length === 0 || !names.includes('package/package.json'))
     throw new Error(`${source}: expected an npm package archive containing package/package.json`);
   for (const name of names) {
-    const components = name.replace(/\/$/, '').split('/');
-    if (
-      components[0] !== 'package' ||
-      components.some(
-        (component) =>
-          component.length === 0 ||
-          /\\|\p{Cc}/u.test(component) ||
-          component === '.' ||
-          component === '..' ||
-          component === 'node_modules',
-      ) ||
-      name === 'package/dependency-closure.json'
-    )
-      throw new Error(`${source}: unsafe or owner-only archive path ${JSON.stringify(name)}`);
+    if (!safeArchiveName(name)) throw new Error(`${source}: unsafe or owner-only archive path ${JSON.stringify(name)}`);
   }
   const kinds = Bun.spawnSync(['tar', '-tzvf', '-'], { stdin: asset, stdout: 'pipe', stderr: 'pipe' });
   if (kinds.exitCode !== 0)
@@ -742,6 +806,23 @@ function validatePackageArchive(asset: Uint8Array, source: string): void {
       .some((entry) => entry[0] !== '-' && entry[0] !== 'd')
   )
     throw new Error(`${source}: portable package archives must contain only regular files and directories`);
+}
+
+/** A tar entry name a portable package may carry: under package/, plain components, never the owner's records. */
+function safeArchiveName(name: string): boolean {
+  const components = name.replace(/\/$/, '').split('/');
+  return (
+    components[0] === 'package' &&
+    !components.some(
+      (component) =>
+        component.length === 0 ||
+        /\\|\p{Cc}/u.test(component) ||
+        component === '.' ||
+        component === '..' ||
+        component === 'node_modules',
+    ) &&
+    name !== 'package/dependency-closure.json'
+  );
 }
 
 /** Bootstrap precedes installed workspace validators; use its existing explicit boundary validation. */

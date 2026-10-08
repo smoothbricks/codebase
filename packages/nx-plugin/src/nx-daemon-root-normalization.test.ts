@@ -158,7 +158,7 @@ it('keeps the old product generation daemon serving while a complete new generat
       await copyFile(join(producer, source.asset), join(directory, source.asset));
       const first: PortablePackageProduct = { ...source, identity: `${source.identity}-daemon-old` };
       await writeFile(join(directory, 'product.json'), JSON.stringify(first));
-      expect(activatePackageProduct(workspace, directory)).toBe(true);
+      expect(await activatePackageProduct(workspace, directory)).toBe(true);
       const alias = join(directory, 'node_modules/nx');
       const oldGenerationRoot = join(directory, 'generations', first.identity);
       const oldGeneration = join(oldGenerationRoot, 'node_modules/nx');
@@ -188,7 +188,7 @@ it('keeps the old product generation daemon serving while a complete new generat
         },
       };
       await writeFile(join(directory, 'product.json'), JSON.stringify(refused));
-      expect(() => activatePackageProduct(workspace, directory)).toThrow();
+      await expect(activatePackageProduct(workspace, directory)).rejects.toThrow();
       expect(existsSync(join(directory, 'generations', refused.identity))).toBe(false);
       expect({ inode: lstatSync(alias).ino, target: readlinkSync(alias) }).toEqual(oldAlias);
       expect(generationSnapshot(oldGenerationRoot)).toEqual(oldBytes);
@@ -197,9 +197,9 @@ it('keeps the old product generation daemon serving while a complete new generat
 
       const next: PortablePackageProduct = { ...source, identity: `${source.identity}-daemon-new` };
       await writeFile(join(directory, 'product.json'), JSON.stringify(next));
-      expect(activatePackageProduct(workspace, directory, true)).toBe(false);
+      expect(await activatePackageProduct(workspace, directory, true)).toBe(false);
       expect(realpathSync(alias)).toBe(oldGeneration);
-      expect(activatePackageProduct(workspace, directory)).toBe(true);
+      expect(await activatePackageProduct(workspace, directory)).toBe(true);
       const newGenerationRoot = join(directory, 'generations', next.identity);
       const newGeneration = join(newGenerationRoot, 'node_modules/nx');
       expect(realpathSync(alias)).toBe(newGeneration);
@@ -243,7 +243,7 @@ it('keeps the old product generation daemon serving while a complete new generat
         throw new Error('the actual new generation native load returned no package path or hash');
       }
       expect(realpathSync(dirname(nativePath))).toBe(join(store, native.storePath));
-      expect(activatePackageProduct(workspace, directory, true)).toBe(true);
+      expect(await activatePackageProduct(workspace, directory, true)).toBe(true);
       expect(generationSnapshot(oldGenerationRoot)).toEqual(oldBytes);
       expect(await ping(record.socketPath, workspace)).toBe(true);
       expect(await ping(record.socketPath, `${workspace}/`)).toBe(true);

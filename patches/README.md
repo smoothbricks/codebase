@@ -32,9 +32,12 @@ declared producer's existing Nx task hash, asset integrity and portable dependen
 host-bound symlink is a cached output. The explicit `patched-nx-bindings` dependency uses the existing setup owner
 (`--links --package-product .cache/patched-nx`) to verify the asset and publish a completed immutable
 `generations/<identity>/node_modules/nx` tree before switching the stable `node_modules/nx` alias. Equal identities are
-no-op publications; collisions refuse, and previous generations are retained for live CLI and daemon owners. Producer
-execution and cache restoration therefore cannot remove package files from beneath those processes. Neither a second
-hasher nor a registry names generations.
+no-op publications; collisions refuse, and previous generations are retained for live CLI and daemon owners. Before any
+retained generation is accepted or rebound, each regular payload file, JavaScript and native executables included, must
+be a real file whose bytes equal the canonical tar entry, read by `Bun.Archive` without unpacking. A missing,
+redirected, changed or extra file refuses in `--check` and activation alike, and no file in the generation is rewritten.
+Producer execution and cache restoration therefore cannot remove package files from beneath those processes. Neither a
+second hasher nor a registry names generations.
 
 Owned generation and project-contained declaration aliases are relative to their own namespace, so a source-image fork
 selects its own copied package without reading the donor. Activation checks and atomically normalizes older absolute
