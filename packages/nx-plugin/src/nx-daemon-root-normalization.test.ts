@@ -4,6 +4,7 @@ import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import typia from 'typia';
+import type { DaemonProcessJson } from '../../../.cache/patched-nx/package/dist/src/daemon/cache.js';
 import {
   assertNotForeignWorkspaceMessage,
   isForeignWorkspaceMessage,
@@ -19,11 +20,6 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
 const artifactNxEntry = join(repositoryRoot, '.cache/patched-nx/package/dist/bin/nx.js');
-
-interface DaemonRecord {
-  processId: number;
-  socketPath: string;
-}
 
 it('removes only redundant POSIX separators and preserves root, case and backslash components', () => {
   for (const [input, expected] of [
@@ -101,12 +97,12 @@ it('accepts its real daemon RPC with a trailing root separator and refuses a gen
       });
       expect(started.status, started.stdout + started.stderr).toBe(0);
       const recordPath = join(workspace, '.nx/workspace-data/d/server-process.json');
-      const record = typia.json.assertParse<DaemonRecord>(await readFile(recordPath, 'utf8'));
+      const record = typia.json.assertParse<DaemonProcessJson>(await readFile(recordPath, 'utf8'));
       expect(await ping(record.socketPath, workspace)).toBe(true);
       expect(await ping(record.socketPath, `${workspace}/`)).toBe(true);
       expect(await ping(record.socketPath, foreign)).toMatchObject({ error: expect.anything() });
       expect(await ping(record.socketPath, workspace)).toBe(true);
-      expect(typia.json.assertParse<DaemonRecord>(await readFile(recordPath, 'utf8'))).toEqual(record);
+      expect(typia.json.assertParse<DaemonProcessJson>(await readFile(recordPath, 'utf8'))).toEqual(record);
     },
     'workspace',
   );
