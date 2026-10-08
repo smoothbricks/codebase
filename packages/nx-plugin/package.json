@@ -20,7 +20,6 @@
     },
     "./eslint-file-set": {
       "types": "./dist/eslint-file-set.d.ts",
-      "development": "./src/eslint-file-set.ts",
       "import": "./dist/eslint-file-set.js",
       "default": "./dist/eslint-file-set.js"
     },

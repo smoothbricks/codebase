@@ -32,8 +32,10 @@ describe('Bun bootstrap imports', () => {
       'const policy = await import("@smoothbricks/nx-plugin/workspace-config-policy");',
       'const bounded = await import("@smoothbricks/nx-plugin/bounded-test-policy");',
       'const targets = await import("@smoothbricks/nx-plugin/package-target-policy");',
+      'const eslint = await import("@smoothbricks/nx-plugin/eslint-file-set");',
       'if (!policy.checkWorkspaceConfig({plugins:[{plugin:42}]}).some(issue => issue.message.startsWith("plugins is malformed:"))) throw new Error("the public policy did not validate");',
       'if (typeof bounded.applyBoundedTestTargetPolicy !== "function" || typeof targets.applyPackageTargetPolicy !== "function") throw new Error("the compiled caller closure is incomplete");',
+      'if (!eslint.isEslintFileSet({command:"eslint src/fixture.ts",files:["src/fixture.ts"]}) || eslint.isEslintFileSet({command:42,files:[]})) throw new Error("the compiled ESLint file-set owner did not validate");',
     ].join('\n');
     const child = spawnSync(process.execPath, ['--config=/dev/null', '--no-env-file', '--no-install', '-e', script], {
       cwd: join(import.meta.dir, '../../cli'),
