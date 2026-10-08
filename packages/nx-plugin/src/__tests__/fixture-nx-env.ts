@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fixtureSocketDirectory, ownedFixtureRoot, stopNxDaemon } from '../testing.js';
+import { fixtureSocketDirectory, ownedFixtureRoot, retireFixtureSocketDirectory, stopNxDaemon } from '../testing.js';
 import { guardEvent } from './counted-cargo.js';
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
@@ -105,15 +105,14 @@ export async function withNxFixture<T>(
 }
 
 /**
- * Stop the fixture workspace's daemon, then delete the socket directory and
- * the root. A daemon that outlives its stop fails the retirement and keeps
- * both, so its working directory still names a fixture the next run reclaims.
- * Nx deletes its socket directory itself when the daemon stops, and a
- * daemonless fixture never makes one: `force` takes both.
+ * Stop the fixture workspace's daemon, unlink its owned short socket alias,
+ * then delete the root. A daemon that outlives its stop fails the retirement
+ * and keeps both, so its working directory still names a fixture the next run
+ * reclaims.
  */
 async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
   await stopFixtureNxDaemon(workspace);
-  await rm(fixtureSocketDirectory(workspace), { recursive: true, force: true });
+  await retireFixtureSocketDirectory(workspace);
   await rm(root, { recursive: true, force: true });
 }
 

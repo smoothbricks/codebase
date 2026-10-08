@@ -1,13 +1,16 @@
 import { expect, it } from 'bun:test';
-import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync, lstatSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
+  fixtureSocketDirectory,
   isRunning,
+  NX_LONGEST_SOCKET_NAME,
   nxDaemonProcesses,
   ownedFixtureRoot,
+  ownedWorkspaceSocketDirectory,
   type ProcessEntry,
   pidsWorkingIn,
   processTable,
@@ -21,7 +24,7 @@ const repositoryRoot = join(import.meta.dir, '../../..');
  * Make `workspace` an Nx workspace and start its daemon. The daemon and every
  * process it started, once `nx daemon --start` has returned with it up.
  */
-async function startDaemon(workspace: string): Promise<ProcessEntry[]> {
+async function startDaemon(workspace: string, environment: Record<string, string> = {}): Promise<ProcessEntry[]> {
   await mkdir(workspace, { recursive: true });
   await writeFile(join(workspace, 'package.json'), '{"name":"daemon-fixture","private":true}\n');
   await writeFile(join(workspace, '.gitignore'), 'node_modules\n.nx\n');
@@ -30,7 +33,7 @@ async function startDaemon(workspace: string): Promise<ProcessEntry[]> {
   expect(Bun.spawnSync(['git', 'init', '--quiet', workspace]).exitCode).toBe(0);
   const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'daemon', '--start'], {
     cwd: workspace,
-    env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' },
+    env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', ...environment },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -81,6 +84,46 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its root', a
   expect(await stillRunning(daemon)).toEqual([]);
   expect(await pidsWorkingIn(root)).toEqual([]);
   expect(existsSync(root)).toBe(false);
+}, 120_000);
+
+it('starts and connects to a fixture daemon through owned short aliases with a long private TMPDIR', async () => {
+  await withNxFixture('long-tmp-socket-', async ({ workspace }) => {
+    const privateTemp = join(workspace, 'private-temp-'.padEnd(110, 'x'));
+    await mkdir(privateTemp);
+    expect(Buffer.byteLength(join(privateTemp, NX_LONGEST_SOCKET_NAME))).toBeGreaterThan(95);
+    const daemon = await startDaemon(workspace, { TMPDIR: privateTemp });
+    const directory = fixtureSocketDirectory(workspace);
+    const alias = dirname(directory);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(lstatSync(directory).isDirectory()).toBe(true);
+    expect(lstatSync(directory).isSymbolicLink()).toBe(false);
+    expect(await realpath(directory)).toBe(join(await realpath(workspace), '.nx', 'sockets', 'nx'));
+    expect(Buffer.byteLength(join(directory, NX_LONGEST_SOCKET_NAME))).toBeLessThanOrEqual(95);
+    const other = await ownedWorkspaceSocketDirectory(workspace, 'nc-', NX_LONGEST_SOCKET_NAME);
+    expect(await realpath(other)).toBe(
+      join(await realpath(workspace), '.nx', 'sockets', other.slice(alias.length + 1)),
+    );
+    expect(lstatSync(other).isSymbolicLink()).toBe(false);
+    await rm(other, { recursive: true });
+    const client = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'show', 'projects', '--json'], {
+      cwd: workspace,
+      env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', TMPDIR: privateTemp },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      client.exited,
+      new Response(client.stdout).text(),
+      new Response(client.stderr).text(),
+    ]);
+    expect(code, stdout + stderr).toBe(0);
+    expect(JSON.parse(stdout)).toEqual([]);
+    const record = JSON.parse(
+      await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf8'),
+    );
+    expect(daemon.some(({ pid }) => pid === record.processId)).toBe(true);
+    expect(await stillRunning(daemon)).not.toEqual([]);
+  });
 }, 120_000);
 
 it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live run", async () => {

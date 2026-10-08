@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   fixtureSocketDirectory,
   nxDaemonProcesses,
+  ownedFixtureRoot,
   pidsWorkingIn,
   processTable,
   reclaimDeadFixtureRuns,
+  retireFixtureSocketDirectory,
 } from '@smoothbricks/nx-plugin/testing';
 import {
   classifyReleaseBranchPush,
@@ -117,11 +119,11 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('keeps fixture Nx state out of a shared workspace-data directory', () => {
+  it('keeps fixture Nx state out of a shared workspace-data directory', async () => {
     // Host CI runners export these to a per-lane tree shared by every task in the run. A fixture
     // Nx inheriting any of them works in, or overwrites, another workspace's state.
     const shared = '/runner/lane/nx';
-    const root = '/fixture/repo';
+    const root = await mkdtemp(join(tmpdir(), 'smoo-release-env-'));
     const inherited = {
       NX_WORKSPACE_ROOT_PATH: shared,
       NX_WORKSPACE_DATA_DIRECTORY: join(shared, 'workspace-data'),
@@ -148,23 +150,50 @@ describe('release planning with fixture git repositories', () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+      await retireFixtureSocketDirectory(root);
+      await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("removes only the fixture workspace's own socket directory when it retires", async () => {
-    // Another workspace's directory in the same socket namespace: not this fixture's to remove.
-    const bystander = fixtureSocketDirectory(`/not/a/fixture/${process.pid}`);
-    await mkdir(bystander);
+  it("retires only the fixture workspace's own socket alias, leaving another workspace's intact", async () => {
+    // A bystander: an owned workspace in the same socket namespace, with its own alias and a real socket directory.
+    // None of it is this fixture's to remove, and retiring the fixture must leave all of it in place.
+    const bystander = await ownedFixtureRoot(tmpdir(), 'cli', 'smoo-release-bystander-');
     try {
+      await mkdir(join(bystander, '.nx', 'sockets'), { recursive: true });
+      const bystanderSocketDirectory = fixtureSocketDirectory(bystander);
+      await mkdir(bystanderSocketDirectory);
+      await writeFile(join(bystanderSocketDirectory, 'kept'), 'kept\n');
+      const bystanderAlias = dirname(bystanderSocketDirectory);
+
+      let fixtureRoot = '';
       let socketDirectory = '';
+      let alias = '';
+      let physicalDirectory = '';
       await withFixtureRepo(async (root) => {
+        fixtureRoot = await realpath(root);
+        await mkdir(join(root, '.nx', 'sockets'), { recursive: true });
         socketDirectory = fixtureSocketDirectory(root);
+        alias = dirname(socketDirectory);
         await mkdir(socketDirectory);
+        physicalDirectory = await realpath(socketDirectory);
       });
 
+      // The fixture's leaf was a real directory inside its own root, reached through the alias it retired.
+      expect(physicalDirectory).toBe(join(fixtureRoot, '.nx', 'sockets', 'nx'));
       expect(existsSync(socketDirectory)).toBe(false);
-      expect(existsSync(bystander)).toBe(true);
+      expect(await entryExists(alias)).toBe(false);
+      expect(existsSync(physicalDirectory)).toBe(false);
+
+      // The bystander's alias still names its own sockets directory, and its leaf still holds what it held.
+      const bystanderRoot = await realpath(bystander);
+      expect(await entryExists(bystanderAlias)).toBe(true);
+      expect(await realpath(bystanderAlias)).toBe(join(bystanderRoot, '.nx', 'sockets'));
+      expect(existsSync(bystanderSocketDirectory)).toBe(true);
+      expect(await realpath(bystanderSocketDirectory)).toBe(join(bystanderRoot, '.nx', 'sockets', 'nx'));
+      expect(await readFile(join(bystanderSocketDirectory, 'kept'), 'utf8')).toBe('kept\n');
     } finally {
+      await retireFixtureSocketDirectory(bystander);
       await rm(bystander, { recursive: true, force: true });
     }
   });
@@ -516,6 +545,22 @@ async function survivors(root: string, pids: readonly number[]): Promise<string[
     .map((entry) => `${entry.pid} ${entry.command}`);
   const working = (await pidsWorkingIn(root)).map((pid) => `${pid} works in ${root}`);
   return [...running, ...working];
+}
+
+/**
+ * Whether anything exists at `path`, a symlink whose target is gone included.
+ * Only ENOENT answers no: any other failure is the test's to report.
+ */
+async function entryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function releaseFixturePackages(): ReleasePackageInfo[] {

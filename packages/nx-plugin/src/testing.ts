@@ -29,7 +29,7 @@
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { realpathSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, symlinkSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
@@ -672,22 +672,73 @@ export async function ownedSocketDirectory(prefix: string, longestSocketName: st
 }
 
 /**
- * The socket directory of the Nx that runs in `workspace`, which a fixture
- * names as that Nx's `NX_SOCKET_DIR`: named for a hash of the workspace's own
- * path, so every environment built for it, the stop of its daemon included,
- * names the same one, and no two fixtures share one. It lies in the sandbox's
- * own socket namespace ({@link socketNamespace}), a short root: the plugin
- * sockets inside it have to fit the room the namespace leaves, and a namespace
- * with too little is refused here, before a daemon fails on it. Nx makes the
- * directory when it first needs a socket and deletes it when its daemon stops;
- * whoever retires the fixture removes this one either way, and no other.
+ * A short parent alias for this workspace's real socket leaves. Its spelling
+ * is in the job's admitted namespace, but its target is outside every checkout
+ * in the fixture's own tree. Nx sees a real leaf, never a symlinked socket
+ * directory, and the foreign-workspace guard sees the fixture that owns it.
+ */
+function fixtureSocketPaths(workspace: string) {
+  const root = realpathSync(workspace);
+  const digest = createHash('sha256').update(root).digest('hex');
+  const namespace = socketNamespace();
+  const alias = join(namespace.directory, `nx-${digest.slice(0, 16)}`);
+  const target = join(root, '.nx', 'sockets');
+  assertSocketPath(join(alias, 'nx', NX_LONGEST_SOCKET_NAME), namespace);
+  return { alias, target, namespace };
+}
+
+/** A colliding or retargeted alias is not this fixture's and must not be used or removed. */
+function assertFixtureSocketAlias(alias: string, target: string): void {
+  const entry = lstatSync(alias);
+  if (!entry.isSymbolicLink() || readlinkSync(alias) !== target) {
+    throw new Error(`fixture socket alias ${alias} does not name its owned target ${target}`);
+  }
+}
+
+/**
+ * The fixture's `NX_SOCKET_DIR`: a real `nx` leaf below a short parent alias
+ * to its own physical `.nx/sockets`. Every client and daemon stop for this
+ * workspace uses the same alias. A long private `TMPDIR` affects neither the
+ * bind path nor workspace ownership. Retire the alias only after its daemon
+ * exits, with {@link retireFixtureSocketDirectory}.
  */
 export function fixtureSocketDirectory(workspace: string): string {
-  const digest = createHash('sha256').update(workspace).digest('hex');
-  const namespace = socketNamespace();
-  const directory = join(namespace.directory, `nx-${digest.slice(0, 16)}`);
-  assertSocketPath(join(directory, NX_LONGEST_SOCKET_NAME), namespace);
-  return directory;
+  const { alias, target } = fixtureSocketPaths(workspace);
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  if (realpathSync(target) !== target) {
+    throw new Error(`fixture socket target ${target} escapes its physical workspace`);
+  }
+  try {
+    symlinkSync(target, alias, 'dir');
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error;
+  }
+  assertFixtureSocketAlias(alias, target);
+  return join(alias, 'nx');
+}
+
+/** A distinct real leaf for tests whose subject is multiple daemon socket directories. */
+export async function ownedWorkspaceSocketDirectory(
+  workspace: string,
+  prefix: string,
+  longestSocketName: string,
+): Promise<string> {
+  const { alias, namespace } = fixtureSocketPaths(workspace);
+  assertSocketPath(join(alias, `${prefix}XXXXXX`, longestSocketName), namespace);
+  fixtureSocketDirectory(workspace);
+  return mkdtemp(join(alias, prefix));
+}
+
+/** After the daemon exits, unlink only this workspace's verified parent alias, not its target. */
+export async function retireFixtureSocketDirectory(workspace: string): Promise<void> {
+  const { alias, target } = fixtureSocketPaths(workspace);
+  try {
+    assertFixtureSocketAlias(alias, target);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  await rm(alias);
 }
 
 /** The port block a Cowshed job's environment names, or why it names none a listener can use. */

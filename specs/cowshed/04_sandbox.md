@@ -759,6 +759,12 @@ admission rejects a symlink at the leaf, so the alias itself is not its socket d
 `XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its isolated plugin workers remain
 enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
 
+A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
+Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's
+own root. This reuses the runtime link pattern without a new socket grant; the final socket directory is not a symlink,
+and the foreign-workspace guard recognises the fixture by physical containment. Retirement stops its daemon before
+unlinking only its verified alias and removing its root.
+
 A sandboxed Nx keeps Nx's own daemon default: a caller's `NX_DAEMON` never reaches the child, so Nx decides from
 `nx.json` and its own CI and container checks, as it does in a host shell. A client connects only to the socket named by
 `d/server-process.json` in Nx's workspace-data directory, never to one derived from the socket directory, and a client

@@ -104,6 +104,13 @@ change installed host services or checkout source. The descriptor-inheritance pr
 agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
 exit path.
 
+Sandboxed TypeScript fixtures cannot allocate the host-controller's Rust-only `ScratchRoot` under world-shared
+`/private/tmp`. They use the same short-parent-link pattern in the job's already-admitted socket namespace: a short
+alias points to real socket leaves inside the fixture's own root, outside every checkout. The final socket directory is
+not a symlink. Workspace ownership is established by physical containment, so the foreign-workspace guard stays
+unchanged. The fixture stops its daemon before unlinking its verified alias and removing its root. Bind and connect are
+proved under the real sandbox's long store `TMPDIR`, not only a host runner's short temporary directory.
+
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
 and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the
 `/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication

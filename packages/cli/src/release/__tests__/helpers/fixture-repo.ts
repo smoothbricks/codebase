@@ -8,6 +8,7 @@ import {
   fixtureSocketDirectory,
   ownedFixtureRoot,
   processTable,
+  retireFixtureSocketDirectory,
   stopNxDaemon,
   terminate,
   withDescendants,
@@ -103,14 +104,14 @@ export async function withFixtureRepo(fn: (root: string) => Promise<void>): Prom
 
 /**
  * Stop every Nx process a fixture started, wait until each has exited, then
- * delete the socket directory of each workspace it ran in, and its root. The
+ * unlink the socket alias of each workspace it ran in, then delete its root. The
  * body's `finally` and the test's finish share one retirement. The `nx`
  * clients go first, with everything they spawned: a client killed while it
  * starts a daemon would otherwise leave that daemon running before it has
  * recorded itself. A process that outlives its stop fails the retirement and
  * keeps the root, so its working directory still names the fixture it came
- * from. Nx deletes its socket directory itself when the daemon stops, and a
- * daemonless workspace never makes one: `force` takes both.
+ * from. Nx deletes its socket directory itself when the daemon stops. Retiring a
+ * workspace unlinks only the alias that names that directory, never another alias.
  */
 function retireFixture(fixture: Fixture): Promise<void> {
   fixture.retirement ??= (async () => {
@@ -122,7 +123,7 @@ function retireFixture(fixture: Fixture): Promise<void> {
     await awaitExit(clients, `nx clients of fixture ${fixture.root}`);
     for (const nxRoot of fixture.nxRoots) {
       await stopFixtureNxDaemon(nxRoot);
-      await rm(fixtureSocketDirectory(nxRoot), { recursive: true, force: true });
+      await retireFixtureSocketDirectory(nxRoot);
     }
     await rm(fixture.root, { recursive: true, force: true });
   })();

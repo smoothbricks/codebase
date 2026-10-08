@@ -114,9 +114,9 @@ it("refuses nx run in one workspace under another workspace's environment, and l
 
         const started = await runNx(a, aEnv, ['daemon', '--start']);
         expect(started.code, started.stdout + started.stderr).toBe(0);
-        const listed = await runNx(a, aEnv, ['show', 'projects']);
+        const listed = await runNx(a, aEnv, ['show', 'projects', '--json']);
         expect(listed.code, listed.stdout + listed.stderr).toBe(0);
-        expect(listed.stdout.split('\n')).toContain('a-p');
+        expect(JSON.parse(listed.stdout)).toEqual(['a-p']);
         const [daemon] = await nxDaemonProcesses(a);
         if (daemon === undefined)
           throw new Error(`A's daemon left no running record\n${listed.stdout}${listed.stderr}`);
@@ -129,9 +129,9 @@ it("refuses nx run in one workspace under another workspace's environment, and l
         expect(stop.stderr).toContain(`direnv exec ${b} nx`);
 
         expect((await nxDaemonProcesses(a))[0]?.pid).toBe(daemon.pid);
-        const answered = await runNx(a, aEnv, ['show', 'projects']);
+        const answered = await runNx(a, aEnv, ['show', 'projects', '--json']);
         expect(answered.code, answered.stdout + answered.stderr).toBe(0);
-        expect(answered.stdout.split('\n')).toContain('a-p');
+        expect(JSON.parse(answered.stdout)).toEqual(['a-p']);
         expect((await nxDaemonProcesses(a))[0]?.pid).toBe(daemon.pid);
 
         await stopFixtureNxDaemon(a, aEnv);
