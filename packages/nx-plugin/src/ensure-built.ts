@@ -84,7 +84,6 @@ export type MissReason =
   | { readonly kind: 'not-cached'; readonly taskId: string }
   | { readonly kind: 'cached-failure'; readonly taskId: string; readonly code: number }
   | { readonly kind: 'stale-outputs'; readonly taskId: string }
-  | { readonly kind: 'stale-inputs'; readonly taskId: string }
   | { readonly kind: 'cache-disabled'; readonly taskId: string }
   | { readonly kind: 'no-daemon'; readonly taskId: string };
 
@@ -161,8 +160,6 @@ export function describeMiss(reason: MissReason): string {
       return `${reason.taskId} last failed with exit code ${reason.code}`;
     case 'stale-outputs':
       return `${reason.taskId} outputs are missing or modified on disk`;
-    case 'stale-inputs':
-      return `${reason.taskId} inputs changed since the Nx daemon last looked`;
     case 'cache-disabled':
       return `the Nx cache is disabled, so ${reason.taskId} must run`;
     case 'no-daemon':
@@ -465,19 +462,15 @@ export function withoutOuterTaskCacheBypass(env: Readonly<NodeJS.ProcessEnv>): N
 }
 
 /**
- * The miss known before anything is hashed: a cache bypass the environment
- * asks for, then an input the daemon has not seen change yet (see
- * `refreshWorkspaceContext`). `null` means only the probe can tell.
+ * A caller-requested cache bypass is the only miss known before hashing.
+ * Workspace changes first refresh the authoritative graph; the probe then
+ * decides whether these current inputs have matching artifacts.
  */
-export function missBeforeProbe(
-  env: Readonly<NodeJS.ProcessEnv>,
-  inputsChanged: boolean,
-  taskId: string,
-): MissReason | null {
+export function missBeforeProbe(env: Readonly<NodeJS.ProcessEnv>, taskId: string): MissReason | null {
   if (env.NX_SKIP_NX_CACHE === 'true' || env.NX_DISABLE_NX_CACHE === 'true') {
     return { kind: 'cache-disabled', taskId };
   }
-  return inputsChanged ? { kind: 'stale-inputs', taskId } : null;
+  return null;
 }
 
 async function ensureBuiltInWorkspace(
@@ -510,7 +503,7 @@ async function ensureBuiltInWorkspace(
   const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
   const hooks = requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
 
-  const nxJson = readNxJson();
+  let nxJson = readNxJson();
   // Reproduce `nx run <selector> --outputStyle=<style>` exactly. Task hashes
   // are derived from these arguments, so anything hand-rolled here instead of
   // routed through Nx's own argument normalization would key the cache
@@ -528,9 +521,9 @@ async function ensureBuiltInWorkspace(
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
   performance.mark('ensureBuilt:graph:start');
-  const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
+  let { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
   requireProject(projectGraph, selector.project);
-  const taskGraph = createTaskGraph(
+  let taskGraph = createTaskGraph(
     projectGraph,
     {},
     [selector.project],
@@ -539,10 +532,27 @@ async function ensureBuiltInWorkspace(
     overrides,
     false,
   );
-  const tasks = Object.values(taskGraph.tasks);
+  let tasks = Object.values(taskGraph.tasks);
   performance.measure('ensureBuilt:graph', 'ensureBuilt:graph:start');
 
-  const inputsChanged = await refreshWorkspaceContext(workspaceRoot, tasks, requireNx);
+  if (await refreshWorkspaceContext(workspaceRoot, tasks, requireNx)) {
+    // updateWorkspaceContext schedules recomputation. The graph RPC awaits
+    // that generation; hashing the graph obtained before the update would
+    // still describe the old sources. An unrelated edit is not a build miss.
+    ({ projectGraph } = await daemonClient.getProjectGraphAndSourceMaps());
+    nxJson = readNxJson();
+    requireProject(projectGraph, selector.project);
+    taskGraph = createTaskGraph(
+      projectGraph,
+      {},
+      [selector.project],
+      [selector.target],
+      selector.configuration,
+      overrides,
+      false,
+    );
+    tasks = Object.values(taskGraph.tasks);
+  }
 
   const runId = randomUUID();
   const startTime = Date.now();
@@ -559,7 +569,7 @@ async function ensureBuiltInWorkspace(
 
   performance.mark('ensureBuilt:probe:start');
   const reason =
-    missBeforeProbe(process.env, inputsChanged, taskId) ??
+    missBeforeProbe(process.env, taskId) ??
     (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx));
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   // The CLI runs the hooks around its own run, under its own id. This process
@@ -618,14 +628,10 @@ function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire)
  * Take Nx's native, ignore-aware disk snapshot and compare it with the
  * daemon's file table; its metadata cache reuses unchanged file hashes.
  *
- * Any difference is handed to the daemon so its next graph is current, but
- * that only schedules a recomputation, and a probe meanwhile would hash
- * against the file map it already has. So the caller does not probe: if any
- * differing path is not a declared output of a task in the graph, this
- * returns true and the target is run, which lets Nx's own runner wait for the
- * recomputation. Output paths are exempt because a build's own writes are the
- * commonest thing to reach here before the watcher does, and treating them as
- * a miss would make every hit after a build replay the cached log.
+ * Any difference is handed to the daemon. If a differing path is not a
+ * declared output, the caller awaits its recomputed graph before probing the
+ * cache. Output paths need no graph refresh: their live bytes are hashed by
+ * the probe, and a build's own writes must not force a cached-log replay.
  */
 async function refreshWorkspaceContext(
   workspaceRoot: string,

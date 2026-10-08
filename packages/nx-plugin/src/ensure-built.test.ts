@@ -345,19 +345,19 @@ describe('missBeforeProbe', () => {
     };
     const nested = withoutOuterTaskCacheBypass(outer);
     expect(nested).toEqual({ NX_TASK_TARGET_PROJECT: 'nx-plugin', NX_TASK_TARGET_TARGET: 'test' });
-    expect(missBeforeProbe(nested, false, 'app:build')).toBeNull();
+    expect(missBeforeProbe(nested, 'app:build')).toBeNull();
   });
 
   it('honors a cache bypass the caller asked for outside an Nx task child', () => {
     for (const env of [{ NX_SKIP_NX_CACHE: 'true' }, { NX_DISABLE_NX_CACHE: 'true' }]) {
       const caller = withoutOuterTaskCacheBypass(env);
       expect(caller).toEqual(env);
-      expect(missBeforeProbe(caller, false, 'app:build')).toEqual({ kind: 'cache-disabled', taskId: 'app:build' });
+      expect(missBeforeProbe(caller, 'app:build')).toEqual({ kind: 'cache-disabled', taskId: 'app:build' });
     }
   });
 
-  it('runs the target when an input changed that the daemon has not seen yet', () => {
-    expect(missBeforeProbe({}, true, 'app:build')).toEqual({ kind: 'stale-inputs', taskId: 'app:build' });
+  it('leaves current input and artifact evaluation to the probe', () => {
+    expect(missBeforeProbe({}, 'app:build')).toBeNull();
   });
 });
 
@@ -369,7 +369,6 @@ describe('describeMiss', () => {
       describeMiss({ kind: 'not-cached', taskId: 'app:build' }),
       describeMiss({ kind: 'cached-failure', taskId: 'app:build', code: 7 }),
       describeMiss({ kind: 'stale-outputs', taskId: 'app:build' }),
-      describeMiss({ kind: 'stale-inputs', taskId: 'app:build' }),
       describeMiss({ kind: 'cache-disabled', taskId: 'app:build' }),
       describeMiss({ kind: 'no-daemon', taskId: 'app:build' }),
     ];
@@ -694,7 +693,7 @@ describe('smoo-nx-exec with a fresh daemon', () => {
   // vouched for by comparing the working tree with Nx's cache artifact. The
   // daemon it starts is also the one whose socket is in question, so the same
   // lifetime answers where a root entered from another workspace's shell binds.
-  it("replays outputs a fresh daemon holds no record of, on the root's own socket, running nothing", async () => {
+  it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
     // Under /tmp, not the platform temp directory: a socket path has a 95
     // character budget and macOS's temp directory spends half of it.
     const socketDir = await mkdtemp(join('/tmp', 'eb-sock-'));
@@ -750,6 +749,54 @@ describe('smoo-nx-exec with a fresh daemon', () => {
           });
           expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          // Coordinate a real write after the real daemon returned its file
+          // table. The response is not substituted: this makes the
+          // graph→snapshot race deterministic without relying on FSEvents.
+          const raceEntry = join(root, 'freshness-race.ts');
+          await writeFile(
+            raceEntry,
+            `
+import { createRequire } from 'node:module';
+import { writeFile } from 'node:fs/promises';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'src', 'ensure-built.ts'))};
+const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
+const readFiles = daemonClient.getWorkspaceContextFileData.bind(daemonClient);
+daemonClient.getWorkspaceContextFileData = async () => {
+  const files = await readFiles();
+  await writeFile(process.argv[2], process.argv[3]);
+  return files;
+};
+console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process.cwd() })));
+`,
+          );
+          const refreshed = await run(
+            'bun',
+            raceEntry,
+            workspace,
+            [join(workspace, 'README.md'), 'an unrelated edit\n'],
+            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace },
+          );
+          expect(refreshed.code, refreshed.stdout + refreshed.stderr).toBe(0);
+          expect(refreshed.stdout.trim()).toBe(JSON.stringify({ disposition: 'hit' }));
+          expect(refreshed.stderr).toBe('');
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          // STRICT-BY: the same boundary moving an actual declared input must
+          // miss, run its producer, and rebuild the dependent artifact.
+          const changed = await run(
+            'bun',
+            raceEntry,
+            workspace,
+            [join(workspace, 'packages', 'lib', 'source.txt'), 'changed\n'],
+            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace },
+          );
+          expect(changed.code, changed.stdout + changed.stderr).toBe(0);
+          expect(changed.stdout).toContain('"disposition":"built"');
+          expect(await readFile(builds, 'utf-8')).toBe('lib\nchanged\n');
+          expect(await readFile(join(workspace, 'packages', 'app', 'dist', 'marker.txt'), 'utf-8')).toBe(
+            'built\nchanged\n',
+          );
         },
         'workspace',
       );

@@ -502,15 +502,17 @@ the tasks it aggregates answer in its place, and any outputs it declares are ver
 uncacheable task is a miss on every call, because only running it can say whether its side effects are current.
 
 The probe and runner use the workspace's installed Nx and its normal cache configuration. A build performed by the Nx
-CLI can satisfy the next wrapper invocation without re-executing tasks; changed inputs still go through Nx's runner.
+CLI can satisfy the next wrapper invocation without re-executing tasks; uncached current inputs go through Nx's runner.
 Both invocations must use the same cache location. Relative `NX_CACHE_DIRECTORY` and `NX_WORKSPACE_DATA_DIRECTORY`
 values resolve against the Nx workspace root, so they remain checkout-local when inherited by another shell. Absolute
 paths remain caller-controlled, including deliberately shared CI locations; an absolute path inherited from another
 checkout does not become local merely because the working directory changed.
 
-Before hashing, it compares a native snapshot of the workspace with the daemon's file table. A write the daemon's
-watcher has not delivered yet counts as a miss unless every changed path is a declared output of a task in the graph, so
-a build's own artifacts never turn the next call noisy, and an edit made moments before the call never hits stale.
+Before hashing, it compares a native snapshot of the workspace with the daemon's file table. A write the watcher has not
+delivered is sent to the daemon, then its authoritative graph is awaited and the task graph rebuilt before hashing. Only
+the current keys and matching artifacts decide whether anything runs: an unrelated edit does not turn a warm invocation
+into a cached-log replay, and an actual input edit cannot hit an old source snapshot. Declared output writes are hashed
+directly, without requiring a graph refresh.
 
 The daemon's output records are lossy: they are held in memory, tracked per collapsed directory, and erased by writes it
 processes more than two seconds late — including, on a busy daemon, a restore's own writes. When it cannot vouch for a
