@@ -37,11 +37,14 @@ describe('Bun bootstrap imports', () => {
       'if (typeof bounded.applyBoundedTestTargetPolicy !== "function" || typeof targets.applyPackageTargetPolicy !== "function") throw new Error("the compiled caller closure is incomplete");',
       'if (!eslint.isEslintFileSet({command:"eslint src/fixture.ts",files:["src/fixture.ts"]}) || eslint.isEslintFileSet({command:42,files:[]})) throw new Error("the compiled ESLint file-set owner did not validate");',
     ].join('\n');
-    const child = spawnSync(process.execPath, ['--config=/dev/null', '--no-env-file', '--no-install', '-e', script], {
-      cwd: join(import.meta.dir, '../../cli'),
-      encoding: 'utf8',
-    });
-    expect(child.status, child.stdout + child.stderr).toBe(0);
+    for (const conditions of [[], ['--conditions=development']]) {
+      const child = spawnSync(
+        process.execPath,
+        ['--config=/dev/null', '--no-env-file', '--no-install', ...conditions, '-e', script],
+        { cwd: join(import.meta.dir, '../../cli'), encoding: 'utf8' },
+      );
+      expect(child.status, child.stdout + child.stderr).toBe(0);
+    }
   });
 
   it('imports bounded-test-policy', async () => {
