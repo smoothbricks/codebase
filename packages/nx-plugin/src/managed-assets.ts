@@ -29,3 +29,18 @@ export interface PackageDependencyClosure {
     readonly direct: boolean;
   }[];
 }
+
+/**
+ * Cached product description; only setup activation publishes its immutable installed generation.
+ * The public installed layout is `<product directory>/node_modules/<closure.packageName>`;
+ * its alias selects `generations/<identity>/node_modules/<closure.packageName>`.
+ * Static typed consumers use that installed namespace, never the producer's cached staging files.
+ */
+export interface PortablePackageProduct {
+  readonly version: 1;
+  /** Existing tar release identity, plus the declared producer's existing Nx task hash when present. */
+  readonly identity: string;
+  readonly asset: string;
+  readonly integrity: string;
+  readonly closure: PackageDependencyClosure;
+}

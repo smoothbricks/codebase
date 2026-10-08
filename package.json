@@ -85,6 +85,7 @@
         "cache": true,
         "inputs": [
           "{workspaceRoot}/tooling/patched-nx.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/managed-assets.ts",
           "{workspaceRoot}/patches/nx@23.2.1.patch",
           "{workspaceRoot}/bunfig.toml",
           {
@@ -103,15 +104,7 @@
         "outputs": [
           "{workspaceRoot}/.cache/patched-nx/nx-23.2.1.tgz",
           "{workspaceRoot}/.cache/patched-nx/release-notes.md",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/dist",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/schemas",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/package.json",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/dependency-closure.json",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/executors.json",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/generators.json",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/migrations.json",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/LICENSE",
-          "{workspaceRoot}/.cache/patched-nx/node_modules/nx/README.md"
+          "{workspaceRoot}/.cache/patched-nx/product.json"
         ],
         "options": {
           "command": "bun tooling/patched-nx.ts build .cache/patched-nx",
@@ -126,7 +119,7 @@
           "patched-nx"
         ],
         "options": {
-          "command": "bun tooling/direnv/setup-environment.ts --links --package-root .cache/patched-nx/node_modules/nx",
+          "command": "bun tooling/direnv/setup-environment.ts --links --package-product .cache/patched-nx",
           "cwd": "{workspaceRoot}"
         }
       },

@@ -15,21 +15,21 @@
  * here (sorted regular files, fixed owner, mode and mtime) and gzip-framed here (no timestamp, OS
  * "unknown"), so nothing of the build host leaks into the bytes.
  *
- *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset>, node_modules/nx, and release-notes.md;
- *                                                print the release as JSON
+ *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset>, product.json, and release-notes.md;
+ *                                                activation alone publishes the installed generation
  *   bun tooling/patched-nx.ts verify <asset>     refuse unless the asset unpacks to the tar built now;
  *                                                print the release with the asset's own integrity
  *   bun tooling/patched-nx.ts lock <integrity>   refuse unless bun.lock resolves nx to this release's URL
  *                                                with exactly this integrity
  */
 
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { $ } from 'bun';
 import { readModulePackageJson } from 'nx/src/utils/package-json.js';
-import type { PackageDependencyClosure } from '../packages/nx-plugin/src/managed-assets.js';
+import type { PackageDependencyClosure, PortablePackageProduct } from '../packages/nx-plugin/src/managed-assets.js';
 
 const NX_VERSION = '23.2.1';
 /** The registry's own integrity for the tarball the patch applies to (`npm view nx@23.2.1 dist.integrity`). */
@@ -104,6 +104,10 @@ async function installedDependencyClosure(): Promise<PackageDependencyClosure> {
   const storeRoot = await realpath(cache);
   const installedNx = readModulePackageJson('nx', [join(root, 'node_modules', '.bun')]);
   const installedNxRoot = dirname(installedNx.path);
+  const portableStorePath = (candidate: string): string => {
+    const local = relative(storeRoot, candidate);
+    return sep === '/' ? local : local.replaceAll(sep, '/');
+  };
   const dependencies = new Map<string, PackageDependency>();
   const direct = new Map<string, PackageDependency>();
   const bindingPath = async (name: string, scope: string, canonicalPath: string): Promise<string> => {
@@ -112,7 +116,7 @@ async function installedDependencyClosure(): Promise<PackageDependencyClosure> {
       try {
         if ((await realpath(candidate)) === canonicalPath) {
           const withinStore = relative(storeRoot, candidate);
-          if (withinStore === '..' || withinStore.startsWith('../') || isAbsolute(withinStore)) {
+          if (withinStore === '..' || withinStore.startsWith(`..${sep}`) || isAbsolute(withinStore)) {
             throw new Error(`Nx dependency binding ${name} leaves the immutable Bun store: ${candidate}`);
           }
           return candidate;
@@ -135,7 +139,7 @@ async function installedDependencyClosure(): Promise<PackageDependencyClosure> {
     }
     const canonicalPath = await realpath(dirname(installed.path));
     const withinStore = relative(storeRoot, canonicalPath);
-    if (withinStore === '..' || withinStore.startsWith('../') || isAbsolute(withinStore)) {
+    if (withinStore === '..' || withinStore.startsWith(`..${sep}`) || isAbsolute(withinStore)) {
       throw new Error(`Nx dependency ${name} is not an immutable installed Bun-store package: ${canonicalPath}`);
     }
     if (installed.packageJson.name !== name || !installed.packageJson.version) {
@@ -190,8 +194,8 @@ async function installedDependencyClosure(): Promise<PackageDependencyClosure> {
       .map((dependency) => ({
         name: dependency.name,
         version: dependency.version,
-        storePath: relative(storeRoot, dependency.canonicalPath),
-        bindingPaths: dependency.readPaths.map((binding) => relative(storeRoot, binding)),
+        storePath: portableStorePath(dependency.canonicalPath),
+        bindingPaths: dependency.readPaths.map(portableStorePath),
         direct: direct.get(dependency.name) === dependency,
       })),
   };
@@ -367,13 +371,18 @@ async function main([command, argument]: string[]): Promise<void> {
     await mkdir(argument, { recursive: true });
     await writeFile(join(argument, built.asset), asset);
     await writeFile(join(argument, 'release-notes.md'), notes(built));
-    const packageRoot = join(argument, 'node_modules', 'nx');
-    await rm(packageRoot, { recursive: true, force: true });
-    await rm(join(argument, 'package'), { recursive: true, force: true });
-    await $`tar -xzf ${join(argument, built.asset)} -C ${argument}`.quiet();
-    await mkdir(dirname(packageRoot), { recursive: true });
-    await rename(join(argument, 'package'), packageRoot);
-    await writeFile(join(packageRoot, 'dependency-closure.json'), JSON.stringify(await installedDependencyClosure()));
+    const taskHash = process.env.NX_TASK_HASH;
+    if (taskHash !== undefined && !/^[a-zA-Z0-9_-]+$/.test(taskHash)) {
+      throw new Error('declared product task identity is not a safe generation component');
+    }
+    const product: PortablePackageProduct = {
+      version: 1,
+      identity: taskHash === undefined ? built.tag : `${built.tag}/${taskHash}`,
+      asset: built.asset,
+      integrity: built.integrity,
+      closure: await installedDependencyClosure(),
+    };
+    await writeFile(join(argument, 'product.json'), JSON.stringify(product));
     console.log(JSON.stringify(built));
     return;
   }

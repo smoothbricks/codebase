@@ -205,7 +205,8 @@
       "typecheck-tests": {
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx"
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings"
         ],
         "inputs": [
           "...",

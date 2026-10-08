@@ -27,16 +27,22 @@ main-checkout anchor. This is the shared developer-link rule, not an Nx-only san
 The product is installed under its own `node_modules/nx` namespace, which the real CLI's local/self resolver consumes;
 no checkout-ancestor lookup or external alias stands in for that package layout.
 
-The cached product contains only portable tar/payload files and `dependency-closure.json`: declared names, versions,
-content-addressed Bun-store-relative identities, platform leaves and transitive binding identities. No absolute host or
-checkout path enters its cache key or cached output. The explicit `patched-nx-bindings` dependency uses the existing
-setup/developer-links activation owner to materialize package-name links on the current host once; its output is not
-cached. A stale foreign binding is checked and rebound by that owner, never hidden by a consumer repair. Sandbox
-hotlaunch consumers resolve the retained relative identities against the admitted current Bun store and verify the
-actual package names and versions. The provider checkout's general hoist directory is never borrowed. Because grants
-canonicalize symlinks, transitive reads admit the containing immutable package-private dependency namespace only after
-every reachable payload in it is proven to belong to the declared closure. Direct product links need no installed
-ancestor namespace. No ancestor store, home or provider hoist is granted.
+The cached product contains only the canonical tar, release notes and `product.json`: the existing release identity, the
+declared producer's existing Nx task hash, asset integrity and portable dependency closure. No installed generation or
+host-bound symlink is a cached output. The explicit `patched-nx-bindings` dependency uses the existing setup owner
+(`--links --package-product .cache/patched-nx`) to verify the asset and publish a completed immutable
+`generations/<identity>/node_modules/nx` tree before switching the stable `node_modules/nx` alias. Equal identities are
+no-op publications; collisions refuse, and previous generations are retained for live CLI and daemon owners. Producer
+execution and cache restoration therefore cannot remove package files from beneath those processes. Neither a second
+hasher nor a registry names generations.
+
+Host-local package-name bindings are materialized before activation; stale foreign bindings fail `--check` and are
+rebound by the activation owner, never by a consumer repair. Sandbox hotlaunch consumers resolve the retained relative
+identities against the admitted current Bun store and verify the actual package names and versions. The provider
+checkout's general hoist directory is never borrowed. Because grants canonicalize symlinks, transitive reads admit the
+containing immutable package-private dependency namespace only after every reachable payload in it is proven to belong
+to the declared closure. Direct product links need no installed ancestor namespace. No ancestor store, home or provider
+hoist is granted.
 
 ## Canonical daemon workspace roots
 

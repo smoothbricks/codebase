@@ -743,6 +743,13 @@ declaration selects the product in the current checkout and refuses physical sym
 existing ancestor of a not-yet-built product. Genuine sibling declarations retain their main-checkout anchor. Neither
 rule grants the main checkout or an ancestor dependency store to a cowshed sandbox.
 
+Cached product output and the installed executable generation are distinct. The declared producer writes the portable
+asset and description only; the existing activation owner verifies and fully publishes an immutable installed
+generation, named by existing release/task content identities, before switching its stable installed-package alias.
+Producer execution and cache restoration never overwrite an installed generation. Same-byte publication is a no-op;
+prior generations remain available to their live CLI and daemon owners. No second hash, registry, caller retry or
+version-guard suppression substitutes for this lifetime boundary.
+
 ### The adoption needs the target's Nx database closed
 
 A process that opened the target's task database before a swap keeps that file open but resolves cache paths through the
