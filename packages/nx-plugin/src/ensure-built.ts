@@ -1,11 +1,20 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { inspect } from 'node:util';
-
 import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
@@ -26,6 +35,7 @@ import type * as NxCommandLineUtils from 'nx/src/utils/command-line-utils';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
 import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
 import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
+import { managedAssetsRoot } from './managed-assets.js';
 
 interface NxRuntimeModules {
   readonly 'nx/src/config/nx-json': typeof NxConfiguration;
@@ -87,6 +97,26 @@ export type MissReason =
   | { readonly kind: 'cache-disabled'; readonly taskId: string }
   | { readonly kind: 'no-daemon'; readonly taskId: string };
 
+/** The provider's socket owner refused before any task or daemon client was started. */
+export interface WorkspaceSocketFailure {
+  readonly kind: 'workspace-socket';
+  readonly taskId: string;
+  readonly workspaceRoot: string;
+  readonly detail: string;
+}
+
+export interface EnsureBuiltFailure {
+  readonly disposition: 'failed';
+  readonly reason: MissReason | WorkspaceSocketFailure;
+  readonly exitCode: number;
+  readonly signal: NodeJS.Signals | null;
+}
+
+/** A precise socket-owner refusal; its task has not run. */
+export interface WorkspaceSocketRefusal extends EnsureBuiltFailure {
+  readonly reason: WorkspaceSocketFailure;
+}
+
 /**
  * `hit` means nothing ran: every task in the graph was a recorded success and
  * every recorded output is still byte-identical on disk, so the artifacts are
@@ -98,19 +128,14 @@ export type MissReason =
  * order to decide whether to stay quiet. A run writes only to stderr: stdout
  * belongs to whatever the caller goes on to run.
  *
- * `failed` is an operational outcome, not an exception: the target ran and did
- * not succeed. A caller re-raises `signal` when there is one and exits with
- * `exitCode` otherwise, so a Ctrl-C during a build stays a Ctrl-C.
+ * `failed` is an operational outcome, not an exception: the provider's socket
+ * binding or the target did not succeed. A caller re-raises `signal` when there
+ * is one and exits with `exitCode` otherwise, so a Ctrl-C stays a Ctrl-C.
  */
 export type EnsureBuiltResult =
   | { readonly disposition: 'hit' }
   | { readonly disposition: 'built'; readonly reason: MissReason }
-  | {
-      readonly disposition: 'failed';
-      readonly reason: MissReason;
-      readonly exitCode: number;
-      readonly signal: NodeJS.Signals | null;
-    };
+  | EnsureBuiltFailure;
 
 export interface EnsureBuiltOptions {
   /** `project:target` or `project:target:configuration`. */
@@ -326,7 +351,18 @@ export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBu
     // which keys against `process.cwd()` — has to see the same directory or the
     // probe keys differently from the CLI and never hits.
     process.chdir(workspaceRoot);
-    assignEnvironment(process.env, workspaceEnvironment(callerEnv, workspaceRoot, callerOwnsRoot));
+    const environment = workspaceEnvironment(callerEnv, workspaceRoot, callerOwnsRoot);
+    if (!callerOwnsRoot) {
+      const binding = bindWorkspaceSocketDirectory(workspaceRoot, selectorTaskId(selector), environment);
+      if (binding !== undefined) {
+        if (typeof binding !== 'string') {
+          process.stderr.write(`ensureBuilt: ${binding.reason.workspaceRoot}: ${binding.reason.detail}\n`);
+          return binding;
+        }
+        environment.NX_SOCKET_DIR = binding;
+      }
+    }
+    assignEnvironment(process.env, environment);
     return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream');
   } finally {
     // Nx configures itself through the environment and this function runs
@@ -355,6 +391,97 @@ const WORKSPACE_STATE_ENV_KEYS = [
   'NX_WORKSPACE_DATA_DIRECTORY',
   'NX_CACHE_DIRECTORY',
 ] as const;
+
+/** A socket binding refusal is the existing failed outcome, including the owner's real exit. */
+function workspaceSocketRefusal(
+  workspaceRoot: string,
+  taskId: string,
+  detail: string,
+  exitCode: number,
+  signal: NodeJS.Signals | null,
+): WorkspaceSocketRefusal {
+  return {
+    disposition: 'failed',
+    reason: { kind: 'workspace-socket', taskId, workspaceRoot, detail },
+    exitCode,
+    signal,
+  };
+}
+
+/**
+ * A foreign-root call inside a managed shell asks the same packaged socket
+ * owner that shell uses. The owner reads the provider's binding or derives a
+ * namespace from its canonical checkout spelling under DEVENV_RUNTIME.
+ * Outside a managed shell Nx keeps its normal defaults. No caller socket is reused.
+ */
+function bindWorkspaceSocketDirectory(
+  workspaceRoot: string,
+  taskId: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): string | WorkspaceSocketRefusal | undefined {
+  const runtime = environment.DEVENV_RUNTIME;
+  if (runtime === undefined || runtime === '') return undefined;
+  if (!isAbsolute(runtime))
+    return workspaceSocketRefusal(
+      workspaceRoot,
+      taskId,
+      'DEVENV_RUNTIME must name the managed shell runtime directory',
+      1,
+      null,
+    );
+  const script = join(managedAssetsRoot, 'raw/tooling/direnv/nx-socket-dir.sh');
+  const result = spawnSync('/bin/sh', ['-c', '. "$1" && printf %s "$NX_SOCKET_DIR"', 'sh', script], {
+    cwd: workspaceRoot,
+    env: { ...environment, PWD: workspaceRoot },
+    encoding: 'utf8',
+  });
+  if (result.error !== undefined)
+    return workspaceSocketRefusal(
+      workspaceRoot,
+      taskId,
+      `socket owner could not start: ${result.error.message}; stdout: ${result.stdout}; stderr: ${result.stderr}`,
+      1,
+      null,
+    );
+  if (result.status !== 0) {
+    return workspaceSocketRefusal(
+      workspaceRoot,
+      taskId,
+      `socket owner ended ${result.signal === null ? `with exit ${result.status}` : `by ${result.signal}`}: ${result.stderr}; stdout: ${result.stdout}`,
+      result.status ?? 1,
+      result.signal,
+    );
+  }
+  const directory = result.stdout;
+  if (directory === '' || !isAbsolute(directory))
+    return workspaceSocketRefusal(
+      workspaceRoot,
+      taskId,
+      `socket owner returned no absolute directory: ${directory}; stderr: ${result.stderr}`,
+      1,
+      null,
+    );
+  try {
+    if (!statSync(directory).isDirectory())
+      return workspaceSocketRefusal(
+        workspaceRoot,
+        taskId,
+        `socket owner returned a non-directory: ${directory}; stderr: ${result.stderr}`,
+        1,
+        null,
+      );
+  } catch (error) {
+    return workspaceSocketRefusal(
+      workspaceRoot,
+      taskId,
+      `socket owner returned an unavailable directory ${directory}: ${error instanceof Error ? error.message : String(error)}; stderr: ${result.stderr}`,
+      1,
+      null,
+    );
+  }
+  if (result.stderr !== '') process.stderr.write(result.stderr);
+  return directory;
+}
 
 /**
  * The nearest directory at or above `from` holding an `nx.json`, or null.

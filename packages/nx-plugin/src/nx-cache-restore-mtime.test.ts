@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { bindListener } from './testing.js';
 
 /**
  * Guards the restore-time hunk of `patches/nx@23.2.1.patch`. Nx 23.2.1
@@ -132,20 +133,24 @@ it('restores a remotely cached output newer than the output it replaces', async 
   // The self-hosted remote cache protocol Nx's native HTTP cache speaks: GET and PUT of an
   // artifact tarball at /v1/cache/<hash>.
   const artifacts = new Map<string, ArrayBuffer>();
-  using server = Bun.serve({
-    hostname: '127.0.0.1',
-    port: 0,
-    async fetch(request) {
-      const hash = new URL(request.url).pathname.match(/^\/v1\/cache\/([^/]+)$/)?.[1];
-      if (hash === undefined) return new Response(null, { status: 404 });
-      if (request.method === 'PUT') {
-        artifacts.set(hash, await request.arrayBuffer());
-        return new Response(null, { status: 200 });
-      }
-      const artifact = artifacts.get(hash);
-      return artifact === undefined ? new Response(null, { status: 404 }) : new Response(artifact);
-    },
-  });
+  // Nx's HTTP cache client, a process of its own, connects to this server: in a sandbox it can only reach a
+  // port of the workspace's block, so the server binds one there (a port-0 server binds, but nothing can connect).
+  using server = await bindListener((port) =>
+    Bun.serve({
+      hostname: '127.0.0.1',
+      port,
+      async fetch(request) {
+        const hash = new URL(request.url).pathname.match(/^\/v1\/cache\/([^/]+)$/)?.[1];
+        if (hash === undefined) return new Response(null, { status: 404 });
+        if (request.method === 'PUT') {
+          artifacts.set(hash, await request.arrayBuffer());
+          return new Response(null, { status: 200 });
+        }
+        const artifact = artifacts.get(hash);
+        return artifact === undefined ? new Response(null, { status: 404 }) : new Response(artifact);
+      },
+    }),
+  );
   await withNxFixture('nx-restore-mtime-remote-', async ({ workspace }) => {
     const env = { ...fixtureNxEnv(workspace), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin };
     const run = await restoreFixture(workspace, env);

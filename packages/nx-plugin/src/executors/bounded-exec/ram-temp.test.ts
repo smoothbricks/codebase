@@ -16,7 +16,7 @@ import { writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { pidsWorkingIn, processTable, terminate } from '../../testing.js';
+import { ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   createHostCommands,
   type HostCommands,
@@ -280,8 +280,9 @@ describe('RAM temp volume on this host', () => {
   it('asks a gateway that predates disk leases once, not before every disk command', async () => {
     // Such a gateway answers only after 2 s of silence; asking it before each of a volume's
     // dozen hdiutil and diskutil calls once pushed a test shard past its 120 s bound.
-    const socket = `/tmp/smoo-rt-${process.pid}.sock`;
-    rmSync(socket, { force: true });
+    // A directory of its own in the socket namespace the sandbox admits, not a literal /tmp path.
+    const directory = await ownedSocketDirectory('rt-', 'gw.sock');
+    const socket = join(directory, 'gw.sock');
     let asked = 0;
     const server = createServer({ allowHalfOpen: true }, (client) => {
       asked += 1;
@@ -290,10 +291,12 @@ describe('RAM temp volume on this host', () => {
         client.end('{"ok":false,"code":"invalid-request","error":"unknown gateway control operation"}\n'),
       );
     });
-    const { promise: listening, resolve: listened } = Promise.withResolvers<void>();
-    server.listen(socket, listened);
-    await listening;
     try {
+      const { promise: listening, resolve: listened, reject: failed } = Promise.withResolvers<void>();
+      server.once('error', failed);
+      server.listen(socket, listened);
+      await listening;
+      server.off('error', failed);
       const host = createHostCommands(10_000, socket);
       // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
@@ -301,7 +304,7 @@ describe('RAM temp volume on this host', () => {
       expect(asked).toBe(1);
     } finally {
       server.close();
-      rmSync(socket, { force: true });
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

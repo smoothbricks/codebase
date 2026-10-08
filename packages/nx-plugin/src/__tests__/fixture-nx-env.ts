@@ -1,8 +1,9 @@
 import { onTestFinished } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ownedFixtureRoot, stopNxDaemon } from '../testing.js';
+import { fixtureSocketDirectory, ownedFixtureRoot, stopNxDaemon } from '../testing.js';
 import { guardEvent } from './counted-cargo.js';
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
@@ -26,6 +27,14 @@ const repositoryRoot = join(import.meta.dir, '../../../..');
  * FORCE_COLOR, which an outer Nx also exports, is kept set, next to the
  * NO_COLOR a shell may export. The fixture's runtime inputs inherit both, and
  * must hash the same under them.
+ *
+ * NX_SOCKET_DIR is the fixture's own {@link fixtureSocketDirectory}, never the
+ * inherited one, which a Cowshed job shares with every other Nx of its
+ * checkout. Nx's default socket root is the literal `/tmp/.nx`, which a
+ * sandbox does not admit, and it hashes the daemon's pid into the name, so two
+ * daemons of one workspace bind two paths. With the directory named, they bind
+ * one: a test whose subject is two daemons on two socket paths names a second
+ * directory for the second.
  */
 export function fixtureNxEnv(workspace: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -40,18 +49,19 @@ export function fixtureNxEnv(workspace: string): Record<string, string> {
     NX_USE_LOCAL: 'true',
     NX_WORKSPACE_ROOT_PATH: workspace,
     NX_ISOLATE_PLUGINS: 'false',
+    NX_SOCKET_DIR: fixtureSocketDirectory(workspace),
     NX_WORKSPACE_DATA_DIRECTORY: join(workspace, '.nx/workspace-data'),
     NX_CACHE_DIRECTORY: join(workspace, '.nx/cache'),
   };
 }
 
 /**
- * A fixture root of this package's suite, owned by this test process: the
- * next run's first fixture reclaims it, and whatever still works in it, if
- * this process is killed before the root is retired.
+ * A fixture root of this package's suite in the temp directory, owned by this
+ * test process: the next run's first fixture reclaims it, and whatever still
+ * works in it, if this process is killed before the root is retired.
  */
 export function nxFixtureRoot(prefix: string): Promise<string> {
-  return ownedFixtureRoot('nx-plugin', prefix);
+  return ownedFixtureRoot(tmpdir(), 'nx-plugin', prefix);
 }
 
 /** A fixture root and the Nx workspace in it whose daemon the fixture owns. */
@@ -95,12 +105,15 @@ export async function withNxFixture<T>(
 }
 
 /**
- * Stop the fixture workspace's daemon, then delete the root. A daemon that
- * outlives its stop fails the retirement and keeps the root, so its working
- * directory still names a fixture the next run reclaims.
+ * Stop the fixture workspace's daemon, then delete the socket directory and
+ * the root. A daemon that outlives its stop fails the retirement and keeps
+ * both, so its working directory still names a fixture the next run reclaims.
+ * Nx deletes its socket directory itself when the daemon stops, and a
+ * daemonless fixture never makes one: `force` takes both.
  */
 async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
   await stopFixtureNxDaemon(workspace);
+  await rm(fixtureSocketDirectory(workspace), { recursive: true, force: true });
   await rm(root, { recursive: true, force: true });
 }
 

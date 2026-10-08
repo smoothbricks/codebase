@@ -1,10 +1,11 @@
 import { expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { nxDaemonProcesses } from './testing.js';
+import { NX_LONGEST_SOCKET_NAME, nxDaemonProcesses, ownedFixtureRoot, ownedSocketDirectory } from './testing.js';
 
 /**
  * Guards the foreign-environment hunk of `patches/nx@23.2.1.patch`. A shell set up for one workspace keeps its
@@ -91,8 +92,9 @@ async function writeWorkspace(root: string, name: string): Promise<void> {
 
 it("refuses nx run in one workspace under another workspace's environment, and leaves that daemon running", async () => {
   // A socket path has a ~104 byte budget and the fixture root spends most of it, so A's socket directory, which
-  // lies in A, is reached through a short link under /tmp, as a managed shell's runtime link reaches its checkout's.
-  const link = await mkdtemp(join('/tmp', 'nx-fe-'));
+  // lies in A, is reached through a short link made in the socket namespace the sandbox admits, as a managed
+  // shell's runtime link reaches its checkout's.
+  const link = await ownedSocketDirectory('nx-fe-', join('a', 'nx', NX_LONGEST_SOCKET_NAME));
   try {
     await withNxFixture(
       'nx-foreign-env-',
@@ -164,14 +166,17 @@ function nodeProgram(): string {
 
 /**
  * A scratch directory and a second path to it: the same directory by device and inode, whose canonical path is its own
- * and that no symlink resolution joins to `directory`.
+ * and that no symlink resolution joins to `directory`. The directory is a root of the fixture owner
+ * (`ownedFixtureRoot`), so a test killed before its `finally` leaves it in a `run-<pid>` named for its process, which
+ * the next process's first root under the same parent reclaims; it is not a bare prefix among whatever else the
+ * parent holds.
  *
- * - macOS names every directory of its data volume a second time under `/System/Volumes/Data` (a firmlink), with no
- *   privilege. `/tmp` resolves to `/private/tmp`, which is on the data volume; the temp directory may be another
- *   volume's mount, where the second name resolves back to the first, so the scratch lies under `/tmp`.
- * - Linux has none until something binds one. The program then runs under `launch`, in a mount namespace of its own
- *   where `mount --bind` puts `alias` beside `directory`: nothing outlives it and no mount of the host changes (see
- *   `bindingLaunch`).
+ * - macOS's admitted Bun install cache is on the data volume, which names each directory a second time under
+ *   `/System/Volumes/Data` (a firmlink). The cache is the parent, which keeps that real alias without borrowing
+ *   ungranted `/tmp` or a workspace image whose mount resolves the second name back to the first.
+ * - Linux has none until something binds one. The temp directory is the parent. The program then runs under `launch`,
+ *   in a mount namespace of its own where `mount --bind` puts `alias` beside `directory`: nothing outlives it and no
+ *   mount of the host changes (see `bindingLaunch`).
  * Another platform has no second path to make, and fails.
  */
 interface AliasedScratch {
@@ -182,7 +187,14 @@ interface AliasedScratch {
 }
 
 async function withAliasedScratch<T>(body: (scratch: AliasedScratch) => Promise<T>): Promise<T> {
-  const directory = await realpath(await mkdtemp(join('/tmp', 'nx-fe-alias-')));
+  let parent = tmpdir();
+  if (process.platform === 'darwin') {
+    const cache = await run(repositoryRoot, hostEnv, ['bun', 'pm', 'cache'], 'the admitted Bun install cache');
+    expect(cache.code, cache.stdout + cache.stderr).toBe(0);
+    parent = cache.stdout.trim();
+    expect(isAbsolute(parent), `bun pm cache printed ${JSON.stringify(cache.stdout)}`).toBe(true);
+  }
+  const directory = await ownedFixtureRoot(parent, 'nx-plugin', 'nx-fe-alias-');
   try {
     switch (process.platform) {
       case 'darwin':

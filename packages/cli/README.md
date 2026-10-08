@@ -354,7 +354,7 @@ ignores.
 
 Managed files include:
 
-- [`tooling/git-hooks/git-format-staged.yml`][git-format-staged]
+- [`.git-format-staged.yml`][git-format-staged]
 - Git hook scripts under `tooling/git-hooks`
 - [direnv]/[GitHub Actions] bootstrap scripts under `tooling/direnv`
 - [GitHub Actions] workflows under `.github/workflows`
@@ -544,9 +544,10 @@ carries those changes.
 
 ## Formatting And Git Hooks
 
-The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with
-`--config tooling/git-hooks/git-format-staged.yml --unstaged`. Both the managed commit-hook config and the repository
-formatter config exclude `bun.lock` and binary `.bin`/`.wasm` artifacts from text formatting.
+The root formatting scripts and the commit hook run [`git-format-staged`][git-format-staged] with the generated
+`.git-format-staged.yml` (`lint:fix` adds `--unstaged`). This is the same canonical managed configuration, not a second
+repository formatter model. Prettier receives only explicitly supported file types: unknown stdin would otherwise emit
+empty output and truncate shell scripts, lockfiles, or binary artifacts. Unsupported files remain byte-identical.
 
 The generated pre-commit hook runs the same formatter path from the repository root with `tooling`, `node_modules/.bin`,
 and the [devenv] profile on `PATH`.

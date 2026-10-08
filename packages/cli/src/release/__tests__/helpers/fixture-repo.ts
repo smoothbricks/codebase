@@ -1,9 +1,11 @@
 import { onTestFinished } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   awaitExit,
+  fixtureSocketDirectory,
   ownedFixtureRoot,
   processTable,
   stopNxDaemon,
@@ -82,7 +84,7 @@ export async function withFixtureRepo(fn: (root: string) => Promise<void>): Prom
       await retireFixture(fixture);
     }
   });
-  const root = await ownedFixtureRoot('cli', 'smoo-release-test-');
+  const root = await ownedFixtureRoot(tmpdir(), 'cli', 'smoo-release-test-');
   const owned: Fixture = { root, nxRoots: new Set([root]), clients: new Set(), retirement: null };
   fixture = owned;
   liveFixtures.add(owned);
@@ -101,12 +103,14 @@ export async function withFixtureRepo(fn: (root: string) => Promise<void>): Prom
 
 /**
  * Stop every Nx process a fixture started, wait until each has exited, then
- * delete its root. The body's `finally` and the test's finish share one
- * retirement. The `nx` clients go first, with everything they spawned: a
- * client killed while it starts a daemon would otherwise leave that daemon
- * running before it has recorded itself. A process that outlives its stop
- * fails the retirement and keeps the root, so its working directory still
- * names the fixture it came from.
+ * delete the socket directory of each workspace it ran in, and its root. The
+ * body's `finally` and the test's finish share one retirement. The `nx`
+ * clients go first, with everything they spawned: a client killed while it
+ * starts a daemon would otherwise leave that daemon running before it has
+ * recorded itself. A process that outlives its stop fails the retirement and
+ * keeps the root, so its working directory still names the fixture it came
+ * from. Nx deletes its socket directory itself when the daemon stops, and a
+ * daemonless workspace never makes one: `force` takes both.
  */
 function retireFixture(fixture: Fixture): Promise<void> {
   fixture.retirement ??= (async () => {
@@ -118,6 +122,7 @@ function retireFixture(fixture: Fixture): Promise<void> {
     await awaitExit(clients, `nx clients of fixture ${fixture.root}`);
     for (const nxRoot of fixture.nxRoots) {
       await stopFixtureNxDaemon(nxRoot);
+      await rm(fixtureSocketDirectory(nxRoot), { recursive: true, force: true });
     }
     await rm(fixture.root, { recursive: true, force: true });
   })();
@@ -289,11 +294,13 @@ export async function runFixtureNx(
  * The environment of a fixture `nx`: it owns its own workspace root, graph,
  * cache and daemon. The daemon runs only when `options` asks for it, whatever
  * the inherited `NX_DAEMON` or CI flag says, and the socket directory of
- * whichever workspace launched this process never reaches the fixture. Host CI
- * runners export the state locations to a per-lane tree shared by every task in
- * the run; a fixture inheriting them overwrote the real workspace's project
- * graph with its own one-project graph, and the concurrent `nx run-many -t test`
- * died with "Could not find project lmao-ttsc".
+ * whichever workspace launched this process never reaches the fixture: its own
+ * is `fixtureSocketDirectory(root)`, the one a stop of its daemon and the
+ * fixture's retirement name as well. Host CI runners export the state
+ * locations to a per-lane tree shared by every task in the run; a fixture
+ * inheriting them overwrote the real workspace's project graph with its own
+ * one-project graph, and the concurrent `nx run-many -t test` died with "Could
+ * not find project lmao-ttsc".
  */
 export function fixtureNxEnv(root: string, options: FixtureNxOptions): Record<string, string> {
   const env = definedProcessEnv();
@@ -303,6 +310,7 @@ export function fixtureNxEnv(root: string, options: FixtureNxOptions): Record<st
     ...env,
     NX_DAEMON: options.daemon ? 'true' : 'false',
     NX_WORKSPACE_ROOT_PATH: root,
+    NX_SOCKET_DIR: fixtureSocketDirectory(root),
     NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
     NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
     ...FIXTURE_NX_DIAGNOSTICS,

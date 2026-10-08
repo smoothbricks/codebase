@@ -7,24 +7,35 @@
  * someone stops it. A test that throws stops it in its `finally`; a test
  * process that is killed runs no `finally`. So every fixture root lives in a
  * run directory named for the test process that owns it,
- * `<tmpdir>/smoothbricks-fixtures/<suite>/run-<pid>`. A process that gets
- * SIGTERM, SIGINT or SIGHUP (a bounded test leg's timeout sends SIGTERM, and
- * SIGKILL 10 s later) first stops whatever still works in its own run, then
- * dies of that signal. One killed outright cannot, so the first fixture a
- * process creates for a suite reclaims every run of that suite whose owner is
- * gone: each process working in it is stopped, then the run is deleted. A run
- * whose owner still exists is never touched by another process, so nothing
- * outside a dead or dying run of the same suite is ever signalled.
+ * `<parent>/smoothbricks-fixtures/<suite>/run-<pid>`, where the caller names
+ * the parent: the temp directory, or the directory of a volume the fixture has
+ * to lie on. A process that gets SIGTERM, SIGINT or SIGHUP (a bounded test
+ * leg's timeout sends SIGTERM, and SIGKILL 10 s later) first stops whatever
+ * still works in every run it holds, then dies of that signal. One killed
+ * outright cannot, so the first fixture a process creates for a suite under a
+ * parent reclaims every run of that suite there whose owner is gone: each
+ * process working in it is stopped, then the run is deleted. A run whose owner
+ * still exists is never touched by another process, so nothing outside a dead
+ * or dying run of the same suite is ever signalled.
  *
- * Node APIs only: the module is built with the library and imported by Bun
- * tests in other packages.
+ * The module also says where a fixture's sockets and loopback listeners may
+ * live, because a Cowshed sandbox admits only its own: a Unix socket under its
+ * own tree or short runtime link, a TCP connect to a port of its own block. A
+ * literal `/tmp/x.sock` or a port-0 listener still binds there, and then no
+ * process of the workspace can reach it (specs/cowshed/04_sandbox.md).
+ *
+ * Node APIs and the library's public workspace-root finder only: this module
+ * is built with the library and imported by Bun tests in other packages.
  */
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { findNxWorkspaceRoot } from './ensure-built.js';
 
 const run = promisify(execFile);
 const EXIT_TIMEOUT_MS = 10_000;
@@ -247,53 +258,129 @@ export async function stopNxDaemon(workspace: string, stop: () => Promise<void>)
   await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
 }
 
+/**
+ * The run this process holds in each suite directory, opened or still opening,
+ * by that directory's canonical path: one for each parent and suite, however
+ * the parent is spelled. Entries are kept for the life of the process, an open
+ * that failed included.
+ */
 const runDirectories = new Map<string, Promise<string>>();
+
+const RUN_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const;
+
+/** The handlers this process made for {@link RUN_SIGNALS}, by signal: none until it opens its first run. */
+const runSignalHandlers = new Map<NodeJS.Signals, () => void>();
+
+/** Reclaiming every run this process holds, begun by the first of {@link RUN_SIGNALS} it received. */
+let retirement: Promise<void> | undefined;
 
 /**
  * A fresh fixture root for `suite`, owned by this process: a `prefix`-named
- * temp directory in this process's run directory. Canonical, because macOS
- * puts the temp directory behind a /private symlink and a daemon never sees
- * an edit made under a root named through one. The first root of a suite in
- * a process reclaims the suite's dead runs first.
+ * directory (mode 0700) in this process's run directory under
+ * `parentDirectory`, `<parent>/smoothbricks-fixtures/<suite>/run-<pid>`. The
+ * caller always names the parent: the temp directory, or the directory of the
+ * volume the fixture has to lie on. The parent is resolved through every link,
+ * so the root is canonical (macOS puts the temp directory behind a /private
+ * symlink, and a daemon never sees an edit made under a root named through
+ * one) and a parent spelled two ways is one run. A process holds one run for
+ * each parent and suite, and the first root of a suite under a parent reclaims
+ * that suite's dead runs there first. Once a signal has this process
+ * reclaiming its runs, no root is made.
  */
-export async function ownedFixtureRoot(suite: string, prefix: string): Promise<string> {
-  let directory = runDirectories.get(suite);
-  if (directory === undefined) {
-    directory = openRun(suite);
-    runDirectories.set(suite, directory);
+export async function ownedFixtureRoot(parentDirectory: string, suite: string, prefix: string): Promise<string> {
+  const suiteDirectory = join(await realpath(parentDirectory), FIXTURE_HOME, suite);
+  refuseWhileRetiring();
+  let opened = runDirectories.get(suiteDirectory);
+  if (opened === undefined) {
+    opened = openRun(suiteDirectory);
+    runDirectories.set(suiteDirectory, opened);
   }
-  return mkdtemp(join(await directory, prefix));
+  const directory = await opened;
+  refuseWhileRetiring();
+  return mkdtemp(join(directory, prefix));
 }
 
-async function openRun(suite: string): Promise<string> {
-  const suiteDirectory = await reclaimDeadFixtureRuns(suite);
+async function openRun(suiteDirectory: string): Promise<string> {
+  await sweepSuite(suiteDirectory);
   const directory = join(suiteDirectory, `run-${process.pid}`);
   await mkdir(directory, { recursive: true });
-  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
-    process.once(signal, () => {
-      // Inside the 10 s a bounded leg grants between SIGTERM and SIGKILL.
-      reclaimRun(directory, 'signalled fixture run', SIGNALLED_GRACE_MS)
-        .catch((error: unknown) => {
-          process.stderr.write(`could not reclaim ${directory}: ${error instanceof Error ? error.message : error}\n`);
-        })
-        .finally(() => process.kill(process.pid, signal));
-    });
-  }
+  ownRunSignals();
   return directory;
 }
 
 /**
- * Stop every process working in a run of `suite` whose owner is gone, then
- * delete the run, and return the suite's directory. The first fixture root of a suite in
- * a process does this; a test that just watched a fixture-owning process die
- * may too. An owner's pid reused by an unrelated process makes its run look
- * alive; it is reclaimed once that process is gone too, never early.
+ * Own the signals that end this process, once however many runs it holds. The
+ * first of them reclaims every run (`retireRuns`) before it takes its course. A
+ * handler for each run would let the first to finish re-raise the signal over
+ * the reclaim of the rest, and a signal repeated meanwhile would meet no handler
+ * and kill the process before any reclaim ended.
  */
-export async function reclaimDeadFixtureRuns(suite: string): Promise<string> {
-  const suiteDirectory = join(await realpath(tmpdir()), FIXTURE_HOME, suite);
+function ownRunSignals(): void {
+  if (runSignalHandlers.size > 0) {
+    return;
+  }
+  for (const signal of RUN_SIGNALS) {
+    const handler = (): void => {
+      retirement ??= retireRuns(signal);
+    };
+    runSignalHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+}
+
+/**
+ * Reclaim every run this process holds at once, then let `signal`, the first it
+ * received, take its course: the handlers go and the process dies of it, as it
+ * would have without them. Every run is awaited, one still opening or one whose
+ * open failed included, and one failing cuts no other short; each failure is
+ * written to stderr with the suite directory of its run. A repeated signal
+ * meets a handler, not the default, so it waits for this and neither starts a
+ * second reclaim nor kills the first. That wait is the reclaim's own: for each
+ * run, after any sweep it was still opening with, the scans, two rounds of
+ * `SIGNALLED_GRACE_MS` (SIGTERM, then SIGKILL) for its processes, and the
+ * delete. A bounded test leg's SIGKILL ends it whatever it is.
+ */
+async function retireRuns(signal: NodeJS.Signals): Promise<void> {
+  const runs = [...runDirectories];
+  // Inside the 10 s a bounded leg grants between SIGTERM and SIGKILL.
+  const outcomes = await Promise.allSettled(
+    runs.map(async ([, opened]) => reclaimRun(await opened, 'signalled fixture run', SIGNALLED_GRACE_MS)),
+  );
+  for (const [index, outcome] of outcomes.entries()) {
+    if (outcome.status === 'rejected') {
+      const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+      process.stderr.write(`could not reclaim this process's run in ${runs[index][0]}: ${reason}\n`);
+    }
+  }
+  for (const [name, handler] of runSignalHandlers) {
+    process.removeListener(name, handler);
+  }
+  process.kill(process.pid, signal);
+}
+
+function refuseWhileRetiring(): void {
+  if (retirement !== undefined) {
+    throw new Error('no fixture root is made: a signal has this process reclaiming the fixture runs it owns');
+  }
+}
+
+/**
+ * Stop every process working in a run of `suite` under `parentDirectory` whose
+ * owner is gone, then delete the run, and return the suite's directory there.
+ * The first fixture root of a suite under a parent in a process does this; a
+ * test that just watched a fixture-owning process die may too. An owner's pid
+ * reused by an unrelated process makes its run look alive; it is reclaimed once
+ * that process is gone too, never early.
+ */
+export async function reclaimDeadFixtureRuns(parentDirectory: string, suite: string): Promise<string> {
+  const suiteDirectory = join(await realpath(parentDirectory), FIXTURE_HOME, suite);
+  await sweepSuite(suiteDirectory);
+  return suiteDirectory;
+}
+
+async function sweepSuite(suiteDirectory: string): Promise<void> {
   await mkdir(suiteDirectory, { recursive: true });
   await reclaimDeadRuns(suiteDirectory);
-  return suiteDirectory;
 }
 
 async function reclaimDeadRuns(suiteDirectory: string): Promise<void> {
@@ -390,4 +477,310 @@ async function takeSweepLock(suiteDirectory: string): Promise<string | null> {
     await rm(lock, { force: true });
   }
   return null;
+}
+
+/**
+ * The longest path a fixture binds a Unix socket at: the stricter of Nx's own
+ * limit (`assertValidSocketPath` refuses over 95 characters) and the kernel's
+ * (macOS's `sun_path` holds 104 bytes, the terminating NUL included), counted
+ * in UTF-8 bytes, which is what the kernel limits.
+ */
+const SOCKET_PATH_BYTES = 95;
+
+/**
+ * The longest socket Nx binds in a configured socket directory: an isolated
+ * plugin worker's `p<pid>-<counter>-<8 hex>.sock` (`getPluginSocketFileName`;
+ * with a configured directory `getPluginSocketDir` is the daemon's own), which
+ * outgrows the daemon's `d.sock` and a forked task's `fp<pid>-<n>.sock`. macOS
+ * pids stop at 99999, Linux's have seven digits; two base-36 digits count 1295
+ * workers.
+ */
+export const NX_LONGEST_SOCKET_NAME = `p${'9'.repeat(process.platform === 'darwin' ? 5 : 7)}-zz-ffffffff.sock`;
+
+const RUNTIME_LINK_ENV = 'COWSHED_RUNTIME_LINK';
+const PORT_BASE_ENV = 'COWSHED_PORT_BASE';
+const PORT_BLOCK_SIZE_ENV = 'COWSHED_PORT_BLOCK_SIZE';
+const MAX_PORT = 65_535;
+const DECIMAL = /^[0-9]+$/;
+
+/** Where a fixture's sockets are made, and the candidates passed over on the way there. */
+export interface SocketNamespace {
+  readonly directory: string;
+  /** Each environment root not used, and why: carried into every refusal made in this namespace. */
+  readonly passedOver: readonly string[];
+}
+
+/**
+ * The directory a fixture's sockets are made in: a short root this process's
+ * own environment supplies for the checkout it runs in. In order: the parent
+ * of `NX_SOCKET_DIR`, which for a Cowshed job is the workspace's short runtime
+ * link (its Nx socket directory is `nx` below it); `COWSHED_RUNTIME_LINK`,
+ * that link; else the temp directory. Never `NX_SOCKET_DIR` itself: Nx deletes
+ * that directory, recursively and whatever else is in it, whenever its daemon
+ * stops, so a fixture's sockets live beside it. The sandbox admits Unix sockets
+ * under the link by its literal path, and under the temp directory only for a
+ * job's own `TMPDIR`. Spelled as the environment gives it and never resolved,
+ * since the physical path is too long for a socket.
+ *
+ * As `nx-socket-dir.sh` does, a shell's variable is trusted only when it is
+ * this checkout's. The public finder names the checkout from the working
+ * directory; an `NX_SOCKET_DIR` also needs a matching `NX_WORKSPACE_ROOT_PATH`.
+ * The link must resolve to that checkout's `.cowshed/run`, even when a test
+ * preload has removed the inherited Nx variables. Unproven candidates are
+ * passed over with their resolution or permission failure, so the fallback
+ * directory, or the length refusal it leads to, names what it fell from. One
+ * that is this checkout's but is not an existing directory of this user is an
+ * error naming it.
+ */
+export function socketNamespace(): SocketNamespace {
+  const passedOver: string[] = [];
+  const socketDirectory = environmentValue('NX_SOCKET_DIR');
+  const link = environmentValue(RUNTIME_LINK_ENV);
+  if (socketDirectory !== undefined || link !== undefined) {
+    const checkout = checkoutRoot();
+    if (checkout.kind === 'unresolved') {
+      passedOver.push(`NX_SOCKET_DIR and ${RUNTIME_LINK_ENV} cannot be tied to a checkout: ${checkout.why}`);
+    } else {
+      if (socketDirectory !== undefined) {
+        const named = environmentValue('NX_WORKSPACE_ROOT_PATH');
+        const binding: Resolution =
+          named === undefined ? { kind: 'unresolved', why: 'NX_WORKSPACE_ROOT_PATH is not set' } : resolution(named);
+        if (binding.kind === 'resolved' && binding.path === checkout.path) {
+          const leaf = resolution(socketDirectory);
+          if (leaf.kind === 'resolved' && isWithin(leaf.path, checkout.path)) {
+            const source = `the parent of NX_SOCKET_DIR=${socketDirectory}`;
+            return { directory: ownedDirectory(source, dirname(socketDirectory), passedOver, 'private'), passedOver };
+          }
+          passedOver.push(
+            `NX_SOCKET_DIR=${socketDirectory} ${describeResolution(leaf)}, not inside the checkout ${checkout.path}`,
+          );
+        } else {
+          passedOver.push(
+            `NX_SOCKET_DIR=${socketDirectory} has no current checkout binding: ${describeResolution(binding)}`,
+          );
+        }
+      }
+      if (link !== undefined) {
+        const run = join(checkout.path, '.cowshed', 'run');
+        const runResolved = resolution(run);
+        const linked = resolution(link);
+        if (runResolved.kind === 'resolved' && linked.kind === 'resolved' && linked.path === runResolved.path) {
+          return { directory: ownedDirectory(RUNTIME_LINK_ENV, link, passedOver, 'private'), passedOver };
+        }
+        passedOver.push(
+          `${RUNTIME_LINK_ENV}=${link} ${describeResolution(linked)}, and the checkout's ${run} ${describeResolution(runResolved)}`,
+        );
+      }
+    }
+  }
+  return { directory: ownedDirectory('the temp directory', tmpdir(), passedOver, 'process-temp'), passedOver };
+}
+
+/** The variable's value, or undefined when it is unset or empty. */
+function environmentValue(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value === '' ? undefined : value;
+}
+
+type Resolution =
+  | { readonly kind: 'resolved'; readonly path: string }
+  | { readonly kind: 'unresolved'; readonly why: string };
+
+function describeResolution(resolved: Resolution): string {
+  return resolved.kind === 'resolved' ? `resolves to ${resolved.path}` : `cannot be resolved (${resolved.why})`;
+}
+
+/** The current checkout, read from its marker rather than an inherited Nx override. */
+function checkoutRoot(): Resolution {
+  const here = resolution(process.cwd());
+  if (here.kind === 'unresolved') {
+    return { kind: 'unresolved', why: `the working directory cannot be resolved (${here.why})` };
+  }
+  const root = findNxWorkspaceRoot(here.path);
+  return root === null
+    ? { kind: 'unresolved', why: `no nx.json at or above the working directory ${here.path}` }
+    : resolution(root);
+}
+
+/** `path` resolved through every link, or the errno of a path that does not exist or may not be looked at. */
+function resolution(path: string): Resolution {
+  try {
+    return { kind: 'resolved', path: realpathSync(path) };
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES' || code === 'EPERM') {
+      return { kind: 'unresolved', why: `${code} on ${path}` };
+    }
+    throw error;
+  }
+}
+
+/** Whether the resolved `path` is `root` or lies beneath it. */
+function isWithin(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}${sep}`);
+}
+
+function ownedDirectory(
+  source: string,
+  directory: string,
+  passedOver: readonly string[],
+  ownership: 'private' | 'process-temp',
+): string {
+  const stat = statSync(directory, { throwIfNoEntry: false });
+  const user = process.getuid?.();
+  const owned = user === undefined || stat?.uid === user;
+  const publicTemp = ownership === 'process-temp' && stat?.uid === 0 && (stat.mode & 0o7777) === 0o1777;
+  if (!isAbsolute(directory) || stat === undefined || !stat.isDirectory() || (!owned && !publicTemp)) {
+    throw new Error(
+      `${source} (${directory}, uid=${stat?.uid}, mode=${stat?.mode.toString(8)}) is not an existing absolute ` +
+        'user-owned directory or an admitted sticky public temp directory, so no fixture socket can be ' +
+        `made under it${passedOver.length === 0 ? '' : `; passed over: ${passedOver.join('; ')}`}`,
+    );
+  }
+  return directory;
+}
+
+/**
+ * `path`, or an error naming it, its length and the namespace it was made in
+ * (with what that namespace passed over) when Nx and the kernel would refuse
+ * to bind a socket there.
+ */
+export function assertSocketPath(path: string, namespace: SocketNamespace): string {
+  const bytes = Buffer.byteLength(path, 'utf8');
+  if (bytes > SOCKET_PATH_BYTES) {
+    const { directory, passedOver } = namespace;
+    throw new Error(
+      `the socket path ${path} is ${bytes} UTF-8 bytes, over the ${SOCKET_PATH_BYTES} a Unix socket may have; ` +
+        `the socket namespace ${directory} leaves too little room` +
+        `${passedOver.length === 0 ? '' : `; passed over: ${passedOver.join('; ')}`}`,
+    );
+  }
+  return path;
+}
+
+/**
+ * A fresh directory, mode 0700 and named `prefix` plus six random characters,
+ * in {@link socketNamespace}: the one owner of the sockets a fixture makes
+ * there, so the fixture removes the directory and nothing else. `longestSocketName`
+ * is the longest socket it will hold, and the call fails before creating
+ * anything when that socket's path would be too long to bind.
+ */
+export async function ownedSocketDirectory(prefix: string, longestSocketName: string): Promise<string> {
+  const namespace = socketNamespace();
+  assertSocketPath(join(namespace.directory, `${prefix}XXXXXX`, longestSocketName), namespace);
+  return mkdtemp(join(namespace.directory, prefix));
+}
+
+/**
+ * The socket directory of the Nx that runs in `workspace`, which a fixture
+ * names as that Nx's `NX_SOCKET_DIR`: named for a hash of the workspace's own
+ * path, so every environment built for it, the stop of its daemon included,
+ * names the same one, and no two fixtures share one. It lies in the sandbox's
+ * own socket namespace ({@link socketNamespace}), a short root: the plugin
+ * sockets inside it have to fit the room the namespace leaves, and a namespace
+ * with too little is refused here, before a daemon fails on it. Nx makes the
+ * directory when it first needs a socket and deletes it when its daemon stops;
+ * whoever retires the fixture removes this one either way, and no other.
+ */
+export function fixtureSocketDirectory(workspace: string): string {
+  const digest = createHash('sha256').update(workspace).digest('hex');
+  const namespace = socketNamespace();
+  const directory = join(namespace.directory, `nx-${digest.slice(0, 16)}`);
+  assertSocketPath(join(directory, NX_LONGEST_SOCKET_NAME), namespace);
+  return directory;
+}
+
+/** The port block a Cowshed job's environment names, or why it names none a listener can use. */
+type PortBlockEnvironment =
+  /** Outside Cowshed, or on Linux: no block, so a listener binds port 0 as usual. */
+  | { readonly kind: 'none' }
+  /** The gateway listens on `base`; service ports are `base+1 … base+size-1`. */
+  | { readonly kind: 'block'; readonly base: number; readonly size: number }
+  | { readonly kind: 'broken'; readonly reason: string };
+
+/**
+ * The block `env` (`COWSHED_PORT_BASE`, `COWSHED_PORT_BLOCK_SIZE`) names. A
+ * size without a base, a base without a size (never assumed), a value that is
+ * not a decimal number, a size that is not a power of two of at least two, a
+ * base not aligned to it, or a block outside the TCP ports 1–65535 is a broken
+ * environment, refused rather than guessed around (04_sandbox.md).
+ */
+function portBlockEnvironment(env: NodeJS.ProcessEnv): PortBlockEnvironment {
+  const baseText = env[PORT_BASE_ENV];
+  const sizeText = env[PORT_BLOCK_SIZE_ENV];
+  if (baseText === undefined && sizeText === undefined) {
+    return { kind: 'none' };
+  }
+  if (baseText === undefined) {
+    return { kind: 'broken', reason: `${PORT_BLOCK_SIZE_ENV}=${sizeText} is set without ${PORT_BASE_ENV}` };
+  }
+  if (sizeText === undefined) {
+    return { kind: 'broken', reason: `${PORT_BASE_ENV}=${baseText} is set without ${PORT_BLOCK_SIZE_ENV}` };
+  }
+  if (!DECIMAL.test(baseText) || !DECIMAL.test(sizeText)) {
+    return {
+      kind: 'broken',
+      reason: `${PORT_BASE_ENV}=${JSON.stringify(baseText)} and ${PORT_BLOCK_SIZE_ENV}=${JSON.stringify(sizeText)} are not both decimal numbers`,
+    };
+  }
+  const base = Number(baseText);
+  const size = Number(sizeText);
+  if (!Number.isSafeInteger(size) || size < 2 || (size & (size - 1)) !== 0) {
+    return {
+      kind: 'broken',
+      reason: `${PORT_BLOCK_SIZE_ENV}=${sizeText} is not a power of two of at least 2`,
+    };
+  }
+  if (!Number.isSafeInteger(base) || base < 1 || base % size !== 0) {
+    return {
+      kind: 'broken',
+      reason: `${PORT_BASE_ENV}=${baseText} is not a positive multiple of ${PORT_BLOCK_SIZE_ENV}=${sizeText}`,
+    };
+  }
+  if (base + size - 1 > MAX_PORT) {
+    return {
+      kind: 'broken',
+      reason: `the block ${base}+${size} (${PORT_BASE_ENV}, ${PORT_BLOCK_SIZE_ENV}) runs past TCP port ${MAX_PORT}`,
+    };
+  }
+  return { kind: 'block', base, size };
+}
+
+/**
+ * Bind a real listener where a Cowshed job's other processes can connect to
+ * it. In a block, `bind` is called with each candidate `base+1 … base+size-1`,
+ * lowest first (a long-lived test listener scans from the bottom), and the
+ * first that binds is kept: only a real bind claims a port, so nothing probes
+ * and closes. Only `EADDRINUSE` (by `code`) moves on to the next candidate;
+ * any other failure is that bind's own and surfaces as is, and so does the
+ * last candidate's, so an exhausted block reports `EADDRINUSE`, never a silent
+ * port 0. Outside a block `bind` is called with 0, and the kernel picks.
+ *
+ * `bind` creates and binds one listener per call and returns it, and a failed
+ * bind leaves nothing behind. It may throw (`Bun.serve` does) or reject (a
+ * Node `net` server reports a failed `listen` as an `error` event, which the
+ * caller turns into a rejection). The listener the winning call returns is the
+ * caller's to keep and close.
+ */
+export async function bindListener<T>(bind: (port: number) => T | Promise<T>): Promise<T> {
+  const block = portBlockEnvironment(process.env);
+  switch (block.kind) {
+    case 'none':
+      return bind(0);
+    case 'broken':
+      throw new Error(`a listener cannot bind in a broken Cowshed port-block environment: ${block.reason}`);
+    case 'block': {
+      const last = block.base + block.size - 1;
+      for (let port = block.base + 1; port < last; port += 1) {
+        try {
+          return await bind(port);
+        } catch (error) {
+          if (errorCode(error) !== 'EADDRINUSE') {
+            throw error;
+          }
+        }
+      }
+      return bind(last);
+    }
+  }
 }

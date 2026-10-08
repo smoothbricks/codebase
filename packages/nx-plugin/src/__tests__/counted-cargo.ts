@@ -11,6 +11,7 @@ import { type QueryableSpan, querySpan } from '@smoothbricks/lmao/testing';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { CargoMetadataError } from '../cargo-source-hash.js';
+import { bindListener } from '../testing.js';
 import { BROKER_HOST, encodeOrder, type ProcessReport, parseReport, readLines } from './counted-cargo-process.js';
 
 /** What one fixture's `cargo metadata` children have done so far, in the order they did it. */
@@ -286,16 +287,29 @@ const quote = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`;
 
 const PROGRAM = fileURLToPath(new URL('./counted-cargo-process.ts', import.meta.url));
 
-function listen(server: Server): Promise<number> {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, BROKER_HOST, () => {
-      server.off('error', reject);
-      const address = server.address();
-      if (address === null || typeof address === 'string') reject(new Error(`the broker has no port: ${address}`));
-      else resolve(address.port);
-    });
+interface Listening {
+  readonly server: Server;
+  readonly port: number;
+}
+
+/**
+ * `server` listening on the broker's host at `port` (0: the kernel's choice), with the port it holds; rejects with
+ * the bind's own error.
+ */
+function listen(server: Server, port: number): Promise<Listening> {
+  const { promise, resolve, reject } = Promise.withResolvers<Listening>();
+  server.once('error', reject);
+  server.listen(port, BROKER_HOST, () => {
+    server.off('error', reject);
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      server.close();
+      reject(new Error(`the broker has no port: ${address}`));
+    } else {
+      resolve({ server, port: address.port });
+    }
   });
+  return promise;
 }
 
 /**
@@ -426,7 +440,7 @@ async function shim(
     return `child ${self.pid} reported ${report.kind} while ${self.phase}`;
   };
 
-  const server = createServer((socket) => {
+  const accept = (socket: Socket): void => {
     connections.add(socket);
     let self: Registered | null = null;
     const unterminated = readLines(socket, (line) => {
@@ -455,12 +469,14 @@ async function shim(
       }
       changed();
     });
-  });
+  };
+  // The children connect back to this listener, so it binds in the workspace's port block when it has
+  // one: a port-0 listener binds there too, and then no sandboxed child can connect to it.
+  const { server, port } = await bindListener((candidate) => listen(createServer(accept), candidate));
   server.on('close', () => {
     listening = false;
     changed();
   });
-  const port = await listen(server);
   // Only the processes it serves keep the test process alive, never the listener itself.
   server.unref();
 

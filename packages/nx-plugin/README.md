@@ -58,6 +58,20 @@ Fixtures that intentionally strip caller directory overrides declare `cacheDirec
 `nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline,
 path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's Cargo home.
 
+Fixture sockets and loopback listeners live where a Cowshed sandbox admits them, never at a literal `/tmp` path or on
+port 0. A fixture's Unix sockets go in a directory of its own beside the Nx socket directory the job supplies (the
+parent of `NX_SOCKET_DIR`, the workspace's short runtime link), else under `COWSHED_RUNTIME_LINK`, else the temp
+directory. A shell's variable counts only when it belongs to this checkout, as `nx-socket-dir.sh` decides it; one that
+leads elsewhere or cannot be looked at is passed over, and a refusal names it. The temp fallback admits a user-owned
+parent or the root-owned public sticky directory with mode 1777, not an inaccessible sticky directory. A socket path
+over 95 UTF-8 bytes is refused with an error naming it. The shell owner retains a failed socket-directory creation's
+exit status; the foreign-workspace provider refuses before running a target and preserves its complete diagnostic.
+`fixtureNxEnv` gives each fixture workspace its own `NX_SOCKET_DIR` there, removed when the fixture retires; a test
+whose subject is two daemons names a directory for each. A listener another process connects to (the counted Cargo
+broker, a remote-cache server) binds through `bindListener`: a port of the workspace's
+`COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` block, lowest first, skipping only ports in use, and port 0 outside a
+block.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
@@ -528,6 +542,13 @@ text (never followed), file permission bits and bytes. A tree the restore would 
 daemon's record is re-armed as Nx's runner does after a restore. A missing or empty artifact, any difference, a read
 error, or a write observed during the comparison is a miss.
 
+A caller from another workspace never lends its socket, database or cache overrides to the provider. Inside a managed
+shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the packaged `nx-socket-dir.sh` owner for the provider's binding: the
+root's verified cowshed runtime link when present, otherwise its canonical checkout spelling under that shell runtime.
+Outside a managed shell, Nx retains its normal defaults. A socket-owner refusal returns `disposition: 'failed'` with
+`reason.kind: 'workspace-socket'`, the selected `taskId`, `workspaceRoot` and operational `detail`, before any task or
+daemon client starts. The owner's actual exit or signal is preserved; the wrapper must not report that the target ran.
+
 ```typescript
 import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
 
@@ -881,14 +902,24 @@ daemonless Nx leaves nothing running once it exits. A daemon a fixture does star
 watching files until something stops it, so `@smoothbricks/nx-plugin/testing` (used by this package's and the CLI's
 tests) owns those roots:
 
-- `ownedFixtureRoot(suite, prefix)` creates a root under `<tmpdir>/smoothbricks-fixtures/<suite>/run-<pid>`, the run
-  directory of the test process that owns it. The first root a process creates for a suite first reclaims every run of
-  that suite whose owner pid is gone: each process working in it gets SIGTERM (SIGKILL if it outlives 10 s), then the
-  run is deleted. A run whose owner is alive is never touched by another process. The owner itself, on SIGTERM, SIGINT
-  or SIGHUP (a bounded test leg's timeout sends SIGTERM, then SIGKILL 10 s later), first stops whatever still works in
-  its own run, then dies of that signal.
-- `reclaimDeadFixtureRuns(suite)` runs that sweep on demand, for a test that has just watched a fixture-owning process
-  die.
+- `ownedFixtureRoot(parentDirectory, suite, prefix)` creates a root in the run directory of the test process that owns
+  it, `<parentDirectory>/smoothbricks-fixtures/<suite>/run-<pid>`. The caller always names the parent: `tmpdir()`, or
+  the directory of the volume a fixture has to lie on. The parent is resolved through every link first, so one spelled
+  two ways is one run, and a process holds one run for each parent and suite. The first root a process creates for a
+  suite under a parent first reclaims every run of that suite there whose owner pid is gone: each process working in it
+  gets SIGTERM (SIGKILL if it outlives 10 s), then the run is deleted. A run whose owner is alive is never touched by
+  another process. A killed process therefore leaves what it owned in a `run-<pid>` of its own, inside that parent's
+  `smoothbricks-fixtures` directory, never as a bare prefix among whatever else the parent holds, and the next process
+  to use that parent and suite reclaims it. The owner itself, on SIGTERM, SIGINT or SIGHUP (a bounded test leg's timeout
+  sends SIGTERM, then SIGKILL 10 s later), first stops whatever still works in every run it holds, all at once, and
+  makes no new root meanwhile; a repeated signal waits for that. Then it dies of the first signal it got.
+- `reclaimDeadFixtureRuns(parentDirectory, suite)` runs that sweep on demand, for a test that has just watched a
+  fixture-owning process die.
+- `fixtureSocketDirectory(workspace)` is the `NX_SOCKET_DIR` of the Nx a fixture runs in `workspace`: a directory named
+  for a hash of the workspace's path in the sandbox's socket namespace (`socketNamespace`), so the environment of every
+  `nx` of that workspace, the stop of its daemon and the retirement that removes the directory all name the same one,
+  and no two fixtures share one. A namespace too small for Nx's longest socket name is refused when the directory is
+  named, before a daemon fails on it. This package's `fixtureNxEnv` and the CLI's give it to their fixture's Nx.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
   `<workspace>/.nx/workspace-data/d/server-process.json`, and every process it started, has exited.
 

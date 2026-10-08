@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  fixtureSocketDirectory,
   nxDaemonProcesses,
   pidsWorkingIn,
   processTable,
@@ -136,6 +138,7 @@ describe('release planning with fixture git repositories', () => {
         expect(env).toMatchObject({
           NX_DAEMON: String(daemon),
           NX_WORKSPACE_ROOT_PATH: root,
+          NX_SOCKET_DIR: fixtureSocketDirectory(root),
           NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
           NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
         });
@@ -145,6 +148,24 @@ describe('release planning with fixture git repositories', () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+    }
+  });
+
+  it("removes only the fixture workspace's own socket directory when it retires", async () => {
+    // Another workspace's directory in the same socket namespace: not this fixture's to remove.
+    const bystander = fixtureSocketDirectory(`/not/a/fixture/${process.pid}`);
+    await mkdir(bystander);
+    try {
+      let socketDirectory = '';
+      await withFixtureRepo(async (root) => {
+        socketDirectory = fixtureSocketDirectory(root);
+        await mkdir(socketDirectory);
+      });
+
+      expect(existsSync(socketDirectory)).toBe(false);
+      expect(existsSync(bystander)).toBe(true);
+    } finally {
+      await rm(bystander, { recursive: true, force: true });
     }
   });
 
@@ -475,7 +496,7 @@ test('returns without its fixture body', async () => {
       // this test times out) leaves its daemon behind: reclaim it now, not at
       // the next run. Only then: a run that exited cleanly must have retired
       // its own fixture, which is what the caller asserts.
-      await reclaimDeadFixtureRuns('cli');
+      await reclaimDeadFixtureRuns(tmpdir(), 'cli');
       throw new Error(`abandoned fixture test exited ${exitCode}\n${stdout}\n${stderr}`);
     }
     const pids = /^ABANDONED_FIXTURE_PIDS (.+)$/m.exec(stdout)?.[1]?.split(' ').map(Number) ?? [];

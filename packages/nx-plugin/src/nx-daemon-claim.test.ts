@@ -1,11 +1,18 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, symlink, unlink, utimes, watch, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, symlink, unlink, utimes, watch, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { awaitExit, isRunning, processTable, terminate } from './testing.js';
+import {
+  awaitExit,
+  isRunning,
+  NX_LONGEST_SOCKET_NAME,
+  ownedSocketDirectory,
+  processTable,
+  terminate,
+} from './testing.js';
 
 /**
  * Guards the daemon-claim hunk of `patches/nx@23.2.1.patch`. Every Nx 23.2.1 daemon overwrote the workspace's
@@ -20,6 +27,10 @@ import { awaitExit, isRunning, processTable, terminate } from './testing.js';
  * holding the record, and leaves a path another daemon bound alone. A record whose live pid has not answered for longer
  * than a daemon takes to start is stale, whatever process holds that pid now. Drop the hunk, and keep this test, once
  * the Nx version in use leaves a serving daemon alone.
+ *
+ * Nx's default socket root is the literal `/tmp/.nx` with the daemon's pid hashed into the name, which a sandbox does
+ * not admit. So the two daemons' socket paths are named: one directory each, which is what two daemons on the default
+ * root bind, and one directory for both, which is what a configured `NX_SOCKET_DIR` does.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
@@ -74,9 +85,12 @@ async function startedDaemon(workspace: string, env: Record<string, string>): Pr
   return record;
 }
 
-/** A socket directory short enough for a Unix socket path, as a configured `NX_SOCKET_DIR` has to be. */
-async function withSharedSocketDir<T>(body: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await mkdtemp('/tmp/nx-claim-');
+/**
+ * A socket directory of its own, short enough for a Unix socket path as a configured `NX_SOCKET_DIR` has to be and
+ * made where the sandbox admits Unix sockets. Nx deletes it when the daemon bound in it stops; `force` takes both.
+ */
+async function withSocketDir<T>(body: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await ownedSocketDirectory('nc-', NX_LONGEST_SOCKET_NAME);
   try {
     return await body(dir);
   } finally {
@@ -84,15 +98,27 @@ async function withSharedSocketDir<T>(body: (dir: string) => Promise<T>): Promis
   }
 }
 
-async function secondDaemonDefers(workspace: string, env: Record<string, string>): Promise<void> {
-  const serving = await startedDaemon(workspace, env);
+/**
+ * A daemon serves `workspace` under `servingEnv`, then a second one is started under `challengerEnv`. The two share
+ * a socket path only when their environments name one.
+ */
+async function secondDaemonDefers(
+  workspace: string,
+  servingEnv: Record<string, string>,
+  challengerEnv: Record<string, string>,
+): Promise<void> {
+  const serving = await startedDaemon(workspace, servingEnv);
 
   // What a second client does when its probe found no daemon: start one. The record's directory is watched from
   // before the spawn, so no write the second daemon makes to it can be missed.
   const recordChanges = new AbortController();
   const changes = watch(join(workspace, '.nx/workspace-data/d'), { signal: recordChanges.signal });
   let output = '';
-  const second = spawn(process.execPath, [daemonStart], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const second = spawn(process.execPath, [daemonStart], {
+    cwd: workspace,
+    env: challengerEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   second.stdout.setEncoding('utf8').on('data', (text: string) => {
     output += text;
   });
@@ -128,7 +154,7 @@ async function secondDaemonDefers(workspace: string, env: Record<string, string>
     expect(isRunning(serving.processId)).toBe(true);
 
     // The serving daemon still answers on its socket: no client starts another.
-    expect(nx(workspace, env, 'show', 'projects').trim()).toBe('p');
+    expect(nx(workspace, servingEnv, 'show', 'projects').trim()).toBe('p');
     expect(await daemonRecord(workspace)).toEqual(serving);
   } finally {
     if (second.pid !== undefined && second.exitCode === null) {
@@ -141,22 +167,28 @@ async function secondDaemonDefers(workspace: string, env: Record<string, string>
 }
 
 describe('a second daemon started for a workspace a daemon serves', () => {
-  it('exits and leaves the serving daemon alone', async () => {
-    await withNxFixture('nx-daemon-claim-', async ({ workspace }) => {
-      await fixtureWorkspace(workspace);
-      await secondDaemonDefers(workspace, { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' });
+  it('exits and leaves the serving daemon alone when each binds a socket directory of its own', async () => {
+    await withSocketDir(async (servingDir) => {
+      await withSocketDir(async (challengerDir) => {
+        await withNxFixture('nx-daemon-claim-', async ({ workspace }) => {
+          await fixtureWorkspace(workspace);
+          const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
+          await secondDaemonDefers(
+            workspace,
+            { ...env, NX_SOCKET_DIR: servingDir },
+            { ...env, NX_SOCKET_DIR: challengerDir },
+          );
+        });
+      });
     });
   }, 60_000);
 
   it('exits and leaves the serving daemon alone when both use one socket directory', async () => {
-    await withSharedSocketDir(async (socketDir) => {
+    await withSocketDir(async (socketDir) => {
       await withNxFixture('nx-daemon-claim-shared-', async ({ workspace }) => {
         await fixtureWorkspace(workspace);
-        await secondDaemonDefers(workspace, {
-          ...fixtureNxEnv(workspace),
-          NX_DAEMON: 'true',
-          NX_SOCKET_DIR: socketDir,
-        });
+        const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', NX_SOCKET_DIR: socketDir };
+        await secondDaemonDefers(workspace, env, env);
       });
     });
   }, 60_000);
@@ -179,8 +211,8 @@ it('replaces a daemon whose socket was removed, which no client could reach', as
 }, 60_000);
 
 it('keeps serving clients whose socket directory differs from the one it bound', async () => {
-  await withSharedSocketDir(async (socketDir) => {
-    await withSharedSocketDir(async (otherSocketDir) => {
+  await withSocketDir(async (socketDir) => {
+    await withSocketDir(async (otherSocketDir) => {
       await withNxFixture('nx-daemon-claim-env-', async ({ workspace }) => {
         await fixtureWorkspace(workspace);
         const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };

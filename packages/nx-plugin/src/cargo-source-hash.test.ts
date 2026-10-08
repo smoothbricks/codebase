@@ -65,18 +65,18 @@ it('the runtime input is byte-identical under cargo lock contention: nothing on 
     await mkdir(join(root, 'src'), { recursive: true });
     await writeFile(manifest, '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[workspace]\n');
     await writeFile(join(root, 'src', 'lib.rs'), 'pub fn run() {}\n');
-    // A runtime input inherits the Nx process's environment untouched. An Nx
-    // running inside another Nx task carries that task's FORCE_COLOR, and a
-    // shell may export NO_COLOR; with both set, Node warns on stderr under its
-    // own pid the moment anything imports `node:util`, so each run would
-    // hash differently.
+    // A runtime input inherits the Nx process's environment untouched. Node
+    // warns with its own pid when FORCE_COLOR and NO_COLOR are both set.
+    // The declared wrapper excludes successful diagnostics from the value;
+    // all eight genuinely contended runs must still succeed and hash equally.
     const env = { ...process.env, CARGO_HOME: join(root, '.cargo-home'), FORCE_COLOR: 'true', NO_COLOR: '1' };
     execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe', env });
-    // The built bin under node, exactly as nx.json's runtime input invokes it (test depends on build).
+    // Invoke the declared runtime-input owner, not the raw bin: successful stderr is not a hash value.
     const bin = join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-cargo-hash.js');
+    const runtimeInput = join(import.meta.dir, '..', 'runtime-input.sh');
     const runs = await Promise.all(
       Array.from({ length: 8 }, async () => {
-        const proc = Bun.spawn(['node', bin, manifest], {
+        const proc = Bun.spawn(['sh', runtimeInput, 'node', bin, manifest], {
           cwd: root,
           env,
           stdout: 'pipe',

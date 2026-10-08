@@ -29,7 +29,13 @@ const result = await ensureBuilt({ target, cwd: workspaceRoot }).catch((error: u
 });
 
 if (result.disposition !== 'hit' && process.env.NX_VERBOSE_LOGGING === 'true') {
-  process.stderr.write(`smoo-nx-exec: ran ${target} because ${describeMiss(result.reason)}\n`);
+  if (result.reason.kind === 'workspace-socket') {
+    process.stderr.write(
+      `smoo-nx-exec: could not start ${target}: ${result.reason.workspaceRoot}: ${result.reason.detail}\n`,
+    );
+  } else {
+    process.stderr.write(`smoo-nx-exec: ran ${target} because ${describeMiss(result.reason)}\n`);
+  }
 }
 if (result.disposition === 'failed' || command.length === 0) {
   // This process ends here rather than becoming the binary, and `process.exit`

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -179,10 +180,46 @@ describe('which formatter owns a managed target', () => {
     expect([...BIOME_OWNED_EXTENSIONS].sort()).toEqual(patterns.map((pattern) => pattern.replace('*', '')).sort());
   });
 
+  it('keeps unsupported bytes through the real stdin hook while formatting supported YAML', async () => {
+    const root = await makeConsumerRepo();
+    try {
+      const initialized = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8' });
+      expect(initialized.status, initialized.stderr).toBe(0);
+      const shell = await readFile(join(managedAssetsRoot, 'raw/tooling/direnv/nx-socket-dir.sh'));
+      const template = 'packages/nx-plugin/managed/templates/github/workflows/fixture.yml';
+      const untouched: Record<string, Buffer<ArrayBuffer>> = {
+        'nx-socket-dir.sh': shell,
+        '.envrc': Buffer.from('use    devenv\n'),
+        'bun.lock': Buffer.from('{"lockfileVersion":1}\n'),
+        'fixture.unknown': Buffer.from('unknown    parser\n'),
+        'fixture.wasm': Buffer.from([0, 97, 115, 109, 0, 255]),
+        [template]: Buffer.from('__SMOO_JOBS__\n'),
+      };
+      for (const [target, bytes] of Object.entries(untouched)) {
+        await mkdir(dirname(join(root, target)), { recursive: true });
+        await writeFile(join(root, target), bytes);
+      }
+      const yaml = 'name:    fixture\n';
+      await writeFile(join(root, 'fixture.yml'), yaml);
+      const hook = spawnSync(
+        'git-format-staged',
+        ['--config', GIT_FORMAT_STAGED_CONFIG, '--files', ...Object.keys(untouched), 'fixture.yml'],
+        { cwd: root, encoding: 'utf8' },
+      );
+      expect(hook.status, hook.stdout + hook.stderr).toBe(0);
+      for (const [target, bytes] of Object.entries(untouched))
+        expect(await readFile(join(root, target)), target).toEqual(bytes);
+      expect(await readFile(join(root, 'fixture.yml'), 'utf8')).toBe('name: fixture\n');
+      expect(await readFile(join(root, 'fixture.yml'), 'utf8')).not.toBe(yaml);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('passes content through for targets no Prettier parser claims', async () => {
     const root = await makeConsumerRepo();
     try {
-      // Alejandra owns .nix and the hook leaves .sh to `--ignore-unknown`;
+      // Alejandra owns .nix and no stdin formatter claims .sh;
       // rewriting either here would invent drift rather than remove it.
       const nix = '{...}: {\n    programs.foo.enable   = true;\n}\n';
       const shell = "#!/usr/bin/env bash\nset -euo pipefail\necho    'spaced'\n";

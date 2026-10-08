@@ -74,9 +74,9 @@ fi
 if [ -z "$smoo_nx_socket" ]; then
   case "$(cd "${NX_SOCKET_DIR:-/nonexistent}" >/dev/null 2>&1 && pwd -P)/" in
     "$smoo_nx_checkout"/*) smoo_nx_socket="$NX_SOCKET_DIR" ;;
-    *) smoo_nx_socket="$DEVENV_RUNTIME/nx-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)" ;;
+    *) smoo_nx_socket="$DEVENV_RUNTIME/nx-$(printf '%s' "$smoo_nx_checkout" | cksum | cut -d' ' -f1)" ;;
   esac
 fi
 export NX_SOCKET_DIR="$smoo_nx_socket"
-mkdir -p "$NX_SOCKET_DIR"
+mkdir -p "$NX_SOCKET_DIR" || return $?
 unset smoo_nx_checkout smoo_nx_socket smoo_nx_link

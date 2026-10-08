@@ -190,6 +190,26 @@ describe('nx-socket-dir.sh', () => {
     });
   });
 
+  it('names the same fallback socket through an alias of the same physical checkout', () => {
+    withScratch((scratch) => {
+      const host = hostShell(scratch);
+      const alias = join(scratch.hostRuntime, 'checkout-alias');
+      symlinkSync(scratch.checkout, alias);
+      const entered = spawnSync(
+        'bash',
+        ['-c', 'cd "$1" && . "$2" && printf %s "$NX_SOCKET_DIR"', 'shell', alias, script],
+        {
+          cwd: scratch.checkout,
+          encoding: 'utf8',
+          env: { PATH: process.env.PATH ?? '', DEVENV_RUNTIME: scratch.hostRuntime },
+        },
+      );
+      expect(entered.status, entered.stderr).toBe(0);
+      expect(entered.stderr).toBe('');
+      expect(entered.stdout).toBe(host.NX_SOCKET_DIR);
+    });
+  });
+
   it("keeps a job's socket dir that resolves inside the checkout when cowshed names no runtime link", () => {
     withScratch((scratch) => {
       mkdirSync(scratch.leaf, { recursive: true });

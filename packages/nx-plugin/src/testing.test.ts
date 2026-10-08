@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
-import { mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -105,7 +105,7 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
     // helper processes (watchers, clients) that work in the same root.
     daemon = await startDaemon(abandoned);
 
-    const fresh = await ownedFixtureRoot(suite, 'fresh-');
+    const fresh = await ownedFixtureRoot(tmpdir(), suite, 'fresh-');
 
     expect(await stillRunning(daemon)).toEqual([]);
     expect(await helper.exited).not.toBe(0);
@@ -124,49 +124,67 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
   }
 }, 120_000);
 
-it('stops what works in its own run when the owning process is signalled, then dies of the signal', async () => {
+it('stops what works in every run it owns when the process is signalled, then dies of the signal', async () => {
   const suite = `signal-regression-${process.pid}`;
   const suiteDirectory = join(await realpath(tmpdir()), 'smoothbricks-fixtures', suite);
+  // A second parent for the same suite: the owner holds a run in each, and one signal has to reclaim both.
+  const otherParent = await mkdtemp(join(await realpath(tmpdir()), 'signal-regression-parent-'));
+  const otherSuiteDirectory = join(otherParent, 'smoothbricks-fixtures', suite);
   const script = join(suiteDirectory, 'owner.ts');
   await mkdir(suiteDirectory, { recursive: true });
-  // A detached stand-in for a fixture daemon: its own session, so only the
+  // A detached stand-in for a fixture daemon in each run: its own session, so only the
   // owner's handler, not a process-group signal, can stop it. The interval
   // keeps the owner alive until it is signalled.
   await writeFile(
     script,
     `import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { ownedFixtureRoot } from ${JSON.stringify(join(import.meta.dir, 'testing.ts'))};
-const root = await ownedFixtureRoot(${JSON.stringify(suite)}, 'signalled-');
-const helper = spawn('sleep', ['600'], { cwd: root, detached: true, stdio: 'ignore' });
-helper.unref();
-console.log('READY ' + helper.pid);
+const helpers = [];
+for (const parent of [tmpdir(), ${JSON.stringify(otherParent)}]) {
+  const root = await ownedFixtureRoot(parent, ${JSON.stringify(suite)}, 'signalled-');
+  const helper = spawn('sleep', ['600'], { cwd: root, detached: true, stdio: 'ignore' });
+  helper.unref();
+  helpers.push(helper.pid);
+}
+console.log('READY ' + helpers.join(' '));
 setInterval(() => {}, 1 << 30);
 `,
   );
   const owner = Bun.spawn([process.execPath, script], { stdout: 'pipe', stderr: 'pipe' });
-  let helper = 0;
+  let helpers: number[] = [];
   try {
     const reader = owner.stdout.getReader();
     const decoder = new TextDecoder();
     let printed = '';
-    while (helper === 0) {
+    while (helpers.length === 0) {
       const chunk = await reader.read();
       if (chunk.done) throw new Error(`the owner exited before it was ready: ${printed}`);
       printed += decoder.decode(chunk.value, { stream: true });
-      helper = Number(/^READY (\d+)$/m.exec(printed)?.[1] ?? 0);
+      helpers = /^READY (\d+) (\d+)$/m.exec(printed)?.slice(1).map(Number) ?? [];
     }
-    expect(isRunning(helper)).toBe(true);
+    for (const helper of helpers) {
+      expect(isRunning(helper)).toBe(true);
+    }
+    // One run for each parent, though both name one suite.
+    const runs = [suiteDirectory, otherSuiteDirectory].map((directory) => join(directory, `run-${owner.pid}`));
+    for (const run of runs) {
+      expect(existsSync(run), run).toBe(true);
+    }
 
     owner.kill('SIGTERM');
     await owner.exited;
 
     expect(owner.signalCode, await new Response(owner.stderr).text()).toBe('SIGTERM');
-    expect(await stillRunning([{ pid: helper, ppid: 0, stat: '', command: 'sleep 600' }])).toEqual([]);
-    expect(existsSync(join(suiteDirectory, `run-${owner.pid}`))).toBe(false);
+    expect(await stillRunning(helpers.map((pid) => ({ pid, ppid: 0, stat: '', command: 'sleep 600' })))).toEqual([]);
+    for (const run of runs) {
+      expect(existsSync(run), run).toBe(false);
+    }
   } finally {
-    if (helper !== 0) terminate(helper);
+    for (const helper of helpers) terminate(helper);
     owner.kill('SIGKILL');
     await owner.exited;
     await rm(suiteDirectory, { recursive: true, force: true });
+    await rm(otherParent, { recursive: true, force: true });
   }
 }, 120_000);

@@ -1,30 +1,43 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { rmSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
+import { join } from 'node:path';
+import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_TOKENS_ENV, gatewayCpuBudget, runnerDemand, sizeRunner } from './cpu-tokens.js';
 
 const servers: Server[] = [];
-const sockets: string[] = [];
+const directories: string[] = [];
 
 afterEach(() => {
   for (const server of servers.splice(0)) {
     server.close();
   }
-  for (const socket of sockets.splice(0)) {
-    rmSync(socket, { force: true });
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
-/** A gateway stand-in on a socket under /tmp (sun_path is 104 bytes; macOS links it to /private/tmp) that runs `serve` per client. */
+/**
+ * A socket path in a directory of its own, made in the socket namespace the sandbox admits for Unix
+ * sockets: a literal `/tmp` path binds, but no sandboxed process may connect to it, so a client of it
+ * would see a refusal in place of the absent socket or the gateway the test means.
+ */
+async function socketPath(name: string): Promise<string> {
+  const directory = await ownedSocketDirectory('cpu-', name);
+  directories.push(directory);
+  return join(directory, name);
+}
+
+/** A gateway stand-in on a socket in a directory of its own that runs `serve` per client. */
 async function gateway(serve: (client: Socket) => void): Promise<string> {
-  const socket = `/tmp/smoo-cpu-${process.pid}-${sockets.length}.sock`;
-  rmSync(socket, { force: true });
+  const socket = await socketPath('gw.sock');
   const server = createServer({ allowHalfOpen: true }, serve);
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  server.once('error', reject);
   server.listen(socket, resolve);
   await promise;
+  server.off('error', reject);
   servers.push(server);
-  sockets.push(socket);
   return socket;
 }
 
@@ -115,7 +128,7 @@ describe('cowshed CPU budget client', () => {
   });
 
   it('runs unbudgeted, said as absent, when no gateway listens', async () => {
-    const grant = await gatewayCpuBudget(`/tmp/smoo-cpu-${process.pid}-none.sock`).take(4, '/w', 'x');
+    const grant = await gatewayCpuBudget(await socketPath('none.sock')).take(4, '/w', 'x');
     expect(grant.granted === false && grant.cause).toBe('absent');
   });
 
