@@ -1591,6 +1591,43 @@ index 4e64afa4fb..14723620cb 100644
  }
  function constructLifeCycles(lifeCycle, taskGraph, nxJson, skipNxCache) {
      const lifeCycles = [];
+diff --git a/dist/src/tasks-runner/create-task-graph.js b/dist/src/tasks-runner/create-task-graph.js
+--- a/dist/src/tasks-runner/create-task-graph.js
++++ b/dist/src/tasks-runner/create-task-graph.js
+@@ -77,6 +77,32 @@ class ProcessTasks {
+                 ];
+             }
+         }
++        // Dummy-cycle normalization can disconnect tasks found during expansion.
++        const taskIds = Object.keys(this.tasks);
++        const pending = Object.keys(initialTasks);
++        const reachable = new Set(pending);
++        while (pending.length > 0) {
++            const taskId = pending.pop();
++            for (const dependency of this.dependencies[taskId]) {
++                if (!reachable.has(dependency)) {
++                    reachable.add(dependency);
++                    pending.push(dependency);
++                }
++            }
++            for (const dependency of this.continuousDependencies[taskId]) {
++                if (!reachable.has(dependency)) {
++                    reachable.add(dependency);
++                    pending.push(dependency);
++                }
++            }
++        }
++        for (const taskId of taskIds) {
++            if (!reachable.has(taskId)) {
++                delete this.tasks[taskId];
++                delete this.dependencies[taskId];
++                delete this.continuousDependencies[taskId];
++            }
++        }
+-        return Object.keys(this.tasks).filter((d) => this.dependencies[d].length === 0 &&
++        return taskIds.filter((d) => reachable.has(d) && this.dependencies[d].length === 0 &&
+             this.continuousDependencies[d].length === 0);
+     }
 diff --git a/dist/src/tasks-runner/task-graph-utils.d.ts b/dist/src/tasks-runner/task-graph-utils.d.ts
 index 2ba00c254450c7d3b93e288b1f0bb28361ef8cf3..5f76eee85731e34fbf1edc4ebc0c7593dd2abdbd 100644
 --- a/dist/src/tasks-runner/task-graph-utils.d.ts

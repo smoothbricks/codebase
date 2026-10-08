@@ -5,12 +5,26 @@ Patches this repository applies to its dependencies. `bun install` applies the r
 and packs the result as an immutable GitHub release, which the root `overrides.nx` installs. The Patched Nx workflow
 builds that release twice, byte for byte, and verifies the published asset against `bun.lock`.
 
+## Requested task closure after dummy normalization
+
+The `create-task-graph` hunk retains only the caller's initial tasks and the tasks reachable from them through the
+normalized regular or continuous dependency edges. Expansion may discover a real producer behind a dummy cycle that
+normalization later removes. Leaving that producer in `tasks` makes it an unrelated new root, which Nx executes even
+though no requested task depends on it. On a model-command graph, fourteen such tasks pulled in complete role and native
+builds; no dependency of the nineteen requested-closure tasks was changed.
+
+The selection happens at Nx's graph-construction owner, not in a consumer cache probe or launcher. Explicitly requested
+tasks, genuine producer edges, continuous-only dependencies and real task cycles remain intact. The existing
+`nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership. Drop each carried hunk only when the
+installed upstream version contains its respective repair, retaining the regressions.
+
 ## Upstream PR draft: Nx `findCycles`
 
 Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`
 (2026-10-06), whose `findCycles`, `filterDummyTasks` and `getNonDummyDeps` have the logic of Nx 23.2.1's. This
 repository carries the fix as the `task-graph-utils` hunk of `nx@23.2.1.patch`;
-`packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here and goes when the Nx in use contains the fix.
+`packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here. Drop that patch hunk once the installed Nx
+contains the fix, retaining the regression.
 
 ### Title
 

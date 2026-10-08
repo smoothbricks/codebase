@@ -46,6 +46,10 @@ const UPSTREAM = [
 const NOT_YET_UPSTREAM = [
   ['task graph', 'give a task the same dependencies whichever other tasks the run asks for (`findCycles`)'],
   [
+    'task graph',
+    'retain requested tasks and their real regular or continuous dependencies after dummy-cycle normalization',
+  ],
+  [
     'cache restore',
     'stamp each restored output with the time of the restore, not the time its cache entry was written',
   ],
