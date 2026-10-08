@@ -2,14 +2,15 @@ import { expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { readModulePackageJson } from 'nx/src/utils/package-json.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the workspace-resolution hunk of `patches/nx@23.2.1.patch`, the local build of nrwl/nx#37272. The
- * repository installs Nx from an immutable tarball, so Bun links it from its global store
- * (`~/.bun/install/cache/links`), next to nothing but Nx's own dependencies. Nx 23.2.1 loads `typescript` with a
+ * fixture selects the lockfile's immutable Bun-store install, independent of a developer-linked local product.
+ * It sits next to nothing but Nx's own dependencies. Nx 23.2.1 loads `typescript` with a
  * plain `require`, which from there finds nothing: its dependency analysis then skips every TypeScript import and
  * the graph loses each edge one project's source import makes to another, without a warning (12 of this
  * repository's 44 edges). The patched Nx resolves `typescript` from the workspace first. Release version actions
@@ -21,16 +22,16 @@ import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 const repositoryRoot = join(import.meta.dir, '../../..');
 
 it('keeps the source-import edges when Nx is linked from the global store', async () => {
-  const nx = await realpath(join(repositoryRoot, 'node_modules/nx'));
-  // The regression only exists for an Nx linked from Bun's store, outside this checkout (wherever the install
-  // cache lives on this host); a project-local Nx resolves typescript by walking up to the repository's
-  // node_modules, and this test would prove nothing.
-  const checkout = await realpath(repositoryRoot);
-  expect(nx.startsWith(`${checkout}/`), `${nx} is inside the checkout`).toBe(false);
+  const nx = await realpath(dirname(readModulePackageJson('nx', [join(repositoryRoot, 'node_modules/.bun')]).path));
+  const store = await realpath(execFileSync('bun', ['pm', 'cache'], { cwd: repositoryRoot, encoding: 'utf8' }).trim());
+  if (!nx.startsWith(`${store}/`)) throw new Error(`the controlled fixture has no locked immutable Nx package: ${nx}`);
+  const typescript = dirname(readModulePackageJson('typescript', [repositoryRoot]).path);
 
   const root = await realpath(await mkdtemp(join(tmpdir(), 'nx-store-resolution-')));
   try {
-    await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+    await mkdir(join(root, 'node_modules'));
+    await symlink(nx, join(root, 'node_modules/nx'), 'dir');
+    await symlink(typescript, join(root, 'node_modules/typescript'), 'dir');
     await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
     await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'store-resolution-fixture', private: true }));
     // The fixture's root package.json names no @nx/* package, so Nx analyzes source files only when told to.
@@ -52,7 +53,7 @@ it('keeps the source-import edges when Nx is linked from the global store', asyn
     execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
 
     const graphFile = join(root, 'graph.json');
-    const child = spawn('node', [join(repositoryRoot, 'node_modules/.bin/nx'), 'graph', `--file=${graphFile}`], {
+    const child = spawn('node', [join(nx, 'dist/bin/nx.js'), 'graph', `--file=${graphFile}`], {
       cwd: root,
       env: fixtureNxEnv(root),
       detached: process.platform !== 'win32',
