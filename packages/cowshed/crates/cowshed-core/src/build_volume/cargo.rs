@@ -1,8 +1,8 @@
-//! Cargo's state inside a build volume: the lock a running Cargo holds on each profile directory
-//! of a target directory for its whole build (`<target>/debug/.cargo-lock`, and
-//! `<target>/<triple>/debug/.cargo-lock` for a cross build). Taking the same lock is how cowshed
-//! knows no Cargo writes the volume, and how it keeps one from starting while it clones it
-//! (16_build_volumes.md, "Targets and seeds").
+//! Cargo holds a shared `.cargo-lock` in each profile directory for its whole build
+//! (`<target>/debug/.cargo-lock`, or `<target>/<triple>/debug/.cargo-lock`). An exclusive
+//! nonblocking hold admits a seed capture only when those existing profiles are idle. It cannot
+//! fence creation of a new profile; the detached-image capture excludes filesystem writers
+//! after these descriptors close (16_build_volumes.md, "Targets and seeds").
 
 use std::fs::{self, File, TryLockError};
 use std::io;
@@ -17,10 +17,10 @@ pub const BUILD_LOCK: &str = ".cargo-lock";
 /// `<triple>/<profile>`, or a nested target directory's `<triple>/<profile>`.
 const PROFILE_DEPTH: usize = 3;
 
-/// A volume's Cargo build locks, held by this process until dropped. While they are held no
-/// Cargo build of the volume runs, and one that starts waits for them ("Blocking waiting for
-/// file lock on build directory"). Fenced (`fork_lock`): Cargo gets them back when this is
-/// dropped, whatever this process is spawning.
+/// The existing profile locks enumerated for one admission check. They exclude builds in those
+/// profiles only, not profiles created later. Close them before sealing the volume so our own
+/// descriptors do not prevent unmount. Fenced (`fork_lock`): they close before a concurrent
+/// spawn can carry their lifetime into a child.
 #[must_use]
 pub struct Held {
     _locks: Vec<Fenced<File>>,
@@ -131,7 +131,7 @@ mod tests {
         let debug = lock_at(&root, "target/debug");
         let release = lock_at(&root, "target/release");
         let build = File::open(&release).unwrap();
-        build.lock().unwrap();
+        build.lock_shared().unwrap();
         assert!(matches!(hold(&root, &state()).unwrap(), Err(lock) if lock == release));
         // The debug lock taken before the refusal was let go.
         let other = File::open(&debug).unwrap();

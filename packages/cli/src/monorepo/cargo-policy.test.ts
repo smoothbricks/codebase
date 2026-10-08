@@ -495,6 +495,24 @@ describe('cargo toolchain identity policy', () => {
     ]);
   });
 
+  it('enforces the pin on managed NAPI entry commands instead of treating the shell wrapper as non-Cargo', async () => {
+    for (const command of [
+      'sh ../../tooling/napi-build.sh x86_64-unknown-linux-gnu napi --bin cowshed',
+      'sh tooling/napi-build.sh aarch64-apple-darwin packages/native/node_modules/.bin/napi --platform',
+    ]) {
+      const missingPin: ProjectTargets = {
+        ...cargoLint(['rustWorkspace']),
+        targetOptions: new Map([['cargo-lint', { command }]]),
+      };
+      expect(await checkToolchain({ 'nx.json': '{}\n' }, [missingPin])).toMatchObject({ failures: 1 });
+      const pinned: ProjectTargets = {
+        ...missingPin,
+        targetInputs: new Map([['cargo-lint', ['cargoToolchain']]]),
+      };
+      expect(await checkToolchain({ 'nx.json': '{}\n' }, [pinned])).toMatchObject({ failures: 0 });
+    }
+  });
+
   it('accepts the pin reached directly, through a named input, or by the name inference defines', async () => {
     const viaNamedInput = JSON.stringify({
       namedInputs: { rustWorkspace: ['{workspaceRoot}/Cargo.toml', '{workspaceRoot}/tooling/direnv/devenv.lock'] },

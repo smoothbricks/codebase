@@ -30,7 +30,16 @@
 //! already exists is refused rather than reused. A lookup -- a restarted controller finding the
 //! job its predecessor admitted -- reaches only cgroups of its own incarnation and accepts one only
 //! if it is still the cgroup that admission recorded.
+//!
+//! # Counters
+//!
+//! The job's totals are its cgroup's own: CPU from `cpu.stat`, charged memory from
+//! `memory.current` and `memory.peak`, storage I/O from `io.stat`. They count every process that
+//! ever ran in the job, so a descendant reaped before any observer looked still counts. A counter
+//! the kernel does not provide is an error that names it, never a zero. Retirement first collects
+//! the final counters, then removes the cgroup.
 
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::fs;
@@ -41,7 +50,10 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::JobId;
-use crate::api::resources::{CpuMicros, ResourceUnitError};
+use crate::api::resources::{
+    ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, ResourceUnitError, StorageIoBytes,
+    StorageIoTotals,
+};
 use crate::metadata::WorkspaceIncarnation;
 
 /// Where the unified cgroup hierarchy is mounted.
@@ -68,6 +80,9 @@ impl Controller {
     /// Every controller job accounting needs: `cpu.stat`, `memory.current`/`memory.peak` and
     /// `io.stat` exist only where these are enabled.
     pub const ACCOUNTING: [Self; 3] = [Self::Cpu, Self::Memory, Self::Io];
+
+    /// The fixed request for [`Self::ACCOUNTING`], kept in step by the controller-request test.
+    const ACCOUNTING_REQUEST: &str = "+cpu +memory +io";
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -136,6 +151,8 @@ pub enum CgroupError {
     Populated { path: PathBuf },
     #[error("{path}: {detail}")]
     Malformed { path: PathBuf, detail: String },
+    #[error("{path} does not exist: this kernel or this cgroup's controllers do not provide it")]
+    CounterUnavailable { path: PathBuf },
     #[error("{path} has no {counter} counter")]
     MissingCounter {
         path: PathBuf,
@@ -152,9 +169,27 @@ pub enum CgroupError {
 
 type Result<T, E = CgroupError> = std::result::Result<T, E>;
 
+/// The error of `call` on `path`, which is copied only once the call has failed.
 fn failed(call: &'static str, path: &Path) -> impl FnOnce(io::Error) -> CgroupError {
-    let path = path.to_path_buf();
-    move |source| CgroupError::Io { call, path, source }
+    move |source| CgroupError::Io {
+        call,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The error of `call` on `file` in the cgroup `directory`, joined only once the call has
+/// failed.
+fn failed_in(
+    call: &'static str,
+    directory: &Path,
+    file: &'static str,
+) -> impl FnOnce(io::Error) -> CgroupError {
+    move |source| CgroupError::Io {
+        call,
+        path: directory.join(file),
+        source,
+    }
 }
 
 fn c_path(path: &Path) -> Result<CString> {
@@ -298,16 +333,14 @@ fn make_directory(path: &Path) -> Result<bool> {
 
 /// Distribute the accounting controllers from `path` to its children.
 fn enable_accounting(path: &Path) -> Result<()> {
-    let available = fs::read_to_string(path.join("cgroup.controllers"))
-        .map_err(failed("read", &path.join("cgroup.controllers")))?;
+    let available = fs::read_to_string(path.join("cgroup.controllers")).map_err(failed_in(
+        "read",
+        path,
+        "cgroup.controllers",
+    ))?;
     require_controllers(path, &available, &Controller::ACCOUNTING)?;
-    let request = Controller::ACCOUNTING
-        .iter()
-        .map(|controller| format!("+{controller}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     let control = path.join("cgroup.subtree_control");
-    fs::write(&control, request).map_err(failed("write", &control))
+    fs::write(&control, Controller::ACCOUNTING_REQUEST).map_err(failed("write", &control))
 }
 
 /// The controller's authority over the cgroup subtree delegated to it.
@@ -358,8 +391,11 @@ impl CgroupAuthority {
         for file in ["", "cgroup.procs", "cgroup.subtree_control"] {
             writable(&root, file)?;
         }
-        let available = fs::read_to_string(root.join("cgroup.controllers"))
-            .map_err(failed("read", &root.join("cgroup.controllers")))?;
+        let available = fs::read_to_string(root.join("cgroup.controllers")).map_err(failed_in(
+            "read",
+            &root,
+            "cgroup.controllers",
+        ))?;
         require_controllers(&root, &available, &Controller::ACCOUNTING)?;
         let leaf = root.join(CONTROLLER_LEAF);
         make_directory(&leaf)?;
@@ -487,7 +523,11 @@ impl IncarnationCgroups {
         let mut identities = Vec::new();
         for entry in entries {
             let entry = entry.map_err(failed("readdir", &self.path))?;
-            let file_type = entry.file_type().map_err(failed("stat", &entry.path()))?;
+            let file_type = entry.file_type().map_err(|source| CgroupError::Io {
+                call: "stat",
+                path: entry.path(),
+                source,
+            })?;
             if !file_type.is_dir() {
                 continue;
             }
@@ -525,11 +565,14 @@ pub struct JobCgroup {
 
 impl JobCgroup {
     fn open(identity: JobCgroupIdentity, path: PathBuf, directory: OwnedFd) -> Result<Self> {
-        let available = read_at(&directory, c"cgroup.controllers")
-            .map_err(failed("read", &path.join("cgroup.controllers")))?;
+        let available = read_at(&directory, c"cgroup.controllers").map_err(failed_in(
+            "read",
+            &path,
+            "cgroup.controllers",
+        ))?;
         require_controllers(&path, &available, &Controller::ACCOUNTING)?;
         let procs = open_at(directory.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY)
-            .map_err(failed("open", &path.join("cgroup.procs")))?;
+            .map_err(failed_in("open", &path, "cgroup.procs"))?;
         Ok(Self {
             identity,
             path,
@@ -548,14 +591,27 @@ impl JobCgroup {
 
     /// Whether the cgroup or any descendant holds a live process.
     pub fn populated(&self) -> Result<bool> {
-        let events = read_at(&self.directory, c"cgroup.events")
-            .map_err(failed("read", &self.path.join("cgroup.events")))?;
+        let events = read_at(&self.directory, c"cgroup.events").map_err(failed_in(
+            "read",
+            &self.path,
+            "cgroup.events",
+        ))?;
         populated(&self.path, &events)
     }
 
     /// The job's CPU so far: every process that has run in it, live or reaped.
     pub fn cpu(&self) -> Result<CgroupCpu> {
         read_cpu(&self.directory, &self.path)
+    }
+
+    /// What the job is charged now and the most it was ever charged.
+    pub fn charged_memory(&self) -> Result<ChargedMemoryUsage> {
+        read_charged_memory(&self.directory, &self.path)
+    }
+
+    /// The bytes the job has moved to and from storage so far ([`read_storage_io`]).
+    pub fn storage_io(&self) -> Result<StorageIoTotals> {
+        read_storage_io(&self.directory, &self.path)
     }
 
     /// The means for one process to enter this cgroup before it executes anything.
@@ -652,11 +708,26 @@ impl TerminalJobCgroup {
         read_cpu(&self.directory, &self.path)
     }
 
+    /// What the job is charged after its last process ended -- the cache it filled stays
+    /// charged -- and the most it was ever charged.
+    pub fn charged_memory(&self) -> Result<ChargedMemoryUsage> {
+        read_charged_memory(&self.directory, &self.path)
+    }
+
+    /// The bytes the job moved to and from storage over its life ([`read_storage_io`]).
+    pub fn storage_io(&self) -> Result<StorageIoTotals> {
+        read_storage_io(&self.directory, &self.path)
+    }
+
     /// Collect the job's final counters, then remove the cgroup while its name still holds the
     /// cgroup admission created. A counter that cannot be read leaves the cgroup in place: once
     /// it is gone, nothing could ever read it again.
     pub fn retire(self) -> Result<JobCgroupTotals> {
-        let totals = JobCgroupTotals { cpu: self.cpu()? };
+        let totals = JobCgroupTotals {
+            cpu: self.cpu()?,
+            charged_memory: self.charged_memory()?,
+            storage_io: self.storage_io()?,
+        };
         let current = open_directory(&self.path)?;
         let found = cgroup_id(&current).map_err(failed("fstat", &self.path))?;
         if found != self.identity.cgroup_id {
@@ -676,6 +747,8 @@ impl TerminalJobCgroup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobCgroupTotals {
     pub cpu: CgroupCpu,
+    pub charged_memory: ChargedMemoryUsage,
+    pub storage_io: StorageIoTotals,
 }
 
 /// A job cgroup's CPU as its `cpu.stat` counts it: every process that ran in the cgroup or
@@ -692,6 +765,221 @@ fn read_cpu(directory: &OwnedFd, cgroup: &Path) -> Result<CgroupCpu> {
     let path = cgroup.join("cpu.stat");
     let text = read_at(directory, c"cpu.stat").map_err(failed("read", &path))?;
     parse_cpu_stat(&path, &text)
+}
+
+/// A block device as the kernel numbers it.
+type DeviceNumber = (u32, u32);
+
+/// One device line of `io.stat`: what the cgroup moved through that device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceIo {
+    device: DeviceNumber,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+/// The job's storage I/O from its `io.stat`: the bytes its cgroup and every cgroup beneath it
+/// submitted to block devices, read and written. The file is already hierarchical, so no
+/// descendant cgroup is ever added to it. A bio passed down a device stack (device-mapper, md)
+/// is counted on every device it passes, so each transfer is counted once, at the bottom of its
+/// stack: a listed device that sits on another listed device is left out. Writes count when
+/// they reach a device -- a page the job dirtied is charged to it at writeback -- and a read
+/// the page cache served reaches none. An empty `io.stat` is the kernel's statement that the
+/// cgroup moved no byte; a missing one is unavailable.
+fn read_storage_io(directory: &OwnedFd, cgroup: &Path) -> Result<StorageIoTotals> {
+    let path = cgroup.join("io.stat");
+    let text = read_at(directory, c"io.stat").map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            CgroupError::CounterUnavailable { path: path.clone() }
+        } else {
+            CgroupError::Io {
+                call: "read",
+                path: path.clone(),
+                source,
+            }
+        }
+    })?;
+    let devices = parse_io_stat(&path, &text)?;
+    aggregate_storage_io(&path, &devices, lower_devices)
+}
+
+fn parse_io_stat(path: &Path, text: &str) -> Result<Vec<DeviceIo>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let malformed = |detail: String| CgroupError::Malformed {
+                path: path.to_path_buf(),
+                detail,
+            };
+            let mut fields = line.split_whitespace();
+            let device = fields
+                .next()
+                .and_then(|device| device.split_once(':'))
+                .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+                .ok_or_else(|| malformed(format!("{line:?} names no MAJ:MIN device")))?;
+            let counter = |name: &'static str| -> Result<u64> {
+                let value = fields
+                    .clone()
+                    .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+                    .ok_or_else(|| CgroupError::MissingCounter {
+                        path: path.to_path_buf(),
+                        counter: name,
+                    })?;
+                value
+                    .parse()
+                    .map_err(|_| malformed(format!("{name}={value:?} is not a count")))
+            };
+            Ok(DeviceIo {
+                device,
+                read_bytes: counter("rbytes")?,
+                write_bytes: counter("wbytes")?,
+            })
+        })
+        .collect()
+}
+
+/// Sum the devices of `devices` that no other listed device sits beneath, `lower` naming the
+/// devices one device is stacked directly on.
+fn aggregate_storage_io(
+    path: &Path,
+    devices: &[DeviceIo],
+    lower: impl Fn(DeviceNumber) -> Result<Vec<DeviceNumber>>,
+) -> Result<StorageIoTotals> {
+    let listed: BTreeSet<DeviceNumber> = devices.iter().map(|device| device.device).collect();
+    let (mut read, mut written) = (0_u128, 0_u128);
+    for device in devices {
+        let mut beneath = lower(device.device)?;
+        let mut seen = BTreeSet::new();
+        let mut stacked = false;
+        while let Some(next) = beneath.pop() {
+            if !seen.insert(next) {
+                continue;
+            }
+            if listed.contains(&next) {
+                stacked = true;
+                break;
+            }
+            beneath.extend(lower(next)?);
+        }
+        if !stacked {
+            read += u128::from(device.read_bytes);
+            written += u128::from(device.write_bytes);
+        }
+    }
+    let bytes = |counter: &'static str, value: u128| {
+        u64::try_from(value)
+            .map_err(|_| ResourceUnitError::Inexact {
+                unit: "ioBytes",
+                value,
+            })
+            .and_then(StorageIoBytes::new)
+            .map_err(|source| CgroupError::OutOfRange {
+                path: path.to_path_buf(),
+                counter,
+                source,
+            })
+    };
+    Ok(StorageIoTotals {
+        read_bytes: bytes("rbytes", read)?,
+        write_bytes: bytes("wbytes", written)?,
+    })
+}
+
+/// The devices `device` is stacked directly on, from its sysfs `slaves` directory: none for a
+/// device that sits on no other.
+fn lower_devices((major, minor): DeviceNumber) -> Result<Vec<DeviceNumber>> {
+    let slaves = PathBuf::from(format!("/sys/dev/block/{major}:{minor}/slaves"));
+    let entries = match fs::read_dir(&slaves) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A device sysfs does not list at all is gone, which is not the same as a device on
+            // nothing: only an existing device without a `slaves` directory is the latter.
+            let device = slaves.parent().unwrap_or(&slaves);
+            return match fs::metadata(device) {
+                Ok(_) => Ok(Vec::new()),
+                Err(source) => Err(CgroupError::Io {
+                    call: "stat",
+                    path: device.to_path_buf(),
+                    source,
+                }),
+            };
+        }
+        Err(source) => {
+            return Err(CgroupError::Io {
+                call: "readdir",
+                path: slaves,
+                source,
+            });
+        }
+    };
+    let mut lower = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(failed("readdir", &slaves))?;
+        let dev = entry.path().join("dev");
+        let text = fs::read_to_string(&dev).map_err(failed("read", &dev))?;
+        let number = text
+            .trim()
+            .split_once(':')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .ok_or_else(|| CgroupError::Malformed {
+                path: dev.clone(),
+                detail: format!("{text:?} is no MAJ:MIN device"),
+            })?;
+        lower.push(number);
+    }
+    Ok(lower)
+}
+
+/// `memory.current`, then `memory.peak`: read in that order the peak, a high watermark that only
+/// rises, holds at least the current charge. Both are opened read-only, since a write to a
+/// `memory.peak` descriptor resets the watermark that descriptor reports.
+fn read_charged_memory(directory: &OwnedFd, cgroup: &Path) -> Result<ChargedMemoryUsage> {
+    let current = single_value(directory, cgroup, c"memory.current")?;
+    let peak = single_value(directory, cgroup, c"memory.peak")?;
+    if peak < current {
+        return Err(CgroupError::Malformed {
+            path: cgroup.join("memory.peak"),
+            detail: format!("peak {peak} lies below the current charge {current} read before it"),
+        });
+    }
+    let bytes = |name: &'static str, value: u64| {
+        ChargedMemoryBytes::new(value).map_err(|source| CgroupError::OutOfRange {
+            path: cgroup.join(name),
+            counter: name,
+            source,
+        })
+    };
+    Ok(ChargedMemoryUsage {
+        current_bytes: bytes("memory.current", current)?,
+        peak_bytes: bytes("memory.peak", peak)?,
+    })
+}
+
+/// A cgroup file that holds one count. One the kernel does not provide is unavailable, never
+/// zero.
+fn single_value(directory: &OwnedFd, cgroup: &Path, name: &CStr) -> Result<u64> {
+    let path = cgroup.join(OsStr::from_bytes(name.to_bytes()));
+    let text = read_at(directory, name).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            CgroupError::CounterUnavailable { path: path.clone() }
+        } else {
+            CgroupError::Io {
+                call: "read",
+                path: path.clone(),
+                source,
+            }
+        }
+    })?;
+    parse_single_value(&path, &text)
+}
+
+fn parse_single_value(path: &Path, text: &str) -> Result<u64> {
+    text.trim_end_matches('\n')
+        .parse()
+        .map_err(|_| CgroupError::Malformed {
+            path: path.to_path_buf(),
+            detail: format!("{text:?} is not a count"),
+        })
 }
 
 fn parse_cpu_stat(path: &Path, text: &str) -> Result<CgroupCpu> {
@@ -748,6 +1036,35 @@ mod tests {
     }
 
     #[test]
+    fn the_accounting_request_enables_exactly_the_accounting_controllers() {
+        let expected = Controller::ACCOUNTING
+            .iter()
+            .map(|controller| format!("+{controller}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(Controller::ACCOUNTING_REQUEST, expected);
+    }
+
+    #[test]
+    fn failed_calls_retain_the_call_path_and_source() {
+        let path = Path::new("/sys/fs/cgroup/job-1");
+        let error = failed("open", path)(io::Error::from_raw_os_error(libc::EACCES));
+        assert!(matches!(
+            error,
+            CgroupError::Io { call: "open", path: failed_path, source }
+                if failed_path == path && source.raw_os_error() == Some(libc::EACCES)
+        ));
+        let error =
+            failed_in("read", path, "cgroup.events")(io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(matches!(
+            error,
+            CgroupError::Io { call: "read", path: failed_path, source }
+                if failed_path == path.join("cgroup.events")
+                    && source.raw_os_error() == Some(libc::ENOENT)
+        ));
+    }
+
+    #[test]
     fn a_missing_controller_is_named_never_assumed() {
         let path = Path::new("/sys/fs/cgroup/x");
         require_controllers(path, "cpuset cpu io memory pids\n", &Controller::ACCOUNTING)
@@ -781,6 +1098,134 @@ mod tests {
             populated(path, "populated 2\n"),
             Err(CgroupError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn every_device_line_names_both_byte_counters() {
+        let path = Path::new("/sys/fs/cgroup/x/io.stat");
+        let stat = "259:3 rbytes=811008 wbytes=0 rios=61 wios=0 dbytes=0 dios=0\n\
+                    259:0 rbytes=995328 wbytes=4096 rios=76 wios=1 dbytes=0 dios=0\n";
+        assert_eq!(
+            parse_io_stat(path, stat).expect("two devices"),
+            [
+                DeviceIo {
+                    device: (259, 3),
+                    read_bytes: 811_008,
+                    write_bytes: 0
+                },
+                DeviceIo {
+                    device: (259, 0),
+                    read_bytes: 995_328,
+                    write_bytes: 4096
+                },
+            ]
+        );
+        assert_eq!(parse_io_stat(path, "").expect("no I/O yet"), []);
+        // Operation counts never stand in for a byte counter.
+        assert!(matches!(
+            parse_io_stat(path, "8:0 rbytes=1 rios=1 wios=1\n"),
+            Err(CgroupError::MissingCounter {
+                counter: "wbytes",
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_io_stat(path, "8:0 rbytesx=1 rbytes=2 wbytes=3\n")
+                .expect("a longer key is another counter")[0]
+                .read_bytes,
+            2
+        );
+        assert!(matches!(
+            parse_io_stat(path, "sda rbytes=1 wbytes=1\n"),
+            Err(CgroupError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stacked_transfer_counts_once_at_the_bottom() {
+        let path = Path::new("/sys/fs/cgroup/x/io.stat");
+        let device = |device, read_bytes, write_bytes| DeviceIo {
+            device,
+            read_bytes,
+            write_bytes,
+        };
+        // dm-0 (253:0) sits on md0 (9:0), which sits on two disks; dm-1 (253:1) on nvme (259:0).
+        let lower = |number: DeviceNumber| -> Result<Vec<DeviceNumber>> {
+            Ok(match number {
+                (253, 0) => vec![(9, 0)],
+                (9, 0) => vec![(8, 0), (8, 16)],
+                (253, 1) => vec![(259, 0)],
+                _ => Vec::new(),
+            })
+        };
+        let totals = |devices: &[DeviceIo]| {
+            let totals = aggregate_storage_io(path, devices, lower).expect("totals");
+            (totals.read_bytes.get(), totals.write_bytes.get())
+        };
+        // The whole stack is listed: only the two disks count.
+        assert_eq!(
+            totals(&[
+                device((253, 0), 100, 10),
+                device((9, 0), 100, 10),
+                device((8, 0), 50, 5),
+                device((8, 16), 50, 5),
+            ]),
+            (100, 10)
+        );
+        // An upper device whose lower device is not listed is the bottom of what was seen.
+        assert_eq!(totals(&[device((253, 1), 7, 3)]), (7, 3));
+        // Unrelated disks add up.
+        assert_eq!(
+            totals(&[device((8, 0), 1, 2), device((259, 0), 3, 4)]),
+            (4, 6)
+        );
+        let failing = |_: DeviceNumber| -> Result<Vec<DeviceNumber>> {
+            Err(CgroupError::Malformed {
+                path: PathBuf::from("/sys/dev/block/8:0/slaves"),
+                detail: "unreadable".to_owned(),
+            })
+        };
+        assert!(aggregate_storage_io(path, &[device((8, 0), 1, 1)], failing).is_err());
+    }
+
+    #[test]
+    fn a_charge_is_one_count_and_nothing_else() {
+        let path = Path::new("/sys/fs/cgroup/x/memory.current");
+        assert_eq!(
+            parse_single_value(path, "7329304576\n").expect("a count"),
+            7_329_304_576
+        );
+        for text in ["", "\n", "max\n", "-1\n", "1 2\n"] {
+            assert!(
+                matches!(
+                    parse_single_value(path, text),
+                    Err(CgroupError::Malformed { .. })
+                ),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A directory without the memory controller's files -- here an ordinary one -- reports the
+    /// counter unavailable by name rather than a zero charge.
+    #[test]
+    fn a_missing_memory_counter_is_unavailable_not_zero() {
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-job-cgroup-no-memory-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("scratch directory");
+        let opened = open_directory(&directory).expect("open");
+        let missing = read_charged_memory(&opened, &directory);
+        fs::remove_dir(&directory).expect("remove scratch directory");
+        assert!(
+            matches!(
+                missing,
+                Err(CgroupError::CounterUnavailable { ref path })
+                    if path == &directory.join("memory.current")
+            ),
+            "{missing:?}"
+        );
     }
 
     #[test]

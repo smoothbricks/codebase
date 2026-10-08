@@ -28,6 +28,8 @@ pub enum ResourceUnitError {
         "{unit} {value} exceeds {MAX_EXACT_INTEGER} in magnitude, the largest every projection holds exactly"
     )]
     InexactSigned { unit: &'static str, value: i128 },
+    #[error("a sample interval must be at least one millisecond")]
+    ZeroInterval,
 }
 
 /// CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
@@ -217,6 +219,41 @@ pub enum JobAccounting {
         /// converted into bytes.
         io: Option<StorageIoTotals>,
     },
+}
+
+/// Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel
+/// memory together. Never resident memory: cache a job filled is charged to it while no process
+/// of it maps a page.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ChargedMemoryBytes(u64);
+
+impl ChargedMemoryBytes {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("chargedBytes", u128::from(value)).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ChargedMemoryBytes {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ChargedMemoryBytes> for u64 {
+    fn from(value: ChargedMemoryBytes) -> Self {
+        value.0
+    }
 }
 
 /// Elapsed wall time since the job's first owned process spawned, in microseconds.
@@ -553,6 +590,15 @@ pub struct JobVolumeUsage {
     pub build: Option<VolumeUsage>,
 }
 
+/// A cgroup's charged memory: what it is charged now, and the most it was ever charged. The peak
+/// is the kernel's own high watermark, read without resetting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChargedMemoryUsage {
+    pub current_bytes: ChargedMemoryBytes,
+    pub peak_bytes: ChargedMemoryBytes,
+}
+
 /// What a job's processes cost, observed at `sampled_at`. A sample exists only once the job owns
 /// a process: its shell activation on a cold host, otherwise its command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -602,6 +648,49 @@ impl JobResourceSample {
     }
 }
 
+/// How often a progress subscriber is sent a job's sample, in whole milliseconds: positive, and
+/// within the bound every projection holds exactly.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>"
+    )
+)]
+pub struct SampleInterval(u64);
+
+impl SampleInterval {
+    pub fn new(millis: u64) -> Result<Self, ResourceUnitError> {
+        match exact("everyMs", u128::from(millis))? {
+            0 => Err(ResourceUnitError::ZeroInterval),
+            millis => Ok(Self(millis)),
+        }
+    }
+
+    pub const fn millis(self) -> u64 {
+        self.0
+    }
+
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0)
+    }
+}
+
+impl TryFrom<u64> for SampleInterval {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SampleInterval> for u64 {
+    fn from(value: SampleInterval) -> Self {
+        value.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -646,6 +735,23 @@ mod tests {
             assert!(serde_json::from_str::<CpuMicros>(&json).is_err());
             assert!(serde_json::from_str::<ResidentBytes>(&json).is_err());
             assert!(serde_json::from_str::<StorageIoBytes>(&json).is_err());
+        }
+    }
+
+    #[test]
+    fn a_sample_interval_is_positive_and_exact() {
+        for millis in [1, MAX_EXACT_INTEGER] {
+            let interval = SampleInterval::new(millis).expect("in range");
+            assert_eq!(interval.duration(), Duration::from_millis(millis));
+            assert_eq!(
+                serde_json::from_str::<SampleInterval>(&millis.to_string()).ok(),
+                Some(interval)
+            );
+        }
+        assert_eq!(SampleInterval::new(0), Err(ResourceUnitError::ZeroInterval));
+        for millis in [0, MAX_EXACT_INTEGER + 1] {
+            assert!(SampleInterval::new(millis).is_err());
+            assert!(serde_json::from_str::<SampleInterval>(&millis.to_string()).is_err());
         }
     }
 

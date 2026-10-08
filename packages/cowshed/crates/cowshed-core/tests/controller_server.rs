@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::operations::{Lane, OPERATIONS, OperationRequest, Scope};
 use cowshed_core::api::server::{
-    ConnectionAuthority, HANDSHAKE_VERSION, MAX_BINARY_FRAME_BYTES, MAX_JSON_FRAME_BYTES,
-    RouterHandle, RouterResponse, serve_controller_connection,
+    ConnectionAuthority, EventSource, HANDSHAKE_VERSION, MAX_BINARY_FRAME_BYTES,
+    MAX_JSON_FRAME_BYTES, RouterHandle, RouterResponse, serve_controller_connection,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
@@ -55,6 +56,16 @@ struct RpcResponse {
 struct ClientResponse {
     envelope: RpcResponse,
     binary: Option<Vec<u8>>,
+}
+
+/// A stream with one event, then its end.
+struct OneEvent(Option<Value>);
+
+#[async_trait]
+impl EventSource for OneEvent {
+    async fn next(&mut self) -> Option<cowshed_core::Result<Value>> {
+        self.0.take().map(Ok)
+    }
 }
 
 struct TestClient {
@@ -128,6 +139,22 @@ impl TestClient {
             None => None,
         };
         ClientResponse { envelope, binary }
+    }
+
+    /// Opens a stream-lane call and takes its first event, then demands the next and returns
+    /// both answers: the event frame and what the demand was answered with.
+    async fn stream_request(&mut self, method: &str, params: Value) -> (Value, RpcResponse) {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).expect("test request id");
+        self.write_json(&json!({ "id": id, "method": method, "params": params }))
+            .await;
+        let event: Value =
+            serde_json::from_slice(&self.read_frame().await).expect("an event frame");
+        self.write_json(&json!({ "id": id, "demand": "next" }))
+            .await;
+        let end: RpcResponse =
+            serde_json::from_slice(&self.read_frame().await).expect("strict RPC response");
+        (event, end)
     }
 
     async fn write_json(&mut self, value: &Value) {
@@ -236,6 +263,12 @@ fn is_upload_method(method: &str) -> bool {
         .any(|operation| operation.method == method && operation.lane == Lane::Upload)
 }
 
+fn is_stream_method(method: &str) -> bool {
+    OPERATIONS
+        .iter()
+        .any(|operation| operation.method == method && operation.lane == Lane::Stream)
+}
+
 fn recording_router() -> (
     RouterHandle,
     mpsc::UnboundedReceiver<RecordedRequest>,
@@ -269,6 +302,9 @@ fn recording_router() -> (
                             bytes,
                         )
                     }
+                    None if is_stream_method(method) => Ok(RouterResponse::events(Box::new(
+                        OneEvent(Some(json!({ "method": method }))),
+                    ))),
                     None => Ok(RouterResponse::json(json!({ "method": method }))),
                 },
             };
@@ -338,6 +374,20 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
         TestClient::connect(coordinator_authority(), router.clone()).await;
 
     for method in connection_methods() {
+        if is_stream_method(method) {
+            let id = coordinator.next_id;
+            let (event, end) = coordinator.stream_request(method, params(method)).await;
+            assert_eq!(event, json!({ "id": id, "event": { "method": method } }));
+            assert!(
+                end.ok,
+                "coordinator stream {method} ended with {:?}",
+                end.error
+            );
+            assert_eq!((end.id, end.result), (id, Some(json!({}))));
+            let recorded = records.recv().await.expect("coordinator request recorded");
+            assert_eq!((recorded.method, recorded.params), (method, params(method)));
+            continue;
+        }
         let upload = is_upload_method(method).then_some(&b"input"[..]);
         let response = coordinator.request(method, params(method), upload).await;
         assert!(response.envelope.ok, "coordinator rejected {method}");
@@ -364,6 +414,16 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
     let (mut worker, worker_server) = TestClient::connect(worker_authority(), router).await;
     for method in connection_methods() {
         let allowed = is_worker_method(method);
+        if allowed && is_stream_method(method) {
+            let id = worker.next_id;
+            let (event, end) = worker.stream_request(method, params(method)).await;
+            assert_eq!(event, json!({ "id": id, "event": { "method": method } }));
+            assert_eq!((end.ok, end.id, end.result), (true, id, Some(json!({}))));
+            let recorded = records.recv().await.expect("worker request recorded");
+            assert_eq!(recorded.authority, worker_authority());
+            assert_eq!((recorded.method, recorded.params), (method, params(method)));
+            continue;
+        }
         let upload = (allowed && is_upload_method(method)).then_some(&b"input"[..]);
         let response = worker.request(method, params(method), upload).await;
         assert_eq!(
@@ -393,6 +453,147 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
         }
     }
     assert_clean_disconnect(worker, worker_server).await;
+}
+
+/// Events the test feeds, one per demand; dropping the source tells the test.
+struct Fed {
+    events: mpsc::UnboundedReceiver<Value>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+#[async_trait]
+impl EventSource for Fed {
+    async fn next(&mut self) -> Option<cowshed_core::Result<Value>> {
+        self.events.recv().await.map(Ok)
+    }
+}
+
+impl Drop for Fed {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+/// A router whose one `job.progress` call streams `source`, and whose other calls answer at once.
+fn streaming_router(source: Fed) -> RouterHandle {
+    let (router, mut commands) =
+        RouterHandle::channel(NonZeroUsize::new(8).expect("nonzero router capacity"));
+    tokio::spawn(async move {
+        let mut source = Some(source);
+        while let Some(command) = commands.recv().await {
+            let (request, reply) = command.into_parts();
+            let method = request.method();
+            let response = match (method, source.take()) {
+                ("job.progress", Some(source)) => RouterResponse::events(Box::new(source)),
+                (_, unused) => {
+                    source = unused;
+                    RouterResponse::json(json!({ "method": method }))
+                }
+            };
+            let _ = reply.send(Ok(response));
+        }
+    });
+    router
+}
+
+async fn read_value(client: &mut TestClient) -> Value {
+    serde_json::from_slice(&client.read_frame().await).expect("a JSON frame")
+}
+
+/// A stream-lane call is sent an event only when its caller demands one: unread, it holds up no
+/// other call on its connection, and a close ends it with an empty answer and drops its source.
+#[tokio::test]
+async fn a_stream_sends_each_event_on_demand_and_ends_when_closed() {
+    let (feed, events) = mpsc::unbounded_channel();
+    let (dropped, source_dropped) = oneshot::channel();
+    let router = streaming_router(Fed {
+        events,
+        dropped: Some(dropped),
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    client
+        .write_json(&json!({ "id": 1, "method": "job.progress", "params": params("job.progress") }))
+        .await;
+    client.next_id = 2;
+    // Nothing to send yet: another call is answered meanwhile.
+    let status = client
+        .request("job.status", params("job.status"), None)
+        .await;
+    assert_eq!(status.envelope.id, 2);
+
+    feed.send(json!({ "n": 1 })).expect("feed");
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "event": { "n": 1 } })
+    );
+    // An event waits for its demand: the next frame answers the call made after it.
+    feed.send(json!({ "n": 2 })).expect("feed");
+    let status = client
+        .request("job.status", params("job.status"), None)
+        .await;
+    assert_eq!(status.envelope.id, 3);
+    client
+        .write_json(&json!({ "id": 1, "demand": "next" }))
+        .await;
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "event": { "n": 2 } })
+    );
+
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    let end: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("end");
+    assert_eq!((end.id, end.ok, end.result), (1, true, Some(json!({}))));
+    source_dropped
+        .await
+        .expect("the closed stream's source is dropped");
+    // A close that crosses the end is no error.
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    let status = client
+        .request("job.status", params("job.status"), None)
+        .await;
+    assert_eq!(status.envelope.id, 4);
+    assert_clean_disconnect(client, server).await;
+}
+
+/// A demand the protocol does not allow -- a second one while one is unanswered, or one naming
+/// no open stream -- ends the connection.
+#[tokio::test]
+async fn a_demand_without_an_open_stream_to_answer_it_ends_the_connection() {
+    let (_feed, events) = mpsc::unbounded_channel();
+    let router = streaming_router(Fed {
+        events,
+        dropped: None,
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    client
+        .write_json(&json!({ "id": 1, "method": "job.progress", "params": params("job.progress") }))
+        .await;
+    client
+        .write_json(&json!({ "id": 1, "demand": "next" }))
+        .await;
+    let refused: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refused.id, refused.ok), (1, false));
+    assert_eq!(refused.error.expect("typed").code, ErrorCode::Integrity);
+    assert!(server.await.expect("server task joins").is_err());
+
+    let (_feed, events) = mpsc::unbounded_channel();
+    let router = streaming_router(Fed {
+        events,
+        dropped: None,
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    client
+        .write_json(&json!({ "id": 9, "demand": "next" }))
+        .await;
+    let refused: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refused.id, refused.ok), (9, false));
+    assert!(server.await.expect("server task joins").is_err());
 }
 
 #[tokio::test]
@@ -778,4 +979,144 @@ async fn invalid_version_nonce_replay_and_non_socket_peer_fail_before_router_eff
         .expect_err("non-socket peer rejected");
     assert_eq!(error.code, ErrorCode::EnvironmentMissing);
     assert!(records.try_recv().is_err());
+}
+
+/// A connection with 64 open ordinary calls keeps reading: 64 more wait unrouted, one past
+/// those is refused with a conflict, and a stream's close is still read and answered. As open
+/// calls complete, the waiting ones are routed in order, and every one is answered.
+#[tokio::test]
+async fn a_full_connection_queues_then_refuses_calls_and_still_reads_a_close() {
+    let (router, mut commands) =
+        RouterHandle::channel(NonZeroUsize::new(256).expect("router capacity"));
+    let (held, mut pending) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let (request, reply) = command.into_parts();
+            if request.method() == "job.progress" {
+                let _ = reply.send(Ok(RouterResponse::events(Box::new(OneEvent(Some(
+                    json!({ "n": 1 }),
+                ))))));
+            } else {
+                held.send(reply).expect("the test holds ordinary calls");
+            }
+        }
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    client
+        .write_json(&json!({ "id": 1, "method": "job.progress", "params": params("job.progress") }))
+        .await;
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "event": { "n": 1 } })
+    );
+    let mut open = Vec::new();
+    for id in 2..=65 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.status", "params": params("job.status") }),
+            )
+            .await;
+        open.push(pending.recv().await.expect("an open call is routed"));
+    }
+    for id in 66..=130 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.status", "params": params("job.status") }),
+            )
+            .await;
+    }
+    // Nothing has been answered, so the first frame is the refusal of the call past both caps.
+    let refusal: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refusal.id, refusal.ok), (130, false));
+    assert_eq!(
+        refusal.error.expect("typed cap error").code,
+        ErrorCode::Conflict
+    );
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null }),
+        "the close is read and answered while every call slot is taken"
+    );
+    // Completing the open calls routes the waiting ones.
+    for reply in open {
+        reply
+            .send(Ok(RouterResponse::json(json!({}))))
+            .expect("the connection awaits its call");
+    }
+    for _ in 66..=129 {
+        pending
+            .recv()
+            .await
+            .expect("a waiting call is routed")
+            .send(Ok(RouterResponse::json(json!({}))))
+            .expect("the connection awaits its call");
+    }
+    let mut answered = Vec::new();
+    for _ in 2..=129 {
+        let answer: RpcResponse =
+            serde_json::from_slice(&client.read_frame().await).expect("an answer");
+        assert!(answer.ok, "{answer:?}");
+        answered.push(answer.id);
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, (2..=129).collect::<Vec<_>>());
+    drop(client);
+    server
+        .await
+        .expect("server joins")
+        .expect("clean disconnect");
+}
+
+/// A sixty-fifth open stream is refused with a conflict, and the connection still reads a close
+/// on one of the 64.
+#[tokio::test]
+async fn the_stream_cap_refuses_a_sixty_fifth_stream_and_still_reads_a_close() {
+    let (router, mut commands) =
+        RouterHandle::channel(NonZeroUsize::new(128).expect("router capacity"));
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let (_, reply) = command.into_parts();
+            let _ = reply.send(Ok(RouterResponse::events(Box::new(OneEvent(Some(
+                json!({ "n": 1 }),
+            ))))));
+        }
+    });
+    let (mut client, server) = TestClient::connect(worker_authority(), router).await;
+    for id in 1..=64 {
+        client
+            .write_json(
+                &json!({ "id": id, "method": "job.progress", "params": params("job.progress") }),
+            )
+            .await;
+        assert_eq!(
+            read_value(&mut client).await,
+            json!({ "id": id, "event": { "n": 1 } })
+        );
+    }
+    client
+        .write_json(
+            &json!({ "id": 65, "method": "job.progress", "params": params("job.progress") }),
+        )
+        .await;
+    let refusal: RpcResponse = serde_json::from_slice(&client.read_frame().await).expect("refusal");
+    assert_eq!((refusal.id, refusal.ok), (65, false));
+    assert_eq!(
+        refusal.error.expect("typed cap error").code,
+        ErrorCode::Conflict
+    );
+    client
+        .write_json(&json!({ "id": 1, "demand": "close" }))
+        .await;
+    assert_eq!(
+        read_value(&mut client).await,
+        json!({ "id": 1, "ok": true, "result": {}, "error": null, "binaryLength": null })
+    );
+    drop(client);
+    server
+        .await
+        .expect("server joins")
+        .expect("clean disconnect");
 }

@@ -136,6 +136,20 @@ export const assertChangeRepoIdRequestList = typia.createAssertEquals<readonly A
 export const parseChangeRepoIdRequestList = (json: string): readonly Api.ChangeRepoIdRequest[] =>
   assertChangeRepoIdRequestList(JSON.parse(json));
 
+export const assertChargedMemoryBytes = typia.createAssertEquals<Api.ChargedMemoryBytes>();
+export const parseChargedMemoryBytes = (json: string): Api.ChargedMemoryBytes =>
+  assertChargedMemoryBytes(JSON.parse(json));
+export const assertChargedMemoryBytesList = typia.createAssertEquals<readonly Api.ChargedMemoryBytes[]>();
+export const parseChargedMemoryBytesList = (json: string): readonly Api.ChargedMemoryBytes[] =>
+  assertChargedMemoryBytesList(JSON.parse(json));
+
+export const assertChargedMemoryUsage = typia.createAssertEquals<Api.ChargedMemoryUsage>();
+export const parseChargedMemoryUsage = (json: string): Api.ChargedMemoryUsage =>
+  assertChargedMemoryUsage(JSON.parse(json));
+export const assertChargedMemoryUsageList = typia.createAssertEquals<readonly Api.ChargedMemoryUsage[]>();
+export const parseChargedMemoryUsageList = (json: string): readonly Api.ChargedMemoryUsage[] =>
+  assertChargedMemoryUsageList(JSON.parse(json));
+
 export const assertCheckpointCommitment = typia.createAssertEquals<Api.CheckpointCommitment>();
 export const parseCheckpointCommitment = (json: string): Api.CheckpointCommitment =>
   assertCheckpointCommitment(JSON.parse(json));
@@ -706,6 +720,12 @@ export const assertProcessUsageList = typia.createAssertEquals<readonly Api.Proc
 export const parseProcessUsageList = (json: string): readonly Api.ProcessUsage[] =>
   assertProcessUsageList(JSON.parse(json));
 
+export const assertProgressRequest = typia.createAssertEquals<Api.ProgressRequest>();
+export const parseProgressRequest = (json: string): Api.ProgressRequest => assertProgressRequest(JSON.parse(json));
+export const assertProgressRequestList = typia.createAssertEquals<readonly Api.ProgressRequest[]>();
+export const parseProgressRequestList = (json: string): readonly Api.ProgressRequest[] =>
+  assertProgressRequestList(JSON.parse(json));
+
 export const assertProjectGrantDelta = typia.createAssertEquals<Api.ProjectGrantDelta>();
 export const parseProjectGrantDelta = (json: string): Api.ProjectGrantDelta =>
   assertProjectGrantDelta(JSON.parse(json));
@@ -950,6 +970,12 @@ export const parseRunSandboxMode = (json: string): Api.RunSandboxMode => assertR
 export const assertRunSandboxModeList = typia.createAssertEquals<readonly Api.RunSandboxMode[]>();
 export const parseRunSandboxModeList = (json: string): readonly Api.RunSandboxMode[] =>
   assertRunSandboxModeList(JSON.parse(json));
+
+export const assertSampleInterval = typia.createAssertEquals<Api.SampleInterval>();
+export const parseSampleInterval = (json: string): Api.SampleInterval => assertSampleInterval(JSON.parse(json));
+export const assertSampleIntervalList = typia.createAssertEquals<readonly Api.SampleInterval[]>();
+export const parseSampleIntervalList = (json: string): readonly Api.SampleInterval[] =>
+  assertSampleIntervalList(JSON.parse(json));
 
 export const assertSccacheStats = typia.createAssertEquals<Api.SccacheStats>();
 export const parseSccacheStats = (json: string): Api.SccacheStats => assertSccacheStats(JSON.parse(json));

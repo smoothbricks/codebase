@@ -2708,8 +2708,7 @@ pub enum Reseed {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ReseedSkip {
-    /// A process other than the target's Nx daemon holds its task database, or one opened it
-    /// while the seed was cloned (that clone is deleted).
+    /// A process other than the target's Nx daemon holds its task database at admission.
     Held {
         database: PathBuf,
         holders: Vec<DatabaseHolder>,
@@ -2721,6 +2720,8 @@ pub enum ReseedSkip {
         lock: PathBuf,
         holders: Vec<DatabaseHolder>,
     },
+    /// The source could not be sealed without forcing a filesystem holder off its volume.
+    VolumeBusy { reason: String },
 }
 
 impl fmt::Display for ReseedSkip {
@@ -2758,6 +2759,9 @@ impl fmt::Display for ReseedSkip {
                     formatter.write_str(": ")?;
                 }
                 holders(formatter, held)
+            }
+            Self::VolumeBusy { reason } => {
+                write!(formatter, "the build volume could not be sealed: {reason}")
             }
         }
     }
@@ -3156,6 +3160,11 @@ pub enum AdoptionSkip {
     },
     /// The landing workspace's Nx daemon outlived its stop.
     LandingDaemonStayed { daemon: DatabaseHolder },
+    /// A host Cargo build holds a landing profile's lock immediately before the seed freezes.
+    LandingBuilding {
+        lock: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
     /// A process holds the target's Nx task database (steps 5 and 6).
     TargetHeld {
         database: PathBuf,
@@ -3169,9 +3178,8 @@ pub enum AdoptionSkip {
     },
     /// The target's Nx daemon outlived its stop.
     TargetDaemonStayed { daemon: DatabaseHolder },
-    /// The landing volume had to grow to the target's capacity before the target adopts it,
-    /// and the kernel refused to let go of it: a process still has a file or its working
-    /// directory in it.
+    /// The landing volume could not be sealed for capture or grown to the target's capacity
+    /// without forcing a filesystem holder off it.
     LandingVolumeBusy { reason: String },
 }
 
@@ -3183,6 +3191,7 @@ impl AdoptionSkip {
             Self::NoTargetVolume => "noTargetVolume",
             Self::LandingHeld { .. } => "landingHeld",
             Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
+            Self::LandingBuilding { .. } => "landingBuilding",
             Self::TargetHeld { .. } => "targetHeld",
             Self::TargetOpening { .. } => "targetOpening",
             Self::TargetDaemonStayed { .. } => "targetDaemonStayed",
@@ -3220,6 +3229,20 @@ impl fmt::Display for AdoptionSkip {
                 )?;
                 holders(formatter, held)
             }
+            Self::LandingBuilding {
+                lock,
+                holders: held,
+            } => {
+                write!(
+                    formatter,
+                    "a Cargo build holds the landing profile {}",
+                    lock.display()
+                )?;
+                if !held.is_empty() {
+                    formatter.write_str(": ")?;
+                }
+                holders(formatter, held)
+            }
             Self::TargetHeld {
                 database,
                 holders: held,
@@ -3251,7 +3274,7 @@ impl fmt::Display for AdoptionSkip {
             ),
             Self::LandingVolumeBusy { reason } => write!(
                 formatter,
-                "the landing build volume could not grow to the target's capacity: {reason}"
+                "the landing build volume could not be sealed or grown to the target's capacity: {reason}"
             ),
         }
     }

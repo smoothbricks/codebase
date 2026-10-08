@@ -10,16 +10,16 @@
 //! table changes every projection together; no adapter restates a field list.
 
 use super::dto::{
-    AdmissionKey,
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
-    CreateOptions, DefragmentResult, DoctorReport, EmptyResult, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
-    LandOptions, LandReport, MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions,
-    PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
-    ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
-    WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
+    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, EmptyResult,
+    GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
+    JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
+    ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
+use super::resources::{JobResourceSample, SampleInterval};
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -53,6 +53,9 @@ pub enum Lane {
     Upload,
     /// The result carries one raw-byte frame starting at the request's declared offset.
     Download,
+    /// The call answers with events, one for each demand its caller sends, then ends with an
+    /// answer; its result is the type of each event.
+    Stream,
 }
 
 /// The declared facts of one operation, for validation that runs before a request is decoded.
@@ -122,7 +125,7 @@ fn encode_params(method: &str, request: &impl Serialize) -> Result<Value> {
 
 /// Expands the operation table. Each row is
 /// `scope lane "method" Marker(Request) -> Result;` where `scope` is `coordinator`, `worker` or
-/// `internal`, and `lane` is `json`, `upload` or `download(offset_field)`.
+/// `internal`, and `lane` is `json`, `upload`, `download(offset_field)` or `stream`.
 macro_rules! operations {
     (@scope coordinator) => { Scope::Coordinator };
     (@scope worker) => { Scope::Worker };
@@ -130,9 +133,13 @@ macro_rules! operations {
     (@lane json) => { Lane::Json };
     (@lane upload) => { Lane::Upload };
     (@lane download ($offset:ident)) => { Lane::Download };
+    (@lane stream) => { Lane::Stream };
     (@offset $request:ident json) => {{ let _ = $request; None }};
     (@offset $request:ident upload) => {{ let _ = $request; None }};
     (@offset $request:ident download ($offset:ident)) => { Some($request.$offset) };
+    (@offset $request:ident stream) => {{ let _ = $request; None }};
+    (@streams $marker:ident stream) => { impl StreamOperation for $marker {} };
+    (@streams $marker:ident $lane:ident) => {};
     ($(
         $(#[doc = $doc:literal])+
         $scope:ident $lane:ident $(($offset:ident))? $method:literal
@@ -152,6 +159,10 @@ macro_rules! operations {
             fn request(request: Self::Request) -> OperationRequest;
         }
 
+        /// An operation of the stream lane: its call answers with events of its declared
+        /// result, one per demand, then ends. Implemented exactly by the table's `stream` rows.
+        pub trait StreamOperation: Operation {}
+
         $(
             $(#[doc = $doc])+
             #[derive(Debug)]
@@ -170,6 +181,8 @@ macro_rules! operations {
                     OperationRequest::$marker(request)
                 }
             }
+
+            operations!(@streams $marker $lane);
         )+
 
         /// Every declared operation's facts, in declaration order.
@@ -334,6 +347,9 @@ operations! {
     worker json "job.tail" JobTailRead(TailRequest) -> JobTail;
     /// Reads the TCP ports the job's process group listens on, from the kernel.
     worker json "job.listeningPorts" JobListeningPortsRead(JobRequest) -> JobListeningPorts;
+    /// Streams one job's resource samples: the latest at once, one every interval while it runs,
+    /// then its terminal sample once.
+    worker stream "job.progress" JobProgress(ProgressRequest) -> JobResourceSample;
     /// Writes to an attached job's stdin.
     worker upload "job.attachWrite" JobAttachWrite(JobRequest) -> EmptyResult;
     /// Detaches from a job.
@@ -704,6 +720,17 @@ pub struct TailRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<JobJournalCursor>,
     pub limits: JobTailLimits,
+}
+
+/// A progress subscription to one job, sampled every `everyMs`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProgressRequest {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub every_ms: SampleInterval,
 }
 
 #[cfg(test)]

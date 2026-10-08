@@ -71,7 +71,7 @@ pub(crate) struct Landing {
     hold: BuildVolumeHold,
 }
 
-/// The landing workspace's volume once nothing writes it (Land step 4), still held.
+/// The landing volume after supervised jobs and Nx settle (Land step 4), still held against GC.
 #[derive(Clone, Debug)]
 pub(crate) struct Quiet {
     id: BuildVolumeId,
@@ -913,21 +913,38 @@ impl BuildVolumes {
         .await
     }
 
-    /// Land step 5.6, under the target's image lock: the target's new seed is a clone of the
-    /// quiet landing volume, and every older seed of the target is deleted.
+    /// Land step 5.6, under the target's image lock: admit only an idle Cargo volume, seal it
+    /// without force, capture the target's seed, then retire every older seed.
     pub async fn freeze_seed(
         &self,
         locked: &TargetLock,
         quiet: &Quiet,
         tree: GitOid,
-    ) -> Result<()> {
-        let source = quiet.id.clone();
+    ) -> Result<std::result::Result<(), AdoptionSkip>> {
+        let quiet = quiet.clone();
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
+            let builds = match cargo::hold(&quiet.mount, &quiet.state)
+                .map_err(|error| io("take the landing Cargo profile locks", &quiet.mount, &error))?
+            {
+                Ok(held) => held,
+                Err(lock) => {
+                    let holders = nx::holders(&lock).map_err(|error| {
+                        io("list the landing Cargo build's processes", &lock, &error)
+                    })?;
+                    return Ok(Err(AdoptionSkip::LandingBuilding {
+                        lock,
+                        holders: holders.into_iter().map(database_holder).collect(),
+                    }));
+                }
+            };
             let previous = seeds_of(layout, &target)?;
-            host.clone_build_volume(
+            // Existing profiles are checked, not future directories fenced. Close our own
+            // descriptors before unmount; the non-forced detached capture excludes late writers.
+            drop(builds);
+            match host.clone_build_volume(
                 layout,
-                &source,
+                &quiet.id,
                 &BuildVolumeId::mint(),
                 &BuildVolumeRecord::new(
                     Some(tree),
@@ -936,9 +953,17 @@ impl BuildVolumes {
                         incarnation: target.incarnation.clone(),
                     },
                 ),
-            )
-            .map_err(storage)?;
-            retire_seeds(host, layout, &target, previous)
+            ) {
+                Ok(()) => {}
+                Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
+                    return Ok(Err(AdoptionSkip::LandingVolumeBusy {
+                        reason: error.to_string(),
+                    }));
+                }
+                Err(error) => return Err(storage(error)),
+            }
+            retire_seeds(host, layout, &target, previous)?;
+            Ok(Ok(()))
         })
         .await
     }
@@ -1775,12 +1800,9 @@ fn seed_age(
     }))
 }
 
-/// Refreeze `target`'s seed from its live volume when the seed is behind it and nothing writes
-/// it (16_build_volumes.md, "Targets and seeds"): the same quiesce rule as an adoption for Nx
-/// (only the target's daemon may hold its task database, and it is stopped), and every Cargo
-/// build lock taken, so no Cargo build runs or starts while the image is cloned. The task
-/// databases are looked at once more after the clone; a process that opened one meanwhile may
-/// have written it mid-clone, so that clone is deleted and the reseed skipped.
+/// Refreeze an out-of-date seed after Nx and existing Cargo profiles admit capture. The
+/// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
+/// writers while the image is validated and cloned.
 fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge) -> Result<Reseed> {
     if !age.stale() {
         return Ok(Reseed::Fresh);
@@ -1817,7 +1839,7 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
     // unmount busy. Release them before sealing: a Cargo that gets in first makes unmount
     // refuse, and no filesystem writer can modify the image after its driver is detached.
     drop(builds);
-    host.clone_build_volume(
+    match host.clone_build_volume(
         layout,
         &age.live,
         &seed,
@@ -1828,13 +1850,14 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
                 incarnation: target.incarnation.clone(),
             },
         ),
-    )
-    .map_err(storage)?;
-    if let Err(busy) = nx::held(&mount, &state)
-        .map_err(|error| io("look at the target's Nx state", &mount, &error))?
-    {
-        host.release_build_volume(layout, &seed).map_err(storage)?;
-        return skipped(reseed_skip(busy));
+    ) {
+        Ok(()) => {}
+        Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
+            return skipped(ReseedSkip::VolumeBusy {
+                reason: error.to_string(),
+            });
+        }
+        Err(error) => return Err(storage(error)),
     }
     retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
@@ -2672,6 +2695,261 @@ mod tests {
         }
     }
 
+    /// A real Cargo build stopped inside its build script, after Cargo has taken the profile's
+    /// shared `.cargo-lock`. Socket readiness, not a delay, is the proof that it is building.
+    #[cfg(target_os = "macos")]
+    async fn running_cargo(
+        source: &Path,
+        mount: &Path,
+        profile: &str,
+    ) -> (tokio::process::Child, tokio::net::UnixStream) {
+        use crate::fork_lock::Spawn as _;
+        use tokio::io::AsyncReadExt as _;
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname = \"capture-writer-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+             [workspace]\n[profile.guard]\ninherits = \"dev\"\n",
+        )
+        .unwrap();
+        fs::write(source.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        fs::write(
+            source.join("build.rs"),
+            r#"use std::io::{Read, Write};
+fn main() {
+    let path = std::env::var_os("CAPTURE_WRITER_SOCKET").unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    stream.write_all(b"R").unwrap();
+    stream.read_exact(&mut [0]).unwrap();
+}
+"#,
+        )
+        .unwrap();
+        let socket = source.join("writer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut child = tokio::process::Command::new("cargo")
+            .args(["build", "--offline", "--profile", profile])
+            .current_dir(source)
+            .env("CARGO_TARGET_DIR", mount.join("target"))
+            .env("CAPTURE_WRITER_SOCKET", &socket)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("run the real Cargo build");
+        let (mut stream, _) = tokio::select! {
+            connected = listener.accept() => connected.expect("Cargo build script connects"),
+            status = child.wait() => {
+                let output = child.wait_with_output().await.expect("Cargo diagnostics");
+                panic!("Cargo exited before its build script was ready: {status:?}; {output:?}");
+            }
+        };
+        let mut ready = [0];
+        stream.read_exact(&mut ready).await.unwrap();
+        assert_eq!(ready, *b"R");
+        (child, stream)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn freeze_with_running_cargo(profile: &str, enumerate_before_start: bool) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let scratch = Scratch::new("seed-cargo-admission");
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new("target", "target").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        fs::create_dir_all(mount.join("target/debug")).unwrap();
+        fs::write(mount.join("target/debug/.cargo-lock"), b"").unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(scratch.landing(&topic_checkout), main_checkout)
+            .await
+            .unwrap()
+            .expect("the supervised jobs and Nx state are quiet");
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await
+            .unwrap()
+            .expect("the initial capture has no writer");
+        let original_seed = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap()
+            .0;
+        let enumerated = enumerate_before_start.then(|| {
+            cargo::hold(&mount, &state)
+                .unwrap()
+                .expect("no Cargo build has started yet")
+        });
+        let (child, mut writer) =
+            running_cargo(&scratch.root.path().join("cargo-source"), &mount, profile).await;
+        let cargo_pid = child
+            .id()
+            .expect("the rendezvous Cargo process is still live");
+        let expected_lock = mount
+            .join("target")
+            .join(if profile == "dev" { "debug" } else { profile })
+            .join(cargo::BUILD_LOCK);
+        // Cargo can create a previously absent profile while all previously enumerated profile
+        // locks are held. They are an admission check, not a fence for future directories.
+        drop(enumerated);
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("b".repeat(40)).unwrap())
+            .await;
+        writer.write_all(b"G").await.unwrap();
+        drop(writer);
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let kept_seed = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap()
+            .0;
+        drop(locked);
+        drop(quiet);
+        scratch.release_all();
+        assert_eq!(
+            kept_seed, original_seed,
+            "a refusal must not replace the seed"
+        );
+        let Err(AdoptionSkip::LandingBuilding { lock, holders }) =
+            frozen.expect("a running Cargo build is an admission skip")
+        else {
+            panic!("the real Cargo writer must be named");
+        };
+        assert_eq!(lock, expected_lock);
+        assert!(
+            holders.iter().any(|holder| {
+                u32::try_from(holder.pid) == Ok(cargo_pid)
+                    && holder.command.contains("cargo build --offline --profile")
+            }),
+            "the skip must identify the actual Cargo process: {holders:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_freeze_skips_a_real_cargo_build_after_quiesce() {
+        freeze_with_running_cargo("dev", false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_freeze_skips_a_new_cargo_profile_created_after_enumeration() {
+        freeze_with_running_cargo("guard", true).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_freeze_skips_a_filesystem_holder_arriving_after_quiesce() {
+        let scratch = Scratch::new("seed-late-holder");
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let quiet = scratch
+            .volumes
+            .quiesce(scratch.landing(&topic_checkout), main_checkout)
+            .await
+            .unwrap()
+            .expect("the landing volume was quiet");
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        let held = fs::File::create(mount.join("late-writer")).unwrap();
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await;
+        let seed = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap();
+        drop(held);
+        drop(quiet);
+        drop(locked);
+        scratch.release_all();
+        assert!(seed.is_none(), "a refused seal must publish no seed");
+        let Err(AdoptionSkip::LandingVolumeBusy { reason }) = frozen.unwrap() else {
+            panic!("the late filesystem holder must be a typed skip");
+        };
+        assert!(
+            reason.contains(&format!("pid {}", std::process::id())),
+            "{reason}"
+        );
+        assert!(reason.contains("nothing was forced"), "{reason}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_reseed_skips_a_filesystem_holder_without_retiring_the_previous_seed() {
+        let scratch = Scratch::new("reseed-late-holder");
+        let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let previous = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &previous,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: target.name.clone(),
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let held = fs::File::create(mount.join("late-writer")).unwrap();
+        // Clock ordering is supplied explicitly; this test exercises the real holder and
+        // publication boundary, not the independent image-mtime comparison.
+        let reseeded = reseed(
+            &scratch.host,
+            &scratch.layout,
+            &target,
+            SeedAge {
+                live,
+                tree: None,
+                written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                seed: Some((
+                    previous.clone(),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )),
+            },
+        );
+        let kept = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap()
+            .0;
+        drop(held);
+        scratch.release_all();
+        assert_eq!(kept, previous);
+        let Reseed::Skipped {
+            reason: ReseedSkip::VolumeBusy { reason },
+            ..
+        } = reseeded.unwrap()
+        else {
+            panic!("a busy source is a reseed skip");
+        };
+        assert!(
+            reason.contains(&format!("pid {}", std::process::id())),
+            "{reason}"
+        );
+        assert!(reason.contains("nothing was forced"), "{reason}");
+    }
+
     /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank
     /// image put in place and mounted the way a fork's volume is. Creation is not what these
     /// tests prove. Above the 1 GiB test cap only the clone's ASIF header grows and its container
@@ -2791,7 +3069,8 @@ mod tests {
             .volumes
             .freeze_seed(&locked, &quiet, tree.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .expect("nothing holds the landing volume");
         let (seed, _) = scratch
             .layout
             .seed_of(&WorkspaceName::main(), &owner("main", '0').incarnation)
@@ -3280,7 +3559,8 @@ mod tests {
             .volumes
             .freeze_seed(&locked, &quiet, tree.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .expect("nothing holds the landing volume");
         let closed = scratch
             .volumes
             .close_target(main_checkout.clone())
@@ -3455,7 +3735,10 @@ mod tests {
             tokio::spawn(async move {
                 waiting.send(()).expect("the new waits for the land");
                 let locked = contended.wait().await?;
-                volumes.freeze_seed(&locked, &quiet, tree.clone()).await?;
+                volumes
+                    .freeze_seed(&locked, &quiet, tree.clone())
+                    .await?
+                    .expect("nothing holds the landing volume");
                 let adopted = volumes
                     .adopt(&locked, &quiet, closed, main_checkout, tree)
                     .await?

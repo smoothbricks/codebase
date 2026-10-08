@@ -1107,16 +1107,10 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
         let opened = libc::c_int::try_from(opened).map_err(io::Error::other)?;
         // SAFETY: a fresh descriptor this function alone owns.
         let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(opened) };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        // Still running after the stat was read, the process the pidfd names ran throughout,
-        // so the stat was that process's.
-        if pidfd_exited(&handle)? {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        let Some(stat) = stat_while_running(&handle, stat)? else {
             continue;
-        }
+        };
         let closing = stat.rfind(')').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1131,6 +1125,20 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
         }
     }
     Ok(members)
+}
+
+/// Resolve a proc-stat read against the lifetime of the process its pidfd names.
+#[cfg(target_os = "linux")]
+fn stat_while_running(
+    handle: &std::os::fd::OwnedFd,
+    read: io::Result<String>,
+) -> io::Result<Option<String>> {
+    // A departed process is no current member, even when its proc-stat read returned ESRCH.
+    // Only a process still live afterwards can contribute its stat or its read failure.
+    if pidfd_exited(handle)? {
+        return Ok(None);
+    }
+    read.map(Some)
 }
 
 #[cfg(target_os = "linux")]
@@ -1424,6 +1432,75 @@ mod tests {
                 .map(|member| u32::try_from(member.pid()).expect("a pid"))
                 .collect(),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pipe_held_process() -> (std::process::Child, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd as _;
+
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn_locked()
+            .expect("a pipe-held child");
+        // SAFETY: pidfd_open takes plain integers; the child remains live on its stdin.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        assert!(
+            opened >= 0,
+            "pidfd_open: {}",
+            std::io::Error::last_os_error()
+        );
+        let opened = libc::c_int::try_from(opened).expect("a pidfd fits a descriptor");
+        // SAFETY: this fresh descriptor is owned only by this test.
+        let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(opened) };
+        (child, handle)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proc_stat_read_of_a_reaped_process_is_its_departure_not_a_membership_failure() {
+        use std::io::Read as _;
+
+        let (mut child, handle) = pipe_held_process();
+        let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))
+            .expect("open the live child's proc-stat inode");
+        drop(child.stdin.take());
+        assert!(child.wait().expect("reap the departed child").success());
+        let mut text = String::new();
+        let read = stat.read_to_string(&mut text).map(|_| text);
+        assert_eq!(
+            read.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::ESRCH),
+            "the open proc-stat inode reports its process was reaped"
+        );
+        assert_eq!(
+            super::stat_while_running(&handle, read).unwrap(),
+            None,
+            "the retained pidfd proves this process departed during the read"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proc_stat_read_failure_of_a_live_process_remains_an_error() {
+        let (mut child, handle) = pipe_held_process();
+        let failures = [libc::EACCES, libc::ESRCH, libc::ENOENT].map(|code| {
+            (
+                code,
+                super::stat_while_running(&handle, Err(std::io::Error::from_raw_os_error(code))),
+            )
+        });
+        drop(child.stdin.take());
+        assert!(
+            child
+                .wait()
+                .expect("reap the child after its live reads")
+                .success()
+        );
+        for (code, read) in failures {
+            assert_eq!(read.unwrap_err().raw_os_error(), Some(code));
+        }
     }
 
     #[test]

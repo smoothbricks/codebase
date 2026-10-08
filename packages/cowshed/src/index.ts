@@ -4,6 +4,7 @@ import { exec } from './exec.js';
 import { packageRootFromModule, runLauncher } from './launcher.js';
 import * as N from './native.generated.js';
 import {
+  type EventIterator,
   loadNativeModule,
   type NativeCoordinatorHandle,
   type NativeJobHandle,
@@ -68,6 +69,19 @@ async function callNativeAsync<T>(call: () => Promise<T>): Promise<T> {
   } catch (error) {
     throw normalizeNativeError(error);
   }
+}
+
+/**
+ * A native stream's events, its rejections normalized as `callNativeAsync` normalizes a call's.
+ * `return` reaches the native iterator at once, never behind a `next` in flight.
+ */
+function callNativeEvents<T>(events: EventIterator<T>): EventIterator<T> {
+  const iterator: EventIterator<T> = {
+    next: () => callNativeAsync(() => events.next()),
+    return: () => callNativeAsync(() => events.return()),
+    [Symbol.asyncIterator]: () => iterator,
+  };
+  return iterator;
 }
 
 class ProjectImpl implements Project {
@@ -323,12 +337,21 @@ class JobHandleImpl implements JobHandle {
     return callNativeAsync(() => N.jobStatus(this.#native, {}));
   }
 
+  progress(everyMs: number): AsyncIterable<Api.JobResourceSample> {
+    return callNativeEvents(N.jobProgress(this.#native, { everyMs }));
+  }
+
   async logs(args: N.JobLogsArguments): Promise<JobLogs> {
     return callNativeAsync(() => N.jobLogs(this.#native, args));
   }
 
   async listeningPorts(): Promise<Api.JobListeningPorts> {
     return callNativeAsync(() => N.jobListeningPorts(this.#native, {}));
+  }
+
+  async tail(cursor: Api.JobJournalCursor | undefined, limits: Api.JobTailLimits): Promise<Api.JobTail> {
+    // An undefined cursor is omitted from the request's JSON: the latest tail, never `null`.
+    return callNativeAsync(() => N.jobTail(this.#native, { cursor, limits }));
   }
 
   async detach(): Promise<void> {

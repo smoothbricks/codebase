@@ -883,6 +883,36 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
 }
 
 #[test]
+fn seed_capture_skip_shapes_preserve_the_named_writer_and_refusal() {
+    use cowshed_core::api::dto::{AdoptionSkip, DatabaseHolder, ReseedSkip};
+    let building = AdoptionSkip::LandingBuilding {
+        lock: PathBuf::from("/build/target/guard/.cargo-lock"),
+        holders: vec![DatabaseHolder {
+            pid: 42,
+            command: "cargo build --profile guard".into(),
+        }],
+    };
+    let wire = json!({
+        "kind": "landingBuilding",
+        "lock": "/build/target/guard/.cargo-lock",
+        "holders": [{"pid": 42, "command": "cargo build --profile guard"}]
+    });
+    assert_eq!(serde_json::to_value(&building).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<AdoptionSkip>(wire).unwrap(),
+        building
+    );
+    assert_eq!(building.name(), "landingBuilding");
+    let busy = ReseedSkip::VolumeBusy {
+        reason: "pid 43 holds the source; nothing was forced".into(),
+    };
+    let wire =
+        json!({"kind": "volumeBusy", "reason": "pid 43 holds the source; nothing was forced"});
+    assert_eq!(serde_json::to_value(&busy).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<ReseedSkip>(wire).unwrap(), busy);
+}
+
+#[test]
 fn reports_gateway_and_audit_shapes_are_frozen() {
     let push = PushReport {
         source_head: oid('a'),

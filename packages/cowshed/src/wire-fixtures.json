@@ -1153,6 +1153,28 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "landingBuilding": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "holders": [
+              {
+                "command": "cargo build --profile guard",
+                "pid": 4747
+              }
+            ],
+            "kind": "landingBuilding",
+            "lock": "/Users/fixture/Dev/widget/target/guard/.cargo-lock"
+          }
+        },
+        "seeded": false
+      },
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "retired": {
       "buildVolume": {
         "adoption": {
@@ -1315,6 +1337,19 @@
       }
     },
     "imageOnly": {}
+  },
+  "ReseedResult": {
+    "volumeBusy": {
+      "outcome": {
+        "behindMs": 1200,
+        "kind": "skipped",
+        "reason": {
+          "kind": "volumeBusy",
+          "reason": "the source is held by pid 4848 (rust-analyzer); nothing was forced"
+        }
+      },
+      "workspace": "main"
+    }
   },
   "ResizeResult": {
     "buildGrown": {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -34,6 +35,44 @@ const inferTargets: typeof rawInferTargets = async (files, options, context) => 
 };
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
+  it('keys native and cross producer modes from the real build entry without invoking a compiler', () => {
+    const entry = join(import.meta.dir, '../managed/raw/tooling/napi-build.sh');
+    const host = execFileSync('uname', ['-sm'], { encoding: 'utf8' }).trim().replace(' ', ':');
+    for (const target of ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin']) {
+      const isNativeLinux =
+        (target === 'x86_64-unknown-linux-gnu' && host === 'Linux:x86_64') ||
+        (target === 'aarch64-unknown-linux-gnu' && (host === 'Linux:aarch64' || host === 'Linux:arm64'));
+      const nativeMode = target.endsWith('-unknown-linux-gnu') && !isNativeLinux ? 'linux-cross' : 'native';
+      expect(
+        execFileSync('sh', [entry, target, '--identity'], {
+          encoding: 'utf8',
+          env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'native' },
+        }),
+      ).toBe(`${nativeMode}:${host}\n`);
+      expect(
+        execFileSync('sh', [entry, target, '--identity'], {
+          encoding: 'utf8',
+          env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'linux-cross' },
+        }),
+      ).toBe(`linux-cross:${host}\n`);
+    }
+    const unmanagedEnv = { ...process.env };
+    delete unmanagedEnv.SMOO_NAPI_TOOLCHAIN_MODE;
+    delete unmanagedEnv.CARGO_BUILD_TARGET;
+    expect(execFileSync('sh', [entry, 'host', '--identity'], { encoding: 'utf8', env: unmanagedEnv })).toBe(
+      `unmanaged:${host}\n`,
+    );
+    const refused = spawnSync('sh', [entry, 'host', 'uname'], { encoding: 'utf8', env: unmanagedEnv });
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain('native NAPI build needs the managed shell');
+    const redirected = spawnSync('sh', [entry, 'host', '--identity'], {
+      encoding: 'utf8',
+      env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'native', CARGO_BUILD_TARGET: 'x86_64-unknown-linux-gnu' },
+    });
+    expect(redirected.status).toBe(2);
+    expect(redirected.stderr).toContain('host NAPI build refuses CARGO_BUILD_TARGET=');
+  });
+
   it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
     const workspace = await createWorkspace();
     // The emitter keys on one input outside its project, as a transform or toolchain does. The
@@ -1116,10 +1155,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
-          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
+          'sh tooling/napi-build.sh host packages/native/node_modules/.bin/napi --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
       });
       const platformBuild = (release: string): string =>
-        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64`;
+        `sh tooling/napi-build.sh aarch64-apple-darwin packages/native/node_modules/.bin/napi${release} --platform --no-js --dts native.darwin-arm64.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64`;
       expect(native['napi-arm64-macos']?.options).toMatchObject({ cwd: '.', command: platformBuild('') });
       expect(native['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: platformBuild(' --release'),
@@ -1665,12 +1704,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
+            'sh ../../tooling/napi-build.sh host napi --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
         },
         configurations: {
           [RELEASE_CONFIGURATION]: {
             command:
-              'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
+              'sh ../../tooling/napi-build.sh host napi --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
           },
         },
       });
@@ -1678,7 +1717,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
       // Every local build compiles dev; only the release configuration ships.
       const darwinArm64Build = (release: string): string =>
-        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64`;
+        `sh ../../tooling/napi-build.sh aarch64-apple-darwin napi${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64`;
       expect(targets['napi-arm64-macos']?.options).toMatchObject({ command: darwinArm64Build('') });
       expect(targets['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: darwinArm64Build(' --release'),
@@ -1688,15 +1727,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // nothing from it, and a platform target's dependency closure may only reach
       // its own family (`validatePlatformTargetDependencies`).
       expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
-      // A macOS triple never gets a cross toolchain: `usesNapiCross` is
-      // `family === 'linux' && target !== host`, so the family decides this one
-      // and no host can change it.
-      expect(targets['napi-toolchain-x64-macos']).toBeUndefined();
-      // Everything else about the cross regime depends on WHICH host is
-      // inferring — on an x64 Linux runner `napi-x64-linux` is the native build,
-      // with no `--use-napi-cross` and no toolchain prerequisite at all. Those
-      // facts are asserted against forced platforms below instead of against
-      // whichever machine happens to run the suite.
+      // All platform builds use one declared toolchain entry; neither native
+      // nor foreign builds bootstrap a compiler through NAPI's downloader.
 
       // Exercise both host branches explicitly: this suite usually runs on
       // Darwin, but Linux's native compiler selection is the contract at risk.
@@ -1708,61 +1740,50 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(linuxX64Targets['napi-x64-linux']?.options?.command).not.toContain('--use-napi-cross');
       expect(linuxX64Targets['napi-x64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
       expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
-      expect(linuxX64Targets['napi-toolchain-x64-linux']).toBeUndefined();
-      expect(linuxX64Targets['napi-arm64-linux']?.options?.command).toContain('--use-napi-cross');
-      expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toEqual({
-        TARGET_CC: 'clang',
-        TARGET_CXX: 'clang++',
-      });
+      expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toBeUndefined();
       expect(linuxX64Targets['napi-debug']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
+      expect(linuxX64Targets['napi-debug']?.inputs).toContainEqual({
+        runtime:
+          'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c \'cd "$0" && rustc -vV\' packages/cowshed',
+      });
 
       const darwinArm64Targets = await inferProjectTargets(
         workspace,
         'packages/cowshed/package.json',
         createNodesV2ForPlatform('darwin', 'arm64'),
       );
-      expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toContain('--use-napi-cross');
-      expect(darwinArm64Targets['napi-x64-linux']?.options?.env).toEqual({
-        TARGET_CC: 'clang',
-        TARGET_CXX: 'clang++',
-      });
-      expect(darwinArm64Targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
+      expect(darwinArm64Targets['napi-x64-linux']?.options?.env).toBeUndefined();
+      expect(darwinArm64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
       expect(darwinArm64Targets['napi-debug']?.options?.env).toBeUndefined();
-      expect(darwinArm64Targets['napi-toolchain-arm64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'aarch64-unknown-linux-gnu' },
-      });
-      expect(darwinArm64Targets['napi-toolchain-x64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'x86_64-unknown-linux-gnu' },
-      });
-      expect(darwinArm64Targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
       expect(darwinArm64Targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
       expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toBe(
-        'napi build --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/linux-x64-gnu',
+        'sh ../../tooling/napi-build.sh x86_64-unknown-linux-gnu napi --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/linux-x64-gnu',
       );
       expect(darwinArm64Targets['napi-x64-linux']?.configurations?.[RELEASE_CONFIGURATION]?.command).toContain(
-        'napi build --release --platform',
+        'napi --release --platform',
       );
 
-      // The whole rule, stated once per forced host: a triple gets a cross
-      // toolchain exactly when it is a linux triple that is not this host's own.
-      // Asserting the pair by name is what broke on Linux, where
-      // napi-toolchain-x64-linux legitimately does not exist.
-      for (const [inferred, hostTriple] of [
-        [linuxX64Targets, 'x64-linux'],
-        [darwinArm64Targets, 'arm64-macos'],
-      ] as const) {
+      const linuxArm64Targets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('linux', 'arm64'),
+      );
+      expect(linuxArm64Targets['napi-arm64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
+      expect(linuxArm64Targets['napi-x64-linux']?.options?.env).toBeUndefined();
+      for (const inferred of [linuxX64Targets, linuxArm64Targets, darwinArm64Targets]) {
+        expect(Object.keys(inferred).some((name) => name.startsWith('napi-toolchain-'))).toBe(false);
         for (const suffix of ['arm64-linux', 'x64-linux', 'arm64-macos', 'x64-macos']) {
-          const expectsToolchain = suffix.endsWith('-linux') && suffix !== hostTriple;
-          expect(inferred[`napi-toolchain-${suffix}`] === undefined).toBe(!expectsToolchain);
-          expect(inferred[`napi-${suffix}`]?.options?.command).toContain(
-            expectsToolchain ? '--use-napi-cross' : '--target',
-          );
+          expect(inferred[`napi-${suffix}`]?.options?.command).toContain('tooling/napi-build.sh');
+          expect(inferred[`napi-${suffix}`]?.options?.command).not.toContain('--use-napi-cross');
+          expect(inferred[`napi-${suffix}`]?.inputs).toContain('{workspaceRoot}/tooling/napi-build.sh');
+          expect(inferred[`napi-${suffix}`]?.inputs).toContain('{workspaceRoot}/tooling/direnv/*.nix');
+          expect(inferred[`napi-${suffix}`]?.dependsOn).toBeUndefined();
         }
       }
+      expect(linuxX64Targets['napi-x64-linux']?.inputs).toContainEqual({
+        runtime:
+          'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh x86_64-unknown-linux-gnu --identity',
+      });
       // The aggregate build pulls in exactly the inferring host's
       // platform-suffixed targets (publish still owns foreign platforms), and
       // the only cargo-test work it owns is compiling the executables — every
@@ -1812,7 +1833,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
+            'sh ../../tooling/napi-build.sh host napi --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);

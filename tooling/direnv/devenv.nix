@@ -43,17 +43,18 @@ in {
       alejandra # Nix formatter
     ])
     # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
-    # N-API cross targets need raw Clang: Nix's cc-wrapper injects host include
-    # paths ahead of the downloaded target sysroot.
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.stdenv.cc
-      (lib.hiPrio pkgs.llvmPackages.clang-unwrapped)
       pkgs.rsync
       # openssl-src (vendored-openssl / git2) configure needs perl + make.
       pkgs.perl
       pkgs.gnumake
       pkgs.pkg-config
       pkgs.openssl
+      # mkfs.ext4 for the job cgroup test's loop-mounted scratch: the build's own
+      # ZFS storage reaches neither memory.current's page cache nor io.stat.
+      pkgs.e2fsprogs
+      pkgs.util-linux # loop mounting, probing, and unprivileged controller execution
     ];
 
   # Nix's setup hooks replace generic CC/CXX after `env` is applied, leaving

@@ -2,13 +2,29 @@
 /// <reference types="node" />
 
 import type * as Api from './api.generated.js';
-import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';
+import {
+  type EventIterator,
+  eventIterator,
+  type NativeJobHandle,
+  type NativeWorkspaceHandle,
+  type NativeWorkspaceRefHandle,
+} from './native.js';
 import * as V from './validators.generated.js';
 
 /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */
 export interface NativeDownload {
   readonly json: string;
   readonly bytes: Buffer;
+}
+
+/**
+ * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,
+ * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even
+ * while a `next` waits, which then resolves to `null`.
+ */
+export interface NativeEvents {
+  next(): Promise<string | null>;
+  close(): Promise<void>;
 }
 
 /** The operations a `Project` serves: exactly those its authority admits. */
@@ -71,6 +87,7 @@ export interface NativeJobHandleOperations
     NativeJobLogs,
     NativeJobTail,
     NativeJobListeningPorts,
+    NativeJobProgress,
     NativeJobAttachWrite,
     NativeJobDetach,
     NativeJobWait,
@@ -631,6 +648,25 @@ export async function jobLogs(
 ): Promise<Api.LogsChunk & { readonly bytes: Uint8Array }> {
   const answer = await handle.logs(JSON.stringify(args));
   return { ...V.parseLogsChunk(answer.json), bytes: answer.bytes };
+}
+
+/** A handle that serves `job.progress`. */
+export interface NativeJobProgress {
+  progress(argumentsJson: string): Promise<NativeEvents>;
+}
+
+/** The request fields a `job.progress` caller names; its handle binds the rest. */
+export type JobProgressArguments = Pick<Api.ProgressRequest, 'everyMs'>;
+
+/**
+ * Streams one job's resource samples: the latest at once, one every interval while it runs,
+ * then its terminal sample once.
+ */
+export function jobProgress(
+  handle: NativeJobProgress,
+  args: JobProgressArguments,
+): EventIterator<Api.JobResourceSample> {
+  return eventIterator(() => handle.progress(JSON.stringify(args)), V.parseJobResourceSample);
 }
 
 /** A handle that serves `job.sealed`. */

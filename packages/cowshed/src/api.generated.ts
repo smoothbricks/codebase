@@ -123,6 +123,10 @@ export type AdoptionSkip =
   | ({ readonly kind: 'landingDaemonStayed' } & {
       readonly daemon: DatabaseHolder;
     })
+  | ({ readonly kind: 'landingBuilding' } & {
+      readonly lock: string;
+      readonly holders: ReadonlyArray<DatabaseHolder>;
+    })
   | ({ readonly kind: 'targetHeld' } & {
       readonly database: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
@@ -220,6 +224,22 @@ export type CarrySide = 'workspace' | 'target';
 export type ChangeRepoIdRequest = {
   readonly repoId: RepoId;
   readonly newRepoId: RepoId;
+};
+
+/**
+ * Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel
+ * memory together. Never resident memory: cache a job filled is charged to it while no process
+ * of it maps a page.
+ */
+export type ChargedMemoryBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * A cgroup's charged memory: what it is charged now, and the most it was ever charged. The peak
+ * is the kernel's own high watermark, read without resetting it.
+ */
+export type ChargedMemoryUsage = {
+  readonly currentBytes: ChargedMemoryBytes;
+  readonly peakBytes: ChargedMemoryBytes;
 };
 
 export type CheckpointCommitment = {
@@ -1342,6 +1362,17 @@ export type ProcessUsage = {
 };
 
 /**
+ * A progress subscription to one job, sampled every `everyMs`.
+ */
+export type ProgressRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly jobId: JobId;
+  readonly everyMs: SampleInterval;
+};
+
+/**
  * A change to the project's standing policy: read grants, egress grants and
  * workspace-relative denies. A write allow stays per-workspace (`GrantDelta`).
  */
@@ -1636,6 +1667,9 @@ export type ReseedSkip =
   | ({ readonly kind: 'building' } & {
       readonly lock: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
+    })
+  | ({ readonly kind: 'volumeBusy' } & {
+      readonly reason: string;
     });
 
 /**
@@ -1693,6 +1727,12 @@ export type Retry = { readonly reason: 'gcPlanStale' };
 export type RevisionTarget = { readonly branch: BranchName } | { readonly ref: GitRef } | { readonly oid: GitOid };
 
 export type RunSandboxMode = 'readWrite' | 'readOnly';
+
+/**
+ * How often a progress subscriber is sent a job's sample, in whole milliseconds: positive, and
+ * within the bound every projection holds exactly.
+ */
+export type SampleInterval = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
 
 /**
  * What the running sccache daemon reports about itself.

@@ -10,17 +10,17 @@ use super::dto::{
 };
 use super::frame;
 use super::operations::{
-    AdmissionKeyRequest,
-    self, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest, CreateRequest, DestroyRequest,
-    ExecParams, ExecStdin, GcRequest, GrantRequest, JobRequest, JobStream, LandRequest, LogsChunk,
-    LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation, ProjectGrantRequest,
-    ProjectOpenRequest, PushRequest, QuotaRequest, RebaseRequest, RemoveProjectRequest,
-    RepoRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
-    SourceDestinationRequest, TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest,
-    WorkspaceAttachRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result,
-    encode_request,
+    self, AdmissionKeyRequest, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest, CreateRequest,
+    DestroyRequest, ExecParams, ExecStdin, GcRequest, GrantRequest, JobRequest, JobStream,
+    LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
+    ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
+    RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest, RestoreRequest,
+    SessionRequest, SlotRequest, SourceDestinationRequest, StreamOperation, TailRequest,
+    WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
+    WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
+use super::resources::SampleInterval;
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
@@ -155,6 +155,8 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         cursor: JobJournalCursor,
     ) -> Result<JobAttachment>;
     async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()>;
+    /// Opens a stream-lane call: its events, one per demand, until its end.
+    async fn stream(&self, method: &'static str, params: Params) -> Result<RawEventStream>;
 }
 
 #[cfg(unix)]
@@ -178,6 +180,27 @@ enum ActorMessage {
         expected_offset: u64,
         reply: oneshot::Sender<Result<ActorResponse>>,
     },
+    /// Opens a stream-lane call; `opened` hears its id once its request is sent, `first` its
+    /// first event or its end.
+    Stream {
+        method: &'static str,
+        params: Params,
+        opened: oneshot::Sender<Result<u64>>,
+        first: oneshot::Sender<Result<StreamStep>>,
+    },
+    /// Demands the next event of the open stream `id`.
+    Next {
+        id: u64,
+        reply: oneshot::Sender<Result<StreamStep>>,
+    },
+}
+
+/// What one demand on a stream-lane call is answered with.
+#[cfg(unix)]
+enum StreamStep {
+    Event(Value),
+    /// The call ended: its events ended, or its caller closed it.
+    End,
 }
 
 #[cfg(unix)]
@@ -197,6 +220,9 @@ enum ActorLane {
 #[derive(Clone)]
 struct ActorRuntime {
     sender: mpsc::Sender<ActorMessage>,
+    /// Where a dropped stream asks for its call to be closed: unbounded, so a drop never waits
+    /// and never fails while the actor runs, and each open stream sends at most one.
+    closes: mpsc::UnboundedSender<u64>,
 }
 
 #[cfg(unix)]
@@ -430,6 +456,27 @@ impl ControllerRuntime for ActorRuntime {
             .await
             .map(|EmptyResult {}| ())
     }
+
+    async fn stream(&self, method: &'static str, params: Params) -> Result<RawEventStream> {
+        let (opened, id) = oneshot::channel();
+        let (first, step) = oneshot::channel();
+        self.sender
+            .send(ActorMessage::Stream {
+                method,
+                params,
+                opened,
+                first,
+            })
+            .await
+            .map_err(|_| actor_send_error())?;
+        let id = id.await.map_err(|_| actor_reply_error())??;
+        Ok(RawEventStream {
+            id,
+            runtime: self.clone(),
+            pending: Some(step),
+            ended: false,
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -585,6 +632,111 @@ impl RawByteStream {
     pub async fn next(&mut self) -> Option<Result<Bytes>> {
         self.receiver.recv().await
     }
+}
+
+/// The events of one stream-lane call, as JSON: each demanded when its reader asks for it, so an
+/// unread stream holds the controller to one event and the connection to none. Dropping it before
+/// its end closes the call.
+#[cfg(unix)]
+pub(crate) struct RawEventStream {
+    id: u64,
+    runtime: ActorRuntime,
+    /// The demand sent and not yet answered: the request's, or the last [`Self::next`]'s.
+    pending: Option<oneshot::Receiver<Result<StreamStep>>>,
+    ended: bool,
+}
+
+#[cfg(unix)]
+impl RawEventStream {
+    /// The next event, or `None` after the end. An error is the stream's last item. Cancelling
+    /// this future keeps its demand: the next call takes the answer.
+    pub(crate) async fn next(&mut self) -> Option<Result<Value>> {
+        if self.ended {
+            return None;
+        }
+        let answer = match &mut self.pending {
+            Some(answer) => answer,
+            None => {
+                let (reply, answer) = oneshot::channel();
+                if self
+                    .runtime
+                    .sender
+                    .send(ActorMessage::Next { id: self.id, reply })
+                    .await
+                    .is_err()
+                {
+                    self.ended = true;
+                    return Some(Err(actor_send_error()));
+                }
+                self.pending.insert(answer)
+            }
+        };
+        let step = answer.await;
+        self.pending = None;
+        match step {
+            Ok(Ok(StreamStep::Event(event))) => Some(Ok(event)),
+            Ok(Ok(StreamStep::End)) => {
+                self.ended = true;
+                None
+            }
+            Ok(Err(error)) => {
+                self.ended = true;
+                Some(Err(error))
+            }
+            Err(_) => {
+                self.ended = true;
+                Some(Err(actor_reply_error()))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawEventStream {
+    fn drop(&mut self) {
+        if !self.ended {
+            // A send fails only once the actor is gone, and the connection, with every call
+            // still open on it, with it.
+            let _ = self.runtime.closes.send(self.id);
+        }
+    }
+}
+
+/// The events of one stream-lane operation's call, each its declared result: see
+/// [`JobHandle::progress`].
+pub struct EventStream<O: StreamOperation> {
+    events: RawEventStream,
+    operation: std::marker::PhantomData<fn() -> O>,
+}
+
+impl<O: StreamOperation> EventStream<O> {
+    /// The next event, or `None` after the call's end. An error is the stream's last item.
+    pub async fn next(&mut self) -> Option<Result<O::Result>> {
+        let event = self.events.next().await?;
+        Some(event.and_then(decode_result::<O>))
+    }
+}
+
+impl<O: StreamOperation> fmt::Debug for EventStream<O> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventStream")
+            .field("method", &O::METHOD)
+            .field("id", &self.events.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opens a call of the stream-lane operation `O`.
+pub(super) async fn invoke_stream<O: StreamOperation>(
+    runtime: &(impl ControllerRuntime + ?Sized),
+    request: &O::Request,
+) -> Result<EventStream<O>> {
+    let params = encode_request::<O>(request)?;
+    Ok(EventStream {
+        events: runtime.stream(O::METHOD, params).await?,
+        operation: std::marker::PhantomData,
+    })
 }
 
 pub struct JobStdin {
@@ -1132,6 +1284,7 @@ fn spawn_controller_actor(
     watch::Receiver<Option<OtherBuild>>,
 ) {
     let (sender, receiver) = mpsc::channel::<ActorMessage>(32);
+    let (closes, closed) = mpsc::unbounded_channel();
     let (reader, writer) = stream.into_split();
     let (answers, answer_receiver) = mpsc::unbounded_channel();
     let (other_build, refused) = watch::channel(None);
@@ -1144,11 +1297,12 @@ fn spawn_controller_actor(
     ));
     tokio::spawn(run_controller_actor(
         receiver,
+        closed,
         writer,
         downloads,
         answer_receiver,
     ));
-    (Arc::new(ActorRuntime { sender }), refused)
+    (Arc::new(ActorRuntime { sender, closes }), refused)
 }
 
 /// The stream offset each sent download call continues from, by call id. The actor adds an
@@ -1166,10 +1320,11 @@ struct Answer {
 }
 
 /// What the reader takes off the connection for the actor: one step of a call that asked for
-/// its steps, or a call's answer.
+/// its steps, one event of a stream-lane call, or a call's answer.
 #[cfg(unix)]
 enum Inbound {
     Step { id: u64, report: StepReport },
+    Event { id: u64, event: Value },
     Answer(Answer),
 }
 
@@ -1214,6 +1369,7 @@ async fn read_inbound(
         CowshedError::internal(format!("controller RPC response decoding failed: {error}"))
     })? {
         codec::DecodedServerFrame::Step { id, report } => Ok(Inbound::Step { id, report }),
+        codec::DecodedServerFrame::Event { id, event } => Ok(Inbound::Event { id, event }),
         codec::DecodedServerFrame::Response(response) => read_answer(reader, downloads, response)
             .await
             .map(Inbound::Answer),
@@ -1298,9 +1454,19 @@ async fn read_answer(
     })
 }
 
+/// One open stream-lane call, as the actor tracks it.
+#[cfg(unix)]
+struct OpenStream {
+    /// Who waits for the answer to the demand on the wire, when one is.
+    waiting: Option<oneshot::Sender<Result<StreamStep>>>,
+    /// Its reader dropped it, and its close is sent: what still arrives for it is discarded.
+    closing: bool,
+}
+
 #[cfg(unix)]
 async fn run_controller_actor(
     mut messages: mpsc::Receiver<ActorMessage>,
+    mut closes: mpsc::UnboundedReceiver<u64>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     downloads: Downloads,
     mut answers: mpsc::UnboundedReceiver<Result<Inbound>>,
@@ -1310,14 +1476,13 @@ async fn run_controller_actor(
     // The step listeners of the pending calls that asked for steps; a listener is dropped with
     // its call's answer, so the caller's step stream ends exactly when the call does.
     let mut listeners = std::collections::HashMap::<u64, mpsc::UnboundedSender<StepReport>>::new();
+    let mut streams = std::collections::HashMap::<u64, OpenStream>::new();
     let mut next_id = 1_u64;
     let failure = loop {
         tokio::select! {
             message = messages.recv() => {
                 // Every handle is gone, and with it every caller that could wait on an answer.
                 let Some(message) = message else { return };
-                let id = next_id;
-                next_id = next_id.saturating_add(1);
                 let (method, params, lane, steps, reply) = match message {
                     ActorMessage::Json { method, params, steps, reply } => {
                         (method, params, ActorLane::Json, steps, reply)
@@ -1328,7 +1493,39 @@ async fn run_controller_actor(
                     ActorMessage::Download { method, params, expected_offset, reply } => {
                         (method, params, ActorLane::Download(expected_offset), None, reply)
                     }
+                    ActorMessage::Stream { method, params, opened, first } => {
+                        let id = next_id;
+                        next_id = next_id.saturating_add(1);
+                        let call = send_call(&mut writer, id, method, &params, &ActorLane::Json, false);
+                        if let Err(error) = call.await {
+                            let _ = opened.send(Err(error.clone()));
+                            break error;
+                        }
+                        // The request is the stream's first demand.
+                        streams.insert(id, OpenStream { waiting: Some(first), closing: false });
+                        let _ = opened.send(Ok(id));
+                        continue;
+                    }
+                    ActorMessage::Next { id, reply } => {
+                        let Some(stream) = streams
+                            .get_mut(&id)
+                            .filter(|stream| stream.waiting.is_none() && !stream.closing)
+                        else {
+                            let _ = reply.send(Err(CowshedError::internal(format!(
+                                "stream {id} was demanded while it is not open or awaits an answer"
+                            ))));
+                            continue;
+                        };
+                        if let Err(error) = send_demand(&mut writer, id, codec::Demand::Next).await {
+                            let _ = reply.send(Err(error.clone()));
+                            break error;
+                        }
+                        stream.waiting = Some(reply);
+                        continue;
+                    }
                 };
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
                 if let ActorLane::Download(offset) = lane {
                     downloads
                         .lock()
@@ -1345,6 +1542,16 @@ async fn run_controller_actor(
                     listeners.insert(id, steps);
                 }
             }
+            Some(id) = closes.recv() => {
+                // A stream that already ended has nothing to close.
+                if let Some(stream) = streams.get_mut(&id).filter(|stream| !stream.closing) {
+                    stream.closing = true;
+                    stream.waiting = None;
+                    if let Err(error) = send_demand(&mut writer, id, codec::Demand::Close).await {
+                        break error;
+                    }
+                }
+            }
             inbound = answers.recv() => {
                 let answer = match inbound {
                     Some(Ok(Inbound::Answer(answer))) => answer,
@@ -1358,9 +1565,53 @@ async fn run_controller_actor(
                         let _ = listener.send(report);
                         continue;
                     }
+                    Some(Ok(Inbound::Event { id, event })) => {
+                        let Some(stream) = streams.get_mut(&id) else {
+                            break CowshedError::internal(
+                                "controller RPC event did not match an open stream",
+                            );
+                        };
+                        match stream.waiting.take() {
+                            Some(waiting) => {
+                                let _ = waiting.send(Ok(StreamStep::Event(event)));
+                            }
+                            None if stream.closing => {}
+                            None => {
+                                break CowshedError::internal(
+                                    "controller RPC event answered no demand",
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     Some(Err(error)) => break error,
                     None => break actor_reply_error(),
                 };
+                if let Some(stream) = streams.remove(&answer.id) {
+                    let step = match answer.outcome {
+                        Ok(ActorResponse::Json(Value::Object(ended))) if ended.is_empty() => {
+                            Ok(StreamStep::End)
+                        }
+                        Ok(_) => {
+                            break CowshedError::internal(
+                                "controller RPC stream ended with a result",
+                            );
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match stream.waiting {
+                        Some(waiting) => {
+                            let _ = waiting.send(step);
+                        }
+                        None if stream.closing => {}
+                        None => {
+                            break CowshedError::internal(
+                                "controller RPC stream ended without a demand",
+                            );
+                        }
+                    }
+                    continue;
+                }
                 listeners.remove(&answer.id);
                 let Some(reply) = pending.remove(&answer.id) else {
                     break CowshedError::internal(
@@ -1374,6 +1625,24 @@ async fn run_controller_actor(
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(failure.clone()));
     }
+    for (_, stream) in streams.drain() {
+        if let Some(waiting) = stream.waiting {
+            let _ = waiting.send(Err(failure.clone()));
+        }
+    }
+}
+
+/// Write one demand on the open stream `id`. Any failure leaves the connection unusable.
+#[cfg(unix)]
+async fn send_demand(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    demand: codec::Demand,
+) -> Result<()> {
+    let frame = codec::encode_rpc_demand(id, demand).map_err(|error| {
+        CowshedError::internal(format!("controller RPC demand encoding failed: {error}"))
+    })?;
+    write_rpc_frame(writer, &frame).await
 }
 
 /// Write one call, and its upload frame, under `id`. Any failure leaves the connection
@@ -2090,6 +2359,24 @@ impl JobHandle {
             .await
     }
 
+    /// The job's resource samples: the latest at once when the job owns a process, another
+    /// every `every` while it runs, then its terminal sample exactly once, and the end. A reader
+    /// slower than `every` receives the latest sample, never a backlog, and always the terminal
+    /// one. Dropping the stream ends the subscription, not the job.
+    pub async fn progress(
+        &self,
+        every: SampleInterval,
+    ) -> Result<EventStream<operations::JobProgress>> {
+        let request = ProgressRequest {
+            repo_id: self.authority.repo_id.clone(),
+            workspace: self.authority.workspace.clone(),
+            workspace_incarnation: self.authority.workspace_incarnation.clone(),
+            job_id: self.id,
+            every_ms: every,
+        };
+        invoke_stream::<operations::JobProgress>(&*self.runtime, &request).await
+    }
+
     /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already
     /// continues from there. Without `follow`, ends at the current written end even while the
     /// job runs; `follow` waits on output notifications past that end until the job is terminal.
@@ -2335,6 +2622,12 @@ mod tests {
 
         async fn kill(&self, _authority: &WorkspaceAuthority, _id: JobId) -> Result<()> {
             Err(CowshedError::internal("test controller rejected kill"))
+        }
+
+        async fn stream(&self, method: &'static str, _params: Params) -> Result<RawEventStream> {
+            Err(CowshedError::internal(format!(
+                "the job-stream tests open no stream, and {method} is one"
+            )))
         }
     }
 
@@ -2772,8 +3065,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let (sender, _receiver) = mpsc::channel(1);
+        let (closes, _closed) = mpsc::unbounded_channel();
         let cowshed = Cowshed {
-            runtime: Arc::new(ActorRuntime { sender }),
+            runtime: Arc::new(ActorRuntime { sender, closes }),
             other_build: watch::channel(None).1,
         };
         let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));

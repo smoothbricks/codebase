@@ -123,6 +123,13 @@ export interface JobHandle {
   readonly id: number;
   status(): Promise<Api.JobInfo>;
   /**
+   * The job's resource samples: the latest once it owns a process, another every `everyMs` while
+   * it runs, then its terminal sample once. Each step of the loop asks the controller for one
+   * sample, so a slow reader gets the latest, never a backlog; leaving the loop ends the
+   * subscription, never the job.
+   */
+  progress(everyMs: number): AsyncIterable<Api.JobResourceSample>;
+  /**
    * One stream's bytes from `offset`, at most one chunk. Reading again from `nextOffset` continues
    * where this chunk ended. Without `follow`, stop at an empty chunk or `eof`: an empty chunk is
    * the current end even when the stream is still open (`eof: false`). With `follow`, the supervisor
@@ -134,6 +141,12 @@ export interface JobHandle {
    * child counts, a port another process holds never does, and nothing connects to a port.
    */
   listeningPorts(): Promise<Api.JobListeningPorts>;
+  /**
+   * A bounded raw slice of both streams after `cursor`, or their latest bounded tail when there is
+   * none; `next` is the cursor that continues after it. A cursor past what the job admitted is a
+   * usage error.
+   */
+  tail(cursor: Api.JobJournalCursor | undefined, limits: Api.JobTailLimits): Promise<Api.JobTail>;
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;
