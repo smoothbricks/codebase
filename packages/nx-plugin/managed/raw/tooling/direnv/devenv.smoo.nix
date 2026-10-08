@@ -203,6 +203,10 @@ in {
         value = lib.mkForce (tool "ar");
       }
       {
+        name = "RANLIB_${suffix}";
+        value = lib.mkForce (tool "ranlib");
+      }
+      {
         name = "CARGO_TARGET_${upper}_LINKER";
         value = lib.mkForce (tool "cc");
       }
