@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 const realPluginPath = new URL('./dist/index.js', import.meta.url);
 
@@ -9,6 +10,7 @@ if (!existsSync(realPluginPath)) {
   );
 }
 
-const plugin = await import(realPluginPath.href);
+// Nx's real loader uses require(), so this boundary must stay synchronous in Node and Bun.
+const plugin = createRequire(import.meta.url)('./dist/index.js');
 export const createNodesV2 = plugin.createNodesV2;
 export default plugin.default;

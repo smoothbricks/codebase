@@ -7,6 +7,10 @@ options, include/exclude filters and order. It adds the bare `@smoothbricks/nx-p
 absent; repeated updates do not replace an existing configured entry or discard scoped instances. Malformed plugin
 values are reported rather than replaced, and an unchanged Nx Tree configuration is not serialized again.
 
+The public plugin entry loads its transformed bootstrap product synchronously, matching Nx's real `handleImport` require
+path in Node and Bun. A missing `dist/index.js` refuses by name and gives the `ttsc` bootstrap command; it never returns
+an empty graph or loads raw development source in place of transformed code.
+
 ## Target Ownership
 
 Official `@nx/js/typescript` inference is disabled because it cannot run the workspace's source transformers. A package

@@ -29,7 +29,9 @@ describe('Bun bootstrap imports', () => {
 
   it('loads the public policy caller closure without a transform preload', () => {
     const script = [
-      'const root = await import("@smoothbricks/nx-plugin");',
+      'const { fileURLToPath } = await import("node:url");',
+      'const { handleImport } = await import("nx/src/utils/handle-import.js");',
+      'const root = await handleImport(fileURLToPath(import.meta.resolve("@smoothbricks/nx-plugin")));',
       'if (!Array.isArray(root.createNodesV2)) throw new Error("the compiled plugin entry is incomplete");',
       'const policy = await import("@smoothbricks/nx-plugin/workspace-config-policy");',
       'const bounded = await import("@smoothbricks/nx-plugin/bounded-test-policy");',
