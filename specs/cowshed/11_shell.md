@@ -60,9 +60,9 @@ group, so a kill reaches all of them and never the host; a killed script dies by
 `cd`, `umask`, `ulimit`, `trap` and `exec` end with the child. The interpreter lives only in the host binary (the
 `cowshed-shell` crate), not in the supervisor library or its Node addon.
 
-Complete-group termination means every retained running member receives the group signal and reaches an observed
-exit; it does not mean the caller may reap processes whose parent is another process. An exited, unreaped zombie still
-answers `kill(pid, 0)`, so a null signal is not evidence that a killed descendant survived. Consumers retain a kernel
+Complete-group termination means every retained running member receives the group signal and reaches an observed exit;
+it does not mean the caller may reap processes whose parent is another process. An exited, unreaped zombie still answers
+`kill(pid, 0)`, so a null signal is not evidence that a killed descendant survived. Consumers retain a kernel
 identity-fenced exit watch while the member is running, then wait for that member's actual exit event. The actual parent
 alone reaps its children; the command leader stays unreaped until release, and the independent host must remain usable.
 
@@ -84,7 +84,14 @@ success. Signal/release while no command is held, malformed frames, and unknown 
 Parent-side output/diagnostic writers are dropped as soon as the command starts, not kept until release: otherwise EOF
 would wait for release while release waited for EOF. Every post-fork failure and controller EOF ends the host's own held
 command group with TERM, the existing grace, KILL, and reap. The supervisor never force-kills the host before that
-command retirement can run, and no stale start reply can authorize signalling another process.
+command retirement can run, and no stale start reply can authorize signalling another process. Retirement is a fallible
+actual-parent operation. A failed TERM, membership read, KILL, or reap retains its operation and native cause; later
+cleanup steps are still attempted. A controller EOF invokes that same operation explicitly, and the host reports failure
+rather than acknowledging successful retirement. The host reports the preserved native failure before attempting a reply
+that may fail on the closed controller socket; a refused reply retains its native cause too. Destructor fallback
+attempts fallible stderr/stdout reporting without panicking or hiding the original caller error; if both channels are
+unavailable, delivery cannot be guaranteed. Consumers never clean up an old descendant PID or group ID after an exit or
+release: they close the actual parent-control capability, which still owns any held command.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
