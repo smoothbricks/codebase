@@ -1,6 +1,7 @@
 import { expect, it } from 'bun:test';
 import { existsSync, lstatSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -14,6 +15,7 @@ import {
   type ProcessEntry,
   pidsWorkingIn,
   processTable,
+  retireFixtureSocketDirectory,
   terminate,
   withDescendants,
 } from './testing.js';
@@ -86,6 +88,53 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its root', a
   expect(existsSync(root)).toBe(false);
 }, 120_000);
 
+it('binds and connects through its short alias without granting the long fixture root a socket namespace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'short-socket-boundary-'.padEnd(100, 'x')));
+  const directory = fixtureSocketDirectory(root);
+  const socket = join(directory, NX_LONGEST_SOCKET_NAME);
+  const server = createServer((client) => client.end('owned-socket-ok'));
+  try {
+    await mkdir(directory);
+    expect(Buffer.byteLength(join(root, '.nx', 'sockets', NX_LONGEST_SOCKET_NAME))).toBeGreaterThan(95);
+    expect(await realpath(directory)).toBe(join(await realpath(root), '.nx', 'sockets', 'nx'));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socket, resolve);
+    });
+    const received = await new Promise<string>((resolve, reject) => {
+      const client = createConnection(socket);
+      let text = '';
+      client.on('data', (bytes) => {
+        text += bytes.toString();
+      });
+      client.once('error', reject);
+      client.once('end', () => resolve(text));
+    });
+    expect(received).toBe('owned-socket-ok');
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error === undefined ? resolve() : reject(error)));
+      });
+    }
+    await retireFixtureSocketDirectory(root);
+    await rm(root, { recursive: true });
+  }
+});
+
+it('refuses a symlinked socket-state ancestor before writing outside the fixture', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socket-escape-boundary-'));
+  const foreign = await mkdtemp(join(tmpdir(), 'socket-foreign-boundary-'));
+  try {
+    await symlink(foreign, join(root, '.nx'), 'dir');
+    expect(() => fixtureSocketDirectory(root)).toThrow('is not a real directory in its physical workspace');
+    expect(existsSync(join(foreign, 'sockets'))).toBe(false);
+  } finally {
+    await rm(root, { recursive: true });
+    await rm(foreign, { recursive: true });
+  }
+});
+
 it('starts and connects to a fixture daemon through owned short aliases with a long private TMPDIR', async () => {
   await withNxFixture('long-tmp-socket-', async ({ workspace }) => {
     const privateTemp = join(workspace, 'private-temp-'.padEnd(110, 'x'));
@@ -140,6 +189,8 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
   const kept = join(liveRun, 'live-fixture');
   await mkdir(kept, { recursive: true });
   await mkdir(abandoned, { recursive: true });
+  const abandonedAlias = dirname(fixtureSocketDirectory(abandoned));
+  const keptAlias = dirname(fixtureSocketDirectory(kept));
   let daemon: ProcessEntry[] = [];
   const helper = Bun.spawn(['sleep', '600'], { cwd: abandoned });
   const bystander = Bun.spawn(['sleep', '600'], { cwd: kept });
@@ -154,15 +205,19 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
     expect(await helper.exited).not.toBe(0);
     expect(helper.signalCode).toBe('SIGTERM');
     expect(existsSync(deadRun)).toBe(false);
+    expect(lstatSync(abandonedAlias, { throwIfNoEntry: false })).toBeUndefined();
     expect(bystander.exitCode).toBeNull();
     expect(bystander.signalCode).toBeNull();
     expect(existsSync(kept)).toBe(true);
+    expect(lstatSync(keptAlias).isSymbolicLink()).toBe(true);
+    expect(await realpath(keptAlias)).toBe(join(await realpath(kept), '.nx', 'sockets'));
     expect(fresh.startsWith(join(suiteDirectory, `run-${process.pid}`, 'fresh-'))).toBe(true);
   } finally {
     for (const entry of [...daemon, { pid: helper.pid }, { pid: bystander.pid }]) {
       terminate(entry.pid);
     }
     await Promise.all([helper.exited, bystander.exited]);
+    await retireFixtureSocketDirectory(kept);
     await rm(suiteDirectory, { recursive: true, force: true });
   }
 }, 120_000);

@@ -442,6 +442,25 @@ async function reclaimRun(directory: string, owner: string, graceMs = EXIT_TIMEO
       }
     }
   }
+  // A killed fixture may never have reached its normal alias retirement. Only
+  // aliases whose exact target lies in this reclaimed run belong to its sweep.
+  const namespace = socketNamespace();
+  for (const entry of await readdir(namespace.directory, { withFileTypes: true })) {
+    if (!entry.isSymbolicLink() || !/^nx-[a-f0-9]{16}$/.test(entry.name)) continue;
+    const alias = join(namespace.directory, entry.name);
+    const target = await readlink(alias).catch((error: unknown) => {
+      if (errorCode(error) === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (target === undefined) continue;
+    const workspace = dirname(dirname(target));
+    if (target === join(workspace, '.nx', 'sockets') && isWithin(workspace, directory)) {
+      if (fixtureSocketPaths(workspace).alias !== alias) {
+        throw new Error(`fixture socket alias ${alias} has a different workspace identity for ${workspace}`);
+      }
+      await retireFixtureSocketDirectory(workspace);
+    }
+  }
   await rm(directory, { recursive: true, force: true });
 }
 
@@ -704,9 +723,15 @@ function assertFixtureSocketAlias(alias: string, target: string): void {
  */
 export function fixtureSocketDirectory(workspace: string): string {
   const { alias, target } = fixtureSocketPaths(workspace);
-  mkdirSync(target, { recursive: true, mode: 0o700 });
-  if (realpathSync(target) !== target) {
-    throw new Error(`fixture socket target ${target} escapes its physical workspace`);
+  for (const directory of [dirname(target), target]) {
+    try {
+      mkdirSync(directory, { mode: 0o700 });
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    }
+    if (!lstatSync(directory).isDirectory()) {
+      throw new Error(`fixture socket target ${directory} is not a real directory in its physical workspace`);
+    }
   }
   try {
     symlinkSync(target, alias, 'dir');
