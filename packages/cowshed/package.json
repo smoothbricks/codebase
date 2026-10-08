@@ -191,6 +191,9 @@
           "{workspaceRoot}/tooling/napi-build.sh",
           "{workspaceRoot}/tooling/devenv",
           "{workspaceRoot}/tooling/direnv/*.nix",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh aarch64-apple-darwin --identity"
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -223,6 +226,9 @@
           "{workspaceRoot}/tooling/napi-build.sh",
           "{workspaceRoot}/tooling/devenv",
           "{workspaceRoot}/tooling/direnv/*.nix",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh x86_64-apple-darwin --identity"
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -254,6 +260,9 @@
           "{workspaceRoot}/tooling/napi-build.sh",
           "{workspaceRoot}/tooling/devenv",
           "{workspaceRoot}/tooling/direnv/*.nix",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh aarch64-unknown-linux-gnu --identity"
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -285,6 +294,9 @@
           "{workspaceRoot}/tooling/napi-build.sh",
           "{workspaceRoot}/tooling/devenv",
           "{workspaceRoot}/tooling/direnv/*.nix",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh x86_64-unknown-linux-gnu --identity"
+          },
           "cargoToolchain"
         ],
         "outputs": [

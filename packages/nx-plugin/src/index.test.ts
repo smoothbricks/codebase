@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -34,6 +35,29 @@ const inferTargets: typeof rawInferTargets = async (files, options, context) => 
 };
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
+  it('keys native and cross producer modes from the real build entry without invoking a compiler', () => {
+    const entry = join(import.meta.dir, '../managed/raw/tooling/napi-build.sh');
+    const host = execFileSync('uname', ['-sm'], { encoding: 'utf8' }).trim().replace(' ', ':');
+    for (const target of ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin']) {
+      const isNativeLinux =
+        (target === 'x86_64-unknown-linux-gnu' && host === 'Linux:x86_64') ||
+        (target === 'aarch64-unknown-linux-gnu' && (host === 'Linux:aarch64' || host === 'Linux:arm64'));
+      const nativeMode = target.endsWith('-unknown-linux-gnu') && !isNativeLinux ? 'linux-cross' : 'native';
+      expect(
+        execFileSync('sh', [entry, target, '--identity'], {
+          encoding: 'utf8',
+          env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'native' },
+        }),
+      ).toBe(`${nativeMode}:${host}\n`);
+      expect(
+        execFileSync('sh', [entry, target, '--identity'], {
+          encoding: 'utf8',
+          env: { ...process.env, SMOO_NAPI_TOOLCHAIN_MODE: 'linux-cross' },
+        }),
+      ).toBe(`linux-cross:${host}\n`);
+    }
+  });
+
   it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
     const workspace = await createWorkspace();
     // The emitter keys on one input outside its project, as a transform or toolchain does. The
@@ -1737,6 +1761,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           expect(inferred[`napi-${suffix}`]?.dependsOn).toBeUndefined();
         }
       }
+      expect(linuxX64Targets['napi-x64-linux']?.inputs).toContainEqual({
+        runtime:
+          'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh tooling/napi-build.sh x86_64-unknown-linux-gnu --identity',
+      });
       // The aggregate build pulls in exactly the inferring host's
       // platform-suffixed targets (publish still owns foreign platforms), and
       // the only cargo-test work it owns is compiling the executables — every

@@ -467,7 +467,7 @@ function targetCommandText(target: TargetConfiguration): string {
  * against one toolchain hashed equal to the same sources linked against the
  * next one.
  */
-function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfiguration['inputs'] {
+function napiInputs(projectRoot: string, repoRooted: boolean): NonNullable<TargetConfiguration['inputs']> {
   // Runtime inputs execute from the workspace root, so the manifest is named
   // by its path from there whichever way the Cargo invocation is rooted.
   const packageJson = `./${posix.join(projectRoot, 'package.json')}`;
@@ -2113,7 +2113,7 @@ function createNapiTargets(
     targets[targetName] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: cargoInputs,
+      inputs: [...cargoInputs, runtimeInput(`sh tooling/napi-build.sh ${triple} --identity`)],
       outputs: [`{projectRoot}/${outputDirectory}`],
       options: {
         cwd: cargoCwd,

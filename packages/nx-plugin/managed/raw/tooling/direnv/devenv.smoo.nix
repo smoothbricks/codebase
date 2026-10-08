@@ -70,6 +70,7 @@ in {
       # `NX_USE_LOCAL=false nx migrate` restores that for the one command.
       NX_USE_LOCAL = "true";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
+      SMOO_NAPI_TOOLCHAIN_MODE = "native";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use
@@ -219,7 +220,11 @@ in {
   in {
     packages = map (target: target.compiler) crossTargets;
     languages.rust.targets = ["aarch64-unknown-linux-gnu"];
-    env = builtins.listToAttrs (lib.concatMap targetEnv crossTargets);
+    env =
+      (builtins.listToAttrs (lib.concatMap targetEnv crossTargets))
+      // {
+        SMOO_NAPI_TOOLCHAIN_MODE = lib.mkForce "linux-cross";
+      };
   };
 
   # linux-cross is the only profile here, and the shape of the publish job is

@@ -444,7 +444,9 @@ Concrete targets come from concrete files:
   linker, libc headers and Rust standard library for each supported Linux triple.
 - No build uses `--use-napi-cross`, a registry-downloaded sysroot or a cache-prewarm target. Nix declarations and locks
   own toolchain provisioning. NAPI target inputs include the managed build entry, shell wrapper, Nix declarations and
-  toolchain pins, so changing the producer cannot replay an artifact built with another toolchain.
+  toolchain pins. A guarded `--identity` input observes the build entry's selected native/cross mode and host, including
+  an already-entered cross profile, without dumping checkout paths or raw compiler environments. Native and cross
+  producers therefore cannot share a key merely because they compile the same target triple.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
