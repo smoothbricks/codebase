@@ -99,11 +99,36 @@ pub fn serve() -> i32 {
         match read_frame(&socket) {
             Ok(Some((payload, descriptors))) => {
                 if let Err(error) = host.handle(&socket, &payload, descriptors) {
-                    // The host's own stderr is /dev/null: the reason goes to the supervisor,
-                    // which gives it to the job that was waiting on this request.
-                    let _ = FrameWriter::new(REPLY_HOST_FAILED)
-                        .bytes(error.to_string().as_bytes())
-                        .and_then(|frame| reply(&socket, frame));
+                    // The controller may already have closed the socket. Report the preserved
+                    // native cause before trying that channel, never relying on a later Drop.
+                    let report = match writeln!(
+                        io::stderr(),
+                        "cowshed: exec host request failed: {error}"
+                    ) {
+                        Ok(()) => error.to_string(),
+                        Err(cause) => format!("{error}; stderr diagnostic unavailable: {cause}"),
+                    };
+                    if let Err(reply_error) = FrameWriter::new(REPLY_HOST_FAILED)
+                        .bytes(report.as_bytes())
+                        .and_then(|frame| reply(&socket, frame))
+                    {
+                        match writeln!(
+                            io::stderr(),
+                            "cowshed: {report}; failed host reply: {reply_error}"
+                        ) {
+                            Ok(()) => {}
+                            Err(stderr_error) => match writeln!(
+                                io::stdout(),
+                                "cowshed: {report}; failed host reply: {reply_error}; stderr diagnostic unavailable: {stderr_error}"
+                            ) {
+                                Ok(()) => {}
+                                Err(_stdout_error) => {
+                                    // The controller and both standard streams are unavailable.
+                                    // No delivery channel remains; the host still returns failure.
+                                }
+                            },
+                        }
+                    }
                     return 70;
                 }
             }
@@ -451,6 +476,33 @@ impl Held {
         job_groups::signal_unreaped_group(self.pid, signal)
     }
 
+    /// Retire the actual parent's unreaped group, retaining every failed native operation.
+    fn retire(&mut self) -> io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        let term = self.signal(libc::SIGTERM);
+        let deadline = std::time::Instant::now() + ORPHANED_COMMAND_GRACE;
+        let membership = loop {
+            match job_groups::group_has_live_members(self.pid) {
+                Ok(true) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(ORPHANED_COMMAND_POLL);
+                }
+                Ok(_) => break Ok(()),
+                Err(cause) => break Err(cause),
+            }
+        };
+        let kill = self.signal(libc::SIGKILL);
+        let reap = self.reap();
+        match (&term, &membership, &kill, &reap) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            _ => Err(io::Error::other(format!(
+                "retiring unreaped command group {}: TERM={term:?}; membership={membership:?}; KILL={kill:?}; reap={reap:?}",
+                self.pid,
+            ))),
+        }
+    }
+
     /// Collect the exited leader. Its id may name another process from here on.
     fn reap(&mut self) -> io::Result<()> {
         loop {
@@ -470,20 +522,24 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if self.reaped {
-            return;
+        if let Err(cause) = self.retire() {
+            match writeln!(
+                io::stderr(),
+                "cowshed: owned command retirement failed: {cause}"
+            ) {
+                Ok(()) => {}
+                Err(stderr_error) => match writeln!(
+                    io::stdout(),
+                    "cowshed: owned command retirement failed: {cause}; stderr diagnostic unavailable: {stderr_error}"
+                ) {
+                    Ok(()) => {}
+                    Err(_stdout_error) => {
+                        // Both existing channels are unavailable. Drop cannot return their
+                        // errors; the native retirement steps have already been attempted.
+                    }
+                },
+            }
         }
-        // Nothing is left to report to: the supervisor is gone, or this host is failing. Each
-        // step runs whatever the one before it did, so the group is ended as far as it can be.
-        let _ = self.signal(libc::SIGTERM);
-        let deadline = std::time::Instant::now() + ORPHANED_COMMAND_GRACE;
-        while matches!(job_groups::group_has_live_members(self.pid), Ok(true))
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(ORPHANED_COMMAND_POLL);
-        }
-        let _ = self.signal(libc::SIGKILL);
-        let _ = self.reap();
     }
 }
 
@@ -500,7 +556,7 @@ pub(crate) fn serve_command(socket: &UnixStream, mut held: Held) -> io::Result<(
                 Some((payload, _)) => {
                     serve_request(socket, &mut held, &payload, false)?;
                 }
-                None => return Ok(()),
+                None => return held.retire(),
             },
         }
     }
@@ -514,7 +570,7 @@ pub(crate) fn serve_command(socket: &UnixStream, mut held: Held) -> io::Result<(
                     return Ok(());
                 }
             }
-            None => return Ok(()),
+            None => return held.retire(),
         }
     }
 }
