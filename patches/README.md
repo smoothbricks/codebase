@@ -15,8 +15,11 @@ builds; no dependency of the nineteen requested-closure tasks was changed.
 
 The selection happens at Nx's graph-construction owner, not in a consumer cache probe or launcher. Explicitly requested
 tasks, genuine producer edges, continuous-only dependencies and real task cycles remain intact. The existing
-`nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership. Drop each carried hunk only when the
-installed upstream version contains its respective repair, retaining the regressions.
+`nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership against the package extracted from the
+actual tarball produced by `@smoothbricks/codebase:patched-nx`. Every test shard and test typecheck depends on that
+producer and hashes its output bytes, so a source gate tests the current patch before its public release is installed.
+The installed dependency and its frozen lock remain unchanged until the served release is pinned. Drop each carried hunk
+only when the installed upstream version contains its respective repair, retaining the regressions.
 
 ## Upstream PR draft: Nx `findCycles`
 

@@ -15,7 +15,7 @@
  * here (sorted regular files, fixed owner, mode and mtime) and gzip-framed here (no timestamp, OS
  * "unknown"), so nothing of the build host leaks into the bytes.
  *
- *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset> and <out-dir>/release-notes.md;
+ *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset>, its extracted package/, and release-notes.md;
  *                                                print the release as JSON
  *   bun tooling/patched-nx.ts verify <asset>     refuse unless the asset unpacks to the tar built now;
  *                                                print the release with the asset's own integrity
@@ -251,6 +251,8 @@ async function main([command, argument]: string[]): Promise<void> {
     await mkdir(argument, { recursive: true });
     await writeFile(join(argument, built.asset), asset);
     await writeFile(join(argument, 'release-notes.md'), notes(built));
+    await rm(join(argument, 'package'), { recursive: true, force: true });
+    await $`tar -xzf ${join(argument, built.asset)} -C ${argument}`.quiet();
     console.log(JSON.stringify(built));
     return;
   }

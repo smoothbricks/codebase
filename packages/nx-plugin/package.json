@@ -196,6 +196,19 @@
   "nx": {
     "targets": {
       "lint": {},
+      "typecheck-tests": {
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx"
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ]
+      },
       "test": {
         "executor": "nx:noop",
         "dependsOn": [
@@ -207,6 +220,17 @@
       },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx"
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4",
           "cwd": "{projectRoot}",
@@ -216,6 +240,17 @@
       },
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx"
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4",
           "cwd": "{projectRoot}",
@@ -225,6 +260,17 @@
       },
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx"
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4",
           "cwd": "{projectRoot}",
@@ -234,6 +280,17 @@
       },
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx"
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4",
           "cwd": "{projectRoot}",

@@ -79,6 +79,24 @@
           ]
         }
       },
+      "patched-nx": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/tooling/patched-nx.ts",
+          "{workspaceRoot}/patches/nx@23.2.1.patch",
+          {
+            "runtime": "bun -e 'console.log(Bun.version, Bun.revision)'"
+          }
+        ],
+        "outputs": [
+          "{workspaceRoot}/.cache/patched-nx"
+        ],
+        "options": {
+          "command": "bun tooling/patched-nx.ts build .cache/patched-nx",
+          "cwd": "{workspaceRoot}"
+        }
+      },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
         "options": {
