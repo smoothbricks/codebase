@@ -3,12 +3,12 @@
 //! delegated to an unprivileged controller.
 //!
 //! The harness asks `sudo -n systemd-run --scope -p Delegate=yes` for a fresh delegated scope and
-//! re-executes this test binary there as root, only to hand the scope to the invoking user the way
-//! cgroup-v2.rst "Delegation" describes (its directory, `cgroup.procs`, `cgroup.threads` and
-//! `cgroup.subtree_control`) and drop to that user. The unprivileged controller then takes
-//! authority with [`CgroupAuthority::delegated`] and runs workloads: this binary again, whose
-//! first action is to report its own cgroup, which burns CPU it measures itself (`getrusage`) and
-//! may start children. Every comparison reads the job's `cpu.stat` directly.
+//! re-executes this test binary there as a root parent that delegates the scope to the invoking
+//! user and owns scratch cleanup. The unprivileged controller then takes authority with
+//! [`CgroupAuthority::delegated`] and runs workloads: this binary again, whose first action
+//! reports its cgroup. It burns CPU measured by `getrusage` and may start children. The controller
+//! collects each selected child's complete lifetime with `wait4`, including report/exit overhead,
+//! and compares it with an independent final `cpu.stat` read.
 //!
 //! Workloads keep their files on test-owned scratch storage prepared by the root Delegate phase
 //! and removed on success or unwind ([`Scratch`]): a sparse image formatted ext4 and loop-mounted.
@@ -23,6 +23,7 @@
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::chown;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -69,11 +70,9 @@ struct Workload {
     burn_after_ms: u64,
     /// Anonymous memory to touch page by page and release again.
     allocate_mib: u64,
-    /// A file beside this binary to fill with this many MiB through the page cache, held until
-    /// the workload ends and removed then.
+    /// A test-owned scratch file filled through the page cache and held until workload exit.
     page_cache: Option<(PathBuf, u64)>,
-    /// A file beside this binary to write this many MiB to past the page cache (`O_DIRECT`),
-    /// flushed, then read this many MiB of it back the same way, and remove it.
+    /// A test-owned scratch file written/read past the page cache (`O_DIRECT`) and flushed.
     direct_io: Option<(PathBuf, u64, u64)>,
     /// A file the page cache already holds, read whole through it.
     cached_read: Option<PathBuf>,
@@ -83,6 +82,8 @@ struct Workload {
     children: Vec<Workload>,
     /// Once every child was reaped, report [`HELD`] and wait for one byte on stdin.
     hold: bool,
+    /// CPU deliberately spent after the self-report, for the complete-lifetime oracle control.
+    burn_after_report_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -106,6 +107,30 @@ impl WorkloadReport {
     }
 }
 
+/// The selected child's complete lifetime, collected on reap, separate from its pre-exit report.
+struct WorkloadExit {
+    report: WorkloadReport,
+    cpu_us: u64,
+}
+
+#[test]
+fn workload_exit_cpu_includes_work_after_its_report() {
+    let exit = Spawned::unplaced(&Workload {
+        burn_after_report_ms: 20,
+        ..Workload::default()
+    })
+    .finish();
+    let reported = exit.report.total_cpu_us();
+    println!(
+        "CPU oracle control: pre-report {reported} us; wait4 lifetime {} us",
+        exit.cpu_us
+    );
+    assert!(
+        exit.cpu_us >= reported + 20_000,
+        "a pre-report oracle omits the deliberate 20 ms of post-report CPU"
+    );
+}
+
 /// The harness: everything else runs in the delegated scope.
 #[test]
 fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
@@ -114,6 +139,10 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
     }
     // SAFETY: getuid and getgid cannot fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    assert_ne!(
+        uid, 0,
+        "run the harness as the ordinary runner, not as its root setup role"
+    );
     let delegate = serde_json::to_string(&Role::Delegate { uid, gid }).expect("role");
     let mut assignment = OsString::from(format!("{ROLE}="));
     assignment.push(delegate);
@@ -170,6 +199,13 @@ fn job_cgroup_role() {
 
 /// Delegate the scope to `uid`/`gid`; retain a root parent solely to own scratch cleanup.
 fn delegate(uid: u32, gid: u32) {
+    report_fixture_authority("setup");
+    // SAFETY: geteuid cannot fail; sudo grants guest fixture setup, not host capabilities.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "the setup parent requires scoped guest root"
+    );
     let scope = own_cgroup_path();
     for file in [
         "",
@@ -196,7 +232,7 @@ fn delegate(uid: u32, gid: u32) {
     // Keep this parent root until the controller ends: it owns the mount even when a scenario
     // panics or the controller cannot be spawned. Only the controller drops privilege.
     scratch_cleanup_survives_failure(uid, gid);
-    let scratch = Scratch::make(uid, gid);
+    let mut scratch = Scratch::make(uid, gid);
     let mut command = Command::new(find_program("setpriv"));
     command
         .arg("--reuid")
@@ -216,7 +252,9 @@ fn delegate(uid: u32, gid: u32) {
         .expect("run the unprivileged controller");
     println!("{}", String::from_utf8_lossy(&output.stdout));
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-    drop(scratch);
+    scratch
+        .cleanup()
+        .expect("release scratch after the controller exits");
     assert!(output.status.success(), "controller: {}", output.status);
 }
 
@@ -238,6 +276,10 @@ fn work(workload: &Workload) {
     if let Some((path, write, read)) = &workload.direct_io {
         uncached_io(path, *write, *read);
         std::fs::remove_file(path).expect("remove the direct I/O file");
+        // Flush unlink metadata before this child can be reaped and its parent can report HELD.
+        std::fs::File::open(path.parent().expect("direct I/O file directory"))
+            .and_then(|directory| directory.sync_all())
+            .expect("flush the direct I/O deletion metadata");
     }
     if let Some(path) = &workload.cached_read {
         read_through_cache(path);
@@ -267,6 +309,11 @@ fn work(workload: &Workload) {
     }
     if let Some((path, _)) = &workload.allocate_file {
         std::fs::remove_file(path).expect("remove the allocated file");
+        // Finish directory metadata before the parent reports/exits, making final io.stat
+        // comparisons quiescent without a timing wait.
+        std::fs::File::open(path.parent().expect("allocated file directory"))
+            .and_then(|directory| directory.sync_all())
+            .expect("flush the allocation/deletion metadata");
     }
     let report = WorkloadReport {
         pid: std::process::id(),
@@ -280,10 +327,24 @@ fn work(workload: &Workload) {
         "{REPORT}{}",
         serde_json::to_string(&report).expect("report")
     );
+    if workload.burn_after_report_ms != 0 {
+        burn(workload.burn_after_report_ms);
+    }
 }
 
 /// The scenarios, run by the unprivileged controller that holds the delegated scope.
 fn control() {
+    report_fixture_authority("controller");
+    // This controller receives only the runner-owned mountpoint, never device authority.
+    let denied = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/loop-control");
+    assert!(
+        matches!(denied, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+        "the unprivileged controller must not open the root-only loop control"
+    );
+    println!("fixture authority: ordinary controller loop-control open denied");
     let own = own_cgroup_path();
     assert_eq!(own.file_name(), Some(std::ffi::OsStr::new(CONTROLLER_LEAF)));
     let scope = own.parent().expect("the delegated scope");
@@ -331,7 +392,7 @@ fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
         burn_before_ms: 100,
         ..Workload::default()
     };
-    let report = Spawned::placed(
+    let exit = Spawned::placed(
         &job,
         &Workload {
             burn_before_ms: 50,
@@ -342,13 +403,13 @@ fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
     .finish();
     let path = relative(job.path());
     assert_eq!(
-        report.first_cgroup, path,
+        exit.report.first_cgroup, path,
         "the first instruction ran in the job"
     );
-    for child in &report.children {
+    for child in &exit.report.children {
         assert_eq!(child.first_cgroup, path, "a descendant is born in the job");
     }
-    assert_accounted(&job, &report, "inheritance");
+    assert_accounted(&job, &exit, "inheritance");
 }
 
 fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
@@ -375,12 +436,12 @@ fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
             ..Workload::default()
         },
     );
-    let small_report = running_small.finish();
-    let large_report = running_large.finish();
-    assert_eq!(small_report.first_cgroup, relative(small.path()));
-    assert_eq!(large_report.first_cgroup, relative(large.path()));
-    assert_accounted(&small, &small_report, "concurrent small");
-    assert_accounted(&large, &large_report, "concurrent large");
+    let small_exit = running_small.finish();
+    let large_exit = running_large.finish();
+    assert_eq!(small_exit.report.first_cgroup, relative(small.path()));
+    assert_eq!(large_exit.report.first_cgroup, relative(large.path()));
+    assert_accounted(&small, &small_exit, "concurrent small");
+    assert_accounted(&large, &large_exit, "concurrent large");
 }
 
 /// A reused host's idle work before a job is its own: here the spawner itself burns before it
@@ -390,7 +451,7 @@ fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
     let before = cpu_us(libc::RUSAGE_SELF);
     burn(300);
     let spawner_burned = cpu_us(libc::RUSAGE_SELF) - before;
-    let report = Spawned::placed(
+    let exit = Spawned::placed(
         &job,
         &Workload {
             burn_before_ms: 50,
@@ -401,9 +462,9 @@ fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
     let usage = usage_us(&job);
     println!(
         "spawner burned {spawner_burned} us; the job's cgroup read {usage} us for its own {} us",
-        report.total_cpu_us()
+        exit.cpu_us
     );
-    assert_accounted(&job, &report, "spawner");
+    assert_accounted(&job, &exit, "spawner");
 }
 
 /// The control: a process that ran before it was moved into the job's cgroup took its first
@@ -421,15 +482,15 @@ fn late_migration_misses_initial_cpu(jobs: &IncarnationCgroups) {
     std::fs::write(&procs, late.child.id().to_string())
         .unwrap_or_else(|error| panic!("migrate into {}: {error}", procs.display()));
     late.resume();
-    let report = late.finish();
+    let exit = late.finish();
     assert_eq!(
-        report.first_cgroup,
+        exit.report.first_cgroup,
         relative(&own_cgroup_path()),
         "the control started outside the job"
     );
-    assert_eq!(report.last_cgroup, relative(job.path()));
+    assert_eq!(exit.report.last_cgroup, relative(job.path()));
     let usage = usage_us(&job);
-    let total = report.total_cpu_us();
+    let total = exit.cpu_us;
     println!("late migration: cgroup {usage} us of the workload's own {total} us");
     assert!(
         usage + PLACEMENT_WINDOW_US < total,
@@ -471,7 +532,7 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
     );
     running.await_marker(HELD);
     // The poll after the burst: only the parent is left, and it burned next to nothing itself.
-    let live = live_members_cpu_us(&burst);
+    let live = live_members_cpu_us(&burst, &running).expect("read the held parent's actual CPU");
     let during = burst.cpu().expect("cpu after the burst");
     println!(
         "burst: cgroup {} us before, {} us after; live members hold {live} us",
@@ -485,15 +546,15 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
         during.usage_us.get()
     );
     running.release();
-    let report = running.finish();
-    let neighbour_report = neighbour.finish();
+    let exit = running.finish();
+    let neighbour_exit = neighbour.finish();
     assert!(
-        report.children_cpu_us >= 8 * 40_000,
+        exit.report.children_cpu_us >= 8 * 40_000,
         "the children burned what they were told: {} us",
-        report.children_cpu_us
+        exit.report.children_cpu_us
     );
-    assert_accounted(&burst, &report, "burst");
-    assert_accounted(&unrelated, &neighbour_report, "burst neighbour");
+    assert_accounted(&burst, &exit, "burst");
+    assert_accounted(&unrelated, &neighbour_exit, "burst neighbour");
 }
 
 /// A job that fills the page cache is charged for it while no process of it holds that memory
@@ -520,7 +581,8 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         .charged_memory()
         .expect("charged memory again")
         .peak_bytes;
-    let resident = live_members_resident_bytes(&job);
+    let resident =
+        live_members_resident_bytes(&job, &running).expect("read the held parent's actual RSS");
     let (current, peak) = (charged.current_bytes.get(), charged.peak_bytes.get());
     let stat = std::fs::read_to_string(job.path().join("memory.stat")).expect("memory.stat");
     let counter = |name: &str| -> u64 {
@@ -644,7 +706,8 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
     let io = job.storage_io().expect("the job's io.stat");
     let raw = std::fs::read_to_string(job.path().join("io.stat")).expect("read io.stat");
     let (raw_read, raw_written) = raw_io_stat_sum(&raw);
-    let live = live_members_storage_io_bytes(&job);
+    let held_members = held_parent_census(&job, &running).expect("the sole retained parent");
+    let held_live = live_members_storage_io_bytes(&held_members).expect("both held I/O counters");
     let allocated_bytes = {
         use std::os::unix::fs::MetadataExt as _;
         std::fs::metadata(&allocated)
@@ -655,11 +718,13 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
     let (read, written) = (io.read_bytes.get(), io.write_bytes.get());
     println!(
         "storage I/O: read {read} B, written {written} B; io.stat {raw:?} sums to read \
-         {raw_read} B, written {raw_written} B; live members {live} B; allocated {allocated_bytes} B"
+         {raw_read} B, written {raw_written} B; held live members (including waited-for children) \
+         {held_live} B; allocated {allocated_bytes} B"
     );
-    assert!(
-        read <= raw_read && written <= raw_written,
-        "aggregation only ever leaves stacked devices out"
+    assert_eq!(
+        (read, written),
+        (raw_read, raw_written),
+        "the test-owned loop ext4 totals equal an independent io.stat read"
     );
     assert!(
         written >= 24 * MIB && read >= 12 * MIB,
@@ -679,12 +744,51 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
         allocated_bytes >= 64 * MIB && allocated_bytes > written + 16 * MIB,
         "a volume-allocation proxy would report {allocated_bytes} B for {written} B written"
     );
-    assert!(
-        live + 16 * MIB < read + written,
-        "a live-members census misses the reaped children's I/O: live {live} B"
-    );
     running.release();
     running.finish();
+    // /proc/<pid>/io includes waited-for children. A held parent can retain those bytes;
+    // the live-only proxy is incomplete only once the entire owned tree has ended.
+    let terminal = job
+        .terminal()
+        .expect("the entire I/O workload tree was reaped");
+    let terminal_members = std::fs::read_to_string(terminal.path().join("cgroup.procs"))
+        .expect("read the proven empty terminal census");
+    assert!(
+        terminal_members.trim().is_empty(),
+        "terminal group has no members"
+    );
+    let live = live_members_storage_io_bytes(&terminal_members).expect("terminal census I/O");
+    let final_io = terminal.storage_io().expect("terminal io.stat");
+    let final_raw = std::fs::read_to_string(terminal.path().join("io.stat"))
+        .expect("independent terminal io.stat");
+    let (final_read, final_written) = (final_io.read_bytes.get(), final_io.write_bytes.get());
+    let (raw_read, raw_written) = raw_io_stat_sum(&final_raw);
+    println!(
+        "terminal storage I/O: read {final_read} B, written {final_written} B; \
+         io.stat {final_raw:?} sums to read {raw_read} B, written {raw_written} B; \
+         live members {live} B; earlier held census {held_live} B"
+    );
+    assert_eq!(
+        (final_read, final_written),
+        (raw_read, raw_written),
+        "terminal totals equal the independent final io.stat read"
+    );
+    assert!(
+        final_read >= read && final_written >= written,
+        "the cgroup retains the reaped tree's earlier transfers"
+    );
+    assert!(
+        final_written < 24 * MIB + 8 * MIB && final_read < 12 * MIB + 8 * MIB,
+        "terminal totals still exclude the neighbour, allocation and cached-read proxies"
+    );
+    assert_eq!(
+        live, 0,
+        "no owned live process remains for the final census"
+    );
+    assert!(
+        live + 16 * MIB < final_read + final_written,
+        "the ended tree's retained I/O is absent from a live-only census"
+    );
     let neighbour_io = neighbour_job.storage_io().expect("the neighbour's io.stat");
     assert!(
         neighbour_io.write_bytes.get() >= 16 * MIB,
@@ -828,14 +932,17 @@ impl Spawned {
         self.stdin.write_all(b"r").expect("release the workload");
     }
 
-    fn finish(mut self) -> WorkloadReport {
+    fn finish(mut self) -> WorkloadExit {
         let mut rest = String::new();
         self.stdout
             .read_to_string(&mut rest)
             .expect("workload output");
-        let status = self.child.wait().expect("wait for the workload");
+        let (status, cpu_us) = reap_workload(&self.child).expect("reap the workload with rusage");
         assert!(status.success(), "workload: {status}\n{rest}");
-        report_in(&rest)
+        WorkloadExit {
+            report: report_in(&rest),
+            cpu_us,
+        }
     }
 }
 
@@ -856,13 +963,36 @@ fn report_in(output: &str) -> WorkloadReport {
     serde_json::from_str(line).expect("workload report")
 }
 
+/// Reap only this child, collecting the same completed lifetime the final cgroup read covers.
+/// Linux wait4 includes the child's own CPU and that of descendants it already reaped.
+fn reap_workload(child: &Child) -> std::io::Result<(std::process::ExitStatus, u64)> {
+    let pid = libc::pid_t::try_from(child.id()).expect("an owned child's pid fits pid_t");
+    let mut status = 0;
+    // SAFETY: an all-zero rusage is valid output storage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: the selected child is owned by this caller and both output buffers are valid.
+        let waited = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if waited == pid {
+            return Ok((
+                std::process::ExitStatus::from_raw(status),
+                rusage_cpu_us(&usage),
+            ));
+        }
+        let error = last_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Kernel reads
 
-/// The job's cgroup accounts at least the workload's own CPU, less the fork-to-placement window,
-/// and at most that CPU: nothing outside the workload's tree is charged to it. The reader agrees
-/// with an independent read of the same final counters, and its user and system split the usage.
-fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
+/// Compare the job's final CPU to this selected child's independently reaped complete lifetime,
+/// less only the fork-to-placement window. The pre-exit report is diagnostic, never that oracle.
+/// The reader agrees with a direct final cpu.stat read, and its user/system counters split usage.
+fn assert_accounted(job: &JobCgroup, exit: &WorkloadExit, scenario: &str) {
     let cpu = job.cpu().expect("the job's cpu.stat");
     let usage = usage_us(job);
     assert_eq!(
@@ -877,12 +1007,13 @@ fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
         cpu.user_us.get(),
         cpu.system_us.get()
     );
-    let total = report.total_cpu_us();
+    let total = exit.cpu_us;
     println!(
-        "{scenario}: cgroup {usage} us (user {} us, system {} us), workload's own {total} us, \
-         deficit {} us",
+        "{scenario}: cgroup {usage} us (user {} us, system {} us), wait4 lifetime {total} us, \
+         pre-report {} us, deficit {} us",
         cpu.user_us.get(),
         cpu.system_us.get(),
+        exit.report.total_cpu_us(),
         i128::from(total) - i128::from(usage)
     );
     assert!(
@@ -896,20 +1027,44 @@ fn assert_accounted(job: &JobCgroup, report: &WorkloadReport, scenario: &str) {
     );
 }
 
+/// HELD is emitted after every child has been reaped. The directly owned, unreaped parent
+/// must still be the sole member: an empty or foreign census is not a zero-valued observation.
+fn held_parent_census(job: &JobCgroup, running: &Spawned) -> Result<String, String> {
+    let procs = std::fs::read_to_string(job.path().join("cgroup.procs"))
+        .map_err(|error| format!("read held cgroup.procs: {error}"))?;
+    let mut members = procs.lines();
+    let pid: u32 = members
+        .next()
+        .ok_or_else(|| "HELD parent is absent from cgroup.procs".to_owned())?
+        .parse()
+        .map_err(|error| format!("held member PID: {error}"))?;
+    if pid != running.child.id() || members.next().is_some() {
+        return Err(format!(
+            "held census {procs:?} is not sole owned parent {}",
+            running.child.id()
+        ));
+    }
+    Ok(procs)
+}
+
 /// What a census of the job's live members holds resident, from `/proc/<pid>/statm`.
-fn live_members_resident_bytes(job: &JobCgroup) -> u64 {
+fn live_members_resident_bytes(job: &JobCgroup, running: &Spawned) -> Result<u64, String> {
     // SAFETY: sysconf takes a constant.
-    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
-    let procs = job.path().join("cgroup.procs");
-    std::fs::read_to_string(&procs)
-        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
-        .lines()
-        .filter_map(|pid| {
-            let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-            let pages: u64 = statm.split_whitespace().nth(1)?.parse().expect("resident");
-            Some(pages * page)
-        })
-        .sum()
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|error| format!("page size: {error}"))?;
+    let procs = held_parent_census(job, running)?;
+    procs.lines().try_fold(0, |total, pid| {
+        let path = format!("/proc/{pid}/statm");
+        let statm =
+            std::fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?;
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| format!("{path} has no resident field"))?
+            .parse()
+            .map_err(|error| format!("resident in {path}: {error}"))?;
+        Ok(total + pages * page)
+    })
 }
 
 /// `memory.current` and `memory.peak`, read directly.
@@ -925,25 +1080,33 @@ fn direct_charged_memory(job: &JobCgroup) -> (u64, u64) {
     (read("memory.current"), read("memory.peak"))
 }
 
-/// What a census of the job's live members finds: each one's own user + system CPU from
-/// `/proc/<pid>/stat`, summed. Reaped processes are in no census.
-fn live_members_cpu_us(job: &JobCgroup) -> u64 {
+/// Each live member's own user + system CPU from `/proc/<pid>/stat`. Every unavailable
+/// record fails the observation; departure is not silently treated as zero.
+fn live_members_cpu_us(job: &JobCgroup, running: &Spawned) -> Result<u64, String> {
     // SAFETY: sysconf takes a constant.
-    let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).expect("clock ticks");
-    let procs = job.path().join("cgroup.procs");
-    std::fs::read_to_string(&procs)
-        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
-        .lines()
-        .filter_map(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            let after = &stat[stat.rfind(')')? + 2..];
-            let fields: Vec<&str> = after.split_whitespace().collect();
-            // utime and stime are fields 14 and 15 of stat(5); `after` starts at field 3.
-            let utime: u64 = fields[11].parse().expect("utime");
-            let stime: u64 = fields[12].parse().expect("stime");
-            Some((utime + stime) * 1_000_000 / ticks)
-        })
-        .sum()
+    let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .map_err(|error| format!("clock ticks: {error}"))?;
+    let procs = held_parent_census(job, running)?;
+    procs.lines().try_fold(0, |total, pid| {
+        let path = format!("/proc/{pid}/stat");
+        let stat =
+            std::fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?;
+        let (_, after) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| format!("{path} has no command delimiter"))?;
+        // utime/stime are fields 14/15; after starts at field 3.
+        let mut fields = after.split_whitespace().skip(11);
+        let mut counter = |name| -> Result<u64, String> {
+            fields
+                .next()
+                .ok_or_else(|| format!("{path} has no {name}"))?
+                .parse()
+                .map_err(|error| format!("{name} in {path}: {error}"))
+        };
+        let utime = counter("utime")?;
+        let stime = counter("stime")?;
+        Ok(total + (utime + stime) * 1_000_000 / ticks)
+    })
 }
 
 /// `usage_usec` of the job's `cpu.stat`, read directly.
@@ -968,6 +1131,10 @@ fn cpu_us(who: libc::c_int) -> u64 {
         "getrusage: {}",
         last_error()
     );
+    rusage_cpu_us(&usage)
+}
+
+fn rusage_cpu_us(usage: &libc::rusage) -> u64 {
     let micros = |time: libc::timeval| {
         u64::try_from(time.tv_sec).expect("seconds") * 1_000_000
             + u64::try_from(time.tv_usec).expect("microseconds")
@@ -1032,36 +1199,47 @@ struct Scratch {
     root: PathBuf,
     /// Where workloads keep their files.
     directory: PathBuf,
-    /// `directory` holds the mounted image, until it is unmounted.
-    mounted: bool,
+    /// Cleanup is attempted once, explicitly on success and by Drop during unwind.
+    cleanup_started: bool,
+    /// Atomic AUTOCLEAR ownership. The backing file's final-close notification fences the
+    /// kernel's deferred device retirement after unmount and our descriptor close.
+    loop_association: Option<LoopAssociation>,
+}
+
+struct LoopAssociation {
+    device: PathBuf,
+    file: std::fs::File,
+    backing: (u64, u64),
+    closed: BackingClose,
 }
 
 impl Scratch {
     fn make(uid: u32, gid: u32) -> Self {
         let name = format!("cowshed-job-cgroup-{}", std::process::id());
-        let loop_control = Path::new("/dev/loop-control");
-        let unavailable = match std::fs::metadata(loop_control) {
-            Ok(_) => run(Command::new(find_program("losetup")).arg("--find")).err(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(format!("{}: {error}", loop_control.display()))
-            }
-            Err(error) => panic!("inspect {}: {error}", loop_control.display()),
-        };
-        if let Some(reason) = unavailable {
-            println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
-            return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
+        let scratch = Self::prepare(std::env::temp_dir().join(name), uid, gid);
+        if scratch.loop_association.is_none() {
+            return scratch;
         }
-        Self::loop_ext4(std::env::temp_dir().join(name), uid, gid)
+        scratch.mount_using(uid, gid, run)
     }
 
-    fn loop_ext4(root: PathBuf, uid: u32, gid: u32) -> Self {
+    fn prepare(root: PathBuf, uid: u32, gid: u32) -> Self {
         std::fs::create_dir(&root)
             .unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
         let image = root.join("ext4.img");
         let mut scratch = Self {
             directory: root.join("mnt"),
             root,
-            mounted: false,
+            cleanup_started: false,
+            loop_association: None,
+        };
+        let device = match scratch_loop_device() {
+            Ok(device) => device,
+            Err(reason) => {
+                report_loop_unavailable(&reason);
+                let name = scratch.root.file_name().expect("scratch name");
+                return Self::tmpfs(Path::new("/dev/shm").join(name), uid, gid);
+            }
         };
         std::fs::File::create(&image)
             .and_then(|file| file.set_len(SCRATCH_IMAGE_BYTES))
@@ -1070,14 +1248,38 @@ impl Scratch {
             .arg("-q")
             .arg(&image))
         .unwrap_or_else(|refusal| panic!("{refusal}"));
+        scratch.loop_association = Some(
+            associate_scratch_loop(device, &image).unwrap_or_else(|refusal| panic!("{refusal}")),
+        );
+        scratch
+    }
+
+    fn mount_using(
+        mut self,
+        uid: u32,
+        gid: u32,
+        mount: impl FnOnce(&mut Command) -> Result<(), String>,
+    ) -> Self {
+        let scratch = &mut self;
+        let association = scratch.loop_association.as_ref().expect("prepared loop");
         std::fs::create_dir(&scratch.directory)
             .unwrap_or_else(|error| panic!("create {}: {error}", scratch.directory.display()));
-        run(Command::new(find_program("mount"))
-            .args(["-o", "loop"])
-            .arg(&image)
-            .arg(&scratch.directory))
+        // The trusted runner delegates mount(2) for ext4, not the fsopen/fsmount API.
+        // Drop observes kernel mount identity even when mount reports an error after acquiring it.
+        mount(
+            Command::new(find_program("mount"))
+                .env("LIBMOUNT_FORCE_MOUNT2", "always")
+                .args(["-t", "ext4"])
+                .arg(&association.device)
+                .arg(&scratch.directory),
+        )
         .unwrap_or_else(|refusal| panic!("{refusal}"));
-        scratch.mounted = true;
+        assert!(
+            scratch
+                .owned_mount()
+                .expect("kernel mount identity")
+                .is_some()
+        );
         chown(&scratch.directory, Some(uid), Some(gid)).expect("chown scratch to the runner");
         let f_type = filesystem_type(&scratch.directory).expect("statfs the mounted image");
         assert_eq!(
@@ -1090,7 +1292,7 @@ impl Scratch {
             "scratch: {} is ext4 on a loop device",
             scratch.directory.display()
         );
-        scratch
+        self
     }
 
     fn tmpfs(root: PathBuf, uid: u32, gid: u32) -> Self {
@@ -1099,7 +1301,8 @@ impl Scratch {
         let scratch = Self {
             directory: root.clone(),
             root,
-            mounted: false,
+            cleanup_started: false,
+            loop_association: None,
         };
         chown(&scratch.directory, Some(uid), Some(gid)).expect("chown tmpfs scratch to the runner");
         let f_type = filesystem_type(&scratch.directory).expect("statfs the tmpfs directory");
@@ -1113,59 +1316,548 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let mut failures = Vec::new();
-        if self.mounted {
-            match run(Command::new(find_program("umount")).arg(&self.directory)) {
-                Ok(()) => self.mounted = false,
-                Err(refusal) => failures.push(refusal),
-            }
+/// Consume the runner's declared finite device pool. GET_FREE can select a globally free loop
+/// that this namespace does not expose: refuse that selection, never create nodes or retry it.
+fn scratch_loop_device() -> Result<PathBuf, String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let control = Path::new("/dev/loop-control");
+    let control = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control)
+        .map_err(|error| format!("open {}: {error}", control.display()))?;
+    let metadata = control
+        .metadata()
+        .map_err(|error| format!("stat loop-control: {error}"))?;
+    if !metadata.file_type().is_char_device()
+        || (metadata.uid(), metadata.gid(), metadata.mode() & 0o777) != (0, 0, 0o600)
+    {
+        return Err("loop-control must be a declared root:root 0600 character device".to_owned());
+    }
+    let expected = kernel_device_number(Path::new("/sys/class/misc/loop-control/dev"))?;
+    let actual = (libc::major(metadata.rdev()), libc::minor(metadata.rdev()));
+    if actual != expected {
+        return Err(format!(
+            "loop-control names {actual:?}, not its kernel device {expected:?}"
+        ));
+    }
+    // SAFETY: the declared loop-control descriptor is live; LOOP_CTL_GET_FREE takes no
+    // pointer argument and returns a globally free loop device's index or -1.
+    let index = unsafe { libc::ioctl(control.as_raw_fd(), 0x4c82) };
+    let index = u32::try_from(index).map_err(|_| format!("LOOP_CTL_GET_FREE: {}", last_error()))?;
+    let device = PathBuf::from(format!("/dev/loop{index}"));
+    let metadata = std::fs::metadata(&device).map_err(|error| {
+        format!(
+            "selected global loop{index} is not exposed in the runner's finite pool at {}: {error}",
+            device.display()
+        )
+    })?;
+    if !metadata.file_type().is_block_device() {
+        return Err(format!(
+            "{} is not a declared block device",
+            device.display()
+        ));
+    }
+    if (metadata.uid(), metadata.gid(), metadata.mode() & 0o777) != (0, 0, 0o600) {
+        return Err(format!("{} must remain root:root 0600", device.display()));
+    }
+    let expected = kernel_device_number(&Path::new("/sys/block").join(format!("loop{index}/dev")))?;
+    let actual = (libc::major(metadata.rdev()), libc::minor(metadata.rdev()));
+    if actual != expected {
+        return Err(format!(
+            "{} names {actual:?}, not the kernel-selected device {expected:?}",
+            device.display()
+        ));
+    }
+    println!(
+        "scratch loop: index {index}, declared device {}",
+        device.display()
+    );
+    Ok(device)
+}
+
+/// Linux's loop_info64 and loop_config UAPI (linux/loop.h). Integer/byte-array-only layouts
+/// admit an all-zero configuration; LOOP_CONFIGURE applies association and AUTOCLEAR atomically.
+#[repr(C)]
+struct LoopInfo64 {
+    device: u64,
+    inode: u64,
+    rdevice: u64,
+    offset: u64,
+    sizelimit: u64,
+    number: u32,
+    encrypt_type: u32,
+    encrypt_key_size: u32,
+    flags: u32,
+    file_name: [u8; 64],
+    crypt_name: [u8; 64],
+    encrypt_key: [u8; 32],
+    init: [u64; 2],
+}
+
+#[repr(C)]
+struct LoopConfig {
+    fd: u32,
+    block_size: u32,
+    info: LoopInfo64,
+    reserved: [u64; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<LoopInfo64>() == 232);
+const _: () = assert!(std::mem::size_of::<LoopConfig>() == 304);
+const _: () = assert!(std::mem::size_of::<libc::inotify_event>() == 16);
+
+/// Freshly armed on the exact inode pinned by the writable file description configured into
+/// the loop. Inotify is inode-based: no later writable open of this owned image is allowed.
+struct BackingClose {
+    events: std::fs::File,
+    watch: i32,
+}
+
+impl BackingClose {
+    fn arm(image: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        // SAFETY: creates a new descriptor; CLOEXEC prevents every setup child inheriting it.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(last_error());
         }
-        // A mounted tree is the image's own: removing it would only empty the image, and its
-        // mountpoint stays busy.
-        if !self.mounted
-            && let Err(error) = std::fs::remove_dir_all(&self.root)
-        {
-            failures.push(format!("remove {}: {error}", self.root.display()));
+        // SAFETY: this successful syscall returned one descriptor owned only here.
+        let events = unsafe { std::fs::File::from_raw_fd(fd) };
+        let image_fd = std::ffi::CString::new(format!("/proc/self/fd/{}", image.as_raw_fd()))
+            .map_err(std::io::Error::other)?;
+        // SAFETY: the live image descriptor pins the exact inode behind this NUL-terminated path.
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                fd,
+                image_fd.as_ptr(),
+                libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
+            )
+        };
+        if watch < 0 {
+            return Err(last_error());
         }
-        if failures.is_empty() {
-            println!(
-                "scratch cleanup: {} unmounted and removed",
-                self.root.display()
-            );
-            return;
+        Ok(Self { events, watch })
+    }
+
+    fn wait(mut self) -> std::io::Result<()> {
+        // One blocking read consumes one complete record. A 16-byte buffer admits only a nameless
+        // inotify_event; any other length is a failed delivery, never retried. The fixture's
+        // existing overall guard bounds this wait: no new grace is added.
+        let mut event = [0_u8; 16];
+        let received = self.events.read(&mut event)?;
+        if received != event.len() {
+            return Err(std::io::Error::other(format!(
+                "backing close notification short: read {received} of {} bytes",
+                event.len(),
+            )));
         }
-        let report = format!(
-            "scratch storage {} is left behind:\n{}",
-            self.root.display(),
-            failures.join("\n")
-        );
-        // A second panic while the first unwinds would abort before either is reported.
-        if std::thread::panicking() {
-            eprintln!("{report}");
-        } else {
-            panic!("{report}");
+        let watch = i32::from_ne_bytes(event[0..4].try_into().expect("fixed watch field"));
+        let mask = u32::from_ne_bytes(event[4..8].try_into().expect("fixed mask field"));
+        let cookie = u32::from_ne_bytes(event[8..12].try_into().expect("fixed cookie field"));
+        let length = u32::from_ne_bytes(event[12..16].try_into().expect("fixed length field"));
+        if watch != self.watch || mask != libc::IN_CLOSE_WRITE || cookie != 0 || length != 0 {
+            return Err(std::io::Error::other(format!(
+                "backing close notification unavailable: expected watch {} IN_CLOSE_WRITE, \
+                 cookie 0, name length 0; got watch {watch}, mask {mask:#x}, cookie {cookie}, \
+                 name length {length}",
+                self.watch,
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn associate_scratch_loop(device: PathBuf, image: &Path) -> Result<LoopAssociation, String> {
+    use std::os::fd::AsRawFd as _;
+
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open {}: {error}", path.display()))
+    };
+    let loop_file = open(&device)?;
+    let image = open(image)?;
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = image
+        .metadata()
+        .map_err(|error| format!("stat backing image: {error}"))?;
+    let backing = (metadata.dev(), metadata.ino());
+    // mkfs and all earlier writable opens finished before this fresh exact-inode watch.
+    let closed = BackingClose::arm(&image)
+        .map_err(|error| format!("watch configured backing file's final close: {error}"))?;
+    // SAFETY: every bit pattern of these UAPI integer/byte-array fields is valid.
+    let mut config: LoopConfig = unsafe { std::mem::zeroed() };
+    config.fd = u32::try_from(image.as_raw_fd()).expect("an open file has a nonnegative fd");
+    config.info.flags = 4; // LO_FLAGS_AUTOCLEAR
+    // SAFETY: live loop and backing descriptors and the exact loop_config UAPI layout.
+    if unsafe { libc::ioctl(loop_file.as_raw_fd(), 0x4c0a, std::ptr::from_ref(&config)) } != 0 {
+        return Err(format!(
+            "LOOP_CONFIGURE {}: {}",
+            device.display(),
+            last_error()
+        ));
+    }
+    Ok(LoopAssociation {
+        device,
+        file: loop_file,
+        backing,
+        closed,
+    })
+}
+
+fn loop_backing(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: the integer/byte-array-only output layout admits every bit pattern.
+    let mut info: LoopInfo64 = unsafe { std::mem::zeroed() };
+    // SAFETY: a live loop descriptor and the exact loop_info64 output buffer.
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0x4c05, std::ptr::from_mut(&mut info)) } != 0 {
+        return Err(last_error());
+    }
+    Ok((info.device, info.inode))
+}
+
+/// Use the kernel's registered device number, not a guessed host node name or major/minor.
+fn kernel_device_number(sys_dev: &Path) -> Result<(u32, u32), String> {
+    let text = std::fs::read_to_string(sys_dev)
+        .map_err(|error| format!("read {}: {error}", sys_dev.display()))?;
+    let (major, minor) = text
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| format!("{} has no MAJ:MIN: {text:?}", sys_dev.display()))?;
+    let major = major
+        .parse()
+        .map_err(|error| format!("device major: {error}"))?;
+    let minor = minor
+        .parse()
+        .map_err(|error| format!("device minor: {error}"))?;
+    Ok((major, minor))
+}
+
+fn report_loop_unavailable(reason: &str) {
+    println!("scratch: loop devices unavailable: {reason}; tmpfs measures shmem only");
+    let status = std::fs::read_to_string("/proc/self/status").expect("root status");
+    for line in status.lines().filter(|line| {
+        line.starts_with("CapEff:")
+            || line.starts_with("NoNewPrivs:")
+            || line.starts_with("Seccomp:")
+            || line.starts_with("Seccomp_filters:")
+    }) {
+        println!("scratch availability: {line}");
+    }
+    println!(
+        "scratch availability: loop module present {}, kernel {}",
+        Path::new("/sys/module/loop").exists(),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("kernel release")
+            .trim()
+    );
+    let devices = std::fs::read_to_string("/proc/devices").expect("registered devices");
+    println!(
+        "scratch availability: loop device registered {}",
+        devices
+            .lines()
+            .any(|line| line.split_whitespace().eq(["7", "loop"]))
+    );
+    for entry in std::fs::read_dir("/sys/block").expect("kernel block devices") {
+        let entry = entry.expect("block device entry");
+        if entry.file_name().as_encoded_bytes().starts_with(b"loop") {
+            println!("scratch availability: {}", entry.path().display());
         }
     }
 }
 
-/// A refused command unwinds through the same guard as a failed scenario. Check the mount and
-/// sparse image are gone, not merely that the command returned an error.
-fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
-    let scratch = Scratch::make(uid, gid);
-    let root = scratch.root.clone();
-    let outcome = std::panic::catch_unwind(move || {
-        let _scratch = scratch;
-        run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
-    });
-    assert!(outcome.is_err(), "the refusal unwinds");
-    assert!(
-        !root.exists(),
-        "cleanup removed {} after refusal",
-        root.display()
+/// Record the actual namespace/credentials used by each fixture role. Delegating cgroupfs
+/// does not grant mount authority in that namespace, and UID zero alone proves no capability.
+fn report_fixture_authority(role: &str) {
+    // SAFETY: these credential reads cannot fail.
+    let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
+    let namespace = std::fs::read_link("/proc/self/ns/mnt").expect("read fixture mount namespace");
+    let kernel =
+        std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("read fixture kernel");
+    println!(
+        "fixture authority: role {role}, uid {uid}, euid {euid}, gid {gid}, \
+         mount namespace {}, kernel {}",
+        namespace.display(),
+        kernel.trim()
     );
-    println!("scratch cleanup: command failure and panic unwind verified");
+    let status = std::fs::read_to_string("/proc/self/status").expect("read fixture capabilities");
+    for line in status.lines().filter(|line| {
+        line.starts_with("CapEff:")
+            || line.starts_with("NoNewPrivs:")
+            || line.starts_with("Seccomp:")
+    }) {
+        println!("fixture authority: {role} {line}");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MountIdentity {
+    id: u64,
+    device: (u32, u32),
+}
+
+/// Ask the kernel for the mount containing this exact path, not mount(8)'s exit status.
+fn mount_identity(path: &Path) -> std::io::Result<MountIdentity> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: an all-zero statx is valid output storage.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and correctly sized statx output buffer.
+    if unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    } != 0
+    {
+        return Err(last_error());
+    }
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(std::io::Error::other("kernel did not supply STATX_MNT_ID"));
+    }
+    Ok(MountIdentity {
+        id: stat.stx_mnt_id,
+        device: (stat.stx_dev_major, stat.stx_dev_minor),
+    })
+}
+
+impl Scratch {
+    fn owned_mount(&self) -> std::io::Result<Option<MountIdentity>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let target = match mount_identity(&self.directory) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if target.id == mount_identity(&self.root)?.id {
+            return Ok(None);
+        }
+        let association = self.loop_association.as_ref().ok_or_else(|| {
+            std::io::Error::other(format!("unowned mount at {}", self.directory.display()))
+        })?;
+        let device = association.file.metadata()?.rdev();
+        let expected = (libc::major(device), libc::minor(device));
+        if target.device != expected || loop_backing(&association.file)? != association.backing {
+            return Err(std::io::Error::other(format!(
+                "mount {target:?} at {} does not belong to our loop backing {:?}",
+                self.directory.display(),
+                association.backing,
+            )));
+        }
+        Ok(Some(target))
+    }
+
+    fn report_cleanup(failures: &mut Vec<String>, message: std::fmt::Arguments<'_>) {
+        if let Err(error) = writeln!(std::io::stdout(), "{message}") {
+            failures.push(format!("write scratch cleanup diagnostic: {error}"));
+        }
+    }
+
+    /// Release every safe owned step; preserve an image whose detach is not proven.
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleanup_started {
+            return Ok(());
+        }
+        self.cleanup_started = true;
+        let mut failures = Vec::new();
+        match self.owned_mount() {
+            Ok(Some(identity)) => {
+                Self::report_cleanup(
+                    &mut failures,
+                    format_args!("scratch cleanup: retiring kernel mount {identity:?}"),
+                );
+                // Command's PATH lookup is fallible; no executable lookup may panic in Drop.
+                if let Err(refusal) = run(Command::new("umount").arg(&self.directory)) {
+                    failures.push(refusal);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(format!("observe owned mount: {error}")),
+        }
+        let unmounted = match self.owned_mount() {
+            Ok(None) => true,
+            Ok(Some(identity)) => {
+                failures.push(format!("kernel mount {identity:?} remains attached"));
+                false
+            }
+            Err(error) => {
+                failures.push(format!("verify unmount: {error}"));
+                false
+            }
+        };
+        let mut detached = true;
+        // AUTOCLEAR was set atomically. Closing our descriptor is attempted even if umount failed.
+        if let Some(LoopAssociation {
+            device,
+            file,
+            backing,
+            closed,
+        }) = self.loop_association.take()
+        {
+            drop(file);
+            if unmounted {
+                if let Err(error) = closed.wait() {
+                    failures.push(format!(
+                        "await the owned backing file's final close: {error}"
+                    ));
+                    detached = false;
+                }
+            } else {
+                failures.push("unmount unproven: cannot await backing release".to_owned());
+                detached = false;
+            }
+            let after = std::fs::File::open(&device).and_then(|file| loop_backing(&file));
+            match after {
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    Self::report_cleanup(
+                        &mut failures,
+                        format_args!("scratch cleanup: loop association cleared"),
+                    );
+                }
+                Ok(after) if backing != after => {
+                    Self::report_cleanup(
+                        &mut failures,
+                        format_args!(
+                            "scratch cleanup: our association cleared and the device was reused"
+                        ),
+                    );
+                }
+                Ok(_) => {
+                    failures.push("our loop association remains attached".to_owned());
+                    detached = false;
+                }
+                Err(error) => {
+                    failures.push(format!("verify loop association cleanup: {error}"));
+                    detached = false;
+                }
+            }
+        }
+        // Never descend into a still-mounted image or unlink an unproven backing association.
+        let removed = if unmounted && detached {
+            match std::fs::remove_dir_all(&self.root) {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("remove {}: {error}", self.root.display()));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if removed {
+            Self::report_cleanup(
+                &mut failures,
+                format_args!(
+                    "scratch cleanup: {} unmounted and removed",
+                    self.root.display()
+                ),
+            );
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "scratch cleanup {}: {}",
+                self.root.display(),
+                failures.join("; "),
+            ))
+        }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !self.cleanup_started
+            && let Err(refusal) = self.cleanup()
+        {
+            match writeln!(std::io::stderr(), "{refusal}") {
+                Ok(()) => {}
+                Err(stderr_error) => match writeln!(
+                    std::io::stdout(),
+                    "{refusal}; stderr diagnostic unavailable: {stderr_error}"
+                ) {
+                    Ok(()) => {}
+                    Err(_stdout_error) => {
+                        // Both existing delivery channels are unavailable. Drop cannot return
+                        // their errors; all safe resource releases have already been attempted.
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A refused command unwinds through the same guard as failed setup or a failed scenario.
+/// When loop access is refused, report unmounted tmpfs cleanup only, not association proof.
+fn scratch_cleanup_survives_failure(uid: u32, gid: u32) {
+    for requested_mount in [false, true] {
+        let scratch = if requested_mount {
+            Scratch::make(uid, gid)
+        } else {
+            let name = format!("cowshed-job-cgroup-{}", std::process::id());
+            Scratch::prepare(std::env::temp_dir().join(name), uid, gid)
+        };
+        let root = scratch.root.clone();
+        let actual_mounted = scratch
+            .owned_mount()
+            .expect("kernel mount identity")
+            .is_some();
+        let associated = scratch.loop_association.is_some();
+        let outcome = std::panic::catch_unwind(move || {
+            let _scratch = scratch;
+            run(&mut Command::new(find_program("false"))).expect("intentional cleanup refusal");
+        });
+        assert!(outcome.is_err(), "the refusal unwinds");
+        assert!(
+            !root.exists(),
+            "cleanup removed {} after refusal",
+            root.display()
+        );
+        println!(
+            "scratch cleanup: command failure and panic unwind verified \
+             (requested mount {requested_mount}, actual mounted {actual_mounted}, \
+             loop associated {associated})"
+        );
+    }
+    // A setup operation can acquire the mount and still report failure to its caller.
+    // Inject that refusal inside setup, not after Scratch construction has already succeeded.
+    let name = format!("cowshed-job-cgroup-{}", std::process::id());
+    let scratch = Scratch::prepare(std::env::temp_dir().join(name), uid, gid);
+    let root = scratch.root.clone();
+    if scratch.loop_association.is_none() {
+        drop(scratch);
+        println!("blocked: setup-acquired mount refusal needs an available loop device");
+        return;
+    }
+    let parent_mount = mount_identity(&root).expect("parent mount");
+    let target = scratch.directory.clone();
+    let mut acquired = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scratch.mount_using(uid, gid, |command| {
+            run(command)?;
+            let identity = mount_identity(&target)
+                .map_err(|error| format!("observe acquired setup mount: {error}"))?;
+            assert_ne!(identity.id, parent_mount.id);
+            acquired = Some(identity);
+            println!("scratch setup refusal: acquired kernel mount {identity:?}");
+            Err("intentional setup refusal after the kernel acquired the mount".to_owned())
+        });
+    }));
+    assert!(outcome.is_err(), "the setup refusal unwinds");
+    assert!(
+        acquired.is_some(),
+        "the refused setup actually acquired its kernel mount"
+    );
+    assert!(!root.exists(), "setup refusal removed {}", root.display());
+    println!("scratch cleanup: setup-acquired mount refusal verified");
 }
 
 /// `program` from `PATH`, run as root by `sudo`, which never prompts for a password.
@@ -1268,7 +1960,7 @@ fn read_through_cache(path: &Path) {
     while file.read(&mut buffer).expect("read through the cache") > 0 {}
 }
 
-/// Give `path` `mebibytes` of storage without writing a byte of it.
+/// Allocate storage without writing payload bytes; finish allocation metadata before HELD.
 fn allocate(path: &Path, mebibytes: u64) {
     use std::os::fd::AsRawFd as _;
 
@@ -1278,6 +1970,10 @@ fn allocate(path: &Path, mebibytes: u64) {
     // SAFETY: a live descriptor and plain integers.
     let allocated = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
     assert_eq!(allocated, 0, "posix_fallocate: errno {allocated}");
+    file.sync_all().expect("flush the allocated file metadata");
+    std::fs::File::open(path.parent().expect("allocated file directory"))
+        .and_then(|directory| directory.sync_all())
+        .expect("flush the allocation directory metadata");
 }
 
 /// `statfs(2)`'s `f_type` of the filesystem holding `path`.
@@ -1312,25 +2008,24 @@ fn raw_io_stat_sum(stat: &str) -> (u64, u64) {
         })
 }
 
-/// What a census of the job's live members finds in their own `/proc/<pid>/io` storage counters.
-fn live_members_storage_io_bytes(job: &JobCgroup) -> u64 {
-    let procs = job.path().join("cgroup.procs");
-    std::fs::read_to_string(&procs)
-        .unwrap_or_else(|error| panic!("read {}: {error}", procs.display()))
-        .lines()
-        .filter_map(|pid| {
-            let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
-            Some(
-                io.lines()
-                    .filter_map(|line| {
-                        let (key, value) = line.split_once(": ")?;
-                        matches!(key, "read_bytes" | "write_bytes")
-                            .then(|| value.parse::<u64>().expect("a count"))
-                    })
-                    .sum::<u64>(),
-            )
-        })
-        .sum()
+/// Live tasks' own and waited-for-children bytes, not lifetime job I/O. Both byte keys
+/// must actually be present; an unreadable member or absent key is not measured zero.
+fn live_members_storage_io_bytes(procs: &str) -> Result<u64, String> {
+    procs.lines().try_fold(0, |total, pid| {
+        let path = format!("/proc/{pid}/io");
+        let io = std::fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?;
+        let counter = |name| -> Result<u64, String> {
+            io.lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key == name).then_some(value.trim())
+                })
+                .ok_or_else(|| format!("{path} has no {name}"))?
+                .parse()
+                .map_err(|error| format!("{name} in {path}: {error}"))
+        };
+        Ok(total + counter("read_bytes")? + counter("write_bytes")?)
+    })
 }
 
 /// Spend `millis` of this process's own CPU, as `getrusage` measures it.

@@ -838,7 +838,7 @@ impl Process {
         })
     }
 
-    pub(super) fn pid(&self) -> i32 {
+    pub fn pid(&self) -> i32 {
         self.pid
     }
 
@@ -867,7 +867,7 @@ impl Process {
     /// after it is gone could name another process: so it must be watched while it runs. The
     /// pid's running process read after the registration carries this process's pid version,
     /// which no other process is given: it ran throughout, and the watch names it.
-    pub(super) fn watch_exit(&self) -> io::Result<ExitWatch> {
+    pub fn watch_exit(&self) -> io::Result<ExitWatch> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
         // SAFETY: kqueue takes nothing and returns a new descriptor.
@@ -960,12 +960,12 @@ pub struct ExitWatch(std::os::fd::OwnedFd);
 
 impl ExitWatch {
     /// Block until the process has exited.
-    pub(super) fn wait(&self) -> io::Result<()> {
+    pub fn wait(&self) -> io::Result<()> {
         self.exited(None).map(|_| ())
     }
 
     /// Block until the process has exited or `within` passes; whether it exited.
-    pub(super) fn within(&self, within: Duration) -> io::Result<bool> {
+    pub fn within(&self, within: Duration) -> io::Result<bool> {
         self.exited(Some(within))
     }
 }
@@ -1192,7 +1192,7 @@ impl Process {
         })
     }
 
-    pub(super) fn pid(&self) -> i32 {
+    pub fn pid(&self) -> i32 {
         self.pid
     }
 
@@ -1221,7 +1221,7 @@ impl Process {
     }
 
     /// Watch for this process's exit: its pidfd names it alone, whenever it is polled.
-    pub(super) fn watch_exit(&self) -> io::Result<ExitWatch> {
+    pub fn watch_exit(&self) -> io::Result<ExitWatch> {
         self.handle.try_clone().map(ExitWatch)
     }
 

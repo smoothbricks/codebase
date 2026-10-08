@@ -1048,13 +1048,44 @@ share and is not that lifetime statistic. A zero-duration observation does not m
 baseline. The cgroup's peak counter is read without resetting it, and missing controllers/counters are typed operational
 errors, not zero totals.
 
-The delegated Linux accounting probe uses test-owned, loop-mounted ext4 storage. It compares
-`memory.current`/`memory.peak` to direct kernel reads and verifies regular-file cache separately from shmem using
-`memory.stat`'s `file - shmem`. Its direct-I/O workloads compare `io.stat` against live-process and allocation proxies;
-cached reads and an unrelated job's transfers are excluded. The root delegating parent owns unmount/removal on success
-and unwind, including a measured command-refusal cleanup path. If loop devices are unavailable, tmpfs can measure
-anonymous/shmem charging only: neither regular-file page-cache attribution nor storage-I/O attribution is proved, and
-the probe reports that blocked boundary rather than passing it.
+The delegated Linux accounting fixture keeps a root setup/cleanup parent in its non-job controller leaf and runs all
+accounting workloads as the ordinary runner. Cgroup delegation grants cgroupfs authority, not mount authority; role
+receipts record the actual UID, effective capabilities, mount namespace and kernel rather than inferring privileges. The
+setup parent consumes only runner-declared root-only loop-control and finite loop block nodes, validates their kernel
+device numbers and mode, and binds its own sparse ext4 image atomically with `LOOP_CONFIGURE`/`AUTOCLEAR`. It selects
+the narrow classic ext4 mount operation with command-local `LIBMOUNT_FORCE_MOUNT2=always`. The controller receives the
+runner-owned mountpoint, not the device capability; a real denied loop-control open proves that separation. The parent
+holds the loop descriptor until kernel-proven unmount; closing it does not itself prove deferred device retirement. A
+fresh `IN_CLOSE_WRITE` watch is armed on the exact opened backing inode through `/proc/self/fd`, after mkfs and all
+earlier writable opens finish and before `LOOP_CONFIGURE`. The local backing descriptor is dropped after configuration;
+no later independent writable image open is allowed. Linux's loop teardown sets `Lo_unbound` before putting its retained
+backing file, whose final put emits the close notification
+([loop.c](https://github.com/torvalds/linux/blob/v6.18/drivers/block/loop.c),
+[file_table.c](https://github.com/torvalds/linux/blob/v6.18/fs/file_table.c)). After proven unmount and owned loop
+close, the fixture performs one blocking read of that watch: exactly one complete 16-byte nameless `inotify_event` must
+match this watch descriptor, an `IN_CLOSE_WRITE` mask and a zero cookie, then one independent device/backing
+verification runs. Overflow, watch loss, rename/unlink, a short or misframed record, or failed delivery is an error,
+never completion and never retried. The existing fixture guard is unchanged: no timed sleep, status retry or new
+deadline substitutes for the kernel event. Cleanup observes the target's kernel mount ID and device/backing identity,
+including when mount reports failure after acquiring it; an unmount command's status is reconciled with that kernel
+state before the image can be removed. Explicit cleanup returns every release and diagnostic-write failure. Destructor
+fallback attempts the same safe steps without panicking, then attempts fallible stderr/stdout reporting; delivery is
+unavailable if both existing channels fail. Failure controls exercise refused commands before and after mounting,
+including a setup refusal after actual mount acquisition.
+
+The fixture compares `memory.current`/`memory.peak` with direct reads and verifies regular-file cache separately from
+shmem using `memory.stat`'s `file - shmem`. Direct-I/O workloads require exact independent `io.stat` parity, excluding
+cached reads, unrelated jobs and volume-allocation proxies. `/proc/pid/io` includes waited-for children, so the missing
+live-process control runs after the complete tree is reaped, alongside retained terminal counters. Allocation and
+deletion metadata are flushed at the held/terminal boundaries without timing waits. Each direct-I/O workload
+synchronizes its parent directory after unlink, before the child can be reaped and its parent can report held readiness.
+CPU comparisons collect each selected child's full `wait4` lifetime; a pre-report sample cannot include its report and
+process teardown. Unavailable loop/mount authority remains a failure, never a skip or permission widening. Tmpfs can
+measure anonymous/shmem charging only: it does not prove regular-file page-cache or storage-I/O attribution. At the held
+boundary, each live-process control requires the directly owned, unreaped parent to be the sole cgroup member and reads
+every stated counter. Unavailable membership, unreadable proc records or absent CPU/RSS/I/O keys fail the observation
+rather than becoming a zero-valued proxy; both proc I/O byte keys are required. Terminal census zero is accepted only
+after kernel terminal evidence and an independently read empty membership.
 
 The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
 through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
