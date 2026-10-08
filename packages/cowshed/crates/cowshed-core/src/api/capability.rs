@@ -4144,7 +4144,6 @@ mod tests {
                 let response = serde_json::to_vec(&json!({
                     "id": request["id"],
                     "ok": true,
-                    "result": null,
                     "error": null,
                 }))
                 .unwrap();
