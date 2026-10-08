@@ -1201,8 +1201,8 @@ struct Scratch {
     directory: PathBuf,
     /// Cleanup is attempted once, explicitly on success and by Drop during unwind.
     cleanup_started: bool,
-    /// The atomically configured loop association, with AUTOCLEAR; closing this last owned
-    /// descriptor clears it after unmount, including a failure before mount.
+    /// Atomic AUTOCLEAR ownership. The backing file's final-close notification fences the
+    /// kernel's deferred device retirement after unmount and our descriptor close.
     loop_association: Option<LoopAssociation>,
 }
 
@@ -1210,6 +1210,7 @@ struct LoopAssociation {
     device: PathBuf,
     file: std::fs::File,
     backing: (u64, u64),
+    closed: BackingClose,
 }
 
 impl Scratch {
@@ -1406,6 +1407,68 @@ struct LoopConfig {
 
 const _: () = assert!(std::mem::size_of::<LoopInfo64>() == 232);
 const _: () = assert!(std::mem::size_of::<LoopConfig>() == 304);
+const _: () = assert!(std::mem::size_of::<libc::inotify_event>() == 16);
+
+/// Freshly armed on the exact inode pinned by the writable file description configured into
+/// the loop. Inotify is inode-based: no later writable open of this owned image is allowed.
+struct BackingClose {
+    events: std::fs::File,
+    watch: i32,
+}
+
+impl BackingClose {
+    fn arm(image: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        // SAFETY: creates a new descriptor; CLOEXEC prevents every setup child inheriting it.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(last_error());
+        }
+        // SAFETY: this successful syscall returned one descriptor owned only here.
+        let events = unsafe { std::fs::File::from_raw_fd(fd) };
+        let image_fd = std::ffi::CString::new(format!("/proc/self/fd/{}", image.as_raw_fd()))
+            .map_err(std::io::Error::other)?;
+        // SAFETY: the live image descriptor pins the exact inode behind this NUL-terminated path.
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                fd,
+                image_fd.as_ptr(),
+                libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
+            )
+        };
+        if watch < 0 {
+            return Err(last_error());
+        }
+        Ok(Self { events, watch })
+    }
+
+    fn wait(mut self) -> std::io::Result<()> {
+        // One blocking read consumes one complete record. A 16-byte buffer admits only a nameless
+        // inotify_event; any other length is a failed delivery, never retried. The fixture's
+        // existing overall guard bounds this wait: no new grace is added.
+        let mut event = [0_u8; 16];
+        let received = self.events.read(&mut event)?;
+        if received != event.len() {
+            return Err(std::io::Error::other(format!(
+                "backing close notification short: read {received} of {} bytes",
+                event.len(),
+            )));
+        }
+        let watch = i32::from_ne_bytes(event[0..4].try_into().expect("fixed watch field"));
+        let mask = u32::from_ne_bytes(event[4..8].try_into().expect("fixed mask field"));
+        let cookie = u32::from_ne_bytes(event[8..12].try_into().expect("fixed cookie field"));
+        let length = u32::from_ne_bytes(event[12..16].try_into().expect("fixed length field"));
+        if watch != self.watch || mask != libc::IN_CLOSE_WRITE || cookie != 0 || length != 0 {
+            return Err(std::io::Error::other(format!(
+                "backing close notification unavailable: expected watch {} IN_CLOSE_WRITE, \
+                 cookie 0, name length 0; got watch {watch}, mask {mask:#x}, cookie {cookie}, \
+                 name length {length}",
+                self.watch,
+            )));
+        }
+        Ok(())
+    }
+}
 
 fn associate_scratch_loop(device: PathBuf, image: &Path) -> Result<LoopAssociation, String> {
     use std::os::fd::AsRawFd as _;
@@ -1424,6 +1487,9 @@ fn associate_scratch_loop(device: PathBuf, image: &Path) -> Result<LoopAssociati
         .metadata()
         .map_err(|error| format!("stat backing image: {error}"))?;
     let backing = (metadata.dev(), metadata.ino());
+    // mkfs and all earlier writable opens finished before this fresh exact-inode watch.
+    let closed = BackingClose::arm(&image)
+        .map_err(|error| format!("watch configured backing file's final close: {error}"))?;
     // SAFETY: every bit pattern of these UAPI integer/byte-array fields is valid.
     let mut config: LoopConfig = unsafe { std::mem::zeroed() };
     config.fd = u32::try_from(image.as_raw_fd()).expect("an open file has a nonnegative fd");
@@ -1440,6 +1506,7 @@ fn associate_scratch_loop(device: PathBuf, image: &Path) -> Result<LoopAssociati
         device,
         file: loop_file,
         backing,
+        closed,
     })
 }
 
@@ -1632,9 +1699,21 @@ impl Scratch {
             device,
             file,
             backing,
+            closed,
         }) = self.loop_association.take()
         {
             drop(file);
+            if unmounted {
+                if let Err(error) = closed.wait() {
+                    failures.push(format!(
+                        "await the owned backing file's final close: {error}"
+                    ));
+                    detached = false;
+                }
+            } else {
+                failures.push("unmount unproven: cannot await backing release".to_owned());
+                detached = false;
+            }
             let after = std::fs::File::open(&device).and_then(|file| loop_backing(&file));
             match after {
                 Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
