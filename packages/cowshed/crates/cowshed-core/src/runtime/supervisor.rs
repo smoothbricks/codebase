@@ -2770,6 +2770,9 @@ enum KillReason {
 struct StdinDelivery {
     /// Bytes of the input the pump wrote, whole, to the child's stdin.
     delivered: u64,
+    /// The end checked when input was accepted. Delivery changes no accepted boundary; only
+    /// discarding queued or uncertain input moves it back.
+    admitted_end: u64,
     /// The last delivered bytes, ending at `delivered` and at most [`RETAINED_STDIN_BYTES`]
     /// long: what a repeated write is compared with.
     retained: VecDeque<Bytes>,
@@ -2799,8 +2802,7 @@ enum Replay {
 impl StdinDelivery {
     /// The byte a write continues the input at.
     fn admitted(&self) -> u64 {
-        let in_lane: usize = self.in_lane.iter().map(Bytes::len).sum();
-        self.delivered + byte_count(in_lane) + byte_count(self.queued_bytes)
+        self.admitted_end
     }
 
     /// Compares `bytes`, which start at `offset` and end within the admitted input, with the
@@ -2866,6 +2868,7 @@ impl StdinDelivery {
     /// The queued writes can never reach the job: they are dropped, and every write waiting on
     /// a byte past the lane is refused with `error`.
     fn drop_queued(&mut self, error: &CowshedError) {
+        self.admitted_end -= byte_count(self.queued_bytes);
         self.queued.clear();
         self.queued_bytes = 0;
         let reachable = self.admitted();
@@ -2885,6 +2888,7 @@ impl StdinDelivery {
         self.in_lane.clear();
         self.queued.clear();
         self.queued_bytes = 0;
+        self.admitted_end = self.delivered;
         for (_, reply) in self.waiters.drain(..) {
             let _ = reply.send(Err(error.clone()));
         }
@@ -4347,6 +4351,7 @@ impl SupervisorActor {
                 return;
             }
         }
+        delivery.admitted_end = end;
         delivery.waiters.push((end, reply));
     }
 
@@ -7316,6 +7321,7 @@ mod stdin_lane_tests {
     #[test]
     fn delivered_and_refused_waiters_keep_their_storage() {
         let mut delivery = StdinDelivery {
+            admitted_end: 3,
             in_lane: VecDeque::from([Bytes::from_static(b"one")]),
             waiters: Vec::with_capacity(4),
             ..StdinDelivery::default()
@@ -7328,6 +7334,7 @@ mod stdin_lane_tests {
             .extend([(3, due), (6, queued), (3, repeated)]);
         let storage = delivery.waiters.as_ptr();
         delivery.deliver_front();
+        assert_eq!((delivery.delivered, delivery.admitted()), (3, 3));
         assert_eq!(delivery.waiters.as_ptr(), storage);
         assert!(due_reply.try_recv().unwrap().is_ok());
         assert!(repeated_reply.try_recv().unwrap().is_ok());
@@ -7339,10 +7346,12 @@ mod stdin_lane_tests {
         delivery.in_lane.push_back(Bytes::from_static(b"x"));
         delivery.queued.push_back(Bytes::from_static(b"yz"));
         delivery.queued_bytes = 2;
+        delivery.admitted_end = 6;
         let (reachable, mut reachable_reply) = oneshot::channel();
         delivery.waiters.push((4, reachable));
         let refusal = CowshedError::conflict("input ended", "inspect the job");
         delivery.drop_queued(&refusal);
+        assert_eq!((delivery.delivered, delivery.admitted()), (3, 4));
         assert_eq!(delivery.waiters.as_ptr(), storage);
         let rejected = queued_reply.try_recv().unwrap().unwrap_err();
         assert_eq!(rejected.code, refusal.code);
@@ -7353,9 +7362,20 @@ mod stdin_lane_tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         delivery.deliver_front();
+        assert_eq!((delivery.delivered, delivery.admitted()), (4, 4));
         assert_eq!(delivery.waiters.as_ptr(), storage);
         assert!(reachable_reply.try_recv().unwrap().is_ok());
         assert!(delivery.waiters.is_empty());
+
+        delivery.in_lane.push_back(Bytes::from_static(b"lost"));
+        delivery.queued.push_back(Bytes::from_static(b"later"));
+        delivery.queued_bytes = 5;
+        delivery.admitted_end = 13;
+        delivery.refuse_waiting(&refusal);
+        assert_eq!((delivery.delivered, delivery.admitted()), (4, 4));
+        assert!(delivery.in_lane.is_empty());
+        assert!(delivery.queued.is_empty());
+        assert_eq!(delivery.queued_bytes, 0);
     }
 
     /// A close that arrives while the lane's one slot still holds a write its pump has not taken
