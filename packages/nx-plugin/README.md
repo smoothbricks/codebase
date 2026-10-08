@@ -446,7 +446,9 @@ Concrete targets come from concrete files:
   own toolchain provisioning. NAPI target inputs include the managed build entry, shell wrapper, Nix declarations and
   toolchain pins. A guarded `--identity` input observes the build entry's selected native/cross mode and host, including
   an already-entered cross profile, without dumping checkout paths or raw compiler environments. Native and cross
-  producers therefore cannot share a key merely because they compile the same target triple.
+  producers therefore cannot share a key merely because they compile the same target triple. An absent shell marker has
+  a distinct unmanaged identity and refuses a native build. Host debug/fallback addons use the same entry and mode
+  input. Darwin still uses host Xcode; this Linux cutover does not add an Xcode/SDK version input.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.

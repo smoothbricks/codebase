@@ -460,12 +460,10 @@ function targetCommandText(target: TargetConfiguration): string {
  * CLI's resolved version from the lockfile. Neither the package version nor
  * any other lockfile entry is part of the artifact.
  *
- * The pin is stated here rather than inherited: `napi build` compiles with the
- * same rustc and links against the same SDK as any other cargo target, but its
- * command does not spell `cargo --frozen`, which is how every other cached
- * cargo target acquires its toolchain identity. Without it a `.node` linked
- * against one toolchain hashed equal to the same sources linked against the
- * next one.
+ * The pin is stated here rather than inherited: NAPI's Cargo invocation does
+ * not spell `cargo --frozen`, which attaches identity to other cached Cargo
+ * targets. It covers declared Nix/Rust toolchains; Darwin's host Xcode/SDK is
+ * not pinned by this lock. Each producer also hashes its actual shell mode.
  */
 function napiInputs(projectRoot: string, repoRooted: boolean): NonNullable<TargetConfiguration['inputs']> {
   // Runtime inputs execute from the workspace root, so the manifest is named
@@ -2033,6 +2031,7 @@ function createNapiTargets(
   const packageJsonPath = repoRooted ? posix.join(projectRoot, 'package.json') : 'package.json';
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage} --package-json-path ${packageJsonPath}`;
   const cargoInputs = napiInputs(projectRoot, repoRooted);
+  const hostInputs = [...cargoInputs, runtimeInput('sh tooling/napi-build.sh host --identity')];
   const cargoCwd = repoRooted ? '.' : projectRoot;
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
@@ -2067,11 +2066,11 @@ function createNapiTargets(
     executor: 'nx:run-commands',
     cache: true,
     dependsOn: ['^build'],
-    inputs: cargoInputs,
+    inputs: hostInputs,
     outputs: ['{projectRoot}/.cache/native-debug'],
     options: {
       cwd: cargoCwd,
-      command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
+      command: `${napiBuildEntry} host ${shellWord(napiCommand)} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
       ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
     },
   };
@@ -2084,12 +2083,12 @@ function createNapiTargets(
     // platform-suffixed filename from dist/native/<platform-dir> after
     // dist/native/host.
     const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}`;
+      `${napiBuildEntry} host ${shellWord(napiCommand)}${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}`;
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
       cache: true,
       dependsOn: ['^build'],
-      inputs: cargoInputs,
+      inputs: hostInputs,
       outputs: ['{projectRoot}/dist/native/host'],
       options: {
         cwd: cargoCwd,

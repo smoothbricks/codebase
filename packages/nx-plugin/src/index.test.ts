@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -56,6 +56,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         }),
       ).toBe(`linux-cross:${host}\n`);
     }
+    const unmanagedEnv = { ...process.env };
+    delete unmanagedEnv.SMOO_NAPI_TOOLCHAIN_MODE;
+    expect(execFileSync('sh', [entry, 'host', '--identity'], { encoding: 'utf8', env: unmanagedEnv })).toBe(
+      `unmanaged:${host}\n`,
+    );
+    const refused = spawnSync('sh', [entry, 'host', 'uname'], { encoding: 'utf8', env: unmanagedEnv });
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain('native NAPI build needs the managed shell');
   });
 
   it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
@@ -1140,7 +1148,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
-          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
+          'sh tooling/napi-build.sh host packages/native/node_modules/.bin/napi --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
       });
       const platformBuild = (release: string): string =>
         `sh tooling/napi-build.sh aarch64-apple-darwin packages/native/node_modules/.bin/napi${release} --platform --no-js --dts native.darwin-arm64.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64`;
@@ -1689,12 +1697,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
+            'sh ../../tooling/napi-build.sh host napi --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
         },
         configurations: {
           [RELEASE_CONFIGURATION]: {
             command:
-              'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
+              'sh ../../tooling/napi-build.sh host napi --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
           },
         },
       });
