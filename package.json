@@ -85,6 +85,13 @@
         "inputs": [
           "{workspaceRoot}/tooling/patched-nx.ts",
           "{workspaceRoot}/patches/nx@23.2.1.patch",
+          "{workspaceRoot}/bunfig.toml",
+          {
+            "json": "{workspaceRoot}/bun.lock",
+            "excludeFields": [
+              "workspaces"
+            ]
+          },
           {
             "runtime": "bun -e 'console.log(Bun.version, Bun.revision)'"
           }

@@ -23,9 +23,9 @@
  *                                                with exactly this integrity
  */
 
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { $ } from 'bun';
 
 const NX_VERSION = '23.2.1';
@@ -253,6 +253,12 @@ async function main([command, argument]: string[]): Promise<void> {
     await writeFile(join(argument, 'release-notes.md'), notes(built));
     await rm(join(argument, 'package'), { recursive: true, force: true });
     await $`tar -xzf ${join(argument, built.asset)} -C ${argument}`.quiet();
+    // The test package borrows this checkout's locked dependencies, not its installed Nx implementation.
+    await symlink(
+      relative(resolve(argument, 'package'), join(root, 'node_modules', '.bun', 'node_modules')),
+      join(argument, 'package', 'node_modules'),
+      'dir',
+    );
     console.log(JSON.stringify(built));
     return;
   }
