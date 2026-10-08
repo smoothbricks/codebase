@@ -1,10 +1,45 @@
 import { describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 describe('Bun bootstrap imports', () => {
   it('imports the main plugin entry point', async () => {
-    const plugin = await import('./index.js');
+    // Module loading is the boundary under test; the public entry must select the transformed product.
+    const plugin = await import('@smoothbricks/nx-plugin');
     expect(plugin.createNodesV2).toBeDefined();
     expect(Array.isArray(plugin.createNodesV2)).toBe(true);
+  });
+
+  it('refuses a cold missing bootstrap product instead of returning an empty graph', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-plugin-bootstrap-'));
+    try {
+      await writeFile(join(root, 'package.json'), '{"type":"module"}\n');
+      await copyFile(join(import.meta.dir, '../loader.js'), join(root, 'loader.js'));
+      const script = `await import(${JSON.stringify(join(root, 'loader.js'))})`;
+      const child = spawnSync(process.execPath, ['--no-install', '-e', script], { cwd: root, encoding: 'utf8' });
+      expect(child.status).not.toBe(0);
+      expect(child.stderr).toContain('The Nx plugin bootstrap product is missing:');
+      expect(child.stderr).toContain('ttsc -p packages/nx-plugin/tsconfig.lib.json --emit');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('loads the public policy caller closure without a transform preload', () => {
+    const script = [
+      'const policy = await import("@smoothbricks/nx-plugin/workspace-config-policy");',
+      'const bounded = await import("@smoothbricks/nx-plugin/bounded-test-policy");',
+      'const targets = await import("@smoothbricks/nx-plugin/package-target-policy");',
+      'if (!policy.checkWorkspaceConfig({plugins:[{plugin:42}]}).some(issue => issue.message.startsWith("plugins is malformed:"))) throw new Error("the public policy did not validate");',
+      'if (typeof bounded.applyBoundedTestTargetPolicy !== "function" || typeof targets.applyPackageTargetPolicy !== "function") throw new Error("the compiled caller closure is incomplete");',
+    ].join('\n');
+    const child = spawnSync(process.execPath, ['--config=/dev/null', '--no-env-file', '--no-install', '-e', script], {
+      cwd: join(import.meta.dir, '../../cli'),
+      encoding: 'utf8',
+    });
+    expect(child.status, child.stdout + child.stderr).toBe(0);
   });
 
   it('imports bounded-test-policy', async () => {
@@ -23,10 +58,16 @@ describe('Bun bootstrap imports', () => {
   });
 
   it('imports workspace-config-policy', async () => {
-    const policy = await import('./workspace-config-policy.js');
+    // Module loading is the boundary under test; no test preload may mask a raw public policy entry.
+    const policy = await import('@smoothbricks/nx-plugin/workspace-config-policy');
     expect(typeof policy.checkWorkspaceConfigPolicy).toBe('function');
     expect(typeof policy.applyWorkspaceConfigPolicy).toBe('function');
     expect(Array.isArray(policy.BUILD_OUTPUT_DEPENDENCIES)).toBe(true);
+    expect(
+      policy
+        .checkWorkspaceConfig({ plugins: [{ plugin: 42 }] })
+        .some((issue) => issue.message.startsWith('plugins is malformed:')),
+    ).toBe(true);
   });
 
   it('imports release-config-policy', async () => {

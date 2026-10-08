@@ -317,6 +317,25 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(pluginNames).toContain('@smoothbricks/nx-plugin');
   });
 
+  it('keeps configured plugin entries and their order through two policy runs', () => {
+    const configured = {
+      plugin: '@smoothbricks/nx-plugin',
+      options: { custom: { owner: 'declared-owner', enabled: true } },
+      include: ['packages/owned/**'],
+      exclude: ['packages/foreign/**'],
+    };
+    const scoped = { ...configured, include: ['targets/owned/**'] };
+    const plugins = ['example:before', configured, scoped, 'example:after'];
+    const original = JSON.stringify(plugins);
+    const nxJson = { ...validNxJson(), plugins };
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(JSON.stringify(nxJson.plugins)).toBe(original);
+    expect(nxJson.plugins[1]).toBe(configured);
+    expect(nxJson.plugins[2]).toBe(scoped);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(JSON.stringify(nxJson.plugins)).toBe(original);
+  });
+
   it('removes colon target defaults', () => {
     const nxJson = {
       ...validNxJson(),
@@ -436,6 +455,59 @@ describe('Tree: applyWorkspaceConfigTree', () => {
 
     // Tree version now passes check
     expect(checkWorkspaceConfigTree(tree)).toEqual([]);
+  });
+
+  it('preserves configured plugin options and filters in the real Nx tree through two updates', () => {
+    const tree = createTreeWithEmptyWorkspace();
+    const configured = {
+      plugin: '@smoothbricks/nx-plugin',
+      options: { custom: { owner: 'declared-owner', enabled: true } },
+      include: ['packages/owned/**'],
+      exclude: ['packages/foreign/**'],
+    };
+    const plugins = ['example:before', configured, 'example:after'];
+    writeJson(tree, 'nx.json', { ...validNxJson(), plugins });
+    const original = tree.read('nx.json', 'utf8');
+    expect(applyWorkspaceConfigTree(tree)).toBe(false);
+    expect(applyWorkspaceConfigTree(tree)).toBe(false);
+    expect(tree.read('nx.json', 'utf8')).toBe(original);
+    expect(readJson(tree, 'nx.json').plugins).toEqual(plugins);
+  });
+
+  it('does not serialize an unchanged raw JSONC configuration or remove its comments', () => {
+    const tree = createTreeWithEmptyWorkspace();
+    const configured = {
+      plugin: '@smoothbricks/nx-plugin',
+      options: { custom: { owner: 'declared-owner', enabled: true } },
+      include: ['packages/owned/**'],
+      exclude: ['packages/foreign/**'],
+    };
+    const raw = JSON.stringify({ ...validNxJson(), plugins: [configured] }, null, 2).replace(
+      '"plugin":',
+      '/* scoped plugin options must remain authored */ "plugin":',
+    );
+    tree.write('nx.json', `${raw}\n`);
+    const original = tree.read('nx.json', 'utf8');
+    expect(applyWorkspaceConfigTree(tree)).toBe(false);
+    expect(applyWorkspaceConfigTree(tree)).toBe(false);
+    expect(tree.read('nx.json', 'utf8')).toBe(original);
+  });
+
+  it('reports malformed plugin values and never replaces them with a default entry', () => {
+    for (const plugins of [
+      null,
+      'not-an-array',
+      [{ plugin: 42 }],
+      [{ plugin: '@smoothbricks/nx-plugin', include: 42 }],
+    ]) {
+      const nxJson = { ...validNxJson(), plugins };
+      const original = JSON.stringify(plugins);
+      expect(checkWorkspaceConfig(nxJson).some((issue) => issue.message.startsWith('plugins is malformed:'))).toBe(
+        true,
+      );
+      expect(applyWorkspaceConfig(nxJson)).toBe(false);
+      expect(JSON.stringify(nxJson.plugins)).toBe(original);
+    }
   });
 
   it('returns false when config already valid', () => {

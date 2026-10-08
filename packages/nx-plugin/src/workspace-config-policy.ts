@@ -1,12 +1,15 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { PluginConfiguration } from 'nx/src/config/nx-json.js';
 import type { Tree } from 'nx/src/devkit-exports.js';
-import { readJson, updateJson } from 'nx/src/devkit-exports.js';
+import { readJson, writeJson } from 'nx/src/devkit-exports.js';
+import typia from 'typia';
 
 import { CARGO_TEST_TARGET } from './cargo-workspace.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
 
 export const MANAGED_FILES_SYNC_GENERATOR = '@smoothbricks/nx-plugin:managed-files';
+const validatePlugins = typia.createValidate<PluginConfiguration[]>();
 
 export interface NxPolicyIssue {
   path: string;
@@ -121,22 +124,29 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
   validateNamedInputDefaults(nxJson, 'nx.json', issues);
 
   // Plugin configuration
-  const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  if (plugins.some(isNxJsTypescriptPlugin)) {
+  const plugins = validatePlugins(nxJson.plugins === undefined ? [] : nxJson.plugins);
+  if (!plugins.success) {
     issues.push({
       path: 'nx.json',
-      message:
-        `plugins must not configure ${nxJsTypescriptPlugin}. ` +
-        'Smoo owns transformer-aware TypeScript targets; Nx native inference only supports tsc/tsgo.',
+      message: `plugins is malformed: ${plugins.errors.map(({ path, expected }) => `${path}: expected ${expected}`).join('; ')}`,
     });
-  }
-  if (!plugins.includes(smoothBricksNxPlugin) && !plugins.some(isSmoothBricksNxPluginRecord)) {
-    issues.push({
-      path: 'nx.json',
-      message:
-        `plugins must include ${smoothBricksNxPlugin}. ` +
-        'Smoo relies on this plugin to infer convention targets that official Nx does not provide, including typecheck-tests, non-TypeScript build-tool targets, and aggregate build/lint targets.',
-    });
+  } else {
+    if (plugins.data.some((plugin) => nxPluginName(plugin) === nxJsTypescriptPlugin)) {
+      issues.push({
+        path: 'nx.json',
+        message:
+          `plugins must not configure ${nxJsTypescriptPlugin}. ` +
+          'Smoo owns transformer-aware TypeScript targets; Nx native inference only supports tsc/tsgo.',
+      });
+    }
+    if (!plugins.data.some((plugin) => nxPluginName(plugin) === smoothBricksNxPlugin)) {
+      issues.push({
+        path: 'nx.json',
+        message:
+          `plugins must include ${smoothBricksNxPlugin}. ` +
+          'Smoo relies on this plugin to infer convention targets that official Nx does not provide, including typecheck-tests, non-TypeScript build-tool targets, and aggregate build/lint targets.',
+      });
+    }
   }
 
   return issues;
@@ -153,12 +163,16 @@ export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   changed = applyLintTargetDefault(nxJson) || changed;
   changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
-  const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  const pluginsWithoutNxTypeScript = currentPlugins.filter((plugin) => !isNxJsTypescriptPlugin(plugin));
-  const nextPlugins = upsertNxPlugin(pluginsWithoutNxTypeScript, smoothBricksNxPlugin);
-  if (JSON.stringify(currentPlugins) !== JSON.stringify(nextPlugins)) {
-    nxJson.plugins = nextPlugins;
-    changed = true;
+  const plugins = validatePlugins(nxJson.plugins === undefined ? [] : nxJson.plugins);
+  if (plugins.success) {
+    const nextPlugins = plugins.data.filter((plugin) => nxPluginName(plugin) !== nxJsTypescriptPlugin);
+    if (!nextPlugins.some((plugin) => nxPluginName(plugin) === smoothBricksNxPlugin)) {
+      nextPlugins.push(smoothBricksNxPlugin);
+    }
+    if (JSON.stringify(plugins.data) !== JSON.stringify(nextPlugins)) {
+      nxJson.plugins = nextPlugins;
+      changed = true;
+    }
   }
   const sync = recordProperty(nxJson, 'sync') ?? {};
   const generators = Array.isArray(sync.globalGenerators) ? sync.globalGenerators : [];
@@ -187,11 +201,9 @@ export function applyWorkspaceConfigTree(tree: Tree): boolean {
   if (!tree.exists('nx.json')) {
     return false;
   }
-  let changed = false;
-  updateJson(tree, 'nx.json', (nxJson: Record<string, unknown>) => {
-    changed = applyWorkspaceConfig(nxJson);
-    return nxJson;
-  });
+  const nxJson = readJson<Record<string, unknown>>(tree, 'nx.json');
+  const changed = applyWorkspaceConfig(nxJson);
+  if (changed) writeJson(tree, 'nx.json', nxJson);
   return changed;
 }
 
@@ -451,28 +463,8 @@ function isPreciseProductionNamedInput(production: unknown[]): boolean {
   return hasPositiveProjectInput;
 }
 
-function upsertNxPlugin(plugins: readonly unknown[], plugin: string | Record<string, unknown>): unknown[] {
-  const pluginName = typeof plugin === 'string' ? plugin : stringProperty(plugin, 'plugin');
-  const next = plugins.filter((entry) => nxPluginName(entry) !== pluginName);
-  next.push(plugin);
-  return next;
-}
-
-function nxPluginName(value: unknown): string | null {
-  if (typeof value === 'string') {
-    return value;
-  }
-  return isRecord(value) ? stringProperty(value, 'plugin') : null;
-}
-
-function isNxJsTypescriptPlugin(value: unknown): boolean {
-  return (
-    value === nxJsTypescriptPlugin || (isRecord(value) && stringProperty(value, 'plugin') === nxJsTypescriptPlugin)
-  );
-}
-
-function isSmoothBricksNxPluginRecord(value: unknown): boolean {
-  return isRecord(value) && stringProperty(value, 'plugin') === smoothBricksNxPlugin;
+function nxPluginName(plugin: PluginConfiguration): string {
+  return typeof plugin === 'string' ? plugin : plugin.plugin;
 }
 
 function readJsonObject(path: string): Record<string, unknown> | null {
@@ -489,11 +481,6 @@ function readJsonObject(path: string): Record<string, unknown> | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function stringProperty(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 function recordProperty(record: Record<string, unknown>, key: string): Record<string, unknown> | null {

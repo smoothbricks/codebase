@@ -10,7 +10,6 @@
     "./package.json": "./package.json",
     ".": {
       "types": "./dist/index.d.ts",
-      "development": "./src/index.ts",
       "import": "./loader.js",
       "default": "./loader.js"
     },
@@ -27,7 +26,6 @@
     },
     "./bounded-test-policy": {
       "types": "./dist/bounded-test-policy.d.ts",
-      "development": "./src/bounded-test-policy.ts",
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
     },
@@ -39,7 +37,6 @@
     },
     "./workspace-config-policy": {
       "types": "./dist/workspace-config-policy.d.ts",
-      "development": "./src/workspace-config-policy.ts",
       "import": "./dist/workspace-config-policy.js",
       "default": "./dist/workspace-config-policy.js"
     },
@@ -51,7 +48,6 @@
     },
     "./package-target-policy": {
       "types": "./dist/package-target-policy.d.ts",
-      "development": "./src/package-target-policy.ts",
       "import": "./dist/package-target-policy.js",
       "default": "./dist/package-target-policy.js"
     },

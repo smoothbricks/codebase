@@ -2,6 +2,11 @@
 
 Local Nx plugin for workspace-standard package setup and missing inferred targets.
 
+Workspace policy preserves configured plugin entries other than the disabled `@nx/js/typescript`, including their
+options, include/exclude filters and order. It adds the bare `@smoothbricks/nx-plugin` entry only when the plugin is
+absent; repeated updates do not replace an existing configured entry or discard scoped instances. Malformed plugin
+values are reported rather than replaced, and an unchanged Nx Tree configuration is not serialized again.
+
 ## Target Ownership
 
 Official `@nx/js/typescript` inference is disabled because it cannot run the workspace's source transformers. A package
