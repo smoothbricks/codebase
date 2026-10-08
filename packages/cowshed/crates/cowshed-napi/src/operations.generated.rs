@@ -458,7 +458,8 @@ impl JobHandle {
         super::stream_call::<operations::JobProgress, _>(env, Arc::clone(&self.inner), arguments)
     }
 
-    /// Writes to an attached job's stdin.
+    /// Writes to an attached job's stdin at its byte offset, answered once the bytes reached the
+    /// job's stdin pipe.
     #[napi(js_name = "attachWrite")]
     pub fn attach_write(
         &self,

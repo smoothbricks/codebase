@@ -702,16 +702,20 @@ fn typescript(
         .iter()
         .any(|method| method.answer == capabilities::Answer::Attachment);
     let native_imports = match (iterates, attaches) {
-        (true, true) =>
+        (true, true) => {
             "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobAttachmentHandle,\n  \
-             type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  type NativeWorkspaceRefHandle,\n} from './native.js';\n",
-        (true, false) =>
+             type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  type NativeWorkspaceRefHandle,\n} from './native.js';\n"
+        }
+        (true, false) => {
             "import {\n  type EventIterator,\n  eventIterator,\n  type NativeJobHandle,\n  type NativeWorkspaceHandle,\n  \
-             type NativeWorkspaceRefHandle,\n} from './native.js';\n",
-        (false, true) =>
-            "import type { NativeJobAttachmentHandle, NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n",
-        (false, false) =>
-            "import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n",
+             type NativeWorkspaceRefHandle,\n} from './native.js';\n"
+        }
+        (false, true) => {
+            "import type { NativeJobAttachmentHandle, NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n"
+        }
+        (false, false) => {
+            "import type { NativeJobHandle, NativeWorkspaceHandle, NativeWorkspaceRefHandle } from './native.js';\n"
+        }
     };
     let mut output = format!(
         "{HEADER}/// <reference types=\"node\" />\n\n\

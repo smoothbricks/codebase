@@ -30,8 +30,8 @@ use crate::api::dto::{
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
     LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest, ProjectOpenRequest,
-    ProjectOpened, RepoRequest, Scope, StdinWriteRequest, TailRequest, WorkerScope, WorkspaceAtRequest,
-    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
+    ProjectOpened, RepoRequest, Scope, StdinWriteRequest, TailRequest, WorkerScope,
+    WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
 };
 use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{

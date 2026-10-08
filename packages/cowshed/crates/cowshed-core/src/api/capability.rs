@@ -15,9 +15,9 @@ use super::operations::{
     LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
     ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
     RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest, RestoreRequest,
-    SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest,
-    WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
-    WorkspaceRequest, WorkspaceView, decode_result, encode_request,
+    SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation,
+    TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
+    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::resources::{JobResourceSample, SampleInterval};

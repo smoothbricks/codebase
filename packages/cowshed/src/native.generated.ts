@@ -5,6 +5,7 @@ import type * as Api from './api.generated.js';
 import {
   type EventIterator,
   eventIterator,
+  type NativeJobAttachmentHandle,
   type NativeJobHandle,
   type NativeWorkspaceHandle,
   type NativeWorkspaceRefHandle,
