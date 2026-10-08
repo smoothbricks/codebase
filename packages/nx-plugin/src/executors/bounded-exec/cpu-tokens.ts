@@ -19,7 +19,7 @@ export type RunnerKind =
   | 'nextest'
   /** `bun test --parallel`: its worker processes. */
   | 'bun-parallel'
-  /** A cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`): its jobs. */
+  /** A Cargo build, nextest archive, or NAPI build (direct or through the managed toolchain entry): its jobs. */
   | 'cargo'
   /** Anything else, one `bun test` process included: one process unless it declares more. */
   | 'process';
@@ -35,7 +35,7 @@ export interface Demand {
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
 
 const CARGO_BUILD =
-  /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build)(?=\s|$)/;
+  /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build|(?:\S*\/)?napi-build\.sh)(?=\s|$)/;
 const TEST_THREADS = /--test-threads(?:=|\s+)(\d+)/g;
 const BUN_PARALLEL = /--parallel(?:=(\d+))?(?=\s|$)/g;
 
