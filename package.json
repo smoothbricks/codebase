@@ -93,7 +93,7 @@
             ]
           },
           {
-            "runtime": "bun -e 'console.log(Bun.version, Bun.revision)'"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
           }
         ],
         "outputs": [
