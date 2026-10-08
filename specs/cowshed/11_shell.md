@@ -60,6 +60,12 @@ group, so a kill reaches all of them and never the host; a killed script dies by
 `cd`, `umask`, `ulimit`, `trap` and `exec` end with the child. The interpreter lives only in the host binary (the
 `cowshed-shell` crate), not in the supervisor library or its Node addon.
 
+Complete-group termination means every retained running member receives the group signal and reaches an observed
+exit; it does not mean the caller may reap processes whose parent is another process. An exited, unreaped zombie still
+answers `kill(pid, 0)`, so a null signal is not evidence that a killed descendant survived. Consumers retain a kernel
+identity-fenced exit watch while the member is running, then wait for that member's actual exit event. The actual parent
+alone reaps its children; the command leader stays unreaped until release, and the independent host must remain usable.
+
 **Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
 birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
 hosts are direct children held by a parent-owned reap/signal fence. A job's leader is observed exiting **without

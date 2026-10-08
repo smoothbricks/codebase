@@ -525,90 +525,83 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let mut host = Host::start("group");
     let leader = host.directory.join("leader");
     let descendant = host.directory.join("descendant");
-    let rendered = text(&format!(
-        "sh -c 'printf \"%s\\n\" \"$$\" > {}; exec sleep 300' & printf '%s\\n' \"$$\" > {}; wait",
-        descendant.display(),
-        leader.display()
-    ));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let control = host.control.try_clone().expect("control clone");
-    let directory = host.directory.clone();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let runner = std::thread::spawn(move || {
-        let ran = run_on(&control, &directory, &rendered, None);
-        sender.send((ran.pid, ran.status)).unwrap();
-    });
-    // Wait until the descendant itself has written its PID. `$!` in the parent
-    // may still be unset when its background command first starts.
-    let pids = loop {
-        let parent = std::fs::read_to_string(&leader)
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok());
-        let child = std::fs::read_to_string(&descendant)
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok());
-        if let (Some(parent), Some(child)) = (parent, child) {
-            break [parent, child];
-        }
-        if std::time::Instant::now() >= deadline {
-            let parent = std::fs::read_to_string(&leader);
-            let child = std::fs::read_to_string(&descendant);
-            let parent_pid = parent
-                .as_ref()
-                .ok()
-                .and_then(|value| value.trim().parse::<i32>().ok());
-            let child_pid = child
-                .as_ref()
-                .ok()
-                .and_then(|value| value.trim().parse::<i32>().ok());
-            stop_fixture_jobs(host.child.id(), parent_pid, child_pid);
-            let host_status = host.child.try_wait().expect("host status");
-            panic!(
-                "the background job did not publish both PIDs: leader={parent:?}, descendant={child:?}, host={host_status:?}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut job = ScriptJobGuard {
-        host_pid: host.child.id(),
-        leader: pids[0],
-        descendant: pids[1],
-        armed: true,
-    };
-    // The background child holds the script's output pipes. If brush moves it to a
-    // different process group, killing the script leaves both those pipes open.
-    let script_group = unsafe { libc::getpgid(pids[0]) };
-    let grandchild_group = unsafe { libc::getpgid(pids[1]) };
-    assert_eq!(script_group, pids[0], "the script must lead its own group");
-    assert_eq!(
-        grandchild_group, script_group,
-        "a background child must remain in the script's group"
-    );
-    // The job's group is the script process's own pid.
-    // SAFETY: a group signal to the job's group.
-    assert_eq!(unsafe { libc::kill(-pids[0], libc::SIGTERM) }, 0);
-    let outcome =
-        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-    let (_, status) = outcome.unwrap_or_else(|error| {
-        let script_group = unsafe { libc::getpgid(pids[0]) };
-        let grandchild_group = unsafe { libc::getpgid(pids[1]) };
-        let host = host.child.try_wait().expect("host status");
-        panic!(
-            "the job did not end: {error}; script group={script_group}, grandchild group={grandchild_group}, host={host:?}"
-        );
-    });
-    runner.join().unwrap();
-    assert_eq!(signaled(status.as_ref()), Some(libc::SIGTERM));
-    std::thread::sleep(Duration::from_millis(100));
-    for pid in pids {
-        assert!(!alive(pid), "process {pid} of the killed script survived");
+    let hold = host.directory.join("hold");
+    for path in [&leader, &descendant, &hold] {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        // SAFETY: a NUL-terminated path in this fixture's own directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
     }
+    let rendered = text(&format!(
+        "sh -c 'printf \"%s\\n\" \"$$\" > {}; read -r _ < {}' & printf '%s\\n' \"$$\" > {}; wait",
+        descendant.display(), hold.display(), leader.display()
+    ));
+    let Submitted { reply, readers } = submit(&host.control, &host.directory, &rendered);
+    let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
+    assert_eq!(tag, REPLY_STARTED);
+    let birth = fields.birth().expect("the real parent observed its unreaped leader");
+    fields.finish().expect("start frame");
+    // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
+    let pids = [&leader, &descendant].map(|path| {
+        let value = std::fs::read_to_string(path).expect("read the actual process's FIFO");
+        value.trim().parse::<i32>().expect("published process PID")
+    });
+    assert_eq!(birth.pid(), pids[0].cast_unsigned());
+    let mut job = ScriptJobGuard {
+        host_pid: host.child.id(), leader: pids[0], descendant: pids[1], armed: true,
+    };
+    let members = cowshed_core::runtime::job_groups::job_members(&birth).expect("identity-proven live group");
+    let exits = pids.map(|pid| {
+        let member = members.iter().find(|member| member.pid() == pid).expect("published process is in the actual owned group");
+        let exit = member.watch_exit().expect("watch this retained life before killing it");
+        assert!(!exit.within(Duration::ZERO).expect("current exit readiness"), "process {pid} already exited");
+        exit
+    });
+    // A real group signal must end both retained lives, not just the leader or its output pipes.
+    send_signal(&host.control, libc::SIGTERM);
+    let status = read_exit(&host.control);
+    assert_eq!(signaled(Some(&status)), Some(libc::SIGTERM));
+    for (pid, exit) in pids.into_iter().zip(exits) {
+        assert!(exit.within(Duration::from_secs(10)).expect("native exit notification"),
+            "retained process {pid} of the killed script still runs");
+    }
+    let [stdout, stderr] = readers.map(|reader| reader.join().expect("owned output reader"));
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+    release(&host.control); // Only its actual parent reaps the script's leader.
     job.armed = false;
-    assert!(
-        host.child.try_wait().unwrap().is_none(),
-        "the host is not in the job's group"
-    );
+    assert!(host.child.try_wait().expect("host status").is_none(), "the host is not in the job's group");
     assert_eq!(host.run(&text("printf again")).stdout, "again");
+}
+
+/// The old null-signal oracle called an exited, unreaped child alive. The exit watch must not.
+#[test]
+fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "read -r _"]).stdin(Stdio::piped()).process_group(0)
+        .spawn().expect("owned pipe-held child");
+    let pid = i32::try_from(child.id()).expect("child PID");
+    let birth = Birth::of(child.id());
+    let members = cowshed_core::runtime::job_groups::job_members(&birth).expect("owned group");
+    let retained = members.iter().find(|member| member.pid() == pid).expect("the owned leader");
+    let exit = retained.watch_exit().expect("watch the actual running child");
+    let running = exit.within(Duration::ZERO).expect("live readiness");
+    drop(child.stdin.take());
+    let status = cowshed_core::runtime::job_groups::await_exit_unreaped(pid).expect("real exit, no reap");
+    let null_signal_reaches = alive(pid);
+    let exited = exit.within(Duration::ZERO).expect("zombie exit notification");
+    #[cfg(target_os = "linux")]
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+    child.wait().expect("only the owner reaps this child, even when an oracle below fails");
+    assert!(!running, "the held child was running before EOF");
+    assert_eq!(status, ExitStatus::Exited { code: 1 });
+    assert!(null_signal_reaches, "POSIX null signal succeeds on the owned unreaped zombie");
+    assert!(exited, "positive native exit evidence while the child remained unreaped");
+    #[cfg(target_os = "linux")]
+    {
+        let stat = stat.expect("unreaped child's real kernel state");
+        let closing = stat.rfind(')').expect("stat command delimiter");
+        assert_eq!(stat[closing + 1..].split_whitespace().next(), Some("Z"), "actual Linux zombie state: {stat}");
+        eprintln!("owned-zombie pid={pid} kernel_state=Z null_signal_reaches=true exit_watch_ready=true reaped_by_owner=true");
+    }
 }
 
 /// Scripts forked at once each run whole. Two creations of one process group race, and macOS
