@@ -77,12 +77,13 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
 } from 'node:fs';
 import path from 'node:path';
-import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
+import type { KeepDeveloperLinksOptions, PackageDependencyClosure } from '@smoothbricks/nx-plugin/managed-assets';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -342,6 +343,115 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
     const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));
     console.error(`linked declared packages to local checkouts: ${entries.join(', ')}`);
   }
+}
+
+/** Host-local binding belongs to activation, never to a portable cached package output. */
+export function materializePackageDependencies(root: string, product: string, check = false): boolean {
+  const packageRoot = realpathSync(product);
+  const relativeRoot = path.relative(realpathSync(root), packageRoot);
+  const owned =
+    relativeRoot === '' ||
+    (!relativeRoot.startsWith(`..${path.sep}`) && relativeRoot !== '..' && !path.isAbsolute(relativeRoot));
+  const metadataPath = path.join(packageRoot, 'dependency-closure.json');
+  if (!existsSync(metadataPath)) return true;
+  const metadata = readDependencyClosure(metadataPath);
+  const identity: unknown = JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+  if (typeof identity !== 'object' || identity === null || Reflect.get(identity, 'name') !== metadata.packageName) {
+    throw new Error(`${metadataPath}: package identity does not match its portable dependency closure`);
+  }
+  if (metadata.platform !== process.platform || metadata.arch !== process.arch) {
+    throw new Error(`${metadataPath}: rebuild this declared product for ${process.platform}/${process.arch}`);
+  }
+  const cache = Bun.spawnSync(['bun', 'pm', 'cache'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+  if (cache.exitCode !== 0)
+    throw new Error(`cannot resolve the installed Bun store: ${new TextDecoder().decode(cache.stderr)}`);
+  const storeRoot = realpathSync(new TextDecoder().decode(cache.stdout).trim());
+  for (const dependency of metadata.dependencies) {
+    if (!dependency.direct) continue;
+    const target = path.join(storeRoot, dependency.storePath);
+    if (realpathSync(target) !== target)
+      throw new Error(`${metadataPath}: dependency path redirects outside its immutable identity`);
+    const installed: unknown = JSON.parse(readFileSync(path.join(target, 'package.json'), 'utf8'));
+    if (
+      typeof installed !== 'object' ||
+      installed === null ||
+      Reflect.get(installed, 'name') !== dependency.name ||
+      Reflect.get(installed, 'version') !== dependency.version
+    )
+      throw new Error(`${metadataPath}: installed ${dependency.name} does not match its declared content identity`);
+    const link = path.join(packageRoot, 'node_modules', dependency.name);
+    const state = lstatSync(link, { throwIfNoEntry: false });
+    if (state?.isSymbolicLink() && path.resolve(path.dirname(link), readlinkSync(link)) === target) continue;
+    if (check) return false;
+    if (!owned)
+      throw new Error(
+        `local product ${packageRoot} needs binding by its owning checkout; run its declared activation target`,
+      );
+    if (state && !state.isSymbolicLink()) throw new Error(`refuse to replace non-link dependency ${link}`);
+    mkdirSync(path.dirname(link), { recursive: true });
+    if (state) rmSync(link);
+    symlinkSync(target, link, 'dir');
+  }
+  return true;
+}
+
+export function materializeDeclaredPackages(root: string, check = false): boolean {
+  const anchor = linkAnchor(root);
+  const targets = new Set(readDeclaredLinks(root).map(([, relative]) => path.resolve(anchor, relative)));
+  for (const target of targets) {
+    if (unavailableReason(target) === null && !materializePackageDependencies(root, target, check)) return false;
+  }
+  return true;
+}
+
+/** Bootstrap runs before workspace validators are installed; retain the existing explicit boundary validation. */
+function readDependencyClosure(file: string): PackageDependencyClosure {
+  const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
+  if (typeof value !== 'object' || value === null) throw new Error(`${file}: expected a package dependency closure`);
+  const version = Reflect.get(value, 'version');
+  const packageName = Reflect.get(value, 'packageName');
+  const platform = Reflect.get(value, 'platform');
+  const arch = Reflect.get(value, 'arch');
+  const records = Reflect.get(value, 'dependencies');
+  if (
+    version !== 1 ||
+    typeof packageName !== 'string' ||
+    !PACKAGE_NAME.test(packageName) ||
+    typeof platform !== 'string' ||
+    typeof arch !== 'string' ||
+    !Array.isArray(records)
+  ) {
+    throw new Error(`${file}: invalid portable package identity`);
+  }
+  const relativePath = (value: unknown): string => {
+    if (
+      typeof value !== 'string' ||
+      value.length === 0 ||
+      path.isAbsolute(value) ||
+      value.split(/[\\/]/).some((part) => part === '' || part === '.' || part === '..')
+    ) {
+      throw new Error(`${file}: dependency identity must be a contained Bun-store-relative path`);
+    }
+    return value;
+  };
+  const dependencies = records.map((record: unknown) => {
+    if (typeof record !== 'object' || record === null) throw new Error(`${file}: invalid package dependency`);
+    const name = Reflect.get(record, 'name');
+    const version = Reflect.get(record, 'version');
+    const storePath = Reflect.get(record, 'storePath');
+    const bindingPaths = Reflect.get(record, 'bindingPaths');
+    const direct = Reflect.get(record, 'direct');
+    if (
+      typeof name !== 'string' ||
+      !PACKAGE_NAME.test(name) ||
+      typeof version !== 'string' ||
+      typeof direct !== 'boolean' ||
+      !Array.isArray(bindingPaths)
+    )
+      throw new Error(`${file}: invalid dependency identity`);
+    return { name, version, storePath: relativePath(storePath), bindingPaths: bindingPaths.map(relativePath), direct };
+  });
+  return { version, packageName, platform, arch, dependencies };
 }
 
 /** Why `target` cannot be linked to, or null when it is a directory this process can reach. */

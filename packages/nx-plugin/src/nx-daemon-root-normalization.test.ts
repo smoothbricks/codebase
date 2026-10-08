@@ -4,22 +4,22 @@ import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import typia from 'typia';
-import type { DaemonProcessJson } from '../../../.cache/patched-nx/package/dist/src/daemon/cache.js';
+import type { DaemonProcessJson } from '../../../.cache/patched-nx/node_modules/nx/dist/src/daemon/cache.js';
 import {
   assertNotForeignWorkspaceMessage,
   isForeignWorkspaceMessage,
   normalizeRootString,
-} from '../../../.cache/patched-nx/package/dist/src/daemon/message-types/daemon-message.js';
-import { sendMessage } from '../../../.cache/patched-nx/package/dist/src/daemon/socket-utils.js';
+} from '../../../.cache/patched-nx/node_modules/nx/dist/src/daemon/message-types/daemon-message.js';
+import { sendMessage } from '../../../.cache/patched-nx/node_modules/nx/dist/src/daemon/socket-utils.js';
 import {
   consumeMessagesFromSocket,
   parseMessage,
-} from '../../../.cache/patched-nx/package/dist/src/utils/consume-messages-from-socket.js';
+} from '../../../.cache/patched-nx/node_modules/nx/dist/src/utils/consume-messages-from-socket.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
-const artifactNxEntry = join(repositoryRoot, '.cache/patched-nx/package/dist/bin/nx.js');
+const artifactNxEntry = join(repositoryRoot, '.cache/patched-nx/node_modules/nx/dist/bin/nx.js');
 
 it('removes only redundant POSIX separators and preserves root, case and backslash components', () => {
   for (const [input, expected] of [

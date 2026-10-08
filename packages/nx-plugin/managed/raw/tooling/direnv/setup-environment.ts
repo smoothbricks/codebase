@@ -20,7 +20,14 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
-import { applyDeclaredLinks, keepDeveloperLinks, planDeclaredLinks, reportDeveloperLinks } from './developer-links.ts';
+import {
+  applyDeclaredLinks,
+  keepDeveloperLinks,
+  materializeDeclaredPackages,
+  materializePackageDependencies,
+  planDeclaredLinks,
+  reportDeveloperLinks,
+} from './developer-links.ts';
 import {
   type DeferredSecret,
   dependentGroups,
@@ -142,6 +149,7 @@ const { values: flags } = parseArgs({
     python: { type: 'string' },
     cargo: { type: 'boolean' },
     links: { type: 'boolean' },
+    'package-root': { type: 'string' },
     check: { type: 'boolean' },
   },
 });
@@ -158,14 +166,40 @@ try {
   if (flags.links === true) {
     // CI builds against the published packages its lockfile names; a
     // declaration is for developer machines, so a runner links nothing.
-    if (process.env.GITHUB_ACTIONS === 'true') {
+    if (process.env.GITHUB_ACTIONS === 'true' && flags['package-root'] === undefined) {
       process.exit(0);
     }
-    if (flags.check === true) {
-      process.exit(planDeclaredLinks(projectRoot).changes.length === 0 ? 0 : 1);
+    if (flags['package-root'] !== undefined) {
+      const product = path.resolve(projectRoot, flags['package-root']);
+      const within = path.relative(projectRoot, product);
+      const physical = path.relative(realpathSync(projectRoot), realpathSync(product));
+      if (
+        path.isAbsolute(flags['package-root']) ||
+        within === '..' ||
+        within.startsWith(`..${path.sep}`) ||
+        physical === '..' ||
+        physical.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(physical)
+      ) {
+        throw new Error('--package-root must select a declared product inside this checkout');
+      }
+      if (!existsSync(path.join(product, 'dependency-closure.json'))) {
+        throw new Error('the selected declared product has no portable dependency closure; run its producer first');
+      }
+      const ready = await withInstallLock(async () =>
+        materializePackageDependencies(projectRoot, product, flags.check),
+      );
+      process.exit(ready ? 0 : 1);
     }
-    // Under the install lock: an install another entry runs replaces the same entries.
-    await withInstallLock(async () => applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot)));
+    if (flags.check === true) {
+      process.exit(
+        planDeclaredLinks(projectRoot).changes.length === 0 && materializeDeclaredPackages(projectRoot, true) ? 0 : 1,
+      );
+    }
+    await withInstallLock(async () => {
+      applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot));
+      materializeDeclaredPackages(projectRoot);
+    });
     process.exit(0);
   }
   // Bootstrap only: install deps + wire local git hooks/config.

@@ -14,3 +14,18 @@ export type KeepDeveloperLinks = <T>(
   install: () => Promise<T>,
   options?: KeepDeveloperLinksOptions,
 ) => Promise<T>;
+
+/** Portable immutable package identities; host paths are resolved only by the activation owner. */
+export interface PackageDependencyClosure {
+  readonly version: 1;
+  readonly packageName: string;
+  readonly platform: string;
+  readonly arch: string;
+  readonly dependencies: readonly {
+    readonly name: string;
+    readonly version: string;
+    readonly storePath: string;
+    readonly bindingPaths: readonly string[];
+    readonly direct: boolean;
+  }[];
+}

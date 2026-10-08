@@ -37,6 +37,30 @@
   "nx": {
     "name": "cowshed",
     "targets": {
+      "cargo-test-cowshed-cli": {
+        "dependsOn": [
+          "...",
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "patched-nx"
+          },
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "patched-nx-bindings"
+          }
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ]
+      },
       "api-generator": {
         "executor": "nx:run-commands",
         "cache": true,

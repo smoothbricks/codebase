@@ -15,7 +15,7 @@
  * here (sorted regular files, fixed owner, mode and mtime) and gzip-framed here (no timestamp, OS
  * "unknown"), so nothing of the build host leaks into the bytes.
  *
- *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset>, its extracted package/, and release-notes.md;
+ *   bun tooling/patched-nx.ts build <out-dir>    write <out-dir>/<asset>, node_modules/nx, and release-notes.md;
  *                                                print the release as JSON
  *   bun tooling/patched-nx.ts verify <asset>     refuse unless the asset unpacks to the tar built now;
  *                                                print the release with the asset's own integrity
@@ -23,10 +23,13 @@
  *                                                with exactly this integrity
  */
 
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import { $ } from 'bun';
+import { readModulePackageJson } from 'nx/src/utils/package-json.js';
+import type { PackageDependencyClosure } from '../packages/nx-plugin/src/managed-assets.js';
 
 const NX_VERSION = '23.2.1';
 /** The registry's own integrity for the tarball the patch applies to (`npm view nx@23.2.1 dist.integrity`). */
@@ -87,6 +90,111 @@ interface Release {
   readonly integrity: string;
   /** sha256 of the uncompressed tar, the content the tag is named for. */
   readonly tarSha256: string;
+}
+interface PackageDependency {
+  readonly name: string;
+  readonly version: string;
+  readonly canonicalPath: string;
+  readonly readPaths: string[];
+}
+
+/** Resolve the lockfile install, not the developer link that selects the generated product. */
+async function installedDependencyClosure(): Promise<PackageDependencyClosure> {
+  const cache = (await $`bun pm cache`.cwd(root).quiet().text()).trim();
+  const storeRoot = await realpath(cache);
+  const installedNx = readModulePackageJson('nx', [join(root, 'node_modules', '.bun')]);
+  const installedNxRoot = dirname(installedNx.path);
+  const dependencies = new Map<string, PackageDependency>();
+  const direct = new Map<string, PackageDependency>();
+  const bindingPath = async (name: string, scope: string, canonicalPath: string): Promise<string> => {
+    for (const directory of createRequire(join(scope, 'package.json')).resolve.paths(`${name}/package.json`) ?? []) {
+      const candidate = join(directory, name);
+      try {
+        if ((await realpath(candidate)) === canonicalPath) {
+          const withinStore = relative(storeRoot, candidate);
+          if (withinStore === '..' || withinStore.startsWith('../') || isAbsolute(withinStore)) {
+            throw new Error(`Nx dependency binding ${name} leaves the immutable Bun store: ${candidate}`);
+          }
+          return candidate;
+        }
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR'))
+          continue;
+        throw error;
+      }
+    }
+    throw new Error(`Nx dependency ${name} has no proven logical package binding from ${scope}`);
+  };
+  const visit = async (name: string, scope: string, optional: boolean): Promise<PackageDependency | null> => {
+    let installed: ReturnType<typeof readModulePackageJson>;
+    try {
+      installed = readModulePackageJson(name, [scope]);
+    } catch (error) {
+      if (optional && error instanceof Error && 'code' in error && error.code === 'MODULE_NOT_FOUND') return null;
+      throw error;
+    }
+    const canonicalPath = await realpath(dirname(installed.path));
+    const withinStore = relative(storeRoot, canonicalPath);
+    if (withinStore === '..' || withinStore.startsWith('../') || isAbsolute(withinStore)) {
+      throw new Error(`Nx dependency ${name} is not an immutable installed Bun-store package: ${canonicalPath}`);
+    }
+    if (installed.packageJson.name !== name || !installed.packageJson.version) {
+      throw new Error(`Nx dependency ${name} has inconsistent package identity at ${canonicalPath}`);
+    }
+    const binding = scope === installedNxRoot ? null : await bindingPath(name, scope, canonicalPath);
+    const known = dependencies.get(canonicalPath);
+    if (known) {
+      if (binding && !known.readPaths.includes(binding)) known.readPaths.push(binding);
+      return known;
+    }
+    const dependency = {
+      name,
+      version: installed.packageJson.version,
+      canonicalPath,
+      readPaths: binding ? [binding] : [],
+    };
+    dependencies.set(canonicalPath, dependency);
+    const children = new Map<string, boolean>();
+    for (const child of Object.keys(installed.packageJson.dependencies ?? {})) children.set(child, false);
+    for (const child of Object.keys(installed.packageJson.peerDependencies ?? {})) {
+      if (!children.has(child))
+        children.set(child, installed.packageJson.peerDependenciesMeta?.[child]?.optional === true);
+    }
+    for (const child of Object.keys(installed.packageJson.optionalDependencies ?? {})) children.set(child, true);
+    for (const [child, isOptional] of [...children].sort(([left], [right]) => left.localeCompare(right))) {
+      await visit(child, canonicalPath, isOptional);
+    }
+    return dependency;
+  };
+  const declared = new Map<string, boolean>();
+  for (const name of Object.keys(installedNx.packageJson.dependencies ?? {})) declared.set(name, false);
+  for (const name of Object.keys(installedNx.packageJson.peerDependencies ?? {})) {
+    if (!declared.has(name))
+      declared.set(name, installedNx.packageJson.peerDependenciesMeta?.[name]?.optional === true);
+  }
+  for (const name of Object.keys(installedNx.packageJson.optionalDependencies ?? {})) declared.set(name, true);
+  for (const [name, optional] of [...declared].sort(([left], [right]) => left.localeCompare(right))) {
+    const dependency = await visit(name, installedNxRoot, optional);
+    if (dependency) direct.set(name, dependency);
+  }
+  for (const dependency of dependencies.values()) dependency.readPaths.sort();
+  return {
+    version: 1,
+    packageName: 'nx',
+    platform: process.platform,
+    arch: process.arch,
+    dependencies: [...dependencies.values()]
+      .sort(
+        (left, right) => left.name.localeCompare(right.name) || left.canonicalPath.localeCompare(right.canonicalPath),
+      )
+      .map((dependency) => ({
+        name: dependency.name,
+        version: dependency.version,
+        storePath: relative(storeRoot, dependency.canonicalPath),
+        bindingPaths: dependency.readPaths.map((binding) => relative(storeRoot, binding)),
+        direct: direct.get(dependency.name) === dependency,
+      })),
+  };
 }
 
 function sri(bytes: Uint8Array): string {
@@ -248,6 +356,10 @@ async function checkLock(built: Release, integrity: string): Promise<void> {
 }
 
 async function main([command, argument]: string[]): Promise<void> {
+  if (command === 'dependency-identity') {
+    console.log(JSON.stringify(await installedDependencyClosure()));
+    return;
+  }
   if (command === 'build' && argument !== undefined) {
     const tarBytes = await patchedTar();
     const asset = gzip(tarBytes);
@@ -255,14 +367,13 @@ async function main([command, argument]: string[]): Promise<void> {
     await mkdir(argument, { recursive: true });
     await writeFile(join(argument, built.asset), asset);
     await writeFile(join(argument, 'release-notes.md'), notes(built));
+    const packageRoot = join(argument, 'node_modules', 'nx');
+    await rm(packageRoot, { recursive: true, force: true });
     await rm(join(argument, 'package'), { recursive: true, force: true });
     await $`tar -xzf ${join(argument, built.asset)} -C ${argument}`.quiet();
-    // The test package borrows this checkout's locked dependencies, not its installed Nx implementation.
-    await symlink(
-      relative(resolve(argument, 'package'), join(root, 'node_modules', '.bun', 'node_modules')),
-      join(argument, 'package', 'node_modules'),
-      'dir',
-    );
+    await mkdir(dirname(packageRoot), { recursive: true });
+    await rename(join(argument, 'package'), packageRoot);
+    await writeFile(join(packageRoot, 'dependency-closure.json'), JSON.stringify(await installedDependencyClosure()));
     console.log(JSON.stringify(built));
     return;
   }
@@ -280,7 +391,9 @@ async function main([command, argument]: string[]): Promise<void> {
     await checkLock(release(tarBytes, gzip(tarBytes)), argument);
     return;
   }
-  throw new Error('usage: bun tooling/patched-nx.ts build <out-dir> | verify <asset> | lock <integrity>');
+  throw new Error(
+    'usage: bun tooling/patched-nx.ts build <out-dir> | dependency-identity | verify <asset> | lock <integrity>',
+  );
 }
 
 await main(Bun.argv.slice(2));

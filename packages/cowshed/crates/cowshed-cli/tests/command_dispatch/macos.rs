@@ -1015,15 +1015,15 @@ async fn real_apfs_rm_stops_the_checkouts_nx_daemon_before_its_unmount() {
     fixture.stop_gateway().await;
 }
 
-/// The repository's own Nx and the node that runs it, as absolute paths resolved at run time:
-/// `env!` would compile this checkout's path into the test binary.
+/// The declared patched-Nx product and its actual Node runtime, resolved from this test checkout:
+/// no installed ancestor implementation or compiled checkout path substitutes for the product.
 fn repository_nx() -> (PathBuf, PathBuf) {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
     let nx = PathBuf::from(manifest)
-        .join("../../../../node_modules/nx")
+        .join("../../../../.cache/patched-nx/node_modules/nx")
         .canonicalize()
-        .expect("the repository's own Nx is installed");
+        .expect("the declared patched-nx producer ran before the sandbox consumer");
     let node = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
@@ -1036,13 +1036,147 @@ fn repository_nx() -> (PathBuf, PathBuf) {
     (nx, node)
 }
 
-/// The package-manager link directory the repository's Nx is installed through: the sandbox
-/// reads Nx there.
-fn nx_links(nx: &Path) -> PathBuf {
-    nx.ancestors()
-        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "links"))
-        .unwrap_or(nx)
-        .to_path_buf()
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NxDependencyClosure {
+    version: u8,
+    package_name: String,
+    platform: String,
+    arch: String,
+    dependencies: Vec<NxPackageDependency>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NxPackageDependency {
+    name: String,
+    version: String,
+    store_path: PathBuf,
+    binding_paths: Vec<PathBuf>,
+    direct: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct InstalledPackageIdentity {
+    name: String,
+    version: String,
+}
+
+/// Exact immutable logical packages emitted by the declared Nx product, never a hoist or home grant.
+fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
+    let closure: NxDependencyClosure = serde_json::from_slice(
+        &fs::read(nx.join("dependency-closure.json"))
+            .expect("build the declared patched-nx product and its dependency closure"),
+    )
+    .expect("typed patched-Nx dependency closure");
+    assert_eq!(closure.version, 1);
+    assert_eq!(closure.package_name, "nx");
+    assert_eq!(closure.platform, "darwin");
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => panic!("unsupported Node architecture for this macOS fixture: {other}"),
+    };
+    assert_eq!(closure.arch, arch);
+    let cache = std::env::var_os("BUN_INSTALL_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("host HOME")).join(".bun/install/cache")
+        })
+        .canonicalize()
+        .expect("the host's admitted immutable Bun install cache");
+    let mut reads = std::collections::BTreeSet::from([nx.to_path_buf()]);
+    let mut namespaces = std::collections::BTreeSet::new();
+    for dependency in closure.dependencies {
+        assert!(
+            dependency
+                .store_path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        );
+        let selected = cache.join(&dependency.store_path);
+        let canonical = selected
+            .canonicalize()
+            .expect("an installed immutable dependency resolves");
+        assert_eq!(canonical, selected);
+        assert!(
+            canonical.starts_with(&cache) && canonical != cache,
+            "dependency {} is not an immutable installed Bun-store package: {}",
+            dependency.name,
+            canonical.display()
+        );
+        let installed: InstalledPackageIdentity = serde_json::from_slice(
+            &fs::read(canonical.join("package.json")).expect("installed package manifest"),
+        )
+        .expect("installed logical package identity");
+        assert_eq!(installed.name, dependency.name);
+        assert_eq!(installed.version, dependency.version);
+        if dependency.direct {
+            assert_eq!(
+                nx.join("node_modules")
+                    .join(&dependency.name)
+                    .canonicalize()
+                    .expect("the existing activation owner bound this direct dependency"),
+                canonical
+            );
+        }
+        for relative in dependency.binding_paths {
+            assert!(
+                relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            );
+            let binding = cache.join(relative);
+            assert_eq!(
+                binding
+                    .canonicalize()
+                    .expect("logical dependency link resolves"),
+                canonical,
+                "read admission cannot redirect a logical package binding"
+            );
+            assert!(binding.ends_with(Path::new(&dependency.name)));
+            let mut namespace = binding;
+            for _ in Path::new(&dependency.name).components() {
+                assert!(namespace.pop());
+            }
+            assert_eq!(
+                namespace.file_name(),
+                Some(std::ffi::OsStr::new("node_modules"))
+            );
+            namespaces.insert(
+                namespace
+                    .canonicalize()
+                    .expect("the immutable package's dependency namespace resolves"),
+            );
+        }
+        reads.insert(canonical);
+    }
+    for namespace in namespaces {
+        assert!(namespace.starts_with(&cache) && namespace != cache);
+        let mut groups = vec![namespace.clone()];
+        while let Some(group) = groups.pop() {
+            for entry in fs::read_dir(group).expect("installed dependency namespace") {
+                let entry = entry.expect("dependency namespace entry");
+                let target = entry
+                    .path()
+                    .canonicalize()
+                    .expect("installed namespace entry resolves");
+                if reads.iter().any(|package| target.starts_with(package)) {
+                    continue;
+                }
+                let name = entry.file_name();
+                let grouping = name.to_string_lossy().starts_with('@') || name == ".bin";
+                assert!(
+                    grouping && entry.file_type().expect("namespace entry kind").is_dir(),
+                    "dependency namespace contains an undeclared payload: {}",
+                    entry.path().display()
+                );
+                groups.push(entry.path());
+            }
+        }
+        reads.insert(namespace);
+    }
+    reads.into_iter().collect()
 }
 
 /// Adopt the fixture's checkout as main, let every workspace read `reads` (the toolchains its
@@ -1164,7 +1298,7 @@ async fn land_nx_project(
         node: &node,
         declared,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
@@ -1626,7 +1760,7 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
         nx: Some((&nx, &node)),
         rust: Some(&rust),
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     assert_target_on_build_volume(&fixture.checkout);
     let nx_check = nx_run_many(&node);
 
@@ -1671,8 +1805,10 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
     sh(&mut service, "w2", &nx_check).await;
     let exited = SystemTime::now();
     let nx_run = nx::attribute(&w2.join(".nx/cache"), &nx_check, spawned, exited);
+    eprintln!("physical warm proof: stopping runtime after both real builds and Nx run");
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
+    eprintln!("physical warm proof: runtime and gateway stopped; checking captured outcomes");
     assert!(
         host.status.success(),
         "host Cargo: {}",
@@ -1703,6 +1839,11 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
             panic!("w2's Nx run left no summary of its own: {reason:?}")
         }
     }
+    eprintln!(
+        "physical warm proof: semantic assertions passed; releasing owned runtime and scratch images"
+    );
+    drop(fixture);
+    eprintln!("physical warm proof: owned scratch teardown complete");
 }
 
 /// The checkout path [`Project::Declared`] declares as build state.
@@ -1791,7 +1932,7 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
 
@@ -1884,7 +2025,7 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
     let main = fixture.checkout.clone();
@@ -1970,7 +2111,7 @@ async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run() {
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let nx_check = nx_run_many(&node);
 
     let w1 = new_workspace(&mut service, "w1").await;
@@ -2026,7 +2167,7 @@ async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() 
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
 
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -2066,7 +2207,7 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let nx_check = nx_run_many(&node);
 
     let b = new_workspace(&mut service, "b").await;
@@ -2123,7 +2264,7 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let nx_check = nx_run_many(&node);
 
     let b = new_workspace(&mut service, "b").await;
@@ -2243,7 +2384,7 @@ async fn database_holder_fixture() -> DatabaseHolderFixture {
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &[nx_links(&nx)]).await;
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
     let topic = new_workspace(&mut service, "topic").await;

@@ -4,6 +4,9 @@ import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import type { PackageDependencyClosure } from '@smoothbricks/nx-plugin/managed-assets';
+import { readModulePackageJson } from 'nx/src/utils/package-json.js';
+import { materializePackageDependencies } from '../../../nx-plugin/managed/raw/tooling/direnv/developer-links.js';
 import { keepDeveloperLinks } from './developer-links.js';
 import { DECLARED_LINKS_POSTINSTALL } from './package-policy.js';
 
@@ -983,6 +986,61 @@ describe('what shell entry keeps linked', () => {
       });
     });
   });
+});
+
+it('materializes portable package identities in a second checkout and rebounds a stale foreign binding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'portable-package-bindings-'));
+  try {
+    const cache = Bun.spawnSync(['bun', 'pm', 'cache'], { stdout: 'pipe', stderr: 'pipe' });
+    expect(cache.exitCode).toBe(0);
+    const store = realpathSync(new TextDecoder().decode(cache.stdout).trim());
+    const installed = readModulePackageJson('tslib', [dirname(import.meta.path)]);
+    const canonical = realpathSync(dirname(installed.path));
+    const version = installed.packageJson.version;
+    if (!version) throw new Error('the real immutable tslib package has no version');
+    const dependency = {
+      name: 'tslib',
+      version,
+      storePath: canonical.slice(store.length + 1),
+      bindingPaths: [],
+      direct: true,
+    };
+    const closure: PackageDependencyClosure = {
+      version: 1,
+      packageName: '@fixture/bindings',
+      platform: process.platform,
+      arch: process.arch,
+      dependencies: [dependency],
+    };
+    const portable = JSON.stringify(closure);
+    expect(portable).not.toContain(root);
+    expect(portable).not.toContain(store);
+    for (const checkout of ['first', 'second']) {
+      const product = join(root, checkout, 'product');
+      await mkdir(product, { recursive: true });
+      await writeFile(
+        join(root, checkout, 'package.json'),
+        JSON.stringify({ name: `@fixture/${checkout}`, private: true }),
+      );
+      await writeFile(join(product, 'package.json'), JSON.stringify({ name: closure.packageName, version: '1.0.0' }));
+      await writeFile(join(product, 'dependency-closure.json'), portable);
+      expect(materializePackageDependencies(join(root, checkout), product, true)).toBe(false);
+      expect(materializePackageDependencies(join(root, checkout), product)).toBe(true);
+      expect(realpathSync(join(product, 'node_modules/tslib'))).toBe(canonical);
+    }
+    const second = join(root, 'second', 'product');
+    const binding = join(second, 'node_modules/tslib');
+    await rm(binding);
+    symlinkSync(join(root, 'first', 'product'), binding, 'dir');
+    expect(materializePackageDependencies(join(root, 'second'), second, true)).toBe(false);
+    expect(materializePackageDependencies(join(root, 'second'), second)).toBe(true);
+    expect(realpathSync(binding)).toBe(canonical);
+    const changed = { ...closure, dependencies: [{ ...dependency, storePath: '../outside' }] };
+    await writeFile(join(second, 'dependency-closure.json'), JSON.stringify(changed));
+    expect(() => materializePackageDependencies(join(root, 'second'), second)).toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 describe('what shell entry syncs for a uv project', () => {

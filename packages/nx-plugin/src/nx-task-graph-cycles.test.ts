@@ -1,7 +1,7 @@
 import { expect, it } from 'bun:test';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
-import { createTaskGraph } from '../../../.cache/patched-nx/package/dist/src/tasks-runner/create-task-graph.js';
-import { findCycles } from '../../../.cache/patched-nx/package/dist/src/tasks-runner/task-graph-utils.js';
+import { createTaskGraph } from '../../../.cache/patched-nx/node_modules/nx/dist/src/tasks-runner/create-task-graph.js';
+import { findCycles } from '../../../.cache/patched-nx/node_modules/nx/dist/src/tasks-runner/task-graph-utils.js';
 
 /**
  * Loads the package extracted from the declared patched-nx producer's actual tarball, not the previously installed

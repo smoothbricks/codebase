@@ -228,7 +228,8 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx"
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings"
         ],
         "inputs": [
           "...",
@@ -248,7 +249,8 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx"
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings"
         ],
         "inputs": [
           "...",
@@ -268,7 +270,8 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx"
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings"
         ],
         "inputs": [
           "...",
@@ -288,7 +291,8 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx"
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings"
         ],
         "inputs": [
           "...",

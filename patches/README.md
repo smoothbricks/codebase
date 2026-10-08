@@ -19,6 +19,20 @@ beforehand. Then point `overrides.nx` at the new URL and run `bun install`, here
 `bun tooling/patched-nx.ts lock <integrity>` confirms the lock matches the served asset. The library packages
 (`@smoothbricks/*`) keep their `smoo.developerLinks` path before publication (packages/cli README, "Declared Links").
 
+The product is installed under its own `node_modules/nx` namespace, which the real CLI's local/self resolver consumes;
+no checkout-ancestor lookup or external alias stands in for that package layout.
+
+The cached product contains only portable tar/payload files and `dependency-closure.json`: declared names, versions,
+content-addressed Bun-store-relative identities, platform leaves and transitive binding identities. No absolute host or
+checkout path enters its cache key or cached output. The explicit `patched-nx-bindings` dependency uses the existing
+setup/developer-links activation owner to materialize package-name links on the current host once; its output is not
+cached. A stale foreign binding is checked and rebound by that owner, never hidden by a consumer repair. Sandbox
+hotlaunch consumers resolve the retained relative identities against the admitted current Bun store and verify the
+actual package names and versions. The provider checkout's general hoist directory is never borrowed. Because grants
+canonicalize symlinks, transitive reads admit the containing immutable package-private dependency namespace only after
+every reachable payload in it is proven to belong to the declared closure. Direct product links need no installed
+ancestor namespace. No ancestor store, home or provider hoist is granted.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make
