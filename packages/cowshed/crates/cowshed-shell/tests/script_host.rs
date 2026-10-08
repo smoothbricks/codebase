@@ -36,6 +36,7 @@ struct Host {
     child: std::process::Child,
     control: std::os::unix::net::UnixStream,
     directory: PathBuf,
+    finished: bool,
 }
 
 impl Host {
@@ -78,6 +79,7 @@ impl Host {
             child,
             control: ours,
             directory,
+            finished: false,
         }
     }
 
@@ -88,6 +90,21 @@ impl Host {
     /// Run `script`, sending the host `signal` for it once it has started.
     fn run_signalled(&mut self, script: &RenderedScript, signal: i32) -> Ran {
         run_on(&self.control, &self.directory, script, Some(signal))
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.finished { return Ok(()); }
+        // The actual parent host must retire its held group before it is joined.
+        let shutdown = self.control.shutdown(std::net::Shutdown::Both);
+        let joined = self.child.wait();
+        let removed = std::fs::remove_dir_all(&self.directory);
+        self.finished = joined.is_ok() && removed.is_ok();
+        match (&shutdown, &joined, &removed) {
+            (Ok(()), Ok(_), Ok(())) => Ok(()),
+            _ => Err(std::io::Error::other(format!(
+                "fixture teardown: control shutdown={shutdown:?}; host join={joined:?}; directory removal={removed:?}"
+            ))),
+        }
     }
 }
 
@@ -247,10 +264,9 @@ fn run_on(
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // The actual parent host owns group retirement. Killing it first would bypass Held::drop.
-        self.control.shutdown(std::net::Shutdown::Both).expect("close the fixture controller");
-        self.child.wait().expect("join the host after its owned command retirement");
-        std::fs::remove_dir_all(&self.directory).expect("remove the fixture directory");
+        if let Err(error) = self.finish() {
+            eprintln!("host fixture cleanup failed: {error}");
+        }
     }
 }
 
@@ -306,21 +322,29 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-fn stop_fixture_jobs(host_pid: u32, leader: Option<i32>, descendant: Option<i32>) {
-    let host_pid = i32::try_from(host_pid).expect("host PID");
+fn stop_fixture_jobs(host_pid: u32, leader: Option<i32>, descendant: Option<i32>) -> std::io::Result<()> {
+    let host_pid = i32::try_from(host_pid).map_err(std::io::Error::other)?;
+    // SAFETY: read-only queries of the fixture host's and this test's process groups.
     let host_group = unsafe { libc::getpgid(host_pid) };
     let our_group = unsafe { libc::getpgrp() };
-    if let Some(pid) =
-        leader.filter(|pid| *pid > 0 && *pid != host_pid && *pid != host_group && *pid != our_group)
-    {
-        // SAFETY: never signal our group or the host's group.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let group = leader.filter(|pid| *pid > 0 && *pid != host_pid && *pid != host_group && *pid != our_group);
+    let descendant = descendant.filter(|pid| *pid > 0 && *pid != host_pid && pid.cast_unsigned() != std::process::id());
+    let mut failure = None;
+    for target in [group.map(|pid| -pid), descendant].into_iter().flatten() {
+        // SAFETY: the fixture's held job group or its independently reported descendant, never host/our group.
+        if unsafe { libc::kill(target, libc::SIGKILL) } == -1 {
+            let cause = std::io::Error::last_os_error();
+            if cause.raw_os_error() != Some(libc::ESRCH) {
+                failure = Some(std::io::Error::other(match failure {
+                    Some(prior) => format!("{prior}; kill({target}, SIGKILL): {cause}"),
+                    None => format!("kill({target}, SIGKILL): {cause}"),
+                }));
+            }
+        }
     }
-    if let Some(pid) =
-        descendant.filter(|pid| *pid > 0 && *pid != host_pid && *pid != std::process::id() as i32)
-    {
-        // A background child may have escaped its leader's group.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -333,13 +357,25 @@ struct ScriptJobGuard {
     child: Option<std::process::Child>,
 }
 
+impl ScriptJobGuard {
+    fn finish_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(mut child) = self.child.take() else { return Ok(None); };
+        match child.wait() {
+            Ok(status) => { self.armed = false; Ok(Some(status)) },
+            Err(error) => { self.child = Some(child); Err(error) },
+        }
+    }
+}
+
 impl Drop for ScriptJobGuard {
     fn drop(&mut self) {
         if self.armed {
-            stop_fixture_jobs(self.host_pid, Some(self.leader), Some(self.descendant));
+            if let Err(error) = stop_fixture_jobs(self.host_pid, Some(self.leader), Some(self.descendant)) {
+                eprintln!("script fixture group cleanup failed: {error}");
+            }
         }
-        if let Some(child) = &mut self.child {
-            child.wait().expect("reap only the guard's own child");
+        if let Err(error) = self.finish_child() {
+            eprintln!("script fixture owned-child reap failed: {error}");
         }
     }
 }
@@ -580,6 +616,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     job.armed = false;
     assert!(host.child.try_wait().expect("host status").is_none(), "the host is not in the job's group");
     assert_eq!(host.run(&text("printf again")).stdout, "again");
+    host.finish().expect("finish the successful host fixture");
 }
 
 /// The old null-signal oracle called an exited, unreaped child alive. The exit watch must not.
@@ -604,8 +641,7 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
     let exited = exit.within(Duration::ZERO).expect("zombie exit notification");
     #[cfg(target_os = "linux")]
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-    child.wait().expect("only the owner reaps this child, even when an oracle below fails");
-    owner.armed = false;
+    owner.finish_child().expect("join and consume the guard's owned child exactly once");
     assert!(!running, "the held child was running before EOF");
     assert!(matches!(status, ExitStatus::Exited { .. }), "the owned child actually exited: {status:?}");
     assert!(null_signal_reaches, "POSIX null signal succeeds on the owned unreaped zombie");
