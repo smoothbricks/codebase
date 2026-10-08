@@ -59,10 +59,10 @@
           }
         ],
         "outputs": [
-          "{workspaceRoot}/target/debug/cowshed-api-gen"
+          "{projectRoot}/.cache/api-generator"
         ],
         "options": {
-          "command": "cargo build --frozen -p cowshed-api-gen",
+          "command": "cargo build --frozen -p cowshed-api-gen -Z unstable-options --artifact-dir packages/cowshed/.cache/api-generator",
           "cwd": "{workspaceRoot}"
         }
       },
@@ -94,7 +94,7 @@
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs"
         ],
         "options": {
-          "command": "target/debug/cowshed-api-gen write packages/cowshed",
+          "command": "packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed",
           "cwd": "{workspaceRoot}"
         }
       },
@@ -124,7 +124,7 @@
           }
         ],
         "options": {
-          "command": "target/debug/cowshed-api-gen check packages/cowshed",
+          "command": "packages/cowshed/.cache/api-generator/cowshed-api-gen check packages/cowshed",
           "cwd": "{workspaceRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000

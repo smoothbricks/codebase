@@ -328,7 +328,7 @@ describe('canonical DTO generation', () => {
       expect(changed).not.toBe(original);
       writeFileSync(declaration, changed);
 
-      const generator = fileURLToPath(new URL('../../../target/debug/cowshed-api-gen', import.meta.url));
+      const generator = fileURLToPath(new URL('../.cache/api-generator/cowshed-api-gen', import.meta.url));
       const generated = spawnSync(generator, ['write', scratch], { encoding: 'utf8' });
       if (generated.status !== 0) {
         throw new Error(`API generator failed (${generated.status}): ${generated.stderr}`, { cause: generated.error });

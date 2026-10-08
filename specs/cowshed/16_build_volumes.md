@@ -700,6 +700,9 @@ workspace root.
   real directory, which silently detaches the checkout from its build volume; declaring the link itself as an output
   caches the symlink, not the bytes, so a hit restores nothing. Task outputs belong on the source volume (`dist/`,
   `.cache/<tool>/`), where the source image carries them to forks.
+- The API generator is published directly by Cargo's artifact directory into `packages/cowshed/.cache/api-generator`. Nx
+  caches that source-owned directory; generation, drift checks and the executed DTO/validator regression invoke that
+  published binary, never a borrowed executable under `target/`.
 - **Enforced by**: the consuming repository's Nx lint calls the plugin's `refuseOutputsUnderBuildState` validator with
   its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
   root. A refusal names the target, output, and build-state path. Job admission and `cowshed doctor` never construct an
