@@ -60,6 +60,10 @@ const NOT_YET_UPSTREAM = [
     'start at most one daemon per workspace, and never close a socket another daemon bound (`startServer`)',
   ],
   [
+    'daemon workspace identity',
+    'ignore redundant trailing root separators without weakening foreign-workspace refusal or losing POSIX/drive/UNC roots',
+  ],
+  [
     'foreign environment',
     'refuse any command whose `NX_*` root, data, cache or socket directory names another workspace than the cwd\u2019s',
   ],

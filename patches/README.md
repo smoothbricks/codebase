@@ -19,6 +19,18 @@ The registry override and lockfile remain publication records, not claims that a
 acceptance measures the actual resolved package and graph; the served-byte verification and pin remain a later release
 boundary. Library source links retain the consumer's dependency-scoped input contract.
 
+## Canonical daemon workspace roots
+
+The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make
+a workspace foreign to itself, but a different workspace remains refused. The normalizer trims only past the path's
+root: POSIX `/`, Windows drive roots and UNC share roots remain absolute, Windows case/separator rules remain intact,
+and POSIX case and backslash filename components retain their meaning.
+
+`nx-daemon-root-normalization.test.ts` consumes the declared patched artifact. It checks both platform rules and drives
+an actual owned daemon RPC with the same root's trailing separator, then a genuinely foreign root, and verifies the
+daemon remains available to its own workspace. No caller root override, shared-socket allowance or namespace workaround
+replaces the guard. Drop this hunk only when upstream contains the same normalization, retaining the regression.
+
 ## Requested task closure after dummy normalization
 
 The `create-task-graph` hunk retains only the caller's initial tasks and the tasks reachable from them through the
