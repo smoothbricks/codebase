@@ -9,11 +9,12 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
 > termination. Core job resource samples, terminal persistence and keyed admission/lookup are implemented, and periodic
 > progress subscriptions stream over the controller and through N-API. Controller and N-API operation bindings derive
-> from one API declaration, group-owned TCP-listener queries among them. Attachment stdin EOF remains unbuilt; Rust
-> attachment writes exist. The process-group ownership ledger identifies groups for sampling and termination. Complete
-> fork/exec tree observation, per-process usage and blocker samples, process event streams, CPU-winning leaf identity,
-> and process/job resource spans are unbuilt as well. Complete cgroup job totals, charged-memory measurements,
-> event-source coverage/overhead measurement and unattributed-usage reconciliation are unbuilt too.
+> from one API declaration, group-owned TCP-listener queries among them. Explicit Open stdin, bounded delivered-byte
+> writes and exactly-once EOF are implemented in Rust and through the generated N-API attachment input view. The
+> process-group ownership ledger identifies groups for sampling and termination. Complete fork/exec tree observation,
+> per-process usage and blocker samples, process event streams, CPU-winning leaf identity, and process/job resource
+> spans are unbuilt as well. Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead
+> measurement and unattributed-usage reconciliation are unbuilt too.
 
 ## Shell activation and process reuse
 
@@ -278,10 +279,12 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   duration, output limit and both streams — for any job of the incarnation that has one, including a job an earlier
   supervisor ran and sealed, and `logRead` reads such a job's sealed streams from any offset as it reads its own
   terminal jobs'.
-- **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file the supervisor opens
-  inside the sandbox boundary, or a stream: the client forwards its source as `streamChunk` calls in order, each
-  answered only once the job's bounded queue took it, and ends it with `streamEnd`, naming the source's error if it
-  failed. Bytes are never interpolated into shell text.
+- **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file opened inside the
+  sandbox, a reader-backed stream, or explicit `open` with no reader or automatic EOF. A reader's `streamChunk` calls
+  enter its bounded source channel in order and `streamEnd` names clean EOF or the source error. Attachment `stdinWrite`
+  carries a byte offset and answers only after its frame is fully written to the child's pipe; `stdinClose` waits for
+  all accepted writes, then sends one EOF. Admission to a source channel is not the delivered cursor. Bytes are never
+  interpolated into shell text.
 - **stdout/stderr** — `logRead` returns the bytes of one stream from an offset, following (waiting for the next bytes)
   when asked. Capture begins in a bounded in-memory buffer while SHA-256 and the combined quota advance over the exact
   admitted bytes; a stream promotes lazily to a protected file when it exceeds the inline bound or when backgrounding,
@@ -485,10 +488,16 @@ job's process group. It includes listening children, supports IPv4 and IPv6, and
 unrelated host process for readiness. The supervisor reads kernel socket ownership through the same birth-identity fence
 as group sampling; a failed ownership read is a typed error, not an empty census.
 
-An attachment's stdin supports bounded raw-byte writes with backpressure and explicit EOF, through
-`JobStdin::write`/`close` in Rust and `JobAttachment.write`/`end` in N-API. EOF is sent exactly once; later writes
-refuse, and repeated EOF is idempotent. Closing stdin, detaching a reader, and cancelling the process group are distinct
-operations. Neither stdin EOF nor a closed attachment stream silently kills the job.
+Explicit Open admission keeps stdin available without starting a reader. `JobStdin::write` / `close` in Rust and the
+generated N-API `JobAttachment.write` / `end` preserve arbitrary binary views, at most 64 KiB per wire frame, with
+delivery backpressure. The cursor is the known fully-written prefix, never merely queued bytes; its accepted end is
+retained once, not recalculated by scanning the lane. Closing waits even when the pump owns an unfinished write and the
+channel slot is free. EOF is sent once, repeated EOF is idempotent, and later writes refuse.
+
+Offset replay delivers no bytes twice: equal retained ranges are acknowledged, unequal ranges are typed conflicts, and a
+range outside retained evidence is explicitly unprovable. If the pipe fails partway, `DeliveryUnknown` names the last
+known cursor and is not safe to retry; every later input operation preserves that refusal. Closing stdin, detaching a
+view and cancelling the process group remain distinct. Neither EOF nor detachment silently kills the job.
 
 ### Exec records, stream storage, and tiered authority
 

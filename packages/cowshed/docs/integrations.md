@@ -126,11 +126,11 @@ allowing the job to continue.
 
 ### Structured stdin
 
-`ExecRequest` stdin is typed as none, inline binary or a streamed byte source, or a workspace-relative file. File input
-is not shell text: the supervisor resolves it beneath the workspace, opens it without following symlinks, and streams it
-with backpressure. EOF closes the child's stdin; cancellation closes the source and participates in the job's normal
-cancellation/termination path. Job metadata records the stdin source kind and byte count, never the input content. No
-variant interpolates a filename into a shell command.
+`ExecRequest` stdin is typed as none, inline bytes, a Rust streamed source, a workspace-relative file, or explicit Open.
+The N-API spelling `stdin: { kind: "open" }` binds no reader and sends no automatic EOF. File input resolves beneath the
+workspace without following symlinks and streams with backpressure; no filename is interpolated into shell text.
+Metadata records kind, known delivered-byte count and completion, never input content. EOF, source cancellation and
+explicit process-group cancellation are separate actions.
 
 ### Script jobs
 
@@ -238,7 +238,9 @@ Both runtimes receive the same typed `CowshedError` with stable kebab-case `code
 `hint`. Workspace and grant DTOs are serialized directly from cowshed-core and Typia-validated by the TypeScript facade.
 Keyed refusal details are native objects generated from that same declaration: `CowshedError.admission` distinguishes
 changed request fields, an already-bound stdin reader, and unreadable keyed history. No message parsing or JSON-string
-cause conversion is involved.
+cause conversion is involved. `CowshedError.stdin` likewise carries the generated canonical refusal object, including
+the delivered cursor and `deliveryUnknown` without safe-retry metadata; the underlying native cause retains the same
+typed details.
 
 The addon exposes coordinator lifecycle operations, workspace exec and named sessions, numeric and keyed job lookup,
 `status()`, `resources()`, `wait()`, `kill()`, `detach()`, `logs({ stream, offset, follow })`, bounded
@@ -253,16 +255,27 @@ running-command tail.
 status result. Before the job owns a process it reports the typed not-ready conflict; once the job ends it returns the
 same frozen sample its terminal record carries.
 
+`job.attach({ cursor? })` returns the implemented attachment input view. `write(Uint8Array)` preserves a subview's byte
+offset and length, snapshots that supplied view once for the runtime-thread handoff, and awaits bounded 64 KiB frames
+actually written to the child's pipe. `end()` waits for all accepted writes and sends one idempotent EOF; later writes
+are typed conflicts. `detach()` leaves the job running. The core owns the only cursor; input merely admitted to a queue
+is not reported delivered. `worker.jobByKey(key)` can recover the handle used for this attachment.
+
+The acceptance boundaries are explicit: the actual addon and core client over a scripted controller prove 4 MiB binary
+framing, per-frame backpressure, EOF and typed causes; an independent real supervisor with a real child and pipe proves
+byte-identical delivery, known cursors, pending-write drain and EOF without cancellation. The full real-host N-API
+monitoring fixture is separate work.
+
 ### Implementation status — monitoring gaps
 
 Core job resource samples and terminal persistence, controller cursor-addressed bounded tails, and keyed admission and
 lookup are implemented. Periodic progress samples stream over the controller and through the generated N-API adapter.
-Resumable N-API raw-byte streams, full attachment stdio/EOF and `AbortSignal` plumbing remain unbuilt. The Rust core
-supports numeric and keyed reattachment and attachment stdin writes; its `JobStdin` still has no explicit close
-operation on main, and the addon does not yet expose attachment. One-use worker descriptor connection is also unbuilt.
-Fork/exec tree observations, per-process CPU/RSS/I/O and blocker facts, typed process event streams, CPU-winning leaf
-identity, and their `process.run`/job spans are also unbuilt. Complete cgroup job totals, separate charged-memory
-counters, measured fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt as well.
+Open stdin and generated N-API attachment input `write` / `end` / `detach` are implemented. Resumable N-API raw-byte
+output iterables, full attachment output stdio and `AbortSignal` plumbing remain unbuilt; existing raw log chunks and
+cursor tails are unchanged. One-use worker descriptor connection is also unbuilt. Fork/exec tree observations,
+per-process CPU/RSS/I/O and blocker facts, typed process event streams, CPU-winning leaf identity, and their
+`process.run`/job spans are also unbuilt. Complete cgroup job totals, separate charged-memory counters, measured
+fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt as well.
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.

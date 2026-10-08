@@ -10,13 +10,13 @@ with identical semantics and error taxonomy.
 > implemented, and `progress` streams samples over the controller and through N-API as an `AsyncIterable`. Controller
 > request/result codecs, TypeScript types and validators, and N-API operation bindings derive from one Rust API
 > declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
-> `job.listeningPorts`; backpressured byte-stream iterables for logs and attachments, attachment stdin EOF, and abort
-> plumbing remain separate implementation work. Core attachment stdin writes exist, but `JobStdin` has no close
-> operation on main yet. Complete fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process
-> event streams, leaf-work identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The
-> ownership ledger identifies groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2
-> accounting, measured Linux fork/exec event-source selection, macOS exit observation and rusage reconciliation,
-> charged-memory counters, and explicit unattributed-usage rows are also unbuilt.
+> `job.listeningPorts`. Rust stdin `write`/`close` and generated N-API attachment `write`/`end` are implemented.
+> Backpressured byte-stream iterables for logs and attachment output, and abort plumbing remain separate work. Complete
+> fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work
+> identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies
+> groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux
+> fork/exec event-source selection, macOS exit observation and rusage reconciliation, charged-memory counters, and
+> explicit unattributed-usage rows are also unbuilt.
 
 ## Authority model (frozen)
 
@@ -157,20 +157,21 @@ pub struct OutputPublication {
 }
 pub enum PublicationPolicy { CreateNew, Replace }
 
-/// Binary stdin without shell interpolation. N-API projects Inline as Uint8Array/Buffer,
-/// Stream as a backpressured readable, and WorkspaceFile as a relative path object.
+/// Binary stdin without shell interpolation. Inline crosses N-API as a byte view; Open as
+/// `{ kind: "open" }`, with no reader or automatic EOF. Stream is a Rust backpressured reader.
 pub enum StdinSource {
     Empty,
     Inline(Bytes),
     Stream(Pin<Box<dyn AsyncRead + Send>>),
     WorkspaceFile(WorkspacePath),
+    Open,
 }
 
 pub struct StdinInfo {
     pub kind: StdinKind,                 // empty | inline | stream | workspace-file
-    pub bytes: u64,                      // bytes successfully delivered before EOF/cancellation
+    pub bytes: u64,                      // last known fully-written byte in the child's stdin pipe
     pub workspace_path: Option<WorkspacePath>, // normalized relative path; never host-absolute
-    pub complete: bool,                  // true only after clean source EOF reached child stdin
+    pub complete: bool,                  // clean EOF sent once all accepted writes drained
 }
 
 /// Raw UTF-8 spelling, 1..=4096 bytes; AdmissionKey::new enforces the invariant. Never hashed.
@@ -832,11 +833,24 @@ workspace's one private namespace (04_sandbox.md). macOS reads each socket descr
 (`PROC_PIDFDSOCKETINFO`) and keeps TCP sockets in `TSI_S_LISTEN`. A job that has not yet owned a process is a conflict;
 an ended job's group answers what its ended group still holds, normally nothing.
 
-Attachment stdin is the same bounded, backpressured raw-byte lane as exec stdin, not text interpolated into the command.
-`JobStdin.write` waits until its chunk is admitted to the job's input queue; `close()` sends EOF exactly once and is
-idempotent. Writes after EOF are a typed conflict. The N-API attachment projects these as `write()` and `end()`, without
-buffering the whole input. Detaching the attachment or closing its output iterator does not kill the job; explicit input
-EOF and job cancellation remain different operations.
+Attachment stdin uses the same bounded raw-byte lane as exec stdin. Explicit `StdinSource::Open` / wire
+`{ kind: "open" }` admits no reader and sends no automatic EOF; its metadata kind is `stream`. `JobStdin.write` splits
+input into at most 64 KiB raw frames and awaits each complete write to the child's pipe, not merely admission to a
+channel. The delivered cursor advances only over those complete writes. The accepted boundary is the already-checked end
+retained at acceptance; moving bytes through the queue, lane and pipe does not recompute it.
+
+`close()` waits for every accepted write, including one the pump owns while its channel slot is free, then sends one
+EOF. Repeated close is idempotent and subsequent writes return a typed conflict. A full-range replay is acknowledged
+without redelivery only when retained bytes prove it identical; mismatched or older, unprovable input is an explicit
+refusal. A partial pump failure returns `stdin: { reason: "deliveryUnknown", cursor }`, naming the last known delivered
+prefix, with no safe-retry metadata. No later write or close disguises that uncertainty.
+
+The public N-API `job.attach({ cursor? })` returns an input view whose `write(Uint8Array)`, `end()` and `detach()`
+project the core's stateful capability methods through the generator, without a second cursor implementation. Each
+JavaScript write preserves its view's byte offset and length and snapshots that supplied view once before the
+runtime-thread handoff; its bounded frames then await delivery. Full attachment output iterables remain separate work:
+the existing `job.logs` raw chunks and cursor tails continue to read output. EOF, detachment and process-group
+cancellation are distinct; neither EOF nor a dropped attachment kills the job.
 
 ### Process-tree observations
 
@@ -1075,6 +1089,11 @@ identified by its SHA-256 and length, a workspace file by its path, and a stream
 Named sessions compare by name; unnamed sessions carry a distinct UUID, including across supervisor restart. The command
 remains the record's own, not a second copy inside admission metadata.
 
+Open remains distinct from Stream on the wire and has no live reader, while its durable stdin identity uses the existing
+stream kind. A repeated keyed Open answers the same job before or after termination, starts no reader and sends no EOF.
+Only a repeat that actually supplies a Stream reader receives `StdinBound`; `jobByKey` can recover the handle used to
+attach and write.
+
 A repeated exec with the same key and request answers the existing job and spawns nothing. A changed request is a typed
 `Conflict`, `admission: { reason: "keyConflict", jobId, fields }`. The first stream admission binds its reader; a repeat
 carrying another reader returns typed `Usage`, `stdin already bound to job N; attach to write`, with
@@ -1242,12 +1261,13 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
     pub fn fence_source(&self) -> Option<&FenceRefusal>;
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
+    pub fn stdin_source(&self) -> Option<StdinRefusal>;
 }
 
 pub enum ErrorCode {
