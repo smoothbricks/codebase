@@ -5,6 +5,20 @@ Patches this repository applies to its dependencies. `bun install` applies the r
 and packs the result as an immutable GitHub release, which the root `overrides.nx` installs. The Patched Nx workflow
 builds that release twice, byte for byte, and verifies the published asset against `bun.lock`.
 
+## Local package activation
+
+Local dogfood does not wait for publication. Build `@smoothbricks/codebase:patched-nx` and `nx-plugin:build`, then
+register the actual packages with `bun link --cwd .cache/patched-nx/package` and `bun link --cwd packages/nx-plugin`.
+The root's maintained `smoo.developerLinks.nx` selects that generated package;
+`bun tooling/direnv/setup-environment.ts --links` applies the declaration after installation. This explicit local choice
+is necessary while the registry override still selects the previous served release. A sibling consumer declares the
+generated package's path relative to its main checkout and the plugin's ordinary package path through the same
+maintained developer-link boundary.
+
+The registry override and lockfile remain publication records, not claims that a local package was published. Local
+acceptance measures the actual resolved package and graph; the served-byte verification and pin remain a later release
+boundary. Library source links retain the consumer's dependency-scoped input contract.
+
 ## Requested task closure after dummy normalization
 
 The `create-task-graph` hunk retains only the caller's initial tasks and the tasks reachable from them through the
@@ -18,8 +32,9 @@ tasks, genuine producer edges, continuous-only dependencies and real task cycles
 `nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership against the package extracted from the
 actual tarball produced by `@smoothbricks/codebase:patched-nx`. Every test shard and test typecheck depends on that
 producer and hashes its output bytes, so a source gate tests the current patch before its public release is installed.
-The installed dependency and its frozen lock remain unchanged until the served release is pinned. Drop each carried hunk
-only when the installed upstream version contains its respective repair, retaining the regressions.
+The registry dependency and its frozen lock remain unchanged until the served release is pinned; the maintained local
+package declaration may select the generated product before then. Drop each carried hunk only when the installed
+upstream version contains its respective repair, retaining the regressions.
 
 ## Upstream PR draft: Nx `findCycles`
 

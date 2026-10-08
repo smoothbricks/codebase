@@ -159,6 +159,9 @@
         "nixos-latest-x64",
         "self-hosted"
       ]
+    },
+    "developerLinks": {
+      "nx": ".cache/patched-nx/package"
     }
   }
 }
