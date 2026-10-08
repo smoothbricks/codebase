@@ -177,6 +177,21 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
+The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
+runs from the ordinary runner through a passwordless-sudo delegated scope; only its parent prepares and cleans up a
+test-owned ext4 image on a declared root-only loop device. Delegation of cgroupfs does not confer mount authority. The
+fixture records actual role credentials, capabilities, namespace and kernel and consumes only the runner's narrow ext4
+mount mediation. A missing device or refused mount fails explicitly, never skips or substitutes a tmpfs page-cache
+claim. Its ordinary controller must be denied device control. Kernel mount ID/device/backing identity is observed even
+on a mount command error; unmount is reconciled against kernel state before removing the image. Explicit cleanup returns
+release and diagnostic-write failures, while destructor fallback remains non-panicking and attempts every safe owned
+release step. Its fallible stderr/stdout reporting cannot guarantee delivery when both channels are unavailable.
+Unmount, association absence and image/directory removal are verified after successful workloads, refused-command unwind
+before/after mounting, and setup failure after actual mount acquisition. Held CPU/RSS/I/O controls require the sole
+retained parent and every stated proc counter; missing observations fail rather than becoming zero. CPU comparisons use
+the selected child's complete `wait4` lifetime, not a pre-exit self-report; cache/I/O assertions compare direct counters
+and retain their isolation, allocation/cache-hit and kernel-terminal empty-census negative controls.
+
 Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
 one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the user's template stay under `/private/tmp`
 whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease; a clone
