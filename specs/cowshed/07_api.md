@@ -1066,14 +1066,15 @@ The fixture compares `memory.current`/`memory.peak` with direct reads and verifi
 shmem using `memory.stat`'s `file - shmem`. Direct-I/O workloads require exact independent `io.stat` parity, excluding
 cached reads, unrelated jobs and volume-allocation proxies. `/proc/pid/io` includes waited-for children, so the missing
 live-process control runs after the complete tree is reaped, alongside retained terminal counters. Allocation and
-deletion metadata are flushed at the held/terminal boundaries without timing waits. CPU comparisons collect each
-selected child's full `wait4` lifetime; a pre-report sample cannot include its report and process teardown. Unavailable
-loop/mount authority remains a failure, never a skip or permission widening. Tmpfs can measure anonymous/shmem charging
-only: it does not prove regular-file page-cache or storage-I/O attribution. At the held boundary, each live-process
-control requires the directly owned, unreaped parent to be the sole cgroup member and reads every stated counter.
-Unavailable membership, unreadable proc records or absent CPU/RSS/I/O keys fail the observation rather than becoming a
-zero-valued proxy; both proc I/O byte keys are required. Terminal census zero is accepted only after kernel terminal
-evidence and an independently read empty membership.
+deletion metadata are flushed at the held/terminal boundaries without timing waits. Each direct-I/O workload
+synchronizes its parent directory after unlink, before the child can be reaped and its parent can report held readiness.
+CPU comparisons collect each selected child's full `wait4` lifetime; a pre-report sample cannot include its report and
+process teardown. Unavailable loop/mount authority remains a failure, never a skip or permission widening. Tmpfs can
+measure anonymous/shmem charging only: it does not prove regular-file page-cache or storage-I/O attribution. At the held
+boundary, each live-process control requires the directly owned, unreaped parent to be the sole cgroup member and reads
+every stated counter. Unavailable membership, unreadable proc records or absent CPU/RSS/I/O keys fail the observation
+rather than becoming a zero-valued proxy; both proc I/O byte keys are required. Terminal census zero is accepted only
+after kernel terminal evidence and an independently read empty membership.
 
 The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
 through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same

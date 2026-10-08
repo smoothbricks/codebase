@@ -276,6 +276,10 @@ fn work(workload: &Workload) {
     if let Some((path, write, read)) = &workload.direct_io {
         uncached_io(path, *write, *read);
         std::fs::remove_file(path).expect("remove the direct I/O file");
+        // Flush unlink metadata before this child can be reaped and its parent can report HELD.
+        std::fs::File::open(path.parent().expect("direct I/O file directory"))
+            .and_then(|directory| directory.sync_all())
+            .expect("flush the direct I/O deletion metadata");
     }
     if let Some(path) = &workload.cached_read {
         read_through_cache(path);
