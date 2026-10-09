@@ -9,11 +9,13 @@
 use crate::meta::SlotMetaView;
 use columine_types::types::ErrorCode;
 
-/// Reusable paid erase plan and physical ranges for successive container calls.
+/// Physical ranges for successive container erases. A hash-table, array or
+/// condition-tree erase names a fixed number of ranges, held inline; only a
+/// bitmap removal's payload ranges vary with the patch.
 #[derive(Debug, Default)]
 pub struct EraseScratch {
-    pub plan: crate::hash_table::ErasePlan,
-    pub ranges: Vec<(u32, u32)>,
+    pub ranges: crate::hash_table::EraseRanges,
+    pub payload_ranges: Vec<(u32, u32)>,
 }
 
 /// TTL physical authority for a combined family mutation. Only the live

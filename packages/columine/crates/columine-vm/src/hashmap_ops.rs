@@ -296,7 +296,6 @@ pub fn batch_map_remove(
     }
     let mut scratch = hooks.take_erase_scratch();
     let result = (|| {
-        let plan = &mut scratch.plan;
         let ranges = &mut scratch.ranges;
         for &key in keys {
             let Some(pos) = tbl.find(state, key) else {
@@ -304,15 +303,10 @@ pub fn batch_map_remove(
             };
 
             ranges.clear();
-            let reserved = match tbl
-                .plan_erase_at(state, pos, plan)
-                .and_then(|()| tbl.erase_ranges(plan, ranges))
-            {
-                Ok(reserved) => reserved,
-                Err(error) => return error,
-            };
+            let erase = tbl.plan_erase_at(state, pos);
+            tbl.erase_ranges(&erase, ranges);
             if has_ts {
-                plan.for_each_destination_run(|start, len| {
+                erase.for_each_destination_run(|start, len| {
                     ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
                 });
             }
@@ -331,25 +325,22 @@ pub fn batch_map_remove(
                 None
             };
             if let Some(plan) = &ttl_plan {
-                ranges.extend_from_slice(plan.ranges());
+                for &range in plan.ranges() {
+                    ranges.push(range);
+                }
             }
-            debug_assert_eq!(
-                ranges.capacity(),
-                reserved,
-                "erase capture ranges grew past their reservation"
-            );
-            let capture = match hooks.begin_capture(state, ranges) {
+            let capture = match hooks.begin_capture(state, ranges.as_slice()) {
                 Ok(capture) => capture,
                 Err(error) => return error,
             };
-            erase_slot_map_planned(state, meta, &tbl, plan);
+            erase_slot_map_planned(state, meta, &tbl, &erase);
             let size = tbl.size(state);
             tbl.set_size(state, size - 1);
             meta.set_change_flag(state, ChangeFlag::REMOVED);
             if let Some(plan) = ttl_plan {
                 hooks.consume_ttl_batch_plan(state, meta, plan);
             }
-            hooks.finish_capture(delta_mode, state, ranges, capture);
+            hooks.finish_capture(delta_mode, state, ranges.as_slice(), capture);
         }
         ErrorCode::Ok
     })();

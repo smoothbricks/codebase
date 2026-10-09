@@ -70,23 +70,21 @@ pub struct Probe {
     pub found: bool,
 }
 
-/// Ranges an erase's caller appends after the lane runs: size, change flag
-/// and the two TTL capture ranges.
-const ERASE_CALLER_RANGES: usize = 4;
+/// Most capture ranges one erase names: two runs (a wrap splits one) for
+/// each of the key, entry and timestamp lanes, then size, change flag and
+/// the two TTL capture ranges.
+pub const ERASE_MAX_RANGES: usize = 10;
 
-/// Retained backward-shift destinations for one erase. A batch reuses this
-/// allocation; capture and mutation consume the same plan without re-probing.
-#[derive(Debug, Default)]
+/// One backward-shift erase, planned before any byte changes: the cell the
+/// erased key vacates and the last cell the shift vacates. Every cell the
+/// erase changes lies in `hole..=tail` (wrapping), so an erase is captured by
+/// a fixed number of ranges and needs no storage proportional to its probe
+/// cluster.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ErasePlan {
-    shifts: Vec<EraseShift>,
+    hole: u32,
     tail: u32,
-}
-
-#[derive(Debug)]
-struct EraseShift {
-    from: u32,
-    to: u32,
-    key: u32,
+    cap: u32,
 }
 
 impl ErasePlan {
@@ -94,24 +92,52 @@ impl ErasePlan {
         self.tail
     }
 
-    /// Emit only cells overwritten by a shift or cleared at the final hole.
-    /// Adjacent cells coalesce; wrapping produces two distinct ranges.
+    /// The cells `hole..=tail` as at most two runs: one, or two when the
+    /// span wraps past the table's end.
     pub fn for_each_destination_run(&self, mut visit: impl FnMut(u32, u32)) {
-        let mut positions = self.shifts.iter().map(|shift| shift.to).chain([self.tail]);
-        let Some(mut start) = positions.next() else {
-            return;
-        };
-        let mut end = start + 1;
-        for pos in positions {
-            if pos == end {
-                end += 1;
-            } else {
-                visit(start, end - start);
-                start = pos;
-                end = pos + 1;
-            }
+        if self.tail >= self.hole {
+            visit(self.hole, self.tail - self.hole + 1);
+        } else {
+            visit(self.hole, self.cap - self.hole);
+            visit(0, self.tail + 1);
         }
-        visit(start, end - start);
+    }
+}
+
+/// The capture ranges of one erase, held inline: an erase never allocates.
+#[derive(Debug)]
+pub struct EraseRanges {
+    cells: [(u32, u32); ERASE_MAX_RANGES],
+    len: usize,
+}
+
+impl Default for EraseRanges {
+    fn default() -> Self {
+        Self {
+            cells: [(0, 0); ERASE_MAX_RANGES],
+            len: 0,
+        }
+    }
+}
+
+impl EraseRanges {
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Append one range. An erase names at most [`ERASE_MAX_RANGES`]; more
+    /// is a caller bug, not an operational state.
+    pub fn push(&mut self, range: (u32, u32)) {
+        assert!(
+            self.len < ERASE_MAX_RANGES,
+            "an erase names at most ten ranges"
+        );
+        self.cells[self.len] = range;
+        self.len += 1;
+    }
+
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        &self.cells[..self.len]
     }
 }
 
@@ -453,19 +479,20 @@ impl FlatTable {
         Some(true)
     }
 
-    /// Derive the exact erase once, retaining keys and source/destination cells
-    /// before any bytes change. `plan` is reusable across a whole batch and
-    /// grows to the longest cluster it has planned; memory that cannot back
-    /// a shift refuses with `OutOfMemory` before this erase writes.
-    pub fn plan_erase_at(
-        &self,
-        state: &[u8],
-        mut hole: u32,
-        plan: &mut ErasePlan,
-    ) -> Result<(), ErrorCode> {
+    /// Whether the entry at `scan`, whose home is `home`, moves back into
+    /// `hole`: its probe distance from home reaches the hole.
+    fn shifts_back(&self, scan: u32, home: u32, hole: u32) -> bool {
+        let mask = self.cap - 1;
+        (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask)
+    }
+
+    /// Plan the erase of the key at `hole` before any bytes change: walk its
+    /// probe cluster to the last cell the backward shift vacates. Reads only;
+    /// [`Self::erase_planned`] repeats the same walk while writing.
+    pub fn plan_erase_at(&self, state: &[u8], mut hole: u32) -> ErasePlan {
         debug_assert!(self.cap.is_power_of_two());
         debug_assert!(self.key_at(state, hole) < TOMBSTONE);
-        plan.shifts.clear();
+        let first = hole;
         let mask = self.cap - 1;
         let mut scan = (hole + 1) & mask;
         loop {
@@ -473,40 +500,20 @@ impl FlatTable {
             if key == EMPTY_KEY {
                 break;
             }
-            let home = hash_key(key, self.cap);
-            if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
-                plan.shifts
-                    .try_reserve(1)
-                    .map_err(|_| ErrorCode::OutOfMemory)?;
-                plan.shifts.push(EraseShift {
-                    from: scan,
-                    to: hole,
-                    key,
-                });
+            if self.shifts_back(scan, hash_key(key, self.cap), hole) {
                 hole = scan;
             }
             scan = (scan + 1) & mask;
         }
-        plan.tail = hole;
-        Ok(())
+        ErasePlan {
+            hole: first,
+            tail: hole,
+            cap: self.cap,
+        }
     }
 
-    /// Append bounded key/value destination ranges for a retained erase.
-    /// Side lanes use the same destination runs, never a second cluster walk.
-    /// Reserves first for every range the erase's capture can name: the key
-    /// and entry lanes here, plus a caller's timestamp lane over the same
-    /// runs and its size, change-flag and two TTL ranges. Memory that cannot
-    /// back them refuses with `OutOfMemory` before this erase writes. Answers the
-    /// reserved capacity, which the caller's appends must not outgrow.
-    pub fn erase_ranges(
-        &self,
-        plan: &ErasePlan,
-        ranges: &mut Vec<(u32, u32)>,
-    ) -> Result<usize, ErrorCode> {
-        let runs = plan.shifts.len() + 1;
-        ranges
-            .try_reserve(3 * runs + ERASE_CALLER_RANGES)
-            .map_err(|_| ErrorCode::OutOfMemory)?;
+    /// Append the key and entry lanes' capture ranges for a planned erase.
+    pub fn erase_ranges(&self, plan: &ErasePlan, ranges: &mut EraseRanges) {
         plan.for_each_destination_run(|start, len| {
             ranges.push((self.keys_off + start * 4, len * 4));
             if self.entry_size != 0 {
@@ -516,7 +523,6 @@ impl FlatTable {
                 ));
             }
         });
-        Ok(ranges.capacity())
     }
 
     /// Apply a retained erase, moving a caller's side lane with each entry.
@@ -528,17 +534,28 @@ impl FlatTable {
         plan: &ErasePlan,
         mut moved: impl FnMut(&mut [u8], u32, u32),
     ) -> u32 {
-        for shift in &plan.shifts {
-            self.set_key_at(state, shift.to, shift.key);
-            if self.entry_size != 0 {
-                self.raw_entry_copy(
-                    state,
-                    self.entries_off + shift.from * self.entry_size,
-                    shift.to,
-                );
+        let mask = self.cap - 1;
+        let mut hole = plan.hole;
+        let mut scan = (hole + 1) & mask;
+        loop {
+            let key = self.key_at(state, scan);
+            if key == EMPTY_KEY {
+                break;
             }
-            moved(state, shift.from, shift.to);
+            if self.shifts_back(scan, hash_key(key, self.cap), hole) {
+                self.set_key_at(state, hole, key);
+                if self.entry_size != 0 {
+                    self.raw_entry_copy(state, self.entries_off + scan * self.entry_size, hole);
+                }
+                moved(state, scan, hole);
+                hole = scan;
+            }
+            scan = (scan + 1) & mask;
         }
+        debug_assert_eq!(
+            hole, plan.tail,
+            "the erase walked another cluster than it planned"
+        );
         self.set_key_at(state, plan.tail, EMPTY_KEY);
         let start = (self.entries_off + plan.tail * self.entry_size) as usize;
         state[start..start + self.entry_size as usize].fill(0);

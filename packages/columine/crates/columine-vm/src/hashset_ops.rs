@@ -136,7 +136,6 @@ pub fn batch_set_remove(
     }
     let mut scratch = hooks.take_erase_scratch();
     let result = (|| {
-        let plan = &mut scratch.plan;
         let ranges = &mut scratch.ranges;
         for &elem in elems {
             let Some(pos) = tbl.find(state, elem) else {
@@ -144,13 +143,8 @@ pub fn batch_set_remove(
             };
 
             ranges.clear();
-            let reserved = match tbl
-                .plan_erase_at(state, pos, plan)
-                .and_then(|()| tbl.erase_ranges(plan, ranges))
-            {
-                Ok(reserved) => reserved,
-                Err(error) => return error,
-            };
+            let erase = tbl.plan_erase_at(state, pos);
+            tbl.erase_ranges(&erase, ranges);
             ranges.push((tbl.size_off, 4));
             ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
             let ttl_plan = if meta.has_ttl() {
@@ -166,25 +160,22 @@ pub fn batch_set_remove(
                 None
             };
             if let Some(plan) = &ttl_plan {
-                ranges.extend_from_slice(plan.ranges());
+                for &range in plan.ranges() {
+                    ranges.push(range);
+                }
             }
-            debug_assert_eq!(
-                ranges.capacity(),
-                reserved,
-                "erase capture ranges grew past their reservation"
-            );
-            let capture = match hooks.begin_capture(state, ranges) {
+            let capture = match hooks.begin_capture(state, ranges.as_slice()) {
                 Ok(capture) => capture,
                 Err(error) => return error,
             };
-            tbl.erase_planned(state, plan, |_, _, _| {});
+            tbl.erase_planned(state, &erase, |_, _, _| {});
             let size = tbl.size(state);
             tbl.set_size(state, size - 1);
             meta.set_change_flag(state, ChangeFlag::REMOVED);
             if let Some(plan) = ttl_plan {
                 hooks.consume_ttl_batch_plan(state, meta, plan);
             }
-            hooks.finish_capture(delta_mode, state, ranges, capture);
+            hooks.finish_capture(delta_mode, state, ranges.as_slice(), capture);
         }
         ErrorCode::Ok
     })();

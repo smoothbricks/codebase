@@ -247,21 +247,20 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
     assert_eq!(OK, upsert(&mut vm, &mut grown, &prog, &[1, 2, 200]));
     assert_eq!(Some(2000), CheckedMap::bind(&grown, 0).unwrap().get(200));
 
-    // A removal plans its erase in storage it grows to demand: on a VM that
-    // has never erased, memory that cannot back the plan refuses it by name
-    // with nothing written, and the same removal runs once memory returns.
+    // An erase needs no working memory of its own: a VM that has never
+    // erased removes several keys, whatever their probe clusters, while every
+    // allocation fails, so a removal batch cannot stop after its first key.
     let mut fresh = Vm::default();
-    let before = grown.clone();
-    assert_eq!(
-        ErrorCode::OutOfMemory,
-        without_memory(|| fresh.map_remove(false, &mut grown, 0, &[200]))
-    );
-    assert_eq!(before, grown);
+    let removed: Vec<u32> = (1..=20).chain([200]).collect();
     assert_eq!(
         ErrorCode::Ok,
-        fresh.map_remove(false, &mut grown, 0, &[200])
+        without_memory(|| fresh.map_remove(false, &mut grown, 0, &removed))
     );
-    assert_eq!(None, CheckedMap::bind(&grown, 0).unwrap().get(200));
+    let map = CheckedMap::bind(&grown, 0).unwrap();
+    for key in removed {
+        assert_eq!(None, map.get(key), "key {key}");
+    }
+    assert_eq!(Some(1000), map.get(100));
 }
 
 // ---------------------------------------------------------------------------

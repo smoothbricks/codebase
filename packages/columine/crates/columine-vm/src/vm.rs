@@ -245,10 +245,11 @@ fn remove_entry_by_key(
     key: u32,
 ) -> Result<bool, ErrorCode> {
     let EraseScratch {
-        plan: mut erase,
         mut ranges,
+        mut payload_ranges,
     } = core::mem::take(&mut undo.erase_scratch);
     ranges.clear();
+    payload_ranges.clear();
     let result = (|| match meta.slot_type() {
         SlotType::HashMap | SlotType::HashSet => {
             let table = if meta.slot_type() == SlotType::HashMap {
@@ -259,25 +260,20 @@ fn remove_entry_by_key(
             let Some(position) = table.find(state, key) else {
                 return Ok(false);
             };
-            table.plan_erase_at(state, position, &mut erase)?;
-            let reserved = table.erase_ranges(&erase, &mut ranges)?;
+            let erase = table.plan_erase_at(state, position);
+            table.erase_ranges(&erase, &mut ranges);
             if meta.has_hashmap_timestamp_storage() {
                 erase.for_each_destination_run(|start, len| {
                     ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));
                 });
             }
-            debug_assert_eq!(
-                ranges.capacity(),
-                reserved,
-                "erase capture ranges grew past their reservation"
-            );
-            let capture = undo.begin_capture(state, &ranges)?;
+            let capture = undo.begin_capture(state, ranges.as_slice())?;
             if meta.slot_type() == SlotType::HashMap {
                 hashmap_ops::erase_slot_map_planned(state, meta, &table, &erase);
             } else {
                 table.erase_planned(state, &erase, |_, _, _| {});
             }
-            undo.finish_capture(delta_mode, state, &ranges, capture);
+            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
             Ok(true)
         }
         SlotType::Bitmap => {
@@ -290,7 +286,7 @@ fn remove_entry_by_key(
                     && tail_offset <= offset
                 {
                     bitmap_ops::push_payload_capture_range(
-                        &mut ranges,
+                        &mut payload_ranges,
                         storage.payload_offset(),
                         tail_offset,
                         tail_len,
@@ -298,7 +294,7 @@ fn remove_entry_by_key(
                     tail = None;
                 }
                 bitmap_ops::push_payload_capture_range(
-                    &mut ranges,
+                    &mut payload_ranges,
                     storage.payload_offset(),
                     offset,
                     len,
@@ -306,15 +302,15 @@ fn remove_entry_by_key(
             }
             if let Some((offset, len)) = tail {
                 bitmap_ops::push_payload_capture_range(
-                    &mut ranges,
+                    &mut payload_ranges,
                     storage.payload_offset(),
                     offset,
                     len,
                 )?;
             }
-            let capture = undo.begin_capture(prepared.state(), &ranges)?;
+            let capture = undo.begin_capture(prepared.state(), &payload_ranges)?;
             let (report, state) = prepared.apply_with_cleared_tail();
-            undo.finish_capture(delta_mode, state, &ranges, capture);
+            undo.finish_capture(delta_mode, state, &payload_ranges, capture);
             Ok(report.removed == 1)
         }
         SlotType::Array => {
@@ -336,18 +332,18 @@ fn remove_entry_by_key(
                 return Ok(false);
             }
             ranges.push((offset, 4));
-            let capture = undo.begin_capture(state, &ranges)?;
+            let capture = undo.begin_capture(state, ranges.as_slice())?;
             bytes::write_u32(state, offset, TOMBSTONE);
-            undo.finish_capture(delta_mode, state, &ranges, capture);
+            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
             Ok(true)
         }
         SlotType::ConditionTree => {
             ranges.push((meta.offset, 8));
-            let capture = undo.begin_capture(state, &ranges)?;
+            let capture = undo.begin_capture(state, ranges.as_slice())?;
             let generation = bytes::read_u32(state, meta.offset).wrapping_add(1);
             bytes::write_u32(state, meta.offset, generation);
             bytes::write_u32(state, meta.offset + 4, key);
-            undo.finish_capture(delta_mode, state, &ranges, capture);
+            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
             Ok(true)
         }
         SlotType::Aggregate
@@ -358,8 +354,8 @@ fn remove_entry_by_key(
         | SlotType::Nested => Ok(false),
     })();
     undo.erase_scratch = EraseScratch {
-        plan: erase,
         ranges,
+        payload_ranges,
     };
     result
 }
@@ -5684,6 +5680,7 @@ impl Vm {
         u.capture_ranges.clear();
         u.ttl_batch_scratch.reset();
         u.erase_scratch.ranges.clear();
+        u.erase_scratch.payload_ranges.clear();
         u.saved_change_flags.reserve(slots as usize + 1);
         u.saved_change_flags.clear();
         u.state_size = state_size;
