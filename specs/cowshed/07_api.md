@@ -633,6 +633,8 @@ is crossed. Accounting includes protected and in-flight bytes; the supervisor ad
 boundary, terminates the process group, drains pipes, seals artifacts, and only then publishes terminal state. Summaries
 remain a separate bounded diagnostic projection.
 
+Authorization, grant, and gateway audit authority remain controller-owned.
+
 The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
 inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
 subagent holding one cannot grant itself anything.
@@ -660,7 +662,9 @@ its captured-prefix hashes, while a new manifest validates its prefixes and own 
 digest. No manifest body or stream payload is copied into a second cache. Read and recovery failures retain their causes
 and never become `None`. Snapshot publication advances readable-job presence, immutable terminal rows, key authority,
 record identity and the validated manifest digest together. A checkpoint derives its manifest from that snapshot,
-independent of earlier read traffic.
+independent of earlier read traffic. A checkpoint makes this store's live prefixes durable before taking the records
+lock, then refreshes and joins their commitments with the current sealed rows. A live commitment wins for the same job;
+prefix I/O holds no cross-process records lock.
 
 Any unread layout can hold numeric job ids at or below its valid retained `records.job-floor`. A missing id above that
 floor is proven not to come from the unread store and reaches the ordinary missing-job error. With unread history but no
