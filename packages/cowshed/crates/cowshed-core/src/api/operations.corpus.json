@@ -16,7 +16,7 @@
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
   },
   "coordinator.rename": { "repoId": "acme/widget", "source": "feature", "destination": "renamed" },
-  "coordinator.adopt": { "repoId": "acme/widget", "options": { "quarantine": false } },
+  "coordinator.adopt": { "repoId": "acme/widget", "options": { "quarantine": false, "reAdopt": false } },
   "coordinator.create": {
     "repoId": "acme/widget",
     "workspace": "feature",

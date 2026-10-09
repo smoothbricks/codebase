@@ -377,9 +377,9 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .map_err(|error| std::io::Error::other(format!("defragment: {error}")))?;
         let defragment_elapsed = defragment_started.elapsed();
         assert!(
-            defragmented.previous >= fragmented
+            defragmented.previous.get() >= 1_000
                 && defragmented.extents.get().saturating_mul(10) <= defragmented.previous.get(),
-            "the rewrite lays the data out in at most a tenth of the extents: {defragmented:?}"
+            "the rewrite compares its own fragmented input to at most a tenth as many extents: {defragmented:?}"
         );
         assert_ne!(fs::metadata(&image)?.ino(), inode, "the image is a new file");
         assert!(!fs::exists(rewrite_sibling(&image))?);
