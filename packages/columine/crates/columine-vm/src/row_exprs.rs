@@ -160,6 +160,12 @@ pub struct RowColumns {
     /// Whether the last bind completed: a failed bind leaves partial cells
     /// that no splice may hand out as that bind's.
     bound: bool,
+    /// The row table the last bind evaluated, and where it sat in its
+    /// program. The cells, and which entries were deferred, are a function
+    /// of these bytes, so a resume is admitted only over the same table at
+    /// the same position.
+    table: Vec<u8>,
+    table_start: usize,
 }
 
 /// `live_index` value of a column no live entry targets.
@@ -199,6 +205,8 @@ impl RowColumns {
             type_col: 0,
             batch_len: 0,
             bound: false,
+            table: Vec::new(),
+            table_start: 0,
         }
     }
 
@@ -222,11 +230,12 @@ impl RowColumns {
     }
 
     /// Whether these are the cells of a completed bind of `program`'s table
-    /// over a batch of `batch_len` rows: the same type column, the same entry
-    /// targets in table order, and every deferred entry at the program range
-    /// this table holds it, so a live read indexes `program` exactly. A
-    /// batch with no rows binds nothing, and a program without a table needs
-    /// no bind.
+    /// over a batch of `batch_len` rows: the same table bytes at the same
+    /// program position. The targets, the type column, which entries were
+    /// deferred and the program ranges a live read indexes all follow from
+    /// those bytes, so a program of the same table shape with other
+    /// expressions is refused. A batch with no rows binds nothing, and a
+    /// program without a table needs no bind.
     fn bound_for(&self, program: &[u8], batch_len: u32) -> Result<(), ErrorCode> {
         let table = match row_table(program)? {
             None if self.targets.is_empty() => return Ok(()),
@@ -234,33 +243,11 @@ impl RowColumns {
             Some(table) if batch_len != 0 => table,
             _ => return Err(ErrorCode::InvalidProgram),
         };
-        let count = usize::from(bytes::read_u16(table, 4));
-        if !self.bound || self.batch_len != batch_len || self.targets.len() != count {
-            return Err(ErrorCode::InvalidProgram);
-        }
-        let mut header = Operands::at(table, TABLE_FIXED_BYTES);
-        if header.index() != Some(self.type_col) {
-            return Err(ErrorCode::InvalidProgram);
-        }
-        let table_start = program.len() - table.len();
-        let mut pos = header.pos();
-        let mut live = 0usize;
-        for &target in &self.targets {
-            let entry = parse_entry(table, &mut pos)?;
-            if entry.target_col != target {
-                return Err(ErrorCode::InvalidProgram);
-            }
-            if let Some(index) = self.live_entry(target) {
-                let deferred = self.live[index];
-                if deferred.match_ids != entry.match_ids_at.shifted(table_start)
-                    || deferred.expr != entry.expr_at.shifted(table_start)
-                {
-                    return Err(ErrorCode::InvalidProgram);
-                }
-                live += 1;
-            }
-        }
-        if live != self.live.len() {
+        if !self.bound
+            || self.batch_len != batch_len
+            || self.table_start != program.len() - table.len()
+            || self.table != table
+        {
             return Err(ErrorCode::InvalidProgram);
         }
         Ok(())
@@ -488,6 +475,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     out.targets.clear();
     out.clear_live();
     out.bound = false;
+    out.table.clear();
     let Some(table) = row_table(program)? else {
         out.bound = true;
         return Ok(LiveColumns {
@@ -515,6 +503,11 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // The table is the program's tail: a table offset plus this is a
     // program offset, which is what the live reads index.
     let table_start = program.len() - table.len();
+    out.table
+        .try_reserve(table.len())
+        .map_err(|_| ErrorCode::OutOfMemory)?;
+    out.table.extend_from_slice(table);
+    out.table_start = table_start;
     out.cells.resize_with(count, Vec::new);
     out.targets.resize(count, 0);
     out.type_col = type_col;

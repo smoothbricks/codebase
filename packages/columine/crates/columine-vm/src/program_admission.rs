@@ -512,15 +512,15 @@ mod tests {
     /// The type the FOR_EACH selects; only the derived column carries it.
     const FOR_EACH_TYPE: u8 = 7;
 
-    /// `[k]`: the constant `k` for every matched row, bound up front.
-    /// `[k, 0]`: `k` plus the state's first byte, a live read evaluated at
-    /// the row against the state as it then stands.
+    /// `[k]` and `[k, 1]`: the constant `k` for every matched row, bound up
+    /// front. `[k, 0]`: `k` plus the state's first byte, a live read
+    /// evaluated at the row against the state as it then stands.
     struct Constant;
 
     impl RowExpression for Constant {
         fn admit(&mut self, expr: &[u8], _: &BatchView<'_>) -> Result<Binding, ErrorCode> {
             match expr {
-                [_] => Ok(Binding::Bound),
+                [_] | [_, 1] => Ok(Binding::Bound),
                 [_, 0] => Ok(Binding::Live),
                 _ => Err(ErrorCode::InvalidProgram),
             }
@@ -528,7 +528,12 @@ mod tests {
 
         fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, _: u32) -> Result<u32, ErrorCode> {
             let state = batch.state.first().copied().unwrap_or(0);
-            Ok(u32::from(expr[0]) + if expr.len() == 2 { u32::from(state) } else { 0 })
+            Ok(u32::from(expr[0])
+                + if expr == [expr[0], 0] {
+                    u32::from(state)
+                } else {
+                    0
+                })
         }
     }
 
@@ -947,6 +952,43 @@ mod tests {
             ),
             refused,
             "a live entry at another range"
+        );
+
+        // A program of the same table shape whose entry on `LIVE` binds up
+        // front: its bind recorded no live entry, so resuming the live
+        // program over it would read the bound cell where a live read
+        // belongs.
+        let bound_split = admitted_with(&[
+            (DERIVED, EVENT, &[FOR_EACH_TYPE]),
+            (LIVE, EVENT + 1, &[3, 1]),
+        ]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            bound_split.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| 0,
+            ),
+            Ok(0)
+        );
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            live.execute_spliced(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never
+            ),
+            refused,
+            "another program's split of the same table shape"
         );
     }
 }
