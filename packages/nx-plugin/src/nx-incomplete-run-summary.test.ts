@@ -22,7 +22,7 @@ const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
 
 it('does not report success for a run the orchestrator abandoned part way through', async () => {
-  await withNxFixture('nx-incomplete-run-', async ({ workspace }) => {
+  await withNxFixture('nx-incomplete-run-', async ({ workspace, socketDirectory }) => {
     await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
     await writeFile(join(workspace, 'nx.json'), JSON.stringify({}));
     await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'incomplete-run', private: true }));
@@ -54,7 +54,7 @@ it('does not report success for a run the orchestrator abandoned part way throug
     ]) {
       const ran = spawnSync('bun', [nxEntry, ...command, '--outputStyle=static'], {
         cwd: workspace,
-        env: fixtureNxEnv(workspace),
+        env: fixtureNxEnv(workspace, socketDirectory),
         encoding: 'utf8',
       });
       const output = `nx ${command.join(' ')}\n${ran.stdout}${ran.stderr}`;

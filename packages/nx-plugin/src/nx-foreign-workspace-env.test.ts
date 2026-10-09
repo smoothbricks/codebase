@@ -98,7 +98,7 @@ it("refuses nx run in one workspace under another workspace's environment, and l
   try {
     await withNxFixture(
       'nx-foreign-env-',
-      async ({ root, workspace: a }) => {
+      async ({ root, socketDirectory, workspace: a }) => {
         const b = join(root, 'b');
         await writeWorkspace(a, 'a');
         await writeWorkspace(b, 'b');
@@ -110,7 +110,7 @@ it("refuses nx run in one workspace under another workspace's environment, and l
           NX_CACHE_DIRECTORY: join(a, '.nx', 'cache'),
           NX_SOCKET_DIR: join(link, 'a', 'nx'),
         };
-        const aEnv = { ...fixtureNxEnv(a), ...state, NX_DAEMON: 'true' };
+        const aEnv = { ...fixtureNxEnv(a, socketDirectory), ...state, NX_DAEMON: 'true' };
 
         const started = await runNx(a, aEnv, ['daemon', '--start']);
         expect(started.code, started.stdout + started.stderr).toBe(0);

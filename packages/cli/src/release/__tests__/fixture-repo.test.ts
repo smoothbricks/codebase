@@ -9,6 +9,7 @@ import {
   ownedFixtureRoot,
   pidsWorkingIn,
   processTable,
+  publishFixtureSocketDirectory,
   reclaimDeadFixtureRuns,
   retireFixtureSocketDirectory,
 } from '@smoothbricks/nx-plugin/testing';
@@ -131,16 +132,18 @@ describe('release planning with fixture git repositories', () => {
       NX_SOCKET_DIR: join(shared, 'socket'),
       NX_DAEMON_SOCKET_DIR: join(shared, 'socket'),
     };
+    // Named before the inherited variables are planted: the fixture's directory is its own, not derived from them.
+    const socketDirectory = fixtureSocketDirectory(root);
     const outer = Object.fromEntries(Object.keys(inherited).map((key) => [key, process.env[key]]));
     Object.assign(process.env, inherited);
     try {
       for (const daemon of [false, true]) {
-        const env = fixtureNxEnv(root, { daemon });
+        const env = fixtureNxEnv(root, { daemon }, socketDirectory);
         expect(Object.entries(env).filter(([, value]) => value.includes(shared))).toEqual([]);
         expect(env).toMatchObject({
           NX_DAEMON: String(daemon),
           NX_WORKSPACE_ROOT_PATH: root,
-          NX_SOCKET_DIR: fixtureSocketDirectory(root),
+          NX_SOCKET_DIR: socketDirectory,
           NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
           NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
         });
@@ -150,7 +153,6 @@ describe('release planning with fixture git repositories', () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
-      await retireFixtureSocketDirectory(root);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -160,8 +162,7 @@ describe('release planning with fixture git repositories', () => {
     // None of it is this fixture's to remove, and retiring the fixture must leave all of it in place.
     const bystander = await ownedFixtureRoot(tmpdir(), 'cli', 'smoo-release-bystander-');
     try {
-      await mkdir(join(bystander, '.nx', 'sockets'), { recursive: true });
-      const bystanderSocketDirectory = fixtureSocketDirectory(bystander);
+      const bystanderSocketDirectory = await publishFixtureSocketDirectory(bystander);
       await mkdir(bystanderSocketDirectory);
       await writeFile(join(bystanderSocketDirectory, 'kept'), 'kept\n');
       const bystanderAlias = dirname(bystanderSocketDirectory);
@@ -172,8 +173,7 @@ describe('release planning with fixture git repositories', () => {
       let physicalDirectory = '';
       await withFixtureRepo(async (root) => {
         fixtureRoot = await realpath(root);
-        await mkdir(join(root, '.nx', 'sockets'), { recursive: true });
-        socketDirectory = fixtureSocketDirectory(root);
+        socketDirectory = await publishFixtureSocketDirectory(root);
         alias = dirname(socketDirectory);
         await mkdir(socketDirectory);
         physicalDirectory = await realpath(socketDirectory);

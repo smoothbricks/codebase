@@ -1,9 +1,15 @@
 import { onTestFinished } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { rm } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fixtureSocketDirectory, ownedFixtureRoot, retireFixtureSocketDirectory, stopNxDaemon } from '../testing.js';
+import {
+  fixtureSocketDirectory,
+  ownedFixtureRoot,
+  publishFixtureSocketDirectory,
+  retireFixtureSocketDirectory,
+  stopNxDaemon,
+} from '../testing.js';
 import { guardEvent } from './counted-cargo.js';
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
@@ -28,15 +34,16 @@ const repositoryRoot = join(import.meta.dir, '../../../..');
  * NO_COLOR a shell may export. The fixture's runtime inputs inherit both, and
  * must hash the same under them.
  *
- * NX_SOCKET_DIR is the fixture's own {@link fixtureSocketDirectory}, never the
+ * NX_SOCKET_DIR is `socketDirectory`, the fixture's own published
+ * {@link fixtureSocketDirectory} ({@link withNxFixture} passes it), never the
  * inherited one, which a Cowshed job shares with every other Nx of its
  * checkout. Nx's default socket root is the literal `/tmp/.nx`, which a
  * sandbox does not admit, and it hashes the daemon's pid into the name, so two
  * daemons of one workspace bind two paths. With the directory named, they bind
  * one: a test whose subject is two daemons on two socket paths names a second
- * directory for the second.
+ * directory for the second. Building the environment publishes nothing.
  */
-export function fixtureNxEnv(workspace: string): Record<string, string> {
+export function fixtureNxEnv(workspace: string, socketDirectory: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined && !key.startsWith('NX_')) env[key] = value;
@@ -49,7 +56,7 @@ export function fixtureNxEnv(workspace: string): Record<string, string> {
     NX_USE_LOCAL: 'true',
     NX_WORKSPACE_ROOT_PATH: workspace,
     NX_ISOLATE_PLUGINS: 'false',
-    NX_SOCKET_DIR: fixtureSocketDirectory(workspace),
+    NX_SOCKET_DIR: socketDirectory,
     NX_WORKSPACE_DATA_DIRECTORY: join(workspace, '.nx/workspace-data'),
     NX_CACHE_DIRECTORY: join(workspace, '.nx/cache'),
   };
@@ -64,17 +71,20 @@ export function nxFixtureRoot(prefix: string): Promise<string> {
   return ownedFixtureRoot(tmpdir(), 'nx-plugin', prefix);
 }
 
-/** A fixture root and the Nx workspace in it whose daemon the fixture owns. */
+/** A fixture root, the Nx workspace in it whose daemon the fixture owns, and that workspace's published socket directory. */
 export interface NxFixture {
   readonly root: string;
   readonly workspace: string;
+  readonly socketDirectory: string;
 }
 
 /**
  * Run `body` in a fresh fixture root whose Nx workspace is `workspace`
- * (relative to the root), then retire it: stop the workspace's daemon and
- * delete the root, however `body` ends. Bun ends a timed-out test without
- * cancelling its body, so the fixture also retires when the test finishes.
+ * (relative to the root, made if it is not the root), with the workspace's
+ * socket alias published, then retire it: stop the workspace's daemon, unlink
+ * the alias and delete the root, however `body` ends. Bun ends a timed-out test
+ * without cancelling its body, so the fixture also retires when the test
+ * finishes.
  */
 export async function withNxFixture<T>(
   prefix: string,
@@ -82,16 +92,17 @@ export async function withNxFixture<T>(
   workspace = '.',
 ): Promise<T> {
   const root = await nxFixtureRoot(prefix);
-  const fixture = { root, workspace: join(root, workspace) };
+  const owned = { root, workspace: join(root, workspace) };
   let retirement: Promise<void> | undefined;
   const retire = () => {
-    retirement ??= retireNxFixture(fixture);
+    retirement ??= retireNxFixture(owned);
     return retirement;
   };
   onTestFinished(retire);
   let result: T;
   try {
-    result = await body(fixture);
+    await mkdir(owned.workspace, { recursive: true });
+    result = await body({ ...owned, socketDirectory: await publishFixtureSocketDirectory(owned.workspace) });
   } catch (error) {
     try {
       await retire();
@@ -107,11 +118,12 @@ export async function withNxFixture<T>(
 /**
  * Stop the fixture workspace's daemon, unlink its owned short socket alias,
  * then delete the root. A daemon that outlives its stop fails the retirement
- * and keeps both, so its working directory still names a fixture the next run
- * reclaims.
+ * and keeps all three, so its working directory still names a fixture the next
+ * run reclaims, alias included. Nothing is published here: the stop names the
+ * directory publication returned, by the same pure naming.
  */
-async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
-  await stopFixtureNxDaemon(workspace);
+async function retireNxFixture({ root, workspace }: Omit<NxFixture, 'socketDirectory'>): Promise<void> {
+  await stopFixtureNxDaemon(workspace, fixtureNxEnv(workspace, fixtureSocketDirectory(workspace)));
   await retireFixtureSocketDirectory(workspace);
   await rm(root, { recursive: true, force: true });
 }
@@ -119,11 +131,11 @@ async function retireNxFixture({ root, workspace }: NxFixture): Promise<void> {
 /**
  * Stop the Nx daemon a fixture's own `nx` runs started, through Nx's supported
  * `nx daemon --stop`, and wait until it and every process it ran have exited.
- * The daemon is told the same root and data directory that started it
- * (`fixtureNxEnv`, or the `env` a test started it under), so it can only be
- * this fixture's: no other workspace's daemon is reached, and nothing is reset.
+ * The daemon is told the same root, data and socket directory that started it
+ * (`env`, the one a test started it under), so it can only be this fixture's:
+ * no other workspace's daemon is reached, and nothing is reset.
  */
-export function stopFixtureNxDaemon(workspace: string, env = fixtureNxEnv(workspace)): Promise<void> {
+export function stopFixtureNxDaemon(workspace: string, env: Record<string, string>): Promise<void> {
   return stopNxDaemon(workspace, async () => {
     let stdout = '';
     let stderr = '';

@@ -1,10 +1,9 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the cache-bound hunk of `patches/nx@23.2.1.patch`, the local build of
@@ -72,8 +71,7 @@ async function runNx(root: string, env: Record<string, string>): Promise<{ code:
 }
 
 it('bounds the default cache from its own filesystem without listing the host disks', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'nx-cache-bound-')));
-  try {
+  await withNxFixture('nx-cache-bound-', async ({ workspace: root, socketDirectory }) => {
     await mkdir(join(root, 'app'));
     await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
     await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\napp/result.txt\n');
@@ -101,13 +99,11 @@ it('bounds the default cache from its own filesystem without listing the host di
     // The bound is taken by the client that runs the tasks, daemon or not.
     // The cache directory does not exist yet, as on a checkout's first run.
     const { code, output } = await runNx(root, {
-      ...fixtureNxEnv(root),
+      ...fixtureNxEnv(root, socketDirectory),
       NODE_OPTIONS: `--require ${join(root, 'forbid-disk-inventory.cjs')}`,
     });
     expect(output).not.toContain('Nx enumerated the host disks');
     expect(code, output).toBe(0);
     expect(await readFile(join(root, 'app/result.txt'), 'utf8')).toBe('built');
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  });
 });

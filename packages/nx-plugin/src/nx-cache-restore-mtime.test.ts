@@ -117,8 +117,8 @@ function expectRestoredNewer(restored: Run, replaced: Run, text: string): void {
 }
 
 it('restores a locally cached output newer than the output it replaces', async () => {
-  await withNxFixture('nx-restore-mtime-', async ({ workspace }) => {
-    const run = await restoreFixture(workspace, fixtureNxEnv(workspace));
+  await withNxFixture('nx-restore-mtime-', async ({ workspace, socketDirectory }) => {
+    const run = await restoreFixture(workspace, fixtureNxEnv(workspace, socketDirectory));
 
     await run('A');
     const fromB = await run('B');
@@ -151,16 +151,18 @@ it('restores a remotely cached output newer than the output it replaces', async 
       },
     }),
   );
-  await withNxFixture('nx-restore-mtime-remote-', async ({ workspace }) => {
-    const env = { ...fixtureNxEnv(workspace), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin };
+  await withNxFixture('nx-restore-mtime-remote-', async ({ workspace, socketDirectory }) => {
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin };
     const run = await restoreFixture(workspace, env);
 
     await run('A');
     const fromB = await run('B');
     expectBuilt(fromB, 'B');
     expect(artifacts.size).toBe(2);
-    // Forget the local cache and its records, so A can only come from the remote.
-    await rm(join(workspace, '.nx'), { recursive: true });
+    // Forget the local cache and its records, so A can only come from the remote. The fixture's socket state in
+    // `.nx/sockets` stays: its published alias names it.
+    await rm(join(workspace, '.nx', 'cache'), { recursive: true });
+    await rm(join(workspace, '.nx', 'workspace-data'), { recursive: true });
     const restored = await run('A');
     expect(restored.log).toContain('[remote cache]');
     expectRestoredNewer(restored, fromB, 'A');

@@ -111,8 +111,8 @@ function watchClient(workspace: string, env: Record<string, string>) {
 }
 
 it('keeps serving when a watched ignore file is rewritten with the bytes the daemon started with', async () => {
-  await withNxFixture('nx-daemon-ignore-', async ({ workspace }) => {
-    const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
+  await withNxFixture('nx-daemon-ignore-', async ({ workspace, socketDirectory }) => {
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
     await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
     await writeFile(join(workspace, 'nx.json'), '{}\n');
     await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'daemon-ignore', private: true }));
@@ -171,9 +171,13 @@ async function largeWorkspace(workspace: string): Promise<void> {
 }
 
 it('stops when an ignore file changes after the watcher read it and before the daemon compared it', async () => {
-  await withNxFixture('nx-daemon-ignore-gap-', async ({ workspace }) => {
+  await withNxFixture('nx-daemon-ignore-gap-', async ({ workspace, socketDirectory }) => {
     await largeWorkspace(workspace);
-    const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', NX_NATIVE_LOGGING: 'nx::native::watch=debug' };
+    const env = {
+      ...fixtureNxEnv(workspace, socketDirectory),
+      NX_DAEMON: 'true',
+      NX_NATIVE_LOGGING: 'nx::native::watch=debug',
+    };
     // The native watcher logs `watching started` once watch() has read the ignore files and started its stream; the
     // daemon sets its workspace context up, walking every file, only after that. The rewrite lands in between.
     const daemon = spawn(process.execPath, [daemonStart], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });

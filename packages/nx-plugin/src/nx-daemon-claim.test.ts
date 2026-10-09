@@ -5,14 +5,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
-import {
-  awaitExit,
-  isRunning,
-  NX_LONGEST_SOCKET_NAME,
-  ownedWorkspaceSocketDirectory,
-  processTable,
-  terminate,
-} from './testing.js';
+import { awaitExit, isRunning, ownedWorkspaceSocketDirectory, processTable, terminate } from './testing.js';
 
 /**
  * Guards the daemon-claim hunk of `patches/nx@23.2.1.patch`. Every Nx 23.2.1 daemon overwrote the workspace's
@@ -90,8 +83,8 @@ async function startedDaemon(workspace: string, env: Record<string, string>): Pr
  * names a real directory inside the workspace, which the sandbox admits. The caller stops any daemon bound in it before
  * this returns; this removes only the directory it made, and `force` takes what is left.
  */
-async function withSocketDir<T>(workspace: string, body: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await ownedWorkspaceSocketDirectory(workspace, 'nc-', NX_LONGEST_SOCKET_NAME);
+async function withSocketDir<T>(workspace: string, slot: 'a' | 'b', body: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await ownedWorkspaceSocketDirectory(workspace, slot);
   try {
     return await body(dir);
   } finally {
@@ -171,11 +164,11 @@ async function secondDaemonDefers(
 
 describe('a second daemon started for a workspace a daemon serves', () => {
   it('exits and leaves the serving daemon alone when each binds a socket directory of its own', async () => {
-    await withNxFixture('nx-daemon-claim-', async ({ workspace }) => {
+    await withNxFixture('nx-daemon-claim-', async ({ socketDirectory, workspace }) => {
       await fixtureWorkspace(workspace);
-      const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
-      await withSocketDir(workspace, async (servingDir) => {
-        await withSocketDir(workspace, async (challengerDir) => {
+      const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+      await withSocketDir(workspace, 'a', async (servingDir) => {
+        await withSocketDir(workspace, 'b', async (challengerDir) => {
           await secondDaemonDefers(
             workspace,
             { ...env, NX_SOCKET_DIR: servingDir },
@@ -187,10 +180,10 @@ describe('a second daemon started for a workspace a daemon serves', () => {
   }, 60_000);
 
   it('exits and leaves the serving daemon alone when both use one socket directory', async () => {
-    await withNxFixture('nx-daemon-claim-shared-', async ({ workspace }) => {
+    await withNxFixture('nx-daemon-claim-shared-', async ({ socketDirectory, workspace }) => {
       await fixtureWorkspace(workspace);
-      await withSocketDir(workspace, async (socketDir) => {
-        const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', NX_SOCKET_DIR: socketDir };
+      await withSocketDir(workspace, 'a', async (socketDir) => {
+        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_SOCKET_DIR: socketDir };
         await secondDaemonDefers(workspace, env, env);
       });
     });
@@ -198,9 +191,9 @@ describe('a second daemon started for a workspace a daemon serves', () => {
 });
 
 it('replaces a daemon whose socket was removed, which no client could reach', async () => {
-  await withNxFixture('nx-daemon-claim-lost-', async ({ workspace }) => {
+  await withNxFixture('nx-daemon-claim-lost-', async ({ socketDirectory, workspace }) => {
     await fixtureWorkspace(workspace);
-    const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
     const lost = await startedDaemon(workspace, env);
     const lostProcess = (await processTable()).filter((entry) => entry.pid === lost.processId);
     // What a temp-directory reaper does to a socket that has not been used for days.
@@ -214,11 +207,11 @@ it('replaces a daemon whose socket was removed, which no client could reach', as
 }, 60_000);
 
 it('keeps serving clients whose socket directory differs from the one it bound', async () => {
-  await withNxFixture('nx-daemon-claim-env-', async ({ workspace }) => {
+  await withNxFixture('nx-daemon-claim-env-', async ({ socketDirectory, workspace }) => {
     await fixtureWorkspace(workspace);
-    const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
-    await withSocketDir(workspace, async (socketDir) => {
-      await withSocketDir(workspace, async (otherSocketDir) => {
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    await withSocketDir(workspace, 'a', async (socketDir) => {
+      await withSocketDir(workspace, 'b', async (otherSocketDir) => {
         const servingEnv = { ...env, NX_SOCKET_DIR: socketDir };
         try {
           const serving = await startedDaemon(workspace, servingEnv);
@@ -239,9 +232,9 @@ it('keeps serving clients whose socket directory differs from the one it bound',
 }, 60_000);
 
 it('replaces a record whose pid now belongs to an unrelated live process', async () => {
-  await withNxFixture('nx-daemon-claim-reused-', async ({ workspace }) => {
+  await withNxFixture('nx-daemon-claim-reused-', async ({ socketDirectory, workspace }) => {
     await fixtureWorkspace(workspace);
-    const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
     // A process that lives until its stdin closes: what a daemon's pid can be reused by after a crash.
     const unrelated = spawn(process.execPath, ['-e', 'process.stdin.resume()'], {
       stdio: ['pipe', 'ignore', 'ignore'],

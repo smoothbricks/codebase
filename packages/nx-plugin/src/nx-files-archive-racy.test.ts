@@ -29,7 +29,7 @@ const repoRoot = dirname(dirname(packageRoot));
 const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
 
 it('hashes an input rewritten in the second its archived hash was taken', async () => {
-  await withNxFixture('nx-files-archive-racy-', async ({ workspace }) => {
+  await withNxFixture('nx-files-archive-racy-', async ({ workspace, socketDirectory }) => {
     await mkdir(join(workspace, 'app'), { recursive: true });
     const git = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
     expect(git.exitCode, git.stderr.toString()).toBe(0);
@@ -58,7 +58,7 @@ it('hashes an input rewritten in the second its archived hash was taken', async 
     for (const file of ['.gitignore', 'nx.json', 'app/project.json']) {
       await utimes(join(workspace, file), anHourAgo, anHourAgo);
     }
-    const env = fixtureNxEnv(workspace);
+    const env = fixtureNxEnv(workspace, socketDirectory);
     const source = join(workspace, 'app', 'source.txt');
     const archive = join(env.NX_WORKSPACE_DATA_DIRECTORY, 'nx_files.nxt');
     // Writes the input dated `second`, builds, and reports the log and the output.

@@ -29,8 +29,8 @@
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, symlinkSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -442,22 +442,24 @@ async function reclaimRun(directory: string, owner: string, graceMs = EXIT_TIMEO
       }
     }
   }
-  // A killed fixture may never have reached its normal alias retirement. Only
-  // aliases whose exact target lies in this reclaimed run belong to its sweep.
-  const namespace = socketNamespace();
-  for (const entry of await readdir(namespace.directory, { withFileTypes: true })) {
-    if (!entry.isSymbolicLink() || !/^nx-[a-f0-9]{16}$/.test(entry.name)) continue;
-    const alias = join(namespace.directory, entry.name);
-    const target = await readlink(alias).catch((error: unknown) => {
+  // A killed fixture may never have reached its own alias retirement, and its
+  // workspace may be gone. The alias is its own record: one whose target is the
+  // socket state of a workspace in this reclaimed run, and whose name is that
+  // workspace's, is this sweep's to retire. Every other entry is left alone.
+  const { directory: namespace } = socketNamespace();
+  for (const entry of await readdir(namespace, { withFileTypes: true })) {
+    if (!entry.isSymbolicLink()) continue;
+    const target = await readlink(join(namespace, entry.name)).catch((error: unknown) => {
       if (errorCode(error) === 'ENOENT') return undefined;
       throw error;
     });
     if (target === undefined) continue;
     const workspace = dirname(dirname(target));
-    if (target === join(workspace, '.nx', 'sockets') && isWithin(workspace, directory)) {
-      if (fixtureSocketPaths(workspace).alias !== alias) {
-        throw new Error(`fixture socket alias ${alias} has a different workspace identity for ${workspace}`);
-      }
+    if (
+      workspace.startsWith(`${directory}${sep}`) &&
+      target === fixtureSocketTarget(workspace) &&
+      entry.name === fixtureSocketAliasName(workspace)
+    ) {
       await retireFixtureSocketDirectory(workspace);
     }
   }
@@ -690,20 +692,14 @@ export async function ownedSocketDirectory(prefix: string, longestSocketName: st
   return mkdtemp(join(namespace.directory, prefix));
 }
 
-/**
- * A short parent alias for this workspace's real socket leaves. Its spelling
- * is in the job's admitted namespace, but its target is outside every checkout
- * in the fixture's own tree. Nx sees a real leaf, never a symlinked socket
- * directory, and the foreign-workspace guard sees the fixture that owns it.
- */
-function fixtureSocketPaths(workspace: string) {
-  const root = realpathSync(workspace);
-  const digest = createHash('sha256').update(root).digest('hex');
-  const namespace = socketNamespace();
-  const alias = join(namespace.directory, `nx-${digest.slice(0, 16)}`);
-  const target = join(root, '.nx', 'sockets');
-  assertSocketPath(join(alias, 'nx', NX_LONGEST_SOCKET_NAME), namespace);
-  return { alias, target, namespace };
+/** The alias's name: a digest of the workspace's physical path, which is the whole of its identity. */
+function fixtureSocketAliasName(workspace: string): string {
+  return `nx-${createHash('sha256').update(workspace).digest('hex').slice(0, 16)}`;
+}
+
+/** The real directory below the workspace that its alias names. */
+function fixtureSocketTarget(workspace: string): string {
+  return join(workspace, '.nx', 'sockets');
 }
 
 /** A colliding or retargeted alias is not this fixture's and must not be used or removed. */
@@ -715,50 +711,88 @@ function assertFixtureSocketAlias(alias: string, target: string): void {
 }
 
 /**
- * The fixture's `NX_SOCKET_DIR`: a real `nx` leaf below a short parent alias
- * to its own physical `.nx/sockets`. Every client and daemon stop for this
- * workspace uses the same alias. A long private `TMPDIR` affects neither the
- * bind path nor workspace ownership. Retire the alias only after its daemon
- * exits, with {@link retireFixtureSocketDirectory}.
+ * The fixture's `NX_SOCKET_DIR`, named and nothing more: the real `nx` leaf
+ * below the short parent alias {@link publishFixtureSocketDirectory} makes in
+ * the job's admitted namespace. `workspace` is the physical path that
+ * publication was given; the alias is named for a hash of it, so every client,
+ * daemon stop and retirement of the workspace names the same leaf, and no two
+ * fixtures share one. A long private `TMPDIR` affects neither the bind path nor
+ * workspace ownership. A namespace too small for Nx's longest socket name is
+ * refused here, so before any publication.
  */
 export function fixtureSocketDirectory(workspace: string): string {
-  const { alias, target } = fixtureSocketPaths(workspace);
-  for (const directory of [dirname(target), target]) {
+  const namespace = socketNamespace();
+  const directory = join(namespace.directory, fixtureSocketAliasName(workspace), 'nx');
+  assertSocketPath(join(directory, NX_LONGEST_SOCKET_NAME), namespace);
+  return directory;
+}
+
+/**
+ * Publish the fixture's short socket alias and return its
+ * {@link fixtureSocketDirectory}. The workspace must be a physical directory in
+ * a fixture run this process holds ({@link ownedFixtureRoot}): then the run's
+ * sweep reclaims the alias even if this process dies before its
+ * {@link retireFixtureSocketDirectory}. The alias points at the workspace's own
+ * `.nx/sockets`, made mode 0700; a symlinked `.nx` or `.nx/sockets` is refused
+ * before anything is written through it. Nx makes the `nx` leaf itself.
+ */
+export async function publishFixtureSocketDirectory(workspace: string): Promise<string> {
+  refuseWhileRetiring();
+  const runs = await Promise.allSettled(runDirectories.values());
+  const owned = runs.some((run) => run.status === 'fulfilled' && workspace.startsWith(`${run.value}${sep}`));
+  if (!owned || (await realpath(workspace)) !== workspace) {
+    throw new Error(
+      `no socket alias is published for ${workspace}: it is not a physical workspace in a fixture run this ` +
+        'process owns, so no sweep could reclaim its alias',
+    );
+  }
+  const directory = fixtureSocketDirectory(workspace);
+  const alias = dirname(directory);
+  const target = fixtureSocketTarget(workspace);
+  for (const state of [dirname(target), target]) {
     try {
-      mkdirSync(directory, { mode: 0o700 });
+      await mkdir(state, { mode: 0o700 });
     } catch (error) {
       if (errorCode(error) !== 'EEXIST') throw error;
     }
-    if (!lstatSync(directory).isDirectory()) {
-      throw new Error(`fixture socket target ${directory} is not a real directory in its physical workspace`);
+    if (!(await lstat(state)).isDirectory()) {
+      throw new Error(`fixture socket target ${state} is not a real directory in its physical workspace`);
     }
   }
   try {
-    symlinkSync(target, alias, 'dir');
+    await symlink(target, alias, 'dir');
   } catch (error) {
     if (errorCode(error) !== 'EEXIST') throw error;
   }
   assertFixtureSocketAlias(alias, target);
-  return join(alias, 'nx');
+  return directory;
 }
 
-/** A distinct real leaf for tests whose subject is multiple daemon socket directories. */
-export async function ownedWorkspaceSocketDirectory(
-  workspace: string,
-  prefix: string,
-  longestSocketName: string,
-): Promise<string> {
-  const { alias, namespace } = fixtureSocketPaths(workspace);
-  assertSocketPath(join(alias, `${prefix}XXXXXX`, longestSocketName), namespace);
-  fixtureSocketDirectory(workspace);
-  return mkdtemp(join(alias, prefix));
+/**
+ * A second real leaf, `slot`, beside the `nx` one below the workspace's
+ * published alias, for tests whose subject is two daemon socket directories.
+ * A slot name is shorter than `nx`, so it fits wherever the published leaf
+ * does. An existing slot is an error. Its caller stops the daemon bound in it
+ * before removing it.
+ */
+export async function ownedWorkspaceSocketDirectory(workspace: string, slot: 'a' | 'b'): Promise<string> {
+  const alias = dirname(fixtureSocketDirectory(workspace));
+  assertFixtureSocketAlias(alias, fixtureSocketTarget(workspace));
+  const directory = join(alias, slot);
+  await mkdir(directory, { mode: 0o700 });
+  return directory;
 }
 
-/** After the daemon exits, unlink only this workspace's verified parent alias, not its target. */
+/**
+ * After the daemon exits, unlink only this workspace's verified parent alias,
+ * not its target. Named from the workspace's path alone, so a workspace already
+ * deleted retires too. No alias is not an error; any other entry under its name
+ * is refused and left in place.
+ */
 export async function retireFixtureSocketDirectory(workspace: string): Promise<void> {
-  const { alias, target } = fixtureSocketPaths(workspace);
+  const alias = join(socketNamespace().directory, fixtureSocketAliasName(workspace));
   try {
-    assertFixtureSocketAlias(alias, target);
+    assertFixtureSocketAlias(alias, fixtureSocketTarget(workspace));
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return;
     throw error;

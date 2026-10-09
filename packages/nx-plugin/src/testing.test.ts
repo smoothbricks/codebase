@@ -1,10 +1,10 @@
 import { expect, it } from 'bun:test';
 import { existsSync, lstatSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   fixtureSocketDirectory,
   isRunning,
@@ -15,7 +15,9 @@ import {
   type ProcessEntry,
   pidsWorkingIn,
   processTable,
+  publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
+  socketNamespace,
   terminate,
   withDescendants,
 } from './testing.js';
@@ -26,7 +28,11 @@ const repositoryRoot = join(import.meta.dir, '../../..');
  * Make `workspace` an Nx workspace and start its daemon. The daemon and every
  * process it started, once `nx daemon --start` has returned with it up.
  */
-async function startDaemon(workspace: string, environment: Record<string, string> = {}): Promise<ProcessEntry[]> {
+async function startDaemon(
+  workspace: string,
+  socketDirectory: string,
+  environment: Record<string, string> = {},
+): Promise<ProcessEntry[]> {
   await mkdir(workspace, { recursive: true });
   await writeFile(join(workspace, 'package.json'), '{"name":"daemon-fixture","private":true}\n');
   await writeFile(join(workspace, '.gitignore'), 'node_modules\n.nx\n');
@@ -35,7 +41,7 @@ async function startDaemon(workspace: string, environment: Record<string, string
   expect(Bun.spawnSync(['git', 'init', '--quiet', workspace]).exitCode).toBe(0);
   const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'daemon', '--start'], {
     cwd: workspace,
-    env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', ...environment },
+    env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', ...environment },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -72,12 +78,15 @@ it('lists a process once when it descends from another of the pids it is asked a
   ).toEqual([10, 11, 12]);
 });
 
-it('stops the Nx daemon of a fixture whose body throws, and deletes its root', async () => {
+it('stops the Nx daemon of a fixture whose body throws, and deletes its socket alias and root', async () => {
   let root = '';
+  let alias = '';
   let daemon: ProcessEntry[] = [];
   const thrown = withNxFixture('throwing-body-', async (fixture) => {
     root = fixture.root;
-    daemon = await startDaemon(fixture.workspace);
+    alias = dirname(fixture.socketDirectory);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    daemon = await startDaemon(fixture.workspace, fixture.socketDirectory);
     throw new Error('the fixture body failed on purpose');
   });
 
@@ -86,77 +95,158 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its root', a
   expect(await stillRunning(daemon)).toEqual([]);
   expect(await pidsWorkingIn(root)).toEqual([]);
   expect(existsSync(root)).toBe(false);
+  expect(lstatSync(alias, { throwIfNoEntry: false })).toBeUndefined();
 }, 120_000);
 
 it('binds and connects through its short alias without granting the long fixture root a socket namespace', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'short-socket-boundary-'.padEnd(100, 'x')));
-  const directory = fixtureSocketDirectory(root);
-  const socket = join(directory, NX_LONGEST_SOCKET_NAME);
-  const server = createServer((client) => client.end('owned-socket-ok'));
-  try {
-    await mkdir(directory);
-    expect(Buffer.byteLength(join(root, '.nx', 'sockets', NX_LONGEST_SOCKET_NAME))).toBeGreaterThan(95);
-    expect(await realpath(directory)).toBe(join(await realpath(root), '.nx', 'sockets', 'nx'));
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socket, resolve);
-    });
-    const received = await new Promise<string>((resolve, reject) => {
-      const client = createConnection(socket);
-      let text = '';
-      client.on('data', (bytes) => {
-        text += bytes.toString();
-      });
-      client.once('error', reject);
-      client.once('end', () => resolve(text));
-    });
-    expect(received).toBe('owned-socket-ok');
-  } finally {
-    if (server.listening) {
+  let alias = '';
+  await withNxFixture('short-socket-boundary-'.padEnd(100, 'x'), async ({ workspace, socketDirectory }) => {
+    alias = dirname(socketDirectory);
+    const socket = join(socketDirectory, NX_LONGEST_SOCKET_NAME);
+    // The physical leaf is too long for Nx to bind, so only the alias can make this pass.
+    expect(Buffer.byteLength(join(workspace, '.nx', 'sockets', 'nx', NX_LONGEST_SOCKET_NAME))).toBeGreaterThan(95);
+    expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(95);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(dirname(alias)).toBe(socketNamespace().directory);
+    await mkdir(socketDirectory);
+    expect(await realpath(socketDirectory)).toBe(join(workspace, '.nx', 'sockets', 'nx'));
+    const server = createServer((client) => client.end('owned-socket-ok'));
+    try {
       await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error === undefined ? resolve() : reject(error)));
+        server.once('error', reject);
+        server.listen(socket, resolve);
       });
+      const received = await new Promise<string>((resolve, reject) => {
+        const client = createConnection(socket);
+        let text = '';
+        client.on('data', (bytes) => {
+          text += bytes.toString();
+        });
+        client.once('error', reject);
+        client.once('end', () => resolve(text));
+      });
+      expect(received).toBe('owned-socket-ok');
+    } finally {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => (error === undefined ? resolve() : reject(error)));
+        });
+      }
     }
-    await retireFixtureSocketDirectory(root);
+  });
+  // The fixture's retirement unlinked its alias.
+  expect(lstatSync(alias, { throwIfNoEntry: false })).toBeUndefined();
+});
+
+it('publishes no alias for a workspace outside its own fixture run, or one named through a link', async () => {
+  const unowned = await realpath(await mkdtemp(join(tmpdir(), 'socket-unowned-')));
+  const root = await nxFixtureRoot('socket-linked-');
+  const linked = join(root, 'linked');
+  try {
+    await mkdir(join(root, 'real'));
+    await symlink(join(root, 'real'), linked, 'dir');
+    for (const workspace of [unowned, linked]) {
+      await expect(publishFixtureSocketDirectory(workspace)).rejects.toThrow(
+        'not a physical workspace in a fixture run this process owns',
+      );
+      expect(existsSync(join(workspace, '.nx'))).toBe(false);
+      expect(lstatSync(dirname(fixtureSocketDirectory(workspace)), { throwIfNoEntry: false })).toBeUndefined();
+    }
+  } finally {
+    await rm(unowned, { recursive: true });
     await rm(root, { recursive: true });
   }
 });
 
 it('refuses a symlinked socket-state ancestor before writing outside the fixture', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'socket-escape-boundary-'));
+  const root = await nxFixtureRoot('socket-escape-boundary-');
   const foreign = await mkdtemp(join(tmpdir(), 'socket-foreign-boundary-'));
   try {
     await symlink(foreign, join(root, '.nx'), 'dir');
-    expect(() => fixtureSocketDirectory(root)).toThrow('is not a real directory in its physical workspace');
+    await expect(publishFixtureSocketDirectory(root)).rejects.toThrow(
+      'is not a real directory in its physical workspace',
+    );
     expect(existsSync(join(foreign, 'sockets'))).toBe(false);
+    expect(lstatSync(dirname(fixtureSocketDirectory(root)), { throwIfNoEntry: false })).toBeUndefined();
   } finally {
     await rm(root, { recursive: true });
     await rm(foreign, { recursive: true });
   }
 });
 
+it('neither uses nor removes a retargeted alias or a colliding directory at its alias name', async () => {
+  const root = await nxFixtureRoot('socket-collision-');
+  const foreign = await realpath(await mkdtemp(join(tmpdir(), 'socket-collision-foreign-')));
+  const alias = dirname(fixtureSocketDirectory(root));
+  try {
+    await symlink(foreign, alias, 'dir');
+    await expect(publishFixtureSocketDirectory(root)).rejects.toThrow('does not name its owned target');
+    await expect(retireFixtureSocketDirectory(root)).rejects.toThrow('does not name its owned target');
+    await expect(ownedWorkspaceSocketDirectory(root, 'a')).rejects.toThrow('does not name its owned target');
+    expect(await readlink(alias)).toBe(foreign);
+    expect(await readdir(foreign)).toEqual([]);
+    await rm(alias);
+
+    await mkdir(alias);
+    await writeFile(join(alias, 'kept'), 'kept\n');
+    await expect(publishFixtureSocketDirectory(root)).rejects.toThrow('does not name its owned target');
+    await expect(retireFixtureSocketDirectory(root)).rejects.toThrow('does not name its owned target');
+    expect(lstatSync(alias).isDirectory()).toBe(true);
+    expect(await readFile(join(alias, 'kept'), 'utf8')).toBe('kept\n');
+  } finally {
+    await rm(alias, { recursive: true, force: true });
+    await rm(root, { recursive: true });
+    await rm(foreign, { recursive: true });
+  }
+});
+
+it('refuses a socket namespace too long for Nx before publishing anything', async () => {
+  const root = await nxFixtureRoot('socket-length-');
+  const namespace = join(root, 'namespace-'.padEnd(80, 'x'));
+  await mkdir(namespace);
+  const outer = Object.fromEntries(
+    ['NX_SOCKET_DIR', 'COWSHED_RUNTIME_LINK', 'TMPDIR'].map((name) => [name, process.env[name]]),
+  );
+  // Only the temp directory is left to fall back to, and it is too long.
+  delete process.env.NX_SOCKET_DIR;
+  delete process.env.COWSHED_RUNTIME_LINK;
+  process.env.TMPDIR = namespace;
+  try {
+    expect(socketNamespace().directory).toBe(namespace);
+    await expect(publishFixtureSocketDirectory(root)).rejects.toThrow('over the 95 a Unix socket may have');
+    expect(existsSync(join(root, '.nx'))).toBe(false);
+    expect(await readdir(namespace)).toEqual([]);
+  } finally {
+    for (const [name, value] of Object.entries(outer)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await rm(root, { recursive: true });
+  }
+});
+
 it('starts and connects to a fixture daemon through owned short aliases with a long private TMPDIR', async () => {
-  await withNxFixture('long-tmp-socket-', async ({ workspace }) => {
+  await withNxFixture('long-tmp-socket-', async ({ workspace, socketDirectory }) => {
     const privateTemp = join(workspace, 'private-temp-'.padEnd(110, 'x'));
     await mkdir(privateTemp);
     expect(Buffer.byteLength(join(privateTemp, NX_LONGEST_SOCKET_NAME))).toBeGreaterThan(95);
-    const daemon = await startDaemon(workspace, { TMPDIR: privateTemp });
-    const directory = fixtureSocketDirectory(workspace);
-    const alias = dirname(directory);
+    const daemon = await startDaemon(workspace, socketDirectory, { TMPDIR: privateTemp });
+    const alias = dirname(socketDirectory);
     expect(lstatSync(alias).isSymbolicLink()).toBe(true);
-    expect(lstatSync(directory).isDirectory()).toBe(true);
-    expect(lstatSync(directory).isSymbolicLink()).toBe(false);
-    expect(await realpath(directory)).toBe(join(await realpath(workspace), '.nx', 'sockets', 'nx'));
-    expect(Buffer.byteLength(join(directory, NX_LONGEST_SOCKET_NAME))).toBeLessThanOrEqual(95);
-    const other = await ownedWorkspaceSocketDirectory(workspace, 'nc-', NX_LONGEST_SOCKET_NAME);
-    expect(await realpath(other)).toBe(
-      join(await realpath(workspace), '.nx', 'sockets', other.slice(alias.length + 1)),
-    );
-    expect(lstatSync(other).isSymbolicLink()).toBe(false);
-    await rm(other, { recursive: true });
+    expect(lstatSync(socketDirectory).isDirectory()).toBe(true);
+    expect(lstatSync(socketDirectory).isSymbolicLink()).toBe(false);
+    expect(await realpath(socketDirectory)).toBe(join(workspace, '.nx', 'sockets', 'nx'));
+    expect(Buffer.byteLength(join(socketDirectory, NX_LONGEST_SOCKET_NAME))).toBeLessThanOrEqual(95);
+    const slot = await ownedWorkspaceSocketDirectory(workspace, 'a');
+    expect(slot).toBe(join(alias, 'a'));
+    expect(await realpath(slot)).toBe(join(workspace, '.nx', 'sockets', 'a'));
+    expect(lstatSync(slot).isSymbolicLink()).toBe(false);
+    expect(Buffer.byteLength(join(slot, NX_LONGEST_SOCKET_NAME))).toBeLessThanOrEqual(95);
+    await expect(ownedWorkspaceSocketDirectory(workspace, 'a')).rejects.toThrow('EEXIST');
+    await rm(slot, { recursive: true });
     const client = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'show', 'projects', '--json'], {
       cwd: workspace,
-      env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true', TMPDIR: privateTemp },
+      env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', TMPDIR: privateTemp },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -175,7 +265,17 @@ it('starts and connects to a fixture daemon through owned short aliases with a l
   });
 }, 120_000);
 
-it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live run", async () => {
+/**
+ * The alias a killed fixture leaves: what {@link publishFixtureSocketDirectory} makes, planted for a workspace in
+ * another process's run, which this process may not publish for. `workspace` itself is not made.
+ */
+async function plantSocketAlias(workspace: string): Promise<string> {
+  const directory = fixtureSocketDirectory(workspace);
+  await symlink(join(workspace, '.nx', 'sockets'), dirname(directory), 'dir');
+  return directory;
+}
+
+it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and nothing of a live run", async () => {
   // A suite of its own, so this process's first fixture of it is the one that sweeps.
   const suite = `sweep-regression-${process.pid}`;
   const suiteDirectory = join(await realpath(tmpdir()), 'smoothbricks-fixtures', suite);
@@ -187,25 +287,44 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
   const liveRun = join(suiteDirectory, `run-${process.ppid}`);
   const abandoned = join(deadRun, 'abandoned-fixture');
   const kept = join(liveRun, 'live-fixture');
-  await mkdir(kept, { recursive: true });
-  await mkdir(abandoned, { recursive: true });
-  const abandonedAlias = dirname(fixtureSocketDirectory(abandoned));
-  const keptAlias = dirname(fixtureSocketDirectory(kept));
+  // A fixture of the dead run whose workspace is already gone: only its alias is left.
+  const vanished = join(deadRun, 'vanished-fixture');
+  await mkdir(join(kept, '.nx', 'sockets'), { recursive: true });
+  await mkdir(join(abandoned, '.nx', 'sockets'), { recursive: true });
+  const abandonedDirectory = await plantSocketAlias(abandoned);
+  const abandonedAlias = dirname(abandonedDirectory);
+  const keptAlias = dirname(await plantSocketAlias(kept));
+  const vanishedAlias = dirname(await plantSocketAlias(vanished));
+  // When the sweep signals the dead run's processes, it has not yet touched the run's aliases.
+  const aliasAtSignal = join(suiteDirectory, 'alias-at-signal');
+  const witness = Bun.spawn(
+    [
+      'sh',
+      '-c',
+      `trap 'if [ -L "$0" ]; then echo present; else echo gone; fi > "$1"; exit 0' TERM; while :; do sleep 1; done`,
+      abandonedAlias,
+      aliasAtSignal,
+    ],
+    { cwd: abandoned },
+  );
   let daemon: ProcessEntry[] = [];
   const helper = Bun.spawn(['sleep', '600'], { cwd: abandoned });
   const bystander = Bun.spawn(['sleep', '600'], { cwd: kept });
   try {
     // A real daemon, as a killed test leaves it, beside a stand-in for the
     // helper processes (watchers, clients) that work in the same root.
-    daemon = await startDaemon(abandoned);
+    daemon = await startDaemon(abandoned, abandonedDirectory);
 
     const fresh = await ownedFixtureRoot(tmpdir(), suite, 'fresh-');
 
     expect(await stillRunning(daemon)).toEqual([]);
     expect(await helper.exited).not.toBe(0);
     expect(helper.signalCode).toBe('SIGTERM');
+    expect(await witness.exited).toBe(0);
+    expect(await readFile(aliasAtSignal, 'utf8')).toBe('present\n');
     expect(existsSync(deadRun)).toBe(false);
     expect(lstatSync(abandonedAlias, { throwIfNoEntry: false })).toBeUndefined();
+    expect(lstatSync(vanishedAlias, { throwIfNoEntry: false })).toBeUndefined();
     expect(bystander.exitCode).toBeNull();
     expect(bystander.signalCode).toBeNull();
     expect(existsSync(kept)).toBe(true);
@@ -213,11 +332,13 @@ it("reclaims a dead run's Nx daemon and helper processes, and nothing of a live 
     expect(await realpath(keptAlias)).toBe(join(await realpath(kept), '.nx', 'sockets'));
     expect(fresh.startsWith(join(suiteDirectory, `run-${process.pid}`, 'fresh-'))).toBe(true);
   } finally {
-    for (const entry of [...daemon, { pid: helper.pid }, { pid: bystander.pid }]) {
+    for (const entry of [...daemon, { pid: helper.pid }, { pid: bystander.pid }, { pid: witness.pid }]) {
       terminate(entry.pid);
     }
-    await Promise.all([helper.exited, bystander.exited]);
-    await retireFixtureSocketDirectory(kept);
+    await Promise.all([helper.exited, bystander.exited, witness.exited]);
+    for (const workspace of [abandoned, kept, vanished]) {
+      await retireFixtureSocketDirectory(workspace);
+    }
     await rm(suiteDirectory, { recursive: true, force: true });
   }
 }, 120_000);

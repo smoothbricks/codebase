@@ -8,6 +8,7 @@ import {
   fixtureSocketDirectory,
   ownedFixtureRoot,
   processTable,
+  publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
   stopNxDaemon,
   terminate,
@@ -270,7 +271,8 @@ export interface FixtureNxOptions {
 
 /**
  * `nx` against a fixture root, with {@link fixtureNxEnv}. The root must lie in
- * a live fixture, which then stops whatever this client starts.
+ * a live fixture, which then stops whatever this client starts and retires the
+ * socket alias published for the root here.
  */
 export async function runFixtureNx(
   root: string,
@@ -282,7 +284,7 @@ export async function runFixtureNx(
     throw new Error(`runFixtureNx: no live withFixtureRepo fixture contains ${root}; its test has already finished`);
   }
   fixture.nxRoots.add(root);
-  const client = spawnFixtureNx(root, args, options);
+  const client = spawnFixtureNx(root, args, options, await publishFixtureSocketDirectory(root));
   fixture.clients.add(client.pid);
   try {
     await expectNxSuccess(args, client);
@@ -296,14 +298,14 @@ export async function runFixtureNx(
  * cache and daemon. The daemon runs only when `options` asks for it, whatever
  * the inherited `NX_DAEMON` or CI flag says, and the socket directory of
  * whichever workspace launched this process never reaches the fixture: its own
- * is `fixtureSocketDirectory(root)`, the one a stop of its daemon and the
- * fixture's retirement name as well. Host CI runners export the state
- * locations to a per-lane tree shared by every task in the run; a fixture
- * inheriting them overwrote the real workspace's project graph with its own
- * one-project graph, and the concurrent `nx run-many -t test` died with "Could
- * not find project lmao-ttsc".
+ * is `socketDirectory`, the root's published `fixtureSocketDirectory`, the one
+ * a stop of its daemon and the fixture's retirement name as well. Building it
+ * publishes nothing. Host CI runners export the state locations to a per-lane
+ * tree shared by every task in the run; a fixture inheriting them overwrote the
+ * real workspace's project graph with its own one-project graph, and the
+ * concurrent `nx run-many -t test` died with "Could not find project lmao-ttsc".
  */
-export function fixtureNxEnv(root: string, options: FixtureNxOptions): Record<string, string> {
+export function fixtureNxEnv(root: string, options: FixtureNxOptions, socketDirectory: string): Record<string, string> {
   const env = definedProcessEnv();
   delete env.NX_SOCKET_DIR;
   delete env.NX_DAEMON_SOCKET_DIR;
@@ -311,7 +313,7 @@ export function fixtureNxEnv(root: string, options: FixtureNxOptions): Record<st
     ...env,
     NX_DAEMON: options.daemon ? 'true' : 'false',
     NX_WORKSPACE_ROOT_PATH: root,
-    NX_SOCKET_DIR: fixtureSocketDirectory(root),
+    NX_SOCKET_DIR: socketDirectory,
     NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
     NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
     ...FIXTURE_NX_DIAGNOSTICS,
@@ -322,10 +324,11 @@ function spawnFixtureNx(
   root: string,
   args: string[],
   options: FixtureNxOptions,
+  socketDirectory: string,
 ): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
   return Bun.spawn(['nx', ...args], {
     cwd: root,
-    env: fixtureNxEnv(root, options),
+    env: fixtureNxEnv(root, options, socketDirectory),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -348,11 +351,16 @@ async function expectNxSuccess(args: string[], client: Bun.Subprocess<'ignore', 
 
 /**
  * Release the Nx daemon a root started, through `nx daemon --stop`, and wait
- * until the daemon and every process it ran have exited.
+ * until the daemon and every process it ran have exited. The stop names the
+ * root's socket directory without publishing it: a root with a daemon was
+ * published by the `runFixtureNx` that started it.
  */
 function stopFixtureNxDaemon(root: string): Promise<void> {
   return stopNxDaemon(root, () =>
-    expectNxSuccess(['daemon', '--stop'], spawnFixtureNx(root, ['daemon', '--stop'], { daemon: true })),
+    expectNxSuccess(
+      ['daemon', '--stop'],
+      spawnFixtureNx(root, ['daemon', '--stop'], { daemon: true }, fixtureSocketDirectory(root)),
+    ),
   );
 }
 

@@ -1,11 +1,10 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { readModulePackageJson } from 'nx/src/utils/package-json.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the workspace-resolution hunk of `patches/nx@23.2.1.patch`, the local build of nrwl/nx#37272. The
@@ -27,8 +26,7 @@ it('keeps the source-import edges when Nx is linked from the global store', asyn
   if (!nx.startsWith(`${store}/`)) throw new Error(`the controlled fixture has no locked immutable Nx package: ${nx}`);
   const typescript = dirname(readModulePackageJson('typescript', [repositoryRoot]).path);
 
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'nx-store-resolution-')));
-  try {
+  await withNxFixture('nx-store-resolution-', async ({ workspace: root, socketDirectory }) => {
     await mkdir(join(root, 'node_modules'));
     await symlink(nx, join(root, 'node_modules/nx'), 'dir');
     await symlink(typescript, join(root, 'node_modules/typescript'), 'dir');
@@ -55,7 +53,7 @@ it('keeps the source-import edges when Nx is linked from the global store', asyn
     const graphFile = join(root, 'graph.json');
     const child = spawn('node', [join(nx, 'dist/bin/nx.js'), 'graph', `--file=${graphFile}`], {
       cwd: root,
-      env: fixtureNxEnv(root),
+      env: fixtureNxEnv(root, socketDirectory),
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -93,7 +91,5 @@ it('keeps the source-import edges when Nx is linked from the global store', asyn
     expect(JSON.parse(await readFile(graphFile, 'utf8'))).toMatchObject({
       graph: { dependencies: { b: [{ source: 'b', target: 'a', type: 'static' }] } },
     });
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  });
 });

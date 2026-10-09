@@ -90,17 +90,21 @@ async function recordedRuns(directory: string) {
 it('records task history in the client database when the running daemon resolved the shared one', async () => {
   await withNxFixture(
     'nx-history-owner-',
-    async ({ root: base, workspace: root }) => {
+    async ({ root: base, socketDirectory, workspace: root }) => {
       // Nx shares its DB and cache across a repository's checkouts under ~/.nx/<id>;
       // a private HOME keeps that shared scope inside the fixture.
       const home = join(base, 'home');
-      const { NX_WORKSPACE_DATA_DIRECTORY: _data, NX_CACHE_DIRECTORY: _cache, ...defaultScope } = fixtureNxEnv(root);
+      const {
+        NX_WORKSPACE_DATA_DIRECTORY: _data,
+        NX_CACHE_DIRECTORY: _cache,
+        ...defaultScope
+      } = fixtureNxEnv(root, socketDirectory);
       // NX_DAEMON: this regression needs the daemon, which fixtureNxEnv turns off.
       const sharedEnv = { ...defaultScope, HOME: home, NX_DAEMON: 'true' };
       // Naming the checkout's default workspace-data directory explicitly keeps the
       // same daemon record, but any explicit data/cache directory turns Nx's sharing
       // off: this client's task details and cache rows land in the checkout DB.
-      const localEnv = { ...fixtureNxEnv(root), HOME: home, NX_DAEMON: 'true' };
+      const localEnv = { ...fixtureNxEnv(root, socketDirectory), HOME: home, NX_DAEMON: 'true' };
       const localData = join(root, '.nx/workspace-data');
       await mkdir(join(root, 'app'), { recursive: true });
       await mkdir(home);
@@ -161,7 +165,7 @@ it('records task history in the client database when the running daemon resolved
       expect(await readFile(daemonRecord, 'utf8')).toBe(initialDaemon);
       // Stop the fixture's daemon so no Nx process still holds either database
       // when the independent SQLite reader inspects them.
-      await stopFixtureNxDaemon(root);
+      await stopFixtureNxDaemon(root, fixtureNxEnv(root, socketDirectory));
       const [sharedId, ...otherShared] = await readdir(join(home, '.nx'));
       expect(otherShared).toEqual([]);
       if (sharedId === undefined) throw new Error(`no shared Nx scope under ${home}/.nx`);

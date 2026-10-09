@@ -107,8 +107,7 @@ async function ping(socketPath: string, workspaceRoot: string): Promise<unknown>
 it('accepts its real daemon RPC with a trailing root separator and refuses a genuinely foreign root', async () => {
   await withNxFixture(
     'nx-root-rpc-',
-    async ({ root, workspace }) => {
-      await mkdir(workspace);
+    async ({ root, socketDirectory, workspace }) => {
       await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
       await writeFile(join(workspace, 'nx.json'), '{}\n');
       await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'root-rpc', private: true }));
@@ -117,7 +116,7 @@ it('accepts its real daemon RPC with a trailing root separator and refuses a gen
       await writeFile(join(foreign, 'nx.json'), '{}\n');
       const started = spawnSync('node', [artifactNxEntry, 'daemon', '--start'], {
         cwd: workspace,
-        env: { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' },
+        env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' },
         encoding: 'utf8',
       });
       expect(started.status, started.stdout + started.stderr).toBe(0);
@@ -136,7 +135,7 @@ it('accepts its real daemon RPC with a trailing root separator and refuses a gen
 it('keeps the old product generation daemon serving while a complete new generation loads its CLI and native closure', async () => {
   await withNxFixture(
     'nx-product-generation-',
-    async ({ workspace }) => {
+    async ({ socketDirectory, workspace }) => {
       await mkdir(join(workspace, 'node_modules'), { recursive: true });
       await writeFile(join(workspace, 'nx.json'), '{}\n');
       await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'generation-daemon', private: true }));
@@ -165,7 +164,7 @@ it('keeps the old product generation daemon serving while a complete new generat
       expect(realpathSync(alias)).toBe(oldGeneration);
       await symlink(alias, join(workspace, 'node_modules/nx'), 'dir');
       const entry = join(alias, 'dist/bin/nx.js');
-      const env = { ...fixtureNxEnv(workspace), NX_DAEMON: 'true' };
+      const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
       const started = spawnSync('node', [entry, 'daemon', '--start'], { cwd: workspace, env, encoding: 'utf8' });
       expect(started.status, started.stdout + started.stderr).toBe(0);
       const recordPath = join(workspace, '.nx/workspace-data/d/server-process.json');

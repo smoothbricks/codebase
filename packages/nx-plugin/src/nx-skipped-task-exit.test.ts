@@ -35,7 +35,7 @@ exports.postTasksExecution = async (options, context) => {
 `;
 
 it('exits 1, not 130, when a failed task leaves a task that depends on it unrun', async () => {
-  await withNxFixture('nx-skipped-exit-', async ({ workspace }) => {
+  await withNxFixture('nx-skipped-exit-', async ({ workspace, socketDirectory }) => {
     await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
     await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./results-hook.js'] }));
     await writeFile(join(workspace, 'results-hook.js'), resultsHook);
@@ -55,7 +55,7 @@ it('exits 1, not 130, when a failed task leaves a task that depends on it unrun'
     for (const bail of [false, true]) {
       const ran = spawnSync('bun', [nxEntry, 'run', 'p:after', `--nx-bail=${bail}`, '--outputStyle=static'], {
         cwd: workspace,
-        env: fixtureNxEnv(workspace),
+        env: fixtureNxEnv(workspace, socketDirectory),
         encoding: 'utf8',
       });
       const output = `${ran.stdout}${ran.stderr}`;
@@ -70,7 +70,7 @@ it('exits 1, not 130, when a failed task leaves a task that depends on it unrun'
 
 it('distinguishes parallel failure bailout from a real interrupt with pending tasks', async () => {
   for (const interrupt of [false, true]) {
-    await withNxFixture('nx-bail-interrupt-', async ({ workspace }) => {
+    await withNxFixture('nx-bail-interrupt-', async ({ workspace, socketDirectory }) => {
       await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
       await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./results-hook.js'] }));
       await writeFile(join(workspace, 'results-hook.js'), resultsHook);
@@ -118,7 +118,7 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
         [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--parallel=2', '--nx-bail=true', '--outputStyle=static'],
         {
           cwd: workspace,
-          env: fixtureNxEnv(workspace),
+          env: fixtureNxEnv(workspace, socketDirectory),
           detached: process.platform !== 'win32',
           stdio: ['ignore', 'pipe', 'pipe'],
         },

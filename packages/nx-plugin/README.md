@@ -927,29 +927,36 @@ tests) owns those roots:
   the directory of the volume a fixture has to lie on. The parent is resolved through every link first, so one spelled
   two ways is one run, and a process holds one run for each parent and suite. The first root a process creates for a
   suite under a parent first reclaims every run of that suite there whose owner pid is gone: each process working in it
-  gets SIGTERM (SIGKILL if it outlives 10 s), then the run is deleted. A run whose owner is alive is never touched by
-  another process. A killed process therefore leaves what it owned in a `run-<pid>` of its own, inside that parent's
+  gets SIGTERM (SIGKILL if it outlives 10 s); once all have exited, every socket alias naming a workspace of that run
+  (see `publishFixtureSocketDirectory`) is unlinked, whether that workspace still exists or not, then the run is
+  deleted. A run whose owner is alive is never touched by another process, and other entries of the socket namespace are
+  left alone. A killed process therefore leaves what it owned in a `run-<pid>` of its own, inside that parent's
   `smoothbricks-fixtures` directory, never as a bare prefix among whatever else the parent holds, and the next process
   to use that parent and suite reclaims it. The owner itself, on SIGTERM, SIGINT or SIGHUP (a bounded test leg's timeout
   sends SIGTERM, then SIGKILL 10 s later), first stops whatever still works in every run it holds, all at once, and
   makes no new root meanwhile; a repeated signal waits for that. Then it dies of the first signal it got.
 - `reclaimDeadFixtureRuns(parentDirectory, suite)` runs that sweep on demand, for a test that has just watched a
   fixture-owning process die.
-- `fixtureSocketDirectory(workspace)` publishes a short parent alias named for a hash of the workspace's physical path
-  in the sandbox's socket namespace (`socketNamespace`). The alias points to the fixture's own `.nx/sockets`; the
-  returned `nx` leaf is real. Every client and daemon stop names the same leaf, and no two fixtures share one. A
-  namespace too small for Nx's longest socket name is refused before publication. This package's `fixtureNxEnv` and the
-  CLI's use it.
-- `ownedWorkspaceSocketDirectory(workspace, prefix, longestSocketName)` creates a distinct real leaf below that alias
+- `fixtureSocketDirectory(workspace)` names, without creating anything, the `nx` socket leaf below a short parent alias
+  in the sandbox's socket namespace (`socketNamespace`). The alias is named for a hash of the workspace's physical path,
+  so every client and daemon stop of a workspace names the same leaf, and no two fixtures share one. A namespace too
+  small for Nx's longest socket name is refused here, before anything is published.
+- `publishFixtureSocketDirectory(workspace)` makes that alias and returns the leaf. The workspace must be a physical
+  directory in a run this process holds (`ownedFixtureRoot`), so the run's sweep can reclaim the alias if the process
+  dies; anything else is refused. The alias points at the fixture's own `.nx/sockets` (mode 0700, never through a
+  symlinked `.nx`); Nx makes the real `nx` leaf. This package's `withNxFixture` publishes its workspace and passes the
+  directory to the body, and the CLI's `runFixtureNx` publishes each root it runs in. Both `fixtureNxEnv`s take the
+  directory as an argument and publish nothing.
+- `ownedWorkspaceSocketDirectory(workspace, slot)` creates the real leaf `a` or `b` beside `nx` below a published alias,
   for tests of multiple daemon socket directories. Its caller stops the daemon before removing the leaf.
-- `retireFixtureSocketDirectory(workspace)` unlinks only the verified parent alias after the daemon exits. A colliding
-  non-symlink or retargeted alias refuses instead of removing another owner's entry; removing the fixture root reclaims
-  its physical socket directories.
+- `retireFixtureSocketDirectory(workspace)` unlinks only the verified parent alias after the daemon exits, named from
+  the workspace's path alone, so a deleted workspace retires too. A colliding non-symlink or retargeted alias refuses
+  instead of removing another owner's entry; removing the fixture root reclaims its physical socket directories.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
   `<workspace>/.nx/workspace-data/d/server-process.json`, and every process it started, has exited.
 
-A fixture retires on every exit path, a throwing body included: stop its daemon, then delete its root. A daemon that
-outlives the stop keeps the root, so the next run's sweep still finds it.
+A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
+its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.
 
 ## Managed workspace files
 

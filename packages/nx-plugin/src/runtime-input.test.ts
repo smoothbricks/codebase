@@ -56,9 +56,9 @@ describe('runtime-input.sh', () => {
 describe('a planted runtime input failure through real Nx', () => {
   for (const daemon of [false, true]) {
     it(`is an error, not a hash${daemon ? ', through the daemon' : ''}`, async () => {
-      await withNxFixture('runtime-input-', async ({ workspace }) => {
+      await withNxFixture('runtime-input-', async ({ workspace, socketDirectory }) => {
         await writeProbeWorkspace(workspace);
-        const env = { ...fixtureNxEnv(workspace), NX_DAEMON: String(daemon) };
+        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: String(daemon) };
 
         const good = nx(workspace, env, 'probe:good');
         expect(good.status, good.output).toBe(0);

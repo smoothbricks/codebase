@@ -80,10 +80,10 @@ function pluginWorkers(daemon: number): number[] {
 }
 
 it('keeps the daemon graph plugin workers running from one tracked change to the next', async () => {
-  await withNxFixture('nx-resident-workers-', async ({ workspace: root }) => {
+  await withNxFixture('nx-resident-workers-', async ({ workspace: root, socketDirectory }) => {
     // fixtureNxEnv runs plugins in process and without a daemon; this
     // regression is about isolated workers, and the daemon is their host.
-    const env = { ...fixtureNxEnv(root), NX_ISOLATE_PLUGINS: 'true', NX_DAEMON: 'true' };
+    const env = { ...fixtureNxEnv(root, socketDirectory), NX_ISOLATE_PLUGINS: 'true', NX_DAEMON: 'true' };
     await mkdir(join(root, 'app'));
     await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
     await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
